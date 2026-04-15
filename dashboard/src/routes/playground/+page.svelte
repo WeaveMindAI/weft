@@ -39,7 +39,6 @@ topic = Text {
 
 config = LlmConfig {
   label: "Config"
-  provider: "openrouter"
   model: "anthropic/claude-sonnet-4.6"
   systemPrompt: "Write a short, beautiful poem (4-6 lines) about the given topic. Just the poem, nothing else."
   temperature: "0.8"
@@ -163,7 +162,6 @@ lead_data = Text {
 # --- First-class citizen: AI ---
 llm_config = LlmConfig {
   label: "LLM Config"
-  provider: "openrouter"
   model: "anthropic/claude-sonnet-4.6"
   systemPrompt: "Analyze this lead. Write a short assessment: who they are, why they matter, and a recommended action."
   temperature: "0.3"
@@ -230,7 +228,6 @@ lead_revenue = Number { value: 95000 }
 
 llm_config = LlmConfig {
   label: "LLM Config"
-  provider: "openrouter"
   model: "anthropic/claude-sonnet-4.6"
   systemPrompt: "Analyze this lead and return a one-sentence assessment."
   temperature: "0.3"
@@ -311,7 +308,6 @@ classify = Group(
 
   llm_config = LlmConfig {
     label: "Classifier Config"
-    provider: "openrouter"
     model: "anthropic/claude-sonnet-4.6"
     systemPrompt: \`\`\`
 You are a customer support triage system. Classify incoming emails and extract structured information.
@@ -553,7 +549,7 @@ debug_classification.data = classify.formatted_context`,
 		},
 		'llm-analysis': {
 			'topic': { output: { value: 'the silence between stars' } },
-			'config': { output: { config: { provider: 'openrouter', model: 'anthropic/claude-sonnet-4.6' } } },
+			'config': { output: { config: { model: 'anthropic/claude-sonnet-4.6' } } },
 			'poet': { output: { response: 'Between the stars, a hush so wide\nno wave has ever crossed its span.\nIt holds the light on every side\nand asks for nothing back from man.' } },
 			'output': { output: { data: 'Between the stars, a hush so wide\nno wave has ever crossed its span.\nIt holds the light on every side\nand asks for nothing back from man.' }, input: { data: 'Between the stars, a hush so wide\nno wave has ever crossed its span.\nIt holds the light on every side\nand asks for nothing back from man.' } },
 		},
@@ -561,7 +557,7 @@ debug_classification.data = classify.formatted_context`,
 			'email_config': { output: { config: { protocol: 'imap', host: 'imap.gmail.com' } } },
 			'incoming_email': { output: { from: 'sarah@bigcorp.com', subject: 'URGENT: Production API returning 500 errors', body: 'Hi, our entire integration with your API has been down for 2 hours. We have a board meeting in 30 minutes and need this resolved immediately. This is affecting all 200 of our users. If this isn\'t fixed today we will need to evaluate alternatives.' } },
 			'classify': { output: { category: 'churn_risk', severity: 'critical', summary: 'Enterprise customer experiencing production API outage, threatening to leave', suggested_action: 'Escalate to engineering lead immediately, provide status update within 15 minutes', formatted_context: '🔴 *Churn Risk* (critical)\n*From:* sarah@bigcorp.com\n*Subject:* URGENT: Production API returning 500 errors\n*Summary:* Enterprise customer experiencing production API outage, threatening to leave\n*Action:* Escalate to engineering lead immediately' } },
-			'classify.llm_config': { output: { config: { provider: 'openrouter', model: 'anthropic/claude-sonnet-4.6' } } },
+			'classify.llm_config': { output: { config: { model: 'anthropic/claude-sonnet-4.6' } } },
 			'classify.prompt_template': { output: { value: 'Classify this customer email:\n\nFrom: {{sender}}\nSubject: {{subject}}\n\nBody:\n{{body}}' } },
 			'classify.build_prompt': { output: { text: 'Classify this customer email:\n\nFrom: sarah@bigcorp.com\nSubject: URGENT: Production API returning 500 errors\n\nBody:\nHi, our entire integration with your API has been down for 2 hours...' } },
 			'classify.classifier': { output: { response: '{"category": "churn_risk", "severity": "critical", "summary": "Enterprise customer experiencing production API outage, threatening to leave", "suggested_action": "Escalate to engineering lead immediately, provide status update within 15 minutes"}' } },
