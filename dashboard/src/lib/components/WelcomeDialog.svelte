@@ -46,7 +46,7 @@
 				</div>
 			</div>
 			<div class="flex items-start gap-3">
-				<span class="text-lg">�</span>
+				<span class="text-lg">💸</span>
 				<div class="text-sm">
 					<p><strong>You get $5 free credits.</strong> Tangle (the AI builder) uses Sonnet/Opus which burn through credits fast.</p>
 					<p class="text-muted-foreground text-xs mt-0.5">I don't have preferential pricing with Anthropic yet. Working on fine-tuning smaller models to reduce costs.</p>
