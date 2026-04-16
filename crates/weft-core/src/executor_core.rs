@@ -215,8 +215,6 @@ pub fn node_execution_summary(executions: &[NodeExecution]) -> String {
     let failed = executions.iter().filter(|e| e.status == NodeExecutionStatus::Failed).count();
     let completed = executions.iter().filter(|e| e.status == NodeExecutionStatus::Completed).count();
     let skipped = executions.iter().filter(|e| e.status == NodeExecutionStatus::Skipped).count();
-
-
     let cancelled = executions.iter().filter(|e| e.status == NodeExecutionStatus::Cancelled).count();
 
     let base = if running > 0 {
@@ -227,8 +225,6 @@ pub fn node_execution_summary(executions: &[NodeExecution]) -> String {
         "skipped"
     } else if failed > 0 && completed == 0 {
         "failed"
-    } else if failed > 0 {
-        "completed"
     } else {
         "completed"
     };
