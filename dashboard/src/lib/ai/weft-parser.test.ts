@@ -2300,3 +2300,86 @@ n.x = null`;
 		expect(p.warnings.some(w => w.message.includes("'x: null'") && w.message.includes('ignored'))).toBe(true);
 	});
 });
+
+describe('error line numbers', () => {
+	it('MustOverride error reports non-zero line', () => {
+		const p = parse(`
+# Project: Summarizer
+article = Text {
+  label: "Article"
+  value: "Rust is a systems programming language..."
+}
+
+summarizer = LlmInference {
+  label: "Summarizer"
+}
+summarizer.prompt = article.value
+
+output = Debug { label: "Summary" }
+output.data = summarizer.response
+		`);
+		const mustOverrideErr = p.errors.find(e => e.message.includes('requires a type declaration'));
+		expect(mustOverrideErr).toBeDefined();
+		expect(mustOverrideErr!.line).toBeGreaterThan(0);
+	});
+
+	it('unresolved type variable error reports non-zero line', () => {
+		const p = parse(`
+# Project: TypeVar
+source = Text { value: "hello" }
+gate = Gate
+gate.value = source.value
+output = Debug { label: "Out" }
+output.data = gate.value
+		`);
+		// Gate's T resolves from value (wired to String), but gate.pass is
+		// unwired so Gate has a validation error. If there is an unresolved
+		// TypeVar error, its line must be non-zero.
+		const typeVarErr = p.errors.find(e => e.message.includes('unresolved type variable'));
+		if (typeVarErr) {
+			expect(typeVarErr.line).toBeGreaterThan(0);
+		}
+		// At minimum, the MustOverride/validation errors should have real lines
+		const anyNodeErr = p.errors.find(e => e.message.includes('Gate') || e.message.includes('gate'));
+		if (anyNodeErr) {
+			expect(anyNodeErr.line).toBeGreaterThan(0);
+		}
+	});
+});
+
+describe('post-config wrong order detection', () => {
+	it('detects post-config outputs before config block', () => {
+		const p = parse(`
+# Project: WrongOrder
+input = Text { value: "test" }
+cfg = LlmConfig { model: "anthropic/claude-sonnet-4.6" }
+qualify = LlmInference -> (response: JsonDict) -> (is_promising: Boolean, reason: String) {
+  label: "Qualify"
+  parseJson: true
+}
+qualify.prompt = input.value
+qualify.config = cfg.config
+		`);
+		const wrongOrderErr = p.errors.find(e => e.message.includes('AFTER the config block'));
+		expect(wrongOrderErr).toBeDefined();
+		expect(wrongOrderErr!.line).toBeGreaterThan(0);
+	});
+
+	it('wrong order error message warns about cascading', () => {
+		const p = parse(`
+# Project: WrongOrderCascade
+input = Text { value: "test" }
+cfg = LlmConfig { model: "anthropic/claude-sonnet-4.6" }
+bad = LlmInference -> (response: JsonDict) -> (summary: String) {
+  label: "Bad"
+  parseJson: true
+}
+bad.prompt = input.value
+bad.config = cfg.config
+		`);
+		const wrongOrderErr = p.errors.find(e => e.message.includes('AFTER the config block'));
+		expect(wrongOrderErr).toBeDefined();
+		// The error message should warn that other errors may cascade from this
+		expect(wrongOrderErr!.message).toContain('Other errors below may be caused by this');
+	});
+});

@@ -2378,6 +2378,14 @@ function parseScope(
 				const hashIdx = nodeBodyTrimmed.indexOf('#');
 				if (hashIdx > 0) nodeBodyTrimmed = nodeBodyTrimmed.slice(0, hashIdx).trim();
 			}
+			// Detect wrong-order post-config outputs: `-> (pre) -> (post) { config }`.
+			// The correct order is `-> (pre) { config } -> (post)`.
+			if (nodeBodyTrimmed.startsWith('->')) {
+				errors.push({
+					line: lineNum,
+					message: 'Post-config output ports must come AFTER the config block, not before it. Write: node = Type -> (out: T) { config } -> (extra: T2), not: node = Type -> (out: T) -> (extra: T2) { config }. Other errors below may be caused by this. Fix this first to see the real leftover errors.',
+				});
+			}
 			if (nodeBodyTrimmed === '{') {
 				if (!isRoot) {
 					// Inline children emitted by parseNodeBlockBody will target
@@ -3942,17 +3950,18 @@ export function resolveAndValidateTypes(
 	}
 
 	for (const node of nodes) {
+		const nodeLine = (node as NodeInstance & { sourceLine?: number }).sourceLine ?? 0;
 		for (const port of node.inputs) {
 			const key = `${node.id}:${port.name}`;
 			if (!connectedInputs.has(key)) continue;
 			if (isMustOverride(port.portType)) {
 				errors.push({
-					line: 0,
+					line: nodeLine,
 					message: `Node ${node.id}: input port "${port.name}" requires a type declaration (e.g. ${port.name}: String)`,
 				});
 			} else if (containsTypeVar(port.portType)) {
 				errors.push({
-					line: 0,
+					line: nodeLine,
 					message: `Node ${node.id}: input port "${port.name}" has unresolved type variable in '${port.portType}', could not infer type from connections`,
 				});
 			}
@@ -3962,12 +3971,12 @@ export function resolveAndValidateTypes(
 			if (!connectedOutputs.has(key)) continue;
 			if (isMustOverride(port.portType)) {
 				errors.push({
-					line: 0,
+					line: nodeLine,
 					message: `Node ${node.id}: output port "${port.name}" requires a type declaration (e.g. ${port.name}: String)`,
 				});
 			} else if (containsTypeVar(port.portType)) {
 				errors.push({
-					line: 0,
+					line: nodeLine,
 					message: `Node ${node.id}: output port "${port.name}" has unresolved type variable in '${port.portType}', could not infer type from connections`,
 				});
 			}
@@ -3994,8 +4003,9 @@ export function resolveAndValidateTypes(
 
 				if (!hasNull) {
 					const innerStr = weftTypeToString(inner);
+					const nLine = (node as NodeInstance & { sourceLine?: number }).sourceLine ?? 0;
 					warnings.push({
-						line: 0,
+						line: nLine,
 						message: `${node.id}.${port.name} gathers data but its type List[${innerStr}] doesn't handle null lanes. Consider using List[${innerStr} | Null] in case some lanes were skipped.`,
 					});
 				}
@@ -4020,8 +4030,9 @@ export function resolveAndValidateTypes(
 			const anyConnected = node.outputs.some(p => origConnectedOutputs.has(`${node.id}:${p.name}`));
 			if (!anyConnected) {
 				const portNames = node.outputs.map(p => p.name).join(', ');
+				const nLine = (node as NodeInstance & { sourceLine?: number }).sourceLine ?? 0;
 				warnings.push({
-					line: 0,
+					line: nLine,
 					message: `Node ${node.id} (${node.nodeType}): has outputs (${portNames}) but none are connected to other nodes. Consider connecting it or removing it.`,
 				});
 			}
@@ -4053,7 +4064,8 @@ export function resolveAndValidateTypes(
 			if (allPermissive && !hasOneOfRequired) {
 				const portNames = wiredInputs.map(p => p.name).join(', ');
 				const label = node.nodeType === 'Group' ? 'Group' : 'Node';
-				warnings.push({ line: 0, message: `${label} ${node.id}: no connected input will cause a skip if null (${portNames}). This ${label.toLowerCase()} will execute even if all inputs are null. Consider making at least one input required (without Null in type) or using @require_one_of().` });
+				const nLine = (node as NodeInstance & { sourceLine?: number }).sourceLine ?? 0;
+					warnings.push({ line: nLine, message: `${label} ${node.id}: no connected input will cause a skip if null (${portNames}). This ${label.toLowerCase()} will execute even if all inputs are null. Consider making at least one input required (without Null in type) or using @require_one_of().` });
 			}
 		}
 	}

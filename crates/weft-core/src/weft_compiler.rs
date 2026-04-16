@@ -311,6 +311,16 @@ fn try_parse_declaration(
     };
 
     let after_ports = after_ports.trim();
+
+    // Detect wrong-order post-config outputs: `-> (pre) -> (post) { config }`.
+    // The correct order is `-> (pre) { config } -> (post)`.
+    if after_ports.starts_with("->") {
+        errors.push(CompileError {
+            line: line_num,
+            message: "Post-config output ports must come AFTER the config block, not before it. Write: node = Type -> (out: T) { config } -> (extra: T2), not: node = Type -> (out: T) -> (extra: T2) { config }. Other errors below may be caused by this. Fix this first to see the real leftover errors.".to_string(),
+        });
+    }
+
     // The body parsing should start from header_end_line, not start
     let body_start_line = header_end_line;
 
