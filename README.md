@@ -17,7 +17,7 @@ Weft is a language where LLMs, humans, APIs, and infrastructure are base ingredi
 - **Built-in nodes.** LLM, Code, HTTP, Human Query, Gate, Template, Discord, Slack, Telegram, WhatsApp, Email, X, Postgres, Memory, Apollo, Web Search, and more, the end goal will be to allow AI to build custom node on the fly using the langauge features (this is not the case right now).
 - **Two native views.** Same program, rendered as dense code for AI builders and as a graph for humans. Edit either, the other updates. Nothing is bolted on.
 
-Read the full story: [The Future of Programming (and Why I'm Building a New Language)](https://weavemind.ai/blog/announcement).
+Read the full story: [The Future of Programming (and Why I'm Building a New Language)](https://weavemind.ai/blog/future-of-programming).
 
 Full documentation: [weavemind.ai/docs](https://weavemind.ai/docs).
 
