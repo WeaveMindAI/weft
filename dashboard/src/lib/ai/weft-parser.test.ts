@@ -2360,7 +2360,7 @@ qualify = LlmInference -> (response: JsonDict) -> (is_promising: Boolean, reason
 qualify.prompt = input.value
 qualify.config = cfg.config
 		`);
-		const wrongOrderErr = p.errors.find(e => e.message.includes('AFTER the config block'));
+		const wrongOrderErr = p.errors.find(e => e.message.includes('Two arrow clauses before the config block'));
 		expect(wrongOrderErr).toBeDefined();
 		expect(wrongOrderErr!.line).toBeGreaterThan(0);
 	});
@@ -2377,9 +2377,9 @@ bad = LlmInference -> (response: JsonDict) -> (summary: String) {
 bad.prompt = input.value
 bad.config = cfg.config
 		`);
-		const wrongOrderErr = p.errors.find(e => e.message.includes('AFTER the config block'));
+		const wrongOrderErr = p.errors.find(e => e.message.includes('Two arrow clauses before the config block'));
 		expect(wrongOrderErr).toBeDefined();
 		// The error message should warn that other errors may cascade from this
-		expect(wrongOrderErr!.message).toContain('Other errors below may be caused by this');
+		expect(wrongOrderErr!.message).toContain('Other errors below are likely caused by this');
 	});
 });

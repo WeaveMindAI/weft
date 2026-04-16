@@ -317,7 +317,7 @@ fn try_parse_declaration(
     if after_ports.starts_with("->") {
         errors.push(CompileError {
             line: line_num,
-            message: "Post-config output ports must come AFTER the config block, not before it. Write: node = Type -> (out: T) { config } -> (extra: T2), not: node = Type -> (out: T) -> (extra: T2) { config }. Other errors below may be caused by this. Fix this first to see the real leftover errors.".to_string(),
+            message: "Two arrow clauses before the config block. You wrote: Type -> (out: T) -> (extra: T2) { config }. Fix: merge both port lists into one: Type -> (out: T, extra: T2) { config }. Just add the extra ports to the first arrow clause. Other errors below are likely caused by this, ignore them until this is fixed.".to_string(),
         });
     }
 
