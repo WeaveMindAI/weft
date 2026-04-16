@@ -103,6 +103,7 @@
 	let historyPanelRef: HistoryPanel | undefined = $state();
 	let showCodePanel = $state(untrack(() => playground));
 	let mobileForceEditor = $state(false);
+	let mobileToolbarOpen = $state(false);
 	let codePanelMaximized = $state(false);
 	let codePanelWidth = $state(480);
 	let isResizingCodePanel = $state(false);
@@ -2842,14 +2843,14 @@
 				{:else}
 					<button
 						onclick={() => { editingName = true; editingNameValue = project.name || ''; }}
-						class="text-sm font-semibold text-zinc-800 leading-tight text-left hover:text-zinc-600 cursor-text"
+						class="text-sm font-semibold text-zinc-800 leading-tight text-left hover:text-zinc-600 cursor-text truncate max-w-[120px] sm:max-w-[200px] md:max-w-none"
 						title="Click to rename"
 					>{project.name || 'Untitled Project'}</button>
 				{/if}
-				{#if !playground}<span class="text-[10px] text-zinc-500 font-mono leading-tight">{project.id}</span>{/if}
 			</div>
 		</div>
-		<div class="flex items-center gap-2">
+		<!-- Desktop toolbar -->
+		<div class="hidden md:flex items-center gap-2">
 			<button
 				onclick={() => { showCodePanel = !showCodePanel; te.view.codePanelToggled(showCodePanel); if (showCodePanel) initWeftCode(); }}
 				class="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium transition-colors {showCodePanel ? 'bg-zinc-900 text-white' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'}"
@@ -2928,6 +2929,64 @@
 				{/if}
 			{/if}
 		</div>
+
+		<!-- Mobile toolbar hamburger -->
+		<div class="relative md:hidden">
+			<button
+				onclick={() => mobileToolbarOpen = !mobileToolbarOpen}
+				class="p-1.5 rounded-lg hover:bg-zinc-100 transition-colors"
+				aria-label="Toggle toolbar"
+			>
+				<svg class="w-5 h-5 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+					{#if mobileToolbarOpen}
+						<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+					{:else}
+						<path stroke-linecap="round" stroke-linejoin="round" d="M12 6.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 12.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 18.75a.75.75 0 110-1.5.75.75 0 010 1.5z" />
+					{/if}
+				</svg>
+			</button>
+			{#if mobileToolbarOpen}
+				<div class="absolute right-0 top-full mt-1 w-48 bg-white border border-zinc-200 rounded-lg shadow-lg py-1 z-50">
+					<button
+						onclick={() => { showCodePanel = !showCodePanel; te.view.codePanelToggled(showCodePanel); if (showCodePanel) initWeftCode(); mobileToolbarOpen = false; }}
+						class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {showCodePanel ? 'text-zinc-900 bg-zinc-50' : 'text-zinc-600 hover:bg-zinc-50'}"
+					>{showCodePanel ? '✓ Code' : 'Code'}</button>
+					{#if onImport}
+						<button onclick={() => { onImport(); mobileToolbarOpen = false; }} class="w-full text-left px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 transition-colors">Import</button>
+					{/if}
+					{#if onExport}
+						<button onclick={() => { showExportDialog = true; mobileToolbarOpen = false; }} class="w-full text-left px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 transition-colors">Export</button>
+					{/if}
+					{#if onShare}
+						<button onclick={() => { onShare(); mobileToolbarOpen = false; }} class="w-full text-left px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 transition-colors">Share</button>
+					{/if}
+					{#if onSetViewMode}
+						<div class="border-t border-zinc-100 my-1"></div>
+						<button
+							onclick={() => { onSetViewMode?.('builder'); mobileToolbarOpen = false; }}
+							class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {viewMode === 'builder' ? 'text-zinc-900 bg-zinc-50' : 'text-zinc-600 hover:bg-zinc-50'}"
+						>{viewMode === 'builder' ? '● Builder' : 'Builder'}</button>
+						<button
+							onclick={() => { onSetViewMode?.('runner'); mobileToolbarOpen = false; }}
+							class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {viewMode === 'runner' ? 'text-zinc-900 bg-zinc-50' : 'text-zinc-600 hover:bg-zinc-50'}"
+						>{viewMode === 'runner' ? '● Runner' : 'Runner'}</button>
+						{#if onOpenTestConfig}
+							<button
+								onclick={() => { onOpenTestConfig(); mobileToolbarOpen = false; }}
+								class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {testMode ? 'text-amber-600 bg-amber-50' : 'text-zinc-600 hover:bg-zinc-50'}"
+							>{testMode ? '● Test ON' : 'Tests'}</button>
+						{/if}
+						{#if onPublish}
+							<div class="border-t border-zinc-100 my-1"></div>
+							<button
+								onclick={() => { onPublish(); mobileToolbarOpen = false; }}
+								class="w-full text-left px-3 py-2 text-xs font-medium text-violet-600 hover:bg-violet-50 transition-colors"
+							>{hasPublications ? 'Manage deployments' : 'Publish'}</button>
+						{/if}
+					{/if}
+				</div>
+			{/if}
+		</div>
 	</div>
 
 	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
@@ -2939,7 +2998,7 @@
 	<!-- Weft Code Panel (left, resizable) -->
 	{#if showCodePanel}
 		<div
-			class="weft-code-panel-container"
+			class="weft-code-panel-container max-md:!flex-1 max-md:!w-full"
 			style={codePanelMaximized ? 'flex: 1;' : `width: ${codePanelWidth}px; flex-shrink: 0;`}
 		>
 			<WeftCodePanel
@@ -2957,15 +3016,15 @@
 		{#if !codePanelMaximized}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
-				class="code-panel-resize-handle"
+				class="code-panel-resize-handle hidden md:block"
 				onmousedown={startCodePanelResize}
 			></div>
 		{/if}
 	{/if}
 
-	<!-- Main Canvas -->
+	<!-- Main Canvas (hidden on mobile when code panel is open) -->
 	{#if !codePanelMaximized}
-	<div class="flex-1 relative" oncontextmenucapture={(e: MouseEvent) => {
+	<div class="flex-1 relative {showCodePanel ? 'hidden md:block' : ''}" oncontextmenucapture={(e: MouseEvent) => {
 		const target = e.target as HTMLElement | null;
 		if (!target?.closest('.svelte-flow__edgeupdater')) return;
 		// Right-click on edge reconnect overlay, find the actual handle underneath
