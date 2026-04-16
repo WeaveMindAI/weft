@@ -102,6 +102,7 @@
 	let configPanelRef: ConfigPanel | undefined = $state();
 	let historyPanelRef: HistoryPanel | undefined = $state();
 	let showCodePanel = $state(untrack(() => playground));
+	let mobileForceEditor = $state(false);
 	let codePanelMaximized = $state(false);
 	let codePanelWidth = $state(480);
 	let isResizingCodePanel = $state(false);
@@ -2775,6 +2776,7 @@
 {/if}
 
 <!-- Mobile notice -->
+{#if !mobileForceEditor}
 <div class="flex flex-col bg-white h-full w-full md:hidden">
 	<div class="flex items-center justify-between px-4 py-3 border-b border-zinc-200">
 		<a href="/dashboard" class="flex items-center gap-2 text-zinc-500 hover:text-zinc-800 transition-colors">
@@ -2799,11 +2801,16 @@
 			{/if}
 			<a href="/dashboard" class="px-4 py-2 text-xs font-medium rounded-lg transition-colors {onSetViewMode ? 'border border-zinc-200 text-zinc-600 hover:bg-zinc-50' : 'bg-zinc-900 text-white hover:bg-zinc-800'}">Back to Dashboard</a>
 		</div>
+		<button
+			onclick={() => mobileForceEditor = true}
+			class="mt-4 text-[11px] text-red-400 hover:text-red-600 transition-colors"
+		>Proceed anyway</button>
 	</div>
 </div>
+{/if}
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="hidden md:flex flex-col h-full w-full">
+<div class="{mobileForceEditor ? 'flex' : 'hidden md:flex'} flex-col h-full w-full">
 	<!-- IDE Header Bar -->
 	<div class="flex items-center justify-between px-4 bg-white border-b border-zinc-200 z-20 shrink-0" style="height: 41px;">
 		<div class="flex items-center gap-3">
