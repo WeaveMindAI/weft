@@ -30,7 +30,7 @@ What's coming next. Not prioritized, not promised, just directions we're explori
 
 - **In-process node execution**: Link weft-nodes into the orchestrator. Local nodes (Text, Gate, Template) run in-process, no HTTP round-trip. ~10ms saved per computational node.
 - **Compile to standalone binary**: Weft compiler emits Rust code. The binary contains the execution graph and node implementations. `cargo build` a Weft project into a self-contained binary.
-- **Per-execution container isolation**: Each execution spawns its own container with the compiled binary. Full filesystem access within execution scope, no nsjail needed. Cross-language file sharing (Python writes a file, another node reads it).
+- **Per-execution container isolation**: Each execution spawns its own container with the compiled binary. Full filesystem access within execution scope, no external sandbox service needed. Cross-language file sharing (Python writes a file, another node reads it).
 - **Binary execution modes**:
   - `./program`, run once: provision infra, execute, tear down, exit.
   - `./program serve`, service mode: provision infra, run trigger setup, stay alive listening. On each trigger event, run the execution sub-graph. Ctrl+C tears down.

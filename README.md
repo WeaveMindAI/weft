@@ -131,7 +131,7 @@ weft/
 │   └── triggers/           #   Cron, webhooks, polling
 ├── crates/
 │   ├── weft-core/          # Type system, Weft compiler, executor, Restate objects
-│   ├── weft-nodes/         # Node trait, registry, sandbox, node runner binary
+│   ├── weft-nodes/         # Node trait, registry, node runner binary
 │   ├── weft-api/           # REST API (triggers, files, infra, usage)
 │   └── weft-orchestrator/  # Restate services and Axum project executor
 ├── dashboard/              # Web UI (SvelteKit + Svelte 5)

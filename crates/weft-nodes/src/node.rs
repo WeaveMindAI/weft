@@ -684,6 +684,7 @@ impl ExecutionContext {
                 "elevenlabs" => "ELEVENLABS_API_KEY",
                 "tavily" => "TAVILY_API_KEY",
                 "apollo" => "APOLLO_API_KEY",
+                "e2b" => "E2B_API_KEY",
                 _ => {
                     tracing::error!("Unknown api_key provider: {}", provider);
                     return None;

@@ -25,10 +25,19 @@ You will get an acknowledgement within 48 hours. We will work with you on a fix 
 
 ## What does not count
 
-- A user running `rm -rf /` inside an ExecPython node in their own sandbox. The sandbox is there to protect the host, not the user from themselves.
+- A user running `rm -rf /` inside an ExecPython node on a deployment they own. In a self-hosted install ExecPython runs via the host's `python3`: same trust boundary as running `python script.py` on that machine. In a cloud install it runs inside a managed remote sandbox. Neither is there to protect you from your own code.
 - An LLM returning unsafe content. That is a model and prompt issue, not a Weft vulnerability.
 - Bugs that require the attacker to already have admin access to your system.
 - Missing security headers on the marketing site.
+
+## ExecPython trust model (important for self-hosters)
+
+ExecPython has two execution backends, selected at runtime by `DEPLOYMENT_MODE`:
+
+- `DEPLOYMENT_MODE=cloud`: user code is submitted to a managed remote sandbox provider over HTTPS. The node-runner pod itself never executes user Python.
+- Anything else (the default for local development): user code runs as a `python3` subprocess of the node-runner process, with the same privileges and filesystem view. There is no sandbox.
+
+If you are running Weft as a multi-tenant service, you MUST set `DEPLOYMENT_MODE=cloud` (and provide the matching provider credentials). Running untrusted code without this flag is equivalent to letting your users run arbitrary shell commands on your host.
 
 ## Scope
 

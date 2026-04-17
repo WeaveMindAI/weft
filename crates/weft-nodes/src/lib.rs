@@ -20,9 +20,6 @@ pub mod infra_helpers;
 // Built-in nodes (compiler-internal, not in catalog)
 pub mod passthrough;
 
-// Sandbox execution for untrusted code
-pub mod sandbox;
-
 // Post-compilation enrichment
 pub mod enrich;
 

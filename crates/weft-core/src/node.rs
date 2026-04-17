@@ -33,46 +33,6 @@ pub struct InfrastructureSpec {
     pub actionEndpoint: ActionEndpoint,
 }
 
-/// Sandbox specification for nodes that execute untrusted code.
-/// Declares what the sandbox environment needs (system packages, resource limits, network).
-/// The runner infrastructure handles the actual isolation (nsjail on Linux, direct on dev).
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export)]
-pub struct SandboxSpec {
-    /// System packages required inside the sandbox (e.g., ["ffmpeg", "imagemagick"]).
-    /// These must be pre-installed in the Docker image. Validated at startup.
-    #[serde(default)]
-    pub system_packages: Vec<String>,
-    /// Max CPU time in seconds
-    #[serde(default = "default_cpu_limit")]
-    pub cpu_limit_secs: u32,
-    /// Max memory in MB
-    #[serde(default = "default_memory_limit")]
-    pub memory_limit_mb: u32,
-    /// Max wall-clock execution time in seconds
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u32,
-    /// Allow outbound network access (internal IPs are always blocked)
-    #[serde(default)]
-    pub allow_network: bool,
-}
-
-fn default_cpu_limit() -> u32 { 30 }
-fn default_memory_limit() -> u32 { 512 }
-fn default_timeout() -> u32 { 60 }
-
-impl Default for SandboxSpec {
-    fn default() -> Self {
-        Self {
-            system_packages: Vec::new(),
-            cpu_limit_secs: default_cpu_limit(),
-            memory_limit_mb: default_memory_limit(),
-            timeout_secs: default_timeout(),
-            allow_network: false,
-        }
-    }
-}
-
 /// Category of trigger - determines how the trigger operates
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
@@ -144,10 +104,6 @@ pub struct NodeFeatures {
     /// e.g. [["text", "media"]] = at least one of text/media must be non-null.
     #[serde(default)]
     pub oneOfRequired: Vec<Vec<String>>,
-    /// Sandbox specification for nodes that execute untrusted code.
-    /// When set, the runner uses nsjail to isolate execution.
-    #[serde(default)]
-    pub sandboxSpec: Option<SandboxSpec>,
 }
 
 fn default_requires_running_instance() -> bool {
@@ -167,7 +123,6 @@ impl Default for NodeFeatures {
             hasLiveData: false,
             hasFormSchema: false,
             oneOfRequired: Vec::new(),
-            sandboxSpec: None,
         }
     }
 }
