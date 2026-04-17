@@ -28,6 +28,7 @@ impl Node for LlmConfigNode {
             },
             fields: vec![
                 FieldDef::api_key("apiKey", "openrouter"),
+                FieldDef::api_key("minimaxApiKey", "minimax"),
                 FieldDef::text("model"),
                 FieldDef::textarea("systemPrompt"),
                 FieldDef::number("maxTokens"),

@@ -684,6 +684,7 @@ impl ExecutionContext {
                 "elevenlabs" => "ELEVENLABS_API_KEY",
                 "tavily" => "TAVILY_API_KEY",
                 "apollo" => "APOLLO_API_KEY",
+                "minimax" => "MINIMAX_API_KEY",
                 _ => {
                     tracing::error!("Unknown api_key provider: {}", provider);
                     return None;
@@ -879,6 +880,11 @@ impl ExecutionContext {
 
         let generator = match provider {
             "openrouter" => minillmlib::GeneratorInfo::openrouter(model).with_api_key(&resolved.key),
+            "minimax" => {
+                let base_url = std::env::var("MINIMAX_BASE_URL")
+                    .unwrap_or_else(|_| "https://api.minimax.io/v1".to_string());
+                minillmlib::GeneratorInfo::new("MiniMax", base_url, model).with_api_key(&resolved.key)
+            },
             _ => return Err(format!("Unknown provider: {}", provider)),
         };
 
@@ -1081,25 +1087,29 @@ impl NodeEntry {
 inventory::collect!(NodeEntry);
 
 /// Macro to simplify node registration
-/// 
+///
 /// Usage:
 /// ```ignore
 /// pub struct LlmNode;
-/// 
+///
 /// #[async_trait]
 /// impl Node for LlmNode {
 ///     // ... implementation
 /// }
-/// 
+///
 /// register_node!(LlmNode);
 /// ```
 #[macro_export]
 macro_rules! register_node {
     ($nodeType:ident) => {
         static __NODE_INSTANCE: $nodeType = $nodeType;
-        
+
         inventory::submit! {
             $crate::node::NodeEntry::new(&__NODE_INSTANCE)
         }
     };
 }
+
+#[cfg(test)]
+#[path = "tests/minimax_tests.rs"]
+mod minimax_tests;
