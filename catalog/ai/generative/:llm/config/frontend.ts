@@ -12,7 +12,8 @@ export const LlmConfigNode: NodeTemplate = {
 	category: 'AI',
 	tags: ['config', 'ai', 'settings', 'model'],
 	fields: [
-		{ key: 'apiKey', label: 'API Key', type: 'api_key', provider: 'openrouter' },
+		{ key: 'apiKey', label: 'OpenRouter API Key', type: 'api_key', provider: 'openrouter' },
+		{ key: 'minimaxApiKey', label: 'MiniMax API Key', type: 'api_key', provider: 'minimax', description: 'Required for MiniMax-M2.7 and MiniMax-M2.7-highspeed models' },
 		{ key: 'model', label: 'Model', type: 'text', placeholder: 'anthropic/claude-3.5-sonnet' },
 		{ key: 'systemPrompt', label: 'System Prompt', type: 'textarea', placeholder: 'You are a helpful assistant.' },
 		{ key: 'maxTokens', label: 'Max Tokens', type: 'number', placeholder: '4096' },

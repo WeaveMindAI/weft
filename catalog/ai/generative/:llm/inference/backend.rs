@@ -107,13 +107,36 @@ impl Node for LlmNode {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let completion_ctx = match ctx.tracked_ai_context("openrouter", model, llm_config.as_ref()).await {
-            Ok(c) => c,
-            Err(e) => return NodeResult::failed(&e),
+        // Route MiniMax models directly to the MiniMax API (OpenAI-compatible endpoint).
+        // Other models go through OpenRouter.
+        let is_minimax = model.starts_with("MiniMax-");
+        let completion_ctx = if is_minimax {
+            // MiniMax temperature must be in (0.0, 1.0] — reject 0 early.
+            if let Some(t) = temperature {
+                if t <= 0.0 {
+                    return NodeResult::failed("MiniMax requires temperature > 0 (range: 0.0–1.0 exclusive). Set temperature to a value between 0.01 and 1.0.");
+                }
+            }
+            // Build a synthetic config with `apiKey` mapped from `minimaxApiKey`
+            // so tracked_ai_context can resolve the key using standard logic.
+            let mut minimax_config = serde_json::Map::new();
+            if let Some(key_val) = config_source.get("minimaxApiKey") {
+                minimax_config.insert("apiKey".to_string(), key_val.clone());
+            }
+            let minimax_cfg = serde_json::Value::Object(minimax_config);
+            match ctx.tracked_ai_context("minimax", model, Some(&minimax_cfg)).await {
+                Ok(c) => c,
+                Err(e) => return NodeResult::failed(&e),
+            }
+        } else {
+            match ctx.tracked_ai_context("openrouter", model, llm_config.as_ref()).await {
+                Ok(c) => c,
+                Err(e) => return NodeResult::failed(&e),
+            }
         };
 
-        tracing::info!("LLM request: model={}, prompt_len={}, parse_json={}, reasoning={}",
-            model, prompt.len(), parse_json, reasoning_enabled);
+        tracing::info!("LLM request: model={}, provider={}, prompt_len={}, parse_json={}, reasoning={}",
+            model, if is_minimax { "minimax" } else { "openrouter" }, prompt.len(), parse_json, reasoning_enabled);
 
         let root = ChatNode::root(system_prompt);
         let user_node = root.add_user(prompt);
