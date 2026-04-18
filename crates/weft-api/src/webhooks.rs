@@ -23,6 +23,10 @@ pub struct WebhookResponse {
     pub message: String,
 }
 
+fn webhook_trigger_is_active(status: &str) -> bool {
+    status == "running"
+}
+
 /// Handle incoming webhook calls
 /// URL format: /api/v1/webhooks/{trigger_id}
 /// 
@@ -64,6 +68,21 @@ pub async fn handle_webhook(
             );
         }
     };
+
+    if !webhook_trigger_is_active(&trigger.status) {
+        tracing::info!(
+            "Ignoring webhook for inactive trigger {} with status {}",
+            trigger_id,
+            trigger.status
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(WebhookResponse {
+                status: "ignored".to_string(),
+                message: "Trigger is inactive".to_string(),
+            }),
+        );
+    }
 
     // Verify trigger category is Webhook
     if trigger.triggerCategory != "Webhook" {
@@ -328,4 +347,18 @@ fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::webhook_trigger_is_active;
+
+    #[test]
+    fn webhook_only_runs_for_running_triggers() {
+        assert!(webhook_trigger_is_active("running"));
+        assert!(!webhook_trigger_is_active("pending"));
+        assert!(!webhook_trigger_is_active("setup_pending"));
+        assert!(!webhook_trigger_is_active("stopped"));
+        assert!(!webhook_trigger_is_active("failed"));
+    }
 }
