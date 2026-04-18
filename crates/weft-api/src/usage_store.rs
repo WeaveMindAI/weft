@@ -84,7 +84,9 @@ async fn get_user_margin(pool: &PgPool, user_id: &str) -> f64 {
 }
 
 /// Record a service usage event (LLM calls, STT, TTS, etc.).
-/// Computes billed_usd at recording time: cost_usd * margin for platform, 0 for BYOK.
+///
+/// `billed_usd` is: 0 for BYOK, raw `costUsd` for local (out-of-pocket
+/// pass-through, no deduction), `costUsd * margin` for cloud (deducted).
 #[allow(non_snake_case)]
 pub async fn record_service_cost(
     pool: &PgPool,
@@ -99,10 +101,13 @@ pub async fn record_service_cost(
     completionTokens: Option<i32>,
     costUsd: f64,
     isByok: bool,
+    isLocal: bool,
     metadata: Option<&serde_json::Value>,
 ) -> Result<(), sqlx::Error> {
     let billed_usd = if isByok {
         0.0
+    } else if isLocal {
+        costUsd
     } else {
         let margin = get_user_margin(pool, userId).await;
         costUsd * margin
@@ -134,10 +139,10 @@ pub async fn record_service_cost(
     .execute(&mut *tx)
     .await?;
 
-    // Deduct billed amount from user's credit balance (same transaction)
-    if billed_usd > 0.0 {
+    // Deduct from credit balance (cloud only; local has no ledger).
+    if !isLocal && billed_usd > 0.0 {
         let ref_id = executionId.or(projectId).unwrap_or("");
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             WITH updated AS (
                 UPDATE user_credits
@@ -155,6 +160,13 @@ pub async fn record_service_cost(
         .bind(ref_id)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() == 0 {
+            tracing::error!(
+                "record_service_cost: user_credits row missing for user {}; rolling back",
+                userId
+            );
+            return Err(sqlx::Error::RowNotFound);
+        }
     }
 
     tx.commit().await?;
@@ -164,13 +176,14 @@ pub async fn record_service_cost(
 /// Get execution base cost for a user.
 /// Priority: subscription custom_execution_base_cost > tier execution_base_cost > default.
 /// Panics if an enterprise user has no custom_execution_base_cost set.
-async fn get_execution_base_cost(pool: &PgPool, user_id: &str) -> f64 {
+/// Takes `&mut PgConnection` so the caller can keep this inside its tx.
+async fn get_execution_base_cost(conn: &mut sqlx::PgConnection, user_id: &str) -> f64 {
     // Check subscription custom override first
     let sub: Option<(Option<f64>, String)> = sqlx::query_as(
         "SELECT custom_execution_base_cost, tier FROM subscriptions WHERE user_id = $1 AND status IN ('active', 'trialing')",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .expect(&format!("DB error looking up subscription execution cost for user {}", user_id));
 
@@ -189,7 +202,7 @@ async fn get_execution_base_cost(pool: &PgPool, user_id: &str) -> f64 {
             "SELECT execution_base_cost FROM pricing_tiers WHERE tier = $1",
         )
         .bind(&tier)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .expect(&format!("DB error looking up execution cost for tier {}", tier));
 
@@ -208,7 +221,7 @@ async fn get_execution_base_cost(pool: &PgPool, user_id: &str) -> f64 {
         "#,
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .expect(&format!("DB error looking up user_credits execution cost for user {}", user_id));
 
@@ -226,26 +239,72 @@ async fn get_execution_base_cost(pool: &PgPool, user_id: &str) -> f64 {
     }
 }
 
-/// Record a project execution event.
+pub enum StartExecutionOutcome {
+    Allowed,
+    InsufficientCredits { balance: f64, required: f64 },
+    ProjectNotOwned,
+    /// Catches an attacker pre-inserting a usage_events row so a later real
+    /// start would short-circuit and run free.
+    ExecutionIdConflictWrongUser,
+}
+
+/// Cloud-only: atomic gate + ledger + executions row in one transaction.
+/// Both INSERTs use `ON CONFLICT DO NOTHING`, so retries are safe: a second
+/// call detects the existing usage_events row and skips the deduction.
 #[allow(non_snake_case)]
 pub async fn record_execution(
     pool: &PgPool,
     userId: &str,
     projectId: &str,
     executionId: &str,
-) -> Result<(), sqlx::Error> {
-    // execution_base_cost in pricing_tiers is the final billed price, not a raw cost.
-    // No margin multiplication: the tier already defines what the user pays.
-    let billed_usd = get_execution_base_cost(pool, userId).await;
-    let base_cost = billed_usd;
-
+    triggerId: Option<&str>,
+    nodeType: Option<&str>,
+) -> Result<StartExecutionOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query(
+    // execution_base_cost is the final billed price (no margin). Read inside
+    // the tx so a tier change can't race with the deduction below.
+    let billed_usd = get_execution_base_cost(&mut *tx, userId).await;
+    let base_cost = billed_usd;
+
+    // Project-ownership guard, in case a future caller crafts mismatched
+    // projectId/userId. Cloud-api already checks ownership on /start.
+    let project_owner: Option<(String,)> = sqlx::query_as(
+        "SELECT user_id FROM projects WHERE id = $1::uuid",
+    )
+    .bind(projectId)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match project_owner {
+        Some((owner,)) if owner == userId => {}
+        _ => return Ok(StartExecutionOutcome::ProjectNotOwned),
+    }
+
+    // FOR UPDATE so concurrent starts serialize on the row lock.
+    if billed_usd > 0.0 {
+        let balance: Option<(f64,)> = sqlx::query_as(
+            "SELECT balance_usd FROM user_credits WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(userId)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let current_balance = balance.map(|(b,)| b).unwrap_or(0.0);
+        if current_balance < billed_usd {
+            return Ok(StartExecutionOutcome::InsufficientCredits {
+                balance: current_balance,
+                required: billed_usd,
+            });
+        }
+    }
+
+    // Retry-safe via the partial unique index uniq_usage_events_execution_once.
+    let inserted = sqlx::query(
         r#"
         INSERT INTO usage_events
             (user_id, event_type, project_id, execution_id, cost_usd, billed_usd)
         VALUES ($1, 'execution', $2, $3, $4, $5)
+        ON CONFLICT (execution_id) WHERE event_type = 'execution' DO NOTHING
         "#,
     )
     .bind(userId)
@@ -256,8 +315,55 @@ pub async fn record_execution(
     .execute(&mut *tx)
     .await?;
 
+    if inserted.rows_affected() == 0 {
+        // Verify the existing row's user matches; otherwise an attacker
+        // pre-inserted it to make our retry short-circuit free.
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT user_id FROM usage_events WHERE event_type = 'execution' AND execution_id = $1",
+        )
+        .bind(executionId)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match existing {
+            Some((existing_user,)) if existing_user == userId => {
+                tx.commit().await?;
+                return Ok(StartExecutionOutcome::Allowed);
+            }
+            Some((existing_user,)) => {
+                tracing::error!(
+                    "record_execution: execution_id={} project={} already owned by user={}, but caller is user={}; refusing (possible spoof or ID collision)",
+                    executionId, projectId, existing_user, userId
+                );
+                return Ok(StartExecutionOutcome::ExecutionIdConflictWrongUser);
+            }
+            None => {
+                tracing::error!(
+                    "record_execution: execution_id={} reported as conflict by INSERT but no row found on follow-up SELECT (caller user={} project={}); refusing",
+                    executionId, userId, projectId
+                );
+                return Ok(StartExecutionOutcome::ExecutionIdConflictWrongUser);
+            }
+        }
+    }
+
+    // Executions metadata row (dashboard list). Same tx, idempotent via PK.
+    sqlx::query(
+        r#"
+        INSERT INTO executions (id, project_id, user_id, trigger_id, node_type, status)
+        VALUES ($1, $2::uuid, $3, $4, $5, 'running')
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(executionId)
+    .bind(projectId)
+    .bind(userId)
+    .bind(triggerId)
+    .bind(nodeType)
+    .execute(&mut *tx)
+    .await?;
+
     if billed_usd > 0.0 {
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             WITH updated AS (
                 UPDATE user_credits
@@ -275,10 +381,17 @@ pub async fn record_execution(
         .bind(executionId)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() == 0 {
+            tracing::error!(
+                "record_execution: user_credits row missing for user {} (execution {}); rolling back",
+                userId, executionId
+            );
+            return Err(sqlx::Error::RowNotFound);
+        }
     }
 
     tx.commit().await?;
-    Ok(())
+    Ok(StartExecutionOutcome::Allowed)
 }
 
 /// Record a daily infrastructure cost snapshot.
@@ -341,7 +454,7 @@ pub async fn record_infra_daily(
     // Only deduct if the event was actually inserted (not a duplicate)
     if result.rows_affected() > 0 && billed_usd > 0.0 {
         let ref_id = format!("infra:{}:{}", namespace, snapshot_date);
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             WITH updated AS (
                 UPDATE user_credits
@@ -359,6 +472,13 @@ pub async fn record_infra_daily(
         .bind(&ref_id)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() == 0 {
+            tracing::error!(
+                "record_infra_daily: user_credits row missing for user {} (infra:{}:{}); rolling back",
+                userId, namespace, snapshot_date
+            );
+            return Err(sqlx::Error::RowNotFound);
+        }
     }
 
     tx.commit().await?;

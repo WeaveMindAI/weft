@@ -631,22 +631,6 @@ export async function initExecutionsTable(): Promise<void> {
 	}
 }
 
-export async function createExecution(
-	id: string,
-	projectId: string,
-	userId: string,
-	triggerId?: string,
-	nodeType?: string
-): Promise<DbExecution> {
-	const result = await pool.query<DbExecution>(
-		`INSERT INTO executions (id, project_id, user_id, trigger_id, node_type, status)
-		 VALUES ($1, $2, $3, $4, $5, 'running')
-		 RETURNING ${EXECUTION_SELECT}`,
-		[id, projectId, userId, triggerId || null, nodeType || null]
-	);
-	return result.rows[0];
-}
-
 export async function updateExecution(
 	id: string,
 	userId: string,
@@ -708,23 +692,6 @@ export async function getExecution(id: string, userId: string): Promise<DbExecut
 		[id, userId]
 	);
 	return result.rows[0] || null;
-}
-
-export async function recordUsageEvent(
-	userId: string,
-	eventType: string,
-	projectId?: string,
-	executionId?: string,
-): Promise<void> {
-	try {
-		await pool.query(
-			`INSERT INTO usage_events (user_id, event_type, project_id, execution_id)
-			 VALUES ($1, $2, $3, $4)`,
-			[userId, eventType, projectId || null, executionId || null]
-		);
-	} catch (e) {
-		console.warn('Failed to record usage event:', e);
-	}
 }
 
 export async function listExecutions(

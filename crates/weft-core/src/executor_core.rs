@@ -30,6 +30,13 @@ pub struct ProjectExecutionRequest {
     pub weftCode: Option<String>,
     #[serde(default)]
     pub testMode: bool,
+    /// Optional metadata for the executions row: which trigger fired this run.
+    /// Internal callers (webhook handler, trigger poll, publish) set these.
+    /// Dashboard manual runs leave them None.
+    #[serde(default)]
+    pub triggerId: Option<String>,
+    #[serde(default)]
+    pub nodeType: Option<String>,
     /// Mock overrides from test configs. Keys are node/group IDs,
     /// values are objects mapping output port names to mock values.
     /// When a node ID appears here, the executor skips real execution

@@ -998,11 +998,8 @@ pub async fn publish_execute(
     headers: HeaderMap,
     Json(req): Json<PublishExecuteRequest>,
 ) -> impl IntoResponse {
-    // Internal-API-key check. This endpoint is the trust boundary between
-    // cloud-api and weft-api for visitor runs, so any misconfig that
-    // would let this through unauthenticated is a critical failure.
-    // Startup fails-closed if the key is missing in non-local mode.
-    let configured = std::env::var("INTERNAL_API_KEY").unwrap_or_default();
+    // Trust boundary between cloud-api and weft-api for visitor runs.
+    let configured = state.internal_api_key.as_bytes();
     let deployment_mode = std::env::var("DEPLOYMENT_MODE").unwrap_or_else(|_| "cloud".to_string());
     if configured.is_empty() {
         if deployment_mode != "local" {
@@ -1010,11 +1007,13 @@ pub async fn publish_execute(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Server misconfiguration" }))).into_response();
         }
     } else {
+        use subtle::ConstantTimeEq;
         let provided = headers
             .get("x-internal-api-key")
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
-        if provided != configured {
+        let eq: bool = provided.as_bytes().ct_eq(configured).into();
+        if !eq {
             tracing::warn!("publish_execute: invalid x-internal-api-key");
             return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Unauthorized" }))).into_response();
         }
@@ -1028,13 +1027,15 @@ pub async fn publish_execute(
     #[derive(sqlx::FromRow)]
     struct Row {
         user_id: String,
+        // Real project_id for the ownership guard in record_execution.
+        project_id: Option<sqlx::types::Uuid>,
         is_live: bool,
         weft_code: Option<String>,
         visitor_access: Option<serde_json::Value>,
     }
     let row: Option<Row> = match sqlx::query_as(
         r#"
-        SELECT pp.user_id, pp.is_live, pr.weft_code, pr.visitor_access
+        SELECT pp.user_id, pp.project_id, pp.is_live, pr.weft_code, pr.visitor_access
         FROM published_projects pp
         LEFT JOIN projects pr ON pr.id = pp.project_id
         WHERE pp.username = $1 AND pp.slug = $2
@@ -1063,11 +1064,18 @@ pub async fn publish_execute(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Deployment is missing code" }))).into_response();
     };
     let owner = row.user_id;
+    let Some(deployment_project_id) = row.project_id else {
+        tracing::error!(
+            "publish_execute: deployment ({}, {}) has no project_id mapping",
+            req.username, req.slug
+        );
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Deployment is missing project mapping" }))).into_response();
+    };
 
     // Compile the live weft code into a ProjectDefinition. Visitors then
     // splice allowlist-filtered field values into the parsed project's
     // node configs before we hand it to the executor.
-    let mut project = match weft_core::weft_compiler::compile(&weft_code) {
+    let mut project = match weft_core::weft_compiler::compile(&weft_code, deployment_project_id) {
         Ok(p) => p,
         Err(errs) => {
             tracing::error!("publish_execute: weft compile failed for ({}, {}): {:?}", req.username, req.slug, errs);
@@ -1149,6 +1157,8 @@ pub async fn publish_execute(
         isTriggerSetup: false,
         weftCode: Some(weft_code.clone()),
         testMode: false,
+        triggerId: None,
+        nodeType: None,
         mocks: None,
     };
 

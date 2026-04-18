@@ -17,7 +17,7 @@ llm = Llm {
 
 llm.config = config.value
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     assert_eq!(result.name, "Test");
     assert_eq!(result.description, Some("A test project".to_string()));
     assert_eq!(result.nodes.len(), 2);
@@ -36,7 +36,7 @@ fn test_bare_node() {
 # Project: Bare
 node = Debug
 "#;
-    let result = compile(source).expect("should compile bare node");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile bare node");
     assert_eq!(result.nodes.len(), 1);
     assert_eq!(result.nodes[0].id, "node");
     assert_eq!(result.nodes[0].nodeType.0, "Debug");
@@ -56,7 +56,7 @@ worker = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile node with ports");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile node with ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 2);
     assert_eq!(node.inputs[0].name, "data");
@@ -75,7 +75,7 @@ fn test_node_with_ports_no_config() {
 # Project: PortsNoConfig
 pass = ExecPython(data: String) -> (result: String)
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 1);
     assert_eq!(node.outputs.len(), 1);
@@ -90,7 +90,7 @@ gen = ExecPython() -> (result: String) {
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile node with empty inputs");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile node with empty inputs");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 0);
     assert_eq!(node.outputs.len(), 1);
@@ -119,7 +119,7 @@ preprocessor.raw = input.value
 output = Debug {}
 output.data = preprocessor.result
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     // input, preprocessor__in, preprocessor__out, preprocessor.clean, output = 5
     assert_eq!(result.nodes.len(), 5);
 
@@ -165,7 +165,7 @@ outer = Group(data: String) -> (result: String) {
     self.result = inner.y
 }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     // outer__in + outer__out + outer.inner__in + outer.inner__out + outer.inner.proc = 5
     assert_eq!(result.nodes.len(), 5);
 
@@ -184,7 +184,7 @@ fn test_self_reserved() {
 # Project: Reserved
 self = Debug {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "'self' should be a reserved word");
 }
 
@@ -197,7 +197,7 @@ a = Text { value: "hi" }
 b = Debug {}
 b.data = a.value
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let edge = &result.edges[0];
     assert_eq!(edge.target, "b");
     assert_eq!(edge.targetHandle.as_deref(), Some("data"));
@@ -215,7 +215,7 @@ grp = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     // self.data on right = group input = grp__in
     let edge_in = result.edges.iter().find(|e| e.source == "grp__in").expect("self input edge");
     assert_eq!(edge_in.target, "grp.worker");
@@ -241,7 +241,7 @@ print(\"line2\")
     ```
 }
 ";
-    let result = compile(source).expect("should compile triple backtick");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile triple backtick");
     let node = result.nodes.iter().find(|n| n.id == "node").unwrap();
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.contains("print(\"line1\")"));
@@ -256,7 +256,7 @@ node = ExecPython {
     code: ```print(\"hello\")```
 }
 ";
-    let result = compile(source).expect("should compile inline backtick");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile inline backtick");
     let node = result.nodes.iter().find(|n| n.id == "node").unwrap();
     assert_eq!(node.config.get("code").unwrap().as_str().unwrap(), "print(\"hello\")");
 }
@@ -269,7 +269,7 @@ node = ExecPython {
     code: ```return {\"result\": f\"{name} ({email})\"}```
 }
 ";
-    let result = compile(source).expect("should compile inline backtick with braces");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile inline backtick with braces");
     let node = result.nodes.iter().find(|n| n.id == "node").unwrap();
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.contains("return"), "code should contain return: got {:?}", code);
@@ -290,7 +290,7 @@ node = ExecPython(
     items: List[List[String]]
 ) {}
 "#;
-    let result = compile(source).expect("should compile typed ports");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile typed ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].portType, WeftType::Primitive(WeftPrimitive::Image));
     assert_eq!(node.inputs[1].portType, WeftType::Primitive(WeftPrimitive::String));
@@ -314,7 +314,7 @@ batch = Group(items: List[String]) -> (results: List[String]) {
     self.results = worker.response
 }
 "#;
-    let result = compile(source).expect("should compile group ports");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile group ports");
     let pt_in = result.nodes.iter().find(|n| n.id == "batch__in").unwrap();
     // All lane modes are Single after compilation (inference happens in enrichment)
     assert_eq!(pt_in.inputs[0].laneMode, LaneMode::Single);
@@ -340,7 +340,7 @@ resolver = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile @require_one_of");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile @require_one_of");
     let node = &result.nodes[0];
     assert_eq!(node.features.oneOfRequired.len(), 1);
     assert_eq!(node.features.oneOfRequired[0], vec!["text", "audio"]);
@@ -358,7 +358,7 @@ node = HttpRequest {
     mocked: true
 }
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "mock/mocked should be rejected as compile errors");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("'mock' is not a valid config key")));
@@ -380,7 +380,7 @@ grp = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source).expect("should compile with group description");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile with group description");
     assert_eq!(result.nodes.len(), 3); // grp__in, grp__out, grp.worker
 }
 
@@ -394,7 +394,7 @@ node = ExecPython(
     result: T
 ) {}
 "#;
-    let result = compile(source).expect("should compile TypeVar ports");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile TypeVar ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].portType, WeftType::TypeVar("T".to_string()));
     assert_eq!(node.outputs[0].portType, WeftType::TypeVar("T".to_string()));
@@ -406,7 +406,7 @@ fn test_must_override_port() {
 # Project: MustOverride
 node = ExecPython(data) -> (result) {}
 "#;
-    let result = compile(source).expect("should compile MustOverride ports");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile MustOverride ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].portType, WeftType::MustOverride);
     assert_eq!(node.outputs[0].portType, WeftType::MustOverride);
@@ -450,7 +450,7 @@ level1.data = input_text.value
 output = Debug {}
 output.data = level1.result
 "#;
-    let result = compile(source).expect("should compile triple nested");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile triple nested");
 
     // The critical edge: input_text -> level1__in must exist
     let has_input_to_l1 = result.edges.iter().any(|e| {
@@ -494,7 +494,7 @@ group_b = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source).expect("should compile scoped names");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile scoped names");
     let a_worker = result.nodes.iter().find(|n| n.id == "group_a.worker").unwrap();
     let b_worker = result.nodes.iter().find(|n| n.id == "group_b.worker").unwrap();
     assert_eq!(a_worker.config.get("template").unwrap().as_str().unwrap(), "A");
@@ -528,7 +528,7 @@ return {\"output\": \"hello\"}
   self.result = inner_node.output
 }
 ";
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     if let Err(ref errors) = result {
         for e in errors { eprintln!("COMPILE ERROR: {}", e); }
     }
@@ -558,7 +558,7 @@ node = ExecPython(
     d: Dict[String, Dict[String, List[String] | Number] | String]
 ) {}
 "#;
-    let result = compile(source).expect("should compile complex types");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile complex types");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 3);
     assert_eq!(node.outputs.len(), 1);
@@ -575,7 +575,7 @@ fn test_media_type_alias() {
 # Project: Media
 node = ExecPython(input: Media) -> (result: String) {}
 "#;
-    let result = compile(source).expect("should compile Media alias");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile Media alias");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].portType, WeftType::media());
 }
@@ -590,7 +590,7 @@ node = HttpRequest {
     mock: {broken json
 }
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "mock should be rejected as compile error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("'mock' is not a valid config key")));
@@ -602,7 +602,7 @@ fn test_reject_invalid_type() {
 # Project: BadType
 node = ExecPython(data: Foo) -> (result: String) {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Unknown type 'Foo' should produce an error");
 }
 
@@ -612,7 +612,7 @@ fn test_reject_any_type() {
 # Project: NoAny
 node = ExecPython(data: Any) -> (result: String) {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "'Any' is not a valid type");
 }
 
@@ -622,7 +622,7 @@ fn test_group_with_no_body() {
 # Project: EmptyGroup
 grp = Group(data: String) -> (result: String)
 "#;
-    let result = compile(source).expect("should compile group with no body");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile group with no body");
     // Should still create passthrough nodes
     let pt_in = result.nodes.iter().find(|n| n.id == "grp__in");
     assert!(pt_in.is_some());
@@ -638,7 +638,7 @@ c = Debug {}
 b.prompt = a.value
 c.data = b.response
 "#;
-    let result = compile(source).expect("should compile multiple connections");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile multiple connections");
     assert_eq!(result.edges.len(), 2);
 }
 
@@ -670,7 +670,7 @@ grp = Group(
   self.metadata = pack_node.out
 }
 ";
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     if let Err(ref errors) = result {
         for e in errors { eprintln!("ERR: {}", e); }
     }
@@ -696,7 +696,7 @@ review = HumanQuery {
   }]
 }
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     if let Err(ref errors) = result {
         for e in errors { eprintln!("ERR: {}", e); }
     }
@@ -720,7 +720,7 @@ node = Llm {
     score: Number?
 )
 "#;
-    let result = compile(source).expect("should compile post-config output ports");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile post-config output ports");
     let node = &result.nodes[0];
     assert_eq!(node.outputs.len(), 2);
     assert_eq!(node.outputs[0].name, "summary");
@@ -739,7 +739,7 @@ node = Llm {
 
 -> (result: String)
 "#;
-    let result = compile(source).expect("should compile post-config with blank lines before ->");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile post-config with blank lines before ->");
     let node = &result.nodes[0];
     assert_eq!(node.outputs.len(), 1);
     assert_eq!(node.outputs[0].name, "result");
@@ -757,7 +757,7 @@ node = Llm {
     score: Number?
 )
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let node = &result.nodes[0];
     assert_eq!(node.outputs.len(), 3);
     assert_eq!(node.outputs[0].name, "summary");
@@ -773,7 +773,7 @@ node = ExecPython() -> (result: String) {
     code: "return {}"
 } -> (result: Number)
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Duplicate output port 'result' should produce error");
 }
 
@@ -785,7 +785,7 @@ node = ExecPython(data: String) -> (result: String) {
     code: "return {}"
 } -> (extra: Number)
 "#;
-    let result = compile(source).expect("should compile combined pre + post outputs");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile combined pre + post outputs");
     let node = &result.nodes[0];
     assert_eq!(node.outputs.len(), 2);
     assert!(node.outputs.iter().any(|p| p.name == "result"));
@@ -804,7 +804,7 @@ test = Group {
   inner = Debug { label: "X" }
 } -> (testing: String)
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     if let Err(ref errors) = result {
         for e in errors { eprintln!("ERR: {}", e); }
     }
@@ -824,7 +824,7 @@ node = ExecPython -> (response: String) {
     parseJson: true
 } -> (summary: String, score: Number)
 "#;
-    let result = compile(source).expect("should compile merged pre+post config outputs");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile merged pre+post config outputs");
     let node = &result.nodes[0];
     assert_eq!(node.outputs.len(), 3, "should have 3 outputs: response + summary + score");
     assert!(node.outputs.iter().any(|p| p.name == "response"), "should have response");
@@ -840,7 +840,7 @@ fn test_output_only_no_inputs_no_config() {
 # Project: OutputOnly
 node = ExecPython -> (result: String)
 "#;
-    let result = compile(source).expect("should compile output-only declaration");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile output-only declaration");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 0);
     assert_eq!(node.outputs.len(), 1);
@@ -858,7 +858,7 @@ node = ExecPython {
     disabled: false
 }
 "#;
-    let result = compile(source).expect("should compile booleans");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile booleans");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("enabled").unwrap(), &serde_json::json!(true));
     assert_eq!(node.config.get("disabled").unwrap(), &serde_json::json!(false));
@@ -874,7 +874,7 @@ node = ExecPython {
     negative: -10
 }
 "#;
-    let result = compile(source).expect("should compile numbers");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile numbers");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("count").unwrap(), &serde_json::json!(42));
     assert_eq!(node.config.get("rate").unwrap(), &serde_json::json!(0.75));
@@ -889,7 +889,7 @@ node = ExecPython {
     prompt: "line1\nline2\ttab"
 }
 "#;
-    let result = compile(source).expect("should compile escaped strings");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile escaped strings");
     let node = &result.nodes[0];
     let prompt = node.config.get("prompt").unwrap().as_str().unwrap();
     assert!(prompt.contains('\n'));
@@ -904,7 +904,7 @@ node = ExecPython {
     items: ["a", "b", "c"]
 }
 "#;
-    let result = compile(source).expect("should compile inline JSON array");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile inline JSON array");
     let node = &result.nodes[0];
     let items = node.config.get("items").unwrap();
     assert!(items.is_array());
@@ -919,7 +919,7 @@ node = ExecPython {
     headers: {"Authorization": "Bearer token", "Content-Type": "application/json"}
 }
 "#;
-    let result = compile(source).expect("should compile inline JSON object");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile inline JSON object");
     let node = &result.nodes[0];
     let headers = node.config.get("headers").unwrap();
     assert!(headers.is_object());
@@ -934,7 +934,7 @@ node = ExecPython {
     mode: streaming
 }
 "#;
-    let result = compile(source).expect("should compile bare string");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile bare string");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("mode").unwrap().as_str().unwrap(), "streaming");
 }
@@ -947,7 +947,7 @@ node = ExecPython {
     prefix: ""
 }
 "#;
-    let result = compile(source).expect("should compile empty string");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile empty string");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("prefix").unwrap().as_str().unwrap(), "");
 }
@@ -963,7 +963,7 @@ node = ExecPython {
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let node = &result.nodes[0];
     assert_eq!(node.label.as_deref(), Some("My Worker Node"));
 }
@@ -977,7 +977,7 @@ node = ExecPython {
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile unquoted label");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile unquoted label");
     let node = &result.nodes[0];
     assert_eq!(node.label.as_deref(), Some("Worker"));
 }
@@ -991,7 +991,7 @@ node = ExecPython {
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile escaped label");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile escaped label");
     let node = &result.nodes[0];
     assert_eq!(node.label.as_deref(), Some("Has \"quotes\" inside"));
 }
@@ -1002,7 +1002,7 @@ fn test_label_in_oneliner() {
 # Project: LabelOneLiner
 node = ExecPython { label: "Quick", code: "return {}" }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let node = &result.nodes[0];
     assert_eq!(node.label.as_deref(), Some("Quick"));
     assert!(node.config.get("code").is_some());
@@ -1017,7 +1017,7 @@ fn test_error_unclosed_config_block() {
 node = ExecPython {
     code: "return {}"
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Unclosed config block should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Unclosed config block")));
@@ -1030,7 +1030,7 @@ fn test_error_unclosed_group() {
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "hi" }
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Unclosed group should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Unclosed group")));
@@ -1043,7 +1043,7 @@ fn test_error_duplicate_root_node_id() {
 node = Text { value: "a" }
 node = Text { value: "b" }
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Duplicate node ID should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate node ID")));
@@ -1056,7 +1056,7 @@ fn test_error_duplicate_group_name() {
 grp = Group() -> ()
 grp = Group() -> ()
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Duplicate group name should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate group name")));
@@ -1073,7 +1073,7 @@ grp = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Duplicate node in group should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate node ID")));
@@ -1089,7 +1089,7 @@ node = ExecPython() -> (
     @require_one_of(a, b)
 ) {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "@require_one_of in outputs should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("@require_one_of is only valid in input")));
@@ -1105,7 +1105,7 @@ node = ExecPython(
     @require_one_of(a, b
 ) -> (result: String) {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "@require_one_of missing ) should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("missing closing parenthesis")));
@@ -1117,7 +1117,7 @@ fn test_error_invalid_port_type() {
 # Project: BadPortType
 node = ExecPython(data: Foo) -> (result: String) {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Invalid type 'Foo' should error");
 }
 
@@ -1127,7 +1127,7 @@ fn test_error_duplicate_port_name() {
 # Project: DupPort
 node = ExecPython(data: String, data: Number) -> (result: String) {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Duplicate port name should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate")));
@@ -1139,7 +1139,7 @@ fn test_error_port_name_starts_with_number() {
 # Project: BadPortName
 node = ExecPython(1data: String) -> (result: String) {}
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Port name starting with number should error");
 }
 
@@ -1150,7 +1150,7 @@ fn test_error_unexpected_root_content() {
 node = Text { value: "hi" }
 this is not valid syntax
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Random text should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Unexpected")));
@@ -1166,7 +1166,7 @@ node = ExecPython {
 
 node2 = Text { value: "hi" }
 "#;
-    let result = compile(source);
+    let result = compile(source, uuid::Uuid::new_v4());
     assert!(result.is_err(), "Broken JSON should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Broken JSON") || e.message.contains("Unclosed")));
@@ -1177,7 +1177,7 @@ node2 = Text { value: "hi" }
 #[test]
 fn test_empty_source() {
     let source = "";
-    let result = compile(source).expect("empty project should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("empty project should compile");
     assert_eq!(result.name, "Untitled Project");
     assert_eq!(result.nodes.len(), 0);
 }
@@ -1191,7 +1191,7 @@ fn test_comments_only() {
 # Just comments
 # More comments
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     assert_eq!(result.name, "CommentsOnly");
     assert_eq!(result.nodes.len(), 0);
     assert_eq!(result.edges.len(), 0);
@@ -1202,7 +1202,7 @@ fn test_no_project_name_uses_default() {
     let source = r#"
 node = Text { value: "hi" }
 "#;
-    let result = compile(source).expect("should compile without project name");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile without project name");
     assert_eq!(result.name, "Untitled Project");
 }
 
@@ -1221,7 +1221,7 @@ node = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile multiline sig");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile multiline sig");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 2);
     assert_eq!(node.outputs.len(), 1);
@@ -1236,7 +1236,7 @@ node = ExecPython(data: String)
     code: \"return {}\"
 }
 ";
-    let result = compile(source).expect("should compile arrow on next line");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile arrow on next line");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 1);
     assert_eq!(node.outputs.len(), 1);
@@ -1257,7 +1257,7 @@ node = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile deeply split sig");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile deeply split sig");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 3);
     assert_eq!(node.outputs.len(), 2);
@@ -1278,7 +1278,7 @@ node = ExecPython {
     ```
 }
 ";
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
     // After dedenting, 4 spaces of common indent removed
@@ -1297,7 +1297,7 @@ node = ExecPython {
     ```
 }
 ";
-    let result = compile(source).expect("should compile empty triple backtick");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile empty triple backtick");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.trim().is_empty(), "empty backtick should produce empty string");
@@ -1313,7 +1313,7 @@ print(\"\\`\\`\\`\")
     ```
 }
 ";
-    let result = compile(source).expect("should compile escaped backticks");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile escaped backticks");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.contains("```"), "escaped backticks should become real backticks");
@@ -1327,7 +1327,7 @@ fn test_oneliner_config() {
 # Project: OneLiner
 node = ExecPython { code: "return {}", mode: "fast" }
 "#;
-    let result = compile(source).expect("should compile one-liner config");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile one-liner config");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("code").unwrap().as_str().unwrap(), "return {}");
     assert_eq!(node.config.get("mode").unwrap().as_str().unwrap(), "fast");
@@ -1339,7 +1339,7 @@ fn test_empty_config_block() {
 # Project: EmptyConfig
 node = ExecPython(data: String) -> (result: String) {}
 "#;
-    let result = compile(source).expect("should compile empty config");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile empty config");
     let node = &result.nodes[0];
     assert!(node.config.as_object().unwrap().is_empty());
 }
@@ -1357,7 +1357,7 @@ a = Text { value: "one" }
 
 b = Text { value: "two" }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     assert_eq!(result.nodes.len(), 2);
 }
 
@@ -1369,7 +1369,7 @@ node = ExecPython(data: String) -> (result: String) { # This is a config block
     code: \"return {}\"
 }
 ";
-    let result = compile(source).expect("should compile with comment after {");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile with comment after {");
     let node = &result.nodes[0];
     assert!(node.config.get("code").is_some());
 }
@@ -1389,7 +1389,7 @@ node = ExecPython(
     @require_one_of(url, file)
 ) -> (result: String) {}
 "#;
-    let result = compile(source).expect("should compile multiple @require_one_of");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile multiple @require_one_of");
     let node = &result.nodes[0];
     assert_eq!(node.features.oneOfRequired.len(), 2);
     assert_eq!(node.features.oneOfRequired[0], vec!["text", "audio"]);
@@ -1402,7 +1402,7 @@ fn test_port_underscore_name() {
 # Project: UnderscorePort
 node = ExecPython(_internal: String) -> (_result: String) {}
 "#;
-    let result = compile(source).expect("should compile underscore port names");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile underscore port names");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].name, "_internal");
     assert_eq!(node.outputs[0].name, "_result");
@@ -1414,7 +1414,7 @@ fn test_port_must_override_optional() {
 # Project: MustOverrideOpt
 node = ExecPython(data?, required_data) -> (result) {}
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let node = &result.nodes[0];
     assert!(!node.inputs[0].required, "data? should be optional");
     assert!(node.inputs[1].required, "required_data should be required (default)");
@@ -1429,7 +1429,7 @@ fn test_null_in_union_type() {
 # Project: NullType
 node = ExecPython(data: String | Null) -> (result: String | Null) {}
 "#;
-    let result = compile(source).expect("should compile Null in union");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile Null in union");
     let node = &result.nodes[0];
     // Both should be union types containing Null
     match &node.inputs[0].portType {
@@ -1450,7 +1450,7 @@ a = Text { value: "hi" }
 b = Debug {}
 b.data   =   a.value
 "#;
-    let result = compile(source).expect("should compile connections with whitespace");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile connections with whitespace");
     assert_eq!(result.edges.len(), 1);
     assert_eq!(result.edges[0].target, "b");
     assert_eq!(result.edges[0].source, "a");
@@ -1468,7 +1468,7 @@ target = ExecPython(x: String, y: String) -> (result: String) {
 target.x = src1.value
 target.y = src2.value
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     assert_eq!(result.edges.len(), 2);
 }
 
@@ -1480,7 +1480,7 @@ fn test_group_empty_body() {
 # Project: EmptyBody
 grp = Group(data: String) -> (result: String) {}
 "#;
-    let result = compile(source).expect("should compile empty group body");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile empty group body");
     let pt_in = result.nodes.iter().find(|n| n.id == "grp__in").unwrap();
     let pt_out = result.nodes.iter().find(|n| n.id == "grp__out").unwrap();
     assert_eq!(pt_in.nodeType.0, "Passthrough");
@@ -1495,7 +1495,7 @@ grp = Group(data: String) -> (result: String) {
     self.result = self.data
 }
 "#;
-    let result = compile(source).expect("should compile group with passthrough wiring");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile group with passthrough wiring");
     // Only passthrough nodes, no child nodes
     assert_eq!(result.nodes.len(), 2); // grp__in, grp__out
     // Connection from __in to __out
@@ -1517,7 +1517,7 @@ b = Group(data: String) -> (result: String) {
     self.result = proc.output
 }
 "#;
-    let result = compile(source).expect("should compile: same node ID in different groups is allowed");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile: same node ID in different groups is allowed");
     assert!(result.nodes.iter().any(|n| n.id == "a.proc"));
     assert!(result.nodes.iter().any(|n| n.id == "b.proc"));
 }
@@ -1536,7 +1536,7 @@ node = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source).expect("should compile @require_one_of in config");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile @require_one_of in config");
     let node = &result.nodes[0];
     assert_eq!(node.features.oneOfRequired.len(), 1);
     assert_eq!(node.features.oneOfRequired[0], vec!["a", "b"]);
@@ -1574,7 +1574,7 @@ llm.prompt = processor.clean
 output = Debug {}
 output.data = llm.response
 "#;
-    let result = compile(source).expect("should compile full workflow");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile full workflow");
     assert_eq!(result.name, "Full Workflow");
     assert_eq!(result.description, Some("Small end-to-end test".to_string()));
     // input + processor__in + processor__out + processor.trimmer + llm + output = 6
@@ -1604,7 +1604,7 @@ grp = Group(data: String) -> (summary: String, score: Number) {
     self.score = llm.score
 }
 "#;
-    let result = compile(source).expect("should compile inner node with post-config outputs");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile inner node with post-config outputs");
     let llm = result.nodes.iter().find(|n| n.id == "grp.llm").unwrap();
     assert_eq!(llm.outputs.len(), 2);
     assert!(llm.outputs.iter().any(|p| p.name == "summary"));
@@ -1620,7 +1620,7 @@ fn test_scope_top_level_nodes() {
 a = Text { value: "hello" }
 b = Template { template: "{{data}}" }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     for node in &result.nodes {
         assert!(node.scope.is_empty(), "top-level node '{}' should have empty scope", node.id);
         assert!(node.groupBoundary.is_none(), "top-level node '{}' should not be a boundary", node.id);
@@ -1637,7 +1637,7 @@ grp = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
 
     // __in passthrough: boundary In, scope = [] (parent is top-level)
     let pt_in = result.nodes.iter().find(|n| n.id == "grp__in").unwrap();
@@ -1673,7 +1673,7 @@ outer = Group(data: String) -> (result: String) {
     self.result = inner.result
 }
 "#;
-    let result = compile(source).expect("should compile nested groups");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile nested groups");
 
     // outer__in: scope = [], boundary In for "outer"
     let outer_in = result.nodes.iter().find(|n| n.id == "outer__in").unwrap();
@@ -1720,7 +1720,7 @@ a = Group(x: String) -> (y: String) {
     self.y = b.y
 }
 "#;
-    let result = compile(source).expect("should compile triple nested");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile triple nested");
 
     let node = result.nodes.iter().find(|n| n.id == "a.b.c.node").unwrap();
     assert_eq!(node.scope, vec!["a", "a.b", "a.b.c"]);
@@ -1757,7 +1757,7 @@ outer = Group(data: String) -> (result: String) {
     self.result = inner.result
 }
 "#;
-    let result = compile(source).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
 
     let pre = result.nodes.iter().find(|n| n.id == "outer.pre").unwrap();
     let deep = result.nodes.iter().find(|n| n.id == "outer.inner.deep").unwrap();
@@ -1787,7 +1787,7 @@ draft = LlmInference -> (response: JsonDict) { label: "Draft", parseJson: true }
 out = Debug
 out.data = draft.subject
 "#;
-    let project = compile(src).expect("should compile");
+    let project = compile(src, uuid::Uuid::new_v4()).expect("should compile");
     let draft = project.nodes.iter().find(|n| n.id == "draft").expect("draft node");
     let port_names: Vec<&str> = draft.outputs.iter().map(|p| p.name.as_str()).collect();
     assert!(port_names.contains(&"response"), "missing response port: {:?}", port_names);
@@ -1808,7 +1808,7 @@ draft = LlmInference -> (response: JsonDict) {
 out = Debug
 out.data = draft.subject
 "#;
-    let project = compile(src).expect("should compile");
+    let project = compile(src, uuid::Uuid::new_v4()).expect("should compile");
     let draft = project.nodes.iter().find(|n| n.id == "draft").expect("draft node");
     let port_names: Vec<&str> = draft.outputs.iter().map(|p| p.name.as_str()).collect();
     assert!(port_names.contains(&"response"), "missing response port: {:?}", port_names);
@@ -1826,7 +1826,7 @@ draft = LlmInference -> (response: JsonDict) { label: "Draft Email", parseJson: 
 out = Debug
 out.data = draft.subject
 "#;
-    let project = compile(src).expect("should compile");
+    let project = compile(src, uuid::Uuid::new_v4()).expect("should compile");
 
     let qualify = project.nodes.iter().find(|n| n.id == "qualify").expect("qualify node");
     let q_ports: Vec<&str> = qualify.outputs.iter().map(|p| p.name.as_str()).collect();

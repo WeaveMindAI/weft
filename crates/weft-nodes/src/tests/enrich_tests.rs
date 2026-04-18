@@ -255,7 +255,7 @@ review = HumanQuery {
 }
 review.summary = source.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let review = project.nodes.iter().find(|n| n.id == "review").expect("review node");
@@ -276,7 +276,7 @@ review = HumanQuery {
 }
 review.summary = source.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let review = project.nodes.iter().find(|n| n.id == "review").expect("review node");
@@ -296,7 +296,7 @@ review = HumanQuery {
 }
 review.summary = source.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let review = project.nodes.iter().find(|n| n.id == "review").expect("review node");
@@ -323,7 +323,7 @@ grp = Group(items: List[String | Null]) -> (out: List[String | Null]) {
   self.out = self.items
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let enrich_result = crate::enrich::enrich_project(&mut project, &registry);
     // The enrichment should succeed without type errors about the display port.
@@ -2748,7 +2748,7 @@ review = HumanQuery {
 }
 review.priority_override = priority_options.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
 
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
@@ -2779,7 +2779,7 @@ llm.config = config.config
 out = Debug { label: "Out" }
 out.data = llm.response
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     if let Err(errors) = &result {
@@ -2805,7 +2805,7 @@ worker.data = input.value
 out = Debug { label: "Out" }
 out.data = worker.result
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     if let Err(errors) = &result {
@@ -2838,7 +2838,7 @@ batch.items = articles.value
 out = Debug { label: "Out" }
 out.data = batch.results
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     if let Err(errors) = &result {
@@ -2866,7 +2866,7 @@ review = HumanQuery {
 review.summary = input.value
 review.draft = input.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     if let Err(errors) = &result {
@@ -2895,7 +2895,7 @@ fn integration_unknown_node_type_errors() {
 # Description: Test
 node = FooBarBaz { label: "Bad" }
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(result.is_err(), "unknown node type should error");
@@ -2917,7 +2917,7 @@ tmpl.name = name.value
 out = Debug { label: "Out" }
 out.data = tmpl.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     if let Err(errors) = &result {
@@ -2946,7 +2946,7 @@ gate.value = input.value
 out = Debug { label: "Out" }
 out.data = gate.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     if let Err(errors) = &result {
@@ -2970,7 +2970,7 @@ unpack.in = pack.out
 out = Debug(data: String) { label: "Out" }
 out.data = unpack.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     if let Err(errors) = &result {
@@ -2991,7 +2991,7 @@ llm.config = config.config
 out = Debug { label: "Out" }
 out.data = llm.response
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("should compile");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     // Should have an error about MustOverride on response
@@ -3059,7 +3059,7 @@ writer.prompt = Template {
 
 source = Text { value: "world" }
 "#;
-    let project = weft_core::weft_compiler::compile(source).expect("compile failed");
+    let project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile failed");
     // Expected: the inline Template has been promoted to a named anon node.
     // Naming convention: `{parent_id}__{field_name}`. For `writer.prompt = Template { ... }.text`,
     // the parent is `writer`, field is `prompt`, so the anon id is `writer__prompt`.
@@ -3108,7 +3108,7 @@ per_lead = Group(firstName: String, company: String) -> () {
   }.text
 }
 "#;
-    let project = weft_core::weft_compiler::compile(source).expect("compile failed");
+    let project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile failed");
     // Inside a group, the anon id is `{group_id}.{local_parent}__{field}`.
     // Here: `per_lead.person_search__query`.
     let anon = project.nodes.iter().find(|n| n.id == "per_lead.person_search__query").expect(&format!(
@@ -3146,7 +3146,7 @@ writer.prompt = Template {
   company: source_company.value
 }.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("compile failed");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile failed");
     let registry = &crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "writer__prompt").expect("writer__prompt");
@@ -3175,7 +3175,7 @@ writer.prompt = Template(name: String, company: String) {
   company: source_company.value
 }.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("compile failed");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile failed");
     let registry = &crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "writer__prompt").expect("writer__prompt");
@@ -3199,7 +3199,7 @@ writer.prompt = Template { template: "hi" }.text
 
 writer = Text { value: "oops" }
 "#;
-    let result = weft_core::weft_compiler::compile(source);
+    let result = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4());
     match result {
         Ok(_) => panic!("expected duplicate-id error"),
         Err(errs) => {
@@ -3244,7 +3244,7 @@ writer2 = LlmInference -> (response: String) { label: "2" }
 writer2.prompt = writer1.response
 a = Text { value: "dup" }
 "#;
-    let result = weft_core::weft_compiler::compile(source);
+    let result = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4());
     println!("=== debug_line_map_nested ===");
     match result {
         Ok(p) => {
@@ -3281,7 +3281,7 @@ llm_config = LlmConfig {
   }.text
 }
 "#;
-    let project = weft_core::weft_compiler::compile(source).expect("compile failed");
+    let project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile failed");
     // Expected: two anon nodes, both nested structures carry meaningful IDs.
     // Outer: `llm_config__systemPrompt`
     // Inner: `llm_config__systemPrompt__inner`
@@ -3319,7 +3319,7 @@ fn inline_rejects_post_config_outputs() {
 writer = LlmInference -> (response: String) { label: "Writer" }
 writer.prompt = Template { template: "hi" } -> (out: String).out
 "#;
-    let result = weft_core::weft_compiler::compile(source);
+    let result = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4());
     match result {
         Ok(_) => panic!("expected parse error for post-config outputs in inline"),
         Err(errs) => {
@@ -3336,7 +3336,7 @@ fn inline_rejects_missing_dot_port() {
 writer = LlmInference -> (response: String) { label: "W" }
 writer.prompt = Template { template: "hi" }
 "#;
-    let result = weft_core::weft_compiler::compile(source);
+    let result = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4());
     match result {
         Ok(_) => panic!("expected parse error for missing .port suffix"),
         Err(errs) => {
@@ -3480,7 +3480,7 @@ process_lead.company_name = source.value
 result = Debug { label: "Result" }
 result.data = process_lead.answer
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("compile should succeed");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile should succeed");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter()
@@ -3515,7 +3515,7 @@ process_lead.company_name = source.value
 result = Debug { label: "Result" }
 result.data = process_lead.answer
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("compile should succeed");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile should succeed");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
 
@@ -3554,7 +3554,7 @@ grp.thing = src.value
 out = Debug { label: "out" }
 out.data = grp.out
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("compile should succeed");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile should succeed");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
 
@@ -3599,7 +3599,7 @@ grp.thing = src.value
 out = Debug { label: "out" }
 out.data = grp.out
 "#;
-    let mut project = weft_core::weft_compiler::compile(source).expect("compile should succeed");
+    let mut project = weft_core::weft_compiler::compile(source, uuid::Uuid::new_v4()).expect("compile should succeed");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
 
@@ -3628,7 +3628,7 @@ n = Text { value: "x" }
 
     // Variant 1: no space after colon
     let src1 = "# Project: Test\n\nn = ExecPython -> (result: String) {\n  code:```\nreturn {\"result\": \"x\"}\n```\n}\n";
-    let r1 = weft_core::weft_compiler::compile(src1);
+    let r1 = weft_core::weft_compiler::compile(src1, uuid::Uuid::new_v4());
     assert!(r1.is_ok(), "no-space variant should parse; got: {:?}", r1.err());
     let p1 = r1.unwrap();
     let n1 = p1.nodes.iter().find(|n| n.id == "n").expect("n not found");
@@ -3642,7 +3642,7 @@ n = Text { value: "x" }
 
     // Variant 2: extra whitespace around colon.
     let src2 = "# Project: Test\n\nn = ExecPython -> (result: String) {\n  code  :   ```\nreturn {\"result\": \"x\"}\n```\n}\n";
-    let p2 = weft_core::weft_compiler::compile(src2).expect("extra-ws variant should parse");
+    let p2 = weft_core::weft_compiler::compile(src2, uuid::Uuid::new_v4()).expect("extra-ws variant should parse");
     let n2 = p2.nodes.iter().find(|n| n.id == "n").expect("n not found");
     let code2 = n2.config.get("code").expect("code missing").as_str().expect("string");
     assert!(code2.contains("return"), "expected code body, got: {:?}", code2);
@@ -3660,7 +3660,7 @@ fn multiline_port_list_without_trailing_comma() {
     //     out: String
     //   )
     let src = "# Project: Test\n\nn = ExecPython(\n  a: String\n  b: Number\n) -> (\n  out: String\n) {\n  code: ```\nreturn {\"out\": a}\n```\n}\n";
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     let p = result.expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n not found");
     // Backend: should have 2 input ports a, b
@@ -3680,7 +3680,7 @@ fn legacy_label_after_type_one_liner_is_rejected() {
 
 n = Text "my label" { value: "hi" }
 "#;
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     assert!(result.is_err(), "legacy form should be rejected by the backend");
 }
 
@@ -3698,7 +3698,7 @@ g = Group() -> (x: String?) {
   self.x = n.value
 }
 "#;
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     assert!(result.is_err(), "duplicate group should be rejected");
 }
 
@@ -3714,7 +3714,7 @@ n = Text -> (value: String) {
   value: "hi"
 }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n");
     // value should be "hi"
     assert_eq!(n.config.get("value").and_then(|v| v.as_str()), Some("hi"));
@@ -3739,7 +3739,7 @@ n.x = src.value
 
 src = Text { value: "x" }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n");
     let out_names: Vec<&str> = n.outputs.iter().map(|p| p.name.as_str()).collect();
     assert!(out_names.contains(&"a"), "missing a: {:?}", out_names);
@@ -3761,7 +3761,7 @@ n.x = src.value
 
 src = Text { value: "x" }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n");
     let out_names: Vec<&str> = n.outputs.iter().map(|p| p.name.as_str()).collect();
     assert!(out_names.contains(&"a"), "missing a: {:?}", out_names);
@@ -3782,7 +3782,7 @@ outer = Group() -> (y: String?) {
 
 outer.inner.value = src.value
 "#;
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     // Either side may reject or produce a meaningless edge; we don't
     // care which, as long as it doesn't crash.
     let _ = result;
@@ -3798,7 +3798,7 @@ n = Text(x: String) -> (y: String) { value: "hi" }
 
 n.x = src.value
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n");
     assert_eq!(n.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["x"]);
     assert_eq!(n.outputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["y"]);
@@ -3827,7 +3827,7 @@ n = Text {
   obj_json: {"a": 1, "b": "two"}
 }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n");
     let c = &n.config;
     assert_eq!(c.get("bool_t").and_then(|v| v.as_bool()), Some(true));
@@ -3885,7 +3885,7 @@ return {"r": a or b}
 }
 g.a = src1.value
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     // n1: oneOfRequired should be [["a", "b"]]
     let n1 = p.nodes.iter().find(|n| n.id == "n1").expect("n1");
     assert_eq!(n1.features.oneOfRequired, vec![vec!["a".to_string(), "b".to_string()]],
@@ -3906,7 +3906,7 @@ fn label_with_escaped_quote() {
 
 n = Text { label: "Say \"hello\" there", value: "x" }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n");
     // Backend unescapes \" to "
     assert_eq!(n.label.as_deref(), Some(r#"Say "hello" there"#));
@@ -3921,7 +3921,7 @@ n = Text {
   value: "x"
 }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let n = p.nodes.iter().find(|n| n.id == "n").expect("n");
     assert_eq!(n.label.as_deref(), Some(r#"Say "hello" there"#));
 }
@@ -3940,7 +3940,7 @@ n = Text {
   value: "v"
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("should parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(
@@ -3966,7 +3966,7 @@ fn oneliner_inline_detected_and_anon_created() {
 
 n = Text { label: Template { template: "hi" }.text, value: "v" }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse ok");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse ok");
     let has_anon = project.nodes.iter().any(|nn| nn.id == "n__label");
     assert!(has_anon, "expected n__label anon to be created by the one-liner parser; nodes: {:?}",
         project.nodes.iter().map(|n| &n.id).collect::<Vec<_>>());
@@ -3984,7 +3984,7 @@ fn oneliner_inline_on_non_port_key_rejected_by_enrichment() {
 
 n = Text { label: Template { template: "hi" }.text, value: "v" }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse ok");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse ok");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(result.is_err(), "enrichment should reject; got: {:?}", result);
@@ -4007,7 +4007,7 @@ host = LlmInference {
   prompt: Text.value
 }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let anon = p.nodes.iter().find(|n| n.id == "host__prompt").expect("anon");
     assert_eq!(anon.nodeType.0, "Text");
     // Anon should have empty config (default construction).
@@ -4030,7 +4030,7 @@ host = LlmInference {
 }
 host.prompt = Text.value
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("should parse");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("should parse");
     let anon = p.nodes.iter().find(|n| n.id == "host__prompt").expect("anon");
     assert_eq!(anon.nodeType.0, "Text");
     assert!(anon.config.as_object().map(|o| o.is_empty()).unwrap_or(true));
@@ -4043,7 +4043,7 @@ fn oneliner_bare_inline_creates_anon() {
 
 n = LlmInference { model: "gpt-4", prompt: Text.value }
 "#;
-    let p = weft_core::weft_compiler::compile(src).expect("parse ok");
+    let p = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse ok");
     let anon = p.nodes.iter().find(|n| n.id == "n__prompt").expect("anon");
     assert_eq!(anon.nodeType.0, "Text");
     let edge = p.edges.iter().find(|e| e.source == "n__prompt" && e.target == "n").expect("edge");
@@ -4069,7 +4069,7 @@ grp.text = src.value
 out = Debug { label: "out" }
 out.data = grp.out
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let greeting = project.nodes.iter().find(|n| n.id == "grp.greeting").expect("greeting node");
     assert!(
         greeting.config.get("template").is_none(),
@@ -4094,7 +4094,7 @@ fn port_wiring_in_regular_node_config_cross_node() {
 src = Text { value: "hi {{x}}" }
 greeting = Template { template: src.value }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let greeting = project.nodes.iter().find(|n| n.id == "greeting").expect("greeting");
     assert!(greeting.config.get("template").is_none(), "template should be a wiring, got: {:?}", greeting.config);
     let wired = project.edges.iter().any(|e|
@@ -4116,7 +4116,7 @@ fn port_wiring_in_regular_config_non_port_rejected_by_enrichment() {
 src = Text { value: "hi" }
 greeting = Template { label: src.value, template: "fixed" }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(result.is_err(), "enrichment should reject port wiring on non-port key; got: {:?}", result);
@@ -4138,7 +4138,7 @@ grp = Group(text: String) -> (out: String?) {
 src = Text { value: "hi" }
 grp.text = src.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(
@@ -4166,7 +4166,7 @@ greeting = Template {
 out = Debug { label: "out" }
 out.data = greeting.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(
@@ -4186,7 +4186,7 @@ greeting = Template { label: "bad" }
 out = Debug { label: "out" }
 out.data = greeting.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(
@@ -4205,7 +4205,7 @@ fn connection_line_literal_fills_config() {
 greeting = Template { label: "greeting" }
 greeting.template = "Hello {{name}}"
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let greeting = project.nodes.iter().find(|n| n.id == "greeting").expect("greeting");
     assert_eq!(
         greeting.config.get("template").and_then(|v| v.as_str()),
@@ -4234,7 +4234,7 @@ n.temperature = 0.8
 n.parseJson = true
 n.systemPrompt = "Be concise"
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let n = project.nodes.iter().find(|nn| nn.id == "n").expect("n");
     assert_eq!(n.config.get("temperature").and_then(|v| v.as_f64()), Some(0.8));
     assert_eq!(n.config.get("parseJson").and_then(|v| v.as_bool()), Some(true));
@@ -4250,7 +4250,7 @@ fn connection_line_literal_last_write_wins() {
 n = Template { template: "first" }
 n.template = "second"
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let n = project.nodes.iter().find(|nn| nn.id == "n").expect("n");
     assert_eq!(n.config.get("template").and_then(|v| v.as_str()), Some("second"));
 }
@@ -4267,7 +4267,7 @@ fn connection_line_literal_on_wired_only_port_rejected() {
 llm = LlmInference { model: "gpt-4", prompt: "hi" }
 llm.config = "not a config"
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     assert!(
@@ -4288,7 +4288,7 @@ return {"out": x}
 ```
 n.x = "hi"
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let n = project.nodes.iter().find(|nn| nn.id == "n").expect("n");
     let code = n.config.get("code").and_then(|v| v.as_str()).expect("code config should be set");
     assert!(code.contains("return"), "code should contain 'return'; got: {:?}", code);
@@ -4308,7 +4308,7 @@ n.data = {
   "b": "two"
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let n = project.nodes.iter().find(|nn| nn.id == "n").expect("n");
     let data = n.config.get("data").expect("data missing");
     assert!(data.is_object(), "data should be parsed as JSON object; got: {:?}", data);
@@ -4337,7 +4337,7 @@ return {"out": test}
 ```
 }.out
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     // Anon should exist with the right ports and config.
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("host__data anon missing");
     assert_eq!(anon.nodeType.0, "ExecPython");
@@ -4373,7 +4373,7 @@ host.data = Template {
   }.text
 }.text
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     // Outer anon: host__data (Template)
     let outer = project.nodes.iter().find(|n| n.id == "host__data").expect("outer anon missing");
     assert_eq!(outer.nodeType.0, "Template");
@@ -4408,7 +4408,7 @@ outer = Group() -> (out: String?) {
   self.out = sink.data
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "outer.sink__data").expect("bare anon missing");
     assert_eq!(anon.nodeType.0, "Text");
 }
@@ -4426,7 +4426,7 @@ return {"out": "x"}
 ```
 } -> (out: String).out
 "#;
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     assert!(
         result.is_err(),
         "should reject post-config outputs on inline expression; got: {:?}",
@@ -4458,7 +4458,7 @@ grp = Group(thing: String) -> (out: String?) {
 }
 grp.thing = src.value
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     // The anon is dst__data under grp's scope.
     let anon = project.nodes.iter().find(|n| n.id == "grp.dst__data").expect("anon missing");
     assert_eq!(anon.nodeType.0, "Template");
@@ -4485,7 +4485,7 @@ host.data = Template {
   x: src.value
 }.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("anon missing");
@@ -4506,7 +4506,7 @@ host.data = Template(x: String) {
   x: src.value
 }.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("anon missing");
@@ -4528,7 +4528,7 @@ host.data = Template {
   x: Text.value
 }.text
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     // The outer anon is host__data (Template)
     let outer = project.nodes.iter().find(|n| n.id == "host__data").expect("outer missing");
     assert_eq!(outer.nodeType.0, "Template");
@@ -4566,7 +4566,7 @@ return {"out": test}
   }.out
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("host__data missing");
     assert_eq!(anon.nodeType.0, "ExecPython");
     assert!(anon.inputs.iter().any(|p| p.name == "test"));
@@ -4599,7 +4599,7 @@ host = Debug {
   }.text
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let outer = project.nodes.iter().find(|n| n.id == "host__data").expect("outer missing");
     assert_eq!(outer.nodeType.0, "Template");
     let inner = project.nodes.iter().find(|n| n.id == "host__data__template").expect("inner missing");
@@ -4619,7 +4619,7 @@ host = Debug {
   data: Text.value
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("bare anon missing");
     assert_eq!(anon.nodeType.0, "Text");
 }
@@ -4644,7 +4644,7 @@ grp = Group(thing: String) -> (out: String?) {
 }
 grp.thing = src.value
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "grp.dst__data").expect("anon missing");
     assert_eq!(anon.nodeType.0, "Template");
     let self_wired = project.edges.iter().any(|e|
@@ -4670,7 +4670,7 @@ host.data = Template {
   }.text
 }.text
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     assert!(project.nodes.iter().any(|n| n.id == "host__data"), "L1 missing");
     assert!(project.nodes.iter().any(|n| n.id == "host__data__template"), "L2 missing");
     assert!(project.nodes.iter().any(|n| n.id == "host__data__template__template"), "L3 missing");
@@ -4695,7 +4695,7 @@ return {"out": x}
 ```
 }.out
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("anon missing");
     let code = anon.config.get("code").and_then(|v| v.as_str()).expect("code missing");
     assert!(code.contains("return"), "code should contain return; got: {:?}", code);
@@ -4718,7 +4718,7 @@ return {"out": params}
 ```
 }.out
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("anon missing");
     let params = anon.config.get("params").expect("params missing");
     assert!(params.is_object(), "params should be a JSON object; got: {:?}", params);
@@ -4742,7 +4742,7 @@ host = LlmInference {
 }
 host.systemPrompt = "You are a helpful assistant"
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "host__prompt").expect("prompt anon missing");
     assert_eq!(anon.nodeType.0, "Template");
     let host = project.nodes.iter().find(|n| n.id == "host").expect("host");
@@ -4774,7 +4774,7 @@ host.data = Template {
   }.text
 }.text
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     assert!(project.nodes.iter().any(|n| n.id == "host__data"));
     // Inner anon for the `x` port wiring
     assert!(project.nodes.iter().any(|n| n.id == "host__data__x"));
@@ -4796,7 +4796,7 @@ return {"out": "hi"}
 ```
 }.out
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("anon");
     assert_eq!(anon.nodeType.0, "ExecPython");
     assert!(anon.outputs.iter().any(|p| p.name == "out"));
@@ -4820,7 +4820,7 @@ return {"out": "x"}
   self.out = n.out
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let n = project.nodes.iter().find(|nn| nn.id == "grp.n").expect("n missing");
     let params = n.config.get("params").expect("params missing");
     assert!(params.is_object());
@@ -4844,7 +4844,7 @@ grp = Group(thing: String) -> (out: String?) {
 }
 grp.thing = src.value
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     // Anon id should be self__out within group, merged to grp.self__out
     let anon = project.nodes.iter().find(|n| n.id == "grp.self__out").expect("anon missing");
     assert_eq!(anon.nodeType.0, "Template");
@@ -4874,7 +4874,7 @@ n = ExecPython -> (out: JsonDict) { code: ```
 return {"out": "x"}
 ``` }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let n = project.nodes.iter().find(|nn| nn.id == "n").expect("n missing");
     let code = n.config.get("code").and_then(|v| v.as_str()).expect("code missing");
     assert!(code.contains("return"), "code should contain 'return'; got: {:?}", code);
@@ -4891,7 +4891,7 @@ host.data = Group() -> (out: String?) {
   self.out = n.value
 }.out
 "#;
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     assert!(result.is_err(), "group inlining on RHS should be rejected");
     let errs = result.unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("Group") || e.message.to_lowercase().contains("group")),
@@ -4910,7 +4910,7 @@ host = Debug {
   }.out
 }
 "#;
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     assert!(result.is_err(), "group inlining in config block should be rejected");
 }
 
@@ -4922,7 +4922,7 @@ fn combo_bare_group_inlining_is_rejected() {
 host = Debug { label: "h" }
 host.data = Group.out
 "#;
-    let result = weft_core::weft_compiler::compile(src);
+    let result = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4());
     assert!(result.is_err(), "bare group inlining should be rejected; got: {:?}", result);
 }
 
@@ -4944,7 +4944,7 @@ host.data = Template {
   }.text
 }.text
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     // L1..L4 all exist
     assert!(project.nodes.iter().any(|n| n.id == "host__data"));
     assert!(project.nodes.iter().any(|n| n.id == "host__data__template"));
@@ -4988,7 +4988,7 @@ return {"out": a}
   }.out
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
 
     // Outer anon: host__data (ExecPython)
     let outer = project.nodes.iter().find(|n| n.id == "host__data").expect("host__data missing");
@@ -5052,7 +5052,7 @@ return {"out": a}
   }.out
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("anon");
@@ -5140,7 +5140,7 @@ return {"out": e}
 }
 grp.thing = src.value
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse the maximalist monstrosity");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse the maximalist monstrosity");
 
     // Expected anon ids, level-by-level. root_host__data is the outer
     // ExecPython wired into root_host.data. Each subsequent level is
@@ -5256,7 +5256,7 @@ grp = Group() -> (out: String?) {
   self.out = dst.data
 }
 "#;
-    let project = weft_core::weft_compiler::compile(src).expect("parse");
+    let project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let wired = project.edges.iter().any(|e|
         e.source == "src"
         && e.sourceHandle.as_deref() == Some("value")
@@ -5280,7 +5280,7 @@ upstream = Text { value: "x" }
 n = Text { value: "default" }
 n.value = upstream.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     let errs = result.expect_err("wiring into a catalog config field should fail");
@@ -5299,7 +5299,7 @@ upstream = Text { value: "x" }
 n = Template { template: "hi" }
 n.text = upstream.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     let errs = result.expect_err("wiring into an output port should fail");
@@ -5317,7 +5317,7 @@ fn rule_literal_to_catalog_output_port_is_error() {
 n = Template { template: "hi" }
 n.text = "cannot set output"
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     let errs = result.expect_err("literal to output port should fail");
@@ -5336,7 +5336,7 @@ fn rule_literal_synthesizes_input_port_when_allowed() {
 
 n = Template { template: "Hello {{name}}", name: "world" }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").expect("n");
@@ -5357,7 +5357,7 @@ n = Template {
   meta: { "key": "value" }
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5375,7 +5375,7 @@ fn rule_literal_on_connection_line_synthesizes_port() {
 n = Template { template: "Hello {{name}}" }
 n.name = "world"
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5388,7 +5388,7 @@ fn rule_literal_rejected_on_fixed_port_node() {
 
 n = Text { value: "hi", not_a_field: "oops" }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     let errs = result.expect_err("expected rejection");
@@ -5407,7 +5407,7 @@ fn rule_literal_on_catalog_config_field_is_not_synthesized() {
 
 n = Text { value: "hello world" }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5430,7 +5430,7 @@ n = Template {
   empty: []
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5454,7 +5454,7 @@ n.multi = [
   "c"
 ]
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5468,7 +5468,7 @@ fn rule_heredoc_with_escaped_triple_backtick_inside() {
     // (e.g. a markdown snippet with a code fence) must not be closed early
     // by the parser. `\```` is an escaped literal, not a terminator.
     let src = "# Project: T\n\nn = Template {\n  template: \"hi\"\n  body: ```\nbefore\n\\```\nsome code\n\\```\nafter\n```\n}\n";
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5498,7 +5498,7 @@ n = Template { template: "{{name}} - {{title}}" }
 n.name = src_name.value
 n.title = src_title.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5534,7 +5534,7 @@ review.lead_info = Template {
   company: enrich.organization
 }.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "review__lead_info").expect("review__lead_info");
@@ -5564,7 +5564,7 @@ n = Template {
 }
 n.x = src.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5584,7 +5584,7 @@ src = Text { value: "hi" }
 n = Template(x: String?) { template: "{{x}}" }
 n.x = src.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let n = project.nodes.iter().find(|nn| nn.id == "n").unwrap();
@@ -5605,7 +5605,7 @@ n = LlmInference -> (response: String) {
 }
 n.madeUpPort = src.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     let result = crate::enrich::enrich_project(&mut project, &registry);
     let errs = result.expect_err("expected error: frozen node cannot grow ports via edge");
@@ -5629,7 +5629,7 @@ greeting = Template {
   name: "Alice"
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
 
@@ -5686,7 +5686,7 @@ greeting = Template {
 }
 greeting.name = override_src.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
 
@@ -5737,7 +5737,7 @@ greeting = Template {
   place: "Paris"
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let node = project.nodes.iter().find(|n| n.id == "greeting").expect("greeting");
@@ -5791,7 +5791,7 @@ host.data = Template {
   name: "Alice"
 }.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "host__data").expect("host__data");
@@ -5829,7 +5829,7 @@ outer = Group() -> (out: String?) {
   self.out = inner.res
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let child = project.nodes.iter().find(|n| n.id == "outer.inner.child").expect("outer.inner.child");
@@ -5863,7 +5863,7 @@ n = Template {
   }
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let node = project.nodes.iter().find(|n| n.id == "n").expect("n");
@@ -5908,7 +5908,7 @@ host.data = Template(inner: String) {
   }.text
 }.text
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
 
@@ -5969,7 +5969,7 @@ grp = Group() -> (out: String?) {
   self.out = host.text
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "grp.host__data").expect("grp.host__data");
@@ -5996,7 +5996,7 @@ fn literal_heredoc_in_deep_anon_with_escaped_triple_backtick() {
     //   - scoped propagation through the group body
     //   - runtime config delivery on a no-incoming root anon
     let src = "# Project: T\n\ngrp = Group() -> (out: String?) {\n  host = Template { template: \"W: {{data}}\" }\n  host.data = Template {\n    template: \"doc: {{body}}\"\n    body: ```\nmarkdown:\n\\```\ncode fence\n\\```\nend\n```\n  }.text\n  self.out = host.text\n}\n";
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let anon = project.nodes.iter().find(|n| n.id == "grp.host__data").expect("grp.host__data");
@@ -6023,7 +6023,7 @@ grp = Group() -> (out: String?) {
   self.out = child.text
 }
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let child = project.nodes.iter().find(|n| n.id == "grp.child").expect("grp.child");
@@ -6050,7 +6050,7 @@ n = Template(greeting: String?) {
 }
 n.greeting = override_src.value
 "#;
-    let mut project = weft_core::weft_compiler::compile(src).expect("parse");
+    let mut project = weft_core::weft_compiler::compile(src, uuid::Uuid::new_v4()).expect("parse");
     let registry = crate::registry::NodeTypeRegistry::new();
     crate::enrich::enrich_project(&mut project, &registry).expect("enrich ok");
     let node = project.nodes.iter().find(|n| n.id == "n").expect("n");

@@ -87,14 +87,20 @@ struct ParseState {
 
 /// Compile Weft source code into a flat ProjectDefinition.
 ///
+/// `project_id` must be the real DB project_id. The compiler can't derive
+/// it from source (the source has no id field), and downstream consumers
+/// (orchestrator ownership guard, billing) trust this id, so making it a
+/// required parameter prevents the "forgot to overwrite a random UUID"
+/// class of bug.
+///
 /// Groups are flattened: each group produces two Passthrough nodes
 /// ({groupId}__in and {groupId}__out) with edges rewired accordingly.
-pub fn compile(source: &str) -> Result<ProjectDefinition, Vec<CompileError>> {
+pub fn compile(source: &str, project_id: Uuid) -> Result<ProjectDefinition, Vec<CompileError>> {
     let state = parse_weft(source);
     if !state.errors.is_empty() {
         return Err(state.errors);
     }
-    flatten(state)
+    flatten(state, project_id)
 }
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
@@ -1987,7 +1993,7 @@ fn split_respecting_quotes(s: &str, delimiter: char) -> Vec<String> {
 
 // ─── Flattener ──────────────────────────────────────────────────────────────
 
-fn flatten(state: ParseState) -> Result<ProjectDefinition, Vec<CompileError>> {
+fn flatten(state: ParseState, project_id: Uuid) -> Result<ProjectDefinition, Vec<CompileError>> {
     let mut nodes: Vec<NodeDefinition> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -2023,7 +2029,7 @@ fn flatten(state: ParseState) -> Result<ProjectDefinition, Vec<CompileError>> {
     }
 
     Ok(ProjectDefinition {
-        id: Uuid::new_v4(),
+        id: project_id,
         name: state.name,
         description: if state.description.is_empty() { None } else { Some(state.description) },
         nodes,

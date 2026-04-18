@@ -149,6 +149,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_event_date ON usage_events(event_dat
 CREATE INDEX IF NOT EXISTS idx_usage_events_user_date ON usage_events(user_id, event_date);
 CREATE INDEX IF NOT EXISTS idx_usage_events_event_type ON usage_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_usage_events_execution_id ON usage_events(execution_id) WHERE execution_id IS NOT NULL;
+-- Idempotency for the per-execution flat fee: at most one 'execution' row per execution_id.
+-- The orchestrator retries start-execution on transport failure; this guards against double-charging.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_usage_events_execution_once ON usage_events(execution_id) WHERE event_type = 'execution';
 
 -- Usage daily table (aggregated per user per day, materialized by cron)
 CREATE TABLE IF NOT EXISTS usage_daily (

@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use crate::state::AppState;
 use crate::trigger_store;
-use crate::execution_store;
 
 #[derive(Debug, Serialize)]
 pub struct WebhookResponse {
@@ -90,7 +89,7 @@ pub async fn handle_webhook(
         if !expected_key.is_empty() {
             let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok());
             match provided {
-                Some(key) if constant_time_eq(key.as_bytes(), expected_key.as_bytes()) => {}
+                Some(key) if subtle::ConstantTimeEq::ct_eq(key.as_bytes(), expected_key.as_bytes()).into() => {}
                 _ => {
                     tracing::warn!("Invalid or missing API key for trigger: {}", trigger_id);
                     return (
@@ -171,7 +170,20 @@ pub async fn handle_webhook(
     };
 
     // Compile weft code into a ProjectDefinition
-    let mut project = match weft_core::weft_compiler::compile(&weft_code) {
+    let project_uuid = match uuid::Uuid::parse_str(&trigger.projectId) {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::error!("Invalid project UUID on trigger {}: {}", trigger_id, trigger.projectId);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WebhookResponse {
+                    status: "error".to_string(),
+                    message: "Invalid project UUID on trigger".to_string(),
+                }),
+            );
+        }
+    };
+    let mut project = match weft_core::weft_compiler::compile(&weft_code, project_uuid) {
         Ok(w) => w,
         Err(e) => {
             tracing::error!("Failed to compile weft code for trigger {}: {:?}", trigger_id, e);
@@ -184,10 +196,6 @@ pub async fn handle_webhook(
             );
         }
     };
-    // Override compiler-generated UUID with the actual DB project ID
-    if let Ok(wf_uuid) = uuid::Uuid::parse_str(&trigger.projectId) {
-        project.id = wf_uuid;
-    }
     if let Err(errors) = weft_nodes::enrich::enrich_project(&mut project, state.node_registry) {
         tracing::error!("Project validation failed for webhook trigger {}: {}", trigger_id, errors.join("; "));
         return (
@@ -236,22 +244,11 @@ pub async fn handle_webhook(
         "statusCallbackUrl": status_callback_url,
         "userId": user_id,
         "weftCode": weft_code,
+        "triggerId": trigger_id,
+        "nodeType": trigger.nodeType,
     });
 
-    // Record execution in DB.
-    if let Err(e) = execution_store::create_execution(
-        pool,
-        &execution_id,
-        &trigger.projectId,
-        user_id,
-        Some(&trigger_id),
-        Some(&trigger.nodeType),
-    ).await {
-        tracing::warn!("Failed to record execution in DB: {}", e);
-    }
-
-    let client = reqwest::Client::new();
-    match client.post(&start_url)
+    match state.http_client.post(&start_url)
         .json(&start_request)
         .send()
         .await
@@ -320,14 +317,6 @@ fn verify_hmac_signature(body: &[u8], secret: &str, signature: Option<&str>, pre
 
     mac.update(body);
     mac.verify_slice(&signature_bytes).is_ok()
-}
-
-/// Constant-time string comparison to prevent timing side-channel attacks
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Convert headers to JSON for inclusion in payload

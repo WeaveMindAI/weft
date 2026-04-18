@@ -13,7 +13,6 @@ mod extension_tokens;
 mod extension_api;
 mod trigger_store;
 mod usage_store;
-mod execution_store;
 mod webhooks;
 mod crypto;
 mod log_utils;
@@ -105,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         // Usage tracking API
         .route("/api/v1/usage/{user_id}", get(routes::get_usage))
         .route("/api/v1/usage/events", post(routes::record_usage_event))
+        .route("/api/v1/usage/start-execution", post(routes::start_execution))
         .route("/api/v1/usage/execution-cost", get(routes::get_execution_cost))
         // Credits API (admin)
         .route("/api/v1/admin/credits", post(routes::add_credits))
@@ -236,18 +236,20 @@ fn start_trigger_event_listener(state: Arc<AppState>) {
                 };
 
                 // Compile weft code to ProjectDefinition
-                let mut project = match weft_core::weft_compiler::compile(&weft_code) {
+                let project_uuid = match uuid::Uuid::parse_str(&event.projectId) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::error!("Invalid project UUID for trigger {}: {}", event.triggerId, event.projectId);
+                        continue;
+                    }
+                };
+                let mut project = match weft_core::weft_compiler::compile(&weft_code, project_uuid) {
                     Ok(w) => w,
                     Err(e) => {
                         tracing::error!("Failed to compile weftCode for trigger {}: {:?}", event.triggerId, e);
                         continue;
                     }
                 };
-                // Override compiler-generated UUID with the actual DB project ID.
-                // InfrastructureManager stores endpoint URLs keyed by this ID.
-                if let Ok(wf_uuid) = uuid::Uuid::parse_str(&event.projectId) {
-                    project.id = wf_uuid;
-                }
                 if let Err(errors) = weft_nodes::enrich::enrich_project(&mut project, state.node_registry) {
                     tracing::error!("Project validation failed for trigger {}: {}", event.triggerId, errors.join("; "));
                     continue;
@@ -259,8 +261,6 @@ fn start_trigger_event_listener(state: Arc<AppState>) {
                     "{}/ProjectExecutor/{}/start/send",
                     state.executor_url, execution_id
                 );
-
-                let client = reqwest::Client::new();
 
                 // Use userId from the trigger record.
                 // In cloud mode, a missing userId means the trigger is misconfigured: skip.
@@ -274,23 +274,9 @@ fn start_trigger_event_listener(state: Arc<AppState>) {
                     }
                 };
 
-                // Credit check: skip execution if user has no credits
-                if user_id != "local" && user_id != "anonymous" {
-                    let balance = match usage_store::get_balance(&state.db_pool, user_id).await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!("Credit check DB error for trigger {}: {}", event.triggerId, e);
-                            continue;
-                        }
-                    };
-                    if balance <= 0.0 {
-                        tracing::warn!(
-                            "Skipping trigger {} execution: user {} has insufficient credits (${:.2})",
-                            event.triggerId, user_id, balance
-                        );
-                        continue;
-                    }
-                }
+                // Credit gate and per-execution fee are enforced by the
+                // orchestrator in handle_start. If the user has no credits,
+                // the POST below returns 402 and we skip the trigger run.
 
                 // Build callback URL for execution status updates (Restate calls this back)
                 let dashboard_url = std::env::var("DASHBOARD_URL")
@@ -306,36 +292,16 @@ fn start_trigger_event_listener(state: Arc<AppState>) {
                     "statusCallbackUrl": status_callback_url,
                     "userId": user_id,
                     "weftCode": weft_code,
+                    "triggerId": event.triggerId,
+                    "nodeType": node_type,
                 });
 
-                // Record execution directly in the DB.
-                if let Err(e) = execution_store::create_execution(
-                    &state.db_pool,
-                    &execution_id,
-                    &event.projectId,
-                    user_id,
-                    Some(event.triggerId.as_str()),
-                    Some(node_type.as_str()),
-                ).await {
-                    tracing::warn!("Failed to record execution in DB: {}", e);
-                }
-
-                match client.post(&executor_url)
+                match state.http_client.post(&executor_url)
                     .json(&start_request)
                     .send()
                     .await
                 {
                     Ok(response) if response.status().is_success() => {
-                        // Record execution usage only after successful project start
-                        if let Err(e) = usage_store::record_execution(
-                            &state.db_pool,
-                            user_id,
-                            &event.projectId,
-                            &execution_id,
-                        ).await {
-                            tracing::warn!("Failed to record execution usage event: {}", e);
-                        }
-
                         tracing::info!(
                             "Project execution {} started from trigger {}",
                             execution_id, event.triggerId
@@ -344,32 +310,20 @@ fn start_trigger_event_listener(state: Arc<AppState>) {
                     Ok(response) => {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
+                        // No `executions` row exists yet at this point: the
+                        // orchestrator creates it inside the same tx as the
+                        // billing event, only on success. So there's nothing
+                        // to update to "failed"; just log.
                         tracing::error!(
-                            "Failed to start project from trigger {}: {} - {}",
-                            event.triggerId, status, body
+                            "Failed to start project from trigger {} (execution {}): {} - {}",
+                            event.triggerId, execution_id, status, body
                         );
-                        
-                        // Update execution status to failed
-                        let _ = execution_store::update_execution_status(
-                            &state.db_pool,
-                            &execution_id,
-                            "failed",
-                            Some(&format!("Restate error: {} - {}", status, body)),
-                        ).await;
                     }
                     Err(e) => {
                         tracing::error!(
-                            "Failed to call Restate for trigger {}: {}",
-                            event.triggerId, e
+                            "Failed to call orchestrator for trigger {} (execution {}): {}",
+                            event.triggerId, execution_id, e
                         );
-                        
-                        // Update execution status to failed
-                        let _ = execution_store::update_execution_status(
-                            &state.db_pool,
-                            &execution_id,
-                            "failed",
-                            Some(&format!("Connection error: {}", e)),
-                        ).await;
                     }
                 }
             }
@@ -454,7 +408,15 @@ async fn redispatch_trigger_setups(state: &Arc<AppState>, triggers: Vec<trigger_
             }
         };
 
-        let mut wf: ProjectDefinition = match weft_core::weft_compiler::compile(&weft_code) {
+        let project_uuid = match uuid::Uuid::parse_str(&trigger.projectId) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::error!("Invalid project UUID for trigger {}: {}", trigger.id, trigger.projectId);
+                let _ = trigger_store::update_trigger_status(pool, &trigger.id, "failed", None).await;
+                continue;
+            }
+        };
+        let mut wf: ProjectDefinition = match weft_core::weft_compiler::compile(&weft_code, project_uuid) {
             Ok(w) => w,
             Err(e) => {
                 tracing::error!("Failed to compile weft code for trigger {}: {:?}", trigger.id, e);
@@ -462,10 +424,6 @@ async fn redispatch_trigger_setups(state: &Arc<AppState>, triggers: Vec<trigger_
                 continue;
             }
         };
-        // Override compiler-generated UUID with the actual DB project ID
-        if let Ok(wf_uuid) = uuid::Uuid::parse_str(&trigger.projectId) {
-            wf.id = wf_uuid;
-        }
         if let Err(errors) = weft_nodes::enrich::enrich_project(&mut wf, state.node_registry) {
             tracing::error!("Project validation failed for trigger {}: {}", trigger.id, errors.join("; "));
             let _ = trigger_store::update_trigger_status(pool, &trigger.id, "failed", None).await;
@@ -513,6 +471,8 @@ async fn redispatch_trigger_setups(state: &Arc<AppState>, triggers: Vec<trigger_
             isTriggerSetup: true,
             weftCode: None,
             testMode: false,
+            triggerId: None,
+            nodeType: None,
             mocks: None,
         };
 

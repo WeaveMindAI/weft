@@ -1809,29 +1809,12 @@
 
 		// Show transition state while backend processes the request
 		executionState = { ...executionState, isStarting: true };
-		
+
 		console.debug('[Execution] Starting backend project execution. ID:', currentExecutionId);
 
-		// Create execution record in dashboard DB (for executions page).
-		// The dashboard server pulls the owner from the JWT, so we no
-		// longer pass `userId` in the body. Previous behavior of
-		// trusting sessionStorage's `weavemind_user_id` was a
-		// client-side claim the dashboard server can't verify; the
-		// JWT is the source of truth.
-		try {
-			await authFetch('/api/executions', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					id: currentExecutionId,
-					projectId: project.id,
-					triggerId: null,
-					nodeType: null,
-				}),
-			});
-		} catch (e) {
-			console.warn('[Execution] Failed to create execution record:', e);
-		}
+		// The executions row is created by weft-api inside the same
+		// transaction as the billing event, so no client-side pre-flight
+		// is needed. The orchestrator's /start handler triggers it.
 
 		// The executor (axum) is a separate service from the
 		// dashboard SvelteKit server and runs its own auth path. It

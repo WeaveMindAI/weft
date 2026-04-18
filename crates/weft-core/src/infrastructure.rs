@@ -189,10 +189,13 @@ impl InfrastructureManager for InfrastructureManagerImpl {
         let current_status = ctx.get::<String>("infra_status").await?.unwrap_or_default();
         tracing::info!("[START_ALL] project={} current_status='{}'", project_id, current_status);
 
-        let project = if let Some(pd) = req.project {
+        let pid = uuid::Uuid::parse_str(&project_id)
+            .map_err(|_| TerminalError::new(format!("Invalid project UUID: {}", project_id)))?;
+        let project = if let Some(mut pd) = req.project {
+            pd.id = pid;
             pd
         } else {
-            crate::weft_compiler::compile(&req.weftCode)
+            crate::weft_compiler::compile(&req.weftCode, pid)
                 .map_err(|e| TerminalError::new(format!("Failed to compile weftCode: {:?}", e)))?
         };
 
@@ -327,14 +330,21 @@ impl InfrastructureManager for InfrastructureManagerImpl {
             isTriggerSetup: false,
             weftCode: None,
             testMode: false,
+            triggerId: None,
+            nodeType: None,
             mocks: None,
         };
         let executor_url = executor_base_url();
         let url = format!("{}/ProjectExecutor/{}/start", executor_url, execution_id);
-        if let Err(e) = reqwest::Client::new().post(&url).json(&start_req)
-            .timeout(std::time::Duration::from_secs(30))
-            .send().await
-        {
+        // Server-to-server: orchestrator's auth in cloud mode requires the
+        // internal API key. Bare reqwest::Client wouldn't send it.
+        let mut req_builder = reqwest::Client::new().post(&url).json(&start_req);
+        if let Ok(key) = std::env::var("INTERNAL_API_KEY") {
+            if !key.is_empty() {
+                req_builder = req_builder.header("x-internal-api-key", key);
+            }
+        }
+        if let Err(e) = req_builder.timeout(std::time::Duration::from_secs(30)).send().await {
             tracing::error!("[InfrastructureManager] Failed to start infra sub-flow: {}", e);
         }
 

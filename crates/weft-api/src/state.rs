@@ -12,6 +12,10 @@ pub struct AppState {
     pub executor_url: String,
     pub db_pool: PgPool,
     pub instance_id: String,
+    /// Internal API key, loaded once at startup (no per-request env reads).
+    pub internal_api_key: String,
+    /// Carries `x-internal-api-key` by default. Internal targets only;
+    /// never user-controlled URLs (the key would leak).
     pub http_client: reqwest::Client,
     pub node_registry: &'static weft_nodes::NodeTypeRegistry,
 }
@@ -38,6 +42,24 @@ impl AppState {
         let node_registry: &'static weft_nodes::NodeTypeRegistry =
             Box::leak(Box::new(weft_nodes::NodeTypeRegistry::new()));
 
+        // Load once at startup; never re-read from env per request.
+        let internal_api_key = std::env::var("INTERNAL_API_KEY").unwrap_or_default();
+
+        // Default x-internal-api-key header. Internal targets only;
+        // never user-controlled URLs (the key would leak).
+        let http_client = {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if !internal_api_key.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&internal_api_key) {
+                    headers.insert("x-internal-api-key", val);
+                }
+            }
+            reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .expect("failed to build internal HTTP client")
+        };
+
         Self {
             trigger_service: Arc::new(Mutex::new(TriggerService::with_registry(node_registry))),
             restate_url,
@@ -45,7 +67,8 @@ impl AppState {
             executor_url,
             db_pool,
             instance_id,
-            http_client: reqwest::Client::new(),
+            internal_api_key,
+            http_client,
             node_registry,
         }
     }
@@ -82,7 +105,53 @@ impl AppState {
             tracing::error!("Failed to create infra_pending_action table: {}", e);
             e
         })?;
-        
+
+        // Idempotency for the per-execution fee. One-shot dedupe runs only
+        // before the unique index is first created (pre-existing duplicates
+        // from older code paths would otherwise make CREATE INDEX fail).
+        let index_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+             WHERE schemaname = current_schema() \
+               AND indexname = 'uniq_usage_events_execution_once')"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(false);
+
+        if !index_exists {
+            let dedup = sqlx::query(
+                "DELETE FROM usage_events ue1 \
+                 USING usage_events ue2 \
+                 WHERE ue1.event_type = 'execution' \
+                   AND ue2.event_type = 'execution' \
+                   AND ue1.execution_id = ue2.execution_id \
+                   AND ue1.id > ue2.id"
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to dedupe usage_events execution rows before index creation: {}", e);
+                e
+            })?;
+            if dedup.rows_affected() > 0 {
+                tracing::warn!(
+                    "Removed {} duplicate execution-event rows during one-shot startup dedupe",
+                    dedup.rows_affected()
+                );
+            }
+
+            sqlx::query(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uniq_usage_events_execution_once \
+                 ON usage_events(execution_id) WHERE event_type = 'execution'"
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create uniq_usage_events_execution_once index: {}", e);
+                e
+            })?;
+        }
+
         Ok(pool)
     }
 }

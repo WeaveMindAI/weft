@@ -79,7 +79,13 @@ pub struct ExecutorState {
     executions: DashMap<String, Arc<Execution>>,
     instance_cache: DashMap<String, NodeInstance>,
     restate_url: String,
+    api_url: String,
+    /// Carries `x-internal-api-key` by default. Internal targets only
+    /// (weft-api, Restate). Never user-controlled URLs: the key would leak.
     http_client: reqwest::Client,
+    /// No auth headers. Use for status callbacks, node-runner dispatches,
+    /// anything whose URL came from a request body or extension registration.
+    external_http_client: reqwest::Client,
     callback_base: String,
     node_registry: &'static weft_nodes::NodeTypeRegistry,
 }
@@ -88,27 +94,51 @@ impl ExecutorState {
     pub fn new(restate_url: String, callback_base: String) -> Self {
         let node_registry: &'static weft_nodes::NodeTypeRegistry =
             Box::leak(Box::new(weft_nodes::NodeTypeRegistry::new()));
+        // API_URL is required in cloud (silent fallback would lose every charge).
+        let is_local: bool = std::env::var("DEPLOYMENT_MODE")
+            .unwrap_or_else(|_| "cloud".to_string())
+            .to_lowercase()
+            == "local";
+        let api_url = match std::env::var("API_URL") {
+            Ok(v) if !v.is_empty() => v,
+            _ if is_local => "http://localhost:3000".to_string(),
+            _ => panic!(
+                "API_URL must be set in non-local DEPLOYMENT_MODE. \
+                 Set it to the weft-api service URL (e.g. \
+                 'http://weavemind-api:3001' in k8s, or set \
+                 DEPLOYMENT_MODE=local for local development)."
+            ),
+        };
+        let http_client = {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(key) = std::env::var("INTERNAL_API_KEY") {
+                if !key.is_empty() {
+                    if let Ok(val) = reqwest::header::HeaderValue::from_str(&key) {
+                        headers.insert("x-internal-api-key", val);
+                    }
+                }
+            }
+            reqwest::Client::builder()
+                .default_headers(headers)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .tcp_keepalive(std::time::Duration::from_secs(15))
+                .build()
+                .expect("failed to build internal HTTP client")
+        };
+        let external_http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .build()
+            .expect("failed to build external HTTP client");
         Self {
             executions: DashMap::new(),
             instance_cache: DashMap::new(),
             restate_url,
-            http_client: {
-                let mut headers = reqwest::header::HeaderMap::new();
-                if let Ok(key) = std::env::var("INTERNAL_API_KEY") {
-                    if !key.is_empty() {
-                        if let Ok(val) = reqwest::header::HeaderValue::from_str(&key) {
-                            headers.insert("x-internal-api-key", val);
-                        }
-                    }
-                }
-                reqwest::Client::builder()
-                    .default_headers(headers)
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .pool_idle_timeout(std::time::Duration::from_secs(30))
-                    .tcp_keepalive(std::time::Duration::from_secs(15))
-                    .build()
-                    .expect("failed to build HTTP client")
-            },
+            api_url,
+            http_client,
+            external_http_client,
             callback_base,
             node_registry,
         }
@@ -124,9 +154,13 @@ pub type SharedState = Arc<ExecutorState>;
 pub fn router(state: SharedState) -> Router {
     let cors = tower_http::cors::CorsLayer::permissive();
 
+    // Compile runs before billing, so cap to bound zero-credit DoS via huge weftCode.
+    let start_body_limit = axum::extract::DefaultBodyLimit::max(512 * 1024);
+
     Router::new()
         .route("/ProjectExecutor/{execution_id}/start", post(handle_start))
         .route("/ProjectExecutor/{execution_id}/start/send", post(handle_start))
+        .layer(start_body_limit)
         .route("/ProjectExecutor/{execution_id}/execution_callback", post(handle_execution_callback))
         .route("/ProjectExecutor/{execution_id}/cancel", post(handle_cancel))
         .route("/ProjectExecutor/{execution_id}/provide_input", post(handle_provide_input))
@@ -143,20 +177,210 @@ pub fn router(state: SharedState) -> Router {
 // HANDLERS
 // =============================================================================
 
+enum BillingOutcome {
+    Proceed,
+    InsufficientCredits(serde_json::Value),
+    ProjectNotOwned(serde_json::Value),
+    ExecutionIdConflict(serde_json::Value),
+    /// Internal auth misconfig: never surface the underlying body to callers.
+    InternalAuthFailed(serde_json::Value),
+    BadRequest(serde_json::Value),
+    /// Unknown weft-api response: never surface the underlying body to callers.
+    InternalProtocolError(serde_json::Value),
+    ApiUnreachable,
+}
+
+/// Call weft-api's atomic gate+ledger endpoint. Local-mode policy lives
+/// in weft-api (no-op there). Retries 4x with ~15s total cap on transport
+/// errors and 5xx; if still unreachable we fail the start (no free runs
+/// during an outage).
+async fn authorize_and_charge_start(
+    state: &SharedState,
+    execution_id: &str,
+    project_id: uuid::Uuid,
+    user_id: Option<&str>,
+    trigger_id: Option<&str>,
+    node_type: Option<&str>,
+) -> BillingOutcome {
+    // None => no attribution: only reachable in local mode (handle_start
+    // rejects None in cloud).
+    let user_id = match user_id {
+        Some(uid) => uid,
+        None => return BillingOutcome::Proceed,
+    };
+
+    let body = serde_json::json!({
+        "userId": user_id,
+        "projectId": project_id.to_string(),
+        "executionId": execution_id,
+        "triggerId": trigger_id,
+        "nodeType": node_type,
+    });
+    let url = format!("{}/api/v1/usage/start-execution", state.api_url);
+
+    // 4 attempts, 3s timeout, 1s backoff => ~15s worst case. 5xx retries; 4xx propagates.
+    let backoffs_ms = [0u64, 1000, 1000, 1000];
+    let mut last_transport_err: Option<String> = None;
+    for (attempt, sleep_ms) in backoffs_ms.iter().enumerate() {
+        if *sleep_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*sleep_ms)).await;
+        }
+        let send = state
+            .http_client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await;
+        match send {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return BillingOutcome::Proceed;
+                }
+                // Helper to read the body as JSON, falling back to an
+                // empty object when weft-api returns a non-JSON error.
+                let read_payload = |resp: reqwest::Response| async move {
+                    resp.json::<serde_json::Value>()
+                        .await
+                        .unwrap_or_else(|_| serde_json::json!({}))
+                };
+                match status {
+                    reqwest::StatusCode::PAYMENT_REQUIRED => {
+                        return BillingOutcome::InsufficientCredits(read_payload(resp).await);
+                    }
+                    reqwest::StatusCode::FORBIDDEN => {
+                        return BillingOutcome::ProjectNotOwned(read_payload(resp).await);
+                    }
+                    reqwest::StatusCode::CONFLICT => {
+                        return BillingOutcome::ExecutionIdConflict(read_payload(resp).await);
+                    }
+                    reqwest::StatusCode::UNAUTHORIZED => {
+                        // Misconfiguration: orchestrator should always carry
+                        // a valid internal key. Log loudly.
+                        tracing::error!(
+                            "[axum] start_execution returned 401 (internal-auth misconfig) for execution {}",
+                            execution_id
+                        );
+                        return BillingOutcome::InternalAuthFailed(read_payload(resp).await);
+                    }
+                    reqwest::StatusCode::BAD_REQUEST => {
+                        return BillingOutcome::BadRequest(read_payload(resp).await);
+                    }
+                    s if s.is_server_error() => {
+                        tracing::warn!(
+                            "[axum] start_execution returned {} for execution {} (attempt {}); retrying",
+                            s, execution_id, attempt + 1
+                        );
+                        last_transport_err = Some(format!("HTTP {}", s));
+                        continue;
+                    }
+                    other => {
+                        // Unknown status: protocol mismatch with weft-api.
+                        // Log internally; do not surface body externally.
+                        let body = read_payload(resp).await;
+                        tracing::error!(
+                            "[axum] start_execution returned unexpected {} for execution {}: {}",
+                            other, execution_id, body
+                        );
+                        return BillingOutcome::InternalProtocolError(body);
+                    }
+                }
+            }
+            Err(e) => {
+                last_transport_err = Some(e.to_string());
+                tracing::warn!(
+                    "[axum] start_execution billing transport error for execution {} (attempt {}): {}",
+                    execution_id, attempt + 1, e
+                );
+            }
+        }
+    }
+    tracing::error!(
+        "[axum] start_execution billing unreachable for execution {}: {:?}",
+        execution_id, last_transport_err
+    );
+    BillingOutcome::ApiUnreachable
+}
+
+/// Resolve the trusted userId for a start request.
+///
+/// Cloud requires a valid `x-internal-api-key`. With the key present,
+/// prefer `x-user-id` (cloud-api injects this after JWT verification);
+/// otherwise fall back to `req.userId` (server-to-server callers).
+/// `x-user-id` without the key is NEVER trusted: any pod with network
+/// reach to the orchestrator could otherwise spoof it.
+///
+/// Local mode skips auth entirely.
+fn resolve_trusted_user_id(
+    headers: &axum::http::HeaderMap,
+    req_user_id: Option<&str>,
+) -> Result<Option<String>, axum::response::Response> {
+    let is_local = std::env::var("DEPLOYMENT_MODE")
+        .unwrap_or_else(|_| "cloud".to_string())
+        .to_lowercase()
+        == "local";
+    if is_local {
+        return Ok(req_user_id.map(|s| s.to_string()));
+    }
+
+    // Cloud: require valid internal API key. No fallback.
+    let configured_key = match std::env::var("INTERNAL_API_KEY").ok().filter(|k| !k.is_empty()) {
+        Some(k) => k,
+        None => {
+            tracing::error!("[axum] handle_start rejected: INTERNAL_API_KEY not configured in cloud mode");
+            return Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Server misconfiguration" })),
+            )
+                .into_response());
+        }
+    };
+    use subtle::ConstantTimeEq;
+    let provided_key = headers.get("x-internal-api-key").and_then(|h| h.to_str().ok());
+    let key_ok = provided_key
+        .map(|p| p.as_bytes().ct_eq(configured_key.as_bytes()).into())
+        .unwrap_or(false);
+    if !key_ok {
+        tracing::warn!("[axum] handle_start rejected: missing or invalid x-internal-api-key");
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Unauthorized" })),
+        )
+            .into_response());
+    }
+
+    // Internal key valid. Prefer cloud-api's x-user-id (verified JWT identity)
+    // over the request body. Server-to-server callers without a JWT identity
+    // set req.userId directly; trust it because they hold the internal key.
+    let header_uid = headers
+        .get("x-user-id")
+        .and_then(|h| h.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok(header_uid.or_else(|| req_user_id.map(|s| s.to_string())))
+}
+
 async fn handle_start(
     State(state): State<SharedState>,
     Path(execution_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ProjectExecutionRequest>,
 ) -> impl IntoResponse {
     tracing::info!("[axum] start: execution={}, weftCode={}", execution_id, if req.weftCode.is_some() { "present" } else { "NONE" });
 
+    // Validate caller identity before anything else; downstream uses only this.
+    let trusted_user_id = match resolve_trusted_user_id(&headers, req.userId.as_deref()) {
+        Ok(uid) => uid,
+        Err(response) => return response,
+    };
+
     // If weftCode is provided, compile it to get the ProjectDefinition
     let mut project = if let Some(ref weft_code) = req.weftCode {
         tracing::info!("[axum] compiling weftCode ({} bytes)", weft_code.len());
-        match weft_core::weft_compiler::compile(weft_code) {
+        match weft_core::weft_compiler::compile(weft_code, req.project.id) {
             Ok(mut compiled) => {
-                // Preserve the original project ID and metadata
-                compiled.id = req.project.id;
+                // Preserve the original project metadata (id is set by the compiler).
                 compiled.name = req.project.name.clone();
                 compiled.description = req.project.description.clone();
                 compiled.createdAt = req.project.createdAt;
@@ -195,6 +419,75 @@ async fn handle_start(
         tracing::debug!("[axum] edge: {}.{} -> {}.{}", e.source, e.sourceHandle.as_deref().unwrap_or("?"), e.target, e.targetHandle.as_deref().unwrap_or("?"));
     }
 
+    // Cloud requires userId; without this guard, a server-to-server caller
+    // that forgot to set it would short-circuit billing and run free.
+    let is_local = std::env::var("DEPLOYMENT_MODE")
+        .unwrap_or_else(|_| "cloud".to_string())
+        .to_lowercase()
+        == "local";
+    if !is_local && trusted_user_id.is_none() {
+        tracing::error!(
+            "[axum] handle_start refused: cloud mode requires userId (execution {})",
+            execution_id
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "userId is required" })),
+        )
+            .into_response();
+    }
+
+    // Billing chokepoint. After compile (don't charge for invalid projects),
+    // before any execution state is created (rejected payment leaves no orphan).
+    match authorize_and_charge_start(
+        &state,
+        &execution_id,
+        project.id,
+        trusted_user_id.as_deref(),
+        req.triggerId.as_deref(),
+        req.nodeType.as_deref(),
+    ).await {
+        BillingOutcome::Proceed => {}
+        BillingOutcome::InsufficientCredits(payload) => {
+            return (StatusCode::PAYMENT_REQUIRED, Json(payload)).into_response();
+        }
+        BillingOutcome::ProjectNotOwned(payload) => {
+            return (StatusCode::FORBIDDEN, Json(payload)).into_response();
+        }
+        BillingOutcome::ExecutionIdConflict(payload) => {
+            return (StatusCode::CONFLICT, Json(payload)).into_response();
+        }
+        BillingOutcome::InternalAuthFailed(payload) => {
+            // Misconfig: log internally, return generic 500.
+            tracing::error!("[axum] billing endpoint rejected internal auth: {}", payload);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal server error" })),
+            )
+                .into_response();
+        }
+        BillingOutcome::BadRequest(payload) => {
+            return (StatusCode::BAD_REQUEST, Json(payload)).into_response();
+        }
+        BillingOutcome::InternalProtocolError(payload) => {
+            tracing::error!("[axum] billing protocol error: {}", payload);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal server error" })),
+            )
+                .into_response();
+        }
+        BillingOutcome::ApiUnreachable => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Billing service unreachable. Please retry in a moment, and report on Discord if the issue persists.",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let edge_idx = EdgeIndex::build(&project);
     let pulses = init_pulses(&project, &edge_idx);
 
@@ -202,7 +495,7 @@ async fn handle_start(
         project,
         edge_idx,
         initial_input: req.input,
-        user_id: req.userId,
+        user_id: trusted_user_id,
         status_callback_url: req.statusCallbackUrl,
         is_infra_setup: req.isInfraSetup,
         is_trigger_setup: req.isTriggerSetup,
@@ -499,10 +792,9 @@ async fn handle_cancel(
         }
     }
 
-    // Fire callback
     if let Some(ref callback_url) = imm.status_callback_url {
         let payload = build_cancel_callback_payload(&execution_id, &mt.node_executions, &mt.pulses);
-        if let Err(e) = state.http_client.post(callback_url).json(&payload).send().await {
+        if let Err(e) = state.external_http_client.post(callback_url).json(&payload).send().await {
             tracing::error!("[axum] Status callback failed for execution={}: {}", execution_id, e);
         }
     }
@@ -584,6 +876,7 @@ async fn handle_provide_input(
 
     let url = format!("{}/input_response/{}", inst.endpoint, callback_id);
     tracing::info!("[axum] provide_input: POSTing to {}", url);
+    // Internal client: node-runner is operator-controlled.
     match state.http_client.post(&url).json(&input_payload).send().await {
         Ok(r) if r.status().is_success() => {
             (StatusCode::OK, "ok").into_response()
@@ -1150,6 +1443,9 @@ async fn dispatch_node_inmem(
     let endpoint = format!("{}/execute", instance.endpoint);
     let node_id = node.id.clone();
     let pulse_id = pulse_id.to_string();
+    // Internal client: node-runner endpoints are operator-controlled
+    // (registered via NodeInstanceRegistry, not user input). Future community
+    // extension-runner: will need a separate path.
     let client = state.http_client.clone();
 
     // Dispatch via tokio::spawn: keeps the HTTP connection open until the node
@@ -1248,7 +1544,7 @@ async fn check_and_notify_inmem(
 
     if let Some(ref callback_url) = imm.status_callback_url {
         let payload = build_completion_callback_payload(execution_id, &mt.node_executions, &mt.pulses, any_failed);
-        if let Err(e) = state.http_client.post(callback_url).json(&payload).send().await {
+        if let Err(e) = state.external_http_client.post(callback_url).json(&payload).send().await {
             tracing::error!("[axum] Completion callback failed for execution={}: {}", execution_id, e);
         }
     }

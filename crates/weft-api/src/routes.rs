@@ -29,16 +29,22 @@ struct DashboardTokenClaims {
     pub exp: u64,
 }
 
-fn has_valid_internal_api_key(headers: &HeaderMap) -> bool {
-    let configured = match std::env::var("INTERNAL_API_KEY") {
-        Ok(value) if !value.is_empty() => value,
-        _ => return false,
-    };
-
+/// Check the request's internal API key. Constant-time, reads from state
+/// (no per-request env access).
+fn has_valid_internal_api_key(state: &AppState, headers: &HeaderMap) -> bool {
+    use subtle::ConstantTimeEq;
+    if state.internal_api_key.is_empty() {
+        return false;
+    }
     headers
         .get("x-internal-api-key")
         .and_then(|h| h.to_str().ok())
-        .map(|provided| provided == configured)
+        .map(|provided| {
+            provided
+                .as_bytes()
+                .ct_eq(state.internal_api_key.as_bytes())
+                .into()
+        })
         .unwrap_or(false)
 }
 
@@ -135,10 +141,11 @@ fn require_admin(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json
 }
 
 fn require_internal_or_user_or_admin(
+    state: &AppState,
     headers: &HeaderMap,
     user_id: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if has_valid_internal_api_key(headers) {
+    if has_valid_internal_api_key(state, headers) {
         return Ok(());
     }
 
@@ -365,7 +372,7 @@ pub async fn register_trigger(
         }
     };
 
-    let mut wf: ProjectDefinition = match weft_core::weft_compiler::compile(&weft_code) {
+    let mut wf: ProjectDefinition = match weft_core::weft_compiler::compile(&weft_code, req.projectId) {
         Ok(w) => w,
         Err(e) => {
             tracing::error!("Failed to compile weftCode for trigger: {:?}", e);
@@ -471,6 +478,8 @@ pub async fn register_trigger(
         isTriggerSetup: true,
         weftCode: None,
         testMode: false,
+        triggerId: None,
+        nodeType: None,
         mocks: None,
     };
 
@@ -742,7 +751,7 @@ pub async fn record_usage_event(
     headers: HeaderMap,
     Json(req): Json<UsageEventRequest>,
 ) -> impl IntoResponse {
-    let is_internal = is_local_mode() || has_valid_internal_api_key(&headers);
+    let is_internal = is_local_mode() || has_valid_internal_api_key(&state, &headers);
     if !is_internal {
         if let Err((status, json)) = require_user_or_admin(&headers, &req.userId) {
             return (status, json).into_response();
@@ -752,6 +761,7 @@ pub async fn record_usage_event(
     // Only internal services can set isByok. User-facing requests always pay.
     let is_byok = if is_internal { req.isByok.unwrap_or(false) } else { false };
 
+    let is_local = is_local_mode();
     let result = match req.eventType.as_str() {
         "service" | "tangle" => {
             usage_store::record_service_cost(
@@ -767,16 +777,8 @@ pub async fn record_usage_event(
                 req.completionTokens,
                 req.costUsd.unwrap_or(0.0),
                 is_byok,
+                is_local,
                 req.metadata.as_ref(),
-            )
-            .await
-        }
-        "execution" => {
-            usage_store::record_execution(
-                &state.db_pool,
-                &req.userId,
-                req.projectId.as_deref().unwrap_or(""),
-                req.executionId.as_deref().unwrap_or(""),
             )
             .await
         }
@@ -789,6 +791,19 @@ pub async fn record_usage_event(
             )
             .await
         }
+        "execution" => {
+            tracing::warn!(
+                "record_usage_event rejecting event_type=execution from {}; use /usage/start-execution",
+                req.userId
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "event_type=execution not allowed here; use POST /api/v1/usage/start-execution"
+                })),
+            )
+                .into_response();
+        }
         _ => {
             tracing::warn!("Unknown usage event type: {}", req.eventType);
             return StatusCode::BAD_REQUEST.into_response();
@@ -799,6 +814,178 @@ pub async fn record_usage_event(
         Ok(_) => StatusCode::CREATED.into_response(),
         Err(e) => {
             tracing::error!("Failed to record usage event: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+pub struct StartExecutionRequest {
+    pub userId: String,
+    pub projectId: String,
+    pub executionId: String,
+    /// Optional: which trigger fired this run (webhook, schedule, etc.).
+    /// Stored on the executions row for the dashboard list.
+    #[serde(default)]
+    pub triggerId: Option<String>,
+    /// Optional: the trigger's node type (Webhook, Cron, ManualTrigger, ...).
+    #[serde(default)]
+    pub nodeType: Option<String>,
+}
+
+/// Single chokepoint for project-execution start. Cloud: atomic
+/// gate + charge + executions row. Local: writes the executions row only.
+pub async fn start_execution(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<StartExecutionRequest>,
+) -> impl IntoResponse {
+    let local = is_local_mode();
+    if !local && !has_valid_internal_api_key(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Internal auth required" })),
+        )
+            .into_response();
+    }
+
+    // `anonymous` must never reach here in cloud mode. Published/visitor runs
+    // are supposed to resolve to the owner's userId before the orchestrator
+    // starts. If one slips through, fail loudly rather than run free.
+    if !local && req.userId == "anonymous" {
+        tracing::error!(
+            "start_execution received anonymous userId in cloud mode (execution={}): refusing",
+            req.executionId
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "anonymous userId is not billable" })),
+        )
+            .into_response();
+    }
+
+    if Uuid::parse_str(&req.projectId).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "projectId must be a UUID" })),
+        )
+            .into_response();
+    }
+    // executionId can be `<uuid>`, `publish-<owner>-<uuid>`, or
+    // `trigger-setup-<triggerId>-<counter>`; bound length and charset.
+    let exec_ok = !req.executionId.is_empty()
+        && req.executionId.len() <= 128
+        && req
+            .executionId
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !exec_ok {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "executionId must be 1..=128 ASCII alnum/_/- chars" })),
+        )
+            .into_response();
+    }
+    // triggerId is opaque (`${projectId}-${nodeId}` from the dashboard).
+    if let Some(ref tid) = req.triggerId {
+        let valid = !tid.is_empty()
+            && tid.len() <= 128
+            && tid.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "triggerId must be 1..=128 ASCII alnum/_/- chars" })),
+            )
+                .into_response();
+        }
+    }
+    if let Some(ref nt) = req.nodeType {
+        let valid = !nt.is_empty()
+            && nt.len() <= 64
+            && nt.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "nodeType must be 1..=64 ASCII alnum/_/- chars" })),
+            )
+                .into_response();
+        }
+    }
+
+    if local {
+        // No fee in local; still register the executions row.
+        let result = sqlx::query(
+            r#"
+            INSERT INTO executions (id, project_id, user_id, trigger_id, node_type, status)
+            VALUES ($1, $2::uuid, $3, $4, $5, 'running')
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(&req.executionId)
+        .bind(&req.projectId)
+        .bind(&req.userId)
+        .bind(req.triggerId.as_deref())
+        .bind(req.nodeType.as_deref())
+        .execute(&state.db_pool)
+        .await;
+        return match result {
+            Ok(_) => StatusCode::CREATED.into_response(),
+            Err(e) => {
+                tracing::error!(
+                    "start_execution (local) failed to insert executions row (execution={}): {}",
+                    req.executionId, e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
+
+    match usage_store::record_execution(
+        &state.db_pool,
+        &req.userId,
+        &req.projectId,
+        &req.executionId,
+        req.triggerId.as_deref(),
+        req.nodeType.as_deref(),
+    )
+    .await
+    {
+        Ok(usage_store::StartExecutionOutcome::Allowed) => StatusCode::CREATED.into_response(),
+        Ok(usage_store::StartExecutionOutcome::InsufficientCredits { balance, required }) => {
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "Insufficient credits",
+                    "balance": balance,
+                    "required": required,
+                })),
+            )
+                .into_response()
+        }
+        Ok(usage_store::StartExecutionOutcome::ProjectNotOwned) => {
+            tracing::warn!(
+                "start_execution: user {} does not own project {}",
+                req.userId, req.projectId
+            );
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Project not owned by caller" })),
+            )
+                .into_response()
+        }
+        Ok(usage_store::StartExecutionOutcome::ExecutionIdConflictWrongUser) => {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "Execution ID already in use by another user" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                "start_execution DB error (user={}, execution={}): {}",
+                req.userId, req.executionId, e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -867,7 +1054,7 @@ pub async fn get_execution_cost(
     Query(query): Query<ExecutionCostQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Extract user_id from JWT claims for ownership check
-    let user_id = if is_local_mode() || has_valid_internal_api_key(&headers) {
+    let user_id = if is_local_mode() || has_valid_internal_api_key(&state, &headers) {
         None
     } else {
         match decode_dashboard_claims(&headers) {
@@ -995,7 +1182,7 @@ pub async fn get_credits(
     headers: HeaderMap,
     Query(query): Query<GetCreditsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Err(response) = require_internal_or_user_or_admin(&headers, &query.userId) {
+    if let Err(response) = require_internal_or_user_or_admin(&state, &headers, &query.userId) {
         return response;
     }
 
@@ -1105,7 +1292,15 @@ pub async fn start_infra(
     }
 
     // Compile + enrich
-    let project = match weft_core::weft_compiler::compile(weft_code) {
+    let pid = match Uuid::parse_str(&project_id) {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "project_id must be a UUID"
+            }))).into_response();
+        }
+    };
+    let project = match weft_core::weft_compiler::compile(weft_code, pid) {
         Ok(mut w) => {
             if let Err(errors) = weft_nodes::enrich::enrich_project(&mut w, state.node_registry) {
                 tracing::error!("Project validation failed: {:?}", errors);
@@ -1568,11 +1763,11 @@ fn sanitize_filename(raw: &str) -> String {
 /// Authenticate a file request. Returns the user_id.
 /// In local mode: no auth needed, returns "local".
 /// Otherwise: requires internal API key (backend nodes) or dashboard JWT.
-fn authenticate_file_request(headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+fn authenticate_file_request(state: &AppState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
     if is_local_mode() {
         return Ok("local".to_string());
     }
-    if has_valid_internal_api_key(headers) {
+    if has_valid_internal_api_key(state, headers) {
         return headers.get("x-user-id")
             .and_then(|h| h.to_str().ok())
             .filter(|s| !s.is_empty())
@@ -1593,11 +1788,11 @@ fn authenticate_file_request(headers: &HeaderMap) -> Result<String, (StatusCode,
 /// Request body: { filename, mimeType, sizeBytes, ephemeral?, executionId? }
 /// Response: { file_id, upload_url, url, filename, mimeType }
 pub async fn create_file(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let user_id = authenticate_file_request(&headers)?;
+    let user_id = authenticate_file_request(&state, &headers)?;
 
     let filename = sanitize_filename(
         body.get("filename").and_then(|v| v.as_str()).unwrap_or("file")
@@ -1644,13 +1839,13 @@ pub async fn create_file(
 /// Receives file bytes and writes them to disk.
 /// In cloud mode this endpoint is unused (bytes go directly to R2 via presigned URL).
 pub async fn upload_file_bytes(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(file_id): Path<String>,
     body: Bytes,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Auth
-    let _user_id = authenticate_file_request(&headers)?;
+    let _user_id = authenticate_file_request(&state, &headers)?;
 
     // Validate file_id is a UUID
     let file_uuid = Uuid::parse_str(&file_id)
@@ -1682,6 +1877,7 @@ pub async fn upload_file_bytes(
 ///
 /// Serves a locally stored file with the correct Content-Type.
 pub async fn get_file(
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> impl IntoResponse {
@@ -1692,7 +1888,7 @@ pub async fn get_file(
 
     // In local mode, no auth. Otherwise require internal key or JWT.
     if !is_local_mode() {
-        if let Err((status, msg)) = authenticate_file_request(&headers) {
+        if let Err((status, msg)) = authenticate_file_request(&state, &headers) {
             return (status, msg).into_response();
         }
     }
@@ -1722,10 +1918,11 @@ pub async fn get_file(
 ///
 /// Deletes a locally stored file and its metadata.
 pub async fn delete_file(
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let user_id = authenticate_file_request(&headers)?;
+    let user_id = authenticate_file_request(&state, &headers)?;
     let file_uuid = Uuid::parse_str(&file_id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid file_id".to_string()))?;
 
@@ -1755,9 +1952,10 @@ pub async fn delete_file(
 ///
 /// Lists files for the current user.
 pub async fn list_files(
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let user_id = authenticate_file_request(&headers)?;
+    let user_id = authenticate_file_request(&state, &headers)?;
     let base = files_dir();
 
     let mut files = Vec::new();
