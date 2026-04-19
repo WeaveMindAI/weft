@@ -543,11 +543,17 @@ async fn cleanup_tasks_inner(
     let count = callback_ids.len();
     tracing::info!("cleanup: removing {} tasks for user {} (execution filter: {:?})", count, user_id, execution_id_filter);
 
+    // Bounded concurrency so a user with hundreds of orphan tasks can't OOM
+    // Restate by firing every complete_task at once (each invocation costs
+    // journal state on Restate's side).
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
     let mut set = tokio::task::JoinSet::new();
     for cb_id in callback_ids {
         let client = client.clone();
         let url = complete_url.clone();
+        let permit = semaphore.clone();
         set.spawn(async move {
+            let _permit = permit.acquire_owned().await.ok();
             let fut = client.post(&url).json(&cb_id).send();
             match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
                 Ok(Ok(_)) => true,

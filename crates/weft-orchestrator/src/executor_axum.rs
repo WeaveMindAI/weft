@@ -796,14 +796,21 @@ async fn handle_cancel(
         callback_ids
     };
 
-    // Phase 2: clean up Restate tasks concurrently, without holding the lock.
+    // Phase 2: clean up Restate tasks, without holding the lock. Cap
+    // concurrency so a cancel on an execution with hundreds of orphan tasks
+    // can't stampede Restate (each complete_task invocation allocates journal
+    // state, 220+ in parallel ate past the 4Gi limit and crashloop-evicted the
+    // pod, taking orchestrator down with it).
     let cleanup_count = callback_ids_to_complete.len();
     if cleanup_count > 0 {
         tracing::info!("[axum] cancel: cleaning up {} pending tasks", cleanup_count);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
         let mut set = tokio::task::JoinSet::new();
         for cb_id in callback_ids_to_complete {
             let state = state.clone();
+            let permit = semaphore.clone();
             set.spawn(async move {
+                let _permit = permit.acquire_owned().await.ok();
                 complete_task_via_restate(&state, &cb_id).await;
             });
         }
