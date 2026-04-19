@@ -94,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/ext/{token}/tasks/{execution_id}/cancel", post(extension_api::cancel_task))
         .route("/ext/{token}/actions/{action_id}/dismiss", post(extension_api::dismiss_action))
         .route("/ext/{token}/triggers/{trigger_task_id}/submit", post(extension_api::submit_trigger))
+        .route("/ext/{token}/cleanup/all", post(extension_api::cleanup_all_tasks))
+        .route("/ext/{token}/cleanup/execution/{execution_id}", post(extension_api::cleanup_tasks_for_execution))
         // Infrastructure management
         .route("/api/infra/{project_id}/start", post(routes::start_infra))
         .route("/api/infra/{project_id}/force-retry", post(routes::force_retry_infra))

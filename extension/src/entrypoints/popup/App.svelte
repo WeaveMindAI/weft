@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { fetchPendingTasks, dismissAction, cancelTask, checkConnection, getTokens, addToken, removeToken, type PendingTask, type ExtensionToken } from '../../lib/api';
+  import { fetchPendingTasks, dismissAction, cancelTask, clearAllTasks, clearTasksForExecution, checkConnection, getTokens, addToken, removeToken, type PendingTask, type ExtensionToken } from '../../lib/api';
 
   let allItems = $state<PendingTask[]>([]);
   let loading = $state(true);
@@ -78,6 +78,50 @@
       await refresh();
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to cancel task';
+    }
+  }
+
+  async function handleClearAll() {
+    // Bypass confirmation in browser extension context? Popups block window.confirm.
+    // Use a tiny custom state instead for now: one click removes everything.
+    try {
+      await clearAllTasks();
+      await refresh();
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to clear tasks';
+    }
+  }
+
+  /// Extract the execution UUID from a task's callback_id. The TaskRegistry
+  /// stores callback_id in the `executionId` field in one of three shapes:
+  ///   - WaitingForInput: "{execUuid(36)}-{nodeId}-{pulseUuid}-{seq}"
+  ///   - NotifyAction:    "{execUuid(36)}-{nodeId}-action"  (or overridden)
+  ///   - Trigger:         "trigger-{triggerId}"
+  /// Returns null for shapes where no clean execution UUID can be pulled out,
+  /// so the caller hides the "clear run" affordance instead of sending a
+  /// malformed request.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  function extractExecutionUuid(task: PendingTask): string | null {
+    const prefix = task.executionId.slice(0, 36);
+    return UUID_RE.test(prefix) ? prefix : null;
+  }
+
+  async function handleClearForTask(task: PendingTask) {
+    const tokenConfig = (task as PendingTask & { _tokenConfig?: ExtensionToken })._tokenConfig;
+    if (!tokenConfig) {
+      error = 'Task missing token configuration';
+      return;
+    }
+    const execUuid = extractExecutionUuid(task);
+    if (!execUuid) {
+      error = 'This task does not belong to a runnable execution';
+      return;
+    }
+    try {
+      await clearTasksForExecution(tokenConfig, execUuid);
+      await refresh();
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to clear tasks for this run';
     }
   }
 
@@ -397,6 +441,9 @@
         <div class="section-header">
           <span class="section-title">Tasks</span>
           <span class="section-count">{tasks.length}</span>
+          <button class="clear-all-btn" onclick={handleClearAll} title="Delete every pending task (use this to flush orphan requests from cancelled runs)">
+            Clear all
+          </button>
         </div>
         <div class="tasks-container">
           {#each tasks as task}
@@ -411,6 +458,13 @@
                   <p class="task-preview">{task.description}</p>
                 {/if}
               </button>
+              {#if extractExecutionUuid(task)}
+                <button class="task-clear-run" onclick={() => handleClearForTask(task)} title="Clear every pending task for this run">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/>
+                  </svg>
+                </button>
+              {/if}
               <button class="task-cancel" onclick={() => handleCancelTask(task)} title="Cancel task (skip downstream)">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M18 6L6 18M6 6l12 12"/>
@@ -967,6 +1021,7 @@
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
   }
 
+  .task-clear-run,
   .task-cancel {
     display: flex;
     align-items: center;
@@ -975,17 +1030,48 @@
     background: white;
     border: 1px solid #e4e4e7;
     border-left: none;
-    border-radius: 0 8px 8px 0;
     cursor: pointer;
     color: #a1a1aa;
     transition: all 0.15s;
     flex-shrink: 0;
   }
 
+  .task-clear-run {
+    border-radius: 0;
+  }
+
+  .task-cancel {
+    border-radius: 0 8px 8px 0;
+  }
+
+  .task-clear-run:hover {
+    background: #fff7ed;
+    color: #f59e0b;
+    border-color: #fed7aa;
+  }
+
   .task-cancel:hover {
     background: #fef2f2;
     color: #ef4444;
     border-color: #fecaca;
+  }
+
+  .clear-all-btn {
+    margin-left: auto;
+    font-size: 11px;
+    padding: 4px 10px;
+    background: #fff7ed;
+    border: 1px solid #fed7aa;
+    border-radius: 6px;
+    color: #b45309;
+    cursor: pointer;
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+
+  .clear-all-btn:hover {
+    background: #fef3c7;
+    border-color: #fcd34d;
   }
 
   .action-card {

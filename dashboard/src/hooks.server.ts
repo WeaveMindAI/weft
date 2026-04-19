@@ -1,7 +1,18 @@
 import type { Handle } from "@sveltejs/kit";
 import { env } from "$env/dynamic/private";
 import { json } from "@sveltejs/kit";
+import { timingSafeEqual } from "node:crypto";
 import { verifyDashboardToken } from "$lib/server/verify-token";
+import { getExecutionOwnerInternal } from "$lib/server/db";
+
+/// Constant-time compare to avoid leaking the internal API key via response-time
+/// oracles. Plain string === is observably timing-different at every byte.
+function safeKeyEqual(a: string, b: string): boolean {
+	const ab = Buffer.from(a);
+	const bb = Buffer.from(b);
+	if (ab.length !== bb.length) return false;
+	return timingSafeEqual(ab, bb);
+}
 
 /** Local mode sentinel identity. The dashboard runs single-user in
  *  OSS standalone, so when no JWT infrastructure is available we
@@ -252,6 +263,37 @@ export const handle: Handle = async ({ event, resolve }) => {
 	// infrastructure. Db functions filter by this id, matching the
 	// data created by local-mode handlers.
 	if (requiresJwtAuth(event.url.pathname)) {
+		// Internal service-to-service calls (currently: orchestrator
+		// status callbacks POSTing to /api/executions/{id}) authenticate
+		// with x-internal-api-key instead of a JWT. When the header is
+		// present and valid, we attribute the request to the execution's
+		// owner so the db.updateExecution WHERE clause resolves. Scoped
+		// to /api/executions/* on purpose: every other /api/* route is
+		// genuinely user-driven and has a session.
+		const internalKey = event.request.headers.get("x-internal-api-key");
+		const executionPathMatch = event.url.pathname.match(/^\/api\/executions\/([^/]+)(?:\/|$)/);
+		// Scope the internal-key bypass to writes only (PUT/POST). The
+		// orchestrator's status callback is always POST; allowing GET would
+		// turn the internal key into a read-any-execution credential that
+		// skips the per-user filter in getExecution.
+		const isWriteMethod = event.request.method === "POST" || event.request.method === "PUT";
+		if (
+			isWriteMethod
+			&& internalKey
+			&& env.INTERNAL_API_KEY
+			&& env.INTERNAL_API_KEY.length >= 16
+			&& safeKeyEqual(internalKey, env.INTERNAL_API_KEY)
+			&& executionPathMatch
+		) {
+			const executionId = executionPathMatch[1];
+			const ownerId = await getExecutionOwnerInternal(executionId);
+			if (!ownerId) {
+				return json({ error: "Execution not found" }, { status: 404 });
+			}
+			event.locals.user = { id: ownerId, username: "internal" };
+			return await resolve(event);
+		}
+
 		// Try to decode an Authorization Bearer JWT first, regardless
 		// of mode. This means a local dev environment that happens to
 		// be running the website + dashboard together (so the iframe

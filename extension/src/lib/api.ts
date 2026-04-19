@@ -186,6 +186,44 @@ export async function submitTrigger(
   console.log('[WeaveMind] Trigger submitted successfully');
 }
 
+/// Delete every pending task owned by this token (orphans from cancelled runs, etc).
+/// Returns the total number of tasks removed across all tokens.
+export async function clearAllTasks(): Promise<number> {
+  const tokens = await getTokens();
+  let totalRemoved = 0;
+  for (const tokenConfig of tokens) {
+    const url = `${tokenConfig.cloudUrl}/api/ext/${tokenConfig.token}/cleanup/all`;
+    try {
+      const response = await fetch(url, { method: 'POST' });
+      if (!response.ok) {
+        console.warn(`[WeaveMind] cleanup/all failed for ${tokenConfig.name}: ${response.status}`);
+        continue;
+      }
+      const body = await response.json() as { removed?: number };
+      totalRemoved += body.removed ?? 0;
+    } catch (e) {
+      console.error(`[WeaveMind] cleanup/all error for ${tokenConfig.name}:`, e);
+    }
+  }
+  return totalRemoved;
+}
+
+/// Delete every pending task whose callback_id is scoped to a specific execution.
+/// Use this when one run got stuck with dozens of orphan form requests.
+export async function clearTasksForExecution(
+  tokenConfig: ExtensionToken,
+  executionId: string,
+): Promise<number> {
+  const url = `${tokenConfig.cloudUrl}/api/ext/${tokenConfig.token}/cleanup/execution/${encodeURIComponent(executionId)}`;
+  const response = await fetch(url, { method: 'POST' });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`HTTP ${response.status}: ${text}`);
+  }
+  const body = await response.json() as { removed?: number };
+  return body.removed ?? 0;
+}
+
 /// Check if any token is connected
 export async function checkConnection(): Promise<boolean> {
   const tokens = await getTokens();

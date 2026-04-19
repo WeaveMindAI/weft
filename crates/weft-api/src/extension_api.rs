@@ -442,6 +442,132 @@ pub async fn validate_token_handler(
     }
 }
 
+/// Remove every TaskRegistry entry owned by this user whose callback_id
+/// starts with `{execution_id}-`. Used by the extension "Clear for this run"
+/// button to flush orphan tasks left behind by prior duplication bugs or
+/// by executions that were cancelled before the TaskRegistry could be
+/// cleaned up. Does NOT try to resume or skip the node; the execution is
+/// assumed dead.
+pub async fn cleanup_tasks_for_execution(
+    State(state): State<Arc<AppState>>,
+    Path((token, execution_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Reject anything that isn't a real UUID so the prefix match doesn't
+    // degenerate into an over-broad filter (e.g. execution_id="a" would
+    // match every callback_id starting with "a-" within the user's scope).
+    let parsed = match uuid::Uuid::parse_str(&execution_id) {
+        Ok(u) => u,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "execution_id must be a UUID" })),
+        ).into_response(),
+    };
+    // Normalize to hyphenated lowercase so the prefix match compares against
+    // the same canonical form we use elsewhere (Uuid::Display and callback_id
+    // construction both produce lowercase).
+    cleanup_tasks_inner(state, token, Some(parsed.as_hyphenated().to_string())).await
+}
+
+/// Remove every TaskRegistry entry owned by this user. Used by the
+/// extension "Clear all" button.
+pub async fn cleanup_all_tasks(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    cleanup_tasks_inner(state, token, None).await
+}
+
+async fn cleanup_tasks_inner(
+    state: Arc<AppState>,
+    token: String,
+    execution_id_filter: Option<String>,
+) -> axum::response::Response {
+    let pool = &state.db_pool;
+
+    let user_id = match extension_tokens::validate_token(pool, &token).await {
+        Some(uid) => uid,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Invalid token" })),
+            ).into_response();
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let list_url = format!("{}/TaskRegistry/global/list_tasks", state.restate_url);
+    let complete_url = format!("{}/TaskRegistry/global/complete_task", state.restate_url);
+
+    // Pull the full task list, filter by userId (and optionally by executionId
+    // prefix on the callback_id), then fire concurrent complete_task calls.
+    // callback_id format is "{executionId}-{nodeId}-{pulseId}-{seq}", so
+    // prefix-matching is how we scope to a single execution.
+    let tasks_json = match client.get(&list_url).send().await {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("cleanup: failed to parse list_tasks response: {}", e);
+                return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": "upstream parse error" }))).into_response();
+            }
+        },
+        Ok(r) => {
+            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": format!("upstream {}", r.status()) }))).into_response();
+        }
+        Err(e) => {
+            tracing::error!("cleanup: failed to reach TaskRegistry: {}", e);
+            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": "failed to reach task service" }))).into_response();
+        }
+    };
+
+    let all_tasks = tasks_json.get("tasks").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+
+    // The TaskRegistry stores the callback_id in the `executionId` field of
+    // each PendingTask (see executor_axum.rs where PendingTask.executionId is
+    // set to callback_id for WaitingForInput tasks). That's what complete_task
+    // consumes, so we collect those.
+    // Build the per-execution prefix once and compare case-insensitively:
+    // UUIDs SHOULD be lowercase on both sides (see cleanup_tasks_for_execution),
+    // but a historical task with uppercase storage should still match.
+    let exec_prefix_lower = execution_id_filter.as_ref().map(|e| format!("{}-", e.to_ascii_lowercase()));
+    let callback_ids: Vec<String> = all_tasks.into_iter()
+        .filter(|t| {
+            t.get("userId").and_then(|u| u.as_str()) == Some(user_id.as_str())
+        })
+        .filter_map(|t| t.get("executionId").and_then(|v| v.as_str()).map(String::from))
+        .filter(|cb| match &exec_prefix_lower {
+            Some(prefix) => cb.len() >= prefix.len() && cb[..prefix.len()].eq_ignore_ascii_case(prefix),
+            None => true,
+        })
+        .collect();
+
+    let count = callback_ids.len();
+    tracing::info!("cleanup: removing {} tasks for user {} (execution filter: {:?})", count, user_id, execution_id_filter);
+
+    let mut set = tokio::task::JoinSet::new();
+    for cb_id in callback_ids {
+        let client = client.clone();
+        let url = complete_url.clone();
+        set.spawn(async move {
+            let fut = client.post(&url).json(&cb_id).send();
+            match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => { tracing::warn!("cleanup: complete_task failed for {}: {}", cb_id, e); false }
+                Err(_) => { tracing::warn!("cleanup: complete_task timed out for {}", cb_id); false }
+            }
+        });
+    }
+
+    let mut succeeded = 0usize;
+    while let Some(res) = set.join_next().await {
+        if matches!(res, Ok(true)) { succeeded += 1; }
+    }
+
+    Json(serde_json::json!({
+        "removed": succeeded,
+        "attempted": count,
+    })).into_response()
+}
+
 /// Health check for extension - validates token is valid
 pub async fn health_check(
     State(state): State<Arc<AppState>>,

@@ -757,44 +757,66 @@ async fn handle_cancel(
     };
 
     let imm = &exec.imm;
-    let mut mt = exec.mt.lock().await;
-    mt.cancelled = true;
 
-    // Remove waiting tasks from NodeExecutions
-    for execs in mt.node_executions.values() {
-        for exec in execs.iter().filter(|e| e.status == NodeExecutionStatus::WaitingForInput) {
-            if let Some(ref callback_id) = exec.callbackId {
-                complete_task_via_restate(&state, callback_id).await;
+    // Phase 1: under the mutex, flip state and collect the callback_ids that
+    // need to be cleaned up. We do the Restate calls OUTSIDE the lock so the
+    // cancel handler doesn't hold it for minutes while doing N sequential
+    // HTTP POSTs.
+    let callback_ids_to_complete: Vec<String> = {
+        let mut mt = exec.mt.lock().await;
+        mt.cancelled = true;
+
+        let callback_ids: Vec<String> = mt.node_executions.values()
+            .flat_map(|execs| execs.iter())
+            .filter(|e| e.status == NodeExecutionStatus::WaitingForInput)
+            .filter_map(|e| e.callbackId.clone())
+            .collect();
+
+        for node_pulses in mt.pulses.values_mut() {
+            for p in node_pulses.iter_mut() {
+                if p.status == PulseStatus::Pending {
+                    p.status = PulseStatus::Absorbed;
+                }
             }
         }
-    }
 
-    // Mark all Pending pulses as Absorbed
-    for node_pulses in mt.pulses.values_mut() {
-        for p in node_pulses.iter_mut() {
-            if p.status == PulseStatus::Pending {
-                p.status = PulseStatus::Absorbed;
+        let cancel_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        for execs in mt.node_executions.values_mut() {
+            for exec in execs.iter_mut() {
+                if !exec.status.is_terminal() {
+                    exec.status = NodeExecutionStatus::Cancelled;
+                    exec.completedAt = Some(cancel_ms);
+                }
             }
         }
-    }
 
-    // Mark all non-terminal NodeExecutions as cancelled
-    let cancel_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    for execs in mt.node_executions.values_mut() {
-        for exec in execs.iter_mut() {
-            if !exec.status.is_terminal() {
-                exec.status = NodeExecutionStatus::Cancelled;
-                exec.completedAt = Some(cancel_ms);
-            }
+        callback_ids
+    };
+
+    // Phase 2: clean up Restate tasks concurrently, without holding the lock.
+    let cleanup_count = callback_ids_to_complete.len();
+    if cleanup_count > 0 {
+        tracing::info!("[axum] cancel: cleaning up {} pending tasks", cleanup_count);
+        let mut set = tokio::task::JoinSet::new();
+        for cb_id in callback_ids_to_complete {
+            let state = state.clone();
+            set.spawn(async move {
+                complete_task_via_restate(&state, &cb_id).await;
+            });
         }
+        while set.join_next().await.is_some() {}
     }
 
+    // Phase 3: notify the dashboard (re-lock briefly to build the payload).
     if let Some(ref callback_url) = imm.status_callback_url {
-        let payload = build_cancel_callback_payload(&execution_id, &mt.node_executions, &mt.pulses);
-        if let Err(e) = state.external_http_client.post(callback_url).json(&payload).send().await {
+        let payload = {
+            let mt = exec.mt.lock().await;
+            build_cancel_callback_payload(&execution_id, &mt.node_executions, &mt.pulses)
+        };
+        if let Err(e) = post_status_callback(state.external_http_client.clone(), callback_url, &payload).await {
             tracing::error!("[axum] Status callback failed for execution={}: {}", execution_id, e);
         }
     }
@@ -1458,6 +1480,16 @@ async fn dispatch_node_inmem(
         let mut delay_secs = 1u64;
 
         for attempt in 0..=max_retries {
+            // Bail out if the execution was cancelled. Without this check a
+            // retry storm (e.g. HumanQuery holding the connection longer than
+            // the forwarder's timeout) can keep hammering cloud-api for
+            // minutes after the user clicked stop.
+            if let Some(exec) = state_clone.executions.get(&exec_id_clone) {
+                if exec.mt.lock().await.cancelled {
+                    tracing::info!("[axum dispatch] node={} pulse={} aborting retry loop (execution cancelled)", node_id, pulse_id);
+                    return;
+                }
+            }
             let result = client.post(&endpoint).json(&http_req).send().await;
             match result {
                 Ok(response) if response.status().is_success() => {
@@ -1542,9 +1574,18 @@ async fn check_and_notify_inmem(
     let any_failed = result.unwrap();
     tracing::info!("[axum] Project {} completed (any_failed={})", execution_id, any_failed);
 
+    // If cancel fired while a dispatch response was still in-flight, a
+    // stale completion callback can race behind cancel and flip the
+    // dashboard's execution status back to completed/failed. Suppress it:
+    // cancel already sent the authoritative `cancelled` status.
+    if mt.cancelled {
+        tracing::info!("[axum] Skipping completion callback for cancelled execution={}", execution_id);
+        return true;
+    }
+
     if let Some(ref callback_url) = imm.status_callback_url {
         let payload = build_completion_callback_payload(execution_id, &mt.node_executions, &mt.pulses, any_failed);
-        if let Err(e) = state.external_http_client.post(callback_url).json(&payload).send().await {
+        if let Err(e) = post_status_callback(state.external_http_client.clone(), callback_url, &payload).await {
             tracing::error!("[axum] Completion callback failed for execution={}: {}", execution_id, e);
         }
     }
@@ -1579,10 +1620,36 @@ async fn register_task_via_restate(state: &SharedState, task: PendingTask) {
     }
 }
 
+/// POST a status update (cancelled/completed/failed) to the dashboard's
+/// `/api/executions/{id}` endpoint. The dashboard enforces JWT auth on every
+/// `/api/*` route, but there is no user session on a server-initiated
+/// callback, so we authenticate with `x-internal-api-key` instead and let the
+/// dashboard's middleware recognize it as a trusted service call.
+async fn post_status_callback(
+    client: reqwest::Client,
+    url: &str,
+    payload: &serde_json::Value,
+) -> Result<(), reqwest::Error> {
+    let mut req = client.post(url).json(payload);
+    if let Ok(key) = std::env::var("INTERNAL_API_KEY") {
+        if !key.is_empty() {
+            req = req.header("x-internal-api-key", key);
+        }
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        tracing::error!("[axum] Status callback returned {}: {}", resp.status(), url);
+    }
+    Ok(())
+}
+
 async fn complete_task_via_restate(state: &SharedState, callback_id: &str) {
     let url = format!("{}/TaskRegistry/global/complete_task", state.restate_url);
-    if let Err(e) = state.http_client.post(&url).json(&callback_id).send().await {
-        tracing::error!("[axum] Failed to complete task via Restate: {}", e);
+    let fut = state.http_client.post(&url).json(&callback_id).send();
+    match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::error!("[axum] Failed to complete task via Restate (cb={}): {}", callback_id, e),
+        Err(_) => tracing::error!("[axum] Timed out completing task via Restate (cb={})", callback_id),
     }
 }
 

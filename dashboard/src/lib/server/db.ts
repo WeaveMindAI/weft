@@ -694,6 +694,19 @@ export async function getExecution(id: string, userId: string): Promise<DbExecut
 	return result.rows[0] || null;
 }
 
+/** Look up the owning user_id for an execution without a per-user filter.
+ *  `_INTERNAL` suffix is a NAMING FLAG: this must ONLY be called from the
+ *  internal-API-key auth path in hooks.server.ts, never from a user-facing
+ *  handler, or the per-user isolation guarantee collapses. Adding a new
+ *  call site in a user route is a bug. */
+export async function getExecutionOwnerInternal(id: string): Promise<string | null> {
+	const result = await pool.query<{ user_id: string }>(
+		`SELECT user_id FROM executions WHERE id = $1`,
+		[id]
+	);
+	return result.rows[0]?.user_id ?? null;
+}
+
 export async function listExecutions(
 	projectId?: string,
 	userId?: string,
