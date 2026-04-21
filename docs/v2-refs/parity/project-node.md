@@ -271,6 +271,13 @@ CSS (lines around 1150-1210):
 @keyframes debug-spin { to { transform: rotate(360deg); } }
 ```
 
+## `computeMinNodeWidth(inputs, outputs)` — collapsed/default width
+
+Shared helper defined in ProjectEditorInner.svelte:811-830. Used
+for collapsed regular nodes AND collapsed groups. See
+`group-node.md` for the full formula. Port verbatim so node
+widths track their port labels.
+
 ## Expand / collapse (line 523-556)
 
 ```ts

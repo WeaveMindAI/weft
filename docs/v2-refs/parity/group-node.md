@@ -220,6 +220,34 @@ different from current. Enter commits, Escape cancels.
    exist; they just don't connect to visible handles until
    expanded.
 
+### `computeMinNodeWidth(inputs, outputs)` — collapsed width
+
+Defined in ProjectEditorInner.svelte line 811-830 (shared with
+regular ProjectNode when collapsed):
+
+```ts
+const MIN_WIDTH = 200;
+const CHAR_WIDTH = 6.5;   // px per char at text-[10px]
+const PADDING = 60;       // 2 × 12px handle + gaps + px padding
+const GAP = 20;           // minimum gap between input and output labels
+
+const inputNames = inputs.map(p => p.name + (p.required ? '*' : ''));
+const outputNames = outputs.map(p => p.name);
+
+let maxRowWidth = 0;
+for (let i = 0; i < Math.max(inputNames.length, outputNames.length); i++) {
+  const leftLen = i < inputNames.length ? inputNames[i].length : 0;
+  const rightLen = i < outputNames.length ? outputNames[i].length : 0;
+  const rowWidth = (leftLen + rightLen) * CHAR_WIDTH + GAP;
+  if (rowWidth > maxRowWidth) maxRowWidth = rowWidth;
+}
+
+return Math.max(MIN_WIDTH, Math.ceil(maxRowWidth + PADDING));
+```
+
+Port this verbatim — it's what makes collapsed groups size to
+their port labels instead of flopping between 160px and 400px.
+
 ### Port layout (lines 431-522)
 
 Same shape as ProjectNode's port rows: `flex justify-between`,
