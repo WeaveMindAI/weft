@@ -2,8 +2,10 @@
 //! `KindInfraBackend` (local dev). The closed-source weavemind repo
 //! adds cloud implementations plugging into the same traits.
 
+pub mod docker_infra;
 pub mod subprocess;
 
+pub use docker_infra::DockerInfraBackend;
 pub use subprocess::SubprocessWorkerBackend;
 
 use std::path::PathBuf;

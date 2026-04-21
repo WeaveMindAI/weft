@@ -4,16 +4,13 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use async_trait::async_trait;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
 
 use weft_dispatcher::{
     api::router,
-    backend::{
-        subprocess::SubprocessWorkerBackend, EventStream, InfraBackend, InfraHandle, InfraSpec,
-    },
+    backend::{DockerInfraBackend, SubprocessWorkerBackend},
     journal::sqlite::SqliteJournal,
     DispatcherConfig, DispatcherState,
 };
@@ -53,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config.clone()),
         journal: Arc::new(journal),
         workers: Arc::new(SubprocessWorkerBackend::new(runner_path, self_url)),
-        infra: Arc::new(StubInfraBackend),
+        infra: Arc::new(DockerInfraBackend::new()),
         projects,
     };
 
@@ -63,21 +60,4 @@ async fn main() -> anyhow::Result<()> {
     info!("weft-dispatcher listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-// Infra backend stays a stub until KindInfraBackend lands.
-struct StubInfraBackend;
-
-#[async_trait]
-impl InfraBackend for StubInfraBackend {
-    async fn provision(&self, _spec: InfraSpec) -> anyhow::Result<InfraHandle> {
-        anyhow::bail!("infra backend not yet implemented")
-    }
-    async fn deprovision(&self, _handle: InfraHandle) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn stream_events(&self, _handle: InfraHandle) -> anyhow::Result<EventStream> {
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        Ok(rx)
-    }
 }

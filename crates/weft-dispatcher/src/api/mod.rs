@@ -47,6 +47,8 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/ext/{token}/triggers/{trigger_task_id}/submit", post(extension::submit_trigger))
         .route("/ext/{token}/actions/{action_id}/dismiss", post(extension::dismiss_action))
         .route("/ext/{token}/health", get(extension::health))
+        .route("/", get(dashboard::serve_root))
+        .route("/dashboard", get(dashboard::serve_root))
         .route("/dashboard/{*path}", get(dashboard::serve))
         .route("/describe/nodes", get(describe::nodes))
         .route("/describe/project/{id}", get(describe::project_catalog))

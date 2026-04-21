@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Weft Dispatcher</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #151a21;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #2f81f7;
+      --active: #3fb950;
+      --inactive: #8b949e;
+      --registered: #d29922;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+    header { padding: 14px 24px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 12px; }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .status { font-size: 12px; color: var(--muted); }
+    main { padding: 20px 24px; }
+    .panel { background: var(--panel); border: 1px solid #21262d; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+    .panel h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 4px; border-bottom: 1px solid #21262d; }
+    th { color: var(--muted); font-weight: 500; }
+    tr:last-child td { border-bottom: none; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .dot.active { background: var(--active); }
+    .dot.inactive { background: var(--inactive); }
+    .dot.registered { background: var(--registered); }
+    .empty { color: var(--muted); font-style: italic; padding: 12px 4px; }
+    .id { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Weft Dispatcher</h1>
+    <span id="dispatcher-status" class="status">connecting&hellip;</span>
+  </header>
+  <main>
+    <div class="panel">
+      <h2>Projects</h2>
+      <div id="projects"></div>
+    </div>
+    <div class="panel">
+      <h2>Notes</h2>
+      <div class="status">
+        Phase A2 ops dashboard. Shows registered projects + activation
+        status. Live execution state, cost ledger, and trigger URLs
+        land with Phase B, backed by the dispatcher's SSE stream.
+      </div>
+    </div>
+  </main>
+  <script>
+    const api = (path) => fetch(path).then((r) => (r.ok ? r.json() : Promise.reject(r.status)));
+
+    async function refresh() {
+      const statusEl = document.getElementById('dispatcher-status');
+      try {
+        const projects = await api('/projects');
+        statusEl.textContent = `connected, ${projects.length} project(s)`;
+        renderProjects(projects);
+      } catch (err) {
+        statusEl.textContent = 'dispatcher unreachable';
+        document.getElementById('projects').innerHTML = '<div class="empty">dispatcher unreachable</div>';
+      }
+    }
+
+    function renderProjects(projects) {
+      const container = document.getElementById('projects');
+      if (!projects.length) {
+        container.innerHTML = '<div class="empty">no projects registered</div>';
+        return;
+      }
+      const rows = projects
+        .map(
+          (p) => `<tr>
+            <td><span class="dot ${p.status}"></span>${escape(p.name)}</td>
+            <td class="id">${escape(p.id)}</td>
+            <td>${escape(p.status)}</td>
+          </tr>`,
+        )
+        .join('');
+      container.innerHTML = `<table>
+        <thead><tr><th>Name</th><th>ID</th><th>Status</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
+    function escape(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    refresh();
+    setInterval(refresh, 5_000);
+  </script>
+</body>
+</html>

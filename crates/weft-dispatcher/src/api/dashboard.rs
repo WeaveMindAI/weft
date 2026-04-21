@@ -1,15 +1,31 @@
-//! The ops dashboard UI. Static SvelteKit/React build output is
-//! bundled into the dispatcher binary (via rust-embed in phase A2) and
-//! served from `/dashboard/*`.
-//!
-//! This is an ops dashboard only (watch executions, see URLs, manage
-//! projects). It does NOT do code editing; that lives in the VS Code
-//! extension.
+//! The ops dashboard UI. A single-page HTML shell served from the
+//! dispatcher; fetches live state via the existing JSON endpoints
+//! and renders it in the browser. Deliberately minimal: ops only, no
+//! code editing. Phase B replaces the inlined HTML with a proper
+//! svelte/react build embedded via rust-embed.
 
-use axum::{extract::{Path, State}, http::StatusCode, response::IntoResponse};
+use axum::{
+    extract::{Path, State},
+    http::{header, StatusCode},
+    response::IntoResponse,
+};
 
 use crate::state::DispatcherState;
 
+const INDEX_HTML: &str = include_str!("dashboard.html");
+
 pub async fn serve(State(_state): State<DispatcherState>, Path(_path): Path<String>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "dashboard ui not yet bundled")
+    index()
+}
+
+pub async fn serve_root(State(_state): State<DispatcherState>) -> impl IntoResponse {
+    index()
+}
+
+fn index() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
 }
