@@ -182,9 +182,12 @@ scoping, optional user-auth enforcement.
 
 ## 13. VS Code extension is new
 
-Separate folder `extension-vscode/` (or similar). Scaffolded in
-phase A1. Responsibilities: Tangle chat panel, `.weft` graph view,
-`.loom` runner view, dispatcher connection sidebar.
+Separate folder `extension-vscode/`. Scaffolded in phase A1.
+Responsibilities (open source, ops-only): Projects tree view,
+`.weft` graph view, `.loom` runner view, command palette entries
+for run/activate/deactivate. AI authoring is NOT in this extension;
+it ships from a separate commercial extension maintained outside
+this repository.
 
 ## 14. Five starter nodes for the scaffold
 
@@ -230,12 +233,15 @@ machine).
 
 ## 18. Editor/dashboard split
 
-- VS Code extension = authoring UX (Tangle, graph view, Loom view,
-  dispatcher sidebar).
-- Dispatcher's embedded dashboard = ops UX (watch executions, manage
-  projects, view trigger URLs, inspect infra). Served by the
+- VS Code extension (open source) = ops sidebar + file previews
+  (graph view for `.weft`, runner view for `.loom`). Talks to the
+  local dispatcher.
+- Dispatcher's embedded dashboard = ops UX (watch executions,
+  manage projects, view trigger URLs, inspect infra). Served by the
   dispatcher on its HTTP port.
 - No standalone dashboard SvelteKit app in v2. The old
   `dashboard-v1/` is archived.
+- AI authoring ships from a separate commercial extension and is
+  not part of this repository.
 - Marketing website is separate, minimal, SEO-focused. Not in the
   weft repo.

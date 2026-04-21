@@ -1,16 +1,14 @@
 {
   "name": "weft-vscode",
   "displayName": "Weft",
-  "description": "Weft language support: @weft chat participant, graph view for .weft files, runner view for .loom files, live dispatcher sidebar.",
+  "description": "Weft language support: project management against the local dispatcher, graph view for .weft files, runner view for .loom files.",
   "version": "0.2.0",
   "publisher": "weavemind",
   "engines": {
-    "vscode": "^1.95.0"
+    "vscode": "^1.90.0"
   },
   "categories": [
     "Programming Languages",
-    "AI",
-    "Chat",
     "Other"
   ],
   "activationEvents": [
@@ -49,29 +47,6 @@
         "category": "Weft"
       }
     ],
-    "chatParticipants": [
-      {
-        "id": "weft.tangle",
-        "fullName": "Tangle",
-        "name": "weft",
-        "description": "Weft's AI builder. Ask it to scaffold weft graphs, explain nodes, or debug a running execution.",
-        "isSticky": true,
-        "commands": [
-          {
-            "name": "new",
-            "description": "Scaffold a new weft node or graph from a description."
-          },
-          {
-            "name": "explain",
-            "description": "Explain a weft node, primitive, or concept."
-          },
-          {
-            "name": "debug",
-            "description": "Help diagnose a failing execution."
-          }
-        ]
-      }
-    ],
     "views": {
       "weft-sidebar": [
         {
@@ -107,7 +82,7 @@
   },
   "devDependencies": {
     "@types/node": "^20",
-    "@types/vscode": "^1.95.0",
+    "@types/vscode": "^1.90.0",
     "typescript": "^5.4"
   }
 }

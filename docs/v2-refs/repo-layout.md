@@ -35,8 +35,9 @@ weft/
 │   └── ai/llm/
 │
 ├── extension-vscode/               VS Code extension (TypeScript).
-│                                    Tangle panel, graph view, runner
-│                                    view, Projects tree view.
+│                                    Projects tree view, graph view,
+│                                    runner view. Talks to the local
+│                                    dispatcher.
 │
 ├── extension-browser-v1/           Browser extension (kept as-is,
 │                                    repointed to dispatcher in A2).
