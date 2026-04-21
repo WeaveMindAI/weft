@@ -77,17 +77,8 @@ pub async fn validate(
         });
     }
 
-    // Stage 4: validation pass. Currently a no-op stub; real checks
-    // land with the v1 validation audit.
-    if let Err(e) = weft_compiler::validate::validate(&project) {
-        diagnostics.push(Diagnostic {
-            line: 0,
-            column: 0,
-            severity: weft_compiler::Severity::Error,
-            message: format!("{e}"),
-            code: Some("validate".into()),
-        });
-    }
+    // Stage 4: full validation pass. Every rule from the v1 audit.
+    diagnostics.extend(weft_compiler::validate::validate(&project));
 
     Ok(Json(ValidateResponse { diagnostics }))
 }
