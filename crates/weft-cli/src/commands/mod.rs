@@ -17,6 +17,7 @@ pub mod daemon_stop;
 pub mod infra;
 pub mod add;
 pub mod describe_nodes;
+pub mod executions;
 pub mod token;
 
 pub struct Ctx {

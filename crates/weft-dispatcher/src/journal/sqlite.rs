@@ -10,7 +10,10 @@ use sqlx::SqlitePool;
 
 use weft_core::{Color, CostReport};
 
-use crate::journal::{EntryKind, EntryTarget, ExtToken, Journal, LogEntry, OpenSuspension, WakeTarget};
+use crate::journal::{
+    EntryKind, EntryTarget, ExecutionSummary, ExtToken, Journal, LogEntry, NodeExecEvent,
+    NodeExecKind, OpenSuspension, WakeTarget,
+};
 
 pub struct SqliteJournal {
     pool: SqlitePool,
@@ -63,6 +66,21 @@ impl SqliteJournal {
                 metadata TEXT,
                 created_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS node_exec_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                color TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                lane TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                input_json TEXT,
+                output_json TEXT,
+                error TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_node_exec_event_color
+                ON node_exec_event(color);
 
             CREATE TABLE IF NOT EXISTS log_entry (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -348,6 +366,112 @@ impl Journal for SqliteJournal {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn record_node_event(&self, event: &NodeExecEvent) -> anyhow::Result<()> {
+        let input_str = event
+            .input
+            .as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+        let output_str = event
+            .output
+            .as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+        sqlx::query(
+            "INSERT INTO node_exec_event (color, node_id, lane, kind, input_json, output_json, error, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.color.to_string())
+        .bind(&event.node_id)
+        .bind(&event.lane)
+        .bind(event.kind.as_str())
+        .bind(input_str)
+        .bind(output_str)
+        .bind(event.error.as_deref())
+        .bind(event.at_unix as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>> {
+        let rows: Vec<(String, String, String, Option<String>, Option<String>, Option<String>, i64)> =
+            sqlx::query_as(
+                "SELECT node_id, lane, kind, input_json, output_json, error, created_at \
+                 FROM node_exec_event WHERE color = ? ORDER BY id ASC",
+            )
+            .bind(color.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (node_id, lane, kind, input, output, error, at) in rows {
+            let Some(kind) = NodeExecKind::parse(&kind) else { continue };
+            let input_v = input
+                .map(|s| serde_json::from_str(&s).unwrap_or(Value::Null));
+            let output_v = output
+                .map(|s| serde_json::from_str(&s).unwrap_or(Value::Null));
+            out.push(NodeExecEvent {
+                color,
+                node_id,
+                lane,
+                kind,
+                input: input_v,
+                output: output_v,
+                error,
+                at_unix: at as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
+        let s = color.to_string();
+        sqlx::query("DELETE FROM node_exec_event WHERE color = ?")
+            .bind(&s)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM log_entry WHERE color = ?")
+            .bind(&s)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM cost_event WHERE color = ?")
+            .bind(&s)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM suspension WHERE color = ?")
+            .bind(&s)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM execution WHERE color = ?")
+            .bind(&s)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>> {
+        let rows: Vec<(String, String, String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT color, project_id, entry_node, status, started_at, completed_at \
+             FROM execution ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (color_str, project_id, entry_node, status, started_at, completed_at) in rows {
+            let Ok(color) = color_str.parse::<Color>() else { continue };
+            out.push(ExecutionSummary {
+                color,
+                project_id,
+                entry_node,
+                status,
+                started_at: started_at as u64,
+                completed_at: completed_at.map(|v| v as u64),
+            });
+        }
+        Ok(out)
     }
 
     async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>> {

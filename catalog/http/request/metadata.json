@@ -5,6 +5,7 @@
   "category": "http",
   "tags": ["http", "api", "fetch", "request"],
   "icon": "Send",
+  "color": "#06b6d4",
   "inputs": [
     { "name": "url", "type": "String", "required": true },
     { "name": "body", "type": "JsonDict", "required": false },

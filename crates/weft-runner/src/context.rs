@@ -52,6 +52,39 @@ impl RunnerHandle {
     }
 }
 
+/// Fire-and-forget POST to `/executions/{color}/events`. Called by
+/// the loop driver at every node lifecycle transition (started,
+/// completed, failed, skipped). Returns immediately; failures are
+/// logged at debug level, the loop doesn't wait.
+pub fn ship_node_event(
+    dispatcher: Option<&str>,
+    color: Color,
+    node_id: &str,
+    lane: &[weft_core::lane::LaneFrame],
+    kind: &'static str,
+    input: Option<&serde_json::Value>,
+    output: Option<&serde_json::Value>,
+    error: Option<&str>,
+) {
+    let Some(dispatcher) = dispatcher else { return };
+    let url = format!("{dispatcher}/executions/{color}/events");
+    let lane_str = serde_json::to_string(lane).unwrap_or_default();
+    let body = serde_json::json!({
+        "node_id": node_id,
+        "lane": lane_str,
+        "kind": kind,
+        "input": input,
+        "output": output,
+        "error": error,
+    });
+    let http = reqwest::Client::new();
+    tokio::spawn(async move {
+        if let Err(e) = http.post(&url).json(&body).send().await {
+            tracing::debug!(target: "weft_runner::node_event", error = %e, "ship failed");
+        }
+    });
+}
+
 #[async_trait]
 impl ContextHandle for RunnerHandle {
     async fn await_form(&self, schema: FormSchema) -> WeftResult<FormSubmission> {

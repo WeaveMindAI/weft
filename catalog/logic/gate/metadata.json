@@ -5,6 +5,7 @@
   "category": "logic",
   "tags": ["gate", "branch", "conditional", "if"],
   "icon": "GitBranch",
+  "color": "#f59e0b",
   "inputs": [
     { "name": "value", "type": "T", "required": true },
     { "name": "condition", "type": "Boolean", "required": true }

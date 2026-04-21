@@ -16,7 +16,7 @@ use weft_core::project::EdgeIndex;
 use weft_core::pulse::{Pulse, PulseTable};
 use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
 
-use crate::context::RunnerHandle;
+use crate::context::{ship_node_event, RunnerHandle};
 
 pub enum EntryMode {
     /// Fresh run: pulse targets the entry node's first input port
@@ -150,6 +150,16 @@ pub async fn run_loop(
 
             if group.should_skip {
                 mark_skipped(&mut executions, &node_id, group.color, &group.lane);
+                ship_node_event(
+                    dispatcher_url,
+                    group.color,
+                    &node_id,
+                    &group.lane,
+                    "skipped",
+                    None,
+                    None,
+                    None,
+                );
                 emit_null_downstream(
                     &node_id,
                     group.color,
@@ -164,6 +174,16 @@ pub async fn run_loop(
 
             if let Some(err) = &group.error {
                 mark_failed(&mut executions, &node_id, group.color, &group.lane, err);
+                ship_node_event(
+                    dispatcher_url,
+                    group.color,
+                    &node_id,
+                    &group.lane,
+                    "failed",
+                    None,
+                    None,
+                    Some(err),
+                );
                 emit_null_downstream(
                     &node_id,
                     group.color,
@@ -182,6 +202,16 @@ pub async fn run_loop(
                 None => {
                     let err = format!("unknown node type: {}", node_def.node_type);
                     mark_failed(&mut executions, &node_id, group.color, &group.lane, &err);
+                    ship_node_event(
+                        dispatcher_url,
+                        group.color,
+                        &node_id,
+                        &group.lane,
+                        "failed",
+                        None,
+                        None,
+                        Some(&err),
+                    );
                     emit_null_downstream(&node_id, group.color, &group.lane, &project, &mut pulses, &edge_idx, &mut executions);
                     continue;
                 }
@@ -211,12 +241,33 @@ pub async fn run_loop(
                 handle,
             );
 
+            ship_node_event(
+                dispatcher_url,
+                group.color,
+                &node_id,
+                &group.lane,
+                "started",
+                Some(&group.input),
+                None,
+                None,
+            );
+
             let node_result = node_impl.execute(ctx).await;
 
             match node_result {
                 Ok(output) => {
                     mark_completed(&mut executions, &node_id, group.color, &group.lane, &output);
                     let output_value = output_to_value(&output);
+                    ship_node_event(
+                        dispatcher_url,
+                        group.color,
+                        &node_id,
+                        &group.lane,
+                        "completed",
+                        None,
+                        Some(&output_value),
+                        None,
+                    );
                     postprocess_output(
                         &node_id,
                         &output_value,
@@ -241,6 +292,16 @@ pub async fn run_loop(
                     let err = format!("{e}");
                     tracing::error!(target: "weft_runner", node = %node_id, "{err}");
                     mark_failed(&mut executions, &node_id, group.color, &group.lane, &err);
+                    ship_node_event(
+                        dispatcher_url,
+                        group.color,
+                        &node_id,
+                        &group.lane,
+                        "failed",
+                        None,
+                        None,
+                        Some(&err),
+                    );
                     emit_null_downstream(&node_id, group.color, &group.lane, &project, &mut pulses, &edge_idx, &mut executions);
                 }
             }

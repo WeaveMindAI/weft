@@ -39,7 +39,13 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/executions/{color}/suspensions", post(execution::record_suspension))
         .route("/executions/{color}/status", post(execution::report_status))
         .route("/executions/{color}/logs", post(execution::append_log).get(execution::list_logs))
-        .route("/executions/{color}", get(execution::get))
+        .route("/executions/{color}/events", post(execution::record_node_event))
+        .route("/executions/{color}/replay", get(execution::replay))
+        .route(
+            "/executions/{color}",
+            get(execution::get).delete(execution::delete_execution),
+        )
+        .route("/executions", get(execution::list_executions))
         .route("/events/project/{id}", get(events::project_stream))
         .route("/events/execution/{color}", get(events::execution_stream))
         .route("/w/{token}", post(webhook::handle_root))

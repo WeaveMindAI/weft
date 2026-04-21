@@ -31,27 +31,9 @@ pub use weft_compiler::{compile as compile_source, CompileError as SourceError};
 use uuid::Uuid;
 use weft_core::{NodeCatalog, ProjectDefinition};
 
-/// Diagnostic emitted during parse or validate. Structured for
-/// consumption by VS Code's Problems panel: line + severity + message
-/// + optional code (for click-through to docs).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Diagnostic {
-    pub line: usize,
-    pub column: usize,
-    pub severity: Severity,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Severity {
-    Error,
-    Warning,
-    Info,
-    Hint,
-}
+// Re-export weft_core's Diagnostic/Severity so downstream callers
+// keep using weft_compiler::Diagnostic without touching node impls.
+pub use weft_core::node::{Diagnostic, Severity};
 
 /// Fast-path parse for interactive editing (IDE, live preview). Runs
 /// lex + parse + flatten + lenient enrich. Does NOT run validation:

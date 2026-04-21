@@ -86,6 +86,80 @@ pub trait Journal: Send + Sync {
     /// browser extension's `/ext/{token}/tasks` listing. Phase B
     /// adds per-token metadata filtering.
     async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>>;
+
+    /// Append a per-node execution event. The worker calls this on
+    /// every node lifecycle transition (started / completed / failed
+    /// / skipped). Used by SSE `weft follow` and by `/executions/{color}/replay`.
+    async fn record_node_event(&self, event: &NodeExecEvent) -> anyhow::Result<()>;
+
+    /// Return every node event for an execution, oldest first. Used
+    /// by replay.
+    async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>>;
+
+    /// Delete all data for a color (execution row, node events,
+    /// logs, suspensions, cost). Called by `weft clean <color>`.
+    async fn delete_execution(&self, color: Color) -> anyhow::Result<()>;
+
+    /// List past executions, newest first, capped. Used by
+    /// `weft clean --list` and "Replay execution..." picker.
+    async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>>;
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NodeExecEvent {
+    pub color: Color,
+    pub node_id: String,
+    /// Encoded lane path; JSON array of LaneFrame. Empty string for
+    /// nodes with no expand/gather context.
+    pub lane: String,
+    pub kind: NodeExecKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub at_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeExecKind {
+    Started,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+impl NodeExecKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "started" => Some(Self::Started),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionSummary {
+    pub color: Color,
+    pub project_id: String,
+    pub entry_node: String,
+    pub status: String,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

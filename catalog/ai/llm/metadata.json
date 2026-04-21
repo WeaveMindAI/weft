@@ -5,6 +5,7 @@
   "category": "ai",
   "tags": ["ai", "llm", "completion"],
   "icon": "Brain",
+  "color": "#8b5cf6",
   "inputs": [
     { "name": "prompt", "type": "String", "required": true },
     { "name": "context", "type": "String", "required": false }

@@ -5,6 +5,7 @@
   "category": "triggers/api",
   "tags": ["webhook", "http", "trigger"],
   "icon": "Webhook",
+  "color": "#22c55e",
   "inputs": [],
   "outputs": [
     {

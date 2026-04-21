@@ -219,3 +219,130 @@ pub async fn list_logs(
             .collect(),
     ))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct NodeEventIn {
+    pub node_id: String,
+    #[serde(default)]
+    pub lane: String,
+    pub kind: String,
+    #[serde(default)]
+    pub input: Option<Value>,
+    #[serde(default)]
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+pub async fn record_node_event(
+    State(state): State<DispatcherState>,
+    Path(color_str): Path<String>,
+    Json(body): Json<NodeEventIn>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let color: Color = color_str
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
+    let Some(kind) = crate::journal::NodeExecKind::parse(&body.kind) else {
+        return Err((StatusCode::BAD_REQUEST, format!("bad kind: {}", body.kind)));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let event = crate::journal::NodeExecEvent {
+        color,
+        node_id: body.node_id.clone(),
+        lane: body.lane.clone(),
+        kind,
+        input: body.input.clone(),
+        output: body.output.clone(),
+        error: body.error.clone(),
+        at_unix: now,
+    };
+    state
+        .journal
+        .record_node_event(&event)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+
+    let project_id = state
+        .journal
+        .execution_project(color)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let bus_event = match kind {
+        crate::journal::NodeExecKind::Started => crate::events::DispatcherEvent::NodeStarted {
+            color,
+            node: body.node_id,
+            lane: body.lane,
+            input: body.input.unwrap_or(Value::Null),
+            project_id,
+        },
+        crate::journal::NodeExecKind::Completed => {
+            crate::events::DispatcherEvent::NodeCompleted {
+                color,
+                node: body.node_id,
+                lane: body.lane,
+                output: body.output.unwrap_or(Value::Null),
+                project_id,
+            }
+        }
+        crate::journal::NodeExecKind::Failed => crate::events::DispatcherEvent::NodeFailed {
+            color,
+            node: body.node_id,
+            lane: body.lane,
+            error: body.error.unwrap_or_default(),
+            project_id,
+        },
+        crate::journal::NodeExecKind::Skipped => crate::events::DispatcherEvent::NodeSkipped {
+            color,
+            node: body.node_id,
+            lane: body.lane,
+            project_id,
+        },
+    };
+    state.events.publish(bus_event).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Replay a past execution: returns all node events in order so the
+/// webview can animate the execution from its beginning.
+pub async fn replay(
+    State(state): State<DispatcherState>,
+    Path(color_str): Path<String>,
+) -> Result<Json<Vec<crate::journal::NodeExecEvent>>, StatusCode> {
+    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let events = state
+        .journal
+        .events_for(color)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(events))
+}
+
+/// List past executions; for `weft replay` picker and weft clean.
+pub async fn list_executions(
+    State(state): State<DispatcherState>,
+) -> Result<Json<Vec<crate::journal::ExecutionSummary>>, StatusCode> {
+    let summaries = state
+        .journal
+        .list_executions(200)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(summaries))
+}
+
+pub async fn delete_execution(
+    State(state): State<DispatcherState>,
+    Path(color_str): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    state
+        .journal
+        .delete_execution(color)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}

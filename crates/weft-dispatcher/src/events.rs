@@ -27,6 +27,10 @@ pub enum DispatcherEvent {
     ExecutionCompleted { color: Color, project_id: String, outputs: serde_json::Value },
     ExecutionFailed { color: Color, project_id: String, error: String },
     NodeStatusChanged { color: Color, node: String, status: String, project_id: String },
+    NodeStarted { color: Color, node: String, lane: String, input: serde_json::Value, project_id: String },
+    NodeCompleted { color: Color, node: String, lane: String, output: serde_json::Value, project_id: String },
+    NodeFailed { color: Color, node: String, lane: String, error: String, project_id: String },
+    NodeSkipped { color: Color, node: String, lane: String, project_id: String },
     CostReported { color: Color, project_id: String, service: String, amount_usd: f64 },
     TriggerUrlChanged { project_id: String, node_id: String, url: String },
     ProjectRegistered { project_id: String, name: String },
@@ -43,6 +47,10 @@ impl DispatcherEvent {
             | Self::ExecutionCompleted { project_id, .. }
             | Self::ExecutionFailed { project_id, .. }
             | Self::NodeStatusChanged { project_id, .. }
+            | Self::NodeStarted { project_id, .. }
+            | Self::NodeCompleted { project_id, .. }
+            | Self::NodeFailed { project_id, .. }
+            | Self::NodeSkipped { project_id, .. }
             | Self::CostReported { project_id, .. }
             | Self::TriggerUrlChanged { project_id, .. }
             | Self::ProjectRegistered { project_id, .. }
@@ -59,6 +67,10 @@ impl DispatcherEvent {
             | Self::ExecutionCompleted { color, .. }
             | Self::ExecutionFailed { color, .. }
             | Self::NodeStatusChanged { color, .. }
+            | Self::NodeStarted { color, .. }
+            | Self::NodeCompleted { color, .. }
+            | Self::NodeFailed { color, .. }
+            | Self::NodeSkipped { color, .. }
             | Self::CostReported { color, .. } => Some(*color),
             Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }

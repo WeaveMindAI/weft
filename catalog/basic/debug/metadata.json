@@ -5,6 +5,7 @@
   "category": "basic",
   "tags": ["debug", "inspect", "log"],
   "icon": "Bug",
+  "color": "#ef4444",
   "inputs": [
     { "name": "value", "type": "T", "required": false }
   ],

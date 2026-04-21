@@ -5,6 +5,7 @@
   "category": "triggers",
   "tags": ["cron", "schedule", "timer", "trigger"],
   "icon": "Clock",
+  "color": "#22c55e",
   "inputs": [],
   "outputs": [
     { "name": "firedAt", "type": "String", "required": false }

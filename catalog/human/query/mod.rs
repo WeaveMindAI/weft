@@ -5,8 +5,9 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft_core::node::{Diagnostic, NodeOutput, Severity};
+use weft_core::project::{NodeDefinition, ProjectDefinition};
 use weft_core::{ExecutionContext, FormSchema, Node, NodeMetadata, WeftResult};
-use weft_core::node::NodeOutput;
 
 pub struct HumanQueryNode;
 
@@ -31,5 +32,32 @@ impl Node for HumanQueryNode {
         let submission = ctx.await_form(schema).await?;
 
         Ok(NodeOutput::with("submission", serde_json::to_value(submission).unwrap_or(Value::Null)))
+    }
+
+    fn validate(&self, node: &NodeDefinition, _project: &ProjectDefinition) -> Vec<Diagnostic> {
+        let mut d = Vec::new();
+        let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+        // At least one form field declared. Without fields the
+        // human gets a meaningless empty form.
+        let has_fields = node
+            .config
+            .get("formSchema")
+            .and_then(|v| v.get("fields"))
+            .and_then(|v| v.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+        if !has_fields {
+            d.push(Diagnostic {
+                line,
+                column: 0,
+                severity: Severity::Error,
+                message: format!(
+                    "HumanQuery '{}' has no form fields; the human would see an empty form.",
+                    node.id
+                ),
+                code: Some("humanquery-empty-form".into()),
+            });
+        }
+        d
     }
 }

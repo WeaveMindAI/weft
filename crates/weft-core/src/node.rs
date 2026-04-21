@@ -22,6 +22,40 @@ pub trait Node: Send + Sync {
     /// Run this node. `ctx` provides language primitives (await_form,
     /// report_cost, etc). Input values are pre-resolved on ctx.
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput>;
+
+    /// Optional per-node validation pass. Runs during /validate
+    /// after the generic rules. Override to check node-specific
+    /// invariants (e.g. EmailSend must have a wired config input
+    /// from an EmailConfig node). Default: no-op.
+    fn validate(
+        &self,
+        _node: &crate::project::NodeDefinition,
+        _project: &crate::project::ProjectDefinition,
+    ) -> Vec<Diagnostic> {
+        Vec::new()
+    }
+}
+
+/// Validation diagnostic. Emitted by the generic validate pass and
+/// per-node validators. Mirrored by the VS Code extension's
+/// Diagnostic type; wire format matches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub line: usize,
+    pub column: usize,
+    pub severity: Severity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
 }
 
 /// Metadata returned from `Node::metadata`. Describes the node's
@@ -44,6 +78,10 @@ pub struct NodeMetadata {
     /// Icon hint (lucide icon name in most cases).
     #[serde(default)]
     pub icon: Option<String>,
+    /// Color hint. Free-form: hex ("#f59e0b"), CSS var ("var(--...)"), or
+    /// a token the webview maps to a palette entry. Opaque to the compiler.
+    #[serde(default)]
+    pub color: Option<String>,
     /// Input ports.
     #[serde(default)]
     pub inputs: Vec<PortDef>,

@@ -68,6 +68,25 @@ enum Cmd {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// List past executions for any project (newest first).
+    Executions {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Print a past execution's node events in order. Use for
+    /// offline inspection; `weft replay <color>` drives the graph
+    /// view animation.
+    Events { color: String },
+    /// Remove journal data. With no color: all executions older than
+    /// `--keep` days (default 30). With a color: only that execution.
+    Clean {
+        #[arg(value_name = "color")]
+        color: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        keep_days: u32,
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -135,5 +154,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
+        Cmd::Executions { limit } => commands::executions::list(ctx, limit).await,
+        Cmd::Events { color } => commands::executions::events(ctx, color).await,
+        Cmd::Clean { color, keep_days, all } => {
+            commands::executions::clean(ctx, color, keep_days, all).await
+        }
     }
 }

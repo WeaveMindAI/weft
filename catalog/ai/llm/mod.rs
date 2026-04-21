@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use minillmlib::{ChatNode, GeneratorInfo};
 use serde_json::Value;
 
-use weft_core::{CostReport, ExecutionContext, Node, NodeMetadata, WeftResult};
 use weft_core::error::WeftError;
-use weft_core::node::NodeOutput;
+use weft_core::node::{Diagnostic, NodeOutput, Severity};
+use weft_core::project::{NodeDefinition, ProjectDefinition};
+use weft_core::{CostReport, ExecutionContext, Node, NodeMetadata, WeftResult};
 
 pub struct LlmNode;
 
@@ -77,5 +78,44 @@ impl Node for LlmNode {
             .set("response", Value::String(response_text))
             .set("inputTokens", Value::from(0))
             .set("outputTokens", Value::from(0)))
+    }
+
+    fn validate(&self, node: &NodeDefinition, _project: &ProjectDefinition) -> Vec<Diagnostic> {
+        let mut d = Vec::new();
+        let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+        // Model must be set (required in the catalog, but catch the
+        // empty-string and missing cases for clarity).
+        let model = node.config.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        if model.trim().is_empty() {
+            d.push(Diagnostic {
+                line,
+                column: 0,
+                severity: Severity::Error,
+                message: format!("Llm '{}' is missing a model name.", node.id),
+                code: Some("llm-model-required".into()),
+            });
+        }
+        // API key must come from somewhere: config or OPENROUTER_API_KEY
+        // env var (resolved at run time). Warn (not error) when both
+        // config and env look absent at author time.
+        let cfg_has_key = node
+            .config
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !cfg_has_key && std::env::var("OPENROUTER_API_KEY").is_err() {
+            d.push(Diagnostic {
+                line,
+                column: 0,
+                severity: Severity::Warning,
+                message: format!(
+                    "Llm '{}' has no apiKey in config and OPENROUTER_API_KEY is not set. The call will fail at run time.",
+                    node.id
+                ),
+                code: Some("llm-api-key-missing".into()),
+            });
+        }
+        d
     }
 }

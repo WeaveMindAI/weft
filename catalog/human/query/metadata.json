@@ -5,6 +5,7 @@
   "category": "human",
   "tags": ["human", "form", "hitl", "suspension"],
   "icon": "User",
+  "color": "#ec4899",
   "inputs": [
     { "name": "context", "type": "String", "required": false },
     { "name": "title", "type": "String", "required": false }

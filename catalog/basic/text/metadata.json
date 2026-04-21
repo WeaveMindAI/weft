@@ -5,6 +5,7 @@
   "category": "basic",
   "tags": ["literal", "string"],
   "icon": "Type",
+  "color": "#64748b",
   "inputs": [],
   "outputs": [
     { "name": "value", "type": "String", "required": false }
