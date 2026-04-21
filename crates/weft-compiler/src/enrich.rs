@@ -23,9 +23,32 @@ use weft_core::weft_type::WeftType;
 
 use crate::error::{CompileError, CompileResult};
 
-/// Enrich every node in the project with its catalog metadata, then
-/// resolve TypeVars across connected edges.
+/// Policy for handling unknown node types during enrichment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichPolicy {
+    /// Fail the whole enrichment on any unknown node type. Used by the
+    /// full compile pipeline where an unknown type is a hard error.
+    Strict,
+    /// Skip unknown types and continue. Used by the /parse endpoint
+    /// during interactive editing where the user might be partway
+    /// through typing a node type name.
+    Lenient,
+}
+
+/// Strict enrichment. Fails on unknown node types. Equivalent to
+/// `enrich_with_policy(project, catalog, EnrichPolicy::Strict)`.
 pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn NodeCatalog) -> CompileResult<()> {
+    enrich_with_policy(project, catalog, EnrichPolicy::Strict)
+}
+
+/// Enrich every node in the project with its catalog metadata, then
+/// resolve TypeVars across connected edges. Policy controls what to do
+/// with unknown node types.
+pub fn enrich_with_policy(
+    project: &mut ProjectDefinition,
+    catalog: &dyn NodeCatalog,
+    policy: EnrichPolicy,
+) -> CompileResult<()> {
     let mut errors = Vec::new();
 
     for node in project.nodes.iter_mut() {
@@ -36,7 +59,12 @@ pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn NodeCatalog) -> Com
         }
 
         let Some(node_impl) = catalog.lookup(&node.node_type) else {
-            errors.push(format!("unknown node type: '{}'", node.node_type));
+            if policy == EnrichPolicy::Strict {
+                errors.push(format!("unknown node type: '{}'", node.node_type));
+            }
+            // Lenient: leave inputs/outputs empty; render shows a
+            // placeholder box. Diagnostics pass surfaces the real
+            // error separately.
             continue;
         };
         let meta = node_impl.metadata();

@@ -49,6 +49,25 @@ pub struct ProjectDefinition {
 ///
 /// Before enrichment, `inputs` and `outputs` are empty. After, they
 /// contain the concrete per-instance port shapes the scheduler uses.
+/// Source byte range. 1-indexed lines, 0-indexed columns, end-exclusive.
+/// Populated by the parser; used by tooling (VS Code extension, AI
+/// streaming edits) to perform surgical text edits without re-serializing
+/// the whole file. Missing (None) when the struct wasn't produced by the
+/// parser (e.g. hand-constructed in tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+}
+
+impl Span {
+    pub fn single_line(line: usize, start_col: usize, end_col: usize) -> Self {
+        Self { start_line: line, start_col, end_line: line, end_col }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDefinition {
     pub id: String,
@@ -82,6 +101,21 @@ pub struct NodeDefinition {
     /// catalog at activation time.
     #[serde(default)]
     pub entry: Vec<crate::primitive::EntryPrimitive>,
+    /// Full source range of the node declaration (including config
+    /// block if present). Set by the parser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<Span>,
+    /// Source range of the node's header (`id = NodeType`), the part
+    /// before the `{` config block. Used when adding a config field
+    /// to a bare node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_span: Option<Span>,
+    /// Per-config-field source ranges, keyed by field name. Each range
+    /// covers the `key: value` pair including trailing comma. Used to
+    /// surgically edit one field without re-serializing the whole
+    /// config block.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "configSpans")]
+    pub config_spans: std::collections::BTreeMap<String, Span>,
 }
 
 fn default_config() -> Value {
@@ -152,6 +186,10 @@ pub struct Edge {
     pub source_handle: Option<String>,
     #[serde(rename = "targetHandle")]
     pub target_handle: Option<String>,
+    /// Source range of the connection line (`target.port = source.port`).
+    /// Used by tooling to remove or rewrite the edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,7 +12,7 @@ use uuid::Uuid;
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
     Edge, GroupBoundary, GroupBoundaryRole, LaneMode, NodeDefinition, PortDefinition, Position,
-    ProjectDefinition,
+    ProjectDefinition, Span,
 };
 use weft_core::weft_type::WeftType;
 
@@ -50,6 +50,15 @@ struct ParsedNode {
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
     one_of_required: Vec<Vec<String>>,
+    /// Full source range of the declaration (header + config block).
+    /// None for synthetic nodes (inline-expression children created
+    /// during parsing have a span covering the inline fragment).
+    span: Option<Span>,
+    /// Source range of the header line (`id = NodeType`), used when
+    /// adding a config field to a bare node.
+    header_span: Option<Span>,
+    /// Span per config field name.
+    config_spans: std::collections::BTreeMap<String, Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +67,9 @@ struct ParsedConnection {
     source_port: String,
     target_id: String,
     target_port: String,
+    /// Source range of the connection line (`target.port = source.port`).
+    /// None for synthetic edges produced by inline expressions.
+    span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +467,7 @@ fn try_parse_declaration(
                                     source_port: src_port,
                                     target_id: id.clone(),
                                     target_port: key.to_string(),
+                                    span: None,
                                 });
                                 continue;
                             }
@@ -552,6 +565,9 @@ fn try_parse_declaration(
                 let node = ParsedNode {
                     id, node_type: node_type, label, config,
                     parent_id: None, in_ports: all_in, out_ports: all_out, one_of_required: all_oor,
+                    span: Some(Span { start_line: line_num, start_col: 0, end_line: end_i, end_col: 0 }),
+                    header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
+                    config_spans: Default::default(),
                 };
                 return Some((Declaration::Node(node), end_i));
             } else {
@@ -592,6 +608,9 @@ fn try_parse_declaration(
         let node = ParsedNode {
             id, node_type: node_type, label, config,
             parent_id: None, in_ports: in_ports, out_ports: final_out, one_of_required: final_oor,
+            span: Some(Span { start_line: line_num, start_col: 0, end_line: next_i, end_col: 0 }),
+            header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
+            config_spans: Default::default(),
         };
         Some((Declaration::Node(node), next_i))
     }
@@ -1608,6 +1627,7 @@ fn parse_config_block_inner(
                         source_port: src_port,
                         target_id: parent_id.to_string(),
                         target_port: key.to_string(),
+                        span: Some(Span::single_line(line_num, 0, lines[i].len())),
                     });
                     i += 1;
                     continue;
@@ -1853,6 +1873,7 @@ fn try_parse_group_connection(
         source_port: source_port,
         target_id: target_id,
         target_port: target_port,
+        span: Some(Span::single_line(line_num, 0, trimmed.len())),
     })
 }
 
@@ -2106,6 +2127,9 @@ fn flatten_group(
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
         entry: Vec::new(),
+        span: None,
+        header_span: None,
+        config_spans: Default::default(),
     });
 
     // 2. Create output passthrough: {groupId}__out
@@ -2142,6 +2166,9 @@ fn flatten_group(
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
         entry: Vec::new(),
+        span: None,
+        header_span: None,
+        config_spans: Default::default(),
     });
 
     // 3. Add internal nodes
@@ -2211,6 +2238,9 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         scope,
         group_boundary: None,
         entry: Vec::new(),
+        span: pn.span,
+        header_span: pn.header_span,
+        config_spans: pn.config_spans.clone(),
     }
 }
 
@@ -2221,6 +2251,7 @@ fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
         target: pc.target_id.clone(),
         source_handle: Some(pc.source_port.clone()),
         target_handle: Some(pc.target_port.clone()),
+        span: pc.span,
     }
 }
 
@@ -2421,6 +2452,9 @@ fn try_parse_inline_expression(
                 in_ports: in_ports,
                 out_ports: out_ports,
                 one_of_required: one_of_required,
+                span: None,
+                header_span: None,
+                config_spans: Default::default(),
             };
             inline_scope.nodes.push(node);
             inline_scope.connections.push(ParsedConnection {
@@ -2428,6 +2462,7 @@ fn try_parse_inline_expression(
                 source_port: port,
                 target_id: parent_id.to_string(),
                 target_port: field_key.to_string(),
+                span: None,
             });
             return Some(start_line + 1);
         } else {
@@ -2543,6 +2578,9 @@ fn try_parse_inline_expression(
         in_ports: in_ports,
         out_ports: out_ports,
         one_of_required: one_of_required,
+        span: None,
+        header_span: None,
+        config_spans: Default::default(),
     };
     inline_scope.nodes.push(node);
     inline_scope.connections.push(ParsedConnection {
@@ -2550,6 +2588,7 @@ fn try_parse_inline_expression(
         source_port: output_port,
         target_id: parent_id.to_string(),
         target_port: field_key.to_string(),
+        span: None,
     });
 
     Some(next_line)
@@ -2659,6 +2698,7 @@ fn try_parse_connection_with_inline(
                 source_port: source_port,
                 target_id: target_id,
                 target_port: target_port,
+                span: Some(Span::single_line(start + 1, 0, line.len())),
             },
             start + 1,
         );
