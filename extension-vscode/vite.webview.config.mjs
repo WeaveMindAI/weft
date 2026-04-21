@@ -1,18 +1,16 @@
 // Vite config for the VS Code webview bundle. Produces a single IIFE
-// that the extension host loads from media/webview/bundle.js.
+// that the extension host loads from media/webview/bundle.{js,css}.
 
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [tailwindcss(), svelte()],
   build: {
     outDir: 'media/webview',
     emptyOutDir: true,
     target: 'es2020',
-    // VS Code webviews accept a single <script src> tag; keep output
-    // flat and produce a stable bundle.js + bundle.css so the host's
-    // static CSP can list them.
     rollupOptions: {
       input: 'src/webview/main.ts',
       output: {

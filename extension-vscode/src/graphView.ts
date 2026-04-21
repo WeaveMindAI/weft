@@ -14,11 +14,71 @@ export class GraphViewController {
   private parseTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
   private lastProject: ProjectDefinition | undefined;
+  private follower: EventSource | undefined;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly client: DispatcherClient,
   ) {}
+
+  /** Subscribe to SSE for a live execution (or project) and forward
+   *  NodeStarted/NodeCompleted/NodeFailed/NodeSkipped into the panel
+   *  as `execEvent` messages. Called by the Weft: Follow Execution
+   *  command.
+   */
+  followColor(color: string): void {
+    this.stopFollowing();
+    this.post({ kind: 'execReset' });
+    const es = this.client.subscribe(`/events/execution/${color}`, (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        if (
+          payload.kind === 'node_started' ||
+          payload.kind === 'node_completed' ||
+          payload.kind === 'node_failed' ||
+          payload.kind === 'node_skipped'
+        ) {
+          this.post({
+            kind: 'execEvent',
+            event: {
+              color,
+              node_id: payload.node ?? payload.node_id,
+              lane: payload.lane ?? '',
+              kind: payload.kind.replace('node_', ''),
+              input: payload.input,
+              output: payload.output,
+              error: payload.error,
+              at_unix: Math.floor(Date.now() / 1000),
+            },
+          });
+        }
+      } catch {
+        // malformed event, ignore
+      }
+    });
+    this.follower = es;
+  }
+
+  /** Replay a past execution's node events with small delays so the
+   *  user watches the graph animate. */
+  async replayColor(color: string): Promise<void> {
+    this.stopFollowing();
+    this.post({ kind: 'execReset' });
+    const events = await this.client
+      .get<any[]>(`/executions/${color}/replay`)
+      .catch(() => []);
+    for (const e of events) {
+      this.post({ kind: 'execEvent', event: e });
+      await new Promise((r) => setTimeout(r, 120));
+    }
+  }
+
+  stopFollowing(): void {
+    if (this.follower) {
+      this.follower.close();
+      this.follower = undefined;
+    }
+  }
 
   async open(doc: vscode.TextDocument): Promise<void> {
     if (this.panel) {

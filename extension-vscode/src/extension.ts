@@ -46,6 +46,35 @@ export function activate(context: vscode.ExtensionContext) {
         'weft.runProject wiring pending; for now, use the CLI: `weft run`.',
       );
     }),
+    vscode.commands.registerCommand('weft.followExecution', async () => {
+      const color = await vscode.window.showInputBox({
+        prompt: 'Execution color to follow (UUID)',
+        placeHolder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+      });
+      if (!color) return;
+      graphView.followColor(color);
+    }),
+    vscode.commands.registerCommand('weft.replayExecution', async () => {
+      // List recent executions and let the user pick.
+      const executions = (await dispatcher.get<any[]>('/executions?limit=50').catch(() => [])) ?? [];
+      if (executions.length === 0) {
+        void vscode.window.showInformationMessage('No past executions to replay.');
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        executions.map((e) => ({
+          label: e.color,
+          description: e.status,
+          detail: `project=${e.project_id} entry=${e.entry_node}`,
+        })),
+        { placeHolder: 'Pick an execution to replay' },
+      );
+      if (!picked) return;
+      await graphView.replayColor(picked.label);
+    }),
+    vscode.commands.registerCommand('weft.stopFollowing', () => {
+      graphView.stopFollowing();
+    }),
   );
 
   attachDiagnostics(context, dispatcher);

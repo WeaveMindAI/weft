@@ -21,31 +21,12 @@
   });
 </script>
 
-<div class="root">
+<div class="absolute inset-0">
   {#if error}
-    <div class="error">parse error: {error}</div>
+    <div class="p-4 text-destructive">parse error: {error}</div>
   {:else if response}
-    <Graph project={response.project} />
+    <Graph project={response.project} catalog={response.catalog} />
   {:else}
-    <div class="loading">loading graph...</div>
+    <div class="p-4 text-muted-foreground">loading graph...</div>
   {/if}
 </div>
-
-<style>
-  .root {
-    position: absolute;
-    inset: 0;
-    background: var(--vscode-editor-background);
-    color: var(--vscode-editor-foreground);
-    font-family: var(--vscode-font-family);
-  }
-
-  .loading, .error {
-    padding: 1rem;
-    color: var(--vscode-descriptionForeground);
-  }
-
-  .error {
-    color: var(--vscode-errorForeground);
-  }
-</style>

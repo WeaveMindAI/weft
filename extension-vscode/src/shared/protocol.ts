@@ -67,9 +67,65 @@ export interface Diagnostic {
   code?: string;
 }
 
+export interface FieldType {
+  kind: string;
+  // fields vary by kind (select: options, code: language, etc)
+  [key: string]: unknown;
+}
+
+export interface FieldDef {
+  key: string;
+  label: string;
+  field_type: FieldType;
+  default_value?: unknown;
+  required?: boolean;
+  description?: string;
+}
+
+export interface PortDef {
+  name: string;
+  type: string;
+  required?: boolean;
+  configurable?: boolean;
+}
+
+export interface CatalogEntry {
+  type: string;
+  label: string;
+  description: string;
+  category: string;
+  tags: string[];
+  icon?: string;
+  color?: string;
+  inputs: PortDef[];
+  outputs: PortDef[];
+  fields: FieldDef[];
+  entry: unknown[];
+  requires_infra?: boolean;
+  features?: {
+    oneOfRequired?: string[][];
+    correlatedPorts?: string[][];
+    canAddInputPorts?: boolean;
+    canAddOutputPorts?: boolean;
+    hasFormSchema?: boolean;
+  };
+}
+
 export interface ParseResponse {
   project: ProjectDefinition;
+  catalog: Record<string, CatalogEntry>;
   diagnostics: Diagnostic[];
+}
+
+export interface NodeExecEvent {
+  color: string;
+  node_id: string;
+  lane: string;
+  kind: 'started' | 'completed' | 'failed' | 'skipped';
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+  at_unix: number;
 }
 
 // ─── Messages: extension host -> webview ────────────────────────────────
@@ -78,7 +134,9 @@ export type HostMessage =
   | { kind: 'parseResult'; response: ParseResponse }
   | { kind: 'parseError'; error: string }
   | { kind: 'layoutHint'; positions: Record<string, { x: number; y: number }> }
-  | { kind: 'settings'; parseDebounceMs: number; layoutDebounceMs: number };
+  | { kind: 'settings'; parseDebounceMs: number; layoutDebounceMs: number }
+  | { kind: 'execEvent'; event: NodeExecEvent }
+  | { kind: 'execReset' };
 
 // ─── Messages: webview -> extension host ────────────────────────────────
 

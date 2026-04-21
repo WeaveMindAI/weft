@@ -1,6 +1,7 @@
 // Webview entry. Svelte 5 mounts here, reads messages from the
 // extension host, and forwards mutation intents back.
 
+import './app.css';
 import { mount } from 'svelte';
 import App from './App.svelte';
 
