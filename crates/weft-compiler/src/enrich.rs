@@ -77,6 +77,7 @@ pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn NodeCatalog) -> Com
         node.inputs = inputs;
         node.outputs = outputs;
         node.features = meta.features;
+        node.entry = meta.entry;
     }
 
     if errors.is_empty() {

@@ -126,6 +126,13 @@ impl ProjectStore {
             .map(|n| EntryNodeRef { id: n.id.clone(), node_type: n.node_type.clone() })
             .collect()
     }
+
+    /// Read-only access to the full ProjectDefinition. Returns a
+    /// clone so the caller doesn't hold the store lock.
+    pub async fn project(&self, id: uuid::Uuid) -> Option<ProjectDefinition> {
+        let lock = self.inner.read().await;
+        lock.get(&id).map(|p| p.project.clone())
+    }
 }
 
 #[derive(Debug, Clone)]

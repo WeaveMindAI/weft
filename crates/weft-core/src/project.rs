@@ -76,6 +76,12 @@ pub struct NodeDefinition {
     /// need a registry lookup per node.
     #[serde(default)]
     pub features: crate::node::NodeFeatures,
+    /// Entry primitives this node declares (Webhook, Cron, Event,
+    /// Manual). Mirrored from NodeMetadata at enrich time so the
+    /// dispatcher can wire entry routing without re-looking-up the
+    /// catalog at activation time.
+    #[serde(default)]
+    pub entry: Vec<crate::primitive::EntryPrimitive>,
 }
 
 fn default_config() -> Value {

@@ -2,16 +2,17 @@
 //!
 //! The journal owns everything durable the dispatcher needs to
 //! resume executions across restarts:
-//! - Wake tokens (webhook, form, timer) -> color + suspension point.
-//! - Suspension state: enough to restart a worker at the same node.
-//! - Cost events per color (ledger for the dashboard + billing).
+//! - Entry tokens (webhook URLs, cron schedules) -> project + node.
+//! - Suspension tokens -> color + node + metadata for wake.
+//! - Cost events per color (ledger for dashboard + billing).
 //!
 //! Cloud deployments (weavemind) swap in a restate-backed impl via
-//! the same trait; local uses `sqlite`.
+//! the same trait; local uses sqlite.
 
 pub mod sqlite;
 
 use async_trait::async_trait;
+use serde_json::Value;
 
 use weft_core::Color;
 
@@ -20,14 +21,36 @@ pub trait Journal: Send + Sync {
     async fn record_start(&self, color: Color, project_id: &str, entry_node: &str)
         -> anyhow::Result<()>;
 
+    /// Journal a mid-execution suspension. Returns the opaque token
+    /// the caller serves on the user-facing URL (e.g. form URL).
     async fn record_suspension(
         &self,
         color: Color,
         node: &str,
-        metadata: serde_json::Value,
-    ) -> anyhow::Result<()>;
+        metadata: Value,
+    ) -> anyhow::Result<String>;
 
     async fn resolve_wake(&self, token: &str) -> anyhow::Result<Option<WakeTarget>>;
+
+    /// Remove the suspension once it has been resolved. Returns true
+    /// if the token existed.
+    async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool>;
+
+    /// Mint an entry token for a project's trigger node. Returns the
+    /// opaque token the dispatcher advertises on the user-facing URL.
+    async fn mint_entry_token(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        kind: EntryKind,
+        path: Option<&str>,
+        auth: Option<Value>,
+    ) -> anyhow::Result<String>;
+
+    async fn resolve_entry_token(&self, token: &str) -> anyhow::Result<Option<EntryTarget>>;
+
+    /// Drop every entry token for a project (on deactivate or rm).
+    async fn drop_entry_tokens(&self, project_id: &str) -> anyhow::Result<()>;
 
     async fn record_cost(&self, color: Color, report: weft_core::CostReport)
         -> anyhow::Result<()>;
@@ -39,5 +62,40 @@ pub trait Journal: Send + Sync {
 pub struct WakeTarget {
     pub color: Color,
     pub node: String,
-    pub metadata: serde_json::Value,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Webhook,
+    Cron,
+    Manual,
+}
+
+impl EntryKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Webhook => "webhook",
+            Self::Cron => "cron",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "webhook" => Some(Self::Webhook),
+            "cron" => Some(Self::Cron),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EntryTarget {
+    pub project_id: String,
+    pub node_id: String,
+    pub kind: EntryKind,
+    pub path: Option<String>,
+    pub auth: Option<Value>,
 }

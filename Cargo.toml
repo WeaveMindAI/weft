@@ -52,6 +52,9 @@ chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
 regex = "1"
 
+# minillmlib: local path during development, crates.io for release
+minillmlib = { path = "../MiniLLMLibRS" }
+
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }
 weft-compiler = { path = "crates/weft-compiler" }

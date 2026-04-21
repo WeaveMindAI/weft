@@ -6,9 +6,11 @@ use axum::{extract::{Path, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use weft_core::primitive::EntryPrimitive;
 use weft_core::ProjectDefinition;
 
 use crate::backend::WakeContext;
+use crate::journal::EntryKind;
 use crate::project_store::ProjectStatus;
 use crate::state::DispatcherState;
 
@@ -131,26 +133,130 @@ pub async fn run(
     Ok(Json(RunResponse { color: color.to_string() }))
 }
 
+#[derive(Debug, Serialize)]
+pub struct ActivateResponse {
+    pub urls: Vec<ActivationUrl>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivationUrl {
+    pub node_id: String,
+    pub kind: String,
+    pub url: String,
+}
+
+/// Activate a project. For each node that declares an entry
+/// primitive, mint an entry token and return the user-facing URL.
+/// Webhook tokens under `/w/{token}/{path}`, cron tokens are
+/// registered for scheduled firing (future), manual ones just get
+/// surfaced for completeness.
 pub async fn activate(
     State(state): State<DispatcherState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    let id = id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    if state.projects.set_status(id, ProjectStatus::Active).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(StatusCode::NOT_FOUND)
+    Path(id_str): Path<String>,
+) -> Result<Json<ActivateResponse>, (StatusCode, String)> {
+    let id = id_str
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
+    let project = state
+        .projects
+        .project(id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
+
+    // Drop stale tokens before minting fresh ones. This also wipes
+    // the URLs from a previous activation so they stop resolving.
+    let project_id = id.to_string();
+    state
+        .journal
+        .drop_entry_tokens(&project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drop tokens: {e}")))?;
+
+    let base = format!("http://localhost:{}", state.config.http_port);
+    let mut urls = Vec::new();
+
+    for node in &project.nodes {
+        for entry in &node.entry {
+            let (kind, path, auth, url) = match entry {
+                EntryPrimitive::Webhook { path, auth } => {
+                    let auth_json = serde_json::to_value(auth).ok();
+                    let token = state
+                        .journal
+                        .mint_entry_token(
+                            &project_id,
+                            &node.id,
+                            EntryKind::Webhook,
+                            Some(path.as_str()),
+                            auth_json.clone(),
+                        )
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mint: {e}")))?;
+                    let url = if path.is_empty() {
+                        format!("{base}/w/{token}")
+                    } else {
+                        format!("{base}/w/{token}/{path}")
+                    };
+                    ("webhook", Some(path.clone()), auth_json, url)
+                }
+                EntryPrimitive::Cron { schedule } => {
+                    let token = state
+                        .journal
+                        .mint_entry_token(
+                            &project_id,
+                            &node.id,
+                            EntryKind::Cron,
+                            Some(schedule.as_str()),
+                            None,
+                        )
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mint: {e}")))?;
+                    let url = format!("cron:{schedule} (token {token})");
+                    ("cron", Some(schedule.clone()), None, url)
+                }
+                EntryPrimitive::Manual => {
+                    let token = state
+                        .journal
+                        .mint_entry_token(&project_id, &node.id, EntryKind::Manual, None, None)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mint: {e}")))?;
+                    let url = format!("manual (token {token})");
+                    ("manual", None, None, url)
+                }
+                EntryPrimitive::Event { .. } => {
+                    // Infra-backed event. Handled by the infra
+                    // subscription path, not an entry token.
+                    continue;
+                }
+            };
+
+            let _ = (path, auth);
+            urls.push(ActivationUrl {
+                node_id: node.id.clone(),
+                kind: kind.to_string(),
+                url,
+            });
+        }
     }
+
+    state.projects.set_status(id, ProjectStatus::Active).await;
+    Ok(Json(ActivateResponse { urls }))
 }
 
 pub async fn deactivate(
     State(state): State<DispatcherState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    let id = id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    if state.projects.set_status(id, ProjectStatus::Inactive).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(StatusCode::NOT_FOUND)
+    Path(id_str): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let id = id_str
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
+    let project_id = id.to_string();
+    state
+        .journal
+        .drop_entry_tokens(&project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drop tokens: {e}")))?;
+    if !state.projects.set_status(id, ProjectStatus::Inactive).await {
+        return Err((StatusCode::NOT_FOUND, "project not found".into()));
     }
+    Ok(StatusCode::NO_CONTENT)
 }

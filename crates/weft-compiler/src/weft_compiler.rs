@@ -2105,6 +2105,7 @@ fn flatten_group(
         features: in_features,
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
+        entry: Vec::new(),
     });
 
     // 2. Create output passthrough: {groupId}__out
@@ -2140,6 +2141,7 @@ fn flatten_group(
         features: NodeFeatures::default(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
+        entry: Vec::new(),
     });
 
     // 3. Add internal nodes
@@ -2208,6 +2210,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         features,
         scope,
         group_boundary: None,
+        entry: Vec::new(),
     }
 }
 
