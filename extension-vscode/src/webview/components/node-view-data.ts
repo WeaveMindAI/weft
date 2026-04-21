@@ -3,7 +3,7 @@ import type {
   NodeDefinition,
   PortDefinition,
 } from '../../shared/protocol';
-import type { NodeExecStatus } from './ExecutionInspector.svelte';
+import type { NodeExecStatus } from './exec-types';
 
 export interface NodeViewData {
   node: NodeDefinition;

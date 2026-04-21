@@ -1,85 +1,105 @@
 <script lang="ts">
-  import { cn } from '../utils/cn';
-  import SelfImport from './JsonTree.svelte';
-  // Recursive self-import: cast to any so the TS language server
-  // doesn't collapse the circular type to `never`.
-  const Self = SelfImport as any;
+  // Ported from dashboard-v1/src/lib/components/project/JsonTree.svelte.
+  // Recursive JSON viewer with collapsible object/array nodes,
+  // type-colored leaves (green string, blue number, amber bool,
+  // italic gray null).
 
-  interface Props {
-    value: unknown;
-    depth?: number;
+  import { untrack } from 'svelte';
+  import SelfImport from './JsonTree.svelte';
+  const Self = SelfImport as any; // recursive import, types collapse to never
+
+  let {
+    data,
+    label,
+    depth = 0,
+    defaultExpanded = false,
+  }: {
+    data: unknown;
     label?: string;
+    depth?: number;
+    defaultExpanded?: boolean;
+  } = $props();
+
+  let expanded = $state(untrack(() => defaultExpanded || depth < 1));
+
+  const isObject = $derived(data !== null && typeof data === 'object' && !Array.isArray(data));
+  const isArray = $derived(Array.isArray(data));
+  const isExpandable = $derived(isObject || isArray);
+
+  const entries: [string, unknown][] = $derived(
+    isObject
+      ? Object.entries(data as Record<string, unknown>)
+      : isArray
+        ? (data as unknown[]).map((v, i) => [String(i), v] as [string, unknown])
+        : [],
+  );
+  const preview = $derived(
+    isArray
+      ? `[${(data as unknown[]).length}]`
+      : isObject
+        ? `{${Object.keys(data as Record<string, unknown>).length}}`
+        : '',
+  );
+
+  function formatValue(val: unknown): string {
+    if (val === null) return 'null';
+    if (typeof val === 'string') return val.length > 120 ? `"${val.slice(0, 120)}..."` : `"${val}"`;
+    if (typeof val === 'boolean' || typeof val === 'number') return String(val);
+    return String(val);
   }
 
-  let { value, depth = 0, label = '' }: Props = $props();
-
-  let open = $state(true);
-
-  const kind = $derived(
-    value === null
-      ? 'null'
-      : Array.isArray(value)
-        ? 'array'
-        : typeof value,
-  );
-
-  const arrayItems: unknown[] = $derived(Array.isArray(value) ? value : []);
-  const objectEntries: [string, unknown][] = $derived(
-    value && typeof value === 'object' && !Array.isArray(value)
-      ? Object.entries(value as Record<string, unknown>)
-      : [],
-  );
-
-  function preview(v: unknown): string {
-    if (v === null) return 'null';
-    if (typeof v === 'string') {
-      const s = v.length > 80 ? v.slice(0, 77) + '...' : v;
-      return JSON.stringify(s);
-    }
-    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-    if (Array.isArray(v)) return `[… ${v.length} items]`;
-    return `{… ${Object.keys(v as object).length} keys}`;
+  function leafClass(val: unknown): string {
+    if (val === null) return 'text-zinc-400 italic';
+    if (typeof val === 'string') return 'text-green-700';
+    if (typeof val === 'number') return 'text-blue-700';
+    if (typeof val === 'boolean') return 'text-amber-700';
+    return 'text-zinc-700';
   }
 </script>
 
-<div class={cn('font-mono text-[11px]', depth === 0 && 'py-1')}>
-  {#if kind === 'object' || kind === 'array'}
-    <button
-      type="button"
-      class="text-left w-full hover:bg-muted/40 rounded px-1"
-      onclick={() => (open = !open)}
+{#if isExpandable}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div class="json-tree" style={`padding-left: ${depth > 0 ? 12 : 0}px;`}>
+    <div
+      class="flex items-center gap-1 cursor-pointer hover:bg-zinc-100 rounded px-1 py-0.5 -mx-1"
+      onclick={() => (expanded = !expanded)}
     >
-      <span class="inline-block w-3 text-muted-foreground">
-        {open ? '▾' : '▸'}
-      </span>
-      {#if label}<span class="text-foreground">{label}:</span>{/if}
-      <span class="text-muted-foreground ml-1">{preview(value)}</span>
-    </button>
-    {#if open}
-      <div class="pl-3 border-l border-border/40 ml-1">
-        {#if kind === 'array'}
-          {#each arrayItems as item, i}
-            <Self value={item} depth={depth + 1} label={`[${i}]`} />
-          {/each}
-        {:else}
-          {#each objectEntries as entry}
-            <Self value={entry[1]} depth={depth + 1} label={entry[0]} />
-          {/each}
-        {/if}
-      </div>
-    {/if}
-  {:else}
-    <div class="px-1">
-      {#if label}<span class="text-foreground">{label}:</span>{/if}
-      <span
-        class={cn(
-          'ml-1',
-          kind === 'string' && 'text-[oklch(70%_0.14_120)]',
-          kind === 'number' && 'text-[oklch(70%_0.14_30)]',
-          kind === 'boolean' && 'text-[oklch(70%_0.14_270)]',
-          kind === 'null' && 'text-muted-foreground',
-        )}>{preview(value)}</span
+      <svg
+        class={`w-3 h-3 text-zinc-400 shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`}
+        viewBox="0 0 16 16"
+        fill="currentColor"
       >
+        <path d="M6.22 4.22a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 0 1-1.06-1.06L8.94 8 6.22 5.28a.75.75 0 0 1 0-1.06Z" />
+      </svg>
+      {#if label !== undefined}
+        <span class="text-[11px] font-medium text-zinc-600">{label}</span>
+      {/if}
+      {#if !expanded}
+        <span class="text-[10px] text-zinc-400 font-mono">{preview}</span>
+      {/if}
     </div>
-  {/if}
-</div>
+    {#if expanded}
+      {#each entries as entry}
+        {@const key = entry[0]}
+        {@const value = entry[1]}
+        {@const childExpandable = value !== null && typeof value === 'object'}
+        {#if childExpandable}
+          <Self data={value} label={key} depth={depth + 1} />
+        {:else}
+          <div class="flex items-start gap-1 py-0.5" style={`padding-left: ${(depth + 1) * 12}px;`}>
+            <span class="text-[11px] font-medium text-zinc-500 shrink-0">{key}:</span>
+            <span class={`text-[11px] font-mono ${leafClass(value)} break-all`}>{formatValue(value)}</span>
+          </div>
+        {/if}
+      {/each}
+    {/if}
+  </div>
+{:else}
+  <div class="flex items-start gap-1 py-0.5" style={`padding-left: ${depth * 12}px;`}>
+    {#if label !== undefined}
+      <span class="text-[11px] font-medium text-zinc-500 shrink-0">{label}:</span>
+    {/if}
+    <span class={`text-[11px] font-mono ${leafClass(data)} break-all`}>{formatValue(data)}</span>
+  </div>
+{/if}

@@ -20,7 +20,7 @@
   import CustomEdge from './components/CustomEdge.svelte';
   import GroupNode from './components/GroupNode.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
-  import type { NodeExecStatus } from './components/ExecutionInspector.svelte';
+  import type { NodeExecStatus } from './components/exec-types';
   import type { NodeViewData } from './components/node-view-data';
 
   interface Props {
@@ -87,10 +87,44 @@
     const target = e.target as HTMLElement | null;
     const inInput =
       target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-    if (inInput) return;
+
+    // Ctrl+P always works even inside inputs: it's the primary way
+    // to open the palette.
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'p') {
       paletteOpen = !paletteOpen;
       e.preventDefault();
+      return;
+    }
+
+    if (inInput) return;
+
+    // Ctrl+D: duplicate selected.
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
+      const sel = nodes.find((n) => n.selected);
+      if (sel) {
+        e.preventDefault();
+        send({ kind: 'mutation', mutation: { kind: 'duplicateNode', nodeId: sel.id } });
+      }
+      return;
+    }
+
+    // Delete selected nodes and edges.
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      let touched = false;
+      for (const n of nodes) {
+        if (n.selected) {
+          send({ kind: 'mutation', mutation: { kind: 'removeNode', id: n.id } });
+          touched = true;
+        }
+      }
+      for (const edge of edges) {
+        if (edge.selected) {
+          send({ kind: 'mutation', mutation: { kind: 'removeEdge', edgeId: edge.id } });
+          touched = true;
+        }
+      }
+      if (touched) e.preventDefault();
+      return;
     }
   }
 
@@ -278,6 +312,83 @@
     const id = `n_${Date.now().toString(36)}`;
     send({ kind: 'mutation', mutation: { kind: 'addNode', id, nodeType } });
   }
+
+  // Right-click context menu on the canvas or on a node. Floating
+  // menu on document.body (same helper as the port context menu).
+  let menuCleanup: (() => void) | undefined;
+
+  function closeMenu() {
+    menuCleanup?.();
+    menuCleanup = undefined;
+  }
+
+  function openContextMenu(e: MouseEvent, items: Array<{ label: string; color?: string; onClick: () => void }>) {
+    e.preventDefault();
+    closeMenu();
+    const backdrop = document.createElement('div');
+    backdrop.style.cssText = 'position:fixed;inset:0;z-index:9998;';
+    backdrop.addEventListener('click', closeMenu);
+    backdrop.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      closeMenu();
+    });
+    const menu = document.createElement('div');
+    menu.style.cssText = `position:fixed;left:${e.clientX}px;top:${e.clientY}px;z-index:9999;background:white;border:1px solid #e4e4e7;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:4px 0;min-width:180px;`;
+    for (const item of items) {
+      const btn = document.createElement('button');
+      const c = item.color ?? '#18181b';
+      btn.style.cssText = `width:100%;display:flex;align-items:center;gap:8px;padding:6px 12px;font-size:12px;text-align:left;border:none;background:none;cursor:pointer;color:${c};`;
+      btn.addEventListener('mouseenter', () => (btn.style.background = '#f4f4f5'));
+      btn.addEventListener('mouseleave', () => (btn.style.background = 'none'));
+      btn.innerHTML = `<span>${item.label}</span>`;
+      btn.addEventListener('click', () => {
+        item.onClick();
+        closeMenu();
+      });
+      menu.appendChild(btn);
+    }
+    document.body.appendChild(backdrop);
+    document.body.appendChild(menu);
+    menuCleanup = () => {
+      backdrop.remove();
+      menu.remove();
+      menuCleanup = undefined;
+    };
+  }
+
+  function onPaneContextMenu(params: { event: MouseEvent }) {
+    openContextMenu(params.event, [
+      {
+        label: 'Add Node...  (Ctrl+P)',
+        onClick: () => {
+          paletteOpen = true;
+        },
+      },
+    ]);
+  }
+
+  function handleNodeContextMenu(ev: any) {
+    if (!ev || !ev.event || !ev.node) return;
+    onNodeContextMenu(ev.event as MouseEvent, ev.node);
+  }
+
+  function onNodeContextMenu(e: MouseEvent, n: any) {
+    openContextMenu(e, [
+      {
+        label: 'Duplicate  (Ctrl+D)',
+        onClick: () => {
+          send({ kind: 'mutation', mutation: { kind: 'duplicateNode', nodeId: n.id } });
+        },
+      },
+      {
+        label: 'Delete  (Del)',
+        color: '#ef4444',
+        onClick: () => {
+          send({ kind: 'mutation', mutation: { kind: 'removeNode', id: n.id } });
+        },
+      },
+    ]);
+  }
 </script>
 
 <div class="w-full h-full relative">
@@ -293,6 +404,8 @@
     proOptions={{ hideAttribution: true }}
     onnodedragstop={onNodeDragStop}
     onconnect={onConnect}
+    onpanecontextmenu={onPaneContextMenu}
+    onnodecontextmenu={handleNodeContextMenu}
   >
     <Background />
     <Controls position="bottom-left" showZoom showFitView showLock={false} />
