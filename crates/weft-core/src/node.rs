@@ -61,6 +61,25 @@ pub struct NodeMetadata {
     /// an explicit flag for nodes that use infra without entry.
     #[serde(default)]
     pub requires_infra: bool,
+    /// Node-level semantic constraints. Small, extensible.
+    #[serde(default)]
+    pub features: NodeFeatures,
+}
+
+/// Node-level semantic constraints. All optional; empty by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeFeatures {
+    /// Each inner list is a port group where at least ONE port must
+    /// be non-null. If every port in a group is null/missing, the
+    /// node is skipped. Example: email send might declare
+    /// `one_of_required: [["message", "media"]]`.
+    #[serde(default, rename = "oneOfRequired")]
+    pub one_of_required: Vec<Vec<String>>,
+    /// Port groups where values across the listed ports must share
+    /// the same parent lane (for fan-out correlation). Phase A2+
+    /// when we need it.
+    #[serde(default, rename = "correlatedPorts")]
+    pub correlated_ports: Vec<Vec<String>>,
 }
 
 use crate::project::LaneMode;

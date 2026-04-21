@@ -38,8 +38,17 @@ pub struct ProjectDefinition {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Graph-level instance of a node. Ports are looked up via
-/// `node_type` against the node registry (stdlib + user + vendor).
+/// Graph-level instance of a node.
+///
+/// Two kinds of fields:
+/// - Authored: id, node_type, label, config, position, scope,
+///   group_boundary. Written by the user or the AI.
+/// - Enriched: inputs, outputs. Populated by the compiler's enrich
+///   pass, which looks up the node type's metadata, resolves TypeVars
+///   against connected edges, and materializes dynamic ports.
+///
+/// Before enrichment, `inputs` and `outputs` are empty. After, they
+/// contain the concrete per-instance port shapes the scheduler uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDefinition {
     pub id: String,
@@ -56,6 +65,17 @@ pub struct NodeDefinition {
     /// side.
     #[serde(default, rename = "groupBoundary")]
     pub group_boundary: Option<GroupBoundary>,
+    /// Enriched input ports. Empty before compile.
+    #[serde(default)]
+    pub inputs: Vec<PortDefinition>,
+    /// Enriched output ports. Empty before compile.
+    #[serde(default)]
+    pub outputs: Vec<PortDefinition>,
+    /// Enriched node-level features (one_of_required, etc). Mirrored
+    /// from NodeMetadata at compile time so the scheduler doesn't
+    /// need a registry lookup per node.
+    #[serde(default)]
+    pub features: crate::node::NodeFeatures,
 }
 
 fn default_config() -> Value {
