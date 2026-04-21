@@ -5,13 +5,15 @@
 
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
-import type { HostMessage, WebviewMessage } from './shared/protocol';
+import type { GraphMutation, HostMessage, ProjectDefinition, WebviewMessage } from './shared/protocol';
+import { buildEdit } from './surgical';
 
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
   private watchedDoc: vscode.TextDocument | undefined;
   private parseTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
+  private lastProject: ProjectDefinition | undefined;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -41,6 +43,9 @@ export class GraphViewController {
 
     this.panel.webview.html = this.renderHtml();
     this.watchedDoc = doc;
+
+    void this.sendSettings();
+    void this.sendLayoutHint();
 
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
@@ -72,6 +77,7 @@ export class GraphViewController {
     const source = this.watchedDoc.getText();
     try {
       const response = await this.client.parse(source);
+      this.lastProject = response.project;
       this.post({ kind: 'parseResult', response });
     } catch (err) {
       this.post({
@@ -91,18 +97,69 @@ export class GraphViewController {
         void this.triggerParse();
         break;
       case 'positionsChanged':
-        // Layout persistence lands with the ELK task; for now, log
-        // so a smoke-test can confirm drag events flow.
-        console.log('[weft] positions changed:', msg.positions);
+        void this.saveLayout(msg.positions);
         break;
       case 'mutation':
-        // Surgical edit helpers land next; ignore for now.
-        console.log('[weft] mutation:', msg.mutation);
+        void this.applyMutation(msg.mutation);
         break;
       case 'log':
         console[msg.level]('[weft/webview]', msg.message);
         break;
     }
+  }
+
+  private async applyMutation(mutation: GraphMutation): Promise<void> {
+    if (!this.watchedDoc || !this.lastProject) return;
+    // Reparse the current document first so spans are fresh (v1's
+    // Option A, per our design discussion). This costs ~1ms on
+    // localhost.
+    try {
+      const fresh = await this.client.parse(this.watchedDoc.getText());
+      this.lastProject = fresh.project;
+    } catch {
+      // Continue with stale project; surgical.ts will fail-safe if
+      // spans no longer resolve.
+    }
+    const edit = buildEdit(mutation, { project: this.lastProject, doc: this.watchedDoc });
+    if (!edit) {
+      void vscode.window.showWarningMessage(
+        `Weft: could not apply ${mutation.kind} mutation (missing span info).`,
+      );
+      return;
+    }
+    await vscode.workspace.applyEdit(edit);
+  }
+
+  private layoutUriFor(doc: vscode.TextDocument): vscode.Uri {
+    return vscode.Uri.parse(doc.uri.toString() + '.layout.json');
+  }
+
+  private async sendSettings(): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration('weft');
+    this.post({
+      kind: 'settings',
+      parseDebounceMs: cfg.get<number>('parse.debounceMs', 100),
+      layoutDebounceMs: cfg.get<number>('layout.debounceMs', 400),
+    });
+  }
+
+  private async sendLayoutHint(): Promise<void> {
+    if (!this.watchedDoc) return;
+    try {
+      const data = await vscode.workspace.fs.readFile(this.layoutUriFor(this.watchedDoc));
+      const text = new TextDecoder().decode(data);
+      const positions = JSON.parse(text) as Record<string, { x: number; y: number }>;
+      this.post({ kind: 'layoutHint', positions });
+    } catch {
+      // No layout file yet. Webview falls back to ELK auto-layout.
+    }
+  }
+
+  private async saveLayout(positions: Record<string, { x: number; y: number }>): Promise<void> {
+    if (!this.watchedDoc) return;
+    const uri = this.layoutUriFor(this.watchedDoc);
+    const body = JSON.stringify(positions, null, 2);
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(body));
   }
 
   private onDispose(): void {
@@ -115,8 +172,11 @@ export class GraphViewController {
 
   private renderHtml(): string {
     const panel = this.panel!;
-    const bundleUri = panel.webview.asWebviewUri(
+    const bundleJs = panel.webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'media', 'webview', 'bundle.js'),
+    );
+    const bundleCss = panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'webview', 'bundle.css'),
     );
     const cspSource = panel.webview.cspSource;
     const nonce = randomNonce();
@@ -124,13 +184,14 @@ export class GraphViewController {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data:; font-src ${cspSource};">
+<link rel="stylesheet" href="${bundleCss}">
 <title>Weft Graph</title>
 <style>html,body,#app{margin:0;padding:0;width:100%;height:100%;overflow:hidden}</style>
 </head>
 <body>
 <div id="app"></div>
-<script nonce="${nonce}" src="${bundleUri}"></script>
+<script nonce="${nonce}" src="${bundleJs}"></script>
 </body>
 </html>`;
   }
