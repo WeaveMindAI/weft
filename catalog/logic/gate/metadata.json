@@ -1,0 +1,19 @@
+{
+  "type": "Gate",
+  "label": "Gate",
+  "description": "Pass the input through to either the `then` or `else` output based on a boolean condition.",
+  "category": "logic",
+  "tags": ["gate", "branch", "conditional", "if"],
+  "icon": "GitBranch",
+  "inputs": [
+    { "name": "value", "type": "T", "required": true },
+    { "name": "condition", "type": "Boolean", "required": true }
+  ],
+  "outputs": [
+    { "name": "then", "type": "T", "required": false },
+    { "name": "else", "type": "T", "required": false }
+  ],
+  "fields": [],
+  "entry": [],
+  "requires_infra": false
+}

@@ -32,7 +32,7 @@ sink.value = greeting.value
 
     // Run in-process. Detached (no dispatcher URL) is fine for this
     // smoke test: Text emits its literal, Debug logs it, done.
-    weft_runner::loop_driver::run_loop(
+    let outcome = weft_runner::loop_driver::run_loop(
         project,
         catalog,
         color,
@@ -44,4 +44,6 @@ sink.value = greeting.value
     )
     .await
     .expect("run_loop ok");
+
+    assert!(matches!(outcome, weft_runner::LoopOutcome::Completed { .. }));
 }

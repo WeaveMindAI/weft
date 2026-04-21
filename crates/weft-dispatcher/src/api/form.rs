@@ -68,5 +68,14 @@ pub async fn submit(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
 
+    state
+        .events
+        .publish(crate::events::DispatcherEvent::ExecutionResumed {
+            color: target.color,
+            node: target.node.clone(),
+            project_id: project_id_str.to_string(),
+        })
+        .await;
+
     Ok(Json(FormSubmitResponse { color: target.color.to_string() }))
 }

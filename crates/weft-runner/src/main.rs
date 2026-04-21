@@ -10,7 +10,7 @@ use clap::Parser;
 use tokio::sync::Notify;
 
 use weft_core::ProjectDefinition;
-use weft_runner::{run_loop, EntryMode};
+use weft_runner::{run_loop, EntryMode, LoopOutcome};
 use weft_stdlib::StdlibCatalog;
 
 #[derive(Debug, Parser)]
@@ -33,15 +33,12 @@ struct Args {
     #[arg(long)]
     entry_payload: Option<String>,
 
-    /// Resume value (JSON) for a suspended run. If set, the runner
-    /// interprets entry_node as the node whose suspension completed
-    /// and seeds downstream edges instead of re-running the node.
+    /// Resume value (JSON) for a suspended run.
     #[arg(long)]
     resume_value: Option<String>,
 
-    /// Dispatcher URL (for cost reports, suspension tokens). If
-    /// absent, the runner runs in detached mode: no journal, no
-    /// suspensions (pure programs only).
+    /// Dispatcher URL (for cost reports, suspension tokens, status
+    /// reporting, log shipping).
     #[arg(long, env = "WEFT_DISPATCHER_URL")]
     dispatcher: Option<String>,
 }
@@ -82,7 +79,17 @@ async fn main() -> anyhow::Result<()> {
     let catalog = Arc::new(StdlibCatalog) as Arc<dyn weft_core::NodeCatalog>;
     let cancellation = Arc::new(Notify::new());
 
-    run_loop(
+    let http = reqwest::Client::new();
+    if let (Some(dispatcher), Some(entry)) = (&args.dispatcher, &args.entry_node) {
+        let url = format!("{dispatcher}/executions/{color}/status");
+        let body = serde_json::json!({
+            "kind": "started",
+            "entry_node": entry,
+        });
+        let _ = http.post(&url).json(&body).send().await;
+    }
+
+    let outcome = run_loop(
         project,
         catalog,
         color,
@@ -93,6 +100,21 @@ async fn main() -> anyhow::Result<()> {
         cancellation,
     )
     .await?;
+
+    if let Some(dispatcher) = &args.dispatcher {
+        let url = format!("{dispatcher}/executions/{color}/status");
+        let body = match &outcome {
+            LoopOutcome::Completed { outputs } => serde_json::json!({ "kind": "completed", "outputs": outputs }),
+            LoopOutcome::Failed { error } => serde_json::json!({ "kind": "failed", "error": error }),
+            LoopOutcome::Stuck => serde_json::json!({ "kind": "failed", "error": "execution stuck: pending pulses with no ready nodes" }),
+            LoopOutcome::Suspended { .. } => {
+                // No terminal status emitted on suspend; the resume
+                // worker reports whatever happens next.
+                return Ok(());
+            }
+        };
+        let _ = http.post(&url).json(&body).send().await;
+    }
 
     Ok(())
 }

@@ -14,6 +14,8 @@ weft-core = { workspace = true }
 weft-compiler = { workspace = true }
 weft-stdlib = { workspace = true }
 uuid = { workspace = true }
+futures = { workspace = true }
+eventsource-client = "0.13"
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -29,6 +29,20 @@ pub enum EntryMode {
     Resume,
 }
 
+/// Outcome the loop reports back to the binary wrapper. The
+/// wrapper uses this to POST the final status to the dispatcher
+/// (so `weft follow` sees completed/failed/suspended).
+#[derive(Debug, Clone)]
+pub enum LoopOutcome {
+    Completed { outputs: Value },
+    Failed { error: String },
+    Suspended { token: String },
+    /// Scheduler ran to quiescence but some pulses remain pending.
+    /// Means a graph shape bug or a readiness check missed something;
+    /// report as failure so the user notices.
+    Stuck,
+}
+
 pub async fn run_loop(
     project: ProjectDefinition,
     catalog: Arc<dyn NodeCatalog>,
@@ -38,7 +52,7 @@ pub async fn run_loop(
     entry_mode: EntryMode,
     dispatcher_url: Option<&str>,
     cancellation: Arc<Notify>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LoopOutcome> {
     // cancellation lives on the runner handle; passed to each node's
     // ExecutionContext.
     let _ = &cancellation;
@@ -221,7 +235,7 @@ pub async fn run_loop(
                         "execution suspended; worker exiting cleanly"
                     );
                     mark_waiting(&mut executions, &node_id, group.color, &group.lane, &token);
-                    return Ok(());
+                    return Ok(LoopOutcome::Suspended { token });
                 }
                 Err(e) => {
                     let err = format!("{e}");
@@ -236,18 +250,46 @@ pub async fn run_loop(
     match check_completion(&pulses, &executions) {
         Some(false) => {
             tracing::info!(target: "weft_runner", exec = %exec_id, "execution completed");
+            Ok(LoopOutcome::Completed { outputs: final_outputs(&executions) })
         }
         Some(true) => {
             tracing::warn!(target: "weft_runner", exec = %exec_id, "execution completed with failures");
+            Ok(LoopOutcome::Failed { error: first_failure(&executions).unwrap_or_else(|| "node(s) failed".into()) })
         }
         None => {
-            // Pending pulses remain but no ready nodes: stuck. Log
-            // the state so debugging is possible.
             tracing::warn!(target: "weft_runner", exec = %exec_id, pulses = pulses.len(), "execution stuck: pending pulses with no ready nodes");
+            Ok(LoopOutcome::Stuck)
         }
     }
+}
 
-    Ok(())
+/// Collect the last output value per node, keyed by node id. Gives
+/// the dispatcher something meaningful to publish on
+/// ExecutionCompleted.
+fn final_outputs(executions: &NodeExecutionTable) -> Value {
+    let mut obj = serde_json::Map::new();
+    for (node_id, execs) in executions {
+        if let Some(last) = execs.iter().rev().find(|e| e.status == NodeExecutionStatus::Completed) {
+            if let Some(output) = &last.output {
+                obj.insert(node_id.clone(), output.clone());
+            }
+        }
+    }
+    Value::Object(obj)
+}
+
+fn first_failure(executions: &NodeExecutionTable) -> Option<String> {
+    for execs in executions.values() {
+        for e in execs {
+            if e.status == NodeExecutionStatus::Failed {
+                if let Some(err) = &e.error {
+                    return Some(format!("{}: {}", e.node_id, err));
+                }
+                return Some(format!("{}: failed", e.node_id));
+            }
+        }
+    }
+    None
 }
 
 fn now_unix() -> u64 {

@@ -10,6 +10,7 @@ use weft_core::primitive::EntryPrimitive;
 use weft_core::ProjectDefinition;
 
 use crate::backend::WakeContext;
+use crate::events::DispatcherEvent;
 use crate::journal::EntryKind;
 use crate::project_store::ProjectStatus;
 use crate::state::DispatcherState;
@@ -42,6 +43,13 @@ pub async fn register(
         .register(project)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("register: {e}")))?;
+    state
+        .events
+        .publish(DispatcherEvent::ProjectRegistered {
+            project_id: summary.id.to_string(),
+            name: summary.name.clone(),
+        })
+        .await;
     Ok(Json(ProjectSummary {
         id: summary.id.to_string(),
         name: summary.name,
@@ -117,10 +125,19 @@ pub async fn run(
     };
 
     let color = uuid::Uuid::new_v4();
+
+    // Register the execution in the journal so execution_project
+    // lookups work (SSE for a color needs this).
+    state
+        .journal
+        .record_start(color, &id.to_string(), &resume_node)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+
     let wake = WakeContext {
         project_id: id.to_string(),
         color,
-        resume_node,
+        resume_node: resume_node.clone(),
         resume_value: body.payload,
         kind: crate::backend::WakeKind::Fresh,
     };
@@ -130,6 +147,15 @@ pub async fn run(
         .spawn_worker(&summary.binary_path, wake)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+
+    state
+        .events
+        .publish(DispatcherEvent::ExecutionStarted {
+            color,
+            entry_node: resume_node,
+            project_id: id.to_string(),
+        })
+        .await;
 
     Ok(Json(RunResponse { color: color.to_string() }))
 }
@@ -240,6 +266,20 @@ pub async fn activate(
     }
 
     state.projects.set_status(id, ProjectStatus::Active).await;
+    for url in &urls {
+        state
+            .events
+            .publish(DispatcherEvent::TriggerUrlChanged {
+                project_id: project_id.clone(),
+                node_id: url.node_id.clone(),
+                url: url.url.clone(),
+            })
+            .await;
+    }
+    state
+        .events
+        .publish(DispatcherEvent::ProjectActivated { project_id: project_id.clone() })
+        .await;
     Ok(Json(ActivateResponse { urls }))
 }
 
@@ -259,5 +299,9 @@ pub async fn deactivate(
     if !state.projects.set_status(id, ProjectStatus::Inactive).await {
         return Err((StatusCode::NOT_FOUND, "project not found".into()));
     }
+    state
+        .events
+        .publish(DispatcherEvent::ProjectDeactivated { project_id })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }

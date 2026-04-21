@@ -13,6 +13,10 @@ impl DispatcherClient {
         Self { base: base.into(), http: reqwest::Client::new() }
     }
 
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     pub async fn get_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}{}", self.base, path);
         let resp = self.http.get(&url).send().await.with_context(|| format!("GET {url}"))?;

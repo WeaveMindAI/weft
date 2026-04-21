@@ -23,7 +23,8 @@ use weft_core::weft_type::WeftType;
 
 use crate::error::{CompileError, CompileResult};
 
-/// Enrich every node in the project with its catalog metadata.
+/// Enrich every node in the project with its catalog metadata, then
+/// resolve TypeVars across connected edges.
 pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn NodeCatalog) -> CompileResult<()> {
     let mut errors = Vec::new();
 
@@ -80,10 +81,123 @@ pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn NodeCatalog) -> Com
         node.entry = meta.entry;
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(CompileError::Enrich(errors.join("; ")))
+    if !errors.is_empty() {
+        return Err(CompileError::Enrich(errors.join("; ")));
+    }
+
+    resolve_type_vars(project)?;
+    Ok(())
+}
+
+/// Walk edges; wherever one end is a concrete type and the other is
+/// a TypeVar, substitute the concrete type for that TypeVar across
+/// the node's ports. Iterate to a fixed point (resolving one
+/// TypeVar can open new resolutions). `MustOverride` left alone
+/// (compile error elsewhere).
+fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
+    loop {
+        let mut changed = false;
+
+        // Collect all edge endpoint types into a snapshot so we can
+        // mutate nodes without fighting the borrow checker.
+        let snapshot: Vec<(String, String, WeftType, String, String, WeftType)> = project
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let src_port = edge.source_handle.as_deref()?;
+                let tgt_port = edge.target_handle.as_deref()?;
+                let src_type = project
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == edge.source)
+                    .and_then(|n| n.outputs.iter().find(|p| p.name == src_port))
+                    .map(|p| p.port_type.clone())?;
+                let tgt_type = project
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == edge.target)
+                    .and_then(|n| n.inputs.iter().find(|p| p.name == tgt_port))
+                    .map(|p| p.port_type.clone())?;
+                Some((
+                    edge.source.clone(),
+                    src_port.to_string(),
+                    src_type,
+                    edge.target.clone(),
+                    tgt_port.to_string(),
+                    tgt_type,
+                ))
+            })
+            .collect();
+
+        for (src_node, _src_port, src_type, tgt_node, _tgt_port, tgt_type) in snapshot {
+            // Tgt has a TypeVar, src is concrete: resolve the var on
+            // the tgt side.
+            if let WeftType::TypeVar(name) = &tgt_type {
+                if !src_type.is_unresolved() {
+                    if substitute_type_var(project, &tgt_node, name, &src_type) {
+                        changed = true;
+                    }
+                }
+            }
+            // Src has a TypeVar, tgt is concrete: resolve on the src
+            // side (rarer, but it happens when a trigger's output
+            // type is `T` and downstream expects `String`).
+            if let WeftType::TypeVar(name) = &src_type {
+                if !tgt_type.is_unresolved() {
+                    if substitute_type_var(project, &src_node, name, &tgt_type) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Replace every occurrence of `TypeVar(var_name)` in the given
+/// node's inputs and outputs with `concrete`. Returns true if any
+/// replacement happened.
+fn substitute_type_var(
+    project: &mut ProjectDefinition,
+    node_id: &str,
+    var_name: &str,
+    concrete: &WeftType,
+) -> bool {
+    let Some(node) = project.nodes.iter_mut().find(|n| n.id == node_id) else {
+        return false;
+    };
+    let mut changed = false;
+    for port in node.inputs.iter_mut().chain(node.outputs.iter_mut()) {
+        changed |= replace_in_type(&mut port.port_type, var_name, concrete);
+    }
+    changed
+}
+
+fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bool {
+    match ty {
+        WeftType::TypeVar(n) if n == var_name => {
+            *ty = concrete.clone();
+            true
+        }
+        WeftType::List(inner) => replace_in_type(inner, var_name, concrete),
+        WeftType::Dict(key, val) => {
+            let a = replace_in_type(key, var_name, concrete);
+            let b = replace_in_type(val, var_name, concrete);
+            a || b
+        }
+        WeftType::Union(members) => {
+            let mut any = false;
+            for m in members.iter_mut() {
+                any |= replace_in_type(m, var_name, concrete);
+            }
+            any
+        }
+        _ => false,
     }
 }
 

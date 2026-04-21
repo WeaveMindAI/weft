@@ -56,6 +56,59 @@ pub trait Journal: Send + Sync {
         -> anyhow::Result<()>;
 
     async fn cancel(&self, color: Color) -> anyhow::Result<()>;
+
+    /// Look up which project a given color belongs to. `Ok(None)`
+    /// if the color was never journaled.
+    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>>;
+
+    /// Append a log line emitted by a running worker.
+    async fn append_log(&self, color: Color, level: &str, message: &str)
+        -> anyhow::Result<()>;
+
+    /// Return log lines for a color, oldest first, capped at `limit`.
+    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
+
+    /// Mint an extension token for a human reviewer. Returns the
+    /// opaque string the user pastes into the browser extension.
+    async fn mint_ext_token(
+        &self,
+        name: Option<&str>,
+        metadata: Option<Value>,
+    ) -> anyhow::Result<String>;
+
+    async fn ext_token_exists(&self, token: &str) -> anyhow::Result<bool>;
+
+    async fn list_ext_tokens(&self) -> anyhow::Result<Vec<ExtToken>>;
+
+    async fn revoke_ext_token(&self, token: &str) -> anyhow::Result<()>;
+
+    /// Return every live suspension across all projects. Used by the
+    /// browser extension's `/ext/{token}/tasks` listing. Phase B
+    /// adds per-token metadata filtering.
+    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtToken {
+    pub token: String,
+    pub name: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenSuspension {
+    pub token: String,
+    pub color: Color,
+    pub node: String,
+    pub metadata: Value,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub at_unix: u64,
+    pub level: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]

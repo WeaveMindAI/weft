@@ -29,6 +29,31 @@ out.value = greeting.value
 }
 
 #[test]
+fn enrich_resolves_typevar_through_edge() {
+    let source = r#"
+# Project: Resolve
+
+hello = Text { value: "hi" }
+sink = Debug
+
+sink.value = hello.value
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
+    enrich(&mut project, &StdlibCatalog).expect("enrich");
+
+    let sink = project.nodes.iter().find(|n| n.id == "sink").unwrap();
+    let value_port = sink.inputs.iter().find(|p| p.name == "value").unwrap();
+    // Debug declares `value: T`; wiring Text.value (String) upstream
+    // should resolve T to String.
+    assert_eq!(
+        value_port.port_type.to_string(),
+        "String",
+        "expected T resolved to String, got {}",
+        value_port.port_type,
+    );
+}
+
+#[test]
 fn enrich_rejects_unknown_node_type() {
     let source = r#"
 # Project: Bad

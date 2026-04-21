@@ -1,0 +1,29 @@
+{
+  "type": "HttpRequest",
+  "label": "HTTP Request",
+  "description": "Make an outbound HTTP request. Supports GET/POST/PUT/PATCH/DELETE with JSON body and custom headers.",
+  "category": "http",
+  "tags": ["http", "api", "fetch", "request"],
+  "icon": "Send",
+  "inputs": [
+    { "name": "url", "type": "String", "required": true },
+    { "name": "body", "type": "JsonDict", "required": false },
+    { "name": "headers", "type": "Dict[String, String]", "required": false }
+  ],
+  "outputs": [
+    { "name": "status", "type": "Number", "required": false },
+    { "name": "body", "type": "JsonDict", "required": false },
+    { "name": "ok", "type": "Boolean", "required": false }
+  ],
+  "fields": [
+    {
+      "key": "method",
+      "label": "Method",
+      "field_type": { "kind": "select", "options": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+      "required": true,
+      "default_value": "GET"
+    }
+  ],
+  "entry": [],
+  "requires_infra": false
+}

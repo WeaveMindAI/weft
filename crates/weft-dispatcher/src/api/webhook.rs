@@ -55,6 +55,13 @@ async fn handle_inner(
 
     let payload = body.map(|Json(v)| v).unwrap_or(Value::Null);
     let color = uuid::Uuid::new_v4();
+
+    state
+        .journal
+        .record_start(color, &entry.project_id, &entry.node_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+
     let wake = WakeContext {
         project_id: entry.project_id.clone(),
         color,
@@ -68,6 +75,15 @@ async fn handle_inner(
         .spawn_worker(&summary.binary_path, wake)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+
+    state
+        .events
+        .publish(crate::events::DispatcherEvent::ExecutionStarted {
+            color,
+            entry_node: entry.node_id.clone(),
+            project_id: entry.project_id.clone(),
+        })
+        .await;
 
     Ok((StatusCode::ACCEPTED, Json(WebhookResponse { color: color.to_string() })))
 }

@@ -1,0 +1,37 @@
+{
+  "name": "weft-extension",
+  "description": "Human-in-the-loop task manager for WeaveMind projects",
+  "private": true,
+  "version": "1.0.31",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "dev:safari": "wxt -b safari",
+    "dev:opera": "wxt -b opera",
+    "dev:edge": "wxt -b edge",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "build:safari": "wxt build -b safari",
+    "build:opera": "wxt build -b opera",
+    "build:edge": "wxt build -b edge",
+    "build:all": "pnpm build && pnpm build:firefox && pnpm build:safari && pnpm build:opera && pnpm build:edge",
+    "zip": "wxt zip",
+    "zip:firefox": "wxt zip -b firefox",
+    "zip:safari": "wxt zip -b safari",
+    "zip:opera": "wxt zip -b opera",
+    "zip:edge": "wxt zip -b edge",
+    "zip:all": "pnpm zip && pnpm zip:firefox && pnpm zip:safari && pnpm zip:opera && pnpm zip:edge",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "postinstall": "wxt prepare"
+  },
+  "devDependencies": {
+    "@tsconfig/svelte": "^5.0.8",
+    "@wxt-dev/module-svelte": "^2.0.5",
+    "svelte": "^5.54.1",
+    "svelte-check": "^4.4.5",
+    "tslib": "^2.8.1",
+    "typescript": "^5.9.3",
+    "wxt": "^0.20.20"
+  }
+}

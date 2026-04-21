@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::backend::{InfraBackend, WorkerBackend};
 use crate::config::DispatcherConfig;
+use crate::events::EventBus;
 use crate::journal::Journal;
 use crate::project_store::ProjectStore;
 
@@ -14,4 +15,5 @@ pub struct DispatcherState {
     pub workers: Arc<dyn WorkerBackend>,
     pub infra: Arc<dyn InfraBackend>,
     pub projects: ProjectStore,
+    pub events: EventBus,
 }

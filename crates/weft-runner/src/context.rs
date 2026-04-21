@@ -140,12 +140,31 @@ impl ContextHandle for RunnerHandle {
     }
 
     fn log(&self, level: LogLevel, message: String) {
-        match level {
-            LogLevel::Trace => tracing::trace!(target: "weft_runner::node", exec = %self.execution_id, "{message}"),
-            LogLevel::Debug => tracing::debug!(target: "weft_runner::node", exec = %self.execution_id, "{message}"),
-            LogLevel::Info => tracing::info!(target: "weft_runner::node", exec = %self.execution_id, "{message}"),
-            LogLevel::Warn => tracing::warn!(target: "weft_runner::node", exec = %self.execution_id, "{message}"),
-            LogLevel::Error => tracing::error!(target: "weft_runner::node", exec = %self.execution_id, "{message}"),
+        let level_str = match level {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        };
+        tracing::info!(target: "weft_runner::node", exec = %self.execution_id, level = level_str, "{message}");
+
+        // Fire-and-forget ship to the dispatcher's journal so
+        // `weft logs <color>` can retrieve it later. Silent drop if
+        // the dispatcher is unreachable: this is a logging path, we
+        // don't want it to disrupt the node.
+        if let Some(dispatcher) = self.dispatcher.clone() {
+            let url = format!("{dispatcher}/executions/{}/logs", self.color);
+            let http = self.http.clone();
+            let payload = serde_json::json!({
+                "level": level_str,
+                "message": message,
+            });
+            tokio::spawn(async move {
+                if let Err(e) = http.post(&url).json(&payload).send().await {
+                    tracing::debug!(target: "weft_runner::log", error = %e, "log ship failed");
+                }
+            });
         }
     }
 

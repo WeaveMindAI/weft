@@ -63,6 +63,34 @@ enum Cmd {
     /// Print the per-project catalog as JSON (for Tangle, VS Code,
     /// dashboard introspection).
     DescribeNodes,
+    /// Manage extension tokens (browser extension auth).
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenAction {
+    /// Mint a new extension token.
+    Mint {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List existing extension tokens.
+    Ls,
+    /// Revoke an extension token.
+    Revoke { token: String },
+}
+
+impl From<TokenAction> for commands::token::TokenAction {
+    fn from(value: TokenAction) -> Self {
+        match value {
+            TokenAction::Mint { name } => commands::token::TokenAction::Mint { name },
+            TokenAction::Ls => commands::token::TokenAction::Ls,
+            TokenAction::Revoke { token } => commands::token::TokenAction::Revoke { token },
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -106,5 +134,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Infra { action } => commands::infra::run(ctx, action.into()).await,
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,
+        Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
     }
 }

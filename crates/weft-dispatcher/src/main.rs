@@ -10,7 +10,7 @@ use tracing::info;
 
 use weft_dispatcher::{
     api::router,
-    backend::{DockerInfraBackend, SubprocessWorkerBackend},
+    backend::{KindInfraBackend, SubprocessWorkerBackend},
     journal::sqlite::SqliteJournal,
     DispatcherConfig, DispatcherState,
 };
@@ -50,8 +50,9 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config.clone()),
         journal: Arc::new(journal),
         workers: Arc::new(SubprocessWorkerBackend::new(runner_path, self_url)),
-        infra: Arc::new(DockerInfraBackend::new()),
+        infra: Arc::new(KindInfraBackend::new()),
         projects,
+        events: weft_dispatcher::EventBus::new(),
     };
 
     let app = router(state);

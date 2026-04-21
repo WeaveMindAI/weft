@@ -105,6 +105,7 @@ async fn build_state(tmp: &tempfile::TempDir) -> (DispatcherState, Arc<Mutex<Vec
         workers: Arc::new(RecordingWorkerBackend { spawned: spawned.clone() }),
         infra: Arc::new(StubInfraBackend),
         projects,
+        events: weft_dispatcher::EventBus::new(),
     };
     (state, spawned)
 }

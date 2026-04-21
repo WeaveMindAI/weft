@@ -1,0 +1,26 @@
+{
+  "type": "Cron",
+  "label": "Cron Schedule",
+  "description": "Fire on a schedule. Standard cron expression in the `schedule` field.",
+  "category": "triggers",
+  "tags": ["cron", "schedule", "timer", "trigger"],
+  "icon": "Clock",
+  "inputs": [],
+  "outputs": [
+    { "name": "firedAt", "type": "String", "required": false }
+  ],
+  "fields": [
+    {
+      "key": "schedule",
+      "label": "Schedule",
+      "field_type": { "kind": "text" },
+      "required": true,
+      "default_value": "*/5 * * * *",
+      "description": "Standard cron expression. Default fires every 5 minutes."
+    }
+  ],
+  "entry": [
+    { "kind": "cron", "schedule": "*/5 * * * *" }
+  ],
+  "requires_infra": false
+}

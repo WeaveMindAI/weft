@@ -30,6 +30,15 @@ pub mod debug;
 #[path = "../../../catalog/ai/llm/mod.rs"]
 pub mod llm;
 
+#[path = "../../../catalog/logic/gate/mod.rs"]
+pub mod gate;
+
+#[path = "../../../catalog/triggers/cron/mod.rs"]
+pub mod cron;
+
+#[path = "../../../catalog/http/request/mod.rs"]
+pub mod http_request;
+
 use weft_core::node::{FormFieldPort, FormFieldSpec, Node, NodeCatalog};
 
 /// All nodes shipped in the standard library, as static trait objects.
@@ -40,6 +49,9 @@ pub fn all_nodes() -> Vec<&'static dyn Node> {
         &text::TextNode,
         &debug::DebugNode,
         &llm::LlmNode,
+        &gate::GateNode,
+        &cron::CronNode,
+        &http_request::HttpRequestNode,
     ]
 }
 

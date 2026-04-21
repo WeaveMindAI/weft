@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 
 use weft_core::{Color, CostReport};
 
-use crate::journal::{EntryKind, EntryTarget, Journal, WakeTarget};
+use crate::journal::{EntryKind, EntryTarget, ExtToken, Journal, LogEntry, OpenSuspension, WakeTarget};
 
 pub struct SqliteJournal {
     pool: SqlitePool,
@@ -56,6 +56,24 @@ impl SqliteJournal {
 
             CREATE INDEX IF NOT EXISTS idx_entry_token_project
                 ON entry_token(project_id);
+
+            CREATE TABLE IF NOT EXISTS ext_token (
+                token TEXT PRIMARY KEY,
+                name TEXT,
+                metadata TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS log_entry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                color TEXT NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_log_entry_color
+                ON log_entry(color);
 
             CREATE TABLE IF NOT EXISTS cost_event (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,6 +247,129 @@ impl Journal for SqliteJournal {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT project_id FROM execution WHERE color = ?")
+                .bind(color.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(p,)| p))
+    }
+
+    async fn append_log(
+        &self,
+        color: Color,
+        level: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO log_entry (color, level, message, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(color.to_string())
+        .bind(level)
+        .bind(message)
+        .bind(now_unix() as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT created_at, level, message FROM log_entry \
+             WHERE color = ? ORDER BY id ASC LIMIT ?",
+        )
+        .bind(color.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(at, level, message)| LogEntry {
+                at_unix: at as u64,
+                level,
+                message,
+            })
+            .collect())
+    }
+
+    async fn mint_ext_token(
+        &self,
+        name: Option<&str>,
+        metadata: Option<Value>,
+    ) -> anyhow::Result<String> {
+        let token = format!("wm_ext_{}", uuid::Uuid::new_v4().simple());
+        let metadata_str = match metadata {
+            Some(v) => Some(serde_json::to_string(&v)?),
+            None => None,
+        };
+        sqlx::query(
+            "INSERT INTO ext_token (token, name, metadata, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&token)
+        .bind(name)
+        .bind(metadata_str)
+        .bind(now_unix() as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(token)
+    }
+
+    async fn ext_token_exists(&self, token: &str) -> anyhow::Result<bool> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT token FROM ext_token WHERE token = ?")
+                .bind(token)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    async fn list_ext_tokens(&self) -> anyhow::Result<Vec<ExtToken>> {
+        let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT token, name, created_at FROM ext_token ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(token, name, created_at)| ExtToken {
+                token,
+                name,
+                created_at: created_at as u64,
+            })
+            .collect())
+    }
+
+    async fn revoke_ext_token(&self, token: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM ext_token WHERE token = ?")
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>> {
+        let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT token, color, node, metadata, created_at FROM suspension \
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (token, color_str, node, metadata_str, created_at) in rows {
+            let Ok(color) = color_str.parse::<Color>() else { continue };
+            let metadata: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+            out.push(OpenSuspension {
+                token,
+                color,
+                node,
+                metadata,
+                created_at: created_at as u64,
+            });
+        }
+        Ok(out)
     }
 }
 
