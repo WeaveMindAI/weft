@@ -47,12 +47,14 @@ enum Cmd {
     Rm { project: String },
     /// Tail historical + live logs for a project or execution.
     Logs { target: String },
-    /// Show terminal view of the dashboard for the connected dispatcher.
-    Status,
-    /// Start the local dispatcher daemon (if not running).
-    Start,
-    /// Stop the local dispatcher daemon.
-    DaemonStop,
+    /// Manage the local dispatcher daemon (start, stop, status,
+    /// restart, logs). The dispatcher is the long-lived process that
+    /// owns projects, executions, and infra; `weft run` and the
+    /// VS Code extension talk to it over HTTP.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Provision or tear down infra nodes for the current project.
     Infra {
         #[command(subcommand)]
@@ -118,11 +120,46 @@ enum InfraAction {
     Down,
 }
 
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    /// Start the daemon in the background.
+    Start,
+    /// Stop the running daemon.
+    Stop,
+    /// Report whether the daemon is reachable.
+    Status,
+    /// Stop then start the daemon.
+    Restart,
+    /// Tail the daemon's stderr log.
+    Logs {
+        /// Number of lines to print.
+        #[arg(long, default_value_t = 100)]
+        tail: usize,
+        /// Keep streaming new lines as the daemon writes them.
+        #[arg(long, short = 'f', default_value_t = false)]
+        follow: bool,
+    },
+}
+
 impl From<InfraAction> for commands::infra::InfraAction {
     fn from(value: InfraAction) -> Self {
         match value {
             InfraAction::Up => commands::infra::InfraAction::Up,
             InfraAction::Down => commands::infra::InfraAction::Down,
+        }
+    }
+}
+
+impl From<DaemonAction> for commands::daemon::DaemonAction {
+    fn from(value: DaemonAction) -> Self {
+        match value {
+            DaemonAction::Start => commands::daemon::DaemonAction::Start,
+            DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
+            DaemonAction::Status => commands::daemon::DaemonAction::Status,
+            DaemonAction::Restart => commands::daemon::DaemonAction::Restart,
+            DaemonAction::Logs { tail, follow } => {
+                commands::daemon::DaemonAction::Logs { tail, follow }
+            }
         }
     }
 }
@@ -147,9 +184,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Ps => commands::ps::run(ctx).await,
         Cmd::Rm { project } => commands::rm::run(ctx, project).await,
         Cmd::Logs { target } => commands::logs::run(ctx, target).await,
-        Cmd::Status => commands::status::run(ctx).await,
-        Cmd::Start => commands::start::run(ctx).await,
-        Cmd::DaemonStop => commands::daemon_stop::run(ctx).await,
+        Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
         Cmd::Infra { action } => commands::infra::run(ctx, action.into()).await,
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,

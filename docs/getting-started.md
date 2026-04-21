@@ -4,40 +4,43 @@ How to boot a dispatcher, scaffold a project, run it, wire a
 webhook, and see live events. Everything here runs against the
 subprocess worker backend and sqlite journal, no cloud, no docker.
 
-## Build
+## Install
+
+One script, release build, symlinks into `~/.local/bin`:
 
 ```bash
 git clone <this repo>
 cd weft
-cargo build -p weft-dispatcher -p weft-runner -p weft-cli
+./install.sh
 ```
 
-The three binaries land in `target/debug/`:
+That produces:
 
-- `weft` — the CLI.
-- `weft-dispatcher` — the always-on daemon.
-- `weft-runner` — spawned per execution by the dispatcher; never
-  invoked directly.
+- `~/.local/bin/weft` (CLI)
+- `~/.local/bin/weft-dispatcher` (daemon)
+- `~/.local/bin/weft-runner` (worker, invoked by the dispatcher)
 
-Add `target/debug` to your `PATH` for the rest of this guide, or
-prefix everything with the full path.
+The script verifies `~/.local/bin` is on your `PATH`; if not, it
+prints the exact line to add to your shell rc. The dispatcher
+auto-discovers `weft-runner` as a sibling of its own binary, so
+`WEFT_RUNNER_PATH` isn't needed.
+
+Re-run `./install.sh` anytime to rebuild and re-link. `./install.sh
+--debug` uses the debug profile for faster incremental builds.
+`./install.sh --uninstall` removes the symlinks.
 
 ## Start the dispatcher
 
-The dispatcher listens on port 9999 by default. Override with
-`WEFT_HTTP_PORT` if it clashes. The dispatcher needs to know where
-`weft-runner` lives; set `WEFT_RUNNER_PATH`.
-
 ```bash
-# one-shot foreground (useful for tailing logs):
-WEFT_RUNNER_PATH="$PWD/target/debug/weft-runner" \
-  ./target/debug/weft-dispatcher
-
-# or use the CLI daemon lifecycle:
-weft start       # forks a dispatcher in the background
-weft status      # confirm reachability
-weft daemon-stop # when you're done
+weft daemon start    # fork in the background
+weft daemon status   # is it up?
+weft daemon logs -f  # tail the log
+weft daemon stop     # when done
+weft daemon restart  # stop + start
 ```
+
+Port 9999 by default. Override with `WEFT_HTTP_PORT=…` when
+calling `weft daemon start` if that port is taken.
 
 The dispatcher's ops dashboard lives at `http://localhost:9999/`.
 
@@ -162,32 +165,37 @@ infra-backed nodes are ported.
 ## CLI cheat sheet
 
 ```
-weft new <name>           Scaffold a new project directory.
-weft build                Compile; also runs under the hood for weft run.
-weft run [--detach]       Compile, register, fire an execution.
-weft follow <id|color>    Live SSE events.
-weft logs <color>         Historical logs for one execution.
-weft stop <color>         Cancel an execution.
-weft ps                   List registered projects.
-weft activate <project>   Mint webhook/cron entry URLs.
-weft deactivate <project> Drop all entry tokens for the project.
-weft rm <project>         Remove project (+ its binary) from the dispatcher.
-weft status               Check dispatcher reachability.
-weft start / daemon-stop  Manage the local dispatcher daemon.
-weft token mint/ls/revoke Manage browser-extension tokens.
-weft describe-nodes       Print the per-project catalog as JSON.
-weft infra up/down        Provision/tear down infra pods (kind).
-weft add <git-url>        Install an external node package (phase B).
+weft new <name>            Scaffold a new project directory.
+weft build                 Compile; also runs under the hood for weft run.
+weft run [--detach]        Compile, register, fire an execution.
+weft follow <id|color>     Live SSE events.
+weft logs <color>          Historical logs for one execution.
+weft stop <color>          Cancel an execution.
+weft ps                    List registered projects.
+weft activate <project>    Mint webhook/cron entry URLs.
+weft deactivate <project>  Drop all entry tokens for the project.
+weft rm <project>          Remove project (+ its binary).
+weft daemon start          Launch the local dispatcher in the background.
+weft daemon stop           Stop it.
+weft daemon status         Report whether it's running.
+weft daemon restart        Stop + start.
+weft daemon logs [-f]      Tail the dispatcher's log.
+weft token mint/ls/revoke  Manage browser-extension tokens.
+weft describe-nodes        Print the per-project catalog as JSON.
+weft executions            List past executions.
+weft events <color>        Print one execution's node events.
+weft clean [<color>]       Purge journal data (defaults: keep 30 days).
+weft infra up/down         Provision/tear down infra pods (kind).
+weft add <git-url>         Install an external node package (phase B).
 ```
 
 ## Troubleshooting
 
-- `dispatcher unreachable`: the daemon isn't running. `weft start`
-  or run `weft-dispatcher` in a terminal.
-- `weft-runner not found`: point the dispatcher at your binary with
-  `WEFT_RUNNER_PATH`.
-- Port 9999 in use: `WEFT_HTTP_PORT=19999 weft-dispatcher ...`, and
+- `dispatcher unreachable`: run `weft daemon start`.
+- `weft-runner not found`: re-run `./install.sh`; the dispatcher
+  expects `weft-runner` to sit next to its own binary.
+- Port 9999 in use: `WEFT_HTTP_PORT=19999 weft daemon start`, and
   pass `--dispatcher http://localhost:19999` to every `weft`
-  command (or set `WEFT_DISPATCHER_URL`).
+  command (or `export WEFT_DISPATCHER_URL=http://localhost:19999`).
 - `kind` not found: install it. The dispatcher logs an actionable
   error when the first infra node is provisioned.

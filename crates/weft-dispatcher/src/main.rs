@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         config.http_port = port;
     }
 
-    let runner_path = std::env::var("WEFT_RUNNER_PATH").unwrap_or_else(|_| "weft-runner".to_string());
+    let runner_path = resolve_runner_path();
     let self_url = format!("http://localhost:{}", config.http_port);
     let projects_dir = config.data_dir.join("projects");
     let projects = weft_dispatcher::ProjectStore::new(projects_dir)?;
@@ -61,4 +61,25 @@ async fn main() -> anyhow::Result<()> {
     info!("weft-dispatcher listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Find the `weft-runner` binary. Resolution order:
+/// 1. `WEFT_RUNNER_PATH` env var (explicit override, always wins).
+/// 2. Sibling of the current executable (`install.sh` layout:
+///    weft / weft-dispatcher / weft-runner all in the same dir).
+/// 3. Plain `weft-runner`, resolved via $PATH by the subprocess
+///    backend.
+fn resolve_runner_path() -> String {
+    if let Ok(explicit) = std::env::var("WEFT_RUNNER_PATH") {
+        return explicit;
+    }
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(dir) = self_exe.parent() {
+            let candidate = dir.join("weft-runner");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "weft-runner".to_string()
 }
