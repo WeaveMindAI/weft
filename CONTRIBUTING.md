@@ -1,19 +1,20 @@
 # Contributing to Weft
 
-> **Note.** This document was written fast to ship the open source release. It may sound a bit AI-generated in places. If you have the time to rewrite it more cleanly, a PR that improves the writing is as welcome as one that fixes a bug.
+Thanks for considering it. Weft is early, opinionated, and moves fast. Every external eye on it makes the language better. This document covers setup, repo layout, and the rules for sending code.
 
-Thanks for even considering it. Weft is early, opinionated, and moves fast, and every external eye on it makes the language better. This document tells you how to get set up, what the repo looks like, and the rules of engagement when you send code.
-
-If anything in here is wrong, unclear, or out of date, that is itself a bug. Open an issue.
+If anything here is wrong, unclear, or out of date, that is a bug. Open an issue.
 
 ---
 
 ## Before you start
 
-- **Read [DESIGN.md](./DESIGN.md).** The design principles are not decoration. They are the filter every pull request runs through. If a change fights one of them, it either gets reshaped or dropped. Knowing them up front saves everybody time.
-- **Check the [roadmap](./ROADMAP.md) and open issues.** Someone might already be working on the thing you want to build. Ask in [Discord](https://discord.com/invite/FGwNu6mDkU) before starting a large change.
-- **Small changes: just open a PR.** Typos, doc fixes, obvious bugs, adding a missing error message. Go for it.
-- **Medium or large changes: open an issue first.** Describe what you want to build and why. Wait for a thumbs up. This protects your time: no one enjoys closing a 500-line PR because the approach does not fit.
+Read [DESIGN.md](./DESIGN.md) before anything else. The design principles are the filter every pull request runs through. If a change fights one of them, it gets reshaped or dropped. Knowing them up front saves everyone time.
+
+Check the [roadmap](./ROADMAP.md) and open issues. Someone might already be working on what you want to build. Ask in [Discord](https://discord.com/invite/FGwNu6mDkU) before starting a large change.
+
+For small changes, just open a PR. Typos, doc fixes, obvious bugs, missing error messages. No discussion needed.
+
+For medium or large changes, open an issue first. Describe what you want to build and why. Wait for a thumbs up. This protects your time. No one enjoys closing a 500-line PR because the approach does not fit.
 
 ---
 
@@ -89,7 +90,7 @@ The `catalog/` directory is the source of truth for every node. `scripts/catalog
 
 A node is one folder under `catalog/<category>/<node_name>/` with two files.
 
-**`backend.rs`**: the Rust implementation.
+**`backend.rs`** is the Rust implementation.
 
 ```rust
 //! Greeting Node - says hi.
@@ -134,7 +135,7 @@ impl Node for GreetingNode {
 register_node!(GreetingNode);
 ```
 
-**`frontend.ts`**: the dashboard UI definition.
+**`frontend.ts`** is the dashboard UI definition.
 
 ```typescript
 import type { NodeTemplate } from '$lib/types';
@@ -160,7 +161,7 @@ export const GreetingNode: NodeTemplate = {
 };
 ```
 
-That is it. The `inventory` crate auto-discovers the new node at startup on the backend, and the dashboard picks up the new template on the next reload.
+The `inventory` crate auto-discovers the new node at startup. The dashboard picks up the new template on the next reload.
 
 ### Checklist before you open the PR
 
@@ -169,93 +170,93 @@ That is it. The `inventory` crate auto-discovers the new node at startup on the 
 - [ ] The node has a sensible icon and category.
 - [ ] If the node needs credentials, it uses an existing `*Config` node or you added a new `*Config` alongside it.
 - [ ] You added the node to `catalog-tree.json` if it applies.
-- [ ] You tried building a tiny project that uses the node, end to end, from the dashboard.
+- [ ] You built a small project that uses the node end to end from the dashboard.
 - [ ] `cargo test`, `cargo clippy`, and `pnpm -C dashboard check` all pass.
 
 ### Node design rules
 
-These come straight from [DESIGN.md](./DESIGN.md), do not skip them.
+These come from [DESIGN.md](./DESIGN.md). Do not skip them.
 
-- **No special cases.** If your node needs a new capability, propose the capability as a general language feature first. Do not bolt it into a single node.
+- **No special cases.** If your node needs a new capability, propose it as a general language feature first. Do not bolt it into a single node.
 - **Typed end to end.** Every port has a concrete type. No `Any`. No untyped dicts except `JsonDict` for genuinely opaque JSON.
-- **One thing per node.** If your node is doing five different things based on config flags, it is five nodes.
-- **Surface errors loudly.** Nodes either work or fail with a clear error message, and should handle all the types they are declaring they can handle. No silent fallbacks, no guessed defaults for values the user was supposed to provide.
+- **One thing per node.** If your node does five different things based on config flags, it is five nodes.
+- **Surface errors loudly.** Nodes either work or fail with a clear message. No silent fallbacks, no guessed defaults for values the user was supposed to provide.
 
 ---
 
 ## The compiler and the language
 
-Core language work (parser, type system, edge resolution, groups, parallel processing) lives in `crates/weft-core/`. This is the most opinionated part of the codebase. Before you touch it:
+Core language work lives in `crates/weft-core/`. This covers the parser, type system, edge resolution, groups, and parallel processing. It is the most opinionated part of the codebase. Before you touch it:
 
-1. Read the relevant doc page in the [language reference](https://weavemind.ai/docs).
+1. Read the relevant page in the [language reference](https://weavemind.ai/docs).
 2. Open an issue describing the change.
 3. Wait for a thumbs up.
 
-Reason: changes to the compiler affect every single project written in Weft. A "small improvement" to the type checker can silently break a user's production pipeline. We are not paranoid, we are careful.
+Changes to the compiler affect every project written in Weft. A small improvement to the type checker can silently break a user's production pipeline. We are not paranoid, we are careful.
 
-Tests for the compiler live alongside the code in `crates/weft-core/src/tests/`. Any change to parsing or type resolution needs a test. Any bug fix needs a test that fails before the fix and passes after.
+Tests live alongside the code in `crates/weft-core/src/tests/`. Any change to parsing or type resolution needs a test. Any bug fix needs a test that fails before the fix and passes after.
 
 ---
 
 ## Infrastructure nodes and sidecars
 
-A regular node (see "How to add a node" above) is code that runs during execution. An **infrastructure node** is different: it provisions a real Kubernetes workload on Start and tears it down on Stop. Think Postgres databases, WhatsApp bridges, browser pools, vector stores: anything stateful that needs to outlive a single execution.
+A regular node is code that runs during execution. An infrastructure node provisions a real Kubernetes workload on Start and tears it down on Stop. Postgres databases, WhatsApp bridges, browser pools, and vector stores all fit this pattern. Anything stateful that needs to outlive a single execution does.
 
-Infrastructure nodes are the pattern Weft uses to plug stateful services into the graph. They are more work than a regular node (you are also writing a sidecar service), but they buy you a clean abstraction, language freedom, and real isolation. The design rationale is in [DESIGN.md](./DESIGN.md) under "Infrastructure as nodes, sidecars as the bridge". Read that first.
+Infrastructure nodes are how Weft plugs stateful services into the graph. They are more work than a regular node, but they give you a clean abstraction, language freedom, and real isolation. The design rationale is in [DESIGN.md](./DESIGN.md) under "Infrastructure as nodes, sidecars as the bridge". Read that first.
 
 ### The two pieces
 
-Every infrastructure node is actually two things shipped together:
+Every infrastructure node ships as two things:
 
-1. **The infrastructure node itself** in `catalog/<category>/<name>/`. Same two-file layout as a regular node (`backend.rs` + `frontend.ts`), but the backend returns an `InfrastructureSpec` in its `NodeFeatures` instead of just executing. The spec contains raw Kubernetes manifests (as JSON) with placeholders like `__INSTANCE_ID__` and `__SIDECAR_IMAGE__` that the platform fills at provision time.
-2. **A sidecar service** in `sidecars/<name>/`. A small HTTP service (any language, any runtime) that exposes three endpoints:
-    - `POST /action` accepts `{ action, payload }` and returns `{ result }`
-    - `GET /health` liveness check for the K8s readiness probe
-    - `GET /outputs` runtime-computed values the sidecar wants to expose as the node's output ports
+1. **The infrastructure node** in `catalog/<category>/<name>/`. Same two-file layout as a regular node (`backend.rs` and `frontend.ts`), but the backend returns an `InfrastructureSpec` in its `NodeFeatures` instead of just executing. The spec contains raw Kubernetes manifests as JSON with placeholders like `__INSTANCE_ID__` and `__SIDECAR_IMAGE__` that the platform fills at provision time.
+2. **A sidecar service** in `sidecars/<name>/`. A small HTTP service in any language that exposes three endpoints.
+    - `POST /action` accepts `{ action, payload }` and returns `{ result }`.
+    - `GET /health` is the liveness check for the Kubernetes readiness probe.
+    - `GET /outputs` returns runtime-computed values the sidecar wants to expose as output ports.
 
-The reference implementations are `sidecars/postgres-database/` (Rust) and `sidecars/whatsapp-bridge/` (Node.js). Minimal starter templates live in `sidecars/examples/rust/` and `sidecars/examples/javascript/`. Copy whichever matches your language, and work from there.
+The reference implementations are `sidecars/postgres-database/` (Rust) and `sidecars/whatsapp-bridge/` (Node.js). Starter templates live in `sidecars/examples/rust/` and `sidecars/examples/javascript/`. Copy whichever matches your language and work from there.
 
 ### Consumer nodes
 
-On top of the infrastructure node you usually ship a family of **consumer nodes** (e.g. `MemoryStoreAdd`, `MemoryQuery`, `MemoryDelete` for the Postgres case). Consumer nodes are regular nodes, they take an `endpointUrl` as input, build an `InfraClient` from it, and call `/action` with typed payloads. They never touch the underlying service directly.
+On top of the infrastructure node you usually ship a family of consumer nodes, for example `MemoryStoreAdd`, `MemoryQuery`, and `MemoryDelete` for the Postgres case. Consumer nodes are regular nodes. They take an `endpointUrl` as input, build an `InfraClient` from it, and call `/action` with typed payloads. They never touch the underlying service directly.
 
-This is the point of the whole pattern: the consumer nodes talk to a **capability** (durable KV, send-message, whatever) through a typed action API. The sidecar is the only thing that knows about Postgres (or WhatsApp, or whatever) and that is the only place you would change if you wanted to swap out the backend.
+This is the point of the whole pattern. The consumer nodes talk to a capability (durable KV, send-message, whatever) through a typed action API. The sidecar is the only thing that knows about Postgres or WhatsApp, and that is the only place you would change if you wanted to swap out the backend.
 
 ### The full checklist
 
-- [ ] Write the sidecar. Docker-ize it. Make sure `/health` and `/outputs` work.
-- [ ] Push the image to a registry Weft can pull from. For the reference nodes this is `ghcr.io/weavemindai/sidecar-<name>:latest`. The platform uses `SIDECAR_IMAGE_REGISTRY` (or its default) plus the `sidecarName` from your `InfrastructureSpec` to build the image reference at provision time.
+- [ ] Write the sidecar. Dockerize it. Make sure `/health` and `/outputs` work.
+- [ ] Push the image to a registry Weft can pull from. For the reference nodes this is `ghcr.io/weavemindai/sidecar-<name>:latest`. The platform uses `SIDECAR_IMAGE_REGISTRY` and the `sidecarName` from your `InfrastructureSpec` to build the image reference at provision time.
 - [ ] Write the infrastructure node in `catalog/<category>/<name>/backend.rs`. Return an `InfrastructureSpec` with your manifests, your `sidecarName`, and your `ActionEndpoint`.
-- [ ] Write the matching `frontend.ts` with `features: { isInfrastructure: true }`, output ports `instanceId` and `endpointUrl` (plus whatever else your sidecar exposes via `/outputs`).
+- [ ] Write the matching `frontend.ts` with `features: { isInfrastructure: true }`, output ports `instanceId` and `endpointUrl`, and whatever else your sidecar exposes via `/outputs`.
 - [ ] Write at least one consumer node that wires into the infrastructure node and calls an action.
-- [ ] Test the whole thing against a local kind cluster: `INFRASTRUCTURE_TARGET=local ./dev.sh server`, then build a tiny project, click Start on the infra node, watch it provision, verify the consumer node can talk to it.
-- [ ] Test Stop and Terminate: stop keeps the PVC and data, terminate destroys both.
+- [ ] Test the whole thing against a local kind cluster. Run `INFRASTRUCTURE_TARGET=local ./dev.sh server`, build a small project, click Start on the infra node, watch it provision, and verify the consumer node can talk to it.
+- [ ] Test Stop and Terminate. Stop keeps the PVC and data. Terminate destroys both.
 
 ### Design rules for infrastructure nodes
 
-- **One capability per sidecar.** If your sidecar is doing two unrelated things, it is two sidecars.
+- **One capability per sidecar.** If your sidecar does two unrelated things, it is two sidecars.
 - **Do not leak implementation details into consumer nodes.** Consumer nodes should call `put`, not "insert into a Postgres table". If a consumer node needs to know it is talking to Postgres specifically, the abstraction is wrong.
 - **`/outputs` is authoritative.** Anything the node exposes as an output port must come from `/outputs` at provision time. Do not hardcode URLs or IDs in the node's Rust file.
-- **Manifests use placeholders.** `__INSTANCE_ID__` and `__SIDECAR_IMAGE__` are the standard ones. Do not hardcode names: every pod has to be unique per (user, project, node) or you get collisions.
+- **Manifests use placeholders.** `__INSTANCE_ID__` and `__SIDECAR_IMAGE__` are the standard ones. Do not hardcode names. Every pod has to be unique per (user, project, node) or you get collisions.
 - **Label everything.** The platform injects ownership labels (`weavemind.ai/managed-by`, `weavemind.ai/user`, `weavemind.ai/project`, `weavemind.ai/node`) into every resource you ship. Do not strip them.
-- **Readiness probes matter.** The platform polls pod readiness before calling `/outputs`. Ship realistic `readinessProbe` values for every container in your `Deployment` or the platform will think your infra is ready before it actually is.
+- **Readiness probes matter.** The platform polls pod readiness before calling `/outputs`. Ship realistic `readinessProbe` values for every container in your `Deployment`, or the platform will think your infra is ready before it actually is.
 
 ---
 
 ## The dashboard
 
-`dashboard/` is a SvelteKit + Svelte 5 app. It is the graph view, the code view, and the AI builder UI wrapped into one.
+`dashboard/` is a SvelteKit + Svelte 5 app. It covers the graph view, the code view, and the AI builder UI.
 
-- Svelte 5 runes (`$state`, `$derived`, `$effect`). No legacy reactive statements.
+- Use Svelte 5 runes (`$state`, `$derived`, `$effect`). No legacy reactive statements.
 - Types come from `$lib/types`. Do not duplicate interfaces.
-- The parser lives in `$lib/parser`. Long term, we are moving parsing into Rust (see [ROADMAP.md](./ROADMAP.md)). In the meantime, keep the frontend parser and the backend parser in lockstep.
+- The parser lives in `$lib/parser`. Long term, parsing is moving into Rust (see [ROADMAP.md](./ROADMAP.md)). Until then, keep the frontend parser and the backend parser in lockstep.
 
 ---
 
 ## Commit, branch, PR
 
-- **Branch naming**: `fix/short-description`, `feat/short-description`, `docs/short-description`. One branch per logical change.
-- **Commit messages**: short summary on line 1, blank line, body explaining the "why". Imperative mood ("fix parser crash on empty groups", not "fixed").
+- **Branch naming.** `fix/short-description`, `feat/short-description`, `docs/short-description`. One branch per logical change.
+- **Commit messages.** Short summary on line 1, blank line, body explaining the why. Imperative mood ("fix parser crash on empty groups", not "fixed").
 - **One thing per PR.** A refactor and a feature in the same PR is two PRs.
 - **Link the issue.** `Closes #123` in the PR body if applicable.
 - **No AI-generated slop.** If an AI wrote your PR, read it yourself first. We will notice if there are issues, and it wastes everyone's time.
@@ -274,7 +275,7 @@ This is the point of the whole pattern: the consumer nodes talk to a **capabilit
 ## What not to do
 
 - Do not add a new primitive type to the language without discussion.
-- Do not add a "quick fix" that bypasses the type checker.
+- Do not add a quick fix that bypasses the type checker.
 - Do not add libraries for things we can do in 20 lines.
 - Do not add silent fallbacks. Fail loud.
 
@@ -282,34 +283,36 @@ This is the point of the whole pattern: the consumer nodes talk to a **capabilit
 
 ## Getting help
 
-- **Discord**: [join here](https://discord.com/invite/FGwNu6mDkU). Fastest for questions.
-- **GitHub Discussions**: for longer-form proposals and design conversations.
-- **GitHub Issues**: for bugs and concrete feature requests.
-- **Email**: contact@weavemind.ai.
+- **Discord.** [Join here](https://discord.com/invite/FGwNu6mDkU). Fastest for questions.
+- **GitHub Discussions.** For longer-form proposals and design conversations.
+- **GitHub Issues.** For bugs and concrete feature requests.
+- **Email.** contact@weavemind.ai.
+
+---
 
 ## Ground rules
 
-Weft runs on **constructive confrontation**. We would rather have a 30-minute argument that ends in alignment than three weeks of polite avoidance that ends in a shipped disaster. This project is not a "nice" culture, it is a **respectful** one. That distinction matters, so read this section carefully before you send your first PR.
+Weft runs on constructive confrontation. A 30-minute argument that ends in alignment beats three weeks of polite avoidance that ends in a shipped disaster. This project is not a "nice" culture, it is a respectful one. That distinction matters.
 
 **What is welcome:**
 
-- Strong disagreement with a design, a decision, a PR, a commit, a pattern, a blocker. With real heat behind it if that is how you feel.
+- Strong disagreement with a design, a decision, a PR, a commit, a pattern, or a blocker. With real heat behind it if that is how you feel.
 - Calling out a bug, a broken approach, or a regression bluntly. Swear words at a problem are fine if they are scoped and in service of fixing something.
 - Pushing back on a maintainer when you think they are wrong. Including Quentin. Especially Quentin.
-- Arguing until both sides understand each other. The goal of an argument here is not "someone wins", it is "we both leave knowing more".
+- Arguing until both sides understand each other. The goal of an argument is not "someone wins", it is "we both leave knowing more".
 
 **What is not welcome:**
 
-- Anger or insults aimed at a **person**. Attacks on someone's character, intelligence, background, identity, or experience. Hard no, zero tolerance.
+- Anger or insults aimed at a person. Attacks on someone's character, intelligence, background, or identity. Hard no, zero tolerance.
 - Sarcasm or condescension in code review. Say what you mean directly.
 - "You are lazy", "you clearly did not read", "this is amateur work". Those describe a person. Replace them with "this PR misses X", "this approach breaks Y", "this does not match the convention in Z". Same point, aimed at the work.
 - Piling on. One maintainer's pushback is enough. If you see a contributor getting dogpiled, step in.
 
-**The test.** After an argument, does everyone involved understand the problem better, or does one side just feel worse? If the first, we are doing it right. If the second, somebody crossed the line and we will step in.
+After an argument, does everyone involved understand the problem better, or does one side just feel worse? If the first, we are doing it right. If the second, somebody crossed a line and we will step in.
 
-**Calibrate to context.** A design argument between people who have been working together for a year can run hot. A first-time contributor's PR review should stay warm. Same respect, different temperature, because the trust bandwidth is different. If you are new, you will find us friendly and careful. If you stick around, you will find us blunt and fast. Both are intentional.
+A design argument between people who have worked together for a year can run hot. A first-time contributor's PR review should stay warm. Same respect, different temperature, because the trust is different. If you are new, you will find us friendly and careful. If you stick around, you will find us blunt and fast. Both are intentional.
 
-We follow the [Contributor Covenant](./CODE_OF_CONDUCT.md) as the floor. The rules above describe the ceiling of what kind of heat is welcome above that floor. If someone is making the project worse to be around, email contact@weavemind.ai and we will handle it.
+We follow the [Contributor Covenant](./CODE_OF_CONDUCT.md) as the floor. The rules above describe what heat is welcome above that floor. If someone is making the project worse to be around, email contact@weavemind.ai.
 
 ---
 
