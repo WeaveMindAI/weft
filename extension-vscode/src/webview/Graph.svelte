@@ -4,7 +4,7 @@
     Background,
     Controls,
     type Node,
-    type Edge,
+    type Edge as FlowEdge,
   } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import { onMount } from 'svelte';
@@ -14,12 +14,14 @@
     CatalogEntry,
     NodeExecEvent,
     ProjectDefinition,
+    NodeDefinition,
   } from '../shared/protocol';
   import ProjectNode from './components/ProjectNode.svelte';
   import CustomEdge from './components/CustomEdge.svelte';
   import GroupNode from './components/GroupNode.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
   import type { NodeExecStatus } from './components/ExecutionInspector.svelte';
+  import type { NodeViewData } from './components/node-view-data';
 
   interface Props {
     project: ProjectDefinition;
@@ -28,16 +30,23 @@
 
   let { project, catalog }: Props = $props();
 
+  // nodes / edges: the xyflow source-of-truth. Mutated in-place so
+  // xyflow doesn't remount a node (which would reset position,
+  // focused input, etc).
   let nodes = $state<Node[]>([]);
-  let edges = $state<Edge[]>([]);
+  let edges = $state<FlowEdge[]>([]);
+
+  // Layout cache. Drives initial position for new nodes and survives
+  // across parse rounds. Written to the .layout.json sidecar when the
+  // user drags.
   let savedPositions = $state<Record<string, { x: number; y: number }>>({});
   let layoutDebounceMs = $state(400);
   let layoutTimer: ReturnType<typeof setTimeout> | undefined;
-  let lastSignature = '';
+  let structuralSignature = '';
+
   let paletteOpen = $state(false);
 
-  // Per-node execution state. Keyed by node id. Updated by
-  // execEvent messages from the host.
+  // Per-node execution state. Updated by `execEvent` messages.
   interface NodeExecState {
     status: NodeExecStatus;
     input?: unknown;
@@ -52,9 +61,15 @@
   onMount(() => {
     const unsub = onMessage((msg) => {
       if (msg.kind === 'layoutHint') {
-        savedPositions = msg.positions;
+        savedPositions = { ...savedPositions, ...msg.positions };
+        // Apply incoming positions to existing nodes we haven't
+        // placed from layout yet.
+        for (const n of nodes) {
+          const saved = savedPositions[n.id];
+          if (saved) n.position = saved;
+        }
       } else if (msg.kind === 'settings') {
-        layoutDebounceMs = msg.settings?.layoutDebounceMs ?? layoutDebounceMs;
+        layoutDebounceMs = (msg as any).layoutDebounceMs ?? layoutDebounceMs;
       } else if (msg.kind === 'execEvent') {
         applyExecEvent(msg.event);
       } else if (msg.kind === 'execReset') {
@@ -69,8 +84,12 @@
   });
 
   function onHotkey(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-      paletteOpen = true;
+    const target = e.target as HTMLElement | null;
+    const inInput =
+      target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+    if (inInput) return;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'p') {
+      paletteOpen = !paletteOpen;
       e.preventDefault();
     }
   }
@@ -95,7 +114,7 @@
     execByNode = { ...execByNode, [event.node_id]: next };
   }
 
-  /** Per-target wiring: set of targetHandle names for each target node. */
+  // Wired input set per target node. Recomputed when edges change.
   const wiredByTarget = $derived.by(() => {
     const m: Record<string, Set<string>> = {};
     for (const e of project.edges) {
@@ -105,58 +124,106 @@
     return m;
   });
 
-  $effect(() => {
-    const structural = project.nodes.filter((n) => n.nodeType !== 'Passthrough');
-    const signature = structuralSignature(project);
-
-    const nextNodes: Node[] = structural.map((n, i) => ({
-      id: n.id,
-      position: resolvePosition(n.id, i),
-      type: 'weft',
-      data: {
-        node: n,
-        catalog: catalog[n.nodeType] ?? null,
-        wiredInputs: wiredByTarget[n.id] ?? new Set<string>(),
-        exec: execByNode[n.id] ?? { status: 'idle' as NodeExecStatus },
-        onConfigChange: (nodeId: string, key: string, value: unknown) =>
-          send({
-            kind: 'mutation',
-            mutation: { kind: 'updateConfig', nodeId, key, value },
-          }),
-      },
-    }));
-
-    const nextEdges: Edge[] = project.edges.map((e) => ({
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      sourceHandle: e.sourceHandle ?? undefined,
-      targetHandle: e.targetHandle ?? undefined,
-      type: 'weft',
-    }));
-
-    nodes = nextNodes;
-    edges = nextEdges;
-
-    if (signature !== lastSignature) {
-      lastSignature = signature;
-      scheduleLayout();
-    }
-  });
-
-  function resolvePosition(id: string, i: number): { x: number; y: number } {
-    if (savedPositions[id]) return savedPositions[id];
-    return { x: 100 + (i % 4) * 260, y: 100 + Math.floor(i / 4) * 200 };
+  function onConfigChange(nodeId: string, key: string, value: unknown) {
+    send({ kind: 'mutation', mutation: { kind: 'updateConfig', nodeId, key, value } });
+  }
+  function onLabelChange(nodeId: string, label: string | null) {
+    send({ kind: 'mutation', mutation: { kind: 'updateLabel', nodeId, label } });
+  }
+  function onPortsChange(
+    nodeId: string,
+    changes: { inputs?: unknown; outputs?: unknown },
+  ) {
+    // Ports changes are stored as a _ports config key, which the
+    // Weft compiler reads when rendering the node header. Until the
+    // compiler round-trips ports in the config sugar, we piggyback
+    // on updateConfig so the edit lands in the file.
+    const key = changes.inputs ? '_inputs' : '_outputs';
+    const value = changes.inputs ?? changes.outputs;
+    send({ kind: 'mutation', mutation: { kind: 'updateConfig', nodeId, key, value } });
   }
 
-  function structuralSignature(p: ProjectDefinition): string {
-    const ns = p.nodes.map((n) => `${n.id}:${n.nodeType}`).sort().join(',');
+  function makeNodeData(n: NodeDefinition): NodeViewData {
+    return {
+      node: n,
+      catalog: catalog[n.nodeType] ?? null,
+      wiredInputs: wiredByTarget[n.id] ?? new Set<string>(),
+      exec: execByNode[n.id] ?? { status: 'idle' as NodeExecStatus },
+      onConfigChange,
+      onLabelChange,
+      onPortsChange,
+    };
+  }
+
+  function structuralSignatureOf(p: ProjectDefinition): string {
+    const ns = p.nodes
+      .filter((n) => n.nodeType !== 'Passthrough')
+      .map((n) => `${n.id}:${n.nodeType}`)
+      .sort()
+      .join(',');
     const es = p.edges
       .map((e) => `${e.source}.${e.sourceHandle}->${e.target}.${e.targetHandle}`)
       .sort()
       .join(',');
     return `${ns}|${es}`;
   }
+
+  function fallbackPosition(i: number): { x: number; y: number } {
+    return { x: 100 + (i % 4) * 280, y: 100 + Math.floor(i / 4) * 220 };
+  }
+
+  // Diff `project` into `nodes`/`edges`. Preserves user-drag
+  // positions: only new nodes receive a fresh position.
+  $effect(() => {
+    const structural = project.nodes.filter((n) => n.nodeType !== 'Passthrough');
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const keep = new Set(structural.map((n) => n.id));
+
+    const next: Node[] = [];
+    structural.forEach((n, i) => {
+      const existing = byId.get(n.id);
+      const data = makeNodeData(n);
+      if (existing) {
+        // Preserve position. Only replace data.
+        next.push({ ...existing, data });
+      } else {
+        next.push({
+          id: n.id,
+          position: savedPositions[n.id] ?? fallbackPosition(i),
+          type: 'weft',
+          data,
+        });
+      }
+    });
+    // Drop nodes that no longer exist in `project`.
+    nodes = next.filter((n) => keep.has(n.id));
+
+    edges = project.edges.map((e) => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle ?? undefined,
+      targetHandle: e.targetHandle ?? undefined,
+      type: 'weft',
+      data: {
+        // Only show a label when ports differ.
+        showLabel:
+          (e.sourceHandle ?? '') !== (e.targetHandle ?? '') &&
+          Boolean(e.sourceHandle || e.targetHandle),
+        sourcePort: e.sourceHandle ?? '',
+        targetPort: e.targetHandle ?? '',
+      },
+    }));
+
+    // Only re-run ELK when the structural signature actually changed
+    // (nodes added/removed/retyped, edges added/removed). Config
+    // edits and field changes don't trigger layout.
+    const sig = structuralSignatureOf(project);
+    if (sig !== structuralSignature) {
+      structuralSignature = sig;
+      scheduleLayout();
+    }
+  });
 
   function scheduleLayout() {
     if (layoutTimer) clearTimeout(layoutTimer);
@@ -165,22 +232,34 @@
 
   async function runLayout() {
     try {
-      const positions = await autoLayout({ nodes, edges });
-      const merged = { ...positions, ...savedPositions };
-      nodes = nodes.map((n) => ({ ...n, position: merged[n.id] ?? n.position }));
+      // Only auto-layout nodes that don't have a saved position yet.
+      const unplaced = nodes.filter((n) => !savedPositions[n.id]);
+      if (unplaced.length === 0) return;
+      const positions = await autoLayout({ nodes: unplaced, edges });
+      for (const n of nodes) {
+        const p = positions[n.id];
+        if (p) n.position = p;
+      }
     } catch (err) {
       send({ kind: 'log', level: 'warn', message: `elk layout failed: ${String(err)}` });
     }
   }
 
   function onNodeDragStop() {
+    // Persist every node's current position. Shipping all on every
+    // drag stop is fine (<100 nodes per project).
     const positions: Record<string, { x: number; y: number }> = {};
     for (const n of nodes) positions[n.id] = { x: n.position.x, y: n.position.y };
     savedPositions = { ...savedPositions, ...positions };
     send({ kind: 'positionsChanged', positions });
   }
 
-  function onConnect(e: { source: string; sourceHandle?: string | null; target: string; targetHandle?: string | null }) {
+  function onConnect(e: {
+    source: string;
+    sourceHandle?: string | null;
+    target: string;
+    targetHandle?: string | null;
+  }) {
     if (!e.sourceHandle || !e.targetHandle) return;
     send({
       kind: 'mutation',
@@ -203,16 +282,20 @@
 
 <div class="w-full h-full relative">
   <SvelteFlow
-    nodes={nodes as any}
-    edges={edges as any}
-    nodeTypes={nodeTypes as any}
-    edgeTypes={edgeTypes as any}
+    bind:nodes
+    bind:edges
+    {nodeTypes}
+    {edgeTypes}
     fitView
+    fitViewOptions={{ padding: 0.2 }}
+    minZoom={0.05}
+    maxZoom={2}
+    proOptions={{ hideAttribution: true }}
     onnodedragstop={onNodeDragStop}
     onconnect={onConnect}
   >
     <Background />
-    <Controls />
+    <Controls position="bottom-left" showZoom showFitView showLock={false} />
   </SvelteFlow>
 
   <CommandPalette

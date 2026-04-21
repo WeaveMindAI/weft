@@ -62,6 +62,10 @@ export function buildEdit(
         mutation.value,
         ctx,
       );
+    case 'updateLabel':
+      return buildUpdateLabel(mutation.nodeId, mutation.label, ctx);
+    case 'duplicateNode':
+      return buildDuplicateNode(mutation.nodeId, ctx);
   }
 }
 
@@ -191,7 +195,7 @@ function buildUpdateConfig(
   const edit = new vscode.WorkspaceEdit();
 
   const mergedConfig = { ...(node.config ?? {}), [key]: value };
-  const rendered = renderNode(node, mergedConfig);
+  const rendered = renderNode(node, mergedConfig, node.label);
 
   const nodeRange = spanToRange(node.span);
   const trailingEnd = new vscode.Position(Math.min(nodeRange.end.line + 1, doc.lineCount - 1), 0);
@@ -203,9 +207,19 @@ function findNode(project: ProjectDefinition, id: string): NodeDefinition | null
   return project.nodes.find((n) => n.id === id) ?? null;
 }
 
-function renderNode(node: NodeDefinition, config: Record<string, unknown>): string {
+function renderNode(
+  node: NodeDefinition,
+  config: Record<string, unknown>,
+  label?: string | null,
+): string {
   const header = `${node.id} = ${node.nodeType}`;
-  const entries = Object.entries(config);
+  const entries: [string, unknown][] = [];
+  const lbl = label === undefined ? node.label : label;
+  if (lbl) entries.push(['label', lbl]);
+  for (const [k, v] of Object.entries(config)) {
+    if (k === 'label') continue; // label is handled above
+    entries.push([k, v]);
+  }
   if (entries.length === 0) return header;
   if (entries.length === 1) {
     const [k, v] = entries[0]!;
@@ -213,6 +227,49 @@ function renderNode(node: NodeDefinition, config: Record<string, unknown>): stri
   }
   const body = entries.map(([k, v]) => `  ${k}: ${renderValue(v)}`).join('\n');
   return `${header} {\n${body}\n}`;
+}
+
+function buildUpdateLabel(
+  nodeId: string,
+  label: string | null,
+  { project, doc }: SurgicalContext,
+): vscode.WorkspaceEdit | null {
+  const node = findNode(project, nodeId);
+  if (!node || !node.span) return null;
+  const edit = new vscode.WorkspaceEdit();
+  const rendered = renderNode(node, node.config ?? {}, label);
+  const nodeRange = spanToRange(node.span);
+  const trailingEnd = new vscode.Position(
+    Math.min(nodeRange.end.line + 1, doc.lineCount - 1),
+    0,
+  );
+  edit.replace(doc.uri, new vscode.Range(nodeRange.start, trailingEnd), rendered + '\n');
+  return edit;
+}
+
+function buildDuplicateNode(
+  nodeId: string,
+  { project, doc }: SurgicalContext,
+): vscode.WorkspaceEdit | null {
+  const node = findNode(project, nodeId);
+  if (!node) return null;
+  // Generate a fresh id by appending _copy, _copy2, etc.
+  const usedIds = new Set(project.nodes.map((n) => n.id));
+  let copyId = `${node.id}_copy`;
+  let i = 2;
+  while (usedIds.has(copyId)) {
+    copyId = `${node.id}_copy${i}`;
+    i++;
+  }
+  const dupNode: NodeDefinition = { ...node, id: copyId };
+  const rendered = renderNode(dupNode, node.config ?? {});
+  const lastLine = doc.lineCount - 1;
+  const end = doc.lineAt(lastLine).range.end;
+  const needsNewline = doc.lineAt(lastLine).text.length > 0;
+  const prefix = needsNewline ? '\n\n' : '\n';
+  const edit = new vscode.WorkspaceEdit();
+  edit.insert(doc.uri, end, `${prefix}${rendered}\n`);
+  return edit;
 }
 
 function renderValue(v: unknown): string {

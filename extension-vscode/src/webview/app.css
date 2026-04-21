@@ -1,29 +1,33 @@
 @import "tailwindcss";
 
-/* VS Code theme bridge. Map VS Code's theme variables to Tailwind's
- * semantic tokens so components written with bg-background /
- * text-foreground inherit the user's VS Code theme. */
+/* v1 uses a fixed light palette (white canvas, zinc/slate text,
+ * colored accents per node type). The VS Code theme would override
+ * that, so we pin the graph to v1's look and only let VS Code
+ * influence the outer chrome (scroll colors, focus ring). People
+ * recognize the v1 graph look; letting it invert under a dark theme
+ * would break that.
+ */
 
 @theme {
-  --color-background: var(--vscode-editor-background);
-  --color-foreground: var(--vscode-editor-foreground);
-  --color-muted: var(--vscode-editorWidget-background);
-  --color-muted-foreground: var(--vscode-descriptionForeground);
-  --color-border: var(--vscode-widget-border, var(--vscode-editorWidget-border));
-  --color-input: var(--vscode-input-background);
-  --color-ring: var(--vscode-focusBorder);
-  --color-primary: var(--vscode-button-background);
-  --color-primary-foreground: var(--vscode-button-foreground);
-  --color-secondary: var(--vscode-button-secondaryBackground);
-  --color-secondary-foreground: var(--vscode-button-secondaryForeground);
-  --color-destructive: var(--vscode-errorForeground);
-  --color-destructive-foreground: var(--vscode-editor-background);
-  --color-accent: var(--vscode-list-activeSelectionBackground);
-  --color-accent-foreground: var(--vscode-list-activeSelectionForeground);
-  --color-card: var(--vscode-editor-background);
-  --color-card-foreground: var(--vscode-editor-foreground);
-  --color-popover: var(--vscode-editorHoverWidget-background);
-  --color-popover-foreground: var(--vscode-editorHoverWidget-foreground);
+  --color-background: #ffffff;
+  --color-foreground: #18181b;          /* zinc-900 */
+  --color-muted: #f4f4f5;               /* zinc-100 */
+  --color-muted-foreground: #71717a;    /* zinc-500 */
+  --color-border: #e4e4e7;              /* zinc-200 */
+  --color-input: #f4f4f5;
+  --color-ring: #3b82f6;
+  --color-primary: #18181b;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #e4e4e7;
+  --color-secondary-foreground: #18181b;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #ffffff;
+  --color-accent: #e4e4e7;
+  --color-accent-foreground: #18181b;
+  --color-card: #ffffff;
+  --color-card-foreground: #18181b;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #18181b;
   --radius: 0.375rem;
 }
 
@@ -33,31 +37,125 @@ html, body, #app {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  color: var(--vscode-editor-foreground);
-  background: var(--vscode-editor-background);
-  font-family: var(--vscode-font-family);
-  font-size: var(--vscode-font-size, 13px);
+  color: #18181b;
+  background: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+               Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue",
+               sans-serif;
+  font-size: 13px;
 }
 
-/* xyflow uses its own CSS vars; override a few so the canvas reads
- * from the VS Code theme. */
+/* xyflow canvas: dotted grid on off-white background, matching v1. */
 :global(.svelte-flow) {
-  background: var(--vscode-editor-background);
-  --xy-background-color: var(--vscode-editor-background);
-  --xy-handle-background-color-default: var(--vscode-editor-foreground);
-  --xy-edge-stroke-default: var(--vscode-editor-foreground);
-  --xy-edge-stroke-selected-default: var(--vscode-focusBorder);
+  background: #fafafa;
+  --xy-background-pattern-dots-color-default: #d4d4d8;
+  --xy-background-color-default: #fafafa;
+  --xy-edge-stroke-default: #52525b;
+  --xy-edge-stroke-width-default: 1.5;
+  --xy-edge-stroke-selected-default: #3b82f6;
+  --xy-handle-background-color-default: #52525b;
 }
 
+/* Controls (bottom-left zoom/fit/lock). Match v1: white/90 bg, zinc
+ * border, zinc icons. */
 :global(.svelte-flow__controls) {
-  background: var(--vscode-editorWidget-background);
-  border: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+  background: rgba(255, 255, 255, 0.9) !important;
+  border: 1px solid #e4e4e7 !important;
+  border-radius: 6px !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06) !important;
+  overflow: hidden;
 }
 :global(.svelte-flow__controls-button) {
-  background: var(--vscode-editorWidget-background);
-  color: var(--vscode-editor-foreground);
-  border-bottom: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+  background: #ffffff !important;
+  border: none !important;
+  border-bottom: 1px solid #e4e4e7 !important;
+  color: #71717a !important;
+  fill: #71717a !important;
+}
+:global(.svelte-flow__controls-button:last-child) {
+  border-bottom: none !important;
 }
 :global(.svelte-flow__controls-button:hover) {
-  background: var(--vscode-list-hoverBackground);
+  background: #f4f4f5 !important;
+  color: #18181b !important;
+  fill: #18181b !important;
+}
+
+/* Node status glow rings. Applied on top of the base node shadow.
+ * Ported from v1's ProjectNode :global() block. */
+:global(.node-running-glow) {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.05),
+    0 0 0 2px rgba(245, 158, 11, 0.4) !important;
+}
+:global(.node-completed-glow) {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.05),
+    0 0 0 2px rgba(16, 185, 129, 0.3) !important;
+}
+:global(.node-failed-glow) {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.05),
+    0 0 0 2px rgba(239, 68, 68, 0.4) !important;
+}
+
+/* Wider hit area for resize handles. v1 uses 12px so the grab zone
+ * isn't razor-thin. */
+:global(.svelte-flow__resize-control.line.left),
+:global(.svelte-flow__resize-control.line.right) {
+  width: 12px !important;
+  background: transparent !important;
+}
+:global(.svelte-flow__resize-control.line.top),
+:global(.svelte-flow__resize-control.line.bottom) {
+  height: 12px !important;
+  background: transparent !important;
+}
+
+/* Port handle defaults. xyflow's default is a 12px filled square;
+ * we override to a 12px circle with a proper border so our
+ * port-marker.ts `!w-3 !h-3 !border !rounded-full` classes take
+ * effect cleanly. */
+:global(.svelte-flow__handle) {
+  width: 12px;
+  height: 12px;
+  background: #ffffff;
+  border: 1px solid #52525b;
+  border-radius: 9999px;
+}
+:global(.svelte-flow__handle-left) {
+  left: -6px;
+}
+:global(.svelte-flow__handle-right) {
+  right: -6px;
+}
+
+/* Edges */
+:global(.svelte-flow__edge-path) {
+  stroke: #52525b;
+  stroke-width: 1.5;
+}
+:global(.svelte-flow__edge.selected .svelte-flow__edge-path) {
+  stroke: #3b82f6;
+  stroke-width: 2;
+}
+
+/* Scrollbars inside config field containers. VS Code's native ones
+ * clash with the light palette, so we define our own. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d4d4d8;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1aa;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
 }

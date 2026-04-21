@@ -9,8 +9,7 @@
     targetY,
     sourcePosition,
     targetPosition,
-    sourceHandleId,
-    targetHandleId,
+    data,
     style,
     markerEnd,
   }: EdgeProps = $props();
@@ -29,23 +28,24 @@
   const labelX = $derived(pathResult[1]);
   const labelY = $derived(pathResult[2]);
 
-  const label = $derived(
-    sourceHandleId || targetHandleId
-      ? `${sourceHandleId ?? ''} → ${targetHandleId ?? ''}`
-      : '',
-  );
+  // Data from Graph.svelte: showLabel true only when sourceHandle
+  // != targetHandle. v1 hides labels when they'd be redundant.
+  const showLabel = $derived(Boolean((data as any)?.showLabel));
+  const sourcePort = $derived(String((data as any)?.sourcePort ?? ''));
+  const targetPort = $derived(String((data as any)?.targetPort ?? ''));
 </script>
 
 <BaseEdge {id} path={path} style={style} markerEnd={markerEnd} />
 
-{#if label}
+{#if showLabel}
   <text
     x={labelX}
     y={labelY}
     text-anchor="middle"
     dominant-baseline="central"
-    class="fill-muted-foreground text-[9px] pointer-events-none select-none"
+    class="fill-zinc-500 text-[9px] pointer-events-none select-none"
+    style="paint-order: stroke; stroke: #fafafa; stroke-width: 3px;"
   >
-    {label}
+    {sourcePort} → {targetPort}
   </text>
 {/if}

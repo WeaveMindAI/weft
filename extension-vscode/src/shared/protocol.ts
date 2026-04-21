@@ -154,4 +154,6 @@ export type GraphMutation =
   | { kind: 'removeNode'; id: string }
   | { kind: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string }
   | { kind: 'removeEdge'; edgeId: string }
-  | { kind: 'updateConfig'; nodeId: string; key: string; value: unknown };
+  | { kind: 'updateConfig'; nodeId: string; key: string; value: unknown }
+  | { kind: 'updateLabel'; nodeId: string; label: string | null }
+  | { kind: 'duplicateNode'; nodeId: string };
