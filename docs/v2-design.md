@@ -111,12 +111,15 @@ OSS weft ships with local-only drivers (subprocess for workers, kind
 for infra). The closed-source weavemind repo adds cloud drivers.
 Same source tree, different deployment flavors.
 
-### 1.9 `weft run` unifies "run-once" and "install"
-One command. The dispatcher decides behavior from the graph shape.
-If the program has trigger entry points, the dispatcher registers
-the project and lives on to serve triggers. If the program is pure
-(no triggers, just compute), the dispatcher spawns one worker,
-collects the output, done. No `weft install` vs `weft run` split.
+### 1.9 CLI is a client, dispatcher is the server
+The `weft` CLI never owns execution lifecycle. It makes HTTP calls
+to the dispatcher, same as `kubectl` to a k8s API server. This
+means Ctrl-C on `weft run` disconnects the CLI but does NOT kill
+the execution (kill is `weft stop <color>`). Same shape for pure
+programs, triggered programs, and HITL programs: all go through
+one registration path (`POST /projects/{id}/run`), dispatcher
+handles the rest. Projects stay registered after completion until
+manually pruned (`weft rm`).
 
 ---
 
@@ -531,47 +534,139 @@ runner previews.
 - Dispatcher connection (e.g. `dispatcher = "http://localhost:9999"`
   locally, a cloud URL in hosted contexts).
 
-### 6.2 CLI commands
+### 6.2 The CLI is a client, the dispatcher is the server
+
+This is load-bearing and worth naming explicitly. The `weft` CLI
+does not own execution. The dispatcher does. Every CLI command
+maps to an HTTP call against the dispatcher. This is the same
+relationship as `kubectl` to a k8s API server, or `docker` CLI to
+the daemon.
+
+Consequences:
+- `weft run` does NOT own the execution's lifecycle. Ctrl-C on
+  the terminal disconnects the CLI, it does NOT kill the execution.
+- To actually kill an execution, `weft stop <color>`.
+- The VS Code extension is a parallel client talking to the same
+  dispatcher HTTP API. CLI and extension are peers, not a stack.
+- Same binary, same API whether the dispatcher is local
+  (laptop daemon) or cloud (our hosted dispatcher). CLI switches
+  targets via config.
+
+### 6.3 CLI commands
 
 ```
-weft new <name>              Scaffold a new project (initializes
-                              a git repo, creates main.weft and
-                              weft.toml with sensible defaults).
-weft build                   Compile the project to a native rust
-                              binary.
-weft run                     Compile if needed, register with the
-                              configured dispatcher. If the graph
-                              has triggers, stays registered. If
-                              pure, runs once and exits. Uses
-                              dispatcher URL from weft.toml or
-                              env.
-weft start                   Start the local dispatcher daemon
-                              (if not already running).
-weft stop                    Stop the local dispatcher daemon.
-weft status                  Show registered projects, execution
-                              states, trigger URLs (terminal view
-                              of the dashboard).
-weft deactivate <project>    Unregister a project. Triggers stop
-                              firing, URLs die.
-weft infra up / down         Provision or tear down infra nodes
-                              for the current project.
+weft new <name>                  Scaffold a new project (git init,
+                                  main.weft, main.loom, weft.toml).
+weft build                       Compile to a native rust binary.
+weft run [--detach]              Compile if needed. Register the
+                                  project with the dispatcher and
+                                  start a new execution. Blocks in
+                                  the terminal, streaming logs,
+                                  until the execution completes or
+                                  suspends. Ctrl-C disconnects the
+                                  log stream; the execution keeps
+                                  running. --detach returns
+                                  immediately without streaming.
+weft follow <project|color>      Subscribe to the dispatcher's SSE
+                                  stream and render live state in
+                                  the terminal. Works against the
+                                  project id (shows all active
+                                  executions for that project) or
+                                  a specific color (shows one).
+weft stop <color>                Cancel a running or suspended
+                                  execution. Drops pulses, removes
+                                  wake entries, marks cancelled.
+weft deactivate <project>        Take the project offline.
+                                  Triggers stop firing, URLs die,
+                                  pending suspended executions are
+                                  cancelled. Project stays
+                                  registered (see `weft rm`).
+weft activate <project>          Bring a previously-deactivated
+                                  project back online with fresh
+                                  trigger URLs.
+weft ps                          List every project registered
+                                  with the dispatcher. Shows
+                                  status (active / deactivated),
+                                  active execution count, last run.
+weft rm <project>                Remove a project from the
+                                  dispatcher entirely. Journal is
+                                  gone, logs are gone.
+weft logs <project|color>        Historical + live logs for a
+                                  project or a specific execution.
+weft start                       Start the local dispatcher daemon
+                                  (if not already running). No-op
+                                  in hosted workspaces (cloud
+                                  dispatcher is already there).
+weft daemon-stop                 Stop the local dispatcher daemon.
+                                  Named distinctly from `weft stop`
+                                  which cancels an execution.
+weft status                      Terminal view of the dashboard
+                                  for the connected dispatcher.
+weft infra up / down             Provision or tear down infra
+                                  nodes for the current project.
 ```
 
-### 6.3 Dispatcher connection semantics
+### 6.4 Execution lifecycle via the CLI
 
-`weft run` talks to the dispatcher at the URL in `weft.toml` (or
+What actually happens when the user types `weft run`:
+
+1. CLI parses `weft.toml` for the project id and dispatcher URL.
+2. If the binary isn't built or is stale, compile (see 6.6).
+3. CLI uploads the binary to the dispatcher (if the dispatcher
+   doesn't already have it; usually content-addressed).
+4. CLI calls `POST /projects/{id}/run`. Dispatcher mints a new
+   color, spawns a worker, returns the color and an SSE stream URL.
+5. Unless `--detach`, CLI opens the SSE stream, renders log lines
+   and state changes until the stream closes (execution completed,
+   failed, or the user Ctrl-C'd).
+6. On Ctrl-C: the CLI closes its stream and exits. The dispatcher
+   does not hear about it; the execution keeps going.
+7. Execution can later be watched again via `weft follow <color>`
+   or cancelled via `weft stop <color>`.
+
+This is the only code path. Pure programs, triggered programs,
+and suspended-then-resumed programs all go through the same
+`POST /projects/{id}/run` shape (triggered programs just have
+the dispatcher invoking it internally on event arrival; pure
+programs complete quickly; HITL programs suspend and resume).
+No "simple mode" that bypasses the dispatcher.
+
+### 6.5 Project lifecycle
+
+Projects in the dispatcher have a simple state machine:
+
+```
+  (not registered) -- weft run  --> active
+                   \  weft run --> active
+  active -- weft deactivate --> deactivated
+  deactivated -- weft activate --> active
+  (any) -- weft rm --> (not registered)
+```
+
+A project stays registered with the dispatcher after its last
+execution completes. You can `weft logs` a completed execution
+days later. Manual prune only, no auto-GC of projects. (Individual
+suspended executions may have their own GC policy, see open
+questions; projects themselves are persistent.)
+
+Analogy: `docker ps -a` showing exited containers until `docker rm`.
+Same intuition.
+
+### 6.6 Dispatcher connection semantics
+
+`weft` CLI talks to the dispatcher at the URL in `weft.toml` (or
 `WEFT_DISPATCHER_URL` env var). Default = `http://localhost:9999`.
 
-Running locally: dispatcher is the user's laptop daemon
-(`weft start`). Works offline.
+Local dev: dispatcher is the laptop daemon (`weft start`). Works
+offline. Binary is uploaded to the daemon on `weft run`.
 
-Running inside a hosted workspace: dispatcher URL is pre-set to
-the cloud dispatcher's endpoint. The same CLI talks to it. No
-behavior difference from the user's perspective.
+Hosted workspace: dispatcher URL is pre-set by the workspace
+template to the cloud dispatcher's endpoint. Same CLI binary, same
+commands, no behavior change.
 
-Running in CI or automation: just set the env var, same CLI works.
+CI / automation: set the env var, same CLI works.
 
-### 6.4 `weft build` pipeline
+### 6.7 `weft build` pipeline
 
 1. Parse all `.weft` files (main + imports).
 2. Resolve imports, build the combined graph.
@@ -584,16 +679,8 @@ Running in CI or automation: just set the env var, same CLI works.
    `vendor/`).
 6. Invoke cargo to produce the binary.
 
-### 6.5 Simple programs: `weft run` with no triggers
-
-A pure program (e.g. `Text -> LLM -> Debug`) has no trigger entry
-primitives. When `weft run` registers it with the dispatcher, the
-dispatcher sees "no triggers" and immediately spawns a worker to
-execute the Manual entry (or the first node if no explicit entry).
-Worker runs to completion, emits results, exits. Dispatcher
-unregisters the project (one-shot).
-
-Behaves like `go run`: compile, run, done.
+Output is written to `.weft/target/`. `weft run` uses the cached
+binary if the source hash matches.
 
 ---
 
@@ -1012,8 +1099,12 @@ Concrete sub-tasks for the first milestone:
 4. Port `ApiPost` and `HumanQuery` to the v2 Node trait.
 5. Implement `weft build` producing a binary (hardcoded graph is
    fine for the milestone; full compiler comes after).
-6. Implement `weft run` that registers with the local dispatcher.
-7. Serve the ops dashboard at `localhost:PORT/dashboard/`.
+6. Implement the dispatcher HTTP API: `POST /projects/{id}/run`,
+   `POST /executions/{color}/cancel`, SSE stream on
+   `GET /events/project/{id}`.
+7. Implement the `weft` CLI as a thin client of that API
+   (`weft run`, `weft stop`, `weft follow`).
+8. Serve the ops dashboard at `localhost:PORT/dashboard/`.
 8. Manual testing: curl the webhook URL, verify execution starts,
    curl the form URL, verify execution resumes, watch state in
    the dashboard.
