@@ -10,6 +10,7 @@ What's coming next. Not prioritized, not promised, just directions we're explori
   - Callbacks + loops unlock agent loops, tool-use routing, retry/pagination. Without them, agents are second-class.
 - **Multi-file / imports**: `import { MyGroup } from "./shared/group.weft"`. Reusable groups across projects.
 - **Error handling**: Try/catch equivalent. Catch node failures and route to error-handling sub-graphs instead of killing the execution.
+- **Explicit expand / gather**: The implicit `List[T] → T` expand and `T → List[T]` gather is beloved UX but AI writers (and humans) confuse it. When a downstream port is `T` (especially a TypeVar that absorbs the parent shape), the expected gather silently doesn't happen and produces wrong data. Fix: keep the whole mechanism as-is, but make it opt-in. By default `List[T] → T` is a type error. An explicit `expand T` / `gather List[T]` keyword on the port (or edge) turns on the existing logic and the compiler validates that the depth/breadth matches exactly as today. Same compiler machinery, different default: explicit over implicit.
 
 ## Editor & Tooling
 
