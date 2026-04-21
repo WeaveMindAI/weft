@@ -1,38 +1,35 @@
 // Weft VS Code extension entrypoint.
 //
-// Three surfaces:
-// - Tangle panel: chat with the AI builder. Lives in the left activity
-//   bar (webview). Phase A2 wires this to Tangle's streaming endpoint.
-// - Graph view: when a user opens a .weft file, offer a companion tab
-//   rendering the graph. Phase A2 implements the rendering.
-// - Runner view: when a user opens a .loom file, offer a companion tab
-//   rendering the runner UI preview. Phase A2 implements rendering.
-// - Projects tree view: shows projects registered with the dispatcher,
-//   their status, and active executions. Driven by the dispatcher's
-//   SSE stream. Phase A2 implements the live updates.
+// Surfaces:
+// - Tangle chat participant: invoked as `@weft` from the native
+//   VS Code chat panel. Routes to the dispatcher's AI endpoint
+//   (Phase B) with fallback to VS Code's default language model.
+// - Projects tree view: left activity-bar sidebar showing projects
+//   registered with the dispatcher. Polls every 5s.
+// - Graph view: editor tab showing a .weft file's graph preview.
+// - Runner view: editor tab showing a .loom file's runner preview.
 
 import * as vscode from 'vscode';
 import { DispatcherClient } from './dispatcher';
-import { TangleViewProvider } from './tangle';
+import { registerTangleParticipant } from './tangle';
 import { ProjectsTreeProvider } from './projects';
 import { openGraphView, openLoomView } from './views';
 
 export function activate(context: vscode.ExtensionContext) {
   const dispatcher = new DispatcherClient(getDispatcherUrl());
 
-  // Left activity-bar panels
+  // Chat participant (native VS Code chat panel).
+  registerTangleParticipant(context, dispatcher);
+
+  // Projects sidebar.
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(
-      'weft.tangle',
-      new TangleViewProvider(context, dispatcher),
-    ),
     vscode.window.registerTreeDataProvider(
       'weft.projects',
       new ProjectsTreeProvider(dispatcher),
     ),
   );
 
-  // Commands
+  // Commands.
   context.subscriptions.push(
     vscode.commands.registerCommand('weft.openGraphView', () => openGraphView(context)),
     vscode.commands.registerCommand('weft.openLoomView', () => openLoomView(context)),
