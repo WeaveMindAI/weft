@@ -1,5 +1,6 @@
-// Thin HTTP client for the dispatcher. Mirrors weft-cli's client in
-// shape so behavior stays consistent across surfaces.
+// Thin HTTP client for the dispatcher.
+
+import type { Diagnostic, ParseResponse } from './shared/protocol';
 
 export class DispatcherClient {
   constructor(private baseUrl: string) {}
@@ -30,9 +31,17 @@ export class DispatcherClient {
     return es;
   }
 
-  async runCurrentProject(): Promise<void> {
-    // Phase A2: read the project id from the open workspace's
-    // weft.toml, POST /projects/{id}/run.
-    throw new Error('runCurrentProject not yet implemented');
+  async parse(source: string, projectId?: string): Promise<ParseResponse> {
+    return this.post<ParseResponse>('/parse', {
+      source,
+      project_id: projectId,
+    });
+  }
+
+  async validate(source: string, projectId?: string): Promise<{ diagnostics: Diagnostic[] }> {
+    return this.post<{ diagnostics: Diagnostic[] }>('/validate', {
+      source,
+      project_id: projectId,
+    });
   }
 }

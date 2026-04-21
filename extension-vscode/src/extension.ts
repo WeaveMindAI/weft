@@ -1,26 +1,23 @@
 // Weft VS Code extension entrypoint.
 //
-// Scope: ops only. This extension shows projects registered with
-// the local dispatcher, lets the user run them, and previews .weft
-// / .loom files. It does NOT bundle AI authoring; that lives in a
-// separate extension distributed outside this repository.
-//
-// Surfaces:
-// - Projects tree view: left activity-bar sidebar showing projects
-//   registered with the dispatcher. Polls every 5s.
-// - Graph view: editor tab showing a .weft file's graph preview.
-// - Runner view: editor tab showing a .loom file's runner preview.
-// - Commands: weft.runProject, weft.openGraphView, weft.openLoomView.
+// Scope: ops + graph rendering. This extension:
+// - shows projects registered with the local dispatcher
+// - lets the user run them
+// - renders a live xyflow graph of the active .weft file
+// - surfaces dispatcher /validate diagnostics in the Problems panel
+// - exposes a streaming-edit primitive for AI extensions to drive
+//   SEARCH/REPLACE blocks into the active file as they stream
 
 import * as vscode from 'vscode';
 import { DispatcherClient } from './dispatcher';
 import { ProjectsTreeProvider } from './projects';
-import { openGraphView, openLoomView } from './views';
+import { GraphViewController } from './graphView';
+import { attachDiagnostics } from './diagnostics';
+import { registerStreamingEditApi } from './streamingEdits';
 
 export function activate(context: vscode.ExtensionContext) {
   const dispatcher = new DispatcherClient(getDispatcherUrl());
 
-  // Projects sidebar.
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider(
       'weft.projects',
@@ -28,16 +25,33 @@ export function activate(context: vscode.ExtensionContext) {
     ),
   );
 
-  // Commands.
+  const graphView = new GraphViewController(context, dispatcher);
+
   context.subscriptions.push(
-    vscode.commands.registerCommand('weft.openGraphView', () => openGraphView(context)),
-    vscode.commands.registerCommand('weft.openLoomView', () => openLoomView(context)),
+    vscode.commands.registerCommand('weft.openGraphView', async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.document.languageId !== 'weft') {
+        void vscode.window.showInformationMessage('Open a .weft file first.');
+        return;
+      }
+      await graphView.open(editor.document);
+    }),
+    vscode.commands.registerCommand('weft.openLoomView', () => {
+      void vscode.window.showInformationMessage(
+        'Runner view lands after graph view ships. Tracking in the roadmap.',
+      );
+    }),
     vscode.commands.registerCommand('weft.runProject', async () => {
-      await dispatcher.runCurrentProject();
+      void vscode.window.showInformationMessage(
+        'weft.runProject wiring pending; for now, use the CLI: `weft run`.',
+      );
     }),
   );
 
-  // React to config changes.
+  attachDiagnostics(context, dispatcher);
+
+  context.subscriptions.push(registerStreamingEditApi());
+
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('weft.dispatcherUrl')) {

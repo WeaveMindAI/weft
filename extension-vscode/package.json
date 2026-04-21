@@ -1,7 +1,7 @@
 {
   "name": "weft-vscode",
   "displayName": "Weft",
-  "description": "Weft language support: project management against the local dispatcher, graph view for .weft files, runner view for .loom files.",
+  "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, runner view for .loom files, AI streaming edits.",
   "version": "0.2.0",
   "publisher": "weavemind",
   "engines": {
@@ -15,6 +15,7 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "icon": "media/weft-icon.png",
   "contributes": {
     "languages": [
       {
@@ -60,7 +61,7 @@
         {
           "id": "weft-sidebar",
           "title": "Weft",
-          "icon": "media/weft-icon.svg"
+          "icon": "media/weft-icon.png"
         }
       ]
     },
@@ -71,18 +72,46 @@
           "type": "string",
           "default": "http://localhost:9999",
           "description": "URL of the weft dispatcher daemon the extension talks to."
+        },
+        "weft.parse.debounceMs": {
+          "type": "number",
+          "default": 100,
+          "description": "Debounce between the last text change and the next /parse call that refreshes the graph view."
+        },
+        "weft.validate.debounceMs": {
+          "type": "number",
+          "default": 500,
+          "description": "Debounce between the last text change (or AI stream end) and the next /validate call that refreshes the Problems panel."
+        },
+        "weft.layout.debounceMs": {
+          "type": "number",
+          "default": 400,
+          "description": "Debounce between a structural graph change and the next ELK auto-layout pass."
+        },
+        "weft.ai.streamingEditsEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Apply SEARCH/REPLACE blocks from AI chat responses to the active .weft file in real time."
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "pnpm run compile",
+    "vscode:prepublish": "pnpm run compile && pnpm run bundle:webview",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "bundle:webview": "node build-webview.mjs",
+    "bundle:webview:watch": "node build-webview.mjs --watch"
   },
   "devDependencies": {
     "@types/node": "^20",
     "@types/vscode": "^1.90.0",
-    "typescript": "^5.4"
+    "typescript": "^5.4",
+    "esbuild": "^0.24.0",
+    "esbuild-svelte": "^0.9.0",
+    "svelte": "^5.0.0",
+    "svelte-preprocess": "^6.0.0",
+    "@xyflow/svelte": "^0.1.22",
+    "elkjs": "^0.9.3"
   }
 }
