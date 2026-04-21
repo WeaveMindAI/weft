@@ -6,6 +6,7 @@ members = [
     "crates/weft-dispatcher",
     "crates/weft-cli",
     "crates/weft-stdlib",
+    "crates/weft-runner",
 ]
 
 [workspace.package]
@@ -55,3 +56,4 @@ regex = "1"
 weft-core = { path = "crates/weft-core" }
 weft-compiler = { path = "crates/weft-compiler" }
 weft-stdlib = { path = "crates/weft-stdlib" }
+weft-runner = { path = "crates/weft-runner" }

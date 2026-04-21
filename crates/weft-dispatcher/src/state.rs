@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::backend::{InfraBackend, WorkerBackend};
 use crate::config::DispatcherConfig;
 use crate::journal::Journal;
+use crate::project_store::ProjectStore;
 
 /// Top-level dispatcher state. Shared across HTTP handlers via
 /// `axum::extract::State`. All fields are `Arc`-friendly.
@@ -12,4 +13,5 @@ pub struct DispatcherState {
     pub journal: Arc<dyn Journal>,
     pub workers: Arc<dyn WorkerBackend>,
     pub infra: Arc<dyn InfraBackend>,
+    pub projects: ProjectStore,
 }

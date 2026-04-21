@@ -2056,6 +2056,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-runner"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "weft-compiler",
+ "weft-core",
+ "weft-stdlib",
+]
+
+[[package]]
 name = "weft-stdlib"
 version = "0.2.0"
 dependencies = [

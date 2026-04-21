@@ -2,6 +2,10 @@
 //! `KindInfraBackend` (local dev). The closed-source weavemind repo
 //! adds cloud implementations plugging into the same traits.
 
+pub mod subprocess;
+
+pub use subprocess::SubprocessWorkerBackend;
+
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -17,7 +21,7 @@ pub trait WorkerBackend: Send + Sync {
     /// later.
     async fn spawn_worker(
         &self,
-        binary_path: &PathBuf,
+        binary_path: &std::path::Path,
         wake: WakeContext,
     ) -> anyhow::Result<WorkerHandle>;
 

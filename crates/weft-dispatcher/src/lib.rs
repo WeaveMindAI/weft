@@ -13,9 +13,11 @@
 
 pub mod api;
 pub mod backend;
-pub mod journal;
-pub mod state;
 pub mod config;
+pub mod journal;
+pub mod project_store;
+pub mod state;
 
 pub use config::DispatcherConfig;
+pub use project_store::{ProjectStore, ProjectStatus as StoreStatus};
 pub use state::DispatcherState;

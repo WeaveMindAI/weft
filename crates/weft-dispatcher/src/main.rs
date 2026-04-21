@@ -11,7 +11,10 @@ use tracing::info;
 
 use weft_dispatcher::{
     api::router,
-    backend::{EventStream, InfraBackend, InfraHandle, InfraSpec, WakeContext, WorkerBackend, WorkerHandle},
+    backend::{
+        subprocess::SubprocessWorkerBackend, EventStream, InfraBackend, InfraHandle, InfraSpec,
+        WakeContext, WorkerBackend, WorkerHandle,
+    },
     journal::{Journal, WakeTarget},
     DispatcherConfig, DispatcherState,
 };
@@ -36,11 +39,17 @@ async fn main() -> anyhow::Result<()> {
         config.http_port = port;
     }
 
+    let runner_path = std::env::var("WEFT_RUNNER_PATH").unwrap_or_else(|_| "weft-runner".to_string());
+    let self_url = format!("http://localhost:{}", config.http_port);
+    let projects_dir = config.data_dir.join("projects");
+    let projects = weft_dispatcher::ProjectStore::new(projects_dir)?;
+
     let state = DispatcherState {
         config: Arc::new(config.clone()),
         journal: Arc::new(StubJournal),
-        workers: Arc::new(StubWorkerBackend),
+        workers: Arc::new(SubprocessWorkerBackend::new(runner_path, self_url)),
         infra: Arc::new(StubInfraBackend),
+        projects,
     };
 
     let app = router(state);
@@ -72,18 +81,6 @@ impl Journal for StubJournal {
         Ok(())
     }
     async fn cancel(&self, _color: uuid::Uuid) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-struct StubWorkerBackend;
-
-#[async_trait]
-impl WorkerBackend for StubWorkerBackend {
-    async fn spawn_worker(&self, _binary_path: &std::path::PathBuf, _wake: WakeContext) -> anyhow::Result<WorkerHandle> {
-        anyhow::bail!("worker backend not yet implemented")
-    }
-    async fn kill_worker(&self, _handle: WorkerHandle) -> anyhow::Result<()> {
         Ok(())
     }
 }
