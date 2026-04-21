@@ -1,0 +1,14 @@
+.vscode/**
+node_modules/**
+src/webview/**
+src/shared/**
+build-webview.mjs
+vite.webview.config.mjs
+svelte.config.js
+tsconfig.json
+**/*.ts
+**/*.map
+!out/**/*.js
+!media/**
+.gitignore
+pnpm-lock.yaml

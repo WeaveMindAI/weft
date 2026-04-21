@@ -680,9 +680,12 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
 
         // no-required-skip: only applies when the node has inputs,
-        // none are required, and the node doesn't declare
-        // @require_one_of (which would provide its own skip logic).
+        // none are required, no @require_one_of is declared, and the
+        // node has outputs. Terminal nodes (no outputs) exist
+        // explicitly to run on every invocation (Debug, DLQ, audit
+        // sinks); we don't flag them.
         if !node.inputs.is_empty()
+            && !node.outputs.is_empty()
             && node.inputs.iter().all(|p| !p.required)
             && node.features.one_of_required.is_empty()
         {
