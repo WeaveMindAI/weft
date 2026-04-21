@@ -24,6 +24,20 @@ impl DispatcherClient {
         let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
         resp.error_for_status()?.json().await.context("parse response")
     }
+
+    pub async fn delete(&self, path: &str) -> anyhow::Result<()> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.delete(&url).send().await.with_context(|| format!("DELETE {url}"))?;
+        resp.error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn post_empty(&self, path: &str) -> anyhow::Result<()> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.post(&url).send().await.with_context(|| format!("POST {url}"))?;
+        resp.error_for_status()?;
+        Ok(())
+    }
 }
 
 pub fn resolve_dispatcher_url(override_url: Option<&str>) -> String {

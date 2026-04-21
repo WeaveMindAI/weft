@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::Notify;
 
-use weft_core::context::{ConfigBag, InputBag, LogLevel};
+use weft_core::context::{ConfigBag, InputBag};
 use weft_core::exec::{
     check_completion, find_ready_nodes, postprocess::{emit_null_downstream, postprocess_output},
     preprocess_input, NodeExecution, NodeExecutionStatus, NodeExecutionTable,

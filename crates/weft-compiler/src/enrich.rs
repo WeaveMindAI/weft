@@ -18,7 +18,7 @@
 use serde_json::Value;
 
 use weft_core::node::{FormFieldPort, NodeCatalog};
-use weft_core::project::{NodeDefinition, PortDefinition, ProjectDefinition};
+use weft_core::project::{PortDefinition, ProjectDefinition};
 use weft_core::weft_type::WeftType;
 
 use crate::error::{CompileError, CompileResult};

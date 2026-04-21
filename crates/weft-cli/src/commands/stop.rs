@@ -1,5 +1,7 @@
 use super::Ctx;
 
-pub async fn run(_ctx: Ctx, _color: String) -> anyhow::Result<()> {
-    anyhow::bail!("`weft stop` not yet implemented")
+pub async fn run(ctx: Ctx, color: String) -> anyhow::Result<()> {
+    ctx.client().post_empty(&format!("/executions/{color}/cancel")).await?;
+    println!("cancelled {color}");
+    Ok(())
 }

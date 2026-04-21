@@ -1,5 +1,5 @@
-//! The dispatcher binary. Starts the HTTP server, binds the configured
-//! backends, mounts the API router.
+//! The dispatcher binary. Starts the HTTP server, binds the
+//! configured backends, mounts the API router.
 
 use std::sync::Arc;
 
@@ -13,9 +13,8 @@ use weft_dispatcher::{
     api::router,
     backend::{
         subprocess::SubprocessWorkerBackend, EventStream, InfraBackend, InfraHandle, InfraSpec,
-        WakeContext, WorkerBackend, WorkerHandle,
     },
-    journal::{Journal, WakeTarget},
+    journal::sqlite::SqliteJournal,
     DispatcherConfig, DispatcherState,
 };
 
@@ -29,8 +28,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "weft_dispatcher=info,tower_http=debug".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "weft_dispatcher=info,tower_http=debug".into()),
+        )
         .init();
 
     let args = Args::parse();
@@ -43,10 +44,14 @@ async fn main() -> anyhow::Result<()> {
     let self_url = format!("http://localhost:{}", config.http_port);
     let projects_dir = config.data_dir.join("projects");
     let projects = weft_dispatcher::ProjectStore::new(projects_dir)?;
+    let journal_path = config.data_dir.join("journal.sqlite");
+    let journal = SqliteJournal::open(&journal_path)
+        .await
+        .with_context(|| format!("open journal at {}", journal_path.display()))?;
 
     let state = DispatcherState {
         config: Arc::new(config.clone()),
-        journal: Arc::new(StubJournal),
+        journal: Arc::new(journal),
         workers: Arc::new(SubprocessWorkerBackend::new(runner_path, self_url)),
         infra: Arc::new(StubInfraBackend),
         projects,
@@ -60,31 +65,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ----- Phase A1 stubs -------------------------------------------------
-// Real impls land in phase A2. Keeping the binary runnable end-to-end
-// so we can curl it even though no work actually happens.
-
-struct StubJournal;
-
-#[async_trait]
-impl Journal for StubJournal {
-    async fn record_start(&self, _color: uuid::Uuid, _project_id: &str, _entry_node: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn record_suspension(&self, _color: uuid::Uuid, _node: &str, _metadata: serde_json::Value) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn resolve_wake(&self, _token: &str) -> anyhow::Result<Option<WakeTarget>> {
-        Ok(None)
-    }
-    async fn record_cost(&self, _color: uuid::Uuid, _report: weft_core::CostReport) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn cancel(&self, _color: uuid::Uuid) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
+// Infra backend stays a stub until KindInfraBackend lands.
 struct StubInfraBackend;
 
 #[async_trait]

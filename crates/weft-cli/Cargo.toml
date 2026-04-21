@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 weft-core = { workspace = true }
 weft-compiler = { workspace = true }
+weft-stdlib = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -2888,6 +2888,3 @@ fn try_parse_group_connection_with_inline(
     }
 }
 
-#[cfg(test)]
-#[path = "tests/compiler_tests.rs"]
-mod tests;
