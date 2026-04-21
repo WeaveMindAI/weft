@@ -32,11 +32,11 @@ Re-run `./install.sh` anytime to rebuild and re-link. `./install.sh
 ## Start the dispatcher
 
 ```bash
-weft daemon start    # fork in the background
-weft daemon status   # is it up?
-weft daemon logs -f  # tail the log
-weft daemon stop     # when done
-weft daemon restart  # stop + start
+weft daemon start    # fork in the background   (alias: weft d start)
+weft daemon status   # is it up?                 (alias: weft d status)
+weft daemon logs -f  # tail the log              (alias: weft d logs -f)
+weft daemon stop     # when done                 (alias: weft d stop)
+weft daemon restart  # stop + start              (alias: weft d restart)
 ```
 
 Port 9999 by default. Override with `WEFT_HTTP_PORT=…` when

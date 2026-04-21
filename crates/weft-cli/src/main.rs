@@ -51,6 +51,7 @@ enum Cmd {
     /// restart, logs). The dispatcher is the long-lived process that
     /// owns projects, executions, and infra; `weft run` and the
     /// VS Code extension talk to it over HTTP.
+    #[command(visible_alias = "d")]
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
