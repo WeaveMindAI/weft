@@ -184,7 +184,7 @@ export class GraphViewController {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data:; font-src ${cspSource};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data:; font-src ${cspSource}; connect-src ${cspSource};">
 <link rel="stylesheet" href="${bundleCss}">
 <title>Weft Graph</title>
 <style>html,body,#app{margin:0;padding:0;width:100%;height:100%;overflow:hidden}</style>

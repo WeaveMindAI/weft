@@ -110,7 +110,7 @@
     "vite": "^7.3.1",
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "svelte": "^5.0.0",
-    "@xyflow/svelte": "^0.1.22",
+    "@xyflow/svelte": "^1.5.2",
     "elkjs": "^0.9.3"
   }
 }

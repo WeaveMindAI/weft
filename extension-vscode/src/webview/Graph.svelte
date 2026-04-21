@@ -114,7 +114,7 @@
     nodes={nodes as any}
     edges={edges as any}
     fitView
-    on:nodedragstop={onNodeDragStop}
+    onnodedragstop={onNodeDragStop}
   >
     <Background />
     <Controls />
