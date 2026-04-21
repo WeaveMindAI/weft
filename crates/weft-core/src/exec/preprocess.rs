@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::exec::typecheck::runtime_type_check;
 use crate::lane::{Lane, LaneFrame};
 use crate::project::{LaneMode, NodeDefinition, ProjectDefinition};
-use crate::pulse::{Pulse, PulseStatus, PulseTable};
+use crate::pulse::{Pulse, PulseTable};
 use crate::Color;
 
 pub fn preprocess_input(project: &ProjectDefinition, pulses: &mut PulseTable) -> bool {

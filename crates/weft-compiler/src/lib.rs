@@ -17,7 +17,7 @@
 //! `crates-v1/weft-nodes/src/enrich.rs`.
 
 pub mod project;
-pub mod parser;
+pub mod weft_compiler;
 pub mod enrich;
 pub mod validate;
 pub mod codegen;
@@ -25,4 +25,5 @@ pub mod build;
 pub mod describe;
 pub mod error;
 
-pub use error::{CompileError, CompileResult};
+pub use error::{CompileError as ProjectError, CompileResult};
+pub use weft_compiler::{compile as compile_source, CompileError as SourceError};

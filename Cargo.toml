@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
+regex = "1"
 
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }

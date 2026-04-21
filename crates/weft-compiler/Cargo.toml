@@ -12,3 +12,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+weft-core = { workspace = true }
