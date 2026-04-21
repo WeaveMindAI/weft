@@ -30,12 +30,51 @@ pub struct ProjectDefinition {
     pub description: Option<String>,
     pub nodes: Vec<NodeDefinition>,
     pub edges: Vec<Edge>,
+    /// Group structure preserved by the parser. The flattened node
+    /// list in `nodes` contains the In/Out boundary Passthroughs +
+    /// child nodes for each group; this field carries the pre-
+    /// flatten tree so tooling (the VS Code graph view, AI editors)
+    /// can render groups as structured units without re-deriving
+    /// them from the flat layout.
+    #[serde(default)]
+    pub groups: Vec<GroupDefinition>,
     #[serde(default)]
     pub status: ProjectStatus,
     #[serde(rename = "createdAt", default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(rename = "updatedAt", default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupDefinition {
+    pub id: String,
+    /// Optional user-facing label. Defaults to id if missing.
+    pub label: Option<String>,
+    /// External input ports (the ports outside the group connects to).
+    #[serde(rename = "inPorts", default)]
+    pub in_ports: Vec<PortDefinition>,
+    /// External output ports.
+    #[serde(rename = "outPorts", default)]
+    pub out_ports: Vec<PortDefinition>,
+    /// @require_one_of groups declared on the interface.
+    #[serde(rename = "oneOfRequired", default)]
+    pub one_of_required: Vec<Vec<String>>,
+    /// Parent group id for nested groups. None for top-level groups.
+    #[serde(rename = "parentGroupId", default)]
+    pub parent_group_id: Option<String>,
+    /// Ids of child groups (first-level only; nested groups carry
+    /// their own entry with `parent_group_id` set).
+    #[serde(rename = "childGroupIds", default)]
+    pub child_group_ids: Vec<String>,
+    /// Ids of member nodes (only direct children, not grandchildren).
+    /// Does NOT include the In/Out boundary Passthroughs.
+    #[serde(rename = "nodeIds", default)]
+    pub node_ids: Vec<String>,
+    #[serde(default)]
+    pub span: Option<Span>,
+    #[serde(default, rename = "headerSpan")]
+    pub header_span: Option<Span>,
 }
 
 /// Graph-level instance of a node.

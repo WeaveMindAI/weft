@@ -49,12 +49,26 @@ export interface Edge {
   span?: Span;
 }
 
+export interface GroupDefinition {
+  id: string;
+  label: string | null;
+  inPorts: PortDefinition[];
+  outPorts: PortDefinition[];
+  oneOfRequired: string[][];
+  parentGroupId: string | null;
+  childGroupIds: string[];
+  nodeIds: string[];
+  span?: Span;
+  headerSpan?: Span;
+}
+
 export interface ProjectDefinition {
   id: string;
   name: string;
   description: string | null;
   nodes: NodeDefinition[];
   edges: Edge[];
+  groups: GroupDefinition[];
 }
 
 export type Severity = 'error' | 'warning' | 'info' | 'hint';

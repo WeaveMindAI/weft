@@ -17,7 +17,7 @@ pub use node::{
 };
 pub use primitive::{EntryPrimitive, FormSchema, FormSubmission, CostReport};
 pub use project::{
-    Edge, EdgeIndex, ExecutionStatus, GroupBoundary, GroupBoundaryRole, LaneMode,
+    Edge, EdgeIndex, ExecutionStatus, GroupBoundary, GroupBoundaryRole, GroupDefinition, LaneMode,
     NodeDefinition, PortDefinition, Position, ProjectDefinition, ProjectExecution,
     ProjectStatus,
 };

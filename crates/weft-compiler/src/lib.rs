@@ -112,6 +112,7 @@ fn empty_project(project_id: Uuid) -> ProjectDefinition {
         description: None,
         nodes: Vec::new(),
         edges: Vec::new(),
+        groups: Vec::new(),
         status: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),

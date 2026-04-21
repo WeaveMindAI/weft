@@ -2031,6 +2031,14 @@ fn flatten(state: ParseState, project_id: Uuid) -> Result<ProjectDefinition, Vec
         edges.push(parsed_to_edge(pc));
     }
 
+    // Collect the structured group tree BEFORE flattening so the
+    // GroupDefinitions capture the pre-flatten shape (which node ids
+    // are direct members, which are grandchildren, etc).
+    let mut groups: Vec<weft_core::GroupDefinition> = Vec::new();
+    for group in &state.groups {
+        collect_group_definitions(group, None, &mut groups);
+    }
+
     // Flatten each group (recursively handles nested groups)
     for group in &state.groups {
         flatten_group(group, &mut nodes, &mut edges);
@@ -2056,10 +2064,69 @@ fn flatten(state: ParseState, project_id: Uuid) -> Result<ProjectDefinition, Vec
         description: if state.description.is_empty() { None } else { Some(state.description) },
         nodes,
         edges,
+        groups,
         status: Default::default(),
         created_at: now,
         updated_at: now,
     })
+}
+
+/// Walk the ParsedGroup tree and emit a GroupDefinition per group.
+/// Direct children go into `node_ids`; nested groups go into
+/// `child_group_ids` and recurse with their own entry.
+fn collect_group_definitions(
+    group: &ParsedGroup,
+    parent_group_id: Option<String>,
+    out: &mut Vec<weft_core::GroupDefinition>,
+) {
+    let in_ports: Vec<PortDefinition> = group
+        .in_ports
+        .iter()
+        .map(|p| PortDefinition {
+            name: p.name.clone(),
+            port_type: p.port_type.clone(),
+            required: p.required,
+            description: None,
+            lane_mode: p.lane_mode,
+            lane_depth: 1,
+            configurable: p.port_type.is_default_configurable(),
+        })
+        .collect();
+    let out_ports: Vec<PortDefinition> = group
+        .out_ports
+        .iter()
+        .map(|p| PortDefinition {
+            name: p.name.clone(),
+            port_type: p.port_type.clone(),
+            required: false,
+            description: None,
+            lane_mode: LaneMode::Single,
+            lane_depth: 1,
+            configurable: p.port_type.is_default_configurable(),
+        })
+        .collect();
+
+    // Direct node members (already scoped to this group's id by the
+    // parser's rescope pass).
+    let node_ids: Vec<String> = group.nodes.iter().map(|n| n.id.clone()).collect();
+    let child_group_ids: Vec<String> = group.child_groups.iter().map(|g| g.id.clone()).collect();
+
+    out.push(weft_core::GroupDefinition {
+        id: group.id.clone(),
+        label: Some(group.id.clone()),
+        in_ports,
+        out_ports,
+        one_of_required: group.one_of_required.clone(),
+        parent_group_id: parent_group_id.clone(),
+        child_group_ids,
+        node_ids,
+        span: None,
+        header_span: None,
+    });
+
+    for child in &group.child_groups {
+        collect_group_definitions(child, Some(group.id.clone()), out);
+    }
 }
 
 /// Build the scope chain for a group ID.
