@@ -12,8 +12,12 @@ pub use error::{WeftError, WeftResult};
 pub use lane::{Lane, LaneFrame};
 pub use node::{Node, NodeMetadata, PortDef, FieldDef};
 pub use primitive::{EntryPrimitive, FormSchema, FormSubmission, CostReport};
-pub use project::{ProjectDefinition, NodeDefinition, Edge};
+pub use project::{
+    Edge, EdgeIndex, ExecutionStatus, GroupBoundary, GroupBoundaryRole, LaneMode,
+    NodeDefinition, PortDefinition, Position, ProjectDefinition, ProjectExecution,
+    ProjectStatus,
+};
 pub use pulse::Pulse;
-pub use weft_type::WeftType;
+pub use weft_type::{WeftPrimitive, WeftType};
 
 pub type Color = uuid::Uuid;

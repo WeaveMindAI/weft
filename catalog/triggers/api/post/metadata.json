@@ -9,7 +9,7 @@
   "outputs": [
     {
       "name": "body",
-      "type": "Dict",
+      "type": "JsonDict",
       "required": false
     },
     {

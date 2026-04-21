@@ -6,7 +6,7 @@
   "tags": ["debug", "inspect", "log"],
   "icon": "Bug",
   "inputs": [
-    { "name": "value", "type": "Any", "required": false }
+    { "name": "value", "type": "T", "required": false }
   ],
   "outputs": [],
   "fields": [

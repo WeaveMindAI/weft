@@ -10,7 +10,7 @@
     { "name": "title", "type": "String", "required": false }
   ],
   "outputs": [
-    { "name": "submission", "type": "Dict", "required": false }
+    { "name": "submission", "type": "JsonDict", "required": false }
   ],
   "fields": [
     {

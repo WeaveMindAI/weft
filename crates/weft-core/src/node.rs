@@ -63,6 +63,8 @@ pub struct NodeMetadata {
     pub requires_infra: bool,
 }
 
+use crate::project::LaneMode;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortDef {
     pub name: String,
@@ -76,15 +78,6 @@ pub struct PortDef {
     /// incoming edge). `wired_only` ports must come from upstream.
     #[serde(default)]
     pub configurable: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LaneMode {
-    #[default]
-    Single,
-    Expand,
-    Gather,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
