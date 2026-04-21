@@ -122,6 +122,7 @@ pub async fn run(
         color,
         resume_node,
         resume_value: body.payload,
+        kind: crate::backend::WakeKind::Fresh,
     };
 
     state

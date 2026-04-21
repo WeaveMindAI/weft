@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 
 use weft_compiler::enrich::enrich;
 use weft_compiler::weft_compiler::compile;
+use weft_runner::EntryMode;
 use weft_stdlib::StdlibCatalog;
 
 #[tokio::test]
@@ -37,6 +38,7 @@ sink.value = greeting.value
         color,
         Some("greeting"),
         serde_json::Value::Null,
+        EntryMode::Fresh,
         None,
         cancellation,
     )

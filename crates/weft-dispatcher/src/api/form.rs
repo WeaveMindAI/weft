@@ -59,6 +59,7 @@ pub async fn submit(
         color: target.color,
         resume_node: target.node.clone(),
         resume_value: body,
+        kind: crate::backend::WakeKind::Resume,
     };
 
     state

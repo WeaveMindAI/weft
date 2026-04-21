@@ -45,7 +45,14 @@ impl WorkerBackend for SubprocessWorkerBackend {
         cmd.arg("--color").arg(wake.color.to_string());
         cmd.arg("--entry-node").arg(&wake.resume_node);
         let payload = serde_json::to_string(&wake.resume_value)?;
-        cmd.arg("--entry-payload").arg(payload);
+        match wake.kind {
+            crate::backend::WakeKind::Fresh => {
+                cmd.arg("--entry-payload").arg(payload);
+            }
+            crate::backend::WakeKind::Resume => {
+                cmd.arg("--resume-value").arg(payload);
+            }
+        }
         cmd.arg("--dispatcher").arg(&self.dispatcher_url);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

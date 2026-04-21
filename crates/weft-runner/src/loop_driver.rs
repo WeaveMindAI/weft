@@ -18,12 +18,24 @@ use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
 
 use crate::context::RunnerHandle;
 
+pub enum EntryMode {
+    /// Fresh run: pulse targets the entry node's first input port
+    /// so the node fires and its output propagates.
+    Fresh,
+    /// Resume after a suspension: the node already ran up to the
+    /// suspension point. Inject `entry_value` as the node's output,
+    /// skipping the node body. Downstream reacts as if the suspension
+    /// completed with `entry_value`.
+    Resume,
+}
+
 pub async fn run_loop(
     project: ProjectDefinition,
     catalog: Arc<dyn NodeCatalog>,
     color: Color,
     entry_node: Option<&str>,
     entry_value: Value,
+    entry_mode: EntryMode,
     dispatcher_url: Option<&str>,
     cancellation: Arc<Notify>,
 ) -> anyhow::Result<()> {
@@ -41,15 +53,37 @@ pub async fn run_loop(
             .iter()
             .find(|n| n.id == entry)
             .ok_or_else(|| anyhow::anyhow!("entry node '{entry}' not found"))?;
-        let entry_port = entry_node_def
-            .outputs
-            .first()
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "value".into());
-        pulses
-            .entry(entry.to_string())
-            .or_default()
-            .push(Pulse::new(color, Vec::new(), entry, entry_port, entry_value));
+        match entry_mode {
+            EntryMode::Fresh => {
+                let entry_port = entry_node_def
+                    .inputs
+                    .first()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "body".into());
+                pulses
+                    .entry(entry.to_string())
+                    .or_default()
+                    .push(Pulse::new(color, Vec::new(), entry, entry_port, entry_value));
+            }
+            EntryMode::Resume => {
+                // Seed the entry node's output ports with
+                // entry_value (the form submission, timer wake, etc)
+                // so downstream fires as if the suspension returned.
+                for port in &entry_node_def.outputs {
+                    let outgoing = edge_idx.get_outgoing(&project, entry);
+                    for edge in outgoing.iter().filter(|e| e.source_handle.as_deref() == Some(&port.name)) {
+                        let target_port = edge.target_handle.as_deref().unwrap_or("default");
+                        pulses.entry(edge.target.clone()).or_default().push(Pulse::new(
+                            color,
+                            Vec::new(),
+                            edge.target.clone(),
+                            target_port.to_string(),
+                            entry_value.clone(),
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     let exec_id = uuid::Uuid::new_v4().to_string();
@@ -146,6 +180,7 @@ pub async fn run_loop(
                 exec_id.clone(),
                 project.id.to_string(),
                 group.color,
+                node_id.clone(),
                 dispatcher_url.map(str::to_string),
                 cancellation.clone(),
             )) as Arc<dyn weft_core::context::ContextHandle>;
@@ -178,6 +213,15 @@ pub async fn run_loop(
                         &edge_idx,
                         &mut executions,
                     );
+                }
+                Err(weft_core::error::WeftError::Suspended { token }) => {
+                    tracing::info!(
+                        target: "weft_runner",
+                        node = %node_id, token = %token,
+                        "execution suspended; worker exiting cleanly"
+                    );
+                    mark_waiting(&mut executions, &node_id, group.color, &group.lane, &token);
+                    return Ok(());
                 }
                 Err(e) => {
                     let err = format!("{e}");
@@ -245,6 +289,21 @@ fn mark_failed(
             e.status = NodeExecutionStatus::Failed;
             e.completed_at = Some(now_unix());
             e.error = Some(err.to_string());
+        }
+    }
+}
+
+fn mark_waiting(
+    executions: &mut NodeExecutionTable,
+    node_id: &str,
+    color: Color,
+    lane: &[weft_core::lane::LaneFrame],
+    token: &str,
+) {
+    if let Some(execs) = executions.get_mut(node_id) {
+        if let Some(e) = execs.iter_mut().rev().find(|e| e.color == color && e.lane == lane) {
+            e.status = NodeExecutionStatus::WaitingForInput;
+            e.callback_id = Some(token.to_string());
         }
     }
 }

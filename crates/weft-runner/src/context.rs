@@ -19,6 +19,7 @@ pub struct RunnerHandle {
     execution_id: String,
     project_id: String,
     color: Color,
+    node_id: String,
     dispatcher: Option<String>,
     cancellation: Arc<Notify>,
     http: reqwest::Client,
@@ -29,6 +30,7 @@ impl RunnerHandle {
         execution_id: String,
         project_id: String,
         color: Color,
+        node_id: String,
         dispatcher: Option<String>,
         cancellation: Arc<Notify>,
     ) -> Self {
@@ -36,6 +38,7 @@ impl RunnerHandle {
             execution_id,
             project_id,
             color,
+            node_id,
             dispatcher,
             cancellation,
             http: reqwest::Client::new(),
@@ -51,18 +54,51 @@ impl RunnerHandle {
 
 #[async_trait]
 impl ContextHandle for RunnerHandle {
-    async fn await_form(&self, _schema: FormSchema) -> WeftResult<FormSubmission> {
-        let _dispatcher = self.require_dispatcher()?;
-        // Phase A2: POST to dispatcher /suspensions, receive a token,
-        // exit the worker. The dispatcher serves the form URL,
-        // receives the submission, wakes a new runner with the
-        // resume value; that runner resumes here via replay.
-        //
-        // For now: unimplemented so the primitive is callable but
-        // returns an error. End-to-end scaffold ports this next.
-        Err(WeftError::Suspension(
-            "await_form: dispatcher integration not yet implemented".into(),
-        ))
+    async fn await_form(&self, schema: FormSchema) -> WeftResult<FormSubmission> {
+        let dispatcher = self.require_dispatcher()?.to_string();
+        let url = format!("{dispatcher}/executions/{}/suspensions", self.color);
+        let body = serde_json::json!({
+            "node_id": self.node_id,
+            "project_id": self.project_id,
+            "metadata": {
+                "kind": "form",
+                "schema": schema,
+            }
+        });
+
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            token: String,
+            form_url: String,
+        }
+
+        let resp: Resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| WeftError::Suspension(format!("journal POST: {e}")))?
+            .error_for_status()
+            .map_err(|e| WeftError::Suspension(format!("journal status: {e}")))?
+            .json()
+            .await
+            .map_err(|e| WeftError::Suspension(format!("journal json: {e}")))?;
+
+        tracing::info!(
+            target: "weft_runner::suspend",
+            node = %self.node_id,
+            color = %self.color,
+            form_url = %resp.form_url,
+            "await_form suspension recorded; worker exiting"
+        );
+
+        // Signal to the loop driver: "I'm suspended, wrap up and
+        // exit." The driver catches this variant, marks the
+        // execution WaitingForInput, then returns cleanly. A future
+        // worker spawn with resume_value seeds the form submission
+        // downstream of this node.
+        Err(WeftError::Suspended { token: resp.token })
     }
 
     async fn await_timer(&self, _duration: std::time::Duration) -> WeftResult<()> {

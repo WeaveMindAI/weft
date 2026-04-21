@@ -14,9 +14,25 @@ pub struct WebhookResponse {
     pub color: String,
 }
 
+pub async fn handle_root(
+    state: State<DispatcherState>,
+    Path(token): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<(StatusCode, Json<WebhookResponse>), (StatusCode, String)> {
+    handle_inner(state, token, body).await
+}
+
 pub async fn handle(
-    State(state): State<DispatcherState>,
+    state: State<DispatcherState>,
     Path((token, _path)): Path<(String, String)>,
+    body: Option<Json<Value>>,
+) -> Result<(StatusCode, Json<WebhookResponse>), (StatusCode, String)> {
+    handle_inner(state, token, body).await
+}
+
+async fn handle_inner(
+    State(state): State<DispatcherState>,
+    token: String,
     body: Option<Json<Value>>,
 ) -> Result<(StatusCode, Json<WebhookResponse>), (StatusCode, String)> {
     let entry = state
@@ -43,7 +59,8 @@ pub async fn handle(
         project_id: entry.project_id.clone(),
         color,
         resume_node: entry.node_id.clone(),
-        resume_value: payload,
+        resume_value: serde_json::json!({ "body": payload }),
+        kind: crate::backend::WakeKind::Fresh,
     };
 
     state

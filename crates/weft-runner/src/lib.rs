@@ -6,4 +6,4 @@ pub mod context;
 pub mod loop_driver;
 
 pub use context::RunnerHandle;
-pub use loop_driver::run_loop;
+pub use loop_driver::{run_loop, EntryMode};

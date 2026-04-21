@@ -10,7 +10,7 @@ use clap::Parser;
 use tokio::sync::Notify;
 
 use weft_core::ProjectDefinition;
-use weft_runner::run_loop;
+use weft_runner::{run_loop, EntryMode};
 use weft_stdlib::StdlibCatalog;
 
 #[derive(Debug, Parser)]
@@ -25,27 +25,23 @@ struct Args {
     #[arg(long)]
     color: Option<String>,
 
-    /// Entry node id to kick off a fresh run. Mutually exclusive with
-    /// --resume-node.
+    /// Entry node for a fresh run or resume.
     #[arg(long)]
     entry_node: Option<String>,
 
-    /// Payload for the entry node's first pulse (JSON).
+    /// Entry payload (JSON) for a fresh run.
     #[arg(long)]
     entry_payload: Option<String>,
 
-    /// Node where a suspension is resuming.
-    #[arg(long)]
-    resume_node: Option<String>,
-
-    /// Resume value (JSON) for the suspension primitive.
+    /// Resume value (JSON) for a suspended run. If set, the runner
+    /// interprets entry_node as the node whose suspension completed
+    /// and seeds downstream edges instead of re-running the node.
     #[arg(long)]
     resume_value: Option<String>,
 
-    /// Dispatcher URL (for journal writes, cost reports, suspension
-    /// tokens). If absent, the runner runs in "detached" mode: no
-    /// journal, no suspensions. Pure programs complete and print
-    /// output.
+    /// Dispatcher URL (for cost reports, suspension tokens). If
+    /// absent, the runner runs in detached mode: no journal, no
+    /// suspensions (pure programs only).
     #[arg(long, env = "WEFT_DISPATCHER_URL")]
     dispatcher: Option<String>,
 }
@@ -71,9 +67,16 @@ async fn main() -> anyhow::Result<()> {
         None => uuid::Uuid::new_v4(),
     };
 
-    let entry_value = match args.entry_payload {
-        Some(s) => serde_json::from_str(&s).context("entry payload json")?,
-        None => serde_json::Value::Null,
+    let (entry_value, entry_mode) = match (args.resume_value, args.entry_payload) {
+        (Some(s), _) => (
+            serde_json::from_str(&s).context("resume value json")?,
+            EntryMode::Resume,
+        ),
+        (None, Some(s)) => (
+            serde_json::from_str(&s).context("entry payload json")?,
+            EntryMode::Fresh,
+        ),
+        (None, None) => (serde_json::Value::Null, EntryMode::Fresh),
     };
 
     let catalog = Arc::new(StdlibCatalog) as Arc<dyn weft_core::NodeCatalog>;
@@ -85,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         color,
         args.entry_node.as_deref(),
         entry_value,
+        entry_mode,
         args.dispatcher.as_deref(),
         cancellation,
     )

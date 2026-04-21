@@ -34,6 +34,16 @@ pub struct WakeContext {
     pub color: Color,
     pub resume_node: String,
     pub resume_value: Value,
+    #[serde(default)]
+    pub kind: WakeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeKind {
+    #[default]
+    Fresh,
+    Resume,
 }
 
 #[derive(Debug, Clone)]

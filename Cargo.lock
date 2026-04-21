@@ -2901,6 +2901,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -2910,6 +2911,7 @@ dependencies = [
  "uuid",
  "weft-compiler",
  "weft-core",
+ "weft-stdlib",
 ]
 
 [[package]]

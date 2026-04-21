@@ -30,3 +30,7 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json", "uuid", "chrono"] }
+
+[dev-dependencies]
+weft-stdlib = { workspace = true }
+tempfile = "3"
