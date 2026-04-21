@@ -19,3 +19,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 weft-core = { workspace = true }
+weft-stdlib = { path = "../weft-stdlib" }
+uuid = { workspace = true }

@@ -11,7 +11,10 @@ pub mod weft_type;
 pub use context::ExecutionContext;
 pub use error::{WeftError, WeftResult};
 pub use lane::{Lane, LaneFrame};
-pub use node::{FieldDef, Node, NodeFeatures, NodeMetadata, NodeOutput, PortDef};
+pub use node::{
+    FieldDef, FormFieldPort, FormFieldSpec, Node, NodeCatalog, NodeFeatures, NodeMetadata,
+    NodeOutput, PortDef,
+};
 pub use primitive::{EntryPrimitive, FormSchema, FormSubmission, CostReport};
 pub use project::{
     Edge, EdgeIndex, ExecutionStatus, GroupBoundary, GroupBoundaryRole, LaneMode,

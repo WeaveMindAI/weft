@@ -2012,6 +2012,7 @@ dependencies = [
  "tracing",
  "uuid",
  "weft-core",
+ "weft-stdlib",
 ]
 
 [[package]]

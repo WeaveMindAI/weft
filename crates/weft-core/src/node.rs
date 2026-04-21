@@ -76,10 +76,79 @@ pub struct NodeFeatures {
     #[serde(default, rename = "oneOfRequired")]
     pub one_of_required: Vec<Vec<String>>,
     /// Port groups where values across the listed ports must share
-    /// the same parent lane (for fan-out correlation). Phase A2+
-    /// when we need it.
+    /// the same parent lane (for fan-out correlation).
     #[serde(default, rename = "correlatedPorts")]
     pub correlated_ports: Vec<Vec<String>>,
+    /// The node accepts ad-hoc extra input ports declared in weft
+    /// source. If unset, extra ports cause a compile error.
+    #[serde(default, rename = "canAddInputPorts")]
+    pub can_add_input_ports: bool,
+    /// Same for outputs.
+    #[serde(default, rename = "canAddOutputPorts")]
+    pub can_add_output_ports: bool,
+    /// The node derives ports from a FormBuilder field at compile
+    /// time. See `form_field_specs` for the derivation rules.
+    #[serde(default, rename = "hasFormSchema")]
+    pub has_form_schema: bool,
+}
+
+/// Describes how a config field of a given type contributes to a
+/// node's ports at compile time. Used by nodes with
+/// `has_form_schema` (HumanQuery, runner triggers). The enrich pass
+/// reads this, iterates the configured fields, and materializes
+/// inputs/outputs on the NodeDefinition.
+#[derive(Debug, Clone)]
+pub struct FormFieldSpec {
+    /// Value of the field's `field_type.kind` this spec matches
+    /// (e.g. "text", "select", "file").
+    pub field_type: &'static str,
+    /// Default render metadata applied to the field if not
+    /// overridden in the weft source.
+    pub render: Value,
+    pub adds_inputs: Vec<FormFieldPort>,
+    pub adds_outputs: Vec<FormFieldPort>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FormFieldPort {
+    pub name_template: &'static str,
+    pub port_type: WeftType,
+}
+
+impl FormFieldPort {
+    pub fn new(name_template: &'static str, type_str: &str) -> Self {
+        Self {
+            name_template,
+            port_type: WeftType::parse(type_str)
+                .unwrap_or_else(|| panic!("invalid port type: {type_str}")),
+        }
+    }
+
+    /// Port template accepting any type, independent from sibling
+    /// ports. See `T_Auto` handling in enrich.
+    pub fn any(name_template: &'static str) -> Self {
+        Self { name_template, port_type: WeftType::type_var("T_Auto") }
+    }
+
+    pub fn resolve_name(&self, key: &str) -> String {
+        self.name_template.replace("{key}", key)
+    }
+}
+
+/// Catalog lookup. The compiler uses this to resolve each graph
+/// node's `node_type` to its metadata at enrich time. Both the
+/// stdlib catalog and the user's project `nodes/` folder produce an
+/// implementation of this trait.
+pub trait NodeCatalog: Send + Sync {
+    fn lookup(&self, node_type: &str) -> Option<&dyn Node>;
+    /// All known node types (for describe queries).
+    fn all(&self) -> Vec<&'static str>;
+    /// FormFieldSpecs for a given node type (nodes with
+    /// `has_form_schema` declare these to drive port derivation).
+    /// Default implementation returns an empty slice.
+    fn form_field_specs(&self, _node_type: &str) -> &[FormFieldSpec] {
+        &[]
+    }
 }
 
 use crate::project::LaneMode;
