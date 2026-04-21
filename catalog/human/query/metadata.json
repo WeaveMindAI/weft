@@ -1,0 +1,26 @@
+{
+  "type": "HumanQuery",
+  "label": "Human",
+  "description": "Pause the execution and wait for a human to submit a form. Uses the await_form language primitive.",
+  "category": "human",
+  "tags": ["human", "form", "hitl", "suspension"],
+  "icon": "User",
+  "inputs": [
+    { "name": "context", "type": "String", "required": false },
+    { "name": "title", "type": "String", "required": false }
+  ],
+  "outputs": [
+    { "name": "submission", "type": "Dict", "required": false }
+  ],
+  "fields": [
+    {
+      "key": "formSchema",
+      "label": "Form Schema",
+      "field_type": { "kind": "form_builder" },
+      "required": true,
+      "description": "The form fields the human must fill out."
+    }
+  ],
+  "entry": [],
+  "requires_infra": false
+}

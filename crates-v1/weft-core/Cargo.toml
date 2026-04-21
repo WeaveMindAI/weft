@@ -1,0 +1,18 @@
+[package]
+name = "weft-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+restate-sdk.workspace = true
+reqwest.workspace = true
+kube.workspace = true
+k8s-openapi.workspace = true
+tokio.workspace = true
+regex = "1"
+ts-rs = { version = "10", features = ["uuid-impl", "chrono-impl", "serde-json-impl"] }

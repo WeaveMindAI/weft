@@ -1,0 +1,698 @@
+{
+  "ai": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "generative": {
+        "type": "category",
+        "isPrefix": false,
+        "children": {
+          "llm": {
+            "type": "category",
+            "isPrefix": true,
+            "children": {
+              "config": {
+                "type": "node",
+                "hasBackend": true,
+                "hasFrontend": true
+              },
+              "inference": {
+                "type": "node",
+                "hasBackend": true,
+                "hasFrontend": true
+              }
+            }
+          }
+        }
+      },
+      "processing": {
+        "type": "category",
+        "isPrefix": false,
+        "children": {
+          "elevenlabs": {
+            "type": "category",
+            "isPrefix": true,
+            "children": {
+              "config": {
+                "type": "node",
+                "hasBackend": true,
+                "hasFrontend": true
+              },
+              "transcribe": {
+                "type": "node",
+                "hasBackend": true,
+                "hasFrontend": true
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "code": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "exec": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "python": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      }
+    }
+  },
+  "communication": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "discord": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "ban": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "config": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "delete-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "indicator": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "kick": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "pin-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "react": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "receive": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "send": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "timeout": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "unban": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "email": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "config": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "receive": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "send": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "thread": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "url": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "slack": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "config": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "delete-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "kick": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "pin-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "react": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "receive": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "send": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "set-topic": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "sms": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "url": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "telegram": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "ban": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "config": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "delete-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "forward-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "indicator": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "pin-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "promote": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "receive": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "restrict": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "send": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "unban": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "whatsapp": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "bridge": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true,
+            "hasSidecar": true
+          },
+          "create-group": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "delete-message": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "group-add": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "group-admin": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "group-kick": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "history": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "indicator": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "react": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "receive": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "send": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "send-media": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "url": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      }
+    }
+  },
+  "data": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "media": {
+        "type": "category",
+        "isPrefix": false,
+        "children": {
+          "audio": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "document": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "image": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "video": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "primitives": {
+        "type": "category",
+        "isPrefix": false,
+        "children": {
+          "boolean": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "credential": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "date": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "dict": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "list": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "number": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "text": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      }
+    }
+  },
+  "debug": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "debug": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      }
+    }
+  },
+  "enrichment": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "apollo": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "config": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "enrich": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "org-enrich": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "org-search": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "search": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "tavily": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "config": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "search": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "http": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      }
+    }
+  },
+  "feedback": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "human": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "query": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "trigger": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      }
+    }
+  },
+  "flow": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "stack": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "depth": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "trim": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "gate": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      },
+      "notify": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      }
+    }
+  },
+  "layout": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "annotation": {
+        "type": "node",
+        "hasBackend": false,
+        "hasFrontend": true
+      },
+      "group": {
+        "type": "node",
+        "hasBackend": false,
+        "hasFrontend": true
+      }
+    }
+  },
+  "social": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "x": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "config": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "delete-post": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "like": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "post": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "receive": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "retweet": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      }
+    }
+  },
+  "storage": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "memory": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "delete": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "query": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          },
+          "store": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "postgres": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "database": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true,
+            "hasSidecar": true
+          }
+        }
+      }
+    }
+  },
+  "transform": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "pack": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      },
+      "template": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      },
+      "unpack": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      }
+    }
+  },
+  "triggers": {
+    "type": "category",
+    "isPrefix": false,
+    "children": {
+      "api": {
+        "type": "category",
+        "isPrefix": true,
+        "children": {
+          "post": {
+            "type": "node",
+            "hasBackend": true,
+            "hasFrontend": true
+          }
+        }
+      },
+      "cron": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      },
+      "rss": {
+        "type": "node",
+        "hasBackend": true,
+        "hasFrontend": true
+      }
+    }
+  }
+}

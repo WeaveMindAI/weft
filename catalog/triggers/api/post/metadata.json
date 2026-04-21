@@ -1,0 +1,38 @@
+{
+  "type": "ApiPost",
+  "label": "API Endpoint (POST)",
+  "description": "Start an execution when an HTTP POST request arrives at a project-specific URL.",
+  "category": "triggers/api",
+  "tags": ["webhook", "http", "trigger"],
+  "icon": "Webhook",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "body",
+      "type": "Dict",
+      "required": false
+    },
+    {
+      "name": "receivedAt",
+      "type": "String",
+      "required": false
+    }
+  ],
+  "fields": [
+    {
+      "key": "apiKey",
+      "label": "API Key",
+      "field_type": { "kind": "password" },
+      "required": false,
+      "description": "Optional. If set, the incoming request must include this key in the X-API-Key header."
+    }
+  ],
+  "entry": [
+    {
+      "kind": "webhook",
+      "path": "",
+      "auth": { "kind": "optional_api_key", "field": "apiKey" }
+    }
+  ],
+  "requires_infra": false
+}

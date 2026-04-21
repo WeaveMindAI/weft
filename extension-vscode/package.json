@@ -1,0 +1,93 @@
+{
+  "name": "weft-vscode",
+  "displayName": "Weft",
+  "description": "Weft language support: Tangle AI panel, graph view for .weft files, runner view for .loom files, live dispatcher sidebar.",
+  "version": "0.2.0",
+  "publisher": "weavemind",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "weft",
+        "aliases": ["Weft", "weft"],
+        "extensions": [".weft"],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "loom",
+        "aliases": ["Loom", "loom"],
+        "extensions": [".loom"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "weft.openGraphView",
+        "title": "Weft: Open Graph View",
+        "category": "Weft"
+      },
+      {
+        "command": "weft.openLoomView",
+        "title": "Weft: Open Runner View",
+        "category": "Weft"
+      },
+      {
+        "command": "weft.runProject",
+        "title": "Weft: Run Project",
+        "category": "Weft"
+      }
+    ],
+    "views": {
+      "weft-sidebar": [
+        {
+          "type": "webview",
+          "id": "weft.tangle",
+          "name": "Tangle"
+        },
+        {
+          "id": "weft.projects",
+          "name": "Projects"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "weft-sidebar",
+          "title": "Weft",
+          "icon": "media/weft-icon.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Weft",
+      "properties": {
+        "weft.dispatcherUrl": {
+          "type": "string",
+          "default": "http://localhost:9999",
+          "description": "URL of the weft dispatcher daemon the extension talks to."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4"
+  }
+}

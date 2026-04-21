@@ -1,0 +1,23 @@
+{
+  "type": "Debug",
+  "label": "Debug",
+  "description": "Log whatever flows through. Terminal node for inspecting values during development.",
+  "category": "basic",
+  "tags": ["debug", "inspect", "log"],
+  "icon": "Bug",
+  "inputs": [
+    { "name": "value", "type": "Any", "required": false }
+  ],
+  "outputs": [],
+  "fields": [
+    {
+      "key": "label",
+      "label": "Label",
+      "field_type": { "kind": "text" },
+      "required": false,
+      "description": "Optional label prefixed to the logged value."
+    }
+  ],
+  "entry": [],
+  "requires_infra": false
+}

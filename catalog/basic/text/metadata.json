@@ -1,0 +1,22 @@
+{
+  "type": "Text",
+  "label": "Text",
+  "description": "Emit a literal string. Useful for prompts, labels, and config values.",
+  "category": "basic",
+  "tags": ["literal", "string"],
+  "icon": "Type",
+  "inputs": [],
+  "outputs": [
+    { "name": "value", "type": "String", "required": false }
+  ],
+  "fields": [
+    {
+      "key": "value",
+      "label": "Value",
+      "field_type": { "kind": "textarea" },
+      "required": true
+    }
+  ],
+  "entry": [],
+  "requires_infra": false
+}
