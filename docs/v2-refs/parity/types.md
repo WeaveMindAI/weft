@@ -140,6 +140,53 @@ Not in v2 protocol; deferred until blob upload lands (phase B).
 - `NodeCategory`: `'Triggers' | 'AI' | 'Data' | 'Flow' | 'Utility' | 'Debug' | 'Infrastructure'`. Add to protocol for CommandPalette.
 - `NodeExecutionStatus`: `'running' | 'completed' | 'failed' | 'waiting_for_input' | 'skipped' | 'cancelled'`. Add to v2 NodeExec.
 
+## Runner / Setup-manifest types (deferred to Phase B)
+
+v1 has a "builder/runner" mode where a project owner exposes a
+curated set of fields + outputs to external visitors. The full
+type surface lives at `dashboard-v1/src/lib/types/index.ts:601-900`:
+
+- `Visibility = 'admin' | 'visitor' | 'both'`: who sees a given
+  item.
+- `RunnerMode = 'admin' | 'visitor'`: current render mode.
+- `ItemVariant`: presentation hint (text/textarea/password/email/
+  url/number/slider/toggle/checkbox/radio/select/cards/multiselect
+  /tags/multicards/date/time/datetime/color/file/markdown/code/
+  json/image/gallery/audio/video/download/progress/chart/log).
+- `SetupItem`: a configurable field exposed to the runner.
+  References `{nodeId, fieldKey}` plus overrides (label,
+  description, visibility, as, options, height/width, chrome).
+- `OutputItem`: a live port value displayed in the runner.
+- `LiveItem`: live-data from an infra node's `/live` endpoint.
+- `SetupPhase`: a named group of setup/live items; can contain
+  nested `children: Block[]` for layout bricks.
+- `Theme`: full visual theme (skin, fonts, surfaces, colors,
+  spacing) for the runner page.
+
+These only matter when we port the "runner view" feature. For
+the VS Code extension phase-A we don't expose any runner mode;
+the graph view is always in "builder" mode. Entry points to
+port these types: when we add the cloud-published runner in
+phase B.
+
+### Other v1 types we can skip for now
+
+- `InfrastructureSpec`, `KubeManifest`, `ReadinessCheck`,
+  `ActionEndpoint`: deployment spec for infra nodes. Used by the
+  cloud infra reconciler. In phase A, the local dispatcher uses
+  `kind` clusters with a simpler config, and these types live
+  in the Rust compiler's catalog metadata already.
+- `Capability`: `'DurableKV'` only entry so far. Runtime
+  capability flag on a node type. Read from catalog.
+- `ValidationContext`, `ValidationError`, `ValidationLevel`,
+  `NodeValidateFunction`: v1's per-node validation. In v2 this
+  moved server-side (`Node::validate` trait method on the Rust
+  side). Webview just displays the diagnostics the dispatcher
+  returns.
+- `ApiKeyProvider`: `'openrouter' | 'elevenlabs' | 'tavily' | 'apollo'`. Narrowed set of platforms with API keys. Used
+  by the `api_key` field kind. Needs to be in protocol so the
+  webview can render the provider-specific toggle.
+
 ## What's different in v2's shape
 
 - **ProjectDefinition.groups** (new): pre-flatten group tree.

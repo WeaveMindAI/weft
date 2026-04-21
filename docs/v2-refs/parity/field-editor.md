@@ -132,34 +132,145 @@ persist the new ports.
   `deriveOutputsFromFields` comparison → toast error `"Port name
   conflict: \"X\" already exists..."`.
 
-## BlobField (v1) uses cloud API
+## BlobField pipeline (v1 frontend)
 
-BlobField.svelte:
-- Drag-drop file → `handleBlobFieldUpload(file, accept, onUpdate, onError)`.
-- Browse button → `filePickerOpen = true`.
-- URL paste → `validateExternalUrl` (rejects `data:`).
+BlobField.svelte owns the UI; blob-upload.ts owns the network +
+transform.
 
-`uploadBlob` (blob-upload.ts):
-1. POST `/api/v1/files` with filename, mimeType, sizeBytes → returns
-   `{ file_id, upload_url, url }`.
-2. PUT bytes to `upload_url` (presigned R2 URL in cloud, local
-   endpoint in dev).
-3. Call `data.onUpdate({ config: { [key]: { file_id, filename,
-   url, size_bytes, mime_type } } })`.
+### UI states (BlobField.svelte)
 
-The resulting `FileRef`:
+1. **Uploading** (`fileRef.filename && !fileRef.url && !fileRef.file_id`):
+   Shows the progressive message set by `handleBlobFieldUpload`
+   (e.g. `"Uploading foo.mp3 (1.2MB / 3.5MB)"`).
+   Class: `animate-pulse`, `bg-muted px-2 py-1.5`.
+2. **Uploaded** (`fileRef.url || fileRef.file_id`):
+   Shows filename + size (KB if <1MB, MB otherwise) + × delete.
+3. **Empty**: hidden file input, drag-drop label, browse button,
+   URL paste input.
+
+### `handleBlobFieldUpload(file, acceptHint, onUpdate, onError)`
+(blob-upload.ts line 288-319)
+
+```ts
+const isAudio = file.type.startsWith('audio/') || acceptHint?.includes('audio');
+
+if (isAudio) {
+  onUpdate({ filename: `Compressing ${file.name}...`, url: '', ... });
+  const { blob } = await compressAudio(file);  // decode → 16kHz mono WAV
+  uploadFile = blob;
+  filename = file.name.replace(/\.[^.]+$/, '.wav');
+  mimeType = 'audio/wav';
+}
+
+onUpdate({ filename: `Uploading ${filename}...`, url: '', ... });
+
+const ref = await uploadBlob(uploadFile, filename, mimeType, (loaded, total) => {
+  onUpdate({ filename: `Uploading ${filename} (${formatBytes(loaded)} / ${formatBytes(total)})`, url: '', ... });
+});
+
+onUpdate(ref);  // final FileRef with url + file_id set
+```
+
+Intermediate `onUpdate` calls with partial FileRef shape make
+the UI show the progress message (in the Uploading state). Only
+the final call has a real `url`/`file_id`.
+
+### Audio compression (line 186-261)
+
+`compressAudio(file)` uses Web Audio API:
+1. `decodeAudioData(file.arrayBuffer())`.
+2. Render via `OfflineAudioContext(1 channel, 16000 sample rate)`.
+3. `audioBufferToWav(renderedBuffer)` → Blob via manual RIFF/WAVE
+   encoding (44-byte header + int16 PCM samples).
+
+This is a v1 optimization for speech-processing nodes
+(Transcribe, etc). A 3MB mp3 becomes a ~100KB 16kHz mono WAV
+before upload.
+
+### `uploadBlob(file, filename, mimeType, onProgress)` (line 72-111)
+
+1. POST `/api/v1/files` with `{ filename, mimeType, sizeBytes }`
+   → server returns `{ file_id, upload_url, url }`.
+2. `putWithProgress(upload_url, file, mimeType, onProgress)` —
+   XHR with `upload.onprogress` → loaded/total callback.
+3. Returns `FileRef { file_id, url, filename, mime_type, size_bytes }`.
+4. Tracks `activeUploads++` so `beforeunload` can warn the user
+   if they try to close the tab mid-upload.
+
+### `validateExternalUrl(url)` (line 146-181)
+
+Pasted URL:
+- Reject `data:` URIs.
+- Require `https://` prefix (http rejected for SSRF to internal services).
+- Extract filename from URL path (last segment, decodeURIComponent).
+- `guessMimeType(filename)` uses `MIME_MAP` extension table
+  (audio: mp3/ogg/wav/…, video: mp4/mov/…, image: png/jpg/…,
+  document: pdf/csv/txt/json/zip).
+- Return `FileRef { url, filename, mime_type, size_bytes: 0 }`.
+  `file_id` undefined = external URL, not cloud-managed.
+
+### `listCloudFiles()` + `resolveCloudFile(file)` (line 122-140)
+
+Feed the FilePicker modal (BlobField's "Browse uploaded files"
+button). `listCloudFiles` calls `/api/v1/files`, returns
+CloudFile[]. `resolveCloudFile` asks for a fresh download URL
+for a specific file.
+
+### `FileRef` shape
+
 ```ts
 {
-  file_id: string;
+  file_id?: string;   // present for cloud-managed files
+  url: string;
   filename: string;
-  url: string;         // public / presigned
-  size_bytes: number;
   mime_type: string;
+  size_bytes: number;
 }
 ```
 
-**Deferred to Phase B in v2 extension.** See
-`weavemind/docs/v2-cloud-design.md` section 10.13.
+### Global `beforeunload` warning (line 21-29)
+
+```ts
+let activeUploads = 0;
+function onBeforeUnload(e: BeforeUnloadEvent) {
+  if (activeUploads > 0) e.preventDefault();
+}
+window.addEventListener('beforeunload', onBeforeUnload);
+```
+
+Upload increments the counter; upload end (success or fail)
+decrements. Page close with pending uploads prompts the user.
+
+### `blob-drag-over` class
+
+When dragging a file over the container, `ondragover` adds the
+class:
+```css
+:global(.blob-drag-over) {
+  outline: 2px solid rgb(96, 165, 250);
+  outline-offset: -2px;
+  border-radius: 0.375rem;
+  background-color: rgba(96, 165, 250, 0.08);
+}
+```
+Removed on `ondragleave` / `ondrop`.
+
+## v2 port plan: BlobField
+
+Deferred to Phase B. See `weavemind/docs/v2-cloud-design.md`
+section 10.13.
+
+**What to ship in phase A**: URL-paste only, `validateExternalUrl`
+logic. Skip the upload pipeline entirely.
+
+**What Phase B needs**:
+- A dispatcher `/upload` endpoint that POST multipart → PUT to R2
+  with SSE-C per-file key → returns FileRef.
+- The client-side `uploadBlob` + `handleBlobFieldUpload` pipeline.
+- The FilePicker browse-uploaded-files modal.
+- The audio compression helper (only relevant if we have
+  speech-processing nodes; could port at the same time).
+- `beforeunload` warning for in-flight uploads.
 
 ## v2 port status
 
