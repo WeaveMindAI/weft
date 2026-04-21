@@ -99,6 +99,27 @@ pub fn parse_only(
         });
     }
 
+    // Surface unknown node types as warnings so the IDE can paint a
+    // squiggly on the header line even without calling /validate.
+    for node in &project.nodes {
+        if node.node_type == "Passthrough" {
+            continue;
+        }
+        if catalog.lookup(&node.node_type).is_none() {
+            let line = node
+                .header_span
+                .map(|s| s.start_line)
+                .unwrap_or(0);
+            diagnostics.push(Diagnostic {
+                line,
+                column: 0,
+                severity: Severity::Warning,
+                message: format!("unknown node type '{}'", node.node_type),
+                code: Some("unknown-type".into()),
+            });
+        }
+    }
+
     (project, diagnostics)
 }
 

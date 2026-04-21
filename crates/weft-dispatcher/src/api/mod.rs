@@ -25,6 +25,7 @@ mod form;
 mod extension;
 mod dashboard;
 mod describe;
+mod parse;
 
 pub fn router(state: DispatcherState) -> Router {
     Router::new()
@@ -58,5 +59,7 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/dashboard/{*path}", get(dashboard::serve))
         .route("/describe/nodes", get(describe::nodes))
         .route("/describe/project/{id}", get(describe::project_catalog))
+        .route("/parse", post(parse::parse))
+        .route("/validate", post(parse::validate))
         .with_state(state)
 }

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 weft-core = { workspace = true }
 weft-compiler = { workspace = true }
+weft-stdlib = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -33,5 +34,4 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json", "uuid",
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
-weft-stdlib = { workspace = true }
 tempfile = "3"
