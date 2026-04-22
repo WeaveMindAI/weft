@@ -168,6 +168,8 @@ function buildRemoveEdge(
   targetPort: string,
   { project, doc }: SurgicalContext,
 ): vscode.WorkspaceEdit | null {
+  // Webview always sends the raw project-edge form (passthrough ids
+  // on group boundaries). Match directly.
   const edge = project.edges.find(
     (e) =>
       e.source === source &&

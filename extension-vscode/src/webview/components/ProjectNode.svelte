@@ -398,6 +398,7 @@
     <div class="space-y-1 min-w-0 flex-1">
       {#each inputs as port (port.name)}
         {@const pm = portMarkerStyle(port, oneOfRequiredPorts, configFilledPorts, getPortTypeColor(port.portType), 'input')}
+        {@const isCustom = !catalogInputNames.has(port.name)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="relative flex items-center gap-1.5 group pl-3"
@@ -411,7 +412,20 @@
             class={pm.class}
             style={`top: 50%; ${pm.style}`}
           />
-          <span class="truncate">{port.name}</span>
+          <span class="truncate flex-1">{port.name}</span>
+          {#if isCustom && canAddInputs}
+            <button
+              type="button"
+              class="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-500 transition-opacity nodrag text-[10px]"
+              onclick={(e) => {
+                e.stopPropagation();
+                const list = inputs.filter((p) => p.name !== port.name);
+                data.onPortsChange(node.id, { inputs: list });
+              }}
+              title="Remove port"
+              aria-label="Remove port"
+            >×</button>
+          {/if}
         </div>
       {/each}
       {#if canAddInputs}
@@ -448,13 +462,27 @@
     <div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
       {#each outputs as port (port.name)}
         {@const pm = portMarkerStyle(port, oneOfRequiredPorts, configFilledPorts, getPortTypeColor(port.portType), 'output')}
+        {@const isCustom = !catalogOutputNames.has(port.name)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="relative flex items-center gap-1.5 group pr-3"
           title={`${port.name}: ${port.portType}`}
           oncontextmenu={(e) => openPortMenu(e, port, 'output')}
         >
-          <span class="truncate">{port.name}</span>
+          {#if isCustom && canAddOutputs}
+            <button
+              type="button"
+              class="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-500 transition-opacity nodrag text-[10px]"
+              onclick={(e) => {
+                e.stopPropagation();
+                const list = outputs.filter((p) => p.name !== port.name);
+                data.onPortsChange(node.id, { outputs: list });
+              }}
+              title="Remove port"
+              aria-label="Remove port"
+            >×</button>
+          {/if}
+          <span class="truncate flex-1 text-right">{port.name}</span>
           <Handle
             type="source"
             position={Position.Right}

@@ -245,26 +245,19 @@
   }
 
   function sendDeleteEdge(edge: FlowEdge) {
-    const ref = toWeftEdgeRef(
-      edge.source,
-      (edge.sourceHandle as string | null) ?? null,
-      edge.target,
-      (edge.targetHandle as string | null) ?? null,
-      new Map(
-        nodes.map((n) => [
-          n.id,
-          (n.data as { node?: NodeDefinition }).node ?? (n as unknown as NodeDefinition),
-        ]),
-      ),
-    );
+    // Look up the RAW project edge by id. This sidesteps __inner /
+    // `self` translation — the dispatcher needs the flat passthrough
+    // form anyway because that's what it has spans for.
+    const raw = project.edges.find((e) => e.id === edge.id);
+    if (!raw) return;
     send({
       kind: 'mutation',
       mutation: {
         kind: 'removeEdge',
-        source: ref.source,
-        sourcePort: ref.sourcePort,
-        target: ref.target,
-        targetPort: ref.targetPort,
+        source: raw.source,
+        sourcePort: raw.sourceHandle ?? '',
+        target: raw.target,
+        targetPort: raw.targetHandle ?? '',
       },
     });
   }
@@ -284,15 +277,12 @@
     }
     // 1-driver-per-input: drop any existing edge matching the same
     // (target, targetHandle). xyflow lets us return the NEW edge
-    // (any existing one will be replaced via surgical removeEdge
-    // below).
+    // (surgical removeEdge will handle the cleanup server-side).
     const existing = edges.find(
       (e) =>
         e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null),
     );
-    if (existing) {
-      sendDeleteEdge(existing);
-    }
+    if (existing) sendDeleteEdge(existing);
     setTimeout(() => {
       const ref = toWeftEdgeRef(
         c.source,
