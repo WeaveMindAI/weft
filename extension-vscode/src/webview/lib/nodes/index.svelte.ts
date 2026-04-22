@@ -229,24 +229,58 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 	};
 }
 
-// Shared mutable registry. Consumers import the references below
-// once and read through them. registerCatalog mutates the records
-// in-place so the references stay stable.
-const registry: Record<string, NodeTemplate> = {};
+// Reactive registry. Svelte 5's $state proxy tracks property
+// mutations; components that read NODE_TYPE_CONFIG[type] or call
+// getAllNodes() inside $derived get re-run when registerCatalog
+// adds entries.
+const registry: Record<string, NodeTemplate> = $state({});
 
 export const NODE_TYPE_CONFIG = registry;
 
-export const ALL_NODES: NodeTemplate[] = [];
+/** Reactive view over the registry. Svelte rejects exporting
+ *  $derived directly from a module (runtime scope doesn't exist
+ *  outside components) so we export accessors instead. Call inside
+ *  a $derived to track updates. */
+export function getAllNodes(): NodeTemplate[] {
+	return Object.values(registry);
+}
 
-export const ALL_NODE_TYPES: string[] = [];
+export function getAllNodeTypes(): string[] {
+	return Object.keys(registry);
+}
+
+/** Back-compat aliases. v1 consumers import these directly and
+ *  iterate them at render time. Expose as proxies so every read
+ *  hits the live registry. */
+export const ALL_NODES: NodeTemplate[] = new Proxy([] as NodeTemplate[], {
+	get(_target, prop) {
+		const arr = Object.values(registry);
+		if (prop === 'length') return arr.length;
+		if (prop === Symbol.iterator) return arr[Symbol.iterator].bind(arr);
+		if (typeof prop === 'string' && /^\d+$/.test(prop)) return arr[Number(prop)];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const v = (arr as any)[prop];
+		return typeof v === 'function' ? v.bind(arr) : v;
+	},
+}) as NodeTemplate[];
+
+export const ALL_NODE_TYPES: string[] = new Proxy([] as string[], {
+	get(_target, prop) {
+		const arr = Object.keys(registry);
+		if (prop === 'length') return arr.length;
+		if (prop === Symbol.iterator) return arr[Symbol.iterator].bind(arr);
+		if (typeof prop === 'string' && /^\d+$/.test(prop)) return arr[Number(prop)];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const v = (arr as any)[prop];
+		return typeof v === 'function' ? v.bind(arr) : v;
+	},
+}) as string[];
 
 export type NodeType = string;
 
-/** Virtual entries for node types that don't come from the Rust
- *  catalog (they're editor-only concepts). v1 declares these in
- *  lib/nodes/*.ts files; here we register them inline so the
- *  command palette can show Group / Annotation and so addNode()
- *  can resolve their NODE_TYPE_CONFIG lookup. */
+/** Group is the only editor-only node type (not in the Rust
+ *  catalog). Registered inline so the command palette can list it
+ *  and addNode('Group') resolves its NODE_TYPE_CONFIG lookup. */
 function registerBuiltins(): void {
 	if (!registry.Group) {
 		registry.Group = {
@@ -263,35 +297,15 @@ function registerBuiltins(): void {
 			features: {},
 		};
 	}
-	if (!registry.Annotation) {
-		registry.Annotation = {
-			type: 'Annotation',
-			label: 'Annotation',
-			description: 'A free-floating sticky note rendered behind the graph.',
-			icon: resolveIcon('FileText'),
-			color: '#94a3b8',
-			category: 'Utility' as NodeCategory,
-			tags: ['note', 'doc'],
-			fields: [],
-			defaultInputs: [],
-			defaultOutputs: [],
-			features: {},
-		};
-	}
 }
 registerBuiltins();
 
-/** Called by App.svelte on every parseResult AND once on mount with
- *  the global /describe/nodes response. Merges entries into the
- *  shared registry + rebuilds the ALL_NODES / ALL_NODE_TYPES
- *  snapshots in-place so existing imports stay valid. */
+/** Called by App.svelte on every parseResult AND once on mount
+ *  with the global /describe/nodes response. Mutates the $state
+ *  registry; readers re-run because the proxy tracks set ops. */
 export function registerCatalog(entries: Record<string, CatalogEntry>): void {
 	for (const [type, entry] of Object.entries(entries)) {
 		registry[type] = toTemplate(entry);
 	}
 	registerBuiltins();
-	ALL_NODES.length = 0;
-	ALL_NODES.push(...Object.values(registry));
-	ALL_NODE_TYPES.length = 0;
-	ALL_NODE_TYPES.push(...Object.keys(registry));
 }

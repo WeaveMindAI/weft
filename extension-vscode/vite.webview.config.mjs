@@ -14,6 +14,9 @@ const shimRoot = path.join(webviewRoot, 'src/webview/shims');
 export default defineConfig({
   plugins: [tailwindcss(), svelte()],
   resolve: {
+    // Default Vite list minus the `.mjs` quirks plus `.svelte.ts`
+    // so imports of `./lib/nodes` pick up `lib/nodes/index.svelte.ts`.
+    extensions: ['.mjs', '.js', '.mts', '.ts', '.svelte.ts', '.jsx', '.tsx', '.json'],
     // Mirror v1's SvelteKit path aliases so copied files resolve
     // without editing a single import statement. $app/... and $env/...
     // route to tiny shims; $lib and $lib/utils route to the copied
