@@ -147,6 +147,32 @@ function resolveIcon(name: string | undefined): Component {
 	return (ICON_MAP[name] as Component) ?? (Square as Component);
 }
 
+// Dispatcher-side FieldDef shape. Rust's NodeMetadata nests the
+// kind under field_type with serde(tag = "kind"), so textarea
+// arrives as { kind: "textarea" } and select arrives as
+// { kind: "select", options: [...] }. v1 components read flat
+// properties (type, options, min, max, provider, accept, ...) so
+// we transform here.
+interface RustFieldType {
+	kind: string;
+	options?: string[];
+	min?: number;
+	max?: number;
+	provider?: string;
+	accept?: string;
+	placeholder?: string;
+}
+
+interface RustFieldDef {
+	key: string;
+	label: string;
+	field_type: RustFieldType;
+	default_value?: unknown;
+	required?: boolean;
+	description?: string;
+	placeholder?: string;
+}
+
 // Shape the dispatcher sends per node type. Mirrors Rust
 // NodeMetadata serialization.
 export interface CatalogEntry {
@@ -159,10 +185,32 @@ export interface CatalogEntry {
 	color?: string;
 	inputs?: PortDefinition[];
 	outputs?: PortDefinition[];
-	fields?: FieldDefinition[];
+	fields?: RustFieldDef[];
 	entry?: unknown[];
 	requires_infra?: boolean;
 	features?: NodeFeatures;
+}
+
+function flattenField(f: RustFieldDef): FieldDefinition {
+	const ft = f.field_type ?? { kind: 'text' };
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const flat: any = {
+		key: f.key,
+		label: f.label,
+		type: ft.kind,
+		required: f.required,
+		description: f.description,
+	};
+	if (ft.options) flat.options = ft.options;
+	if (ft.min !== undefined) flat.min = ft.min;
+	if (ft.max !== undefined) flat.max = ft.max;
+	if (ft.provider) flat.provider = ft.provider;
+	if (ft.accept) flat.accept = ft.accept;
+	if (ft.placeholder) flat.placeholder = ft.placeholder;
+	if (f.placeholder) flat.placeholder = f.placeholder;
+	if (f.default_value !== undefined && f.default_value !== null)
+		flat.defaultValue = f.default_value;
+	return flat as FieldDefinition;
 }
 
 function toTemplate(entry: CatalogEntry): NodeTemplate {
@@ -174,7 +222,7 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		color: entry.color ?? '#71717a',
 		category: entry.category as NodeCategory,
 		tags: entry.tags ?? [],
-		fields: entry.fields ?? [],
+		fields: (entry.fields ?? []).map(flattenField),
 		defaultInputs: entry.inputs ?? [],
 		defaultOutputs: entry.outputs ?? [],
 		features: entry.features,
