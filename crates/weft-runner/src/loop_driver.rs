@@ -234,6 +234,7 @@ pub async fn run_loop(
                 project.id.to_string(),
                 node_id.clone(),
                 node_def.node_type.clone(),
+                node_def.label.clone(),
                 group.color,
                 group.lane.clone(),
                 config,

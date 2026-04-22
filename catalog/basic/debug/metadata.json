@@ -7,18 +7,10 @@
   "icon": "Bug",
   "color": "#ef4444",
   "inputs": [
-    { "name": "value", "type": "T", "required": false }
+    { "name": "data", "type": "T", "required": false }
   ],
   "outputs": [],
-  "fields": [
-    {
-      "key": "label",
-      "label": "Label",
-      "field_type": { "kind": "text" },
-      "required": false,
-      "description": "Optional label prefixed to the logged value."
-    }
-  ],
+  "fields": [],
   "entry": [],
   "requires_infra": false
 }

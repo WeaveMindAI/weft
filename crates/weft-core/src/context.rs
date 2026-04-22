@@ -26,6 +26,11 @@ pub struct ExecutionContext {
     pub project_id: String,
     pub node_id: String,
     pub node_type: String,
+    /// The node's user-facing label (the title shown at the top of
+    /// the node in the editor). `None` when the user hasn't named
+    /// the node; runtime callers decide whether to fall back to
+    /// node_id or omit the label entirely.
+    pub node_label: Option<String>,
     pub color: Color,
     pub lane: Lane,
     pub config: ConfigBag,
@@ -39,13 +44,14 @@ impl ExecutionContext {
         project_id: String,
         node_id: String,
         node_type: String,
+        node_label: Option<String>,
         color: Color,
         lane: Lane,
         config: ConfigBag,
         input: InputBag,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
-        Self { execution_id, project_id, node_id, node_type, color, lane, config, input, handle }
+        Self { execution_id, project_id, node_id, node_type, node_label, color, lane, config, input, handle }
     }
 
     // ----- Suspension primitives --------------------------------------

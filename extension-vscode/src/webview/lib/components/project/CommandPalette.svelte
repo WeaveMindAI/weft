@@ -6,7 +6,7 @@
 	import * as te from "$lib/telemetry-events";
 	import {
 		Search, BrainCircuit, ChartBar, GitFork, Server, Wrench, Bug, Zap,
-		Save, Play, Upload, Download, Undo2, Redo2, Copy, Trash2, CheckSquare, Maximize2, LayoutDashboard,
+		Undo2, Redo2, Copy, Trash2, CheckSquare, Maximize2, LayoutDashboard,
 	} from '@lucide/svelte';
 	import type { Component } from 'svelte';
 	
@@ -104,14 +104,16 @@
 	});
 	
 	// Actions available in the palette
-	const playgroundHiddenActions = new Set(['save', 'run', 'export_json', 'export_weft', 'import']);
+	// (Retained for parity with v1 plumbing; empty in the VS Code
+	//  build since unhelpful actions are already pruned from the
+	//  list above.)
+	const playgroundHiddenActions = new Set<string>();
 
+	// VS Code embedding: save/run/export/import are handled by the
+	// extension (Ctrl+S writes the document, execution is an editor
+	// command). We keep only actions that map to the webview itself.
 	const actions: { id: string; label: string; icon: Component; shortcut?: string }[] = [
-		{ id: "save", label: "Save Project", icon: Save, shortcut: "Ctrl+S" },
-		{ id: "run", label: "Run Project", icon: Play, shortcut: "Ctrl+Enter" },
-		{ id: "export_json", label: "Export as JSON", icon: Upload },
-		{ id: "export_weft", label: "Export as Weft", icon: Upload },
-		{ id: "import", label: "Import from JSON/Weft", icon: Download },
+		{ id: "add_group", label: "Add Group", icon: GitFork },
 		{ id: "undo", label: "Undo", icon: Undo2, shortcut: "Ctrl+Z" },
 		{ id: "redo", label: "Redo", icon: Redo2, shortcut: "Ctrl+Shift+Z" },
 		{ id: "duplicate", label: "Duplicate Selected", icon: Copy, shortcut: "Ctrl+D" },

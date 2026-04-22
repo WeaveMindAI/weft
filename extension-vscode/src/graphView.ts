@@ -147,6 +147,7 @@ export class GraphViewController {
     this.watchedDoc = doc;
 
     void this.sendSettings();
+    void this.sendGlobalCatalog();
 
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
@@ -250,6 +251,35 @@ export class GraphViewController {
     if (!this.watchedDoc) return;
     const uri = this.layoutUriFor(this.watchedDoc);
     await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(layoutCode));
+  }
+
+  /** Fetch every node type available in the current project scope
+   *  (stdlib + project-local `nodes/`) and ship the catalog to the
+   *  webview so the command palette can list them all, even types
+   *  the current `main.weft` doesn't reference yet. */
+  private async sendGlobalCatalog(): Promise<void> {
+    if (!this.watchedDoc) return;
+    // The project root is the folder containing the .weft file
+    // (or the workspace folder it lives in). The dispatcher walks
+    // `{root}/nodes/**/metadata.json` from there.
+    const docPath = this.watchedDoc.uri.fsPath;
+    const lastSep = Math.max(docPath.lastIndexOf('/'), docPath.lastIndexOf('\\'));
+    const projectRoot = lastSep > 0 ? docPath.slice(0, lastSep) : undefined;
+    try {
+      const qs = projectRoot
+        ? `?project_root=${encodeURIComponent(projectRoot)}`
+        : '';
+      const response = await this.client.get<{
+        catalog: Record<string, unknown>;
+        warnings?: string[];
+      }>(`/describe/nodes${qs}`);
+      this.post({
+        kind: 'catalogAll',
+        catalog: response.catalog as Record<string, import('./shared/protocol').CatalogEntry>,
+      });
+    } catch (err) {
+      console.warn('[weft/graphView] /describe/nodes failed', err);
+    }
   }
 
   private async sendSettings(): Promise<void> {

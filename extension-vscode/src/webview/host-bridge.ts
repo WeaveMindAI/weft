@@ -118,11 +118,18 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
 }
 
 function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
+  // `label` is a first-class field on NodeDefinition; the compiler
+  // extracts `label: "..."` lines from a node's config block and
+  // promotes them. Defensively strip any leftover 'label' entry
+  // from config so it doesn't show up as a synthetic text field in
+  // the inline config form.
+  const rawConfig = (n.config ?? {}) as Record<string, unknown>;
+  const { label: _stripped, ...cleanConfig } = rawConfig;
   return {
     id: n.id,
     nodeType: n.nodeType,
     label: n.label,
-    config: n.config as Record<string, unknown>,
+    config: cleanConfig,
     position: n.position,
     parentId: resolveParentGroup(n, groupIds),
     inputs: n.inputs.map(toV1Port),

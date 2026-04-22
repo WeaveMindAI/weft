@@ -1786,6 +1786,9 @@
 				te.execution.started(project.id, nodes.length, !!infraState, !!triggerState);
 				onRun?.();
 				break;
+			case 'add_group':
+				addNode('Group');
+				break;
 			case 'undo':
 				undo();
 				break;
@@ -3124,23 +3127,4 @@
 		opacity: 1;
 	}
 
-	.weft-code-panel-container {
-		height: 100%;
-		overflow: hidden;
-		border-right: 1px solid #e4e4e7;
-	}
-
-	.code-panel-resize-handle {
-		width: 4px;
-		flex-shrink: 0;
-		cursor: col-resize;
-		background: transparent;
-		transition: background 0.15s;
-		z-index: 10;
-	}
-
-	.code-panel-resize-handle:hover,
-	.code-panel-resize-handle:active {
-		background: #a1a1aa;
-	}
 </style>

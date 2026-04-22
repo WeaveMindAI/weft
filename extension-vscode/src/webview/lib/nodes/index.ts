@@ -194,13 +194,54 @@ export const ALL_NODE_TYPES: string[] = [];
 
 export type NodeType = string;
 
-/** Called by App.svelte on every parseResult. Merges entries into
- *  the shared registry + rebuilds the ALL_NODES / ALL_NODE_TYPES
+/** Virtual entries for node types that don't come from the Rust
+ *  catalog (they're editor-only concepts). v1 declares these in
+ *  lib/nodes/*.ts files; here we register them inline so the
+ *  command palette can show Group / Annotation and so addNode()
+ *  can resolve their NODE_TYPE_CONFIG lookup. */
+function registerBuiltins(): void {
+	if (!registry.Group) {
+		registry.Group = {
+			type: 'Group',
+			label: 'Group',
+			description: 'Wrap a subgraph. Interface ports flow in and out; children share a scope.',
+			icon: resolveIcon('GitFork'),
+			color: '#71717a',
+			category: 'Flow' as NodeCategory,
+			tags: ['group', 'container', 'scope'],
+			fields: [],
+			defaultInputs: [],
+			defaultOutputs: [],
+			features: {},
+		};
+	}
+	if (!registry.Annotation) {
+		registry.Annotation = {
+			type: 'Annotation',
+			label: 'Annotation',
+			description: 'A free-floating sticky note rendered behind the graph.',
+			icon: resolveIcon('FileText'),
+			color: '#94a3b8',
+			category: 'Utility' as NodeCategory,
+			tags: ['note', 'doc'],
+			fields: [],
+			defaultInputs: [],
+			defaultOutputs: [],
+			features: {},
+		};
+	}
+}
+registerBuiltins();
+
+/** Called by App.svelte on every parseResult AND once on mount with
+ *  the global /describe/nodes response. Merges entries into the
+ *  shared registry + rebuilds the ALL_NODES / ALL_NODE_TYPES
  *  snapshots in-place so existing imports stay valid. */
 export function registerCatalog(entries: Record<string, CatalogEntry>): void {
 	for (const [type, entry] of Object.entries(entries)) {
 		registry[type] = toTemplate(entry);
 	}
+	registerBuiltins();
 	ALL_NODES.length = 0;
 	ALL_NODES.push(...Object.values(registry));
 	ALL_NODE_TYPES.length = 0;

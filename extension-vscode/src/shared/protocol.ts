@@ -227,6 +227,7 @@ export interface EdgeActiveEvent {
 export type HostMessage =
   | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string }
   | { kind: 'parseError'; error: string }
+  | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   | { kind: 'layoutHint'; positions: Record<string, { x: number; y: number }> }
   | { kind: 'settings'; parseDebounceMs: number; layoutDebounceMs: number }
   | { kind: 'execEvent'; event: NodeExecEvent }

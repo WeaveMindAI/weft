@@ -26,6 +26,10 @@
     });
 
     const unsub = onMessage((msg) => {
+      if (msg.kind === 'catalogAll') {
+        registerCatalog(msg.catalog as unknown as Record<string, CatalogEntry>);
+        return;
+      }
       if (msg.kind === 'parseResult') {
         const errs: WeftParseError[] = msg.response.diagnostics
           .filter((d) => d.severity === 'error')
