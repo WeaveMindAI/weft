@@ -257,18 +257,14 @@ export class GraphViewController {
    *  (stdlib + project-local `nodes/`) and ship the catalog to the
    *  webview so the command palette can list them all, even types
    *  the current `main.weft` doesn't reference yet. */
+
   private async sendGlobalCatalog(): Promise<void> {
     if (!this.watchedDoc) return;
-    // The project root is the folder containing the .weft file
-    // (or the workspace folder it lives in). The dispatcher walks
-    // `{root}/nodes/**/metadata.json` from there.
     const docPath = this.watchedDoc.uri.fsPath;
     const lastSep = Math.max(docPath.lastIndexOf('/'), docPath.lastIndexOf('\\'));
     const projectRoot = lastSep > 0 ? docPath.slice(0, lastSep) : undefined;
+    const qs = projectRoot ? `?project_root=${encodeURIComponent(projectRoot)}` : '';
     try {
-      const qs = projectRoot
-        ? `?project_root=${encodeURIComponent(projectRoot)}`
-        : '';
       const response = await this.client.get<{
         catalog: Record<string, unknown>;
         warnings?: string[];

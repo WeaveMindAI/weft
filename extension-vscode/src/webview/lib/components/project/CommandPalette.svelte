@@ -81,11 +81,11 @@
 	// Build categories from ALL_NODES (excluding hidden nodes)
 	const nodeCategories = $derived.by(() => {
 		const categoryMap = new Map<NodeCategory, NodeType[]>();
-		
+
 		for (const node of ALL_NODES) {
 			// Skip nodes that are hidden from palette
 			if (node.features?.hidden) continue;
-			
+
 			const category = node.category;
 			if (!categoryMap.has(category)) {
 				categoryMap.set(category, []);
