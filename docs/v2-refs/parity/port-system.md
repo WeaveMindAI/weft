@@ -166,9 +166,9 @@ Groups do NOT have `_raw`.
 
 ## v2 port status
 
-- `port-marker.ts` already ported to
-  `extension-vscode/src/webview/utils/port-marker.ts`, verbatim.
-- `port-context-menu.ts` already ported, verbatim.
-- `_raw` handle in my ProjectNode port: needs review. v1 wraps
-  `<Handle>` around the SVG (making the Handle the square
-  itself). My version has them as siblings. Should consolidate.
+- `port-marker.ts` ported verbatim to
+  `extension-vscode/src/webview/utils/port-marker.ts`.
+- `port-context-menu.ts` ported verbatim.
+- `_raw` handle wraps the SVG (matches v1 shape: Handle IS the square).
+- Port rows show the hover-only × delete button for custom ports on
+  both ProjectNode and GroupNode.

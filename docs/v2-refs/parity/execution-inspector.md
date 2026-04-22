@@ -163,21 +163,19 @@ correctly; spec is in my group-node commit. Key shape:
 
 ## v2 port plan
 
-### My earlier port status
-- Basic modal ported. Needs audit against this spec.
+### v2 port status
 
-### Specifically missing / wrong
-- **My ExecutionInspector takes a single {status, input, output, error}.
-  Must accept `executions: NodeExecution[]` and paginate.**
-- Inline pager `‹ N/M ›` in header not rendered.
-- Copy buttons per column + full-text copy not ported.
-- Footer (duration, cost, timestamp) simplified; needs real
-  `formatDuration` + `formatCost` (now in `utils/status.ts`, done).
-- Running / waiting_for_input / skipped details-column
-  placeholders not distinguished.
+Ported. `executions: NodeExecution[]` + selectedIndex paginator in
+the node header (‹ N/M ›) + magnifier button. The modal reproduces
+the 3-column layout (Input / Details / Output), each column with a
+per-column copy button plus a full-text copy in the header. Status-
+specific Details text covers running / waiting_for_input / completed
+/ skipped / cancelled / failed with matching colors and pulse
+animation. Footer shows status + formatted duration + cost (hidden
+if 0) + local timestamp, via the shared `utils/status.ts` helpers.
 
 ### Divergences
-- v1 uses bits-ui `<Dialog.Root>`. I'll keep my inline modal (no
-  bits-ui dep). Visual match can be identical.
-- v1's `CopyButton` is a small component. I'll inline a button
-  that uses `navigator.clipboard.writeText`.
+- v1 uses bits-ui `<Dialog.Root>`; v2 uses a plain `fixed inset-0`
+  modal. Same visual behavior, no extra dependency.
+- v1's `CopyButton` is a small component; v2 inlines a button that
+  calls `navigator.clipboard.writeText`.

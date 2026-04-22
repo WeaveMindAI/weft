@@ -393,14 +393,15 @@ focused input.
 
 ## v2 port status
 
-My current Port is partial. A fresh port following this spec is
-required. Order:
-1. Accept `executions: NodeExecution[]` in NodeViewData.
-2. Wire live data rendering.
-3. Wire textareaHeights persistence.
-4. Wire debug preview 4-state placeholder + spinner.
-5. Wire Setup Guide.
-6. CSS global rules matching v1.
-7. Verify glow class names + :global rules are correct.
+Ported. `NodeViewData` carries `executions: NodeExecution[]` and the
+component reads the latest for glow class (`node-running` /
+`-completed` / `-failed`). Live data (text/image/progress), debug
+preview 4-state placeholder + spinner, Setup Guide collapsible,
+textarea height persistence via ResizeObserver, `nowheel` class on
+code/textarea focus, and the `_raw` Handle wrapping the SVG all
+match v1. CSS `:global` rules for glows live in the component
+`<style>` block.
 
-All other pieces already exist but need audit against this doc.
+Deferred: CodeEditor (CodeMirror) for `code` kind (bundle size);
+form_builder full UI; BlobField upload (URL-paste works); Run
+Location selector; infra status badge.

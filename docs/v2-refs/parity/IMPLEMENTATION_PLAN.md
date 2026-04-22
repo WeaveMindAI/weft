@@ -6,6 +6,28 @@ Quentin resets my memory. The deep specs in this folder
 has the "how + why + current state" so I can pick up where I
 left off.
 
+## Current status (post-parity-pass)
+
+Phases W1 / W2 / W3 / W4 / S1 / R1 / D18 all landed. See each
+spec's `v2 port status` for component-level detail. Still open:
+
+- Phase R2: `config_spans` per field on NodeDefinition in the
+  Rust parser. Blocks Phase S16 granular `updateNodeConfig`.
+- Phase S16: `expandNodeToMultiLine` + granular configSpans +
+  `tryMaterializeAnon`. Depends on R2.
+- form_builder full UI + CodeEditor + BlobField upload (deferred
+  for scope reasons; spec calls these out).
+
+Key files to know now:
+- `extension-vscode/src/webview/compose/` — all composition
+  primitives (group-synthesis, edge-rewrite, visibility,
+  exec-overlay, scope-lock, cycle-check, layout).
+- `compose/index.ts` exposes `composeGraph` — Graph.svelte uses
+  this one call.
+- `extension-vscode/src/surgical.ts` — all Stage-1 mutations.
+- `extension-vscode/src/webview/components/*.svelte` — ported
+  per spec.
+
 ## Current state of the tree
 
 - All 16 parity specs in `weft/docs/v2-refs/parity/` are

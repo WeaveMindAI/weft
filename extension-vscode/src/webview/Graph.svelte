@@ -12,9 +12,7 @@
   import { send, onMessage } from './vscode';
   import type {
     CatalogEntry,
-    Edge as ProtoEdge,
     NodeDefinition,
-    NodeExecEvent,
     PortDefinition,
     ProjectDefinition,
   } from '../shared/protocol';
@@ -49,7 +47,10 @@
 
   let { project, catalog }: Props = $props();
 
-  const { getViewport, setViewport, updateNodeInternals } = useSvelteFlow();
+  const flow = useSvelteFlow();
+  const updateNodeInternals = (flow as unknown as {
+    updateNodeInternals?: (id: string) => void;
+  }).updateNodeInternals ?? (() => {});
 
   // xyflow state.
   let nodes = $state<Node[]>([]);
@@ -74,7 +75,6 @@
 
   let paletteOpen = $state(false);
   let pendingConnection: { sourceNodeId: string; sourceHandle: string | null } | null = null;
-  let contextFlowPos: { x: number; y: number } | null = null;
 
   const nodeTypes = {
     weft: ProjectNode,
@@ -360,8 +360,9 @@
     const handle = ev.connection?.fromHandle?.id ?? null;
     if (!src) return;
     pendingConnection = { sourceNodeId: src, sourceHandle: handle };
-    contextFlowPos = { x: ev.clientX, y: ev.clientY };
     paletteOpen = true;
+    void ev.clientX;
+    void ev.clientY;
   }
 
   // ─── Drag / scope-lock ──────────────────────────────────────────
@@ -446,9 +447,40 @@
       }
     }
 
-    // 3. checkGroupCapturesNodes — deferred to a follow-up pass;
-    //    left as a TODO because it requires replaying all siblings.
-    //    Not needed for the common single-node drag.
+    // 3. checkGroupCapturesNodes: when the dragged thing IS a group,
+    //    scan root-scope nodes whose absolute position is inside the
+    //    group's rect; capture those (subject to scope-lock).
+    if (isGroup) {
+      const groupAbs = absolutePosition(current, nodesById);
+      const groupR = nodeRect(current);
+      const groupChildren = descendantIds(current.id, nodes);
+      for (const n of nodes) {
+        if (groupChildren.has(n.id)) continue;
+        if (n.id === current.id) continue;
+        if (n.parentId) continue;
+        if (n.type === 'weftGroup' || n.type === 'weftGroupCollapsed') continue;
+        const nAbs = absolutePosition(n, nodesById);
+        if (
+          nAbs.x < groupAbs.x ||
+          nAbs.y < groupAbs.y ||
+          nAbs.x > groupAbs.x + groupR.w ||
+          nAbs.y > groupAbs.y + groupR.h
+        )
+          continue;
+        if (nodeHasConnectionsInScope(n.id, null, nodes, scopeEdges)) {
+          toast.fire(
+            'Cannot change scope. Disconnect this node from other nodes in its current scope first.',
+          );
+          continue;
+        }
+        n.position = { x: nAbs.x - groupAbs.x, y: nAbs.y - groupAbs.y };
+        n.parentId = current.id;
+        send({
+          kind: 'mutation',
+          mutation: { kind: 'moveNodeScope', nodeId: n.id, targetGroupLabel: current.id },
+        });
+      }
+    }
 
     persistLayoutOverride(current.id, { x: current.position.x, y: current.position.y });
   }

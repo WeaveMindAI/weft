@@ -336,4 +336,14 @@ v2 has `project.groups: GroupDefinition[]` from the compiler
 
 ## v2 port status
 
-Not started. The parity spec is the input for the v2 port.
+Ported. `extension-vscode/src/webview/components/GroupNode.svelte`
+implements both the expanded frame (dashed border, dual-handle side
+ports with `__inner` internal source/target, NodeResizer with
+min-height computed from port count, header ribbon with
+ExecutionInspector + label edit + collapse button) and the collapsed
+pill (matches ProjectNode collapsed shape: accent bar + GROUP label +
+description with Show more/less + bare external handles). Glow CSS
+lives in the component `<style>` block under `:global(.node-running)`
+etc. Viewport anchoring on toggle mirrors ProjectNode (double rAF +
+bounding-rect delta). `updateNodeInternals` called post-toggle so
+xyflow rescans handle positions.

@@ -144,21 +144,26 @@ setViewport({x: newVpX, y: newVpY, zoom: newZoom})
 
 ## v2 port status
 
-- ELK is already a dependency in the extension (`elkjs`).
-- `autoLayout` helper in Graph.svelte exists but runs a flat
-  layered layout without scope awareness.
+Ported. `extension-vscode/src/webview/compose/layout.ts` implements
+the bottom-up per-scope layout: group depth → layout deepest first →
+layout scope runs ELK on each connected component with the
+stacked-component arrangement. Boundary `__inner` edges filtered
+from adjacency so they don't drag root nodes into a group's
+component. Group sizes flow up into the parent layout. Triggered
+from the CommandPalette 'autoOrganize' action via Graph.svelte's
+runAutoLayout, which persists positions + group sizes to the
+.layout.json sidecar.
 
-### What to port
+Viewport anchoring for expand/collapse lives directly in the
+ProjectNode and GroupNode toggleExpand handlers: `tick() + 2 × rAF`
+wait + bounding-rect delta → setViewport. Matches v1's flow exactly.
 
-- `autoOrganize` bottom-up per-scope algorithm.
-- Constants matching v2's CSS (some may differ; audit once
-  components ship).
-- `getPortY` with the measured-position fallback.
-- `SEPARATE_CHILDREN` wrapper for group scopes.
-- Connected component finder + arrangement.
-- Disconnected component arrangement with port-role scoring.
-- Viewport anchoring (partially ported in my ProjectNode.svelte,
-  needs to follow toggle → layout → re-read → adjust flow).
+Deferred:
+- `getPortY` DOM measurement (ELK uses constant defaults; port Y
+  alignment is approximate).
+- `SEPARATE_CHILDREN` wrapper: we compose per-scope manually which
+  keeps the per-group hierarchy clean without relying on ELK's
+  nested-hierarchy modes.
 
 ### Deferred
 

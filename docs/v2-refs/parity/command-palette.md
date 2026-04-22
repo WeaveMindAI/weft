@@ -157,19 +157,18 @@ w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-left transition
 
 ## v2 port status
 
-My previous port is close but has gaps:
-- No favorites / recents storage (fine, defer).
-- Preview panel present but uses `catalog.inputs/outputs`
-  vs v1's `config.defaultInputs/defaultOutputs`. Equivalent once
-  we wire catalog entries to mirror v1's NODE_TYPE_CONFIG.
-- `data-selected` attribute + scroll-into-view: missing.
-- Global keyboard handler for actions: only Ctrl+P + Delete
-  wired; need the full set (Ctrl+S/Z/Y/A/D/Enter).
-- Actions list: my version omits save, run, undo, redo,
-  export, import, autoOrganize, fitView, selectAll. These are
-  all callable from the palette in v1. For v2 some map to VS
-  Code commands (save is built in), some need routes.
-- Playground flag: not present in extension, fine to skip.
+Ported. Actions list covers save/run/export_json/export_weft/import/
+undo/redo/duplicate/delete/selectAll/fitView/autoOrganize with their
+v1 icons and keyboard hints. `data-selected` attribute on the
+highlighted row drives scroll-into-view via a $effect. Preview panel
+reads `catalog.inputs/outputs/tags` and renders the same
+green/blue/zinc chip triplet. `playground` prop hides cloud-only
+actions (save/run/export/import).
+
+Global keyboard shortcuts (Ctrl+P/D, Delete) live in Graph.svelte's
+onHotkey handler — palette-specific shortcuts (ArrowUp/Down, Enter,
+Escape) stay local to the palette. autoOrganize wires to
+runAutoLayout; fitView fires a window resize event.
 
 ## Deferred
 

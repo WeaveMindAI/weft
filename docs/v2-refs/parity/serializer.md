@@ -434,23 +434,21 @@ All operations above are designed to preserve:
 ## v2 port status (Rust dispatcher)
 
 ### Done (extension-vscode/src/surgical.ts)
-- `addNode`, `removeNode`, `addEdge`, `removeEdge`,
-  `updateConfig`, `updateLabel`, `duplicateNode`.
+- `addNode`, `removeNode`, `addEdge`, `removeEdge`, `updateConfig`,
+  `updateLabel`, `duplicateNode`.
+- `addGroup`, `removeGroup`, `renameGroup`, `updateGroupPorts`,
+  `updateNodePorts`, `moveNodeScope`, `moveGroupScope`,
+  `updateProjectMeta`.
+- Layout ops: `.layout.json` sidecar fully handled by the webview +
+  graphView.ts saveFullLayout. No surgical needed.
 
 ### Missing (queued)
-- `addGroup`, `removeGroup`, `renameGroup`, `updateGroupPorts`.
-- `moveNodeScope`, `moveGroupScope`.
-- `updateNodePorts` + `invalidateOrphanedConnections`.
-- `updateProjectMeta`.
-- Per-field `config_spans` in the Rust parser (blocks
-  granular `updateConfig`; currently rewrites whole node).
+- Per-field `config_spans` in the Rust parser (blocks granular
+  `updateConfig`; currently rewrites whole node).
 - `expandNodeToMultiLine` (blocks granular updateConfig on
   one-liners).
 - `tryMaterializeAnon` (blocks safe `removeEdge` for anon
   bindings).
-- Layout ops: `parseLayoutCode`, `updateLayoutEntry`,
-  `removeLayoutEntry`, `renameLayoutPrefix`. v2 uses
-  `.layout.json` sidecar, ops are trivial JSON operations.
 
 ### Port plan stages
 

@@ -285,14 +285,13 @@ logic. Skip the upload pipeline entirely.
   v2 webview currently accepts pasted URLs only.
 
 ### What's still missing in my port
-- Textarea height persistence via ResizeObserver + `textareaHeights`
-  config map. The config value exists but my FieldEditor doesn't
-  read or write it.
-- `nowheel` class management on code/textarea focus (for wheel
-  containment).
-- `code` kind renders as a regular textarea; needs CodeEditor
-  component (CodeMirror-based).
-- `form_builder` stub says "edit .weft source directly"; needs
-  the full builder UI with fieldType dropdown, key validation,
-  options sub-builder.
+- `code` kind still renders as a regular textarea; a proper CodeEditor
+  is deferred (CodeMirror bundle cost).
+- `form_builder` stub says "edit .weft source directly"; needs the
+  full builder UI with fieldType dropdown, key validation, options
+  sub-builder.
 - BlobField URL-paste works; upload does not.
+
+### Done
+- textareaHeights persistence via ResizeObserver.
+- `nowheel` class added on focus, removed on blur.
