@@ -66,12 +66,15 @@
 
   // Options: supports string[] or { value, label }[] schemas.
   const selectOptions: Array<{ value: string; label: string }> = $derived.by(() => {
-    const opts = (field.field_type as any).options;
+    const opts = field.field_type.options;
     if (!Array.isArray(opts)) return [];
     return opts.map((o) =>
       typeof o === 'string'
         ? { value: o, label: o }
-        : { value: String(o.value), label: String(o.label ?? o.value) },
+        : {
+            value: String((o as { value: unknown }).value),
+            label: String((o as { label?: unknown; value: unknown }).label ?? (o as { value: unknown }).value),
+          },
     );
   });
 
@@ -80,12 +83,9 @@
     Array.isArray(value) ? new Set((value as unknown[]).map(String)) : new Set(),
   );
 
-  const numberMin: number | undefined = $derived(
-    typeof (field.field_type as any).min === 'number' ? (field.field_type as any).min : undefined,
-  );
-  const numberMax: number | undefined = $derived(
-    typeof (field.field_type as any).max === 'number' ? (field.field_type as any).max : undefined,
-  );
+  const numberMin = $derived(field.field_type.min);
+  const numberMax = $derived(field.field_type.max);
+  const numberStep = $derived(field.field_type.step);
 
   // Event handlers. Each one extracts the DOM value and calls apply.
   function onInputChange(e: Event) {
@@ -167,6 +167,9 @@
       )}
       value={display}
       rows={4}
+      placeholder={field.placeholder ?? ''}
+      maxlength={field.field_type.maxLength}
+      minlength={field.field_type.minLength}
       style={textareaHeight ? `height: ${textareaHeight}px;` : ''}
       onfocus={(e) => {
         addNoWheel(e);
@@ -187,6 +190,7 @@
       value={numberValue}
       min={numberMin}
       max={numberMax}
+      step={numberStep}
       onchange={onNumberChange}
       onclick={(e) => e.stopPropagation()}
     />
@@ -294,6 +298,10 @@
       type="text"
       class="w-full text-xs bg-zinc-100 px-2 py-1.5 rounded border-none outline-none font-mono"
       value={display}
+      placeholder={field.placeholder ?? ''}
+      maxlength={field.field_type.maxLength}
+      minlength={field.field_type.minLength}
+      pattern={field.field_type.pattern}
       onfocus={onInputFocus}
       oninput={onInputTypeDebounced}
       onblur={onInputBlur}
