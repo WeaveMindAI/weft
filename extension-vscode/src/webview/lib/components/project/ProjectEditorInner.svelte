@@ -25,7 +25,6 @@
 	import { extractTriggerSubgraph } from "$lib/utils/trigger-subgraph";
 	import { toast } from "svelte-sonner";
 
-	import WeftCodePanel from "./WeftCodePanel.svelte";
 	import ExecutionsPanel from "./ExecutionsPanel.svelte";
 
 	// Undo/Redo history
@@ -103,8 +102,12 @@
 	let configPanelRef: any = $state();
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	let historyPanelRef: any = $state();
-	let showCodePanel = $state(untrack(() => playground));
-	let mobileForceEditor = $state(false);
+	// VS Code embedding: the code panel is redundant (the .weft file
+	// is already open as a text tab) and the mobile notice doesn't
+	// apply inside a webview. Force both to their no-render defaults
+	// on mount; the toolbar that toggles them is also removed below.
+	let showCodePanel = $state(false);
+	let mobileForceEditor = $state(true);
 	let mobileToolbarOpen = $state(false);
 	let codePanelMaximized = $state(false);
 	let codePanelWidth = $state(480);
@@ -2800,255 +2803,19 @@
 	/>
 {/if}
 
-<!-- Mobile notice -->
-{#if !mobileForceEditor}
-<div class="flex flex-col bg-white h-full w-full md:hidden">
-	<div class="flex items-center justify-between px-4 py-3 border-b border-zinc-200">
-		<a href="/dashboard" class="flex items-center gap-2 text-zinc-500 hover:text-zinc-800 transition-colors">
-			<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
-			<span class="text-sm font-medium">Dashboard</span>
-		</a>
-		<div class="flex items-center gap-3">
-			<a href="/executions" class="text-xs text-zinc-400 hover:text-zinc-700 transition-colors">Executions</a>
-			<a href="/usage" class="text-xs text-zinc-400 hover:text-zinc-700 transition-colors">Usage</a>
-		</div>
-	</div>
-	<div class="flex-1 flex flex-col items-center justify-center gap-4 p-8 text-center">
-		<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="text-zinc-300"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
-		<p class="text-sm font-medium text-zinc-700">The editor works best on a larger screen</p>
-		<p class="text-xs text-zinc-400 max-w-xs">You can browse your projects and view executions on mobile, but the visual editor needs a desktop or tablet for the full experience.</p>
-		<div class="flex items-center gap-3 mt-2">
-			{#if onSetViewMode}
-				<button
-					onclick={() => onSetViewMode?.('runner')}
-					class="px-4 py-2 text-xs font-medium bg-zinc-900 text-white rounded-lg hover:bg-zinc-800 transition-colors"
-				>Open Runner</button>
-			{/if}
-			<a href="/dashboard" class="px-4 py-2 text-xs font-medium rounded-lg transition-colors {onSetViewMode ? 'border border-zinc-200 text-zinc-600 hover:bg-zinc-50' : 'bg-zinc-900 text-white hover:bg-zinc-800'}">Back to Dashboard</a>
-		</div>
-		<button
-			onclick={() => mobileForceEditor = true}
-			class="mt-4 text-[11px] text-red-400 hover:text-red-600 transition-colors"
-		>Proceed anyway</button>
-	</div>
-</div>
-{/if}
-
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="{mobileForceEditor ? 'flex' : 'hidden md:flex'} flex-col h-full w-full">
-	<!-- IDE Header Bar -->
-	<div class="flex items-center justify-between px-4 bg-white border-b border-zinc-200 z-20 shrink-0" style="height: 41px;">
-		<div class="flex items-center gap-3">
-			{#if !playground}
-			<a href="/dashboard" class="flex items-center justify-center w-6 h-6 rounded hover:bg-zinc-100 text-zinc-500 hover:text-zinc-900 transition-colors" title="Back to Dashboard">
-				<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-			</a>
-			<div class="h-4 w-px bg-zinc-200"></div>
-			{/if}
-			<div class="flex flex-col">
-				{#if editingName}
-					<input
-						type="text"
-						bind:value={editingNameValue}
-						onblur={() => {
-							editingName = false;
-							const trimmed = editingNameValue.trim();
-							if (trimmed && trimmed !== project.name) {
-								onSave({ name: trimmed });
-							}
-						}}
-						onkeydown={(e) => {
-							if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-							if (e.key === 'Escape') { editingName = false; editingNameValue = project.name || ''; }
-						}}
-						class="text-sm font-semibold text-zinc-800 leading-tight bg-transparent border-b border-zinc-400 focus:outline-none focus:border-zinc-700 w-48"
-						use:focusOnMount
-					/>
-				{:else}
-					<button
-						onclick={() => { editingName = true; editingNameValue = project.name || ''; }}
-						class="text-sm font-semibold text-zinc-800 leading-tight text-left hover:text-zinc-600 cursor-text truncate max-w-[120px] sm:max-w-[200px] md:max-w-none"
-						title="Click to rename"
-					>{project.name || 'Untitled Project'}</button>
-				{/if}
-			</div>
-		</div>
-		<!-- Desktop toolbar -->
-		<div class="hidden md:flex items-center gap-2">
-			<button
-				onclick={() => { showCodePanel = !showCodePanel; te.view.codePanelToggled(showCodePanel); if (showCodePanel) initWeftCode(); }}
-				class="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium transition-colors {showCodePanel ? 'bg-zinc-900 text-white' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'}"
-				title="Toggle Weft code editor"
-			>
-				<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-				Code
-			</button>
-			<div class="w-px h-4 bg-zinc-200"></div>
-			{#if onImport}
-				<button
-					class="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 transition-colors"
-					onclick={onImport}
-					title="Import project"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-					Import
-				</button>
-			{/if}
-			{#if onExport}
-				<button
-					class="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 transition-colors"
-					onclick={() => showExportDialog = true}
-					title="Export project"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-					Export
-				</button>
-			{/if}
-			{#if onShare}
-				<button
-					class="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 transition-colors"
-					onclick={onShare}
-					title="Share to community"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-					Share
-				</button>
-			{/if}
-
-			{#if onSetViewMode}
-				<div class="w-px h-4 bg-zinc-200 mx-1"></div>
-				{#if onOpenTestConfig}
-					<button
-						class="flex items-center gap-1.5 px-2 py-1 rounded text-[11px] font-medium transition-colors {testMode ? 'bg-amber-500 text-white shadow-sm' : 'border border-zinc-200 text-zinc-400 hover:bg-zinc-50 hover:text-zinc-600'}"
-						onclick={onOpenTestConfig}
-						title={testMode ? 'Test mode ON: click to manage test configs' : 'Configure test mocks'}
-					>
-						<span class="relative flex h-2 w-2">
-							{#if testMode}
-								<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-50"></span>
-								<span class="relative inline-flex rounded-full h-2 w-2 bg-white"></span>
-							{:else}
-								<span class="relative inline-flex rounded-full h-2 w-2 bg-zinc-300"></span>
-							{/if}
-						</span>
-						{testMode ? 'Test ON' : 'Tests'}
-					</button>
-				{/if}
-				<div class="inline-flex rounded border border-zinc-200 overflow-hidden">
-					<button
-						class="text-[11px] px-2.5 py-1 font-medium transition-colors {viewMode === 'builder' ? 'bg-zinc-900 text-white' : 'bg-white text-zinc-500 hover:text-zinc-800 hover:bg-zinc-50'}"
-						onclick={() => onSetViewMode?.('builder')}
-					>Builder</button>
-					<button
-						class="text-[11px] px-2.5 py-1 font-medium border-l border-zinc-200 transition-colors {viewMode === 'runner' ? 'bg-zinc-900 text-white' : 'bg-white text-zinc-500 hover:text-zinc-800 hover:bg-zinc-50'}"
-						onclick={() => onSetViewMode?.('runner')}
-					>Runner</button>
-				</div>
-				{#if onPublish}
-					<button
-						class="flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium text-white bg-violet-600 hover:bg-violet-700 transition-colors"
-						onclick={onPublish}
-						title={hasPublications ? 'Manage your public deployments' : 'Publish this project to a public URL'}
-					>{hasPublications ? 'Manage deployments' : 'Publish'}</button>
-				{/if}
-			{/if}
-		</div>
-
-		<!-- Mobile toolbar hamburger -->
-		<div class="relative md:hidden">
-			<button
-				onclick={() => mobileToolbarOpen = !mobileToolbarOpen}
-				class="p-1.5 rounded-lg hover:bg-zinc-100 transition-colors"
-				aria-label="Toggle toolbar"
-			>
-				<svg class="w-5 h-5 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-					{#if mobileToolbarOpen}
-						<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-					{:else}
-						<path stroke-linecap="round" stroke-linejoin="round" d="M12 6.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 12.75a.75.75 0 110-1.5.75.75 0 010 1.5zM12 18.75a.75.75 0 110-1.5.75.75 0 010 1.5z" />
-					{/if}
-				</svg>
-			</button>
-			{#if mobileToolbarOpen}
-				<div class="absolute right-0 top-full mt-1 w-48 bg-white border border-zinc-200 rounded-lg shadow-lg py-1 z-50">
-					<button
-						onclick={() => { showCodePanel = !showCodePanel; te.view.codePanelToggled(showCodePanel); if (showCodePanel) initWeftCode(); mobileToolbarOpen = false; }}
-						class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {showCodePanel ? 'text-zinc-900 bg-zinc-50' : 'text-zinc-600 hover:bg-zinc-50'}"
-					>{showCodePanel ? '✓ Code' : 'Code'}</button>
-					{#if onImport}
-						<button onclick={() => { onImport(); mobileToolbarOpen = false; }} class="w-full text-left px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 transition-colors">Import</button>
-					{/if}
-					{#if onExport}
-						<button onclick={() => { showExportDialog = true; mobileToolbarOpen = false; }} class="w-full text-left px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 transition-colors">Export</button>
-					{/if}
-					{#if onShare}
-						<button onclick={() => { onShare(); mobileToolbarOpen = false; }} class="w-full text-left px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 transition-colors">Share</button>
-					{/if}
-					{#if onSetViewMode}
-						<div class="border-t border-zinc-100 my-1"></div>
-						<button
-							onclick={() => { onSetViewMode?.('builder'); mobileToolbarOpen = false; }}
-							class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {viewMode === 'builder' ? 'text-zinc-900 bg-zinc-50' : 'text-zinc-600 hover:bg-zinc-50'}"
-						>{viewMode === 'builder' ? '● Builder' : 'Builder'}</button>
-						<button
-							onclick={() => { onSetViewMode?.('runner'); mobileToolbarOpen = false; }}
-							class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {viewMode === 'runner' ? 'text-zinc-900 bg-zinc-50' : 'text-zinc-600 hover:bg-zinc-50'}"
-						>{viewMode === 'runner' ? '● Runner' : 'Runner'}</button>
-						{#if onOpenTestConfig}
-							<button
-								onclick={() => { onOpenTestConfig(); mobileToolbarOpen = false; }}
-								class="w-full text-left px-3 py-2 text-xs font-medium transition-colors {testMode ? 'text-amber-600 bg-amber-50' : 'text-zinc-600 hover:bg-zinc-50'}"
-							>{testMode ? '● Test ON' : 'Tests'}</button>
-						{/if}
-						{#if onPublish}
-							<div class="border-t border-zinc-100 my-1"></div>
-							<button
-								onclick={() => { onPublish(); mobileToolbarOpen = false; }}
-								class="w-full text-left px-3 py-2 text-xs font-medium text-violet-600 hover:bg-violet-50 transition-colors"
-							>{hasPublications ? 'Manage deployments' : 'Publish'}</button>
-						{/if}
-					{/if}
-				</div>
-			{/if}
-		</div>
-	</div>
-
+<!-- VS Code embedding: mobile notice + IDE header toolbar removed.
+     The extension host owns title, save status, run/stop controls;
+     the webview renders only the graph canvas + context menu +
+     right-panel area. -->
+<div class="flex flex-col h-full w-full">
 	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 	<div 
 		class="flex flex-1 relative overflow-hidden"
 		oncontextmenu={onContextMenu}
 		onclick={() => { if (!justOpenedContextMenu) { contextMenu = null; pendingConnection = null; } }}
 	>
-	<!-- Weft Code Panel (left, resizable) -->
-	{#if showCodePanel}
-		<div
-			class="weft-code-panel-container max-md:!flex-1 max-md:!w-full"
-			style={codePanelMaximized ? 'flex: 1;' : `width: ${codePanelWidth}px; flex-shrink: 0;`}
-		>
-			<WeftCodePanel
-				value={weftCode}
-				maximized={codePanelMaximized}
-				locked={weftStreaming || structuralLock}
-				opaqueBlocks={weftOpaqueBlocks}
-				parseErrors={weftParseErrors}
-				{saveStatus}
-				onchange={handleWeftCodeChange}
-				onToggleMaximize={() => { codePanelMaximized = !codePanelMaximized; }}
-				onClose={() => { showCodePanel = false; codePanelMaximized = false; }}
-			/>
-		</div>
-		{#if !codePanelMaximized}
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div
-				class="code-panel-resize-handle hidden md:block"
-				onmousedown={startCodePanelResize}
-			></div>
-		{/if}
-	{/if}
-
-	<!-- Main Canvas (hidden on mobile when code panel is open) -->
-	{#if !codePanelMaximized}
-	<div class="flex-1 relative {showCodePanel ? 'hidden md:block' : ''}" oncontextmenucapture={(e: MouseEvent) => {
+	<!-- Main Canvas (code panel removed for VS Code embedding) -->
+	<div class="flex-1 relative" oncontextmenucapture={(e: MouseEvent) => {
 		const target = e.target as HTMLElement | null;
 		if (!target?.closest('.svelte-flow__edgeupdater')) return;
 		// Right-click on edge reconnect overlay, find the actual handle underneath
@@ -3145,7 +2912,6 @@
 			nodeCount={nodes.length}
 		/>{/if}
 	</div>
-	{/if}
 
 	<!-- Context Menu -->
 	{#if contextMenu}

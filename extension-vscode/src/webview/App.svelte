@@ -7,6 +7,7 @@
     setRemoteParseTrigger,
     type WeftParseError,
   } from './lib/ai/weft-parser';
+  import { registerCatalog, type CatalogEntry } from './lib/nodes';
   import { translateProject } from './host-bridge';
   import type { ProjectDefinition as V1Project } from './lib/types';
 
@@ -29,6 +30,11 @@
         const errs: WeftParseError[] = msg.response.diagnostics
           .filter((d) => d.severity === 'error')
           .map((d) => ({ line: d.line, message: d.message }));
+        // IMPORTANT: populate NODE_TYPE_CONFIG BEFORE setting
+        // `project`. ProjectEditorInner reads the registry during
+        // its first render via $derived, and we don't want those
+        // reads to see an empty registry on mount.
+        registerCatalog(msg.response.catalog as unknown as Record<string, CatalogEntry>);
         const firstMount = project === null;
         setCachedParseResponse(msg.response.project, msg.source, msg.layoutCode, errs);
         weftCode = msg.source;
