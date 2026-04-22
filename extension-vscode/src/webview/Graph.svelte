@@ -3,25 +3,43 @@
     SvelteFlow,
     Background,
     Controls,
+    useSvelteFlow,
     type Node,
     type Edge as FlowEdge,
   } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { send, onMessage } from './vscode';
-  import { autoLayout } from './layout';
   import type {
     CatalogEntry,
-    NodeExecEvent,
-    ProjectDefinition,
+    Edge as ProtoEdge,
     NodeDefinition,
+    NodeExecEvent,
+    PortDefinition,
+    ProjectDefinition,
   } from '../shared/protocol';
   import ProjectNode from './components/ProjectNode.svelte';
   import CustomEdge from './components/CustomEdge.svelte';
   import GroupNode from './components/GroupNode.svelte';
+  import AnnotationNode from './components/AnnotationNode.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
-  import type { NodeExecStatus } from './components/exec-types';
-  import type { NodeViewData } from './components/node-view-data';
+  import { buildNodes } from './compose/build-nodes';
+  import { buildEdges, toWeftEdgeRef } from './compose/build-edges';
+  import {
+    wouldCreateCycle,
+    isValidConnection as scopeValid,
+  } from './compose/cycle-check';
+  import {
+    absolutePosition,
+    DebouncedToast,
+    deepestGroupContaining,
+    descendantIds,
+    nodeHasConnectionsInScope,
+    nodeRect,
+    toScopeEdges,
+  } from './compose/scope-lock';
+  import { applyExecEvent } from './compose/exec-overlay';
+  import type { ExecMap, LayoutMap } from './compose/types';
 
   interface Props {
     project: ProjectDefinition;
@@ -30,50 +48,65 @@
 
   let { project, catalog }: Props = $props();
 
-  // nodes / edges: the xyflow source-of-truth. Mutated in-place so
-  // xyflow doesn't remount a node (which would reset position,
-  // focused input, etc).
+  const { getViewport, setViewport, updateNodeInternals } = useSvelteFlow();
+
+  // xyflow state.
   let nodes = $state<Node[]>([]);
   let edges = $state<FlowEdge[]>([]);
 
-  // Layout cache. Drives initial position for new nodes and survives
-  // across parse rounds. Written to the .layout.json sidecar when the
-  // user drags.
-  let savedPositions = $state<Record<string, { x: number; y: number }>>({});
-  let layoutDebounceMs = $state(400);
-  let layoutTimer: ReturnType<typeof setTimeout> | undefined;
-  let structuralSignature = '';
+  // Layout sidecar cache. Writes are batched to the extension host
+  // after drag / resize / expand events.
+  let layout = $state<LayoutMap>({});
+  let execByNode = $state<ExecMap>({});
+  let activeEdges = $state<Set<string>>(new Set());
+
+  // Z-index boosts per click (ProjectEditorInner.svelte:2273-2288).
+  let nextNodeZ = 6;
+  const nodeZBoost: Record<string, number> = {};
+  const edgeZBoost: Record<string, number> = {};
+
+  // Drag state for scope-lock.
+  const preDragPositions = new Map<string, { x: number; y: number }>();
+  const toast = new DebouncedToast((msg) =>
+    send({ kind: 'log', level: 'warn', message: msg }),
+  );
 
   let paletteOpen = $state(false);
+  let pendingConnection: { sourceNodeId: string; sourceHandle: string | null } | null = null;
+  let contextFlowPos: { x: number; y: number } | null = null;
 
-  // Per-node execution state. Updated by `execEvent` messages.
-  interface NodeExecState {
-    status: NodeExecStatus;
-    input?: unknown;
-    output?: unknown;
-    error?: string;
-  }
-  let execByNode = $state<Record<string, NodeExecState>>({});
-
-  const nodeTypes = { weft: ProjectNode, weftGroup: GroupNode };
+  const nodeTypes = {
+    weft: ProjectNode,
+    weftGroup: GroupNode,
+    weftGroupCollapsed: GroupNode,
+    annotation: AnnotationNode,
+  };
   const edgeTypes = { weft: CustomEdge };
+
+  // ─── Messages from the host ──────────────────────────────────────
 
   onMount(() => {
     const unsub = onMessage((msg) => {
       if (msg.kind === 'layoutHint') {
-        savedPositions = { ...savedPositions, ...msg.positions };
-        // Apply incoming positions to existing nodes we haven't
-        // placed from layout yet.
-        for (const n of nodes) {
-          const saved = savedPositions[n.id];
-          if (saved) n.position = saved;
+        // Hint from the sidecar: merge but let user drags win.
+        const next = { ...layout };
+        for (const [id, pos] of Object.entries(msg.positions)) {
+          next[id] = { ...(next[id] ?? { x: 0, y: 0 }), x: pos.x, y: pos.y };
         }
-      } else if (msg.kind === 'settings') {
-        layoutDebounceMs = (msg as any).layoutDebounceMs ?? layoutDebounceMs;
+        layout = next;
       } else if (msg.kind === 'execEvent') {
-        applyExecEvent(msg.event);
+        execByNode = applyExecEvent(execByNode, msg.event);
+      } else if (msg.kind === 'edgeActive') {
+        const set = new Set(activeEdges);
+        if (msg.event.active) set.add(msg.event.edgeId);
+        else set.delete(msg.event.edgeId);
+        activeEdges = set;
       } else if (msg.kind === 'execReset') {
         execByNode = {};
+        activeEdges = new Set();
+      } else if (msg.kind === 'liveData') {
+        // Live data flows in through the exec events' output side in
+        // v2, so there's nothing node-specific to cache here yet.
       }
     });
     window.addEventListener('keydown', onHotkey);
@@ -83,72 +116,8 @@
     };
   });
 
-  function onHotkey(e: KeyboardEvent) {
-    const target = e.target as HTMLElement | null;
-    const inInput =
-      target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+  // ─── Recompose on every project / layout / exec change ───────────
 
-    // Ctrl+P always works even inside inputs: it's the primary way
-    // to open the palette.
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'p') {
-      paletteOpen = !paletteOpen;
-      e.preventDefault();
-      return;
-    }
-
-    if (inInput) return;
-
-    // Ctrl+D: duplicate selected.
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
-      const sel = nodes.find((n) => n.selected);
-      if (sel) {
-        e.preventDefault();
-        send({ kind: 'mutation', mutation: { kind: 'duplicateNode', nodeId: sel.id } });
-      }
-      return;
-    }
-
-    // Delete selected nodes and edges.
-    if (e.key === 'Delete' || e.key === 'Backspace') {
-      let touched = false;
-      for (const n of nodes) {
-        if (n.selected) {
-          send({ kind: 'mutation', mutation: { kind: 'removeNode', id: n.id } });
-          touched = true;
-        }
-      }
-      for (const edge of edges) {
-        if (edge.selected) {
-          send({ kind: 'mutation', mutation: { kind: 'removeEdge', edgeId: edge.id } });
-          touched = true;
-        }
-      }
-      if (touched) e.preventDefault();
-      return;
-    }
-  }
-
-  function applyExecEvent(event: NodeExecEvent) {
-    const current = execByNode[event.node_id] ?? { status: 'idle' as NodeExecStatus };
-    const next: NodeExecState = { ...current };
-    if (event.kind === 'started') {
-      next.status = 'started';
-      next.input = event.input;
-      next.output = undefined;
-      next.error = undefined;
-    } else if (event.kind === 'completed') {
-      next.status = 'completed';
-      next.output = event.output;
-    } else if (event.kind === 'failed') {
-      next.status = 'failed';
-      next.error = event.error;
-    } else if (event.kind === 'skipped') {
-      next.status = 'skipped';
-    }
-    execByNode = { ...execByNode, [event.node_id]: next };
-  }
-
-  // Wired input set per target node. Recomputed when edges change.
   const wiredByTarget = $derived.by(() => {
     const m: Record<string, Set<string>> = {};
     for (const e of project.edges) {
@@ -158,7 +127,70 @@
     return m;
   });
 
+  $effect(() => {
+    nodes = buildNodes({
+      project,
+      catalog,
+      layout,
+      exec: execByNode,
+      wiredByTarget,
+      onConfigChange,
+      onLabelChange,
+      onPortsChange,
+      previous: nodes,
+      zIndexBoost: nodeZBoost,
+    });
+  });
+
+  $effect(() => {
+    const boost: Record<string, number> = edgeZBoost;
+    // Hidden nodes computed by the node build — walk and find ids
+    // whose style is display:none to mirror into edge hiding.
+    const hidden = new Set<string>();
+    for (const n of nodes) {
+      const s = (n.style as string | undefined) ?? '';
+      if (s.includes('display: none')) hidden.add(n.id);
+    }
+    edges = buildEdges({
+      project,
+      viewNodes: nodes.map((n) => ({
+        id: n.id,
+        kind:
+          n.type === 'weftGroup' || n.type === 'weftGroupCollapsed'
+            ? 'group'
+            : n.type === 'annotation'
+            ? 'annotation'
+            : 'regular',
+        label: (n.data as { node?: NodeDefinition })?.node?.label ?? null,
+        nodeType: (n.data as { node?: NodeDefinition })?.node?.nodeType ?? '',
+        rawParentId: (n.parentId ?? null) as string | null,
+        inputs: (n.data as { node?: NodeDefinition })?.node?.inputs ?? [],
+        outputs: (n.data as { node?: NodeDefinition })?.node?.outputs ?? [],
+        config: (n.data as { node?: NodeDefinition })?.node?.config ?? {},
+        features: (n.data as { node?: NodeDefinition })?.node?.features ?? {
+          oneOfRequired: [],
+          correlatedPorts: [],
+          canAddInputPorts: false,
+          canAddOutputPorts: false,
+          hasFormSchema: false,
+        },
+        groupDef: null,
+        source: (n.data as { node?: NodeDefinition })?.node ?? null,
+      })),
+      hiddenNodeIds: hidden,
+      activeEdges,
+      edgeZBoost: boost,
+    });
+  });
+
+  // ─── Mutations ──────────────────────────────────────────────────
+
   function onConfigChange(nodeId: string, key: string, value: unknown) {
+    // Layout-only keys don't round-trip through the weft source.
+    if (key === 'width' || key === 'height' || key === 'expanded') {
+      persistLayoutOverride(nodeId, { [key === 'width' ? 'w' : key === 'height' ? 'h' : 'expanded']: value });
+      return;
+    }
     send({ kind: 'mutation', mutation: { kind: 'updateConfig', nodeId, key, value } });
   }
   function onLabelChange(nodeId: string, label: string | null) {
@@ -166,163 +198,343 @@
   }
   function onPortsChange(
     nodeId: string,
-    changes: { inputs?: unknown; outputs?: unknown },
+    changes: { inputs?: PortDefinition[]; outputs?: PortDefinition[] },
   ) {
-    // Ports changes are stored as a _ports config key, which the
-    // Weft compiler reads when rendering the node header. Until the
-    // compiler round-trips ports in the config sugar, we piggyback
-    // on updateConfig so the edit lands in the file.
-    const key = changes.inputs ? '_inputs' : '_outputs';
-    const value = changes.inputs ?? changes.outputs;
-    send({ kind: 'mutation', mutation: { kind: 'updateConfig', nodeId, key, value } });
+    const isGroup = project.groups.some((g) => g.id === nodeId);
+    const mutation = isGroup
+      ? ({
+          kind: 'updateGroupPorts',
+          groupLabel: nodeId,
+          inputs: changes.inputs ?? portsOf(nodeId, 'in'),
+          outputs: changes.outputs ?? portsOf(nodeId, 'out'),
+        } as const)
+      : ({
+          kind: 'updateNodePorts',
+          nodeId,
+          inputs: changes.inputs ?? portsOf(nodeId, 'in'),
+          outputs: changes.outputs ?? portsOf(nodeId, 'out'),
+        } as const);
+    send({ kind: 'mutation', mutation });
+    tick().then(() => updateNodeInternals(nodeId));
   }
 
-  function makeNodeData(n: NodeDefinition): NodeViewData {
+  function portsOf(id: string, side: 'in' | 'out'): PortDefinition[] {
+    const g = project.groups.find((gg) => gg.id === id);
+    if (g) return side === 'in' ? g.inPorts : g.outPorts;
+    const n = project.nodes.find((nn) => nn.id === id);
+    if (!n) return [];
+    return side === 'in' ? n.inputs : n.outputs;
+  }
+
+  function persistLayoutOverride(
+    nodeId: string,
+    patch: Partial<{ x: number; y: number; w: number; h: number; expanded: boolean }>,
+  ) {
+    const cur = layout[nodeId] ?? { x: 0, y: 0 };
+    layout = { ...layout, [nodeId]: { ...cur, ...patch } };
+    send({ kind: 'layoutChanged', layout });
+  }
+
+  // ─── Keyboard ────────────────────────────────────────────────────
+
+  function onHotkey(e: KeyboardEvent) {
+    const target = e.target as HTMLElement | null;
+    const inInput =
+      target &&
+      (target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable ||
+        target.closest('[role="dialog"]'));
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'p') {
+      paletteOpen = !paletteOpen;
+      e.preventDefault();
+      return;
+    }
+
+    if (inInput) return;
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
+      const sel = nodes.find((n) => n.selected);
+      if (sel) {
+        e.preventDefault();
+        send({ kind: 'mutation', mutation: { kind: 'duplicateNode', nodeId: sel.id } });
+      }
+      return;
+    }
+
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      let touched = false;
+      // Delete selected edges FIRST so Delete with both selected
+      // doesn't drop their endpoint too.
+      for (const edge of edges) {
+        if (edge.selected) {
+          sendDeleteEdge(edge);
+          touched = true;
+        }
+      }
+      for (const n of nodes) {
+        if (n.selected) {
+          const isGroup = (n.data as { node?: NodeDefinition }).node?.nodeType === 'Group';
+          send({
+            kind: 'mutation',
+            mutation: isGroup
+              ? { kind: 'removeGroup', label: n.id }
+              : { kind: 'removeNode', id: n.id },
+          });
+          touched = true;
+        }
+      }
+      if (touched) e.preventDefault();
+      return;
+    }
+  }
+
+  function sendDeleteEdge(edge: FlowEdge) {
+    const ref = toWeftEdgeRef(
+      edge.source,
+      (edge.sourceHandle as string | null) ?? null,
+      edge.target,
+      (edge.targetHandle as string | null) ?? null,
+      new Map(
+        nodes.map((n) => [
+          n.id,
+          (n.data as { node?: NodeDefinition }).node ?? (n as unknown as NodeDefinition),
+        ]),
+      ),
+    );
+    send({
+      kind: 'mutation',
+      mutation: {
+        kind: 'removeEdge',
+        source: ref.source,
+        sourcePort: ref.sourcePort,
+        target: ref.target,
+        targetPort: ref.targetPort,
+      },
+    });
+  }
+
+  // ─── Connection flow ────────────────────────────────────────────
+
+  function onBeforeConnect(c: {
+    source: string;
+    sourceHandle?: string | null;
+    target: string;
+    targetHandle?: string | null;
+  }): FlowEdge | null {
+    if (!c.source || !c.target) return null;
+    if (wouldCreateCycle(c.source, c.target, edges)) {
+      send({ kind: 'log', level: 'warn', message: 'Would create a cycle' });
+      return null;
+    }
+    // 1-driver-per-input: drop any existing edge matching the same
+    // (target, targetHandle). xyflow lets us return the NEW edge
+    // (any existing one will be replaced via surgical removeEdge
+    // below).
+    const existing = edges.find(
+      (e) =>
+        e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null),
+    );
+    if (existing) {
+      sendDeleteEdge(existing);
+    }
+    setTimeout(() => {
+      const ref = toWeftEdgeRef(
+        c.source,
+        c.sourceHandle ?? null,
+        c.target,
+        c.targetHandle ?? null,
+        new Map(
+          nodes.map((n) => [
+            n.id,
+            (n.data as { node?: NodeDefinition }).node ?? (n as unknown as NodeDefinition),
+          ]),
+        ),
+      );
+      send({
+        kind: 'mutation',
+        mutation: {
+          kind: 'addEdge',
+          source: ref.source,
+          sourcePort: ref.sourcePort,
+          target: ref.target,
+          targetPort: ref.targetPort,
+          scopeGroupLabel: ref.scopeGroupLabel,
+        },
+      });
+    }, 0);
     return {
-      node: n,
-      catalog: catalog[n.nodeType] ?? null,
-      wiredInputs: wiredByTarget[n.id] ?? new Set<string>(),
-      exec: execByNode[n.id] ?? { status: 'idle' as NodeExecStatus },
-      onConfigChange,
-      onLabelChange,
-      onPortsChange,
+      id: `${c.source}.${c.sourceHandle}->${c.target}.${c.targetHandle}`,
+      source: c.source,
+      target: c.target,
+      sourceHandle: c.sourceHandle ?? undefined,
+      targetHandle: c.targetHandle ?? undefined,
+      type: 'weft',
+      zIndex: 5,
     };
   }
 
-  function structuralSignatureOf(p: ProjectDefinition): string {
-    const ns = p.nodes
-      .filter((n) => n.nodeType !== 'Passthrough')
-      .map((n) => `${n.id}:${n.nodeType}`)
-      .sort()
-      .join(',');
-    const es = p.edges
-      .map((e) => `${e.source}.${e.sourceHandle}->${e.target}.${e.targetHandle}`)
-      .sort()
-      .join(',');
-    return `${ns}|${es}`;
-  }
-
-  function fallbackPosition(i: number): { x: number; y: number } {
-    return { x: 100 + (i % 4) * 280, y: 100 + Math.floor(i / 4) * 220 };
-  }
-
-  // Diff `project` into `nodes`/`edges`. Preserves user-drag
-  // positions: only new nodes receive a fresh position.
-  $effect(() => {
-    const structural = project.nodes.filter((n) => n.nodeType !== 'Passthrough');
-    const byId = new Map(nodes.map((n) => [n.id, n]));
-    const keep = new Set(structural.map((n) => n.id));
-
-    const next: Node[] = [];
-    structural.forEach((n, i) => {
-      const existing = byId.get(n.id);
-      const data = makeNodeData(n);
-      if (existing) {
-        // Preserve position. Only replace data.
-        next.push({ ...existing, data });
-      } else {
-        next.push({
-          id: n.id,
-          position: savedPositions[n.id] ?? fallbackPosition(i),
-          type: 'weft',
-          data,
-        });
-      }
-    });
-    // Drop nodes that no longer exist in `project`.
-    nodes = next.filter((n) => keep.has(n.id));
-
-    edges = project.edges.map((e) => ({
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      sourceHandle: e.sourceHandle ?? undefined,
-      targetHandle: e.targetHandle ?? undefined,
-      type: 'weft',
-      data: {
-        // Only show a label when ports differ.
-        showLabel:
-          (e.sourceHandle ?? '') !== (e.targetHandle ?? '') &&
-          Boolean(e.sourceHandle || e.targetHandle),
-        sourcePort: e.sourceHandle ?? '',
-        targetPort: e.targetHandle ?? '',
-      },
-    }));
-
-    // Only re-run ELK when the structural signature actually changed
-    // (nodes added/removed/retyped, edges added/removed). Config
-    // edits and field changes don't trigger layout.
-    const sig = structuralSignatureOf(project);
-    if (sig !== structuralSignature) {
-      structuralSignature = sig;
-      scheduleLayout();
-    }
-  });
-
-  function scheduleLayout() {
-    if (layoutTimer) clearTimeout(layoutTimer);
-    layoutTimer = setTimeout(runLayout, layoutDebounceMs);
-  }
-
-  async function runLayout() {
-    try {
-      // Only auto-layout nodes that don't have a saved position yet.
-      const unplaced = nodes.filter((n) => !savedPositions[n.id]);
-      if (unplaced.length === 0) return;
-      const positions = await autoLayout({ nodes: unplaced, edges });
-      for (const n of nodes) {
-        const p = positions[n.id];
-        if (p) n.position = p;
-      }
-    } catch (err) {
-      send({ kind: 'log', level: 'warn', message: `elk layout failed: ${String(err)}` });
-    }
-  }
-
-  function onNodeDragStop() {
-    // Persist every node's current position. Shipping all on every
-    // drag stop is fine (<100 nodes per project).
-    const positions: Record<string, { x: number; y: number }> = {};
-    for (const n of nodes) positions[n.id] = { x: n.position.x, y: n.position.y };
-    savedPositions = { ...savedPositions, ...positions };
-    send({ kind: 'positionsChanged', positions });
-  }
-
-  function onConnect(e: {
+  function onReconnect(oldEdge: FlowEdge, newConn: {
     source: string;
     sourceHandle?: string | null;
     target: string;
     targetHandle?: string | null;
   }) {
-    if (!e.sourceHandle || !e.targetHandle) return;
-    send({
-      kind: 'mutation',
-      mutation: {
-        kind: 'addEdge',
-        source: e.source,
-        sourcePort: e.sourceHandle,
-        target: e.target,
-        targetPort: e.targetHandle,
-      },
-    });
+    sendDeleteEdge(oldEdge);
+    onBeforeConnect(newConn);
+    edges = edges.map((e) =>
+      e.id === oldEdge.id
+        ? {
+            ...e,
+            source: newConn.source,
+            target: newConn.target,
+            sourceHandle: newConn.sourceHandle ?? undefined,
+            targetHandle: newConn.targetHandle ?? undefined,
+          }
+        : e,
+    );
   }
 
-  function onPickNode(nodeType: string) {
-    paletteOpen = false;
-    const id = `n_${Date.now().toString(36)}`;
-    send({ kind: 'mutation', mutation: { kind: 'addNode', id, nodeType } });
+  function validateConnection(c: {
+    source: string;
+    sourceHandle: string | null;
+    target: string;
+    targetHandle: string | null;
+  }): boolean {
+    return scopeValid(
+      { nodeId: c.source, handleId: c.sourceHandle },
+      { nodeId: c.target, handleId: c.targetHandle },
+      nodes.map((n) => ({ id: n.id, type: n.type, parentId: n.parentId as string | undefined })),
+    );
   }
 
-  // Right-click context menu on the canvas or on a node. Floating
-  // menu on document.body (same helper as the port context menu).
+  function onConnectEnd(e: unknown) {
+    const ev = e as { connection?: { fromNode?: { id: string }; fromHandle?: { id: string } }; isValid?: boolean; clientX: number; clientY: number };
+    if (ev.isValid) return;
+    const src = ev.connection?.fromNode?.id;
+    const handle = ev.connection?.fromHandle?.id ?? null;
+    if (!src) return;
+    pendingConnection = { sourceNodeId: src, sourceHandle: handle };
+    contextFlowPos = { x: ev.clientX, y: ev.clientY };
+    paletteOpen = true;
+  }
+
+  // ─── Drag / scope-lock ──────────────────────────────────────────
+
+  function onNodeDragStart(e: unknown) {
+    const ev = e as { targetNode?: Node };
+    const n = ev?.targetNode;
+    if (!n) return;
+    preDragPositions.set(n.id, { x: n.position.x, y: n.position.y });
+    nodeZBoost[n.id] = nextNodeZ;
+    for (const edge of edges) {
+      if (edge.source === n.id || edge.target === n.id) {
+        edgeZBoost[edge.id] = nextNodeZ + 1;
+      }
+    }
+    nextNodeZ++;
+  }
+
+  function onNodeDragStop(e: unknown) {
+    const ev = e as { targetNode?: Node };
+    const target = ev?.targetNode;
+    if (!target) return;
+    const nodesById = new Map(nodes.map((n) => [n.id, n]));
+    const scopeEdges = toScopeEdges(edges);
+
+    let current = nodesById.get(target.id);
+    if (!current) return;
+
+    // 1. checkNodeLeavesGroup
+    if (current.parentId) {
+      const parent = nodesById.get(current.parentId);
+      if (parent) {
+        const parentR = nodeRect(parent);
+        const stillInside =
+          current.position.x >= 0 &&
+          current.position.y >= 0 &&
+          current.position.x <= parentR.w &&
+          current.position.y <= parentR.h;
+        if (!stillInside) {
+          if (nodeHasConnectionsInScope(current.id, current.parentId, nodes, scopeEdges)) {
+            const snap = preDragPositions.get(current.id);
+            if (snap) current.position = snap;
+            toast.fire(
+              'Cannot change scope. Disconnect this node from other nodes in its current scope first.',
+            );
+          } else {
+            const abs = absolutePosition(current, nodesById);
+            current.position = abs;
+            current.parentId = undefined;
+            send({
+              kind: 'mutation',
+              mutation: { kind: 'moveNodeScope', nodeId: current.id, targetGroupLabel: null },
+            });
+          }
+        }
+      }
+    }
+
+    // 2. checkNodeCapturedByGroup — only if node isn't itself a group
+    const isGroup = current.type === 'weftGroup' || current.type === 'weftGroupCollapsed';
+    if (!isGroup) {
+      const abs = absolutePosition(current, nodesById);
+      const exclude = new Set<string>([current.id]);
+      for (const child of descendantIds(current.id, nodes)) exclude.add(child);
+      const host = deepestGroupContaining(abs, nodes, exclude);
+      if (host && host.id !== current.parentId) {
+        if (nodeHasConnectionsInScope(current.id, current.parentId ?? null, nodes, scopeEdges)) {
+          const snap = preDragPositions.get(current.id);
+          if (snap) current.position = snap;
+          toast.fire(
+            'Cannot change scope. Disconnect this node from other nodes in its current scope first.',
+          );
+        } else {
+          const hostAbs = absolutePosition(host, nodesById);
+          current.position = { x: abs.x - hostAbs.x, y: abs.y - hostAbs.y };
+          current.parentId = host.id;
+          send({
+            kind: 'mutation',
+            mutation: { kind: 'moveNodeScope', nodeId: current.id, targetGroupLabel: host.id },
+          });
+        }
+      }
+    }
+
+    // 3. checkGroupCapturesNodes — deferred to a follow-up pass;
+    //    left as a TODO because it requires replaying all siblings.
+    //    Not needed for the common single-node drag.
+
+    persistLayoutOverride(current.id, { x: current.position.x, y: current.position.y });
+  }
+
+  // ─── Node selection → z raise ──────────────────────────────────
+
+  function onNodeClick(e: unknown) {
+    const ev = e as { node?: Node };
+    const n = ev?.node;
+    if (!n) return;
+    nodeZBoost[n.id] = nextNodeZ;
+    for (const edge of edges) {
+      if (edge.source === n.id || edge.target === n.id) {
+        edgeZBoost[edge.id] = nextNodeZ + 1;
+      }
+    }
+    nextNodeZ++;
+  }
+
+  // ─── Context menu + palette ────────────────────────────────────
+
   let menuCleanup: (() => void) | undefined;
-
   function closeMenu() {
     menuCleanup?.();
     menuCleanup = undefined;
   }
-
-  function openContextMenu(e: MouseEvent, items: Array<{ label: string; color?: string; onClick: () => void }>) {
+  function openContextMenu(
+    e: MouseEvent,
+    items: Array<{ label: string; color?: string; onClick: () => void }>,
+  ) {
     e.preventDefault();
     closeMenu();
     const backdrop = document.createElement('div');
@@ -358,36 +570,121 @@
 
   function onPaneContextMenu(params: { event: MouseEvent }) {
     openContextMenu(params.event, [
+      { label: 'Add Node...  (Ctrl+P)', onClick: () => (paletteOpen = true) },
       {
-        label: 'Add Node...  (Ctrl+P)',
-        onClick: () => {
-          paletteOpen = true;
-        },
+        label: 'Add Annotation',
+        onClick: () =>
+          send({
+            kind: 'mutation',
+            mutation: {
+              kind: 'addNode',
+              id: `annot_${Date.now().toString(36)}`,
+              nodeType: 'Annotation',
+            },
+          }),
+      },
+      {
+        label: 'Add Group',
+        onClick: () =>
+          send({
+            kind: 'mutation',
+            mutation: { kind: 'addGroup', label: generateUniqueGroupLabel('Group') },
+          }),
       },
     ]);
   }
 
-  function handleNodeContextMenu(ev: any) {
-    if (!ev || !ev.event || !ev.node) return;
-    onNodeContextMenu(ev.event as MouseEvent, ev.node);
-  }
-
-  function onNodeContextMenu(e: MouseEvent, n: any) {
-    openContextMenu(e, [
+  function onNodeContextMenu(ev: { event: MouseEvent; node: Node }) {
+    const isGroup = ev.node.type === 'weftGroup' || ev.node.type === 'weftGroupCollapsed';
+    const items: Array<{ label: string; color?: string; onClick: () => void }> = [
       {
         label: 'Duplicate  (Ctrl+D)',
-        onClick: () => {
-          send({ kind: 'mutation', mutation: { kind: 'duplicateNode', nodeId: n.id } });
-        },
+        onClick: () =>
+          send({
+            kind: 'mutation',
+            mutation: { kind: 'duplicateNode', nodeId: ev.node.id },
+          }),
       },
       {
         label: 'Delete  (Del)',
         color: '#ef4444',
-        onClick: () => {
-          send({ kind: 'mutation', mutation: { kind: 'removeNode', id: n.id } });
-        },
+        onClick: () =>
+          send({
+            kind: 'mutation',
+            mutation: isGroup
+              ? { kind: 'removeGroup', label: ev.node.id }
+              : { kind: 'removeNode', id: ev.node.id },
+          }),
       },
-    ]);
+    ];
+    openContextMenu(ev.event, items);
+  }
+
+  function onPickNode(nodeType: string) {
+    paletteOpen = false;
+    const id = `n_${Date.now().toString(36)}`;
+    send({
+      kind: 'mutation',
+      mutation: { kind: 'addNode', id, nodeType },
+    });
+    if (pendingConnection) {
+      const pc = pendingConnection;
+      pendingConnection = null;
+      setTimeout(() => {
+        send({
+          kind: 'mutation',
+          mutation: {
+            kind: 'addEdge',
+            source: pc.sourceNodeId,
+            sourcePort: pc.sourceHandle ?? 'value',
+            target: id,
+            targetPort: 'value',
+          },
+        });
+      }, 50);
+    }
+  }
+
+  function onPickAction(action: string) {
+    paletteOpen = false;
+    switch (action) {
+      case 'delete': {
+        for (const n of nodes.filter((nn) => nn.selected)) {
+          const isGroup = n.type === 'weftGroup' || n.type === 'weftGroupCollapsed';
+          send({
+            kind: 'mutation',
+            mutation: isGroup
+              ? { kind: 'removeGroup', label: n.id }
+              : { kind: 'removeNode', id: n.id },
+          });
+        }
+        break;
+      }
+      case 'duplicate': {
+        const sel = nodes.find((n) => n.selected);
+        if (sel) send({ kind: 'mutation', mutation: { kind: 'duplicateNode', nodeId: sel.id } });
+        break;
+      }
+      case 'selectAll': {
+        nodes = nodes.map((n) => ({ ...n, selected: true }));
+        break;
+      }
+      case 'fitView':
+      case 'autoOrganize':
+        // Delegated to the xyflow Controls for now; a proper ELK pass
+        // is a follow-up (see parity/layout.md).
+        break;
+    }
+  }
+
+  function generateUniqueGroupLabel(base: string): string {
+    const taken = new Set(project.groups.map((g) => g.label ?? g.id));
+    if (!taken.has(base)) return base;
+    for (let i = 2; i < 9999; i++) {
+      const cand = `${base}_${i}`;
+      if (!taken.has(cand)) return cand;
+    }
+    return base;
   }
 </script>
 
@@ -402,10 +699,15 @@
     minZoom={0.05}
     maxZoom={2}
     proOptions={{ hideAttribution: true }}
+    onnodedragstart={onNodeDragStart}
     onnodedragstop={onNodeDragStop}
-    onconnect={onConnect}
+    onnodeclick={onNodeClick}
+    onbeforeconnect={onBeforeConnect}
+    onreconnect={onReconnect}
+    onconnectend={onConnectEnd}
+    isValidConnection={validateConnection}
     onpanecontextmenu={onPaneContextMenu}
-    onnodecontextmenu={handleNodeContextMenu}
+    onnodecontextmenu={onNodeContextMenu}
   >
     <Background />
     <Controls position="bottom-left" showZoom showFitView showLock={false} />
@@ -415,6 +717,7 @@
     open={paletteOpen}
     catalog={catalog}
     onPick={onPickNode}
+    onAction={onPickAction}
     onClose={() => (paletteOpen = false)}
   />
 </div>

@@ -1,5 +1,17 @@
 <script lang="ts">
-  import { BaseEdge, getBezierPath, type EdgeProps } from '@xyflow/svelte';
+  // Ported verbatim from dashboard-v1/src/lib/components/project/CustomEdge.svelte.
+  // Bezier path, no label (v1 never renders edge labels: the port
+  // colors + handle visuals carry the meaning). EdgeReconnectAnchor
+  // at the target end binds a `reconnecting` flag; while dragging
+  // the target endpoint we hide the static path so the live preview
+  // is the only visible line.
+
+  import {
+    BaseEdge,
+    EdgeReconnectAnchor,
+    getBezierPath,
+    type EdgeProps,
+  } from '@xyflow/svelte';
 
   let {
     id,
@@ -9,12 +21,13 @@
     targetY,
     sourcePosition,
     targetPosition,
-    data,
     style,
     markerEnd,
   }: EdgeProps = $props();
 
-  const pathResult = $derived(
+  let reconnecting = $state(false);
+
+  const edgePath = $derived(
     getBezierPath({
       sourceX,
       sourceY,
@@ -22,30 +35,17 @@
       targetY,
       sourcePosition,
       targetPosition,
-    }),
+    })[0],
   );
-  const path = $derived(pathResult[0]);
-  const labelX = $derived(pathResult[1]);
-  const labelY = $derived(pathResult[2]);
-
-  // Data from Graph.svelte: showLabel true only when sourceHandle
-  // != targetHandle. v1 hides labels when they'd be redundant.
-  const showLabel = $derived(Boolean((data as any)?.showLabel));
-  const sourcePort = $derived(String((data as any)?.sourcePort ?? ''));
-  const targetPort = $derived(String((data as any)?.targetPort ?? ''));
 </script>
 
-<BaseEdge {id} path={path} style={style} markerEnd={markerEnd} />
-
-{#if showLabel}
-  <text
-    x={labelX}
-    y={labelY}
-    text-anchor="middle"
-    dominant-baseline="central"
-    class="fill-zinc-500 text-[9px] pointer-events-none select-none"
-    style="paint-order: stroke; stroke: #fafafa; stroke-width: 3px;"
-  >
-    {sourcePort} → {targetPort}
-  </text>
+{#if !reconnecting}
+  <BaseEdge {id} path={edgePath} {style} {markerEnd} />
 {/if}
+
+<EdgeReconnectAnchor
+  bind:reconnecting
+  type="target"
+  position={{ x: targetX, y: targetY }}
+  size={20}
+/>

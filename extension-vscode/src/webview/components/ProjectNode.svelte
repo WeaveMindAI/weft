@@ -1,5 +1,24 @@
 <script lang="ts">
-  import { Handle, Position, NodeResizer, useSvelteFlow } from '@xyflow/svelte';
+  // Ported from dashboard-v1/src/lib/components/project/ProjectNode.svelte.
+  //
+  // Layout top-down:
+  //   accent bar → header (status icon + type label + exec controls
+  //                        + expand toggle)
+  //              → label row (editable)
+  //              → port rows (two columns)
+  //              → live data (always visible)
+  //              → expanded block (Setup Guide + field editors + debug preview)
+  //              → _raw handle (absolute top-right; Handle wraps the SVG)
+  //
+  // The glow class on the outer element is driven by the latest
+  // NodeExecution status (`node-running` / `node-completed` /
+  // `node-failed`). Xyflow sets `.svelte-flow__node-weft` outer
+  // wrapper; we apply the glow to the inner `.project-node` div so
+  // the `:global(.node-running) .project-node` rules in the stylesheet
+  // match without needing the xyflow wrapper class.
+
+  import { Handle, NodeResizer, Position, useSvelteFlow } from '@xyflow/svelte';
+  import { Maximize2, Minimize2 } from 'lucide-svelte';
   import { tick } from 'svelte';
   import { cn } from '../utils/cn';
   import { resolveIcon } from '../utils/icon';
@@ -7,12 +26,14 @@
   import { getPortTypeColor } from '../utils/colors';
   import { getStatusIcon } from '../utils/status';
   import { buildPortMenuItems, createPortContextMenu } from '../utils/port-context-menu';
+  import { computeNodeMinResizeHeight } from '../utils/node-geometry';
   import FieldEditor from './FieldEditor.svelte';
   import ExecutionInspector from './ExecutionInspector.svelte';
   import type {
     FieldDef,
     PortDefinition,
   } from '../../shared/protocol';
+  import type { NodeExecution } from './exec-types';
   import type { NodeViewData } from './node-view-data';
 
   interface Props {
@@ -21,14 +42,15 @@
     selected?: boolean;
   }
 
-  let { data, id, selected }: Props = $props();
+  let { data, id: _id, selected }: Props = $props();
 
   const { getViewport, setViewport } = useSvelteFlow();
 
   const node = $derived(data.node);
   const catalog = $derived(data.catalog);
   const wired = $derived(data.wiredInputs);
-  const exec = $derived(data.exec);
+  const executions: NodeExecution[] = $derived(data.executions ?? []);
+  const latestExec = $derived(executions[executions.length - 1] ?? null);
   const config: Record<string, unknown> = $derived(
     (node.config ?? {}) as Record<string, unknown>,
   );
@@ -39,14 +61,16 @@
   const userLabel = $derived(node.label ?? '');
   const expanded = $derived(Boolean(config.expanded));
 
-  const statusClass = $derived.by(() => {
-    switch (exec.status) {
-      case 'started':
-        return 'node-running-glow';
+  const glowClass = $derived.by(() => {
+    switch (latestExec?.status) {
+      case 'running':
+      case 'waiting_for_input':
+        return 'node-running';
       case 'completed':
-        return 'node-completed-glow';
+      case 'skipped':
+        return 'node-completed';
       case 'failed':
-        return 'node-failed-glow';
+        return 'node-failed';
       default:
         return '';
     }
@@ -58,30 +82,21 @@
   const outputs: PortDefinition[] = $derived(
     node.outputs?.length ? node.outputs : ((catalog?.outputs ?? []) as PortDefinition[]),
   );
-
-  // A catalog input port's name set, to know which ports are
-  // user-added (custom) vs declared in the catalog.
   const catalogInputNames: Set<string> = $derived(
     new Set(((catalog?.inputs ?? []) as PortDefinition[]).map((p) => p.name)),
   );
   const catalogOutputNames: Set<string> = $derived(
     new Set(((catalog?.outputs ?? []) as PortDefinition[]).map((p) => p.name)),
   );
-
-  const canAddInputs: boolean = $derived(
-    Boolean(catalog?.features?.canAddInputPorts),
-  );
-  const canAddOutputs: boolean = $derived(
-    Boolean(catalog?.features?.canAddOutputPorts),
-  );
+  const canAddInputs = $derived(Boolean(catalog?.features?.canAddInputPorts));
+  const canAddOutputs = $derived(Boolean(catalog?.features?.canAddOutputPorts));
+  const showDebugPreview = $derived(Boolean(catalog?.features?.showDebugPreview));
 
   const oneOfRequiredPorts: Set<string> = $derived.by(() => {
     const s = new Set<string>();
-    const groups = (catalog?.features?.oneOfRequired ?? []) as string[][];
-    for (const grp of groups) for (const p of grp) s.add(p);
+    for (const grp of catalog?.features?.oneOfRequired ?? []) for (const p of grp) s.add(p);
     return s;
   });
-
   const configFilledPorts: Set<string> = $derived.by(() => {
     const filled = new Set<string>();
     for (const p of inputs) {
@@ -113,7 +128,27 @@
     return result;
   });
 
-  const hasExpandableContent = $derived(displayedFields.length > 0);
+  const hasExpandableContent = $derived(displayedFields.length > 0 || showDebugPreview);
+
+  const setupGuide = $derived(
+    (catalog as unknown as { setupGuide?: string })?.setupGuide ?? null,
+  );
+  let setupGuideOpen = $state(false);
+
+  // textareaHeights: Record<key, number> persisted in config. We
+  // mutate via onConfigChange so the value round-trips.
+  const textareaHeights = $derived(
+    (config.textareaHeights as Record<string, number> | undefined) ?? {},
+  );
+  function handleTextareaResize(key: string, height: number) {
+    if (height < 60) return;
+    const cur = textareaHeights[key];
+    if (cur === height) return;
+    data.onConfigChange(node.id, 'textareaHeights', {
+      ...textareaHeights,
+      [key]: height,
+    });
+  }
 
   // Label editing.
   let editingLabel = $state(false);
@@ -128,17 +163,14 @@
     data.onLabelChange(node.id, labelInput.trim() || null);
   }
   function handleLabelKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter') {
-      saveLabel();
-    } else if (e.key === 'Escape') {
+    if (e.key === 'Enter') saveLabel();
+    else if (e.key === 'Escape') {
       editingLabel = false;
       labelInput = userLabel;
     }
   }
 
-  // Collapse/expand with viewport anchoring. Pin the node's screen
-  // position between before/after layout so the cursor stays over the
-  // expand button, matching v1.
+  // Expand / collapse with viewport anchoring.
   let nodeEl: HTMLDivElement | undefined = $state();
   async function toggleExpand(e: MouseEvent) {
     e.stopPropagation();
@@ -147,11 +179,9 @@
     if (!before) return;
     await tick();
     await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+    await new Promise((r) => requestAnimationFrame(() => r(undefined)));
     const after = nodeEl?.getBoundingClientRect();
     if (!after) return;
-    // Pin the top-right corner (where the expand button sits). If
-    // the node moved in screen-space after the layout/size change,
-    // offset the viewport to put it back.
     const dx = after.right - before.right;
     const dy = after.top - before.top;
     if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
@@ -164,9 +194,7 @@
     data.onConfigChange(node.id, key, next);
   }
 
-  // Port context menu. The right-click handler captures the client
-  // coords and spawns the shared menu on document.body. The cleanup
-  // callback nukes the menu on close.
+  // Port context menu.
   let menuCleanup: (() => void) | undefined;
   function openPortMenu(
     e: MouseEvent,
@@ -185,20 +213,20 @@
       isCustom,
       canAddPorts,
       onToggleRequired: () => {
-        const nextList = (side === 'input' ? inputs : outputs).map((p) =>
+        const list = (side === 'input' ? inputs : outputs).map((p) =>
           p.name === port.name ? { ...p, required: !p.required } : p,
         );
-        data.onPortsChange(node.id, side === 'input' ? { inputs: nextList } : { outputs: nextList });
+        data.onPortsChange(node.id, side === 'input' ? { inputs: list } : { outputs: list });
       },
       onSetType: (newType) => {
-        const nextList = (side === 'input' ? inputs : outputs).map((p) =>
+        const list = (side === 'input' ? inputs : outputs).map((p) =>
           p.name === port.name ? { ...p, portType: newType } : p,
         );
-        data.onPortsChange(node.id, side === 'input' ? { inputs: nextList } : { outputs: nextList });
+        data.onPortsChange(node.id, side === 'input' ? { inputs: list } : { outputs: list });
       },
       onRemove: () => {
-        const nextList = (side === 'input' ? inputs : outputs).filter((p) => p.name !== port.name);
-        data.onPortsChange(node.id, side === 'input' ? { inputs: nextList } : { outputs: nextList });
+        const list = (side === 'input' ? inputs : outputs).filter((p) => p.name !== port.name);
+        data.onPortsChange(node.id, side === 'input' ? { inputs: list } : { outputs: list });
       },
     });
     menuCleanup = createPortContextMenu(e.clientX, e.clientY, items, () => {
@@ -221,7 +249,6 @@
     }
     const existing = (side === 'input' ? inputs : outputs).map((p) => p.name);
     if (existing.includes(name) || name === '_raw') {
-      // Reject dup or reserved name; just reset.
       newPortName = '';
       if (side === 'input') addingInput = false;
       else addingOutput = false;
@@ -232,7 +259,7 @@
       portType: 'MustOverride',
       required: false,
       laneMode: 'Single',
-      laneDepth: 0,
+      laneDepth: 1,
       configurable: side === 'input',
     };
     const next = [...(side === 'input' ? inputs : outputs), fresh];
@@ -242,43 +269,73 @@
     else addingOutput = false;
   }
   function handlePortAddKey(e: KeyboardEvent, side: 'input' | 'output') {
-    if (e.key === 'Enter') {
-      addPort(side);
-    } else if (e.key === 'Escape') {
+    if (e.key === 'Enter') addPort(side);
+    else if (e.key === 'Escape') {
       newPortName = '';
       if (side === 'input') addingInput = false;
       else addingOutput = false;
     }
   }
 
-  const liveData = $derived(data.liveData ?? []);
+  // Debug preview — v1 strips `_raw` from the object before rendering
+  // so the pretty view matches what downstream nodes see.
+  const debugData = $derived(showDebugPreview ? latestExec?.output : undefined);
+  function stripRawKeys(v: unknown): unknown {
+    if (v === null || typeof v !== 'object') return v;
+    if (Array.isArray(v)) return v.map(stripRawKeys);
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (k === '_raw') continue;
+      out[k] = stripRawKeys(val);
+    }
+    return out;
+  }
+  const debugDataJson = $derived(
+    debugData !== undefined ? JSON.stringify(stripRawKeys(debugData), null, 2) : '',
+  );
+
+  const liveDataItems = $derived(data.liveData ?? []);
   const rawConnected = $derived(wired.has('_raw'));
+  const minResizeHeight = $derived(
+    computeNodeMinResizeHeight(inputs.length, outputs.length),
+  );
 </script>
 
 <NodeResizer
   isVisible={selected && expanded}
   minWidth={200}
-  minHeight={120}
-  lineClass="!border-zinc-400"
-  handleClass="!bg-zinc-500 !w-2 !h-2 !rounded-[2px]"
+  minHeight={minResizeHeight}
+  lineStyle="border-color: #a1a1aa;"
+  handleStyle="background-color: #71717a; width: 8px; height: 8px; border-radius: 2px;"
 />
 
 <div
   bind:this={nodeEl}
   class={cn(
-    'project-node rounded-md bg-white relative flex flex-col overflow-hidden select-none transition-all duration-200',
+    'project-node relative flex flex-col rounded-md bg-white overflow-hidden select-none transition-all duration-200',
     'min-w-[200px]',
-    statusClass,
+    glowClass,
   )}
-  style={`border: 1px solid ${selected ? color : 'rgba(0,0,0,0.08)'}; ${selected ? `box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05), 0 0 0 1px ${color}20;` : 'box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);'}`}
+  style={`width: 100%; height: 100%; background: rgba(255, 255, 255, 0.95); border: 1px solid ${
+    selected ? color : 'rgba(0,0,0,0.08)'
+  }; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05)${
+    selected ? `, 0 0 0 1px ${color}20` : ''
+  }; backdrop-filter: blur(8px);`}
 >
-  <div class="h-[2px] w-full" style={`background: ${color};`}></div>
+  <!-- Accent bar -->
+  <div class="h-[2px] w-full rounded-t" style={`background: ${color};`}></div>
 
   <!-- Header -->
   <div class="flex items-center justify-between px-3 py-2 border-b border-black/5">
     <div class="flex items-center gap-1.5 min-w-0">
-      <span class={cn('text-[11px]', exec.status === 'started' && 'animate-pulse')} style={`color: ${color};`}>
-        {getStatusIcon(exec.status === 'idle' ? '' : exec.status === 'started' ? 'running' : exec.status)}
+      <span
+        class={cn(
+          'text-[11px]',
+          (latestExec?.status === 'running' || latestExec?.status === 'waiting_for_input') && 'animate-pulse',
+        )}
+        style={`color: ${color};`}
+      >
+        {getStatusIcon(latestExec?.status ?? '')}
       </span>
       <Icon class="size-3" style={`color: ${color};`} />
       <span
@@ -290,36 +347,26 @@
       </span>
     </div>
     <div class="flex items-center gap-0.5 shrink-0 nodrag">
-      <ExecutionInspector status={exec.status} input={exec.input} output={exec.output} error={exec.error} />
+      <ExecutionInspector executions={executions} label={userLabel || typeLabel} />
       {#if hasExpandableContent}
         <button
           type="button"
           class="w-5 h-5 flex items-center justify-center rounded hover:bg-black/5 text-zinc-400 hover:text-zinc-600 transition-colors"
           onclick={toggleExpand}
-          aria-label={expanded ? 'collapse' : 'expand'}
+          aria-label={expanded ? 'Collapse' : 'Expand'}
           title={expanded ? 'Collapse' : 'Expand'}
         >
           {#if expanded}
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="4 14 10 14 10 20" />
-              <polyline points="20 10 14 10 14 4" />
-              <line x1="14" y1="10" x2="21" y2="3" />
-              <line x1="3" y1="21" x2="10" y2="14" />
-            </svg>
+            <Minimize2 class="w-3 h-3" />
           {:else}
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="15 3 21 3 21 9" />
-              <polyline points="9 21 3 21 3 15" />
-              <line x1="21" y1="3" x2="14" y2="10" />
-              <line x1="3" y1="21" x2="10" y2="14" />
-            </svg>
+            <Maximize2 class="w-3 h-3" />
           {/if}
         </button>
       {/if}
     </div>
   </div>
 
-  <!-- Label -->
+  <!-- Label row -->
   <div class="px-3 pt-2">
     {#if editingLabel}
       <!-- svelte-ignore a11y_autofocus -->
@@ -333,6 +380,8 @@
         autofocus
       />
     {:else}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
       <p
         class="text-sm font-medium text-zinc-800 cursor-text hover:bg-black/5 px-1 py-0.5 rounded -mx-1 truncate"
         ondblclick={startEditLabel}
@@ -343,7 +392,7 @@
     {/if}
   </div>
 
-  <!-- Port rows. Two columns, always visible. -->
+  <!-- Port rows -->
   <div class="flex justify-between gap-4 px-3 py-2 text-[10px] text-zinc-500">
     <!-- Inputs -->
     <div class="space-y-1 min-w-0 flex-1">
@@ -355,7 +404,13 @@
           title={`${port.name}: ${port.portType}${port.required ? ' (required)' : ''}`}
           oncontextmenu={(e) => openPortMenu(e, port, 'input')}
         >
-          <Handle type="target" position={Position.Left} id={port.name} class={pm.class} style={`top: 50%; ${pm.style}`} />
+          <Handle
+            type="target"
+            position={Position.Left}
+            id={port.name}
+            class={pm.class}
+            style={`top: 50%; ${pm.style}`}
+          />
           <span class="truncate">{port.name}</span>
         </div>
       {/each}
@@ -389,7 +444,7 @@
       {/if}
     </div>
 
-    <!-- Outputs (right-aligned) -->
+    <!-- Outputs -->
     <div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
       {#each outputs as port (port.name)}
         {@const pm = portMarkerStyle(port, oneOfRequiredPorts, configFilledPorts, getPortTypeColor(port.portType), 'output')}
@@ -400,7 +455,13 @@
           oncontextmenu={(e) => openPortMenu(e, port, 'output')}
         >
           <span class="truncate">{port.name}</span>
-          <Handle type="source" position={Position.Right} id={port.name} class={pm.class} style={`top: 50%; ${pm.style}`} />
+          <Handle
+            type="source"
+            position={Position.Right}
+            id={port.name}
+            class={pm.class}
+            style={`top: 50%; ${pm.style}`}
+          />
         </div>
       {/each}
       {#if canAddOutputs}
@@ -434,22 +495,10 @@
     </div>
   </div>
 
-  {#if expanded && displayedFields.length > 0}
-    <div class="px-3 pt-2 pb-3 border-t border-black/5 space-y-2 nodrag">
-      {#each displayedFields as field (field.key)}
-        <FieldEditor
-          field={field}
-          value={config[field.key]}
-          wired={wired.has(field.key)}
-          onChange={(v) => onFieldChange(field.key, v)}
-        />
-      {/each}
-    </div>
-  {/if}
-
-  {#if liveData.length > 0}
+  <!-- Live data (always visible) -->
+  {#if liveDataItems.length > 0}
     <div class="px-3 py-2 border-t border-black/5 space-y-2">
-      {#each liveData as item}
+      {#each liveDataItems as item}
         {#if item.type === 'image' && typeof item.data === 'string'}
           <div>
             <span class="text-[10px] text-zinc-500 font-medium">{item.label}</span>
@@ -458,7 +507,7 @@
         {:else if item.type === 'text'}
           <div>
             <span class="text-[10px] text-zinc-500 font-medium block mb-1">{item.label}</span>
-            <div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 break-all border border-zinc-200 select-text">
+            <div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 break-all border border-zinc-200 select-text cursor-text">
               {String(item.data)}
             </div>
           </div>
@@ -474,16 +523,156 @@
     </div>
   {/if}
 
-  <div class="absolute" style="top: 18px; right: -5px; pointer-events: none;">
-    <svg width="10" height="10" viewBox="0 0 10 10" style="pointer-events: none;">
-      <rect x="0.75" y="0.75" width="8.5" height="8.5" fill={rawConnected ? '#18181b' : 'white'} stroke="#18181b" stroke-width="1.5" />
-    </svg>
+  <!-- Expanded block -->
+  {#if expanded}
+    <div class="px-3 pt-2 pb-3 border-t border-black/5 space-y-2 nodrag">
+      {#if setupGuide}
+        <div class="border border-zinc-200 rounded">
+          <button
+            type="button"
+            class="w-full flex items-center justify-between px-2 py-1 text-[10px] uppercase tracking-wider text-zinc-500 hover:bg-zinc-50"
+            onclick={(e) => {
+              e.stopPropagation();
+              setupGuideOpen = !setupGuideOpen;
+            }}
+          >
+            <span>Setup Guide</span>
+            <span>{setupGuideOpen ? '−' : '+'}</span>
+          </button>
+          {#if setupGuideOpen}
+            <div class="p-2 text-[11px] text-zinc-600 whitespace-pre-wrap">{setupGuide}</div>
+          {/if}
+        </div>
+      {/if}
+
+      {#each displayedFields as field (field.key)}
+        <FieldEditor
+          field={field}
+          value={config[field.key]}
+          wired={wired.has(field.key)}
+          textareaHeight={textareaHeights[field.key]}
+          onResize={(h) => handleTextareaResize(field.key, h)}
+          onChange={(v) => onFieldChange(field.key, v)}
+        />
+      {/each}
+
+      {#if showDebugPreview}
+        {#if debugData !== undefined}
+          <pre class="debug-data-container nodrag nopan nowheel select-text cursor-text">{debugDataJson}</pre>
+        {:else if latestExec?.status === 'completed'}
+          <div class="debug-placeholder completed">✓ Execution complete</div>
+        {:else if latestExec?.status === 'failed'}
+          <div class="debug-placeholder failed">✗ Execution failed{latestExec.error ? `: ${latestExec.error}` : ''}</div>
+        {:else if latestExec?.status === 'running' || latestExec?.status === 'waiting_for_input'}
+          <div class="debug-placeholder running">
+            <span class="debug-spinner"></span>
+            <span>Processing...</span>
+          </div>
+        {:else}
+          <div class="debug-placeholder waiting">📥 Waiting for data...</div>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+
+  <!-- _raw handle. v1 wraps Handle around the SVG so the handle IS
+       the square; we do the same: Handle is positioned absolutely at
+       top-right and its content is the svg. -->
+  <div class="absolute" style="top: 18px; right: -5px; z-index: 10;">
     <Handle
       type="source"
       position={Position.Right}
       id="_raw"
-      class="!w-[10px] !h-[10px] !bg-transparent !border-none"
-      style="top: 0; right: 0; opacity: 0; pointer-events: auto;"
-    />
+      class="!w-[10px] !h-[10px] !bg-transparent !border-none !relative !inset-auto !transform-none"
+    >
+      <svg width="10" height="10" viewBox="0 0 10 10" style="pointer-events: none;">
+        <rect x="0.75" y="0.75" width="8.5" height="8.5" fill={rawConnected ? '#18181b' : 'white'} stroke="#18181b" stroke-width="1.5" />
+      </svg>
+    </Handle>
   </div>
 </div>
+
+<style>
+  :global(.node-running) .project-node,
+  :global(.project-node.node-running) {
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.08),
+      0 4px 12px rgba(0, 0, 0, 0.05),
+      0 0 0 2px rgba(245, 158, 11, 0.4) !important;
+  }
+  :global(.node-completed) .project-node,
+  :global(.project-node.node-completed) {
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.08),
+      0 4px 12px rgba(0, 0, 0, 0.05),
+      0 0 0 2px rgba(16, 185, 129, 0.3) !important;
+  }
+  :global(.node-failed) .project-node,
+  :global(.project-node.node-failed) {
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.08),
+      0 4px 12px rgba(0, 0, 0, 0.05),
+      0 0 0 2px rgba(239, 68, 68, 0.4) !important;
+  }
+  .debug-data-container {
+    margin: 0;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 8px;
+    min-height: 60px;
+    max-height: 400px;
+    overflow: auto;
+    font-family: ui-monospace, 'SF Mono', Monaco, monospace;
+    font-size: 10px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    resize: vertical;
+    color: #334155;
+  }
+  .debug-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 16px 8px;
+    border: 1px dashed #e2e8f0;
+    border-radius: 6px;
+    color: #94a3b8;
+    font-size: 11px;
+  }
+  .debug-placeholder.completed {
+    background: #f0fdf4;
+    border-color: #bbf7d0;
+    color: #22c55e;
+  }
+  .debug-placeholder.failed {
+    background: #fef2f2;
+    border-color: #fecaca;
+    color: #ef4444;
+  }
+  .debug-placeholder.running {
+    background: #fffbeb;
+    border-color: #fde68a;
+    color: #f59e0b;
+  }
+  .debug-placeholder.waiting {
+    background: #f8fafc;
+    border-color: #e2e8f0;
+  }
+  .debug-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid #fde68a;
+    border-top-color: #f59e0b;
+    border-radius: 50%;
+    animation: debug-spin 0.8s linear infinite;
+    display: inline-block;
+  }
+  @keyframes debug-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+</style>

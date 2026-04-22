@@ -38,17 +38,27 @@ export class GraphViewController {
           payload.kind === 'node_failed' ||
           payload.kind === 'node_skipped'
         ) {
+          const k = payload.kind.replace('node_', '') as
+            | 'started'
+            | 'completed'
+            | 'failed'
+            | 'skipped';
           this.post({
             kind: 'execEvent',
             event: {
+              id: payload.id ?? `${payload.node ?? payload.node_id}-${Date.now()}`,
               color,
               node_id: payload.node ?? payload.node_id,
               lane: payload.lane ?? '',
-              kind: payload.kind.replace('node_', ''),
+              kind: k,
               input: payload.input,
               output: payload.output,
               error: payload.error,
               at_unix: Math.floor(Date.now() / 1000),
+              completed_at_unix: payload.completed_at_unix,
+              cost_usd: payload.cost_usd,
+              pulse_id: payload.pulse_id,
+              pulse_ids_absorbed: payload.pulse_ids_absorbed,
             },
           });
         }
@@ -159,6 +169,9 @@ export class GraphViewController {
       case 'positionsChanged':
         void this.saveLayout(msg.positions);
         break;
+      case 'layoutChanged':
+        void this.saveFullLayout(msg.layout);
+        break;
       case 'mutation':
         void this.applyMutation(msg.mutation);
         break;
@@ -219,6 +232,18 @@ export class GraphViewController {
     if (!this.watchedDoc) return;
     const uri = this.layoutUriFor(this.watchedDoc);
     const body = JSON.stringify(positions, null, 2);
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(body));
+  }
+
+  private async saveFullLayout(
+    layout: Record<
+      string,
+      { x: number; y: number; w?: number; h?: number; expanded?: boolean }
+    >,
+  ): Promise<void> {
+    if (!this.watchedDoc) return;
+    const uri = this.layoutUriFor(this.watchedDoc);
+    const body = JSON.stringify(layout, null, 2);
     await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(body));
   }
 

@@ -8,9 +8,43 @@
     value: unknown;
     onChange: (newValue: unknown) => void;
     wired?: boolean;
+    // Persisted textarea height (ResizeObserver pushes here).
+    textareaHeight?: number;
+    onResize?: (height: number) => void;
   }
 
-  let { field, value, onChange, wired = false }: Props = $props();
+  let {
+    field,
+    value,
+    onChange,
+    wired = false,
+    textareaHeight,
+    onResize,
+  }: Props = $props();
+
+  // v1 toggles the `.nowheel` class on focus so scrolling inside the
+  // textarea doesn't pan the canvas. It's removed on blur so scroll
+  // events propagate to xyflow again when the cursor leaves.
+  function addNoWheel(e: FocusEvent) {
+    const t = e.currentTarget as HTMLElement | null;
+    t?.classList.add('nowheel');
+  }
+  function removeNoWheel(e: FocusEvent) {
+    const t = e.currentTarget as HTMLElement | null;
+    t?.classList.remove('nowheel');
+  }
+
+  // ResizeObserver to persist manual textarea resizes.
+  function observeResize(node: HTMLTextAreaElement) {
+    const obs = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const h = entry.contentRect.height;
+        onResize?.(h);
+      }
+    });
+    obs.observe(node);
+    return { destroy: () => obs.disconnect() };
+  }
 
   // Debounced text editor for string-valued fields. Keeps the user's
   // typing independent of store updates until they pause or blur.
@@ -128,15 +162,23 @@
   {:else if kind === 'textarea' || kind === 'code'}
     <textarea
       class={cn(
-        'w-full text-xs bg-zinc-100 px-2 py-1.5 rounded border-none outline-none font-mono',
+        'w-full text-xs bg-zinc-100 px-2 py-1.5 rounded border-none outline-none font-mono box-border block',
         'min-h-[60px] resize-y',
       )}
       value={display}
       rows={4}
-      onfocus={onTextareaFocus}
+      style={textareaHeight ? `height: ${textareaHeight}px;` : ''}
+      onfocus={(e) => {
+        addNoWheel(e);
+        onTextareaFocus(e);
+      }}
       oninput={onTextareaInput}
-      onblur={onTextareaBlur}
+      onblur={(e) => {
+        removeNoWheel(e);
+        onTextareaBlur();
+      }}
       onclick={(e) => e.stopPropagation()}
+      use:observeResize
     ></textarea>
   {:else if kind === 'number'}
     <input
