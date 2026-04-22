@@ -22,7 +22,13 @@ export class DispatcherClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`POST ${path}: ${res.status}`);
-    return (await res.json()) as T;
+    const text = await res.text();
+    return (text ? JSON.parse(text) : ({} as unknown)) as T;
+  }
+
+  async del(path: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}${path}`, { method: 'DELETE' });
+    if (!res.ok && res.status !== 204) throw new Error(`DELETE ${path}: ${res.status}`);
   }
 
   subscribe(path: string, onEvent: (ev: MessageEvent) => void): EventSource {

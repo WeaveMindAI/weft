@@ -13,13 +13,26 @@ import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import type { HostMessage, ProjectDefinition, WebviewMessage } from './shared/protocol';
 
+export interface SelectedNode {
+  nodeId: string;
+  nodeType: string;
+  label?: string;
+  config?: Record<string, unknown>;
+  inputs?: Array<{ name: string; type: string }>;
+  outputs?: Array<{ name: string; type: string }>;
+}
+
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
   private watchedDoc: vscode.TextDocument | undefined;
+  private watchedProjectId: string | undefined;
   private parseTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
   private lastProject: ProjectDefinition | undefined;
-  private follower: EventSource | undefined;
+  // Host-side callbacks wired by extension.ts.
+  private runHandler: (() => void) | undefined;
+  private stopHandler: (() => void) | undefined;
+  private selectionHandler: ((sel: SelectedNode | undefined) => void) | undefined;
   // Set while we're applying our own TextEdit to the document.
   // onDidChangeTextDocument fires during the edit; if we parsed
   // twice (once for the webview save, once for the VS Code change)
@@ -31,75 +44,20 @@ export class GraphViewController {
     private readonly client: DispatcherClient,
   ) {}
 
-  /** Subscribe to SSE for a live execution (or project) and forward
-   *  NodeStarted/NodeCompleted/NodeFailed/NodeSkipped into the panel
-   *  as `execEvent` messages. Called by Weft: Follow Execution. */
-  followColor(color: string): void {
-    this.stopFollowing();
-    this.post({ kind: 'execReset' });
-    const es = this.client.subscribe(`/events/execution/${color}`, (ev) => {
-      try {
-        const payload = JSON.parse(ev.data);
-        if (
-          payload.kind === 'node_started' ||
-          payload.kind === 'node_completed' ||
-          payload.kind === 'node_failed' ||
-          payload.kind === 'node_skipped'
-        ) {
-          const k = payload.kind.replace('node_', '') as
-            | 'started'
-            | 'completed'
-            | 'failed'
-            | 'skipped';
-          this.post({
-            kind: 'execEvent',
-            event: {
-              id: payload.id ?? `${payload.node ?? payload.node_id}-${Date.now()}`,
-              color,
-              node_id: payload.node ?? payload.node_id,
-              lane: payload.lane ?? '',
-              kind: k,
-              input: payload.input,
-              output: payload.output,
-              error: payload.error,
-              at_unix: Math.floor(Date.now() / 1000),
-              completed_at_unix: payload.completed_at_unix,
-              cost_usd: payload.cost_usd,
-              pulse_id: payload.pulse_id,
-              pulse_ids_absorbed: payload.pulse_ids_absorbed,
-            },
-          });
-          this.approximateActiveEdges(payload.node ?? payload.node_id, k);
-        }
-      } catch {
-        // malformed event, ignore
-      }
-    });
-    this.follower = es;
+  /** Called by extension.ts so sidebar-initiated runs and action-bar
+   *  clicks route through the same business logic. */
+  setRunHandler(fn: () => void): void { this.runHandler = fn; }
+  setStopHandler(fn: () => void): void { this.stopHandler = fn; }
+  setNodeSelectionHandler(fn: (sel: SelectedNode | undefined) => void): void { this.selectionHandler = fn; }
+
+  /** Public so execFollower can push events into the panel. */
+  post(msg: HostMessage): void {
+    this.panel?.webview.postMessage(msg);
   }
 
-  /** Replay a past execution's node events with small delays so the
-   *  user watches the graph animate. */
-  async replayColor(color: string): Promise<void> {
-    this.stopFollowing();
-    this.post({ kind: 'execReset' });
-    const events = await this.client
-      .get<unknown[]>(`/executions/${color}/replay`)
-      .catch(() => []);
-    for (const e of events as HostMessage[]) {
-      this.post(e);
-      await new Promise((r) => setTimeout(r, 120));
-    }
-  }
-
-  stopFollowing(): void {
-    if (this.follower) {
-      this.follower.close();
-      this.follower = undefined;
-    }
-  }
-
-  private approximateActiveEdges(
+  /** Infer which edges are currently pulsing from the latest node
+   *  lifecycle event. Called by ExecutionFollower. */
+  approximateActiveEdges(
     nodeId: string,
     kind: 'started' | 'completed' | 'failed' | 'skipped',
   ): void {
@@ -122,7 +80,8 @@ export class GraphViewController {
     }
   }
 
-  async open(doc: vscode.TextDocument): Promise<void> {
+  async open(doc: vscode.TextDocument, projectId?: string): Promise<void> {
+    if (projectId) this.watchedProjectId = projectId;
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside);
       this.watchedDoc = doc;
@@ -180,7 +139,7 @@ export class GraphViewController {
     const source = this.watchedDoc.getText();
     const layoutCode = await this.readLayoutCode(this.watchedDoc);
     try {
-      const response = await this.client.parse(source);
+      const response = await this.client.parse(source, this.watchedProjectId);
       this.lastProject = response.project;
       this.post({ kind: 'parseResult', response, source, layoutCode });
     } catch (err) {
@@ -189,10 +148,6 @@ export class GraphViewController {
         error: err instanceof Error ? err.message : String(err),
       });
     }
-  }
-
-  private post(msg: HostMessage): void {
-    this.panel?.webview.postMessage(msg);
   }
 
   private onMessage(msg: WebviewMessage): void {
@@ -208,6 +163,29 @@ export class GraphViewController {
         break;
       case 'log':
         console[msg.level]('[weft/webview]', msg.message);
+        break;
+      case 'runProject':
+        this.runHandler?.();
+        break;
+      case 'stopProject':
+        this.stopHandler?.();
+        break;
+      case 'nodeSelected':
+        if (msg.nodeId === null) {
+          this.selectionHandler?.(undefined);
+        } else {
+          const node = this.lastProject?.nodes.find((n) => n.id === msg.nodeId);
+          if (node) {
+            this.selectionHandler?.({
+              nodeId: node.id,
+              nodeType: node.nodeType,
+              label: node.label ?? undefined,
+              config: node.config,
+              inputs: node.inputs.map((p) => ({ name: p.name, type: p.portType })),
+              outputs: node.outputs.map((p) => ({ name: p.name, type: p.portType })),
+            });
+          }
+        }
         break;
     }
   }

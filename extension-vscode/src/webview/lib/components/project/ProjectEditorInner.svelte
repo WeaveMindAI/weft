@@ -2894,7 +2894,11 @@
 			</div>
 		{/if}
 
-		{#if !playground}<ActionBar
+		<!-- Floating action bar. In the VS Code build, 'playground'
+		     only hides SaaS-specific controls in CommandPalette and
+		     other surfaces; the action bar itself (Run/Stop/infra/
+		     trigger controls) is always available. -->
+		<ActionBar
 			variant="floating"
 			{infraState}
 			{triggerState}
@@ -2913,7 +2917,7 @@
 			onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
 			{showTriggerSubgraph}
 			nodeCount={nodes.length}
-		/>{/if}
+		/>
 	</div>
 
 	<!-- Context Menu -->

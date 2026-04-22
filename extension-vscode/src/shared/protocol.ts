@@ -193,20 +193,13 @@ export interface LaneFrame {
   index: number;
 }
 
+// Minimal shape the webview needs to paint node state. Richer
+// journal fields (cost_usd, pulse_id) flow directly in follow-up
+// messages when we need them.
 export interface NodeExecEvent {
-  id: string;
-  color: string;
-  node_id: string;
-  lane: string;
-  kind: NodeExecutionStatus | 'started';
-  input?: unknown;
-  output?: unknown;
+  nodeId: string;
+  state: NodeExecutionStatus | 'started' | 'running';
   error?: string;
-  at_unix: number;
-  completed_at_unix?: number;
-  cost_usd?: number;
-  pulse_id?: string;
-  pulse_ids_absorbed?: string[];
 }
 
 export interface LiveDataItem {
@@ -241,7 +234,10 @@ export type WebviewMessage =
   | { kind: 'ready' }
   | { kind: 'saveWeft'; source: string }
   | { kind: 'saveLayout'; layoutCode: string }
-  | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string };
+  | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string }
+  | { kind: 'runProject' }
+  | { kind: 'stopProject' }
+  | { kind: 'nodeSelected'; nodeId: string | null };
 
 // The v1 editor performs all text surgery in-process and sends the
 // resulting source with `saveWeft`. No semantic mutation protocol
