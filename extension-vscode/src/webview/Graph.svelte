@@ -23,8 +23,8 @@
   import GroupNode from './components/GroupNode.svelte';
   import AnnotationNode from './components/AnnotationNode.svelte';
   import CommandPalette from './components/CommandPalette.svelte';
-  import { buildNodes } from './compose/build-nodes';
-  import { buildEdges, toWeftEdgeRef } from './compose/build-edges';
+  import { composeGraph } from './compose';
+  import { toWeftEdgeRef } from './compose/build-edges';
   import { autoOrganize, buildLayoutInput } from './compose/layout';
   import {
     wouldCreateCycle,
@@ -119,69 +119,22 @@
 
   // ─── Recompose on every project / layout / exec change ───────────
 
-  const wiredByTarget = $derived.by(() => {
-    const m: Record<string, Set<string>> = {};
-    for (const e of project.edges) {
-      if (!e.targetHandle) continue;
-      (m[e.target] ??= new Set()).add(e.targetHandle);
-    }
-    return m;
-  });
-
   $effect(() => {
-    nodes = buildNodes({
+    const result = composeGraph({
       project,
       catalog,
       layout,
       exec: execByNode,
-      wiredByTarget,
+      activeEdges,
+      previous: nodes,
+      nodeZBoost,
+      edgeZBoost,
       onConfigChange,
       onLabelChange,
       onPortsChange,
-      previous: nodes,
-      zIndexBoost: nodeZBoost,
     });
-  });
-
-  $effect(() => {
-    const boost: Record<string, number> = edgeZBoost;
-    // Hidden nodes computed by the node build — walk and find ids
-    // whose style is display:none to mirror into edge hiding.
-    const hidden = new Set<string>();
-    for (const n of nodes) {
-      const s = (n.style as string | undefined) ?? '';
-      if (s.includes('display: none')) hidden.add(n.id);
-    }
-    edges = buildEdges({
-      project,
-      viewNodes: nodes.map((n) => ({
-        id: n.id,
-        kind:
-          n.type === 'weftGroup' || n.type === 'weftGroupCollapsed'
-            ? 'group'
-            : n.type === 'annotation'
-            ? 'annotation'
-            : 'regular',
-        label: (n.data as { node?: NodeDefinition })?.node?.label ?? null,
-        nodeType: (n.data as { node?: NodeDefinition })?.node?.nodeType ?? '',
-        rawParentId: (n.parentId ?? null) as string | null,
-        inputs: (n.data as { node?: NodeDefinition })?.node?.inputs ?? [],
-        outputs: (n.data as { node?: NodeDefinition })?.node?.outputs ?? [],
-        config: (n.data as { node?: NodeDefinition })?.node?.config ?? {},
-        features: (n.data as { node?: NodeDefinition })?.node?.features ?? {
-          oneOfRequired: [],
-          correlatedPorts: [],
-          canAddInputPorts: false,
-          canAddOutputPorts: false,
-          hasFormSchema: false,
-        },
-        groupDef: null,
-        source: (n.data as { node?: NodeDefinition })?.node ?? null,
-      })),
-      hiddenNodeIds: hidden,
-      activeEdges,
-      edgeZBoost: boost,
-    });
+    nodes = result.nodes;
+    edges = result.edges;
   });
 
   // ─── Mutations ──────────────────────────────────────────────────
