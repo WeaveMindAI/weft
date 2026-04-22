@@ -133,6 +133,15 @@ html, body, #app {
   right: -6px;
 }
 
+/* Hide nodes that haven't been placed by ELK yet. Prevents the
+ * flash of everything-stacked-at-origin before the first layout
+ * pass lands. (v1 does the same via node-pending-layout opacity 0
+ * in ProjectEditorInner.) */
+:global(.node-pending-layout) {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
 /* Edges */
 :global(.svelte-flow__edge-path) {
   stroke: #52525b;

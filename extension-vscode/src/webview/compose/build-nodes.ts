@@ -44,7 +44,15 @@ export interface BuildNodesContext {
   zIndexBoost: Record<string, number>;
 }
 
-export function buildNodes(ctx: BuildNodesContext): Node[] {
+export interface BuildNodesResult {
+  nodes: Node[];
+  // Ids that were rendered without any position (no saved layout,
+  // no previous xyflow node). Graph.svelte uses this to decide
+  // whether to auto-run ELK after composition.
+  pendingLayoutIds: string[];
+}
+
+export function buildNodes(ctx: BuildNodesContext): BuildNodesResult {
   const synthesis = synthesizeGroupNodes(ctx.project, ctx.layout);
   const viewNodes: ViewNode[] = [
     ...synthesis.groupNodes,
@@ -57,6 +65,7 @@ export function buildNodes(ctx: BuildNodesContext): Node[] {
   const previousById = new Map(ctx.previous.map((n) => [n.id, n]));
 
   const out: Node[] = [];
+  const pendingLayoutIds: string[] = [];
   for (const v of ordered) {
     const saved = ctx.layout[v.id] ?? {};
     const existing = previousById.get(v.id);
@@ -71,10 +80,12 @@ export function buildNodes(ctx: BuildNodesContext): Node[] {
 
     const style = [visibilityStyle, sizeStyle].filter(Boolean).join(' ');
     const parentId = visibility.parentIdById.get(v.id) ?? undefined;
+    const hasPos = existing?.position != null || saved.x != null;
     const position = existing?.position ?? {
       x: saved.x ?? 0,
       y: saved.y ?? 0,
     };
+    if (!hasPos) pendingLayoutIds.push(v.id);
 
     const node: Node = {
       id: v.id,
@@ -84,14 +95,18 @@ export function buildNodes(ctx: BuildNodesContext): Node[] {
       parentId,
       style,
       zIndex,
-      class: [glow, visibility.hiddenNodeIds.has(v.id) ? 'node-hidden' : ''].filter(Boolean).join(' '),
+      class: [
+        glow,
+        visibility.hiddenNodeIds.has(v.id) ? 'node-hidden' : '',
+        !hasPos ? 'node-pending-layout' : '',
+      ].filter(Boolean).join(' '),
       selected: existing?.selected ?? false,
       width,
       height,
     } as Node;
     out.push(node);
   }
-  return out;
+  return { nodes: out, pendingLayoutIds };
 }
 
 function buildData(

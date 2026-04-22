@@ -34,7 +34,7 @@
 
   let { data, id: _id, selected }: Props = $props();
 
-  const { updateNodeInternals, getViewport, setViewport } = useSvelteFlow();
+  const { getViewport, setViewport } = useSvelteFlow();
   let nodeEl: HTMLDivElement | undefined = $state();
 
   const node = $derived(data.node);
@@ -108,7 +108,6 @@
     await tick();
     await new Promise((r) => requestAnimationFrame(() => r(undefined)));
     await new Promise((r) => requestAnimationFrame(() => r(undefined)));
-    updateNodeInternals(node.id);
     if (!before) return;
     const after = nodeEl?.getBoundingClientRect();
     if (!after) return;
@@ -455,7 +454,7 @@
           {@const pm = portMarkerStyle(port, oneOfRequiredPorts, new Set(), getPortTypeColor(port.portType), 'input')}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="relative flex items-center gap-1.5 pl-3"
+            class="relative flex items-center gap-1.5 pl-3 group"
             oncontextmenu={(e) => openPortMenu(e, port, 'input')}
             title={`${port.name}: ${port.portType}${port.required ? ' (required)' : ''}`}
           >
@@ -466,20 +465,68 @@
               style={`top: 50%; ${pm.style}`}
               class={pm.class}
             />
-            <span class="truncate">{port.name}</span>
+            <span class="truncate flex-1">{port.name}</span>
+            <button
+              type="button"
+              class="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-500 nodrag"
+              onclick={(e) => {
+                e.stopPropagation();
+                const list = inputs.filter((p) => p.name !== port.name);
+                data.onPortsChange(node.id, { inputs: list });
+              }}
+              title="Remove port"
+              aria-label="Remove port"
+            >×</button>
           </div>
         {/each}
+        {#if addingInput}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="w-full text-[10px] bg-zinc-100 px-2 py-0.5 rounded outline-none border border-zinc-200 nodrag"
+            placeholder="port name"
+            bind:value={newPortName}
+            onkeydown={(e) => handlePortAddKey(e, 'input')}
+            onblur={() => {
+              addingInput = false;
+              newPortName = '';
+            }}
+            onclick={(e) => e.stopPropagation()}
+            autofocus
+          />
+        {:else}
+          <button
+            class="flex items-center gap-0.5 text-zinc-400 hover:text-zinc-600 transition-colors nodrag"
+            onclick={(e) => {
+              e.stopPropagation();
+              addingInput = true;
+            }}
+          >
+            <span class="text-xs">+</span>
+            <span>input</span>
+          </button>
+        {/if}
       </div>
       <div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
         {#each outputs as port (port.name)}
           {@const pm = portMarkerStyle(port, oneOfRequiredPorts, new Set(), getPortTypeColor(port.portType), 'output')}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="relative flex items-center gap-1.5 pr-3"
+            class="relative flex items-center gap-1.5 pr-3 group"
             oncontextmenu={(e) => openPortMenu(e, port, 'output')}
             title={`${port.name}: ${port.portType}`}
           >
-            <span class="truncate">{port.name}</span>
+            <button
+              type="button"
+              class="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-500 nodrag"
+              onclick={(e) => {
+                e.stopPropagation();
+                const list = outputs.filter((p) => p.name !== port.name);
+                data.onPortsChange(node.id, { outputs: list });
+              }}
+              title="Remove port"
+              aria-label="Remove port"
+            >×</button>
+            <span class="truncate flex-1 text-right">{port.name}</span>
             <Handle
               type="source"
               position={Position.Right}
@@ -489,6 +536,32 @@
             />
           </div>
         {/each}
+        {#if addingOutput}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="w-full text-[10px] bg-zinc-100 px-2 py-0.5 rounded outline-none border border-zinc-200 nodrag"
+            placeholder="port name"
+            bind:value={newPortName}
+            onkeydown={(e) => handlePortAddKey(e, 'output')}
+            onblur={() => {
+              addingOutput = false;
+              newPortName = '';
+            }}
+            onclick={(e) => e.stopPropagation()}
+            autofocus
+          />
+        {:else}
+          <button
+            class="flex items-center gap-0.5 text-zinc-400 hover:text-zinc-600 transition-colors nodrag"
+            onclick={(e) => {
+              e.stopPropagation();
+              addingOutput = true;
+            }}
+          >
+            <span>output</span>
+            <span class="text-xs">+</span>
+          </button>
+        {/if}
       </div>
     </div>
   </div>

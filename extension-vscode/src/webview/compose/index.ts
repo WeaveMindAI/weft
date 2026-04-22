@@ -35,6 +35,9 @@ export interface ComposeOutput {
   nodes: Node[];
   edges: FlowEdge[];
   hiddenNodeIds: Set<string>;
+  // Ids that have no saved position and no previous xyflow node.
+  // Graph.svelte auto-runs ELK when this is non-empty.
+  pendingLayoutIds: string[];
 }
 
 export function composeGraph(input: ComposeInput): ComposeOutput {
@@ -44,7 +47,7 @@ export function composeGraph(input: ComposeInput): ComposeOutput {
     (wiredByTarget[e.target] ??= new Set()).add(e.targetHandle);
   }
 
-  const nodes = buildNodes({
+  const { nodes, pendingLayoutIds } = buildNodes({
     project: input.project,
     catalog: input.catalog,
     layout: input.layout,
@@ -100,5 +103,5 @@ export function composeGraph(input: ComposeInput): ComposeOutput {
     edgeZBoost: input.edgeZBoost,
   });
 
-  return { nodes, edges, hiddenNodeIds };
+  return { nodes, edges, hiddenNodeIds, pendingLayoutIds };
 }

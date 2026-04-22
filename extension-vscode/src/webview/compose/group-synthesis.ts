@@ -64,6 +64,14 @@ export function synthesizeGroupNodes(
   for (const n of project.nodes) {
     if (passthroughIds.has(n.id)) continue;
     if (n.groupBoundary) continue;
+    // Merge the layout sidecar's expanded / width / height on top of
+    // the compiler config. Layout-only keys never round-trip through
+    // the .weft source; they live in .layout.json.
+    const saved = layout[n.id] ?? {};
+    const mergedConfig: Record<string, unknown> = { ...(n.config ?? {}) };
+    if (saved.expanded !== undefined) mergedConfig.expanded = saved.expanded;
+    if (saved.w !== undefined) mergedConfig.width = saved.w;
+    if (saved.h !== undefined) mergedConfig.height = saved.h;
     regularNodes.push({
       id: n.id,
       kind: n.nodeType === 'Annotation' ? 'annotation' : 'regular',
@@ -72,7 +80,7 @@ export function synthesizeGroupNodes(
       rawParentId: resolveParentGroup(n, project),
       inputs: n.inputs,
       outputs: n.outputs,
-      config: n.config,
+      config: mergedConfig,
       features: n.features,
       groupDef: null,
       source: n,

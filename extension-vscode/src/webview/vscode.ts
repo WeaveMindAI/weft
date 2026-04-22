@@ -14,7 +14,12 @@ declare function acquireVsCodeApi(): VsCodeApi;
 const api = acquireVsCodeApi();
 
 export function send(msg: WebviewMessage): void {
-  api.postMessage(msg);
+  // Svelte 5 $state values are Proxies. structured-clone (the
+  // algorithm VS Code's webview MessagePort uses) can't cross-boundary
+  // those, so we deep-clone the payload via JSON round-trip. All our
+  // messages are plain data (no Dates, Maps, functions), so this is
+  // both safe and cheap.
+  api.postMessage(JSON.parse(JSON.stringify(msg)) as WebviewMessage);
 }
 
 type Listener = (msg: HostMessage) => void;
