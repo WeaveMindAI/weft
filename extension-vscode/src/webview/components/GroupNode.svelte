@@ -12,6 +12,9 @@
   // single xyflow node.
 
   import { Handle, NodeResizer, Position, useSvelteFlow } from '@xyflow/svelte';
+  // The expand/collapse needs a node DOM ref to anchor the viewport
+  // (identical flow to ProjectNode: capture rect → toggle → wait for
+  // xyflow measurements → compute delta → setViewport).
   import { Maximize2, Minimize2, Layers } from 'lucide-svelte';
   import { tick } from 'svelte';
   import { cn } from '../utils/cn';
@@ -31,7 +34,8 @@
 
   let { data, id: _id, selected }: Props = $props();
 
-  const { updateNodeInternals } = useSvelteFlow();
+  const { updateNodeInternals, getViewport, setViewport } = useSvelteFlow();
+  let nodeEl: HTMLDivElement | undefined = $state();
 
   const node = $derived(data.node);
   const config = $derived((node.config ?? {}) as Record<string, unknown>);
@@ -99,9 +103,21 @@
 
   async function toggleExpand(e: MouseEvent) {
     e.stopPropagation();
+    const before = nodeEl?.getBoundingClientRect();
     data.onConfigChange(node.id, 'expanded', !expanded);
     await tick();
+    await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+    await new Promise((r) => requestAnimationFrame(() => r(undefined)));
     updateNodeInternals(node.id);
+    if (!before) return;
+    const after = nodeEl?.getBoundingClientRect();
+    if (!after) return;
+    const dx = after.right - before.right;
+    const dy = after.top - before.top;
+    if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+      const vp = getViewport();
+      setViewport({ x: vp.x - dx, y: vp.y - dy, zoom: vp.zoom });
+    }
   }
 
   // Port context menu on right-click.
@@ -209,6 +225,7 @@
   />
 
   <div
+    bind:this={nodeEl}
     class={cn(
       'expanded-container relative w-full h-full rounded-xl',
       selected && 'selected',
@@ -368,6 +385,7 @@
 {:else}
   <!-- Collapsed pill. Uses the same shape as ProjectNode in collapsed. -->
   <div
+    bind:this={nodeEl}
     class={cn(
       'collapsed-node relative rounded-lg bg-white overflow-hidden',
       selected && 'selected',

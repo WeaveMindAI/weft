@@ -85,6 +85,13 @@ struct ParsedGroup {
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
     child_groups: Vec<ParsedGroup>,
+    /// Source range covering the entire `label = Group(...) -> (...) { body }`
+    /// block. Used by the webview / surgical layer to delete or rewrite the
+    /// whole group region.
+    span: Option<Span>,
+    /// Source range of the header line (`label = Group(ports) -> (ports) {`).
+    /// Used for targeted port-signature rewrites.
+    header_span: Option<Span>,
 }
 
 struct ParseState {
@@ -351,32 +358,62 @@ fn try_parse_declaration(
     };
 
     if node_type == "Group" {
+        // The header occupies lines [line_num .. header_end_line+1].
+        let header_span = Some(Span {
+            start_line: line_num,
+            start_col: 0,
+            end_line: header_end_line + 1,
+            end_col: 0,
+        });
         // Parse as group
         let group = if after_ports_clean.starts_with('{') {
             if after_ports_clean == "{}" || (after_ports_clean.starts_with('{') && after_ports_clean.ends_with('}') && after_ports_clean.len() > 1) {
-                // One-liner empty group or group with inline body
+                // One-liner empty group or group with inline body.
+                let span = Some(Span {
+                    start_line: line_num,
+                    start_col: 0,
+                    end_line: header_end_line + 1,
+                    end_col: 0,
+                });
                 ParsedGroup {
-                    id, in_ports: in_ports, out_ports: out_ports,
-                    one_of_required: one_of_required,
+                    id, in_ports, out_ports,
+                    one_of_required,
                     nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(),
+                    span,
+                    header_span,
                 }
             } else if after_ports_clean == "{" {
                 // Multi-line group body. Note: inline children inside group
                 // nodes are added to the group's own `nodes` list by
                 // parse_group_body (which maintains its own InlineScope),
                 // not to the top-level inline_scope we received.
-                let (group, next_i) = parse_group_body(lines, body_start_line, &id, in_ports, out_ports, one_of_required, errors);
+                let (mut group, next_i) = parse_group_body(lines, body_start_line, &id, in_ports, out_ports, one_of_required, errors);
+                group.header_span = header_span;
+                group.span = Some(Span {
+                    start_line: line_num,
+                    start_col: 0,
+                    end_line: next_i,
+                    end_col: 0,
+                });
                 return Some((Declaration::Group(group), next_i));
             } else {
                 errors.push(CompileError { line: line_num, message: format!("Invalid group syntax: {}", trimmed) });
                 return None;
             }
         } else if after_ports_clean.is_empty() {
-            // No body: bare group
+            // No body: bare group.
+            let span = Some(Span {
+                start_line: line_num,
+                start_col: 0,
+                end_line: header_end_line + 1,
+                end_col: 0,
+            });
             ParsedGroup {
-                id, in_ports: in_ports, out_ports: out_ports,
-                one_of_required: one_of_required,
+                id, in_ports, out_ports,
+                one_of_required,
                 nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(),
+                span,
+                header_span,
             }
         } else {
             errors.push(CompileError { line: line_num, message: format!("Unexpected after group declaration: {}", after_ports_clean) });
@@ -1172,12 +1209,16 @@ fn parse_group_body(
 ) -> (ParsedGroup, usize) {
     let mut group = ParsedGroup {
         id: group_id.to_string(),
-        in_ports: in_ports,
-        out_ports: out_ports,
-        one_of_required: one_of_required,
+        in_ports,
+        out_ports,
+        one_of_required,
         nodes: Vec::new(),
         connections: Vec::new(),
         child_groups: Vec::new(),
+        // The caller overrides these once the header/body extents are
+        // fully known.
+        span: None,
+        header_span: None,
     };
 
     // Pre-scan the group body to collect the set of local child ids. Used
@@ -2120,8 +2161,8 @@ fn collect_group_definitions(
         parent_group_id: parent_group_id.clone(),
         child_group_ids,
         node_ids,
-        span: None,
-        header_span: None,
+        span: group.span.clone(),
+        header_span: group.header_span.clone(),
     });
 
     for child in &group.child_groups {

@@ -61,6 +61,7 @@ export class GraphViewController {
               pulse_ids_absorbed: payload.pulse_ids_absorbed,
             },
           });
+          this.approximateActiveEdges(payload.node ?? payload.node_id, k);
         }
       } catch {
         // malformed event, ignore
@@ -87,6 +88,31 @@ export class GraphViewController {
     if (this.follower) {
       this.follower.close();
       this.follower = undefined;
+    }
+  }
+
+  /** Approximate active-edge SSE: when a node starts we flash all
+   *  incoming edges for ACTIVE_EDGE_WINDOW_MS; when it completes we
+   *  flash all outgoing edges. Exact pulse tracking is a dispatcher
+   *  responsibility for later (parity/execution.md).
+   */
+  private approximateActiveEdges(nodeId: string, kind: 'started' | 'completed' | 'failed' | 'skipped'): void {
+    if (!this.lastProject) return;
+    const relevant: string[] = [];
+    if (kind === 'started') {
+      for (const e of this.lastProject.edges) {
+        if (e.target === nodeId) relevant.push(e.id);
+      }
+    } else if (kind === 'completed') {
+      for (const e of this.lastProject.edges) {
+        if (e.source === nodeId) relevant.push(e.id);
+      }
+    }
+    for (const edgeId of relevant) {
+      this.post({ kind: 'edgeActive', event: { edgeId, active: true } });
+      setTimeout(() => {
+        this.post({ kind: 'edgeActive', event: { edgeId, active: false } });
+      }, 200);
     }
   }
 

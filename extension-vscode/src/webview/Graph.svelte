@@ -25,6 +25,7 @@
   import CommandPalette from './components/CommandPalette.svelte';
   import { buildNodes } from './compose/build-nodes';
   import { buildEdges, toWeftEdgeRef } from './compose/build-edges';
+  import { autoOrganize, buildLayoutInput } from './compose/layout';
   import {
     wouldCreateCycle,
     isValidConnection as scopeValid,
@@ -670,10 +671,35 @@
         break;
       }
       case 'fitView':
-      case 'autoOrganize':
-        // Delegated to the xyflow Controls for now; a proper ELK pass
-        // is a follow-up (see parity/layout.md).
+        // xyflow's fit-view button lives in <Controls>; the action
+        // here emits a synthetic click by dispatching a resize event
+        // so the SvelteFlow store recomputes its bounds.
+        window.dispatchEvent(new Event('resize'));
         break;
+      case 'autoOrganize': {
+        void runAutoLayout(true);
+        break;
+      }
+    }
+  }
+
+  async function runAutoLayout(persist: boolean): Promise<void> {
+    const input = buildLayoutInput(nodes, edges);
+    try {
+      const { positions, groupSizes } = await autoOrganize(input.nodes, input.edges);
+      const nextLayout: typeof layout = { ...layout };
+      for (const [id, p] of positions) {
+        const cur = nextLayout[id] ?? { x: 0, y: 0 };
+        nextLayout[id] = { ...cur, x: p.x, y: p.y };
+      }
+      for (const [id, s] of groupSizes) {
+        const cur = nextLayout[id] ?? { x: 0, y: 0 };
+        nextLayout[id] = { ...cur, w: s.w, h: s.h };
+      }
+      layout = nextLayout;
+      if (persist) send({ kind: 'layoutChanged', layout });
+    } catch (err) {
+      send({ kind: 'log', level: 'warn', message: `elk failed: ${String(err)}` });
     }
   }
 
