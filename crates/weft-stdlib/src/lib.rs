@@ -6,9 +6,6 @@
 //! module and re-exports them for the compiler to link into user
 //! binaries.
 //!
-//! Phase A1 exposes 5 scaffold nodes: ApiPost, HumanQuery, Text, Debug,
-//! Llm. Phase A2 ports the rest from `catalog-v1/` (~100 nodes).
-//!
 //! User projects depend on this crate implicitly via the compiled
 //! binary; the compiler only includes nodes the graph actually
 //! references.
@@ -27,8 +24,14 @@ pub mod text;
 #[path = "../../../catalog/basic/debug/mod.rs"]
 pub mod debug;
 
-#[path = "../../../catalog/ai/llm/mod.rs"]
-pub mod llm;
+// LLM split into two nodes, matching v1:
+//   LlmConfig (settings-only, outputs a config dict)
+//   LlmInference (consumes a prompt, optionally consumes an
+//                 upstream LlmConfig, calls the provider)
+#[path = "../../../catalog/ai/llm/config/mod.rs"]
+pub mod llm_config;
+#[path = "../../../catalog/ai/llm/inference/mod.rs"]
+pub mod llm_inference;
 
 #[path = "../../../catalog/logic/gate/mod.rs"]
 pub mod gate;
@@ -48,7 +51,8 @@ pub fn all_nodes() -> Vec<&'static dyn Node> {
         &human_query::HumanQueryNode,
         &text::TextNode,
         &debug::DebugNode,
-        &llm::LlmNode,
+        &llm_config::LlmConfigNode,
+        &llm_inference::LlmInferenceNode,
         &gate::GateNode,
         &cron::CronNode,
         &http_request::HttpRequestNode,
@@ -76,10 +80,14 @@ impl NodeCatalog for StdlibCatalog {
     }
 }
 
-// Form field specs for HumanQuery. The form-builder field produces
-// output ports: for a "text" field named "name", the HumanQuery node
-// emits an output `submission_name: String`. Defined as a OnceLock
-// so the slice has static lifetime.
+// Form field specs for HumanQuery, ported verbatim from v1's
+// human_form_field_specs() in catalog-v1/feedback/:human/query/backend.rs.
+// The form builder reads `fieldType` on each entry and consults this
+// table to know which input/output ports that field contributes.
+//
+// Naming note: v1 names are preserved ("text_input" not "text",
+// "editable_textarea" not "editableTextarea") so existing .weft
+// source keeps working.
 use std::sync::OnceLock;
 
 static HUMAN_QUERY_FIELD_SPECS: OnceLock<Vec<FormFieldSpec>> = OnceLock::new();
@@ -89,33 +97,72 @@ fn human_query_specs() -> &'static Vec<FormFieldSpec> {
     HUMAN_QUERY_FIELD_SPECS.get_or_init(|| {
         vec![
             FormFieldSpec {
-                field_type: "text",
-                render: serde_json::json!({}),
+                field_type: "display",
+                render: serde_json::json!({ "component": "readonly" }),
+                adds_inputs: vec![FormFieldPort::any("{key}")],
+                adds_outputs: vec![],
+            },
+            FormFieldSpec {
+                field_type: "display_image",
+                render: serde_json::json!({ "component": "image" }),
+                adds_inputs: vec![FormFieldPort::new("{key}", "Image")],
+                adds_outputs: vec![],
+            },
+            FormFieldSpec {
+                field_type: "approve_reject",
+                render: serde_json::json!({ "component": "buttons", "source": "static" }),
+                adds_inputs: vec![],
+                adds_outputs: vec![
+                    FormFieldPort::new("{key}_approved", "Boolean"),
+                    FormFieldPort::new("{key}_rejected", "Boolean"),
+                ],
+            },
+            FormFieldSpec {
+                field_type: "select",
+                render: serde_json::json!({ "component": "select", "source": "static" }),
+                adds_inputs: vec![],
+                adds_outputs: vec![FormFieldPort::new("{key}", "String")],
+            },
+            FormFieldSpec {
+                field_type: "multi_select",
+                render: serde_json::json!({ "component": "select", "source": "static", "multiple": true }),
+                adds_inputs: vec![],
+                adds_outputs: vec![FormFieldPort::new("{key}", "List[String]")],
+            },
+            FormFieldSpec {
+                field_type: "select_input",
+                render: serde_json::json!({ "component": "select", "source": "input" }),
+                adds_inputs: vec![FormFieldPort::new("{key}", "List[String]")],
+                adds_outputs: vec![FormFieldPort::new("{key}", "String")],
+            },
+            FormFieldSpec {
+                field_type: "multi_select_input",
+                render: serde_json::json!({ "component": "select", "source": "input", "multiple": true }),
+                adds_inputs: vec![FormFieldPort::new("{key}", "List[String]")],
+                adds_outputs: vec![FormFieldPort::new("{key}", "List[String]")],
+            },
+            FormFieldSpec {
+                field_type: "text_input",
+                render: serde_json::json!({ "component": "text" }),
                 adds_inputs: vec![],
                 adds_outputs: vec![FormFieldPort::new("{key}", "String")],
             },
             FormFieldSpec {
                 field_type: "textarea",
-                render: serde_json::json!({}),
+                render: serde_json::json!({ "component": "textarea" }),
                 adds_inputs: vec![],
                 adds_outputs: vec![FormFieldPort::new("{key}", "String")],
             },
             FormFieldSpec {
-                field_type: "number",
-                render: serde_json::json!({}),
-                adds_inputs: vec![],
-                adds_outputs: vec![FormFieldPort::new("{key}", "Number")],
+                field_type: "editable_text_input",
+                render: serde_json::json!({ "component": "text", "prefilled": true }),
+                adds_inputs: vec![FormFieldPort::new("{key}", "String")],
+                adds_outputs: vec![FormFieldPort::new("{key}", "String")],
             },
             FormFieldSpec {
-                field_type: "checkbox",
-                render: serde_json::json!({}),
-                adds_inputs: vec![],
-                adds_outputs: vec![FormFieldPort::new("{key}", "Boolean")],
-            },
-            FormFieldSpec {
-                field_type: "select",
-                render: serde_json::json!({}),
-                adds_inputs: vec![],
+                field_type: "editable_textarea",
+                render: serde_json::json!({ "component": "textarea", "prefilled": true }),
+                adds_inputs: vec![FormFieldPort::new("{key}", "String")],
                 adds_outputs: vec![FormFieldPort::new("{key}", "String")],
             },
         ]

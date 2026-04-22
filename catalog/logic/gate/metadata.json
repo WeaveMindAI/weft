@@ -1,18 +1,17 @@
 {
   "type": "Gate",
   "label": "Gate",
-  "description": "Pass the input through to either the `then` or `else` output based on a boolean condition.",
-  "category": "logic",
-  "tags": ["gate", "branch", "conditional", "if"],
+  "description": "Forwards value when pass is true, outputs null when pass is null or false (cuts downstream flow via null propagation).",
+  "category": "Flow",
+  "tags": ["flow", "gate", "route", "conditional", "pass"],
   "icon": "GitBranch",
-  "color": "#f59e0b",
+  "color": "#6366f1",
   "inputs": [
-    { "name": "value", "type": "T", "required": true },
-    { "name": "condition", "type": "Boolean", "required": true }
+    { "name": "pass", "type": "Boolean", "required": true, "description": "true to forward value, null or false to cut flow" },
+    { "name": "value", "type": "T", "required": true, "description": "Value to forward when pass is true" }
   ],
   "outputs": [
-    { "name": "then", "type": "T", "required": false },
-    { "name": "else", "type": "T", "required": false }
+    { "name": "value", "type": "T", "required": false, "description": "The forwarded value, or null if pass was null or false" }
   ],
   "fields": [],
   "entry": [],

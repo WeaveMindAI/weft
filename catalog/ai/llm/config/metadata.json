@@ -1,0 +1,30 @@
+{
+  "type": "LlmConfig",
+  "label": "LLM Config",
+  "description": "LLM provider and parameters. When multiple LlmInference nodes share the same settings, point them at one LlmConfig node to keep maintenance simple. Only use multiple configs when you truly need different settings.",
+  "category": "AI",
+  "tags": ["config", "ai", "settings", "model"],
+  "icon": "Settings",
+  "color": "#6b6b99",
+  "inputs": [
+    { "name": "systemPrompt", "type": "String", "required": false, "description": "Optional system prompt. Can be wired from upstream or set as a config field." }
+  ],
+  "outputs": [
+    { "name": "config", "type": "Dict[String, String | Number | Boolean]", "required": false, "description": "LLM configuration object fed into one or more LlmInference nodes." }
+  ],
+  "fields": [
+    { "key": "apiKey", "label": "API Key", "field_type": { "kind": "api_key", "provider": "openrouter" }, "required": false },
+    { "key": "model", "label": "Model", "field_type": { "kind": "text" }, "placeholder": "anthropic/claude-sonnet-4.6", "required": true },
+    { "key": "systemPrompt", "label": "System Prompt", "field_type": { "kind": "textarea" }, "placeholder": "You are a helpful assistant." },
+    { "key": "maxTokens", "label": "Max Tokens", "field_type": { "kind": "number" }, "placeholder": "4096" },
+    { "key": "temperature", "label": "Temperature", "field_type": { "kind": "number" }, "placeholder": "0.7" },
+    { "key": "topP", "label": "Top P", "field_type": { "kind": "number" }, "placeholder": "1.0" },
+    { "key": "frequencyPenalty", "label": "Frequency Penalty", "field_type": { "kind": "number" }, "placeholder": "0.0", "description": "-2.0 to 2.0" },
+    { "key": "presencePenalty", "label": "Presence Penalty", "field_type": { "kind": "number" }, "placeholder": "0.0", "description": "-2.0 to 2.0" },
+    { "key": "reasoning", "label": "Enable Reasoning", "field_type": { "kind": "checkbox" }, "description": "Enable extended thinking for supported models" },
+    { "key": "reasoningEffort", "label": "Reasoning Effort", "field_type": { "kind": "select", "options": ["low", "medium", "high"] }, "description": "Only used when reasoning is enabled" },
+    { "key": "seed", "label": "Seed", "field_type": { "kind": "number" }, "placeholder": "Leave empty for random", "description": "For reproducible outputs" }
+  ],
+  "entry": [],
+  "requires_infra": false
+}

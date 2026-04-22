@@ -16,3 +16,4 @@ tokio = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 minillmlib = { workspace = true }
+tracing = { workspace = true }

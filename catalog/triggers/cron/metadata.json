@@ -1,19 +1,20 @@
 {
   "type": "Cron",
   "label": "Cron Schedule",
-  "description": "Fire on a schedule. Standard cron expression in the `schedule` field.",
-  "category": "triggers",
+  "description": "Fire on a schedule. Standard cron expression in the `cron` field.",
+  "category": "Triggers",
   "tags": ["cron", "schedule", "timer", "trigger"],
   "icon": "Clock",
   "color": "#22c55e",
   "inputs": [],
   "outputs": [
-    { "name": "firedAt", "type": "String", "required": false }
+    { "name": "scheduledTime", "type": "String", "required": false, "description": "ISO-8601 timestamp of the scheduled fire time" },
+    { "name": "actualTime", "type": "String", "required": false, "description": "ISO-8601 timestamp of when the firing actually happened" }
   ],
   "fields": [
     {
-      "key": "schedule",
-      "label": "Schedule",
+      "key": "cron",
+      "label": "Cron",
       "field_type": { "kind": "text" },
       "required": true,
       "default_value": "*/5 * * * *",
@@ -23,5 +24,9 @@
   "entry": [
     { "kind": "cron", "schedule": "*/5 * * * *" }
   ],
-  "requires_infra": false
+  "requires_infra": false,
+  "features": {
+    "isTrigger": true,
+    "triggerCategory": "Schedule"
+  }
 }

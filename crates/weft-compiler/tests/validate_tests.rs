@@ -35,7 +35,7 @@ fn clean_program_has_no_diagnostics() {
 
 hi = Text { value: "hello" }
 out = Debug
-out.value = hi.value
+out.data = hi.value
 "#,
     );
     let d = validate(&project);
@@ -66,18 +66,18 @@ fn unknown_target_port_with_suggestion() {
 # Project: T
 hello = Text { value: "a" }
 out = Debug
-out.value = hello.value
+out.data = hello.value
 "#,
     );
     // Corrupt the edge to a typo'd input port name.
-    project.edges[0].target_handle = Some("valeu".into());
+    project.edges[0].target_handle = Some("dat".into());
     let d = validate(&project);
     let hit = d
         .iter()
         .find(|x| x.code.as_deref() == Some("unknown-target-port"))
         .expect("should flag unknown-target-port");
     assert!(
-        hit.message.contains("Did you mean 'value'"),
+        hit.message.contains("Did you mean 'data'"),
         "expected did-you-mean hint, got: {}",
         hit.message
     );
@@ -91,7 +91,7 @@ fn duplicate_input_port_is_flagged() {
 a = Text { value: "x" }
 b = Text { value: "y" }
 out = Debug
-out.value = a.value
+out.data = a.value
 "#,
     );
     // Add a second edge driving the same target input.
@@ -100,7 +100,7 @@ out.value = a.value
         source: "b".into(),
         target: "out".into(),
         source_handle: Some("value".into()),
-        target_handle: Some("value".into()),
+        target_handle: Some("data".into()),
         span: None,
     };
     project.edges.push(dup);
@@ -116,7 +116,7 @@ fn type_mismatch_is_flagged() {
 # Project: M
 one = Text { value: "x" }
 out = Debug
-out.value = one.value
+out.data = one.value
 "#,
     );
     let one = project.nodes.iter_mut().find(|n| n.id == "one").unwrap();
@@ -181,7 +181,7 @@ fn unknown_edge_node_ref_is_flagged() {
 # Project: Dangling
 a = Text { value: "x" }
 out = Debug
-out.value = a.value
+out.data = a.value
 "#,
     );
     project.edges[0].source = "ghost".into();

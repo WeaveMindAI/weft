@@ -1,8 +1,13 @@
 //! ApiPost: a webhook trigger node. Declares a `Webhook` entry
 //! primitive in its metadata; the dispatcher mints a URL per project
 //! activation. On POST, the dispatcher routes the body into a new
-//! execution and invokes this node's `execute` with the body as
-//! input.
+//! execution and invokes this node's `execute` with the body's
+//! fields as input.
+//!
+//! Users declare the expected body shape as output ports on the
+//! node (features.canAddOutputPorts). At fire time we copy each
+//! requested field out of the JSON body onto its matching output
+//! port, plus `receivedAt` with the timestamp.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -26,24 +31,26 @@ impl Node for ApiPostNode {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
-        // The dispatcher populates `body` and `receivedAt` on the input
-        // bag when it wakes this entry. Pass them through.
-        let body = ctx.input.raw("body").cloned().unwrap_or(Value::Null);
-        let received_at = ctx
-            .input
-            .raw("receivedAt")
-            .cloned()
-            .unwrap_or_else(|| Value::String(chrono::Utc::now().to_rfc3339()));
-
-        Ok(NodeOutput::empty().set("body", body).set("receivedAt", received_at))
+        // The dispatcher feeds us the request body by merging its
+        // top-level keys into the input bag, plus a `receivedAt`
+        // field. Forward every input key we see to an output
+        // (v1 behaviour): whatever the user declared as an output
+        // port will pick up the matching body field.
+        let mut output = NodeOutput::empty();
+        for (k, v) in ctx.input.iter() {
+            output = output.set(k.as_str(), v.clone());
+        }
+        if output.get("receivedAt").is_none() {
+            output = output.set(
+                "receivedAt",
+                Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        Ok(output)
     }
 
     fn validate(&self, node: &NodeDefinition, _project: &ProjectDefinition) -> Vec<Diagnostic> {
         let mut d = Vec::new();
-        // Webhook entry primitives declare a `path`. If the user
-        // overrides it in config, warn on a leading slash. The
-        // dispatcher joins it to the base URL so a leading slash
-        // produces a double-slash route.
         if let Some(path) = node.config.get("path").and_then(|v| v.as_str()) {
             if path.starts_with('/') {
                 d.push(Diagnostic {

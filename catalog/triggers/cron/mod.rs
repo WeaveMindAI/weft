@@ -1,7 +1,7 @@
-//! Cron: fires an execution on a schedule. The actual schedule
-//! evaluation happens in the dispatcher (cron ticker hits the
-//! entry token when the time comes); the node itself just emits
-//! the fire timestamp on activation.
+//! Cron: fires an execution on a schedule. When triggered, the
+//! dispatcher populates `scheduledTime` (when the tick was due) and
+//! `actualTime` (when it actually fired, useful for lag analysis)
+//! on the input bag; we pass those through to the outputs.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -24,11 +24,19 @@ impl Node for CronNode {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
-        let fired_at = ctx
+        let now = chrono::Utc::now().to_rfc3339();
+        let scheduled = ctx
             .input
-            .raw("firedAt")
+            .raw("scheduledTime")
             .cloned()
-            .unwrap_or_else(|| Value::String(chrono::Utc::now().to_rfc3339()));
-        Ok(NodeOutput::empty().set("firedAt", fired_at))
+            .unwrap_or_else(|| Value::String(now.clone()));
+        let actual = ctx
+            .input
+            .raw("actualTime")
+            .cloned()
+            .unwrap_or(Value::String(now));
+        Ok(NodeOutput::empty()
+            .set("scheduledTime", scheduled)
+            .set("actualTime", actual))
     }
 }

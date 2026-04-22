@@ -128,6 +128,20 @@ pub struct NodeFeatures {
     /// time. See `form_field_specs` for the derivation rules.
     #[serde(default, rename = "hasFormSchema")]
     pub has_form_schema: bool,
+    /// Marks the node as a trigger (fires executions from external
+    /// events rather than running as part of an execution).
+    #[serde(default, rename = "isTrigger")]
+    pub is_trigger: bool,
+    /// If `is_trigger`, which category the trigger falls into.
+    /// Matches v1's TriggerCategory: Webhook / Polling / Schedule /
+    /// Socket / Local / Manual. Serialized as a plain string so the
+    /// webview doesn't need a round-trip type.
+    #[serde(default, rename = "triggerCategory", skip_serializing_if = "Option::is_none")]
+    pub trigger_category: Option<String>,
+    /// Webview hint: render the node's latest output as a JSON
+    /// preview inline on the node body. Used by Debug.
+    #[serde(default, rename = "showDebugPreview")]
+    pub show_debug_preview: bool,
 }
 
 /// Describes how a config field of a given type contributes to a
@@ -257,5 +271,9 @@ impl NodeOutput {
     pub fn set(mut self, port: impl Into<String>, value: Value) -> Self {
         self.outputs.insert(port.into(), value);
         self
+    }
+
+    pub fn get(&self, port: &str) -> Option<&Value> {
+        self.outputs.get(port)
     }
 }

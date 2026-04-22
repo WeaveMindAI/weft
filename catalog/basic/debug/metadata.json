@@ -1,16 +1,19 @@
 {
   "type": "Debug",
   "label": "Debug",
-  "description": "Log whatever flows through. Terminal node for inspecting values during development.",
-  "category": "basic",
-  "tags": ["debug", "inspect", "log"],
+  "description": "Display incoming data for debugging. Connect any output to the data port to inspect its value after execution.",
+  "category": "Debug",
+  "tags": ["debug", "inspect", "log", "test"],
   "icon": "Bug",
-  "color": "#ef4444",
+  "color": "#b05574",
   "inputs": [
-    { "name": "data", "type": "T", "required": false }
+    { "name": "data", "type": "T", "required": true }
   ],
   "outputs": [],
   "fields": [],
   "entry": [],
-  "requires_infra": false
+  "requires_infra": false,
+  "features": {
+    "showDebugPreview": true
+  }
 }

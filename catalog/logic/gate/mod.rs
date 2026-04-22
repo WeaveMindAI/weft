@@ -1,6 +1,12 @@
-//! Gate: route the `value` input to either `then` or `else` based
-//! on the `condition` boolean. The non-chosen branch emits null so
-//! downstream should-skip logic can elide whole subgraphs.
+//! Gate: route a value based on a pass signal. v1 semantics.
+//!
+//! `pass` null or false → output value is null (cuts downstream flow
+//! via null propagation).
+//! `pass` non-null non-false → output = value.
+//!
+//! Pairs with the Human node's approve_reject field:
+//! approve_reject emits true/null → Gate.pass. The Gate forwards
+//! `value` only on the active path.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -23,15 +29,14 @@ impl Node for GateNode {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+        let pass = ctx.input.raw("pass").cloned().unwrap_or(Value::Null);
         let value = ctx.input.raw("value").cloned().unwrap_or(Value::Null);
-        let cond: bool = ctx.input.get("condition")?;
 
-        let (then_out, else_out) = if cond {
-            (value, Value::Null)
-        } else {
-            (Value::Null, value)
+        let output = match pass {
+            Value::Null | Value::Bool(false) => Value::Null,
+            _ => value,
         };
 
-        Ok(NodeOutput::empty().set("then", then_out).set("else", else_out))
+        Ok(NodeOutput::empty().set("value", output))
     }
 }

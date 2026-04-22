@@ -173,6 +173,12 @@ impl InputBag {
     pub fn raw(&self, port: &str) -> Option<&Value> {
         self.values.get(port)
     }
+
+    /// Iterate over every input port (name + raw value). Used by
+    /// trigger nodes that forward their input bag to output ports.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.values.iter()
+    }
 }
 
 /// The runtime-facing handle. The runtime crate implements this; the

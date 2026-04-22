@@ -18,9 +18,9 @@ async fn text_then_debug_completes() {
 # Project: Smoke
 
 greeting = Text { value: "hello world" }
-sink = Debug { label: "greeting" }
+sink = Debug
 
-sink.value = greeting.value
+sink.data = greeting.value
 "#;
 
     let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");

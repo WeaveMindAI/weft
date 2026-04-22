@@ -1,27 +1,41 @@
 {
   "type": "HumanQuery",
   "label": "Human",
-  "description": "Pause the execution and wait for a human to submit a form. Uses the await_form language primitive.",
-  "category": "human",
-  "tags": ["human", "form", "hitl", "suspension"],
+  "description": "Pause execution and wait for a human to submit a form. Uses the await_form language primitive. Form fields determine the visible inputs/outputs via form_field_specs.",
+  "category": "AI",
+  "tags": ["human", "form", "hitl", "suspension", "review"],
   "icon": "User",
   "color": "#ec4899",
   "inputs": [
-    { "name": "context", "type": "String", "required": false },
-    { "name": "title", "type": "String", "required": false }
+    { "name": "context", "type": "String", "required": false, "description": "Optional context shown to the reviewer alongside the form." }
   ],
-  "outputs": [
-    { "name": "submission", "type": "JsonDict", "required": false }
-  ],
+  "outputs": [],
   "fields": [
     {
-      "key": "formSchema",
-      "label": "Form Schema",
+      "key": "title",
+      "label": "Title",
+      "field_type": { "kind": "text" },
+      "placeholder": "Review request",
+      "description": "Title the reviewer sees at the top of the form."
+    },
+    {
+      "key": "description",
+      "label": "Description",
+      "field_type": { "kind": "textarea" },
+      "placeholder": "What you want the reviewer to do.",
+      "description": "Description shown under the title."
+    },
+    {
+      "key": "fields",
+      "label": "Form fields",
       "field_type": { "kind": "form_builder" },
       "required": true,
-      "description": "The form fields the human must fill out."
+      "description": "Each field contributes inputs/outputs per its fieldType (see form_field_specs)."
     }
   ],
   "entry": [],
-  "requires_infra": false
+  "requires_infra": false,
+  "features": {
+    "hasFormSchema": true
+  }
 }

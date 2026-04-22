@@ -1,23 +1,14 @@
 {
   "type": "ApiPost",
   "label": "API Endpoint (POST)",
-  "description": "Start an execution when an HTTP POST request arrives at a project-specific URL.",
-  "category": "triggers/api",
-  "tags": ["webhook", "http", "trigger"],
+  "description": "Start an execution when an HTTP POST request arrives at a project-specific URL. Declare the expected body fields as output ports; the node extracts each from the request body at fire time.",
+  "category": "Triggers",
+  "tags": ["webhook", "http", "trigger", "api"],
   "icon": "Webhook",
   "color": "#22c55e",
   "inputs": [],
   "outputs": [
-    {
-      "name": "body",
-      "type": "JsonDict",
-      "required": false
-    },
-    {
-      "name": "receivedAt",
-      "type": "String",
-      "required": false
-    }
+    { "name": "receivedAt", "type": "String", "required": false, "description": "ISO-8601 timestamp of when the request arrived." }
   ],
   "fields": [
     {
@@ -35,5 +26,10 @@
       "auth": { "kind": "optional_api_key", "field": "apiKey" }
     }
   ],
-  "requires_infra": false
+  "requires_infra": false,
+  "features": {
+    "isTrigger": true,
+    "triggerCategory": "Webhook",
+    "canAddOutputPorts": true
+  }
 }

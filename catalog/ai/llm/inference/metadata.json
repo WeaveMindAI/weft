@@ -1,0 +1,35 @@
+{
+  "type": "LlmInference",
+  "label": "LLM",
+  "description": "AI language model completion. Works out of the box with platform credits (default: anthropic/claude-sonnet-4.6). Optionally connect an LlmConfig node for BYOK or to override any parameter.",
+  "category": "AI",
+  "tags": ["ai", "gpt", "claude", "completion", "chat", "generate"],
+  "icon": "BrainCircuit",
+  "color": "#7c6f9f",
+  "inputs": [
+    { "name": "prompt", "type": "String", "required": true, "description": "The prompt to send to the LLM" },
+    { "name": "systemPrompt", "type": "String", "required": false, "description": "Optional system prompt. Can be wired or set as a config field." },
+    { "name": "config", "type": "Dict[String, String | Number | Boolean]", "required": false, "description": "Optional LlmConfig node. When wired, overrides this node's own config fields.", "configurable": false }
+  ],
+  "outputs": [
+    { "name": "response", "type": "MustOverride", "required": false, "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly." }
+  ],
+  "fields": [
+    { "key": "model", "label": "Model", "field_type": { "kind": "text" }, "placeholder": "anthropic/claude-sonnet-4.6", "description": "OpenRouter model slug. Default: anthropic/claude-sonnet-4.6." },
+    { "key": "systemPrompt", "label": "System prompt", "field_type": { "kind": "textarea" }, "placeholder": "(empty)", "description": "Optional system prompt. Empty by default." },
+    { "key": "temperature", "label": "Temperature", "field_type": { "kind": "number" }, "placeholder": "0.7", "description": "0.0-2.0. Higher = more creative." },
+    { "key": "maxTokens", "label": "Max tokens", "field_type": { "kind": "number" }, "placeholder": "provider default" },
+    { "key": "topP", "label": "Top P", "field_type": { "kind": "number" }, "placeholder": "1.0" },
+    { "key": "frequencyPenalty", "label": "Frequency penalty", "field_type": { "kind": "number" }, "placeholder": "0.0" },
+    { "key": "presencePenalty", "label": "Presence penalty", "field_type": { "kind": "number" }, "placeholder": "0.0" },
+    { "key": "reasoning", "label": "Enable reasoning", "field_type": { "kind": "checkbox" }, "description": "Use the model's reasoning/thinking mode if supported." },
+    { "key": "reasoningEffort", "label": "Reasoning effort", "field_type": { "kind": "select", "options": ["low", "medium", "high"] } },
+    { "key": "seed", "label": "Seed", "field_type": { "kind": "number" }, "placeholder": "(random)" },
+    { "key": "parseJson", "label": "Parse JSON", "field_type": { "kind": "checkbox" }, "description": "Parse and repair JSON from the response (changes output to Dict)." }
+  ],
+  "entry": [],
+  "requires_infra": false,
+  "features": {
+    "canAddOutputPorts": true
+  }
+}
