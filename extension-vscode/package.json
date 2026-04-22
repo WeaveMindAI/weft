@@ -147,6 +147,16 @@
     "vite": "^7.3.1"
   },
   "dependencies": {
-    "marked": "^18.0.2"
+    "@babel/runtime": "^7.29.2",
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.41.1",
+    "@lucide/svelte": "^1.8.0",
+    "@uiw/codemirror-theme-github": "^4.25.9",
+    "codemirror": "^6.0.2",
+    "marked": "^18.0.2",
+    "svelte-sonner": "^1.1.0"
   }
 }

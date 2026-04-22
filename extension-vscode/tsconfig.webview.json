@@ -12,7 +12,15 @@
     "skipLibCheck": true,
     "jsx": "preserve",
     "resolveJsonModule": true,
-    "types": ["svelte", "vite/client"]
+    "types": ["svelte", "vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "$lib": ["src/webview/lib"],
+      "$lib/*": ["src/webview/lib/*"],
+      "$lib/utils": ["src/webview/lib/utils.ts"],
+      "$app/environment": ["src/webview/shims/app-environment.ts"],
+      "$app/navigation": ["src/webview/shims/app-navigation.ts"]
+    }
   },
   "include": ["src/webview/**/*.ts", "src/webview/**/*.svelte", "src/shared/**/*.ts"]
 }

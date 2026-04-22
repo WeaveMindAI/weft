@@ -1,12 +1,17 @@
 // Extension-host side of the graph view. Owns a single WebviewPanel
 // that tracks the currently-active .weft document, parses via the
-// dispatcher on every text change (debounced), and relays graph
-// mutations back as surgical TextEditor.edit() calls.
+// dispatcher on every text change (debounced), and streams saves
+// back into the document / .layout.json sidecar.
+//
+// The webview does all the text surgery in-process via v1's
+// weft-editor.ts. When the user edits something, the webview sends
+// the entire new weft source via `saveWeft`; the host applies a
+// full-range TextEdit and the resulting onDidChangeTextDocument
+// kicks off the next parse.
 
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
-import type { GraphMutation, HostMessage, ProjectDefinition, WebviewMessage } from './shared/protocol';
-import { buildEdit } from './surgical';
+import type { HostMessage, ProjectDefinition, WebviewMessage } from './shared/protocol';
 
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
@@ -15,6 +20,11 @@ export class GraphViewController {
   private disposables: vscode.Disposable[] = [];
   private lastProject: ProjectDefinition | undefined;
   private follower: EventSource | undefined;
+  // Set while we're applying our own TextEdit to the document.
+  // onDidChangeTextDocument fires during the edit; if we parsed
+  // twice (once for the webview save, once for the VS Code change)
+  // we'd loop.
+  private suppressReparse = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -23,9 +33,7 @@ export class GraphViewController {
 
   /** Subscribe to SSE for a live execution (or project) and forward
    *  NodeStarted/NodeCompleted/NodeFailed/NodeSkipped into the panel
-   *  as `execEvent` messages. Called by the Weft: Follow Execution
-   *  command.
-   */
+   *  as `execEvent` messages. Called by Weft: Follow Execution. */
   followColor(color: string): void {
     this.stopFollowing();
     this.post({ kind: 'execReset' });
@@ -76,10 +84,10 @@ export class GraphViewController {
     this.stopFollowing();
     this.post({ kind: 'execReset' });
     const events = await this.client
-      .get<any[]>(`/executions/${color}/replay`)
+      .get<unknown[]>(`/executions/${color}/replay`)
       .catch(() => []);
-    for (const e of events) {
-      this.post({ kind: 'execEvent', event: e });
+    for (const e of events as HostMessage[]) {
+      this.post(e);
       await new Promise((r) => setTimeout(r, 120));
     }
   }
@@ -91,12 +99,10 @@ export class GraphViewController {
     }
   }
 
-  /** Approximate active-edge SSE: when a node starts we flash all
-   *  incoming edges for ACTIVE_EDGE_WINDOW_MS; when it completes we
-   *  flash all outgoing edges. Exact pulse tracking is a dispatcher
-   *  responsibility for later (parity/execution.md).
-   */
-  private approximateActiveEdges(nodeId: string, kind: 'started' | 'completed' | 'failed' | 'skipped'): void {
+  private approximateActiveEdges(
+    nodeId: string,
+    kind: 'started' | 'completed' | 'failed' | 'skipped',
+  ): void {
     if (!this.lastProject) return;
     const relevant: string[] = [];
     if (kind === 'started') {
@@ -141,12 +147,12 @@ export class GraphViewController {
     this.watchedDoc = doc;
 
     void this.sendSettings();
-    void this.sendLayoutHint();
 
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
       this.panel.onDidDispose(() => this.onDispose()),
       vscode.workspace.onDidChangeTextDocument((e) => {
+        if (this.suppressReparse) return;
         if (this.watchedDoc && e.document === this.watchedDoc) {
           this.scheduleParse();
         }
@@ -171,10 +177,11 @@ export class GraphViewController {
   private async triggerParse(): Promise<void> {
     if (!this.panel || !this.watchedDoc) return;
     const source = this.watchedDoc.getText();
+    const layoutCode = await this.readLayoutCode(this.watchedDoc);
     try {
       const response = await this.client.parse(source);
       this.lastProject = response.project;
-      this.post({ kind: 'parseResult', response });
+      this.post({ kind: 'parseResult', response, source, layoutCode });
     } catch (err) {
       this.post({
         kind: 'parseError',
@@ -192,14 +199,11 @@ export class GraphViewController {
       case 'ready':
         void this.triggerParse();
         break;
-      case 'positionsChanged':
-        void this.saveLayout(msg.positions);
+      case 'saveWeft':
+        void this.saveWeft(msg.source);
         break;
-      case 'layoutChanged':
-        void this.saveFullLayout(msg.layout);
-        break;
-      case 'mutation':
-        void this.applyMutation(msg.mutation);
+      case 'saveLayout':
+        void this.saveLayoutCode(msg.layoutCode);
         break;
       case 'log':
         console[msg.level]('[weft/webview]', msg.message);
@@ -207,30 +211,45 @@ export class GraphViewController {
     }
   }
 
-  private async applyMutation(mutation: GraphMutation): Promise<void> {
-    if (!this.watchedDoc || !this.lastProject) return;
-    // Reparse the current document first so spans are fresh (v1's
-    // Option A, per our design discussion). This costs ~1ms on
-    // localhost.
+  /** Replace the watched document's text with the webview's copy.
+   *  Simple full-range replace: VS Code diff-compresses this into a
+   *  proper TextEdit, preserves the user's cursor unless it was
+   *  inside a changed region. Suppress re-entry so we don't reparse
+   *  on our own edit. */
+  private async saveWeft(source: string): Promise<void> {
+    if (!this.watchedDoc) return;
+    if (this.watchedDoc.getText() === source) return;
+    const edit = new vscode.WorkspaceEdit();
+    const last = this.watchedDoc.lineCount - 1;
+    const end = this.watchedDoc.lineAt(last).range.end;
+    edit.replace(this.watchedDoc.uri, new vscode.Range(0, 0, end.line, end.character), source);
+    this.suppressReparse = true;
     try {
-      const fresh = await this.client.parse(this.watchedDoc.getText());
-      this.lastProject = fresh.project;
-    } catch {
-      // Continue with stale project; surgical.ts will fail-safe if
-      // spans no longer resolve.
+      await vscode.workspace.applyEdit(edit);
+      // Parse on OUR schedule after the edit lands.
+      void this.triggerParse();
+    } finally {
+      this.suppressReparse = false;
     }
-    const edit = buildEdit(mutation, { project: this.lastProject, doc: this.watchedDoc });
-    if (!edit) {
-      void vscode.window.showWarningMessage(
-        `Weft: could not apply ${mutation.kind} mutation (missing span info).`,
-      );
-      return;
-    }
-    await vscode.workspace.applyEdit(edit);
   }
 
   private layoutUriFor(doc: vscode.TextDocument): vscode.Uri {
     return vscode.Uri.parse(doc.uri.toString() + '.layout.json');
+  }
+
+  private async readLayoutCode(doc: vscode.TextDocument): Promise<string> {
+    try {
+      const data = await vscode.workspace.fs.readFile(this.layoutUriFor(doc));
+      return new TextDecoder().decode(data);
+    } catch {
+      return '';
+    }
+  }
+
+  private async saveLayoutCode(layoutCode: string): Promise<void> {
+    if (!this.watchedDoc) return;
+    const uri = this.layoutUriFor(this.watchedDoc);
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(layoutCode));
   }
 
   private async sendSettings(): Promise<void> {
@@ -240,37 +259,6 @@ export class GraphViewController {
       parseDebounceMs: cfg.get<number>('parse.debounceMs', 100),
       layoutDebounceMs: cfg.get<number>('layout.debounceMs', 400),
     });
-  }
-
-  private async sendLayoutHint(): Promise<void> {
-    if (!this.watchedDoc) return;
-    try {
-      const data = await vscode.workspace.fs.readFile(this.layoutUriFor(this.watchedDoc));
-      const text = new TextDecoder().decode(data);
-      const positions = JSON.parse(text) as Record<string, { x: number; y: number }>;
-      this.post({ kind: 'layoutHint', positions });
-    } catch {
-      // No layout file yet. Webview falls back to ELK auto-layout.
-    }
-  }
-
-  private async saveLayout(positions: Record<string, { x: number; y: number }>): Promise<void> {
-    if (!this.watchedDoc) return;
-    const uri = this.layoutUriFor(this.watchedDoc);
-    const body = JSON.stringify(positions, null, 2);
-    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(body));
-  }
-
-  private async saveFullLayout(
-    layout: Record<
-      string,
-      { x: number; y: number; w?: number; h?: number; expanded?: boolean }
-    >,
-  ): Promise<void> {
-    if (!this.watchedDoc) return;
-    const uri = this.layoutUriFor(this.watchedDoc);
-    const body = JSON.stringify(layout, null, 2);
-    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(body));
   }
 
   private onDispose(): void {

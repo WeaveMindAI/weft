@@ -225,7 +225,7 @@ export interface EdgeActiveEvent {
 // ─── Messages: extension host -> webview ────────────────────────────────
 
 export type HostMessage =
-  | { kind: 'parseResult'; response: ParseResponse }
+  | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string }
   | { kind: 'parseError'; error: string }
   | { kind: 'layoutHint'; positions: Record<string, { x: number; y: number }> }
   | { kind: 'settings'; parseDebounceMs: number; layoutDebounceMs: number }
@@ -238,38 +238,11 @@ export type HostMessage =
 
 export type WebviewMessage =
   | { kind: 'ready' }
-  | { kind: 'mutation'; mutation: GraphMutation }
-  | { kind: 'positionsChanged'; positions: Record<string, { x: number; y: number }> }
-  | { kind: 'layoutChanged'; layout: LayoutSnapshot }
+  | { kind: 'saveWeft'; source: string }
+  | { kind: 'saveLayout'; layoutCode: string }
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string };
 
-// Layout sidecar persisted to .layout.json. Keyed by node/group id.
-export interface LayoutEntry {
-  x: number;
-  y: number;
-  w?: number;
-  h?: number;
-  expanded?: boolean;
-}
-
-export type LayoutSnapshot = Record<string, LayoutEntry>;
-
-// Graph mutations the webview can request. Extension host translates
-// each into a surgical TextEditor.edit() using the stored spans.
-
-export type GraphMutation =
-  | { kind: 'addNode'; id: string; nodeType: string; parentGroupLabel?: string | null }
-  | { kind: 'removeNode'; id: string }
-  | { kind: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroupLabel?: string | null }
-  | { kind: 'removeEdge'; source: string; sourcePort: string; target: string; targetPort: string }
-  | { kind: 'updateConfig'; nodeId: string; key: string; value: unknown }
-  | { kind: 'updateLabel'; nodeId: string; label: string | null }
-  | { kind: 'duplicateNode'; nodeId: string }
-  | { kind: 'addGroup'; label: string; parentGroupLabel?: string | null }
-  | { kind: 'removeGroup'; label: string }
-  | { kind: 'renameGroup'; oldLabel: string; newLabel: string }
-  | { kind: 'updateGroupPorts'; groupLabel: string; inputs: PortDefinition[]; outputs: PortDefinition[] }
-  | { kind: 'updateNodePorts'; nodeId: string; inputs: PortDefinition[]; outputs: PortDefinition[] }
-  | { kind: 'moveNodeScope'; nodeId: string; targetGroupLabel: string | null }
-  | { kind: 'moveGroupScope'; groupLabel: string; targetGroupLabel: string | null }
-  | { kind: 'updateProjectMeta'; name?: string | null; description?: string | null };
+// The v1 editor performs all text surgery in-process and sends the
+// resulting source with `saveWeft`. No semantic mutation protocol
+// is needed — the extension host just applies the full-range
+// TextEdit and re-parses.
