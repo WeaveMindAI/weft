@@ -1473,6 +1473,28 @@
 
 	// Surgical patch: apply a new project definition without remounting the editor.
 	// Preserves positions of unchanged nodes, then re-runs ELK (same path as the palette auto-organize).
+	/** VS Code embedding: the host owns the authoritative .weft text.
+	 *  Whenever it sends us a parseResult we may need to overwrite
+	 *  our local weftCode + layoutCode copy (e.g. the user edited
+	 *  the file directly in the text editor). Round-trips triggered
+	 *  by our own saveWeft send back the same source, so the guard
+	 *  below no-ops in the common case. */
+	export function applyExternalSource(newWeftCode: string, newLayoutCode: string): void {
+		if (newLayoutCode !== layoutCode) layoutCode = newLayoutCode;
+		if (newWeftCode === weftCode) return;
+		weftCode = newWeftCode;
+		const result = parseWeftCode(weftCode);
+		if (result.projects.length > 0) {
+			const w = result.projects[0];
+			applyParseResult(w);
+			if (w.project.name) project.name = w.project.name;
+			if (w.project.description !== undefined) project.description = w.project.description;
+			void patchFromProject(w.project);
+		} else {
+			weftParseErrors = result.errors;
+		}
+	}
+
 	export async function patchFromProject(newProject: ProjectDefinition, andFitView = false): Promise<void> {
 		// Reset opaque blocks since we're applying a new project (errors are preserved, set by applyParseResult)
 		weftOpaqueBlocks = [];

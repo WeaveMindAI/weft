@@ -11,6 +11,10 @@
 		return inner?.patchFromProject(newProject) ?? Promise.resolve();
 	}
 
+	export function applyExternalSource(weftCode: string, layoutCode: string): void {
+		inner?.applyExternalSource(weftCode, layoutCode);
+	}
+
 	export function weftStreamStart(mode: 'weft' | 'weft-patch' | 'weft-continue') {
 		inner?.weftStreamStart(mode);
 	}

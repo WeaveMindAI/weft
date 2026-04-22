@@ -14,13 +14,14 @@
   let error: string | null = $state(null);
   let weftCode = $state('');
   let layoutCode = $state('');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let editorRef: any = $state();
 
   onMount(() => {
     setRemoteParseTrigger((_source) => {
-      // Webview text surgery has produced a new source; the host
-      // writes it to the document, which triggers a new parse.
-      // Nothing to do here — the resulting parseResult message
-      // lands through onMessage below.
+      // Webview text surgery produced a new source; the host writes
+      // it to the document and re-parses. The resulting parseResult
+      // message lands through onMessage below.
     });
 
     const unsub = onMessage((msg) => {
@@ -28,10 +29,20 @@
         const errs: WeftParseError[] = msg.response.diagnostics
           .filter((d) => d.severity === 'error')
           .map((d) => ({ line: d.line, message: d.message }));
+        const firstMount = project === null;
+        setCachedParseResponse(msg.response.project, msg.source, msg.layoutCode, errs);
         weftCode = msg.source;
         layoutCode = msg.layoutCode;
-        setCachedParseResponse(msg.response.project, msg.source, msg.layoutCode, errs);
-        project = translateProject(msg.response.project, msg.source, msg.layoutCode);
+        if (firstMount) {
+          // Initial mount: hand a fully-populated project to the
+          // editor so it grabs weftCode/layoutCode as its initial
+          // $state snapshot.
+          project = translateProject(msg.response.project, msg.source, msg.layoutCode);
+        } else if (editorRef) {
+          // Subsequent updates: push into the already-mounted editor
+          // so its local weftCode stays in sync with the document.
+          editorRef.applyExternalSource?.(msg.source, msg.layoutCode);
+        }
         error = null;
       } else if (msg.kind === 'parseError') {
         error = msg.error;
@@ -48,31 +59,22 @@
     loomCode?: string;
     layoutCode?: string;
   }) {
-    // v1 sends the whole new weft source after every edit. We
-    // forward that to the host which range-replaces the VS Code
-    // document; the reparse round-trips through onMessage above.
     if (data.weftCode !== undefined && data.weftCode !== weftCode) {
+      weftCode = data.weftCode;
       send({ kind: 'saveWeft', source: data.weftCode });
     }
     if (data.layoutCode !== undefined && data.layoutCode !== layoutCode) {
+      layoutCode = data.layoutCode;
       send({ kind: 'saveLayout', layoutCode: data.layoutCode });
     }
   }
-
-  // Preserve the host-supplied weftCode / layoutCode on the project
-  // we hand ProjectEditor, which otherwise falls back to prop
-  // defaults that are empty. v1's editor also patches the prop on
-  // parse updates so this matches the contract it expects.
-  const projectForEditor = $derived<V1Project | null>(
-    project ? { ...project, weftCode, layoutCode } : null,
-  );
 </script>
 
 <div class="absolute inset-0">
   {#if error}
     <div class="p-4 text-destructive">parse error: {error}</div>
-  {:else if projectForEditor}
-    <ProjectEditor project={projectForEditor} {onSave} playground={true} />
+  {:else if project}
+    <ProjectEditor bind:this={editorRef} {project} {onSave} playground={true} />
   {:else}
     <div class="p-4 text-muted-foreground">loading graph...</div>
   {/if}
