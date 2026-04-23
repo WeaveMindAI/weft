@@ -7,19 +7,19 @@ use tokio::sync::Notify;
 
 use crate::error::{WeftError, WeftResult};
 use crate::lane::Lane;
-use crate::primitive::{CostReport, FormSchema, FormSubmission, SubgraphRef};
+use crate::primitive::{CostReport, WakeSignalSpec};
 use crate::Color;
 
 /// The per-execution context handed to `Node::execute`. Exposes the
-/// language's primitive surface (await_form, await_timer,
-/// await_callback, report_cost, log) plus read helpers for config and
-/// input.
+/// language's primitive surface (`await_signal` for mid-execution
+/// suspensions, `report_cost`, `log`) plus read helpers for config
+/// and input.
 ///
-/// ExecutionContext is constructed by the runtime (inside the user's
+/// ExecutionContext is constructed by the engine (inside the user's
 /// compiled binary) and passed to each node invocation. It holds an
 /// `Arc<dyn ContextHandle>` which abstracts the actual runtime
-/// implementation; the scaffolded runtime provides a concrete handle,
-/// but the trait allows alternative implementations for testing.
+/// implementation; the engine provides a concrete handle, but the
+/// trait allows alternative implementations for testing.
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub execution_id: String,
@@ -54,27 +54,17 @@ impl ExecutionContext {
         Self { execution_id, project_id, node_id, node_type, node_label, color, lane, config, input, handle }
     }
 
-    // ----- Suspension primitives --------------------------------------
+    // ----- Suspension primitive --------------------------------------
 
-    /// Wait for a form submission. Framework mints a token, journals
-    /// the suspension, returns a URL the caller (or the caller's
-    /// parent) can surface to humans. Worker may exit while waiting;
-    /// on submit, a new worker resumes here with the submission.
-    pub async fn await_form(&self, schema: FormSchema) -> WeftResult<FormSubmission> {
-        self.handle.await_form(schema).await
-    }
-
-    /// Wait for a duration. Framework schedules a durable timer; on
-    /// fire, a new worker resumes here.
-    pub async fn await_timer(&self, duration: std::time::Duration) -> WeftResult<()> {
-        self.handle.await_timer(duration).await
-    }
-
-    /// Invoke a callback subgraph synchronously. Framework runs the
-    /// subgraph under the current color (isolated sub-region), returns
-    /// its output.
-    pub async fn await_callback(&self, subgraph: SubgraphRef, input: Value) -> WeftResult<Value> {
-        self.handle.await_callback(subgraph, input).await
+    /// Suspend this lane until the given wake signal fires. The engine
+    /// forwards the spec to the dispatcher (which registers a webhook,
+    /// schedules a timer, etc.), and parks on a oneshot. When the
+    /// dispatcher delivers the fire value, this returns.
+    ///
+    /// `spec.is_resume` must be `true` here; passing `false` is a
+    /// contract violation (that's an entry-signal, not a wait).
+    pub async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value> {
+        self.handle.await_signal(spec).await
     }
 
     // ----- Fire-and-forget primitives --------------------------------
@@ -181,14 +171,12 @@ impl InputBag {
     }
 }
 
-/// The runtime-facing handle. The runtime crate implements this; the
-/// `Node` trait's execute receives an `ExecutionContext` that delegates
-/// to an implementation.
+/// The runtime-facing handle. The engine crate implements this; the
+/// `Node` trait's execute receives an `ExecutionContext` that
+/// delegates to an implementation.
 #[async_trait::async_trait]
 pub trait ContextHandle: Send + Sync {
-    async fn await_form(&self, schema: FormSchema) -> WeftResult<FormSubmission>;
-    async fn await_timer(&self, duration: std::time::Duration) -> WeftResult<()>;
-    async fn await_callback(&self, subgraph: SubgraphRef, input: Value) -> WeftResult<Value>;
+    async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value>;
     fn report_cost(&self, report: CostReport);
     fn log(&self, level: LogLevel, message: String);
     fn is_cancelled(&self) -> bool;

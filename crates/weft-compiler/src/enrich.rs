@@ -17,7 +17,7 @@
 
 use serde_json::Value;
 
-use weft_core::node::{FormFieldPort, NodeCatalog};
+use weft_core::node::{FormFieldPort, MetadataCatalog};
 use weft_core::project::{PortDefinition, ProjectDefinition};
 use weft_core::weft_type::WeftType;
 
@@ -37,7 +37,7 @@ pub enum EnrichPolicy {
 
 /// Strict enrichment. Fails on unknown node types. Equivalent to
 /// `enrich_with_policy(project, catalog, EnrichPolicy::Strict)`.
-pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn NodeCatalog) -> CompileResult<()> {
+pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) -> CompileResult<()> {
     enrich_with_policy(project, catalog, EnrichPolicy::Strict)
 }
 
@@ -46,19 +46,13 @@ pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn NodeCatalog) -> Com
 /// with unknown node types.
 pub fn enrich_with_policy(
     project: &mut ProjectDefinition,
-    catalog: &dyn NodeCatalog,
+    catalog: &dyn MetadataCatalog,
     policy: EnrichPolicy,
 ) -> CompileResult<()> {
     let mut errors = Vec::new();
 
     for node in project.nodes.iter_mut() {
-        if node.node_type == "Passthrough" {
-            // Passthrough ports are set by the compiler at group
-            // flatten time; no catalog lookup.
-            continue;
-        }
-
-        let Some(node_impl) = catalog.lookup(&node.node_type) else {
+        let Some(meta) = catalog.lookup(&node.node_type) else {
             if policy == EnrichPolicy::Strict {
                 errors.push(format!("unknown node type: '{}'", node.node_type));
             }
@@ -67,7 +61,16 @@ pub fn enrich_with_policy(
             // error separately.
             continue;
         };
-        let meta = node_impl.metadata();
+
+        // Passthrough is a real catalog entry, but its ports are
+        // written by the compiler's group-flatten pass, not derived
+        // from metadata. Skip port enrichment; let features through.
+        // entry_signals is empty by construction for passthroughs.
+        if node.node_type == "Passthrough" {
+            node.features = meta.features.clone();
+            node.entry_signals = Vec::new();
+            continue;
+        }
 
         // Base ports from catalog.
         let mut inputs: Vec<PortDefinition> = meta
@@ -105,8 +108,37 @@ pub fn enrich_with_policy(
 
         node.inputs = inputs;
         node.outputs = outputs;
-        node.features = meta.features;
-        node.entry = meta.entry;
+        node.features = meta.features.clone();
+
+        // Resolve each declared entry signal's tag against the
+        // node's config. Each `WakeSignalKind` variant documents
+        // which config fields it expects; contract failures
+        // (missing field, bad type) become enrich errors tied to
+        // this node.
+        let config_map = match node.config.as_object() {
+            Some(obj) => obj.clone().into_iter().collect(),
+            None => std::collections::HashMap::new(),
+        };
+        let mut resolved_signals =
+            Vec::with_capacity(meta.entry_signals.len());
+        for tag in &meta.entry_signals {
+            match weft_core::primitive::WakeSignalKind::resolve_from_config(
+                tag.kind,
+                &config_map,
+            ) {
+                Ok(resolved) => resolved_signals.push(
+                    weft_core::primitive::WakeSignalSpec {
+                        kind: resolved,
+                        is_resume: tag.is_resume,
+                    },
+                ),
+                Err(e) => errors.push(format!(
+                    "node '{}' entry signal: {}",
+                    node.id, e.message
+                )),
+            }
+        }
+        node.entry_signals = resolved_signals;
     }
 
     if !errors.is_empty() {

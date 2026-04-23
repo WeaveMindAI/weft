@@ -12,8 +12,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::node::{Diagnostic, NodeOutput, Severity};
-use weft_core::project::{NodeDefinition, ProjectDefinition};
+use weft_core::node::NodeOutput;
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
 pub struct ApiPostNode;
@@ -49,22 +48,4 @@ impl Node for ApiPostNode {
         Ok(output)
     }
 
-    fn validate(&self, node: &NodeDefinition, _project: &ProjectDefinition) -> Vec<Diagnostic> {
-        let mut d = Vec::new();
-        if let Some(path) = node.config.get("path").and_then(|v| v.as_str()) {
-            if path.starts_with('/') {
-                d.push(Diagnostic {
-                    line: node.header_span.map(|s| s.start_line).unwrap_or(0),
-                    column: 0,
-                    severity: Severity::Warning,
-                    message: format!(
-                        "ApiPost '{}' path '{}' starts with '/'. The dispatcher prefixes the route automatically; drop the leading slash.",
-                        node.id, path
-                    ),
-                    code: Some("apipost-leading-slash".into()),
-                });
-            }
-        }
-        d
-    }
 }

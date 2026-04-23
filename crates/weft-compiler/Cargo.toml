@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 weft-core = { workspace = true }
+weft-catalog = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -18,6 +19,4 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-weft-core = { workspace = true }
-weft-stdlib = { path = "../weft-stdlib" }
 uuid = { workspace = true }

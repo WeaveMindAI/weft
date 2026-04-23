@@ -29,7 +29,7 @@ pub use error::{CompileError as ProjectError, CompileResult};
 pub use weft_compiler::{compile as compile_source, CompileError as SourceError};
 
 use uuid::Uuid;
-use weft_core::{NodeCatalog, ProjectDefinition};
+use weft_core::{MetadataCatalog, ProjectDefinition};
 
 // Re-export weft_core's Diagnostic/Severity so downstream callers
 // keep using weft_compiler::Diagnostic without touching node impls.
@@ -45,7 +45,7 @@ pub use weft_core::node::{Diagnostic, Severity};
 pub fn parse_only(
     source: &str,
     project_id: Uuid,
-    catalog: &dyn NodeCatalog,
+    catalog: &dyn MetadataCatalog,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
@@ -84,9 +84,6 @@ pub fn parse_only(
     // Surface unknown node types as warnings so the IDE can paint a
     // squiggly on the header line even without calling /validate.
     for node in &project.nodes {
-        if node.node_type == "Passthrough" {
-            continue;
-        }
         if catalog.lookup(&node.node_type).is_none() {
             let line = node
                 .header_span

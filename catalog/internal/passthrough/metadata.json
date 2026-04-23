@@ -1,0 +1,19 @@
+{
+  "type": "Passthrough",
+  "label": "Passthrough",
+  "description": "Compiler-internal node. Emitted at every group boundary to host the group's dynamically-added ports and to participate in Expand/Gather lane transformations. Not user-declarable.",
+  "category": "internal",
+  "tags": ["internal"],
+  "icon": "ArrowRight",
+  "color": "#94a3b8",
+  "inputs": [],
+  "outputs": [],
+  "fields": [],
+  "entrySignals": [],
+  "requires_infra": false,
+  "features": {
+    "canAddInputPorts": true,
+    "canAddOutputPorts": true,
+    "hidden": true
+  }
+}

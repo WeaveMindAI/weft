@@ -6,9 +6,10 @@ use std::collections::BTreeMap;
 
 use axum::{extract::{Path, Query, State}, Json};
 use serde::{Deserialize, Serialize};
+use weft_catalog::stdlib_catalog as stdlib_fs_catalog;
 use weft_compiler::describe::describe_project;
-use weft_core::{node::NodeMetadata, NodeCatalog};
-use weft_stdlib::StdlibCatalog;
+use weft_core::node::NodeMetadata;
+use weft_core::MetadataCatalog;
 
 use crate::state::DispatcherState;
 
@@ -32,11 +33,20 @@ pub struct NodesQuery {
     pub project_root: Option<String>,
 }
 
-fn stdlib_catalog() -> BTreeMap<String, NodeMetadata> {
-    StdlibCatalog
-        .all()
+/// Read stdlib metadata from the filesystem and return as a map.
+/// Hidden nodes (like Passthrough) are excluded from the palette.
+fn stdlib_map() -> BTreeMap<String, NodeMetadata> {
+    let fs = match stdlib_fs_catalog() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "weft_dispatcher::describe", "stdlib catalog: {e}");
+            return BTreeMap::new();
+        }
+    };
+    fs.all()
         .into_iter()
-        .filter_map(|t| StdlibCatalog.lookup(t).map(|n| (t.to_string(), n.metadata())))
+        .filter(|m| !m.features.hidden)
+        .map(|m| (m.node_type.clone(), m.clone()))
         .collect()
 }
 
@@ -49,7 +59,7 @@ pub async fn nodes(
     State(_state): State<DispatcherState>,
     Query(q): Query<NodesQuery>,
 ) -> Json<NodesResponse> {
-    let mut catalog = stdlib_catalog();
+    let mut catalog = stdlib_map();
     let mut warnings = Vec::new();
     if let Some(root) = q.project_root.as_deref() {
         if let Ok(desc) = describe_project(std::path::Path::new(root)) {
@@ -70,5 +80,5 @@ pub async fn project_catalog(
     State(_state): State<DispatcherState>,
     Path(_id): Path<String>,
 ) -> Json<NodesResponse> {
-    Json(NodesResponse { catalog: stdlib_catalog(), warnings: Vec::new() })
+    Json(NodesResponse { catalog: stdlib_map(), warnings: Vec::new() })
 }

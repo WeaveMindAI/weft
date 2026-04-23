@@ -42,22 +42,80 @@
       }
     ],
     "commands": [
-      { "command": "weft.openGraphView", "title": "Weft: Open Graph View", "category": "Weft" },
-      { "command": "weft.openLoomView", "title": "Weft: Open Runner View", "category": "Weft" },
-      { "command": "weft.runProject", "title": "Weft: Run Project", "category": "Weft", "icon": "$(play)" },
-      { "command": "weft.stopProject", "title": "Weft: Stop Project", "category": "Weft", "icon": "$(stop)" },
-      { "command": "weft.openInEditor", "title": "Open in Editor", "category": "Weft", "icon": "$(go-to-file)" },
-      { "command": "weft.viewExecution", "title": "View in Graph", "category": "Weft", "icon": "$(eye)" },
-      { "command": "weft.deleteExecution", "title": "Delete", "category": "Weft", "icon": "$(trash)" },
-      { "command": "weft.clearExecutions", "title": "Clear All Executions", "category": "Weft", "icon": "$(clear-all)" },
-      { "command": "weft.refreshProjects", "title": "Refresh", "category": "Weft", "icon": "$(refresh)" },
-      { "command": "weft.toggleTestMode", "title": "Toggle Test Mode", "category": "Weft", "icon": "$(beaker)" }
+      {
+        "command": "weft.openGraphView",
+        "title": "Weft: Open Graph View",
+        "category": "Weft"
+      },
+      {
+        "command": "weft.openLoomView",
+        "title": "Weft: Open Runner View",
+        "category": "Weft"
+      },
+      {
+        "command": "weft.runProject",
+        "title": "Weft: Run Project",
+        "category": "Weft",
+        "icon": "$(play)"
+      },
+      {
+        "command": "weft.stopProject",
+        "title": "Weft: Stop Project",
+        "category": "Weft",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "weft.openInEditor",
+        "title": "Open in Editor",
+        "category": "Weft",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "weft.viewExecution",
+        "title": "View in Graph",
+        "category": "Weft",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "weft.deleteExecution",
+        "title": "Delete",
+        "category": "Weft",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "weft.clearExecutions",
+        "title": "Clear All Executions",
+        "category": "Weft",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "weft.refreshProjects",
+        "title": "Refresh",
+        "category": "Weft",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "weft.toggleTestMode",
+        "title": "Toggle Test Mode",
+        "category": "Weft",
+        "icon": "$(beaker)"
+      }
     ],
     "views": {
       "weft-sidebar": [
-        { "id": "weft.projects", "name": "Projects" },
-        { "id": "weft.executions", "name": "Executions" },
-        { "id": "weft.inspector", "name": "Inspector", "type": "webview" }
+        {
+          "id": "weft.projects",
+          "name": "Projects"
+        },
+        {
+          "id": "weft.executions",
+          "name": "Executions"
+        },
+        {
+          "id": "weft.inspector",
+          "name": "Inspector",
+          "type": "webview"
+        }
       ]
     },
     "viewsContainers": {
@@ -71,14 +129,38 @@
     },
     "menus": {
       "view/title": [
-        { "command": "weft.refreshProjects", "when": "view == weft.projects", "group": "navigation" },
-        { "command": "weft.clearExecutions", "when": "view == weft.executions", "group": "navigation" }
+        {
+          "command": "weft.refreshProjects",
+          "when": "view == weft.projects",
+          "group": "navigation"
+        },
+        {
+          "command": "weft.clearExecutions",
+          "when": "view == weft.executions",
+          "group": "navigation"
+        }
       ],
       "view/item/context": [
-        { "command": "weft.openInEditor", "when": "view == weft.projects && viewItem == weftProject", "group": "inline@1" },
-        { "command": "weft.runProject", "when": "view == weft.projects && viewItem == weftProject", "group": "inline@2" },
-        { "command": "weft.viewExecution", "when": "view == weft.executions && viewItem =~ /^weftExecution/", "group": "inline@1" },
-        { "command": "weft.deleteExecution", "when": "view == weft.executions && viewItem =~ /^weftExecution/", "group": "inline@2" }
+        {
+          "command": "weft.openInEditor",
+          "when": "view == weft.projects && viewItem == weftProject",
+          "group": "inline@1"
+        },
+        {
+          "command": "weft.runProject",
+          "when": "view == weft.projects && viewItem == weftProject",
+          "group": "inline@2"
+        },
+        {
+          "command": "weft.viewExecution",
+          "when": "view == weft.executions && viewItem =~ /^weftExecution/",
+          "group": "inline@1"
+        },
+        {
+          "command": "weft.deleteExecution",
+          "when": "view == weft.executions && viewItem =~ /^weftExecution/",
+          "group": "inline@2"
+        }
       ]
     },
     "configuration": {

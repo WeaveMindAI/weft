@@ -17,15 +17,12 @@ use axum::http::{Request, StatusCode};
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
-use weft_compiler::enrich::enrich;
-use weft_compiler::weft_compiler::compile;
 use weft_dispatcher::api::router;
 use weft_dispatcher::backend::{
     EventStream, InfraBackend, InfraHandle, InfraSpec, WakeContext, WorkerBackend, WorkerHandle,
 };
 use weft_dispatcher::journal::sqlite::SqliteJournal;
 use weft_dispatcher::{DispatcherConfig, DispatcherState, ProjectStore};
-use weft_stdlib::StdlibCatalog;
 
 // ----- Test-only backends --------------------------------------------
 
@@ -66,10 +63,13 @@ impl InfraBackend for StubInfraBackend {
 
 // ----- Helpers -------------------------------------------------------
 
-async fn compile_hello() -> (uuid::Uuid, serde_json::Value) {
+fn hello_project() -> (uuid::Uuid, serde_json::Value) {
     // ApiPost -> Debug. The webhook URL targets `receive`; when
     // `curl` fires it, the runner wakes `receive`, pulses through to
     // `print`, which logs the body.
+    //
+    // The dispatcher compiles + enriches source on register, so the
+    // test just hands it the raw weft + a stable id.
     let source = r#"
 # Project: Hello Webhook
 
@@ -78,10 +78,12 @@ print = Debug { label: "got" }
 
 print.value = receive.body
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
-    enrich(&mut project, &StdlibCatalog).expect("enrich");
-    let id = project.id;
-    let payload = serde_json::to_value(&project).unwrap();
+    let id = uuid::Uuid::new_v4();
+    let payload = serde_json::json!({
+        "id": id,
+        "name": "Hello Webhook",
+        "source": source,
+    });
     (id, payload)
 }
 
@@ -106,6 +108,8 @@ async fn build_state(tmp: &tempfile::TempDir) -> (DispatcherState, Arc<Mutex<Vec
         infra: Arc::new(StubInfraBackend),
         projects,
         events: weft_dispatcher::EventBus::new(),
+        slots: weft_dispatcher::slots::Slots::new(),
+        scheduler: weft_dispatcher::scheduler::Scheduler::new(),
     };
     (state, spawned)
 }
@@ -130,7 +134,7 @@ async fn webhook_round_trip() {
     let app = router(state);
 
     // 1. Register the project.
-    let (project_id, project_json) = compile_hello().await;
+    let (project_id, project_json) = hello_project();
     let resp = app
         .clone()
         .oneshot(req("POST", "/projects", Some(project_json)))
@@ -174,19 +178,13 @@ async fn webhook_round_trip() {
         String::from_utf8_lossy(&body_bytes)
     );
 
-    // 4. Confirm a worker spawn was recorded with the right context.
+    // 4. Confirm a worker spawn was recorded. Under Slice 3 the
+    // wake payload lives in the slot queue (delivered over WS once
+    // the worker connects), not on WakeContext; only `project_id`
+    // and `color` sit on the spawn-time handoff. The WS round-trip
+    // is covered by its own integration test.
     let spawned = spawned.lock().await;
     assert_eq!(spawned.len(), 1, "exactly one worker should have spawned");
     let wake = &spawned[0];
     assert_eq!(wake.project_id, project_id.to_string());
-    assert_eq!(wake.resume_node, "receive");
-    // Dispatcher wraps the raw body under "body" so ApiPost's input
-    // port schema matches what the runner expects on the first pulse.
-    assert_eq!(
-        wake.resume_value
-            .get("body")
-            .and_then(|v| v.get("hello"))
-            .and_then(|v| v.as_str()),
-        Some("world")
-    );
 }

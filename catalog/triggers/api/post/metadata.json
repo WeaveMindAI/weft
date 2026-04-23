@@ -12,6 +12,13 @@
   ],
   "fields": [
     {
+      "key": "path",
+      "label": "Path",
+      "field_type": { "kind": "text" },
+      "required": false,
+      "description": "Optional route suffix appended under `/w/{token}/`. Leave empty for the bare token URL."
+    },
+    {
       "key": "apiKey",
       "label": "API Key",
       "field_type": { "kind": "password" },
@@ -19,17 +26,24 @@
       "description": "Optional. If set, the incoming request must include this key in the X-API-Key header."
     }
   ],
-  "entry": [
-    {
-      "kind": "webhook",
-      "path": "",
-      "auth": { "kind": "optional_api_key", "field": "apiKey" }
-    }
+  "entrySignals": [
+    { "kind": "webhook", "is_resume": false }
   ],
   "requires_infra": false,
   "features": {
     "isTrigger": true,
     "triggerCategory": "Webhook",
     "canAddOutputPorts": true
-  }
+  },
+  "validate": [
+    {
+      "when": { "kind": "config_matches", "field": "path", "regex": "^/" },
+      "then": {
+        "message": "ApiPost '{id}' path starts with '/'. The dispatcher prefixes the route automatically; drop the leading slash.",
+        "level": "structural",
+        "severity": "warning",
+        "field": "path"
+      }
+    }
+  ]
 }

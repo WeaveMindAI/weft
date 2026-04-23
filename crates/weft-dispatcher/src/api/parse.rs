@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
+use weft_catalog::{FsCatalog, stdlib_catalog};
 use weft_compiler::Diagnostic;
-use weft_core::{node::NodeMetadata, NodeCatalog, ProjectDefinition};
-use weft_stdlib::StdlibCatalog;
+use weft_core::{node::NodeMetadata, MetadataCatalog, ProjectDefinition};
 
 use crate::state::DispatcherState;
 
@@ -46,30 +46,31 @@ pub async fn parse(
     Json(req): Json<ParseRequest>,
 ) -> Result<Json<ParseResponse>, (StatusCode, String)> {
     let project_id = req.project_id.unwrap_or_else(uuid::Uuid::nil);
-    let (project, diagnostics) =
-        weft_compiler::parse_only(&req.source, project_id, &StdlibCatalog);
-    let catalog = collect_catalog(&project, &StdlibCatalog);
-    Ok(Json(ParseResponse { project, catalog, diagnostics }))
+    let catalog = stdlib_catalog()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("catalog: {e}")))?;
+    let (project, diagnostics) = weft_compiler::parse_only(&req.source, project_id, &catalog);
+    let catalog_map = collect_catalog(&project, &catalog);
+    Ok(Json(ParseResponse { project, catalog: catalog_map, diagnostics }))
 }
 
 /// For each node type present in the project, pull its catalog entry
-/// (the `NodeMetadata` the `Node` impl declares). Unknown types are
-/// skipped: `/parse` is lenient, the webview renders them as
-/// placeholders.
+/// (the `NodeMetadata` from metadata.json). Hidden node types (like
+/// Passthrough) are omitted. Unknown types are skipped: `/parse` is
+/// lenient, the webview renders them as placeholders.
 fn collect_catalog(
     project: &ProjectDefinition,
-    catalog: &dyn NodeCatalog,
+    catalog: &FsCatalog,
 ) -> BTreeMap<String, CatalogEntry> {
     let mut out = BTreeMap::new();
     for node in &project.nodes {
-        if node.node_type == "Passthrough" {
-            continue;
-        }
         if out.contains_key(&node.node_type) {
             continue;
         }
-        if let Some(n) = catalog.lookup(&node.node_type) {
-            out.insert(node.node_type.clone(), n.metadata());
+        if let Some(meta) = catalog.lookup(&node.node_type) {
+            if meta.features.hidden {
+                continue;
+            }
+            out.insert(node.node_type.clone(), meta.clone());
         }
     }
     out
@@ -103,7 +104,9 @@ pub async fn validate(
         }
     };
 
-    if let Err(e) = weft_compiler::enrich::enrich(&mut project, &StdlibCatalog) {
+    let catalog = stdlib_catalog()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("catalog: {e}")))?;
+    if let Err(e) = weft_compiler::enrich::enrich(&mut project, &catalog) {
         diagnostics.push(Diagnostic {
             line: 0,
             column: 0,
@@ -113,18 +116,15 @@ pub async fn validate(
         });
     }
 
-    diagnostics.extend(weft_compiler::validate::validate(&project));
+    diagnostics.extend(weft_compiler::validate::validate(&project, &catalog));
 
-    // Per-node validators: each node's catalog entry may declare
-    // a `validate` method; run against the enriched project.
-    for node in &project.nodes {
-        if node.node_type == "Passthrough" {
-            continue;
-        }
-        if let Some(impl_) = StdlibCatalog.lookup(&node.node_type) {
-            diagnostics.extend(impl_.validate(node, &project));
-        }
-    }
+    // Per-node validators ran in v1 by calling `node_impl.validate`.
+    // In v2, node Rust code lives in the project binary; the
+    // dispatcher can't invoke it. For Phase A we rely on generic
+    // validation rules expressible from metadata alone (enforced by
+    // the compiler's validate.rs). Node-specific checks that need
+    // Rust logic run when `weft build` invokes cargo (and cargo
+    // compiles the project crate which includes the node).
 
     Ok(Json(ValidateResponse { diagnostics }))
 }

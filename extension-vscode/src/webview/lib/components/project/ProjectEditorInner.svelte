@@ -1764,9 +1764,22 @@
 		if (!hasFitView && nodes.length > 0) {
 			hasFitView = true;
 			if (!layoutCode || autoOrganizeOnMount) {
-				// No saved layout or explicitly requested: run ELK to compute positions
+				// No saved layout or explicitly requested: run ELK to compute positions.
+				// Wait until SvelteFlow has measured every node before firing ELK,
+				// otherwise ELK uses zero-sized fallbacks and produces garbage layouts
+				// (same issue patchFromProject works around below). Cap at 2s so a
+				// pathological case doesn't wedge the canvas forever.
 				hasAutoOrganized = true;
-				setTimeout(() => runAutoOrganize(true).then(() => { canvasReady = true; }), 300);
+				void (async () => {
+					const deadline = Date.now() + 2000;
+					while (Date.now() < deadline) {
+						await tick();
+						if (nodes.every(n => n.measured?.width && n.measured?.height)) break;
+						await new Promise(resolve => setTimeout(resolve, 50));
+					}
+					await runAutoOrganize(true);
+					canvasReady = true;
+				})();
 			} else {
 				// Saved layout exists: just fit the view, don't reorganize
 				setTimeout(() => { doFitView(); canvasReady = true; }, 100);

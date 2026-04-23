@@ -1,0 +1,71 @@
+[
+  {
+    "field_type": "display",
+    "render": { "component": "readonly" },
+    "adds_inputs": [{ "name_template": "{key}", "port_type": "T_Auto" }],
+    "adds_outputs": []
+  },
+  {
+    "field_type": "display_image",
+    "render": { "component": "image" },
+    "adds_inputs": [{ "name_template": "{key}", "port_type": "Image" }],
+    "adds_outputs": []
+  },
+  {
+    "field_type": "approve_reject",
+    "render": { "component": "buttons", "source": "static" },
+    "adds_inputs": [],
+    "adds_outputs": [
+      { "name_template": "{key}_approved", "port_type": "Boolean" },
+      { "name_template": "{key}_rejected", "port_type": "Boolean" }
+    ]
+  },
+  {
+    "field_type": "select",
+    "render": { "component": "select", "source": "static" },
+    "adds_inputs": [],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
+  },
+  {
+    "field_type": "multi_select",
+    "render": { "component": "select", "source": "static", "multiple": true },
+    "adds_inputs": [],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "List[String]" }]
+  },
+  {
+    "field_type": "select_input",
+    "render": { "component": "select", "source": "input" },
+    "adds_inputs": [{ "name_template": "{key}", "port_type": "List[String]" }],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
+  },
+  {
+    "field_type": "multi_select_input",
+    "render": { "component": "select", "source": "input", "multiple": true },
+    "adds_inputs": [{ "name_template": "{key}", "port_type": "List[String]" }],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "List[String]" }]
+  },
+  {
+    "field_type": "text_input",
+    "render": { "component": "text" },
+    "adds_inputs": [],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
+  },
+  {
+    "field_type": "textarea",
+    "render": { "component": "textarea" },
+    "adds_inputs": [],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
+  },
+  {
+    "field_type": "editable_text_input",
+    "render": { "component": "text", "prefilled": true },
+    "adds_inputs": [{ "name_template": "{key}", "port_type": "String" }],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
+  },
+  {
+    "field_type": "editable_textarea",
+    "render": { "component": "textarea", "prefilled": true },
+    "adds_inputs": [{ "name_template": "{key}", "port_type": "String" }],
+    "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
+  }
+]

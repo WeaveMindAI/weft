@@ -30,22 +30,21 @@ pub trait WorkerBackend: Send + Sync {
     async fn kill_worker(&self, handle: WorkerHandle) -> anyhow::Result<()>;
 }
 
+/// Re-export `RootSeed` from core so backends can reference it by
+/// the canonical type. Kept here for compatibility with existing
+/// callers; new code should use `weft_core::RootSeed` directly.
+pub use weft_core::primitive::RootSeed;
+
+/// Minimal handoff passed to `spawn_worker`. The dispatcher-to-worker
+/// channel is the WebSocket (`/ws/executions/{color}`), so all the
+/// actual wake data lives on the slot and is delivered in the
+/// `Start` message after the worker's `Ready` handshake. The spawn
+/// call only needs enough to boot the worker and point it at the
+/// right socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeContext {
     pub project_id: String,
     pub color: Color,
-    pub resume_node: String,
-    pub resume_value: Value,
-    #[serde(default)]
-    pub kind: WakeKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum WakeKind {
-    #[default]
-    Fresh,
-    Resume,
 }
 
 #[derive(Debug, Clone)]

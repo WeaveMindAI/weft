@@ -295,6 +295,18 @@ fn try_parse_declaration(
     if !node_type.chars().next()?.is_uppercase() { return None; }
     if !node_type.chars().all(|c| c.is_alphanumeric()) { return None; }
 
+    // Passthrough is a compiler-internal node type emitted by the
+    // group-flattening pass. Users cannot declare it directly.
+    if node_type == "Passthrough" {
+        errors.push(CompileError {
+            line: line_num,
+            message: "'Passthrough' is a compiler-internal node type and cannot be used directly. \
+                      Passthrough nodes are emitted automatically when a group is flattened."
+                .into(),
+        });
+        return None;
+    }
+
     let after_type = right[type_end..].trim();
 
     // Collect the full declaration header across multiple lines. If
@@ -2234,7 +2246,7 @@ fn flatten_group(
         features: in_features,
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
-        entry: Vec::new(),
+        entry_signals: Vec::new(),
         span: None,
         header_span: None,
         config_spans: Default::default(),
@@ -2273,7 +2285,7 @@ fn flatten_group(
         features: NodeFeatures::default(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
-        entry: Vec::new(),
+        entry_signals: Vec::new(),
         span: None,
         header_span: None,
         config_spans: Default::default(),
@@ -2345,7 +2357,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         features,
         scope,
         group_boundary: None,
-        entry: Vec::new(),
+        entry_signals: Vec::new(),
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),
@@ -2486,6 +2498,14 @@ fn try_parse_inline_expression(
         .unwrap_or(after_start.len());
     let node_type = after_start[..type_end].trim().to_string();
     if node_type.is_empty() || !node_type.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    if node_type == "Passthrough" {
+        errors.push(CompileError {
+            line: line_num,
+            message: "'Passthrough' is a compiler-internal node type and cannot be used directly."
+                .into(),
+        });
         return None;
     }
     if !node_type.chars().all(|c| c.is_alphanumeric()) {

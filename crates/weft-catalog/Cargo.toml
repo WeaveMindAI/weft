@@ -1,5 +1,5 @@
 [package]
-name = "weft-stdlib"
+name = "weft-catalog"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,13 +7,9 @@ repository.workspace = true
 
 [dependencies]
 weft-core = { workspace = true }
-async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
-chrono = { workspace = true }
-reqwest = { workspace = true }
-minillmlib = { workspace = true }
 tracing = { workspace = true }

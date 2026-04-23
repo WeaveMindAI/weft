@@ -1,15 +1,19 @@
 //! End-to-end tests for the validate pass. Each test compiles a
 //! weft source, enriches strictly, then asserts on the diagnostics.
 
+use weft_catalog::{stdlib_catalog, FsCatalog};
 use weft_compiler::enrich::enrich;
 use weft_compiler::validate::validate;
 use weft_compiler::weft_compiler::compile;
 use weft_compiler::{Diagnostic, Severity};
-use weft_stdlib::StdlibCatalog;
+
+fn catalog() -> FsCatalog {
+    stdlib_catalog().expect("stdlib catalog")
+}
 
 fn parse_enrich(source: &str) -> weft_core::ProjectDefinition {
     let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile ok");
-    enrich(&mut project, &StdlibCatalog).expect("enrich ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
     project
 }
 
@@ -38,7 +42,7 @@ out = Debug
 out.data = hi.value
 "#,
     );
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     assert!(errors(&d).is_empty(), "unexpected errors: {:?}", d);
 }
 
@@ -55,7 +59,7 @@ two = Text { value: "b" }
 "#,
     );
     project.nodes[1].id = "one".into();
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"duplicate-node-id"), "{d:?}");
 }
 
@@ -71,7 +75,7 @@ out.data = hello.value
     );
     // Corrupt the edge to a typo'd input port name.
     project.edges[0].target_handle = Some("dat".into());
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     let hit = d
         .iter()
         .find(|x| x.code.as_deref() == Some("unknown-target-port"))
@@ -104,7 +108,7 @@ out.data = a.value
         span: None,
     };
     project.edges.push(dup);
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"duplicate-input-port"), "{d:?}");
 }
 
@@ -123,7 +127,7 @@ out.data = one.value
     one.outputs[0].port_type = WeftType::primitive(WeftPrimitive::Number);
     let out = project.nodes.iter_mut().find(|n| n.id == "out").unwrap();
     out.inputs[0].port_type = WeftType::primitive(WeftPrimitive::String);
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"type-mismatch"), "{d:?}");
 }
 
@@ -147,7 +151,7 @@ t = Text
         configurable: true,
     });
     t.config = serde_json::json!({ "value": 42 });
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"config-type-mismatch"), "{d:?}");
 }
 
@@ -170,7 +174,7 @@ t = Text { value: "ok" }
         lane_depth: 1,
         configurable: false,
     });
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"required-port-unmet"), "{d:?}");
 }
 
@@ -185,6 +189,6 @@ out.data = a.value
 "#,
     );
     project.edges[0].source = "ghost".into();
-    let d = validate(&project);
+    let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"unknown-source-node"), "{d:?}");
 }

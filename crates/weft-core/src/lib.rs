@@ -12,10 +12,16 @@ pub use context::ExecutionContext;
 pub use error::{WeftError, WeftResult};
 pub use lane::{Lane, LaneFrame};
 pub use node::{
-    FieldDef, FormFieldPort, FormFieldSpec, Node, NodeCatalog, NodeFeatures, NodeMetadata,
-    NodeOutput, PortDef,
+    Condition, FieldDef, FormFieldPort, FormFieldSpec, MetadataCatalog, Node, NodeCatalog,
+    NodeFeatures, NodeMetadata, NodeOutput, PortDef, RuleDiagnostic, RuleSeverity,
+    ValidationLevel, ValidationRule,
 };
-pub use primitive::{EntryPrimitive, FormSchema, FormSubmission, CostReport};
+pub use primitive::{
+    CostReport, Delivery, DispatcherToWorker, ExecutionSnapshot, FormField, FormFieldType,
+    FormSchema, RootSeed, SignalResolveError, SuspensionInfo, TimerSpec, WakeMessage,
+    WakeSignalKind, WakeSignalKindTag, WakeSignalSpec, WakeSignalTag, WebhookAuth,
+    WorkerToDispatcher,
+};
 pub use project::{
     Edge, EdgeIndex, ExecutionStatus, GroupBoundary, GroupBoundaryRole, GroupDefinition, LaneMode,
     NodeDefinition, PortDefinition, Position, ProjectDefinition, ProjectExecution,

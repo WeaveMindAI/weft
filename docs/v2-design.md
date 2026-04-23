@@ -223,96 +223,253 @@ default is reversed.
 ## 3. Primitives exposed to nodes
 
 Nodes are rust code implementing a trait. They interact with the
-runtime through two families of primitives: **entry** (starts a new
-run) and **suspension** (pauses the current run to wait on an
-external event).
+runtime through **wake signals** (a unified mechanism for both
+starting a run and resuming a paused one) and a small set of
+fire-and-forget primitives (log, report_cost, is_cancelled).
 
-### 3.1 Entry primitives
+### 3.0 Run modes and the `is_output` flag
 
-Declared at node level, not called from `execute`. The compiler sees
-a node has an entry primitive and knows: this node is an entry
-point; external events matching the declaration start a new
-execution with a fresh color.
+Execution is **always upstream-of-output**. The graph has one or more
+nodes flagged `is_output: true`. A run picks which outputs to produce,
+computes the union of their upstream subgraphs, and pulses that
+subgraph's roots.
 
-```rust
-pub enum EntryPrimitive {
-    /// Incoming HTTP POST. Framework mints a URL, routes matching
-    /// calls.
-    Webhook {
-        /// Path pattern, e.g. "apipost/*". Framework prefixes with a
-        /// project-specific random token so URLs are unguessable.
-        path: &'static str,
-        /// Optional authentication config. Signature + api-key
-        /// validation is framework-level, not per-node.
-        auth: WebhookAuth,
-    },
+There are two run modes. They share the same primitive (compute
+subgraph, pulse roots), they only differ in how they pick the
+outputs and what the trigger nodes' pulses carry.
 
-    /// Cron schedule.
-    Cron {
-        /// Standard cron expression, validated at compile time.
-        schedule: &'static str,
-    },
+**Manual run (`weft run`, no trigger event):**
+1. Targets = every `is_output: true` node in the project (or a
+   user-chosen subset via `--output foo,bar`).
+2. Subgraph = union of upstream-of(target) for each target.
+3. Roots = nodes in the subgraph with no incoming edges to required
+   ports. Every root is seeded with a pulse.
+4. Trigger nodes in the subgraph pulse with **null** (they did not
+   actually fire; this signal is explicit). Downstream with `required`
+   inputs skips via null propagation; downstream with `optional`
+   inputs runs with null.
+5. Non-trigger roots (Text, Constant, anything with no inputs and no
+   event source) pulse with their config value or null.
 
-    /// Subscription to a long-running infra connection (Slack,
-    /// Discord, etc).
-    Event {
-        /// The infra node providing the event stream. Wired in at
-        /// graph level via a typed port.
-        connection_port: &'static str,
-        /// Optional filter pattern.
-        filter: FilterSpec,
-    },
+**Trigger fire (production or simulated):**
+1. Targets = every `is_output: true` node downstream of the firing
+   trigger (computed on the DAG, ignoring the firing itself).
+2. Subgraph = union of upstream-of(target) for each target.
+3. The firing trigger pulses with its real payload.
+4. Every OTHER trigger node in the subgraph pulses with null. Same
+   rule as manual run: non-firing triggers signal "I did not fire
+   this execution" explicitly.
+5. Non-trigger roots behave the same as in manual run.
 
-    /// Manual/UI-initiated run.
-    Manual,
+The runtime is one algorithm. The only parameters that change are
+(a) the target output set and (b) which trigger (if any) carries a
+real payload.
+
+**Why null from non-firing triggers instead of skipping them**: in a
+graph shaped `[trigger_a -> A], [trigger_b -> B], [no-trigger -> C]`
+all feeding an Output Z, excluding non-firing-trigger branches would
+mean C never runs either (since it has no trigger and "isolate by
+firing trigger" would cut it). Emitting null from non-firing triggers
+keeps the subgraph shape stable across runs, makes C always run, and
+forces the author to be explicit about how Z consumes the three
+paths. The cost is one language rule: **if your node consumes a
+trigger output, handle null**. Mark the port `required` to skip on
+null, optional to receive it, or wrap it in a union with an explicit
+absent variant.
+
+**User-facing rule:** every port downstream of a trigger is
+effectively `T | null` unless every possible trigger in its upstream
+subgraph always fires. The compiler can detect this and warn, but
+the semantics are consistent regardless.
+
+#### 3.0.1 `is_output` as a node config flag
+
+`is_output: bool` is a standard node config. Defaults vary by node
+type (Debug defaults to `true`, SlackSend defaults to `false`, most
+nodes default to `false`). Any project can override by setting the
+flag explicitly in the weft source:
+
+```weft
+final_result = SlackSend { channel: "...", is_output: true }
+```
+
+This lets the author designate arbitrary nodes as "I want this
+produced" for a run, including side-effect nodes. A single project
+can have many outputs; each defines a distinct "thing this project
+can produce."
+
+#### 3.0.2 Mocks
+
+Mocks are first-class. A mock file is a JSON document of shape:
+
+```json
+{
+  "name": "happy path",
+  "triggers": {
+    "api_post_node": { "body": { "foo": "bar" } },
+    "cron_node": { "tick": "2026-01-01T00:00:00Z" }
+  },
+  "nodes": {
+    "http_get_weather": { "status": 200, "body": "{\"temp\":72}" }
+  }
 }
 ```
 
-Entry primitives are NOT called from within `execute`. They are
-part of the node's metadata. The framework reads them at compile
-time, wires the routing layer accordingly, and at runtime invokes
-the node's `execute` with the event payload as input.
+Execution semantics under `weft run --mock path.json`:
 
-A node can declare multiple entry primitives (e.g. both `Webhook`
-and `Cron`). Each fires independently and produces a fresh color.
+- **If the `triggers` map is non-empty**: one execution per mocked
+  trigger. In execution N, trigger N pulses with its mock payload,
+  every other trigger in the subgraph pulses with null. This mirrors
+  production (one trigger fire = one execution) exactly, so the
+  same code runs with identical semantics under test and in prod.
+- **If `triggers` is empty**: one execution. All triggers pulse with
+  null (pure manual-run semantics).
+- **The `nodes` map**: applied to every execution. The node's `execute`
+  is bypassed; its output is replaced with the mock value. Useful
+  for stubbing HTTP calls, LLM calls, etc, without removing the
+  nodes from the graph.
 
-### 3.2 Suspension primitives
+Mock files live in `tests/` (or anywhere, the CLI takes a path).
+The format is identical to v1's test-config JSON shape where
+possible, so existing tests port cleanly.
 
-Called from inside `execute` via the `ExecutionContext`. Each pauses
-the current execution, journals the pulse state, and waits for a
-matching event. The execution is suspended in durable storage and
-the worker may die. When the event arrives, a new worker spins up,
-replays the journal to reconstruct state, and the suspension
-primitive returns the resolved value.
+This design replaces v1's separate "mock subsystem" with a single
+injection point. There is no special-cased code path; production
+flow and mock flow are the same flow with different inputs.
+
+### 3.1 Wake signals
+
+**One concept unifies triggers and suspensions: the wake signal.**
+
+A wake signal is "something the dispatcher listens for on behalf of
+a node." When the signal fires, the dispatcher delivers the payload
+to an execution. The `is_resume` flag decides which:
+
+- `is_resume: false` → fresh execution. Every fire spawns a new
+  worker, new color, new run. The signal stays registered forever
+  (until the project is deactivated). This is the trigger case:
+  ApiPost's webhook, Cron, HumanTrigger.
+- `is_resume: true` → resume a specific paused lane. Fire delivers
+  the payload to the waiting lane inside an already-running or
+  snapshotted execution. The signal is single-use: after firing, it
+  is torn down. This is the suspension case: HumanQuery's form,
+  timer waits.
+
+The **kind** is a closed set, owned by the dispatcher. The
+**parameters** per instance are open. Nodes declare a kind + their
+parameters; the dispatcher handles the plumbing.
+
+#### 3.1.1 Kinds (Phase A)
+
+```rust
+pub enum WakeSignalKind {
+    /// HTTP POST to a dispatcher-minted URL. Body delivered as the
+    /// payload. Used by ApiPost (is_resume=false) and generic
+    /// "click this link to resume" flows (is_resume=true).
+    Webhook { path: String, auth: WebhookAuth },
+
+    /// Scheduled fire. Either a single deadline (wait until T) or a
+    /// repeating cron expression.
+    Timer { spec: TimerSpec },
+
+    /// Form-schema submission. Extends Webhook with a shape the
+    /// extension/dashboard can render. `form_type` routes the form
+    /// to the right UI panel (e.g. "human-trigger", "human-query";
+    /// new types added as Phase B expands).
+    Form {
+        form_type: String,
+        schema: FormSchema,
+        title: Option<String>,
+        description: Option<String>,
+    },
+
+    /// Long-lived bidirectional socket. Dispatcher maintains the
+    /// connection and its heartbeat; emits per incoming message.
+    /// Phase B scope; reserved so the shape is known.
+    Socket { spec: SocketSpec },
+}
+
+pub enum TimerSpec {
+    After(std::time::Duration),        // single fire at now+duration
+    At(chrono::DateTime<chrono::Utc>), // single fire at a time
+    Cron(String),                      // recurring
+}
+```
+
+New kinds (Payment, Email-IMAP, etc.) ship as new `WakeSignalKind`
+variants when the framework adds them. Not user-extensible in the
+runtime sense: the dispatcher's handler per variant is trusted code.
+Nodes pick a kind and parameterize it.
+
+#### 3.1.2 Wake signals for entry (trigger use)
+
+A node declares the entry-use wake signals in its metadata:
+
+```rust
+pub struct NodeMetadata {
+    // ...existing fields...
+    /// Wake signals this node acts as the source for. Empty if the
+    /// node is not an entry point. When the project is activated,
+    /// the dispatcher registers each signal; when any fires, a fresh
+    /// execution begins with this node as the firing trigger.
+    pub entry_signals: Vec<WakeSignalSpec>,
+}
+
+pub struct WakeSignalSpec {
+    pub kind: WakeSignalKind,
+    // is_resume is always false for entry_signals (validated at
+    // compile time); included only for symmetry with wait signals
+    // so the dispatcher handlers can be truly uniform.
+    pub is_resume: bool,
+}
+```
+
+Parameters are resolved from the node's config at project
+activation (e.g. ApiPost reads its `path` config and passes it in
+the Webhook spec).
+
+#### 3.1.3 Wake signals for wait (resume use)
+
+A node calls `await_signal` from inside `execute`:
 
 ```rust
 impl ExecutionContext {
-    /// Wait for a form submission. Framework mints a token, returns
-    /// a URL the caller can surface to humans. When a POST arrives
-    /// at that URL, the primitive returns with the form data.
-    pub async fn await_form(&self, schema: FormSchema) -> FormSubmission;
-
-    /// Wait for a duration. Framework schedules a timer in the
-    /// journal; worker dies after this call. On wake, returns ().
-    pub async fn await_timer(&self, duration: Duration);
-
-    /// Invoke a callback subgraph synchronously. Framework runs the
-    /// subgraph under the current color, returns its output.
-    pub async fn await_callback<I, O>(
-        &self,
-        subgraph: SubgraphRef,
-        input: I,
-    ) -> O;
-
-    /// Wait for N of a set of events (select!-style). Not ship-day
-    /// priority but the primitive exists so composition works.
-    pub async fn await_first(&self, primitives: &[SuspensionPrimitive])
-        -> usize;
+    /// Suspend this lane until the given wake signal fires. The
+    /// dispatcher registers the signal (minting a URL, scheduling a
+    /// timer, etc.), the worker's pulse loop keeps running other
+    /// lanes, then the worker snapshots and exits when all running
+    /// lanes are either done or waiting. When the signal fires, the
+    /// dispatcher resumes the worker with this call's return value.
+    pub async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value>;
 }
 ```
 
-Suspension primitives do not start new executions. They pause and
-resume the current one. Color is preserved across the suspend.
+`is_resume` is always true here (validated at compile time).
+
+#### 3.1.4 Dispatcher responsibilities
+
+The dispatcher hosts one handler per `WakeSignalKind` variant. The
+handler knows:
+- How to **register** a signal (mint URL, schedule timer, open socket).
+- How to **deliver** a fire: for `is_resume=false`, start a fresh run;
+  for `is_resume=true`, route to the paused lane.
+- How to **tear down** a signal (is_resume=true on fire, is_resume=false
+  on project deactivate).
+
+Handlers live in `weft-dispatcher`. Dispatchers register all
+handlers at startup. Nodes never touch handler code directly; they
+hand a `WakeSignalSpec` to the dispatcher and the right handler
+takes over.
+
+#### 3.1.5 The extension's `form_type`
+
+When the dispatcher stores an active `Form` wake signal, the
+extension queries the list and routes each entry to the UI panel
+matched by `form_type`:
+- `"human-trigger"` → Triggers panel (persistent forms that start runs).
+- `"human-query"` → Queries panel (one-shot forms that resume a run).
+- Future: `"email-approval"`, `"slack-modal"`, etc. Each adds a new
+  string value and a matching extension-side renderer.
 
 ### 3.3 Callback isolation rule (compile-time)
 
@@ -343,6 +500,78 @@ loop emits its downstream output.
 
 No new primitive. Loops are sugar over callbacks, the same isolation
 rule applies, same pulse propagation.
+
+### 3.5 Execution lifecycle: stall, snapshot, resume
+
+Workers are **ephemeral**. Waiting is free: a worker that can't make
+progress snapshots its state and exits. The dispatcher holds the
+snapshot and wakes a new worker when a signal fires.
+
+**Per-color slot.** The dispatcher tracks exactly one execution per
+color at any moment:
+
+- **Idle**: no worker alive. Snapshot stored (or empty for a fresh
+  run). Queued wakes may exist waiting for the next worker.
+- **Starting**: dispatcher has spawned a worker, waiting for it to
+  connect over WebSocket and send `Ready`.
+- **Live**: worker is connected, executing. Wakes are forwarded over
+  the socket immediately.
+
+The slot enforces **one worker per color at a time**. Wakes that
+arrive while the slot is Starting or Idle are queued; they stream
+to the worker once it's Live (or become part of the `Start` message
+when it connects).
+
+Phase A holds the slot map in RAM on the dispatcher. Phase B moves
+it behind an external lock for multi-dispatcher coordination; the
+slot-state machine is unchanged.
+
+**IPC: WebSocket.** The worker connects out to the dispatcher on
+startup. One socket per worker. Messages both ways:
+
+Dispatcher → worker:
+- `Start { wake, snapshot: Option<Snapshot>, queued_deliveries }`
+- `Deliver { token, value }` (a wake signal fired; deliver to the
+  matching paused lane's oneshot)
+- `Cancel`
+
+Worker → dispatcher:
+- `Ready` (after WS handshake; dispatcher responds with `Start`)
+- `NodeEvent { ... }` (lifecycle events for SSE)
+- `Log { level, message }`
+- `Cost { ... }`
+- `SuspensionRequest { request_id, spec: WakeSignalSpec }` → reply
+  `SuspensionToken { request_id, token, user_url }`
+- `Stalled { snapshot }` → dispatcher persists, acks, worker exits
+- `Completed { outputs }` → terminal
+- `Failed { error }` → terminal
+
+**Stall condition.** Pulse loop finds no ready nodes, no in-flight
+node futures, at least one NodeExecution in WaitingForInput. Worker
+serializes `ExecutionSnapshot` and sends `Stalled`. Dispatcher
+persists. Worker exits.
+
+**Done condition.** All executions terminal, no pending pulses, no
+suspensions. Worker sends `Completed` and exits.
+
+**`ExecutionSnapshot` shape:**
+
+```rust
+pub struct ExecutionSnapshot {
+    pub color: Color,
+    pub pulses: PulseTable,
+    pub executions: NodeExecutionTable,
+    pub suspensions: HashMap<Token, SuspensionInfo>,
+}
+```
+
+Serializable via serde. Stored through the `Journal` trait. All
+fields already exist in `weft-core`; the snapshot just bundles them.
+
+**Per-color serial access is the invariant.** Two workers never
+touch the same color's state. Wakes for a locked color queue. This
+is the actor model applied to executions: execution = actor, wakes =
+messages, serial delivery.
 
 ---
 
@@ -995,6 +1224,13 @@ entry primitives in its metadata. Is that enough, or do we also
 need an explicit `#[entry_point]` attribute on the impl? Preference:
 derive from metadata. If ambiguous cases emerge, add the attribute
 as an override.
+
+Note that "entry point" is NOT how we start executions anymore. The
+run starts from the roots of the upstream-of-outputs subgraph (see
+3.0). Trigger nodes that happen to be roots get special-cased to
+pulse with null when they didn't fire, but they are otherwise
+treated like any other root. The compiler reads entry primitives
+for URL/schedule registration, not for starting a pulse.
 
 ### 12.2 `await_first` composition
 `tokio::select!`-style waiting on multiple primitives. Not ship-day

@@ -15,32 +15,32 @@ pub async fn run(ctx: Ctx, detach: bool) -> anyhow::Result<()> {
         .read_main_weft()
         .map_err(|e| anyhow::anyhow!("read main.weft: {e}"))?;
 
-    let mut compiled = weft_compiler::weft_compiler::compile(&source, project.id())
-        .map_err(|errs| {
-            let joined = errs
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            anyhow::anyhow!("compile errors:\n  {joined}")
-        })?;
+    // Compile locally: produces the native project binary the
+    // dispatcher will spawn. Heavy work lives on the client side;
+    // the dispatcher itself stays thin.
+    println!("compiling {}...", project.manifest.package.name);
+    let build = weft_compiler::build::build_project(&project.root, true)
+        .map_err(|e| anyhow::anyhow!("build failed: {e}"))?;
+    println!("built: {}", build.binary_path.display());
 
-    weft_compiler::enrich::enrich(&mut compiled, &weft_stdlib::StdlibCatalog)
-        .map_err(|e| anyhow::anyhow!("enrich: {e}"))?;
-
-    // Prefer a dispatcher URL explicitly given on the CLI, else the
-    // project manifest's value, else the baked default.
+    // Dispatcher URL: explicit CLI arg > project manifest > baked default.
     let dispatcher = ctx
         .dispatcher
         .clone()
         .unwrap_or_else(|| project.dispatcher_url());
     let client = crate::client::DispatcherClient::new(&dispatcher);
 
-    // Register (idempotent: same project_id overwrites the stored
-    // binary).
-    let body = serde_json::to_value(&compiled).context("serialize project")?;
+    // Register: we hand over the source (the dispatcher re-parses so
+    // it has the enriched `ProjectDefinition` for run dispatch) plus
+    // the absolute path to the binary we just built.
+    let register_body = serde_json::json!({
+        "id": project.id().to_string(),
+        "name": project.manifest.package.name,
+        "source": source,
+        "binary_path": build.binary_path.display().to_string(),
+    });
     let register_resp: serde_json::Value = client
-        .post_json("/projects", &body)
+        .post_json("/projects", &register_body)
         .await
         .with_context(|| format!("register against {dispatcher}"))?;
     let id = register_resp
@@ -70,7 +70,6 @@ pub async fn run(ctx: Ctx, detach: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Follow the color until the dispatcher reports completion.
     super::follow::follow_color(&client, &color).await?;
 
     Ok(())

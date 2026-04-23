@@ -1,15 +1,19 @@
-//! Journal abstraction + sqlite-backed impl for local dev.
+//! Journal abstraction. Single source of truth for execution state.
 //!
-//! The journal owns everything durable the dispatcher needs to
-//! resume executions across restarts:
-//! - Entry tokens (webhook URLs, cron schedules) -> project + node.
-//! - Suspension tokens -> color + node + metadata for wake.
-//! - Cost events per color (ledger for dashboard + billing).
+//! Every state change the dispatcher cares about is an `ExecEvent`
+//! row in the `exec_event` table. Readers fold the log on demand:
+//! logs, node events, execution list, etc. See
+//! `journal::events::fold_to_snapshot`.
 //!
-//! Cloud deployments (weavemind) swap in a restate-backed impl via
-//! the same trait; local uses sqlite.
+//! Separate tables still exist for lookups that aren't state
+//! changes: entry tokens (webhook→project routing), suspension
+//! tokens (form URL→color lookup), extension tokens (reviewer
+//! auth). Those are indexes, not duplicates.
 
+pub mod events;
 pub mod sqlite;
+
+pub use events::{fold_to_snapshot, ExecEvent};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -18,26 +22,41 @@ use weft_core::Color;
 
 #[async_trait]
 pub trait Journal: Send + Sync {
-    async fn record_start(&self, color: Color, project_id: &str, entry_node: &str)
-        -> anyhow::Result<()>;
+    // ----- Event log (state source of truth) -------------------------
 
-    /// Journal a mid-execution suspension. Returns the opaque token
-    /// the caller serves on the user-facing URL (e.g. form URL).
-    async fn record_suspension(
+    /// Append one event to the execution's log. Append-only; only
+    /// user-initiated `weft clean` removes events.
+    async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()>;
+
+    /// Full ordered event log for a color.
+    async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>>;
+
+    // ----- Token indexes (not state duplication) ---------------------
+
+    /// Journal a mid-execution suspension with a caller-supplied
+    /// token. This is a lookup table: token → (color, node,
+    /// metadata) so form URLs can route fires to the right lane.
+    /// Does NOT record a state event; the caller emits
+    /// `ExecEvent::SuspensionRegistered` separately if it wants
+    /// the fact journaled.
+    async fn record_suspension_with_token(
         &self,
+        token: &str,
         color: Color,
         node: &str,
         metadata: Value,
-    ) -> anyhow::Result<String>;
+    ) -> anyhow::Result<()>;
 
     async fn resolve_wake(&self, token: &str) -> anyhow::Result<Option<WakeTarget>>;
 
-    /// Remove the suspension once it has been resolved. Returns true
-    /// if the token existed.
+    /// Remove the suspension once it has been resolved. Returns
+    /// true if the token existed.
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool>;
 
-    /// Mint an entry token for a project's trigger node. Returns the
-    /// opaque token the dispatcher advertises on the user-facing URL.
+    /// Return every live suspension across all projects. Used by
+    /// the browser extension's task listing.
+    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>>;
+
     async fn mint_entry_token(
         &self,
         project_id: &str,
@@ -49,27 +68,8 @@ pub trait Journal: Send + Sync {
 
     async fn resolve_entry_token(&self, token: &str) -> anyhow::Result<Option<EntryTarget>>;
 
-    /// Drop every entry token for a project (on deactivate or rm).
     async fn drop_entry_tokens(&self, project_id: &str) -> anyhow::Result<()>;
 
-    async fn record_cost(&self, color: Color, report: weft_core::CostReport)
-        -> anyhow::Result<()>;
-
-    async fn cancel(&self, color: Color) -> anyhow::Result<()>;
-
-    /// Look up which project a given color belongs to. `Ok(None)`
-    /// if the color was never journaled.
-    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>>;
-
-    /// Append a log line emitted by a running worker.
-    async fn append_log(&self, color: Color, level: &str, message: &str)
-        -> anyhow::Result<()>;
-
-    /// Return log lines for a color, oldest first, capped at `limit`.
-    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
-
-    /// Mint an extension token for a human reviewer. Returns the
-    /// opaque string the user pastes into the browser extension.
     async fn mint_ext_token(
         &self,
         name: Option<&str>,
@@ -82,35 +82,43 @@ pub trait Journal: Send + Sync {
 
     async fn revoke_ext_token(&self, token: &str) -> anyhow::Result<()>;
 
-    /// Return every live suspension across all projects. Used by the
-    /// browser extension's `/ext/{token}/tasks` listing. Phase B
-    /// adds per-token metadata filtering.
-    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>>;
+    // ----- Derived views over the event log --------------------------
 
-    /// Append a per-node execution event. The worker calls this on
-    /// every node lifecycle transition (started / completed / failed
-    /// / skipped). Used by SSE `weft follow` and by `/executions/{color}/replay`.
-    async fn record_node_event(&self, event: &NodeExecEvent) -> anyhow::Result<()>;
+    /// Look up which project a color belongs to. Walks the event
+    /// log for the first `ExecutionStarted` event. `Ok(None)` if
+    /// the color is unknown.
+    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>>;
 
-    /// Return every node event for an execution, oldest first. Used
-    /// by replay.
+    /// Log lines for a color, oldest first. Folded from
+    /// `ExecEvent::LogLine` events.
+    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
+
+    /// Per-node lifecycle events for a color, oldest first.
+    /// Folded from `ExecEvent::Node{Started,Completed,Failed,Skipped}`.
     async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>>;
 
-    /// Delete all data for a color (execution row, node events,
-    /// logs, suspensions, cost). Called by `weft clean <color>`.
+    /// Summary row for every execution the dispatcher has ever
+    /// seen, newest first.
+    async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>>;
+
+    // ----- Administrative ---------------------------------------------
+
+    /// Delete all data for a color. Called only by `weft clean`.
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()>;
 
-    /// List past executions, newest first, capped. Used by
-    /// `weft clean --list` and "Replay execution..." picker.
-    async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>>;
+    /// Mark a color cancelled. Phase A: no-op beyond a log event.
+    /// Phase B: writes a control row so running workers can poll.
+    async fn cancel(&self, color: Color) -> anyhow::Result<()>;
 }
+
+// ----- Public types -----------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NodeExecEvent {
     pub color: Color,
     pub node_id: String,
-    /// Encoded lane path; JSON array of LaneFrame. Empty string for
-    /// nodes with no expand/gather context.
+    /// Encoded lane path; JSON array of LaneFrame. Empty string
+    /// for nodes with no expand/gather context.
     pub lane: String,
     pub kind: NodeExecKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]

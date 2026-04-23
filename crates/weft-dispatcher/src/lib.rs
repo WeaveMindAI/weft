@@ -17,6 +17,8 @@ pub mod config;
 pub mod events;
 pub mod journal;
 pub mod project_store;
+pub mod scheduler;
+pub mod slots;
 pub mod state;
 
 pub use config::DispatcherConfig;

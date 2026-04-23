@@ -1,0 +1,52 @@
+{
+  "type": "HumanTrigger",
+  "label": "Human Trigger",
+  "description": "Start an execution when a human submits a form. Form fields determine the output ports via form_field_specs.",
+  "category": "Triggers",
+  "tags": ["human", "form", "trigger", "manual"],
+  "icon": "User",
+  "color": "#22c55e",
+  "inputs": [],
+  "outputs": [],
+  "fields": [
+    {
+      "key": "title",
+      "label": "Title",
+      "field_type": { "kind": "text" },
+      "placeholder": "Submit",
+      "description": "Title the user sees at the top of the form."
+    },
+    {
+      "key": "description",
+      "label": "Description",
+      "field_type": { "kind": "textarea" },
+      "description": "Description shown under the title."
+    },
+    {
+      "key": "fields",
+      "label": "Form fields",
+      "field_type": { "kind": "form_builder" },
+      "required": true,
+      "description": "Each field contributes an output port per its fieldType (see form_field_specs)."
+    }
+  ],
+  "entrySignals": [
+    { "kind": "form", "is_resume": false }
+  ],
+  "requires_infra": false,
+  "features": {
+    "isTrigger": true,
+    "triggerCategory": "Manual",
+    "hasFormSchema": true
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "fields" } },
+      "then": {
+        "message": "HumanTrigger '{id}' has no form fields; the user would see an empty form.",
+        "level": "structural",
+        "field": "fields"
+      }
+    }
+  ]
+}

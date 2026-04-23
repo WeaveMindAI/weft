@@ -8,7 +8,7 @@ use axum::{extract::{Path, State}, http::StatusCode, Json};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::backend::{WakeContext, WakeKind};
+use crate::backend::WakeContext;
 use crate::state::DispatcherState;
 
 #[derive(Debug, Serialize)]
@@ -139,18 +139,72 @@ pub async fn complete_task(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("consume: {e}")))?;
 
-    let wake = WakeContext {
-        project_id: project_id_str.to_string(),
-        color,
-        resume_node: suspension.node.clone(),
-        resume_value: body,
-        kind: WakeKind::Resume,
-    };
-    state
-        .workers
-        .spawn_worker(&summary.binary_path, wake)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+    // Journal the fire. The worker's next fold will seed this
+    // delivery into its link via `pending_deliveries`.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = state
+        .journal
+        .record_event(&crate::journal::ExecEvent::SuspensionResolved {
+            color,
+            token: suspension.token.clone(),
+            value: body,
+            at_unix: now,
+        })
+        .await;
+
+    // Ensure a worker is alive for this color. Atomic via the slot
+    // mutex: only the first concurrent POST that sees `Idle` spawns.
+    let must_spawn = state
+        .slots
+        .with_slot(color, move |slot| {
+            Box::pin(async move {
+                if matches!(slot, crate::slots::Slot::Idle { .. }) {
+                    let mut q = match std::mem::replace(
+                        slot,
+                        crate::slots::Slot::Idle {
+                            queued: std::collections::VecDeque::new(),
+                        },
+                    ) {
+                        crate::slots::Slot::Idle { queued } => queued,
+                        _ => unreachable!(),
+                    };
+                    q.push_front(crate::slots::QueuedWake::Start(
+                        weft_core::primitive::WakeMessage::Resume,
+                    ));
+                    *slot = crate::slots::Slot::Starting { queued: q, worker: None };
+                    true
+                } else {
+                    false
+                }
+            })
+        })
+        .await;
+
+    if must_spawn {
+        let wake = WakeContext { project_id: project_id_str.to_string(), color };
+        let worker = state
+            .workers
+            .spawn_worker(&summary.binary_path, wake)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+        let _ = state
+            .journal
+            .record_event(&crate::journal::ExecEvent::WorkerSpawned { color, at_unix: now })
+            .await;
+        state
+            .slots
+            .with_slot(color, move |slot| {
+                Box::pin(async move {
+                    if let crate::slots::Slot::Starting { worker: w, .. } = slot {
+                        *w = Some(worker);
+                    }
+                })
+            })
+            .await;
+    }
 
     state
         .events

@@ -2,6 +2,62 @@
 
 import type { Diagnostic, ParseResponse } from './shared/protocol';
 
+/** Minimal SSE subscription handle. `EventSource` is a browser global
+ *  that VS Code's Node-based extension host doesn't ship, so we roll a
+ *  tiny client on top of `fetch` + ReadableStream (Node 18+). We only
+ *  parse `data:` lines (no `event:` / `id:` / `retry:` yet) because
+ *  the dispatcher only emits `data:` and blank-line delimiters. */
+export interface SseSubscription {
+    close: () => void;
+}
+
+function subscribeSse(
+    url: string,
+    onData: (data: string) => void,
+    onError?: (err: unknown) => void,
+): SseSubscription {
+    const controller = new AbortController();
+    let closed = false;
+    (async () => {
+        try {
+            const res = await fetch(url, {
+                headers: { accept: 'text/event-stream' },
+                signal: controller.signal,
+            });
+            if (!res.ok || !res.body) {
+                throw new Error(`SSE ${url}: ${res.status}`);
+            }
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = '';
+            while (!closed) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream: true });
+                // Dispatch every complete event (terminated by blank line).
+                let sep: number;
+                while ((sep = buf.indexOf('\n\n')) !== -1) {
+                    const raw = buf.slice(0, sep);
+                    buf = buf.slice(sep + 2);
+                    const dataLines = raw
+                        .split('\n')
+                        .filter((l) => l.startsWith('data:'))
+                        .map((l) => l.slice(5).replace(/^ /, ''));
+                    if (dataLines.length > 0) onData(dataLines.join('\n'));
+                }
+            }
+        } catch (err) {
+            if (!closed) onError?.(err);
+        }
+    })();
+    return {
+        close: () => {
+            closed = true;
+            controller.abort();
+        },
+    };
+}
+
 export class DispatcherClient {
   constructor(private baseUrl: string) {}
 
@@ -31,10 +87,10 @@ export class DispatcherClient {
     if (!res.ok && res.status !== 204) throw new Error(`DELETE ${path}: ${res.status}`);
   }
 
-  subscribe(path: string, onEvent: (ev: MessageEvent) => void): EventSource {
-    const es = new EventSource(`${this.baseUrl}${path}`);
-    es.onmessage = onEvent;
-    return es;
+  subscribe(path: string, onEvent: (ev: { data: string }) => void): SseSubscription {
+    return subscribeSse(`${this.baseUrl}${path}`, (data) => onEvent({ data }), (err) => {
+      console.warn('[weft/dispatcher] SSE subscription failed:', err);
+    });
   }
 
   async parse(source: string, projectId?: string): Promise<ParseResponse> {

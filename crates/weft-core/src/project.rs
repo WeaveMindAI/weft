@@ -134,12 +134,12 @@ pub struct NodeDefinition {
     /// need a registry lookup per node.
     #[serde(default)]
     pub features: crate::node::NodeFeatures,
-    /// Entry primitives this node declares (Webhook, Cron, Event,
-    /// Manual). Mirrored from NodeMetadata at enrich time so the
-    /// dispatcher can wire entry routing without re-looking-up the
+    /// Entry-use wake signals this node declares (Webhook, Cron,
+    /// Form, Socket). Mirrored from NodeMetadata at enrich time so
+    /// the dispatcher can register signals without re-looking-up the
     /// catalog at activation time.
-    #[serde(default)]
-    pub entry: Vec<crate::primitive::EntryPrimitive>,
+    #[serde(default, rename = "entrySignals", alias = "entry")]
+    pub entry_signals: Vec<crate::primitive::WakeSignalSpec>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +159,23 @@ pub struct NodeDefinition {
 
 fn default_config() -> Value {
     Value::Object(Default::default())
+}
+
+impl NodeDefinition {
+    /// Resolved `is_output` for this node instance. Reads
+    /// `config.is_output` (explicit author override) if set, else
+    /// falls back to `features.is_output_default` (node-type default).
+    ///
+    /// Load-bearing: the dispatcher collects every `is_output()` node
+    /// when computing the run subgraph (see docs/v2-design.md section
+    /// 3.0). Flipping this bit changes what the runtime considers a
+    /// "production target" of a run.
+    pub fn is_output(&self) -> bool {
+        if let Some(v) = self.config.get("is_output").and_then(|v| v.as_bool()) {
+            return v;
+        }
+        self.features.is_output_default
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

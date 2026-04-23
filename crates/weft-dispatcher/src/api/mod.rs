@@ -17,7 +17,7 @@ use axum::{routing::{get, post}, Router};
 
 use crate::state::DispatcherState;
 
-mod project;
+pub mod project;
 mod execution;
 mod events;
 mod webhook;
@@ -26,6 +26,7 @@ mod extension;
 mod dashboard;
 mod describe;
 mod parse;
+pub mod ws;
 
 pub fn router(state: DispatcherState) -> Router {
     Router::new()
@@ -35,11 +36,7 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/projects/{id}/activate", post(project::activate))
         .route("/projects/{id}/deactivate", post(project::deactivate))
         .route("/executions/{color}/cancel", post(execution::cancel))
-        .route("/executions/{color}/cost", post(execution::record_cost))
-        .route("/executions/{color}/suspensions", post(execution::record_suspension))
-        .route("/executions/{color}/status", post(execution::report_status))
-        .route("/executions/{color}/logs", post(execution::append_log).get(execution::list_logs))
-        .route("/executions/{color}/events", post(execution::record_node_event))
+        .route("/executions/{color}/logs", get(execution::list_logs))
         .route("/executions/{color}/replay", get(execution::replay))
         .route(
             "/executions/{color}",
@@ -67,5 +64,6 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/describe/project/{id}", get(describe::project_catalog))
         .route("/parse", post(parse::parse))
         .route("/validate", post(parse::validate))
+        .route("/ws/executions/{color}", get(ws::connect))
         .with_state(state)
 }

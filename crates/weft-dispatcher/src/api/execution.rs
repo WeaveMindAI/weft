@@ -1,12 +1,14 @@
-//! Execution lifecycle handlers. Workers POST to these endpoints
-//! while they run; the CLI, VS Code extension, and dashboard GET /
-//! subscribe to learn about state changes.
+//! Execution state read endpoints. Writers (cost, log, suspension,
+//! node events, status) live on the worker-to-dispatcher WebSocket
+//! in `api::ws`. What's left here is: cancel (control), delete
+//! (cleanup), and the reader endpoints the CLI, VS Code extension,
+//! and dashboard hit over HTTP: logs, replay, list_executions, get.
 
 use axum::{extract::{Path, State}, http::StatusCode, Json};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
-use weft_core::{Color, CostReport};
+use weft_core::Color;
 
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
@@ -34,161 +36,6 @@ pub async fn cancel(
 pub async fn get(State(_state): State<DispatcherState>, Path(_color): Path<String>) -> Json<Value> {
     // Phase B: execution status + cost aggregation.
     Json(serde_json::json!({ "status": "unknown" }))
-}
-
-pub async fn record_cost(
-    State(state): State<DispatcherState>,
-    Path(color_str): Path<String>,
-    Json(report): Json<CostReport>,
-) -> Result<StatusCode, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let report_for_event = report.clone();
-    state
-        .journal
-        .record_cost(color, report)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if let Ok(Some(project_id)) = state.journal.execution_project(color).await {
-        state
-            .events
-            .publish(DispatcherEvent::CostReported {
-                color,
-                project_id,
-                service: report_for_event.service,
-                amount_usd: report_for_event.amount_usd,
-            })
-            .await;
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SuspensionRequest {
-    pub node_id: String,
-    pub project_id: String,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SuspensionResponse {
-    /// Opaque token the worker surfaces to humans. For a form
-    /// suspension, the public URL is `{dispatcher}/f/{token}`.
-    pub token: String,
-    /// Full form URL ready to serve to humans.
-    pub form_url: String,
-}
-
-pub async fn record_suspension(
-    State(state): State<DispatcherState>,
-    Path(color_str): Path<String>,
-    Json(req): Json<SuspensionRequest>,
-) -> Result<Json<SuspensionResponse>, (StatusCode, String)> {
-    let color: Color = color_str
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
-
-    // Stamp project_id into metadata so the form handler can find
-    // the binary to spawn when the submission lands.
-    let mut metadata = req.metadata;
-    if let Some(obj) = metadata.as_object_mut() {
-        obj.insert("project_id".into(), Value::String(req.project_id.clone()));
-    } else {
-        metadata = serde_json::json!({
-            "project_id": req.project_id,
-            "original": metadata,
-        });
-    }
-
-    let metadata_for_event = metadata.clone();
-    let token = state
-        .journal
-        .record_suspension(color, &req.node_id, metadata)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-
-    state
-        .events
-        .publish(DispatcherEvent::ExecutionSuspended {
-            color,
-            node: req.node_id.clone(),
-            token: token.clone(),
-            metadata: metadata_for_event,
-            project_id: req.project_id.clone(),
-        })
-        .await;
-
-    let form_url = format!("http://localhost:{}/f/{}", state.config.http_port, token);
-    Ok(Json(SuspensionResponse { token, form_url }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StatusReport {
-    Started { entry_node: String },
-    Completed { outputs: Value },
-    Failed { error: String },
-}
-
-pub async fn report_status(
-    State(state): State<DispatcherState>,
-    Path(color_str): Path<String>,
-    Json(report): Json<StatusReport>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let color: Color = color_str
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
-    let project_id = state
-        .journal
-        .execution_project(color)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "unknown color".into()))?;
-
-    let event = match report {
-        StatusReport::Started { entry_node } => DispatcherEvent::ExecutionStarted {
-            color,
-            entry_node,
-            project_id,
-        },
-        StatusReport::Completed { outputs } => DispatcherEvent::ExecutionCompleted {
-            color,
-            project_id,
-            outputs,
-        },
-        StatusReport::Failed { error } => DispatcherEvent::ExecutionFailed {
-            color,
-            project_id,
-            error,
-        },
-    };
-    state.events.publish(event).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LogLineIn {
-    #[serde(default = "default_level")]
-    pub level: String,
-    pub message: String,
-}
-
-fn default_level() -> String {
-    "info".into()
-}
-
-pub async fn append_log(
-    State(state): State<DispatcherState>,
-    Path(color_str): Path<String>,
-    Json(line): Json<LogLineIn>,
-) -> Result<StatusCode, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    state
-        .journal
-        .append_log(color, &line.level, &line.message)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Serialize)]
@@ -220,95 +67,8 @@ pub async fn list_logs(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct NodeEventIn {
-    pub node_id: String,
-    #[serde(default)]
-    pub lane: String,
-    pub kind: String,
-    #[serde(default)]
-    pub input: Option<Value>,
-    #[serde(default)]
-    pub output: Option<Value>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-pub async fn record_node_event(
-    State(state): State<DispatcherState>,
-    Path(color_str): Path<String>,
-    Json(body): Json<NodeEventIn>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let color: Color = color_str
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
-    let Some(kind) = crate::journal::NodeExecKind::parse(&body.kind) else {
-        return Err((StatusCode::BAD_REQUEST, format!("bad kind: {}", body.kind)));
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let event = crate::journal::NodeExecEvent {
-        color,
-        node_id: body.node_id.clone(),
-        lane: body.lane.clone(),
-        kind,
-        input: body.input.clone(),
-        output: body.output.clone(),
-        error: body.error.clone(),
-        at_unix: now,
-    };
-    state
-        .journal
-        .record_node_event(&event)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-
-    let project_id = state
-        .journal
-        .execution_project(color)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let bus_event = match kind {
-        crate::journal::NodeExecKind::Started => crate::events::DispatcherEvent::NodeStarted {
-            color,
-            node: body.node_id,
-            lane: body.lane,
-            input: body.input.unwrap_or(Value::Null),
-            project_id,
-        },
-        crate::journal::NodeExecKind::Completed => {
-            crate::events::DispatcherEvent::NodeCompleted {
-                color,
-                node: body.node_id,
-                lane: body.lane,
-                output: body.output.unwrap_or(Value::Null),
-                project_id,
-            }
-        }
-        crate::journal::NodeExecKind::Failed => crate::events::DispatcherEvent::NodeFailed {
-            color,
-            node: body.node_id,
-            lane: body.lane,
-            error: body.error.unwrap_or_default(),
-            project_id,
-        },
-        crate::journal::NodeExecKind::Skipped => crate::events::DispatcherEvent::NodeSkipped {
-            color,
-            node: body.node_id,
-            lane: body.lane,
-            project_id,
-        },
-    };
-    state.events.publish(bus_event).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Replay a past execution: returns all node events in order so the
-/// webview can animate the execution from its beginning.
+/// Replay a past execution: returns all node events in order so
+/// the webview can animate the execution from its beginning.
 pub async fn replay(
     State(state): State<DispatcherState>,
     Path(color_str): Path<String>,
@@ -322,7 +82,6 @@ pub async fn replay(
     Ok(Json(events))
 }
 
-/// List past executions; for `weft replay` picker and weft clean.
 pub async fn list_executions(
     State(state): State<DispatcherState>,
 ) -> Result<Json<Vec<crate::journal::ExecutionSummary>>, StatusCode> {

@@ -1,8 +1,12 @@
 //! End-to-end compile + enrich tests against the stdlib catalog.
 
+use weft_catalog::{stdlib_catalog, FsCatalog};
 use weft_compiler::enrich::enrich;
 use weft_compiler::weft_compiler::compile;
-use weft_stdlib::StdlibCatalog;
+
+fn catalog() -> FsCatalog {
+    stdlib_catalog().expect("stdlib")
+}
 
 #[test]
 fn enrich_text_debug_chain() {
@@ -15,7 +19,7 @@ out = Debug
 out.data = greeting.value
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
-    enrich(&mut project, &StdlibCatalog).expect("enrich");
+    enrich(&mut project, &catalog()).expect("enrich");
 
     let text = project.nodes.iter().find(|n| n.id == "greeting").unwrap();
     assert_eq!(text.node_type, "Text");
@@ -39,7 +43,7 @@ sink = Debug
 sink.data = hello.value
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
-    enrich(&mut project, &StdlibCatalog).expect("enrich");
+    enrich(&mut project, &catalog()).expect("enrich");
 
     let sink = project.nodes.iter().find(|n| n.id == "sink").unwrap();
     let value_port = sink.inputs.iter().find(|p| p.name == "data").unwrap();
@@ -61,7 +65,7 @@ fn enrich_rejects_unknown_node_type() {
 bad = NotARealNode
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
-    let err = enrich(&mut project, &StdlibCatalog).unwrap_err();
+    let err = enrich(&mut project, &catalog()).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("NotARealNode"), "expected NotARealNode in error, got: {msg}");
 }

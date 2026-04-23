@@ -14,6 +14,7 @@
   "entry": [],
   "requires_infra": false,
   "features": {
-    "showDebugPreview": true
+    "showDebugPreview": true,
+    "isOutputDefault": true
   }
 }

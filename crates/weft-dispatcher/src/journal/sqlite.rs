@@ -1,5 +1,7 @@
 //! Sqlite-backed journal. Single file under the dispatcher's
-//! data_dir. Schema is minimal and grows as needed.
+//! data_dir. Execution state lives entirely in the `exec_event`
+//! table; other tables are lookup indexes (tokens) that the event
+//! log doesn't replace.
 
 use std::path::Path;
 
@@ -8,8 +10,9 @@ use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
-use weft_core::{Color, CostReport};
+use weft_core::Color;
 
+use crate::journal::events::ExecEvent;
 use crate::journal::{
     EntryKind, EntryTarget, ExecutionSummary, ExtToken, Journal, LogEntry, NodeExecEvent,
     NodeExecKind, OpenSuspension, WakeTarget,
@@ -29,22 +32,23 @@ impl SqliteJournal {
 
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS execution (
-                color TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                entry_node TEXT NOT NULL,
-                status TEXT NOT NULL,
-                started_at INTEGER NOT NULL,
-                completed_at INTEGER
+            CREATE TABLE IF NOT EXISTS exec_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                color TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_exec_event_color
+                ON exec_event(color, id);
 
             CREATE TABLE IF NOT EXISTS suspension (
                 token TEXT PRIMARY KEY,
                 color TEXT NOT NULL,
                 node TEXT NOT NULL,
                 metadata TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY (color) REFERENCES execution(color)
+                created_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS entry_token (
@@ -66,43 +70,6 @@ impl SqliteJournal {
                 metadata TEXT,
                 created_at INTEGER NOT NULL
             );
-
-            CREATE TABLE IF NOT EXISTS node_exec_event (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                color TEXT NOT NULL,
-                node_id TEXT NOT NULL,
-                lane TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                input_json TEXT,
-                output_json TEXT,
-                error TEXT,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_node_exec_event_color
-                ON node_exec_event(color);
-
-            CREATE TABLE IF NOT EXISTS log_entry (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                color TEXT NOT NULL,
-                level TEXT NOT NULL,
-                message TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_log_entry_color
-                ON log_entry(color);
-
-            CREATE TABLE IF NOT EXISTS cost_event (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                color TEXT NOT NULL,
-                service TEXT NOT NULL,
-                model TEXT,
-                amount_usd REAL NOT NULL,
-                metadata TEXT,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY (color) REFERENCES execution(color)
-            );
             "#,
         )
         .execute(&pool)
@@ -114,45 +81,67 @@ impl SqliteJournal {
 
 #[async_trait]
 impl Journal for SqliteJournal {
-    async fn record_start(
-        &self,
-        color: Color,
-        project_id: &str,
-        entry_node: &str,
-    ) -> anyhow::Result<()> {
+    // ---------- Event log ----------
+
+    async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(event)?;
         sqlx::query(
-            "INSERT OR REPLACE INTO execution (color, project_id, entry_node, status, started_at) \
-             VALUES (?, ?, ?, 'running', ?)",
+            "INSERT INTO exec_event (color, kind, payload_json, created_at) VALUES (?, ?, ?, ?)",
         )
-        .bind(color.to_string())
-        .bind(project_id)
-        .bind(entry_node)
+        .bind(event.color().to_string())
+        .bind(event.kind_str())
+        .bind(payload)
         .bind(now_unix() as i64)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn record_suspension(
+    async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload_json FROM exec_event WHERE color = ? ORDER BY id ASC",
+        )
+        .bind(color.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (payload,) in rows {
+            match serde_json::from_str::<ExecEvent>(&payload) {
+                Ok(ev) => out.push(ev),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "weft_dispatcher::journal",
+                        color = %color, error = %e,
+                        "skip malformed event payload",
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // ---------- Suspension lookup ----------
+
+    async fn record_suspension_with_token(
         &self,
+        token: &str,
         color: Color,
         node: &str,
         metadata: Value,
-    ) -> anyhow::Result<String> {
-        let token = uuid::Uuid::new_v4().to_string();
+    ) -> anyhow::Result<()> {
         let metadata_str = serde_json::to_string(&metadata)?;
         sqlx::query(
             "INSERT INTO suspension (token, color, node, metadata, created_at) \
              VALUES (?, ?, ?, ?, ?)",
         )
-        .bind(&token)
+        .bind(token)
         .bind(color.to_string())
         .bind(node)
         .bind(metadata_str)
         .bind(now_unix() as i64)
         .execute(&self.pool)
         .await?;
-        Ok(token)
+        Ok(())
     }
 
     async fn resolve_wake(&self, token: &str) -> anyhow::Result<Option<WakeTarget>> {
@@ -178,6 +167,30 @@ impl Journal for SqliteJournal {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>> {
+        let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT token, color, node, metadata, created_at FROM suspension \
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (token, color_str, node, metadata_str, created_at) in rows {
+            let Ok(color) = color_str.parse::<Color>() else { continue };
+            let metadata: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+            out.push(OpenSuspension {
+                token,
+                color,
+                node,
+                metadata,
+                created_at: created_at as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    // ---------- Entry tokens ----------
 
     async fn mint_entry_token(
         &self,
@@ -236,82 +249,7 @@ impl Journal for SqliteJournal {
         Ok(())
     }
 
-    async fn record_cost(&self, color: Color, report: CostReport) -> anyhow::Result<()> {
-        let metadata_str = serde_json::to_string(&report.metadata)?;
-        sqlx::query(
-            "INSERT INTO cost_event (color, service, model, amount_usd, metadata, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(color.to_string())
-        .bind(&report.service)
-        .bind(&report.model)
-        .bind(report.amount_usd)
-        .bind(metadata_str)
-        .bind(now_unix() as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn cancel(&self, color: Color) -> anyhow::Result<()> {
-        let color_str = color.to_string();
-        sqlx::query("DELETE FROM suspension WHERE color = ?")
-            .bind(&color_str)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("UPDATE execution SET status = 'cancelled', completed_at = ? WHERE color = ?")
-            .bind(now_unix() as i64)
-            .bind(&color_str)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT project_id FROM execution WHERE color = ?")
-                .bind(color.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(p,)| p))
-    }
-
-    async fn append_log(
-        &self,
-        color: Color,
-        level: &str,
-        message: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO log_entry (color, level, message, created_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(color.to_string())
-        .bind(level)
-        .bind(message)
-        .bind(now_unix() as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
-        let rows: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT created_at, level, message FROM log_entry \
-             WHERE color = ? ORDER BY id ASC LIMIT ?",
-        )
-        .bind(color.to_string())
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(at, level, message)| LogEntry {
-                at_unix: at as u64,
-                level,
-                message,
-            })
-            .collect())
-    }
+    // ---------- Extension tokens ----------
 
     async fn mint_ext_token(
         &self,
@@ -368,75 +306,101 @@ impl Journal for SqliteJournal {
         Ok(())
     }
 
-    async fn record_node_event(&self, event: &NodeExecEvent) -> anyhow::Result<()> {
-        let input_str = event
-            .input
-            .as_ref()
-            .map(|v| serde_json::to_string(v))
-            .transpose()?;
-        let output_str = event
-            .output
-            .as_ref()
-            .map(|v| serde_json::to_string(v))
-            .transpose()?;
-        sqlx::query(
-            "INSERT INTO node_exec_event (color, node_id, lane, kind, input_json, output_json, error, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    // ---------- Derived views over the event log ----------
+
+    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT payload_json FROM exec_event \
+             WHERE color = ? AND kind = 'execution_started' \
+             ORDER BY id ASC LIMIT 1",
         )
-        .bind(event.color.to_string())
-        .bind(&event.node_id)
-        .bind(&event.lane)
-        .bind(event.kind.as_str())
-        .bind(input_str)
-        .bind(output_str)
-        .bind(event.error.as_deref())
-        .bind(event.at_unix as i64)
-        .execute(&self.pool)
+        .bind(color.to_string())
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        let Some((payload,)) = row else { return Ok(None) };
+        let ev: ExecEvent = serde_json::from_str(&payload)?;
+        Ok(match ev {
+            ExecEvent::ExecutionStarted { project_id, .. } => Some(project_id),
+            _ => None,
+        })
+    }
+
+    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload_json FROM exec_event \
+             WHERE color = ? AND kind = 'log_line' \
+             ORDER BY id ASC LIMIT ?",
+        )
+        .bind(color.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (payload,) in rows {
+            if let Ok(ExecEvent::LogLine { level, message, at_unix, .. }) =
+                serde_json::from_str::<ExecEvent>(&payload)
+            {
+                out.push(LogEntry { at_unix, level, message });
+            }
+        }
+        Ok(out)
     }
 
     async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>> {
-        let rows: Vec<(String, String, String, Option<String>, Option<String>, Option<String>, i64)> =
-            sqlx::query_as(
-                "SELECT node_id, lane, kind, input_json, output_json, error, created_at \
-                 FROM node_exec_event WHERE color = ? ORDER BY id ASC",
-            )
-            .bind(color.to_string())
-            .fetch_all(&self.pool)
-            .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload_json FROM exec_event \
+             WHERE color = ? AND kind IN ('node_started', 'node_completed', 'node_failed', 'node_skipped') \
+             ORDER BY id ASC",
+        )
+        .bind(color.to_string())
+        .fetch_all(&self.pool)
+        .await?;
         let mut out = Vec::with_capacity(rows.len());
-        for (node_id, lane, kind, input, output, error, at) in rows {
-            let Some(kind) = NodeExecKind::parse(&kind) else { continue };
-            let input_v = input
-                .map(|s| serde_json::from_str(&s).unwrap_or(Value::Null));
-            let output_v = output
-                .map(|s| serde_json::from_str(&s).unwrap_or(Value::Null));
-            out.push(NodeExecEvent {
+        for (payload,) in rows {
+            let Ok(ev) = serde_json::from_str::<ExecEvent>(&payload) else { continue };
+            if let Some(converted) = exec_event_to_node_exec(&ev) {
+                out.push(converted);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>> {
+        // Collect every ExecutionStarted to get the base rows, then
+        // walk forward per color to compute status + completed_at.
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload_json FROM exec_event \
+             WHERE kind = 'execution_started' \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (payload,) in rows {
+            let Ok(ev) = serde_json::from_str::<ExecEvent>(&payload) else { continue };
+            let ExecEvent::ExecutionStarted { color, project_id, entry_node, at_unix } = ev else {
+                continue;
+            };
+            let (status, completed_at) = terminal_for_color(&self.pool, color).await?;
+            out.push(ExecutionSummary {
                 color,
-                node_id,
-                lane,
-                kind,
-                input: input_v,
-                output: output_v,
-                error,
-                at_unix: at as u64,
+                project_id,
+                entry_node,
+                status,
+                started_at: at_unix,
+                completed_at,
             });
         }
         Ok(out)
     }
 
+    // ---------- Administrative ----------
+
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
         let s = color.to_string();
-        sqlx::query("DELETE FROM node_exec_event WHERE color = ?")
-            .bind(&s)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM log_entry WHERE color = ?")
-            .bind(&s)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM cost_event WHERE color = ?")
+        sqlx::query("DELETE FROM exec_event WHERE color = ?")
             .bind(&s)
             .execute(&self.pool)
             .await?;
@@ -444,57 +408,116 @@ impl Journal for SqliteJournal {
             .bind(&s)
             .execute(&self.pool)
             .await?;
-        sqlx::query("DELETE FROM execution WHERE color = ?")
-            .bind(&s)
-            .execute(&self.pool)
-            .await?;
         Ok(())
     }
 
-    async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>> {
-        let rows: Vec<(String, String, String, String, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT color, project_id, entry_node, status, started_at, completed_at \
-             FROM execution ORDER BY started_at DESC LIMIT ?",
-        )
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (color_str, project_id, entry_node, status, started_at, completed_at) in rows {
-            let Ok(color) = color_str.parse::<Color>() else { continue };
-            out.push(ExecutionSummary {
-                color,
-                project_id,
-                entry_node,
-                status,
-                started_at: started_at as u64,
-                completed_at: completed_at.map(|v| v as u64),
-            });
-        }
-        Ok(out)
+    async fn cancel(&self, color: Color) -> anyhow::Result<()> {
+        // Drop any live suspensions for this color and append a
+        // cancellation failure event. Workers poll nothing yet (a
+        // full cancel protocol lands in Phase B); for now the event
+        // is the record.
+        sqlx::query("DELETE FROM suspension WHERE color = ?")
+            .bind(color.to_string())
+            .execute(&self.pool)
+            .await?;
+        self.record_event(&ExecEvent::ExecutionFailed {
+            color,
+            error: "cancelled".into(),
+            at_unix: now_unix(),
+        })
+        .await
     }
+}
 
-    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>> {
-        let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
-            "SELECT token, color, node, metadata, created_at FROM suspension \
-             ORDER BY created_at ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (token, color_str, node, metadata_str, created_at) in rows {
-            let Ok(color) = color_str.parse::<Color>() else { continue };
-            let metadata: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
-            out.push(OpenSuspension {
-                token,
-                color,
-                node,
-                metadata,
-                created_at: created_at as u64,
-            });
+// ----- Helpers --------------------------------------------------------
+
+/// Compute `(status, completed_at)` for a color by walking its
+/// event log for the most recent terminal or parking event.
+async fn terminal_for_color(
+    pool: &SqlitePool,
+    color: Color,
+) -> anyhow::Result<(String, Option<u64>)> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload_json FROM exec_event \
+         WHERE color = ? AND kind IN ('execution_completed', 'execution_failed', 'stalled') \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(color.to_string())
+    .fetch_all(pool)
+    .await?;
+    if let Some((payload,)) = rows.into_iter().next() {
+        if let Ok(ev) = serde_json::from_str::<ExecEvent>(&payload) {
+            match ev {
+                ExecEvent::ExecutionCompleted { at_unix, .. } => {
+                    return Ok(("completed".into(), Some(at_unix)));
+                }
+                ExecEvent::ExecutionFailed { at_unix, .. } => {
+                    return Ok(("failed".into(), Some(at_unix)));
+                }
+                ExecEvent::Stalled { at_unix, .. } => {
+                    return Ok(("stalled".into(), Some(at_unix)));
+                }
+                _ => {}
+            }
         }
-        Ok(out)
     }
+    Ok(("running".into(), None))
+}
+
+fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
+    let (color, node_id, lane, kind, input, output, error, at_unix) = match ev {
+        ExecEvent::NodeStarted { color, node_id, lane, input, at_unix, .. } => (
+            *color,
+            node_id.clone(),
+            serde_json::to_string(lane).unwrap_or_default(),
+            NodeExecKind::Started,
+            Some(input.clone()),
+            None,
+            None,
+            *at_unix,
+        ),
+        ExecEvent::NodeCompleted { color, node_id, lane, output, at_unix } => (
+            *color,
+            node_id.clone(),
+            serde_json::to_string(lane).unwrap_or_default(),
+            NodeExecKind::Completed,
+            None,
+            Some(output.clone()),
+            None,
+            *at_unix,
+        ),
+        ExecEvent::NodeFailed { color, node_id, lane, error, at_unix } => (
+            *color,
+            node_id.clone(),
+            serde_json::to_string(lane).unwrap_or_default(),
+            NodeExecKind::Failed,
+            None,
+            None,
+            Some(error.clone()),
+            *at_unix,
+        ),
+        ExecEvent::NodeSkipped { color, node_id, lane, at_unix } => (
+            *color,
+            node_id.clone(),
+            serde_json::to_string(lane).unwrap_or_default(),
+            NodeExecKind::Skipped,
+            None,
+            None,
+            None,
+            *at_unix,
+        ),
+        _ => return None,
+    };
+    Some(NodeExecEvent {
+        color,
+        node_id,
+        lane,
+        kind,
+        input,
+        output,
+        error,
+        at_unix,
+    })
 }
 
 fn now_unix() -> u64 {

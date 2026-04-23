@@ -6,23 +6,192 @@
 //! for each rule documented at the helper function that implements
 //! it.
 
+use weft_core::node::{
+    Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
+};
+use weft_core::project::NodeDefinition;
 use weft_core::ProjectDefinition;
 
 use crate::{Diagnostic, Severity};
 
+/// Which validation rules to run. `Structural` checks only editor-
+/// time errors (graph shape, required ports wired or satisfied by a
+/// literal, config shape). `Runtime` additionally runs rules flagged
+/// `level: runtime` (e.g. missing credentials), which we deliberately
+/// skip during editing so an AI builder or human-in-the-loop can
+/// sketch a project without filling every secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationMode {
+    Structural,
+    Runtime,
+}
+
 /// Run every validation rule against an enriched project and collect
 /// all diagnostics. Returns an empty vector for a clean program.
-pub fn validate(project: &ProjectDefinition) -> Vec<Diagnostic> {
+/// `catalog` provides per-node metadata (including declarative
+/// `validate` rules).
+pub fn validate(project: &ProjectDefinition, catalog: &dyn MetadataCatalog) -> Vec<Diagnostic> {
+    validate_with_mode(project, catalog, ValidationMode::Structural)
+}
+
+pub fn validate_with_mode(
+    project: &ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    mode: ValidationMode,
+) -> Vec<Diagnostic> {
     let mut d = Vec::new();
     check_duplicates(project, &mut d);
     check_edge_node_refs(project, &mut d);
     check_scope_reachability(project, &mut d);
     check_port_resolution(project, &mut d);
     check_type_compat(project, &mut d);
-    check_port_coverage(project, &mut d);
+    check_port_coverage(project, catalog, &mut d);
     check_lane_mechanics(project, &mut d);
     check_warnings(project, &mut d);
+    check_declarative_rules(project, catalog, mode, &mut d);
     d
+}
+
+/// Evaluate each node's declarative `validate` rules from its
+/// metadata, emit Diagnostics for rules that fire. Safe by
+/// construction: the grammar is closed, no user Rust runs here.
+fn check_declarative_rules(
+    project: &ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    mode: ValidationMode,
+    out: &mut Vec<Diagnostic>,
+) {
+    for node in &project.nodes {
+        let Some(meta) = catalog.lookup(&node.node_type) else { continue };
+        for rule in &meta.validate {
+            // Skip runtime-only rules in structural mode. Structural
+            // mode is the editor path; runtime rules fire at run time.
+            if matches!(rule.then.level, ValidationLevel::Runtime)
+                && mode == ValidationMode::Structural
+            {
+                continue;
+            }
+            if eval_condition(&rule.when, node, project) {
+                emit_rule_diagnostic(node, rule, out);
+            }
+        }
+    }
+}
+
+fn eval_condition(cond: &Condition, node: &NodeDefinition, project: &ProjectDefinition) -> bool {
+    match cond {
+        Condition::InputSatisfied { port } => input_satisfied(node, project, port),
+        Condition::InputWired { port } => has_incoming_edge(node, project, port),
+        Condition::InputSourceType { port, equals } => {
+            // Vacuously true if the port has no wired edges (use
+            // `all(input_wired, input_source_type)` to require both).
+            let sources: Vec<&NodeDefinition> = project
+                .edges
+                .iter()
+                .filter(|e| e.target == node.id && e.target_handle.as_deref() == Some(port))
+                .filter_map(|e| project.nodes.iter().find(|n| n.id == e.source))
+                .collect();
+            sources.iter().all(|n| &n.node_type == equals)
+        }
+        Condition::ConfigPresent { field } => node
+            .config
+            .get(field)
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        Condition::ConfigNonempty { field } => is_nonempty(node.config.get(field)),
+        Condition::ConfigEquals { field, equals } => {
+            node.config.get(field).map(|v| v == equals).unwrap_or(false)
+        }
+        Condition::ConfigInSet { field, values } => node
+            .config
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(|s| values.iter().any(|v| v == s))
+            .unwrap_or(false),
+        Condition::ConfigMatches { field, regex } => node
+            .config
+            .get(field)
+            .and_then(|v| v.as_str())
+            .and_then(|s| regex::Regex::new(regex).ok().map(|r| r.is_match(s)))
+            .unwrap_or(true),
+        Condition::All { of } => of.iter().all(|c| eval_condition(c, node, project)),
+        Condition::Any { of } => of.iter().any(|c| eval_condition(c, node, project)),
+        Condition::Not { of } => !eval_condition(of, node, project),
+    }
+}
+
+/// Port is "satisfied" if either (a) it has a wired incoming edge,
+/// or (b) the port is `configurable` and the node's config has a
+/// non-null same-named field. This covers `Llm { prompt: "hi" }`
+/// where prompt is provided by a literal rather than a wire.
+fn input_satisfied(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
+    if has_incoming_edge(node, project, port) {
+        return true;
+    }
+    let is_configurable = node
+        .inputs
+        .iter()
+        .find(|p| p.name == port)
+        .map(|p| p.configurable)
+        .unwrap_or(false);
+    if !is_configurable {
+        return false;
+    }
+    node.config
+        .get(port)
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+}
+
+fn has_incoming_edge(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
+    project
+        .edges
+        .iter()
+        .any(|e| e.target == node.id && e.target_handle.as_deref() == Some(port))
+}
+
+fn is_nonempty(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::Object(o)) => !o.is_empty(),
+        Some(_) => true,
+    }
+}
+
+fn emit_rule_diagnostic(node: &NodeDefinition, rule: &ValidationRule, out: &mut Vec<Diagnostic>) {
+    let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+    let severity = match rule.then.severity {
+        RuleSeverity::Error => Severity::Error,
+        RuleSeverity::Warning => Severity::Warning,
+        RuleSeverity::Info => Severity::Info,
+        RuleSeverity::Hint => Severity::Hint,
+    };
+    let message = interpolate(&rule.then.message, node, &rule.then);
+    out.push(Diagnostic {
+        line,
+        column: 0,
+        severity,
+        message,
+        code: Some(match rule.then.level {
+            ValidationLevel::Structural => "rule-structural".into(),
+            ValidationLevel::Runtime => "rule-runtime".into(),
+        }),
+    });
+}
+
+/// Replace `{id}`, `{port}`, `{field}` placeholders in the rule
+/// message with concrete values from the context.
+fn interpolate(template: &str, node: &NodeDefinition, diag: &RuleDiagnostic) -> String {
+    let mut s = template.replace("{id}", &node.id);
+    if let Some(p) = &diag.port {
+        s = s.replace("{port}", p);
+    }
+    if let Some(f) = &diag.field {
+        s = s.replace("{field}", f);
+    }
+    s
 }
 
 fn push(
@@ -378,7 +547,11 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 ///
 /// v1 refs: 3428-3470 (required + require_one_of), 3502-3506
 /// (wired-only), 4313-4319 (undeclared-no-custom).
-fn check_port_coverage(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+fn check_port_coverage(
+    project: &ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    d: &mut Vec<Diagnostic>,
+) {
     // Build "is this (node, port) driven by an edge?" lookup once.
     let driven: std::collections::HashSet<(String, String)> = project
         .edges
@@ -467,12 +640,20 @@ fn check_port_coverage(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 node.inputs.iter().map(|p| p.name.as_str()).collect();
             let known_outputs: std::collections::HashSet<&str> =
                 node.outputs.iter().map(|p| p.name.as_str()).collect();
+            // Metadata-declared fields are also valid config keys;
+            // their values either drive node behavior or resolve into
+            // a wake-signal spec (see WakeSignalKind::resolve_from_config).
+            let Some(meta) = catalog.lookup(&node.node_type) else { continue };
+            let known_fields: std::collections::HashSet<&str> =
+                meta.fields.iter().map(|f| f.key.as_str()).collect();
             for key in obj.keys() {
-                // Internal/compiler-injected keys.
                 if key == "parentId" || key == "fields" {
                     continue;
                 }
-                if known_inputs.contains(key.as_str()) || known_outputs.contains(key.as_str()) {
+                if known_inputs.contains(key.as_str())
+                    || known_outputs.contains(key.as_str())
+                    || known_fields.contains(key.as_str())
+                {
                     continue;
                 }
                 push(
@@ -481,7 +662,7 @@ fn check_port_coverage(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     Severity::Error,
                     "undeclared-port-no-custom",
                     format!(
-                        "node '{}' does not accept custom inputs; config key '{}' doesn't match any declared port",
+                        "node '{}' does not accept custom inputs; config key '{}' doesn't match any declared port or field",
                         node.id, key
                     ),
                 );

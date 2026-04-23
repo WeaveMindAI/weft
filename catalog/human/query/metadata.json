@@ -33,9 +33,19 @@
       "description": "Each field contributes inputs/outputs per its fieldType (see form_field_specs)."
     }
   ],
-  "entry": [],
+  "entrySignals": [],
   "requires_infra": false,
   "features": {
     "hasFormSchema": true
-  }
+  },
+  "validate": [
+    {
+      "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "fields" } },
+      "then": {
+        "message": "HumanQuery '{id}' has no form fields; the human would see an empty form.",
+        "level": "structural",
+        "field": "fields"
+      }
+    }
+  ]
 }

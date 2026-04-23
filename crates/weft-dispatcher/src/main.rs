@@ -37,7 +37,6 @@ async fn main() -> anyhow::Result<()> {
         config.http_port = port;
     }
 
-    let runner_path = resolve_runner_path();
     let self_url = format!("http://localhost:{}", config.http_port);
     let projects_dir = config.data_dir.join("projects");
     let projects = weft_dispatcher::ProjectStore::new(projects_dir)?;
@@ -49,10 +48,12 @@ async fn main() -> anyhow::Result<()> {
     let state = DispatcherState {
         config: Arc::new(config.clone()),
         journal: Arc::new(journal),
-        workers: Arc::new(SubprocessWorkerBackend::new(runner_path, self_url)),
+        workers: Arc::new(SubprocessWorkerBackend::new("", self_url)),
         infra: Arc::new(KindInfraBackend::new()),
         projects,
         events: weft_dispatcher::EventBus::new(),
+        slots: weft_dispatcher::slots::Slots::new(),
+        scheduler: weft_dispatcher::scheduler::Scheduler::new(),
     };
 
     let app = router(state);
@@ -63,23 +64,3 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Find the `weft-runner` binary. Resolution order:
-/// 1. `WEFT_RUNNER_PATH` env var (explicit override, always wins).
-/// 2. Sibling of the current executable (`install.sh` layout:
-///    weft / weft-dispatcher / weft-runner all in the same dir).
-/// 3. Plain `weft-runner`, resolved via $PATH by the subprocess
-///    backend.
-fn resolve_runner_path() -> String {
-    if let Ok(explicit) = std::env::var("WEFT_RUNNER_PATH") {
-        return explicit;
-    }
-    if let Ok(self_exe) = std::env::current_exe() {
-        if let Some(dir) = self_exe.parent() {
-            let candidate = dir.join("weft-runner");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-    "weft-runner".to_string()
-}

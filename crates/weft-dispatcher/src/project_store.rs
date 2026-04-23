@@ -54,12 +54,22 @@ impl ProjectStore {
         })
     }
 
-    pub async fn register(&self, project: ProjectDefinition) -> anyhow::Result<StoredProjectSummary> {
+    /// Register a project. `binary_path` is the absolute path to the
+    /// compiled project binary (emitted by `weft build`); the
+    /// dispatcher spawns it per wake. If `None`, we fall back to a
+    /// placeholder JSON path so `/projects/{id}` still returns
+    /// something (spawn will fail later with a readable error).
+    pub async fn register(
+        &self,
+        project: ProjectDefinition,
+        binary_path: Option<PathBuf>,
+    ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name = project.name.clone();
-        let binary_path = self.data_dir.join(format!("{id}.json"));
-        let json = serde_json::to_string_pretty(&project)?;
-        std::fs::write(&binary_path, json)?;
+        let binary_path = match binary_path {
+            Some(p) => p,
+            None => self.data_dir.join(format!("{id}.missing-binary")),
+        };
 
         let mut lock = self.inner.write().await;
         lock.insert(

@@ -1840,3 +1840,4 @@ out.data = draft.subject
     assert!(d_ports.contains(&"subject"), "draft missing subject: {:?}", d_ports);
     assert!(d_ports.contains(&"body"), "draft missing body: {:?}", d_ports);
 }
+
