@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wm-local
+  labels:
+    weft.dev/purpose: local-dev
+    weft.dev/owner: local

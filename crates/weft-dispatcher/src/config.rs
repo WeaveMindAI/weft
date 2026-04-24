@@ -23,10 +23,16 @@ pub struct DispatcherConfig {
 
 impl Default for DispatcherConfig {
     fn default() -> Self {
-        let home = dirs_data_dir().unwrap_or_else(|| PathBuf::from("."));
+        let data_dir = std::env::var_os("WEFT_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs_data_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("weft")
+            });
         Self {
             http_port: 9999,
-            data_dir: home.join("weft"),
+            data_dir,
             worker_backend: "subprocess".into(),
             infra_backend: "kind".into(),
         }

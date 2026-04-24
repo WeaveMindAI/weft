@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -9,6 +10,33 @@ use crate::error::{WeftError, WeftResult};
 use crate::lane::Lane;
 use crate::primitive::{CostReport, WakeSignalSpec};
 use crate::Color;
+
+/// Which lifecycle phase this invocation belongs to. v2 mirrors v1's
+/// three-runtime model: infra setup provisions long-lived resources
+/// (sidecars), trigger setup wires up listeners (opens subscriptions,
+/// registers URLs), and fire runs the regular execution subgraph.
+/// Nodes branch on this to do the right thing per phase.
+///
+/// - `InfraSetup`: an infra node is being provisioned. Only infra
+///   nodes run in this phase.
+/// - `TriggerSetup`: a trigger node (or its upstream) is being set
+///   up. Trigger nodes produce the wake-signal spec the listener
+///   should register.
+/// - `Fire`: the normal fire-time execution. Trigger nodes receive
+///   the payload, their outputs flow downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    InfraSetup,
+    TriggerSetup,
+    Fire,
+}
+
+impl Default for Phase {
+    fn default() -> Self {
+        Self::Fire
+    }
+}
 
 /// The per-execution context handed to `Node::execute`. Exposes the
 /// language's primitive surface (`await_signal` for mid-execution
@@ -35,6 +63,11 @@ pub struct ExecutionContext {
     pub lane: Lane,
     pub config: ConfigBag,
     pub input: InputBag,
+    /// Which lifecycle phase this invocation belongs to. Mirrors
+    /// v1's `isInfraSetup` / `isTriggerSetup` flags. Nodes use it
+    /// to branch their execute body between provisioning, wake-signal
+    /// registration, and regular fire.
+    pub phase: Phase,
     handle: Arc<dyn ContextHandle>,
 }
 
@@ -49,9 +82,10 @@ impl ExecutionContext {
         lane: Lane,
         config: ConfigBag,
         input: InputBag,
+        phase: Phase,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
-        Self { execution_id, project_id, node_id, node_type, node_label, color, lane, config, input, handle }
+        Self { execution_id, project_id, node_id, node_type, node_label, color, lane, config, input, phase, handle }
     }
 
     // ----- Suspension primitive --------------------------------------
@@ -65,6 +99,35 @@ impl ExecutionContext {
     /// contract violation (that's an entry-signal, not a wait).
     pub async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value> {
         self.handle.await_signal(spec).await
+    }
+
+    // ----- Entry-signal registration (TriggerSetup phase) ------------
+
+    /// Declare that when this node is live, the listener should watch
+    /// for the given wake signal. Called by trigger nodes during
+    /// `Phase::TriggerSetup`. Fire-and-forget: the dispatcher records
+    /// the spec and registers it with the per-project listener after
+    /// the sub-execution completes. Returns the user-facing URL (if
+    /// the signal kind has one).
+    ///
+    /// `spec.is_resume` must be `false` (entry signals are persistent,
+    /// not single-use lane-bound).
+    pub async fn register_signal(&self, spec: WakeSignalSpec) -> WeftResult<Option<String>> {
+        self.handle.register_signal(spec).await
+    }
+
+    // ----- Infra primitive ----------------------------------------
+
+    /// Retrieve the cluster-local endpoint URL of this node's
+    /// sidecar. Only valid for nodes declared `requires_infra: true`
+    /// and only after `weft infra up` has run. Returns an error
+    /// otherwise.
+    ///
+    /// Node code uses this to call its sidecar (e.g. POST /action,
+    /// GET /outputs, subscribe /live). The dispatcher resolves the
+    /// URL from its InfraRegistry so node code never touches k8s.
+    pub async fn sidecar_endpoint(&self) -> WeftResult<String> {
+        self.handle.sidecar_endpoint().await
     }
 
     // ----- Fire-and-forget primitives --------------------------------
@@ -177,6 +240,8 @@ impl InputBag {
 #[async_trait::async_trait]
 pub trait ContextHandle: Send + Sync {
     async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value>;
+    async fn register_signal(&self, spec: WakeSignalSpec) -> WeftResult<Option<String>>;
+    async fn sidecar_endpoint(&self) -> WeftResult<String>;
     fn report_cost(&self, report: CostReport);
     fn log(&self, level: LogLevel, message: String);
     fn is_cancelled(&self) -> bool;

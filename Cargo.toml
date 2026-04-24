@@ -7,6 +7,7 @@ members = [
     "crates/weft-cli",
     "crates/weft-engine",
     "crates/weft-catalog",
+    "crates/weft-listener",
 ]
 
 [workspace.package]

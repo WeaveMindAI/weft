@@ -2,13 +2,14 @@
 //! `KindInfraBackend` (local dev). The closed-source weavemind repo
 //! adds cloud implementations plugging into the same traits.
 
+pub mod k8s_worker;
 pub mod kind_infra;
 pub mod subprocess;
 
 pub use kind_infra::KindInfraBackend;
+pub use k8s_worker::K8sWorkerBackend;
 pub use subprocess::SubprocessWorkerBackend;
 
-use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -54,10 +55,69 @@ pub struct WorkerHandle {
 
 #[async_trait]
 pub trait InfraBackend: Send + Sync {
-    /// Provision an infra node per the given spec. Returns a handle.
+    /// Apply the sidecar's Deployment / Service / PVC manifests.
+    /// Called the first time a project's infra is brought up, and
+    /// again after `delete`. Idempotent: applying a spec that
+    /// already matches the cluster state is a no-op.
     async fn provision(&self, spec: InfraSpec) -> anyhow::Result<InfraHandle>;
 
-    async fn deprovision(&self, handle: InfraHandle) -> anyhow::Result<()>;
+    /// Scan the cluster for already-provisioned sidecars belonging
+    /// to weft projects and return their handles. Called on
+    /// dispatcher startup so a restart doesn't orphan resources.
+    /// Default is empty (backends that don't persist anything
+    /// external).
+    async fn rehydrate(&self) -> anyhow::Result<Vec<AdoptedHandle>> {
+        Ok(Vec::new())
+    }
+
+    /// Scale the sidecar's Deployment to 0 replicas. Keeps the
+    /// Deployment / Service / PVC in place so a subsequent
+    /// `scale_up` can bring the same instance (and its persisted
+    /// state) back without re-apply.
+    async fn scale_to_zero(&self, handle: &InfraHandle) -> anyhow::Result<()>;
+
+    /// Scale a previously-zeroed Deployment back to 1. Paired with
+    /// `scale_to_zero`; no-op if the Deployment is already running.
+    async fn scale_up(&self, handle: &InfraHandle) -> anyhow::Result<()>;
+
+    /// Block until the sidecar's `/health` endpoint answers 200 OK,
+    /// or the deadline passes. The dispatcher calls this after
+    /// `provision` / `scale_up` so the user-facing `start` response
+    /// only returns once a subsequent `activate` can safely query
+    /// `/outputs` without racing the Pod's readiness. Default impl
+    /// polls `{endpoint_url}/health` every 500ms.
+    async fn wait_ready(&self, handle: &InfraHandle) -> anyhow::Result<()> {
+        let Some(endpoint) = handle.endpoint_url.as_deref() else {
+            return Ok(());
+        };
+        let health = format!(
+            "{}/health",
+            endpoint.trim_end_matches('/').trim_end_matches("/action")
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let client = reqwest::Client::new();
+        loop {
+            if let Ok(resp) = client
+                .get(&health)
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("sidecar at {health} did not become ready within 60s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Delete every k8s resource owned by this handle: Deployment,
+    /// Service, Ingress, PVC. Idempotent. After `delete` the
+    /// instance's state is gone; `provision` has to apply fresh.
+    async fn delete(&self, handle: InfraHandle) -> anyhow::Result<()>;
 
     /// Stream events from an infra node back to the dispatcher.
     /// Events arrive as serialized JSON payloads.
@@ -68,14 +128,35 @@ pub trait InfraBackend: Send + Sync {
 pub struct InfraSpec {
     pub project_id: String,
     pub infra_node_id: String,
-    /// Reference to a `sidecar.toml` for this infra node.
-    pub sidecar_manifest: PathBuf,
+    /// Sidecar declaration mirrored from the node's metadata.
+    pub sidecar: weft_core::node::SidecarSpec,
+    /// Project's per-instance config overrides, read from the node
+    /// definition's config block. Backend handlers can use this for
+    /// env vars, resource limits, etc.
+    #[serde(default)]
     pub config: Value,
 }
 
 #[derive(Debug, Clone)]
 pub struct InfraHandle {
     pub id: String,
+    /// Cluster-local URL the sidecar is reachable at. Computed by
+    /// the backend at provision time (e.g. `http://<svc>.<ns>.svc.cluster.local:PORT`).
+    /// None only for backends that can't resolve until the pod is
+    /// scheduled; the dispatcher treats None as "not ready yet."
+    pub endpoint_url: Option<String>,
+}
+
+/// One (project, node) pair adopted from the cluster at startup.
+/// The dispatcher seeds these into `InfraRegistry` with the status
+/// implied by the Deployment's current replica count.
+#[derive(Debug, Clone)]
+pub struct AdoptedHandle {
+    pub project_id: String,
+    pub node_id: String,
+    pub handle: InfraHandle,
+    /// true when the Deployment is at replicas=1+, false when at 0.
+    pub running: bool,
 }
 
 pub type EventStream = tokio::sync::mpsc::Receiver<Value>;

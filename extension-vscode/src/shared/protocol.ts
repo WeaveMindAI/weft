@@ -34,13 +34,23 @@ export interface NodeDefinition {
   groupBoundary: { groupId: string; role: 'In' | 'Out' } | null;
   inputs: PortDefinition[];
   outputs: PortDefinition[];
+  // KEEP IN SYNC with `NodeFeatures` in
+  // `weft/crates/weft-core/src/node.rs`. A field that appears in
+  // one side but not the other will silently round-trip as
+  // undefined (Rust serde drops unknown metadata fields;
+  // JS reads missing fields as undefined). See the sync comment
+  // over NodeFeatures in node.rs for the full checklist.
   features: {
     oneOfRequired: string[][];
-    correlatedPorts: string[][];
     canAddInputPorts: boolean;
     canAddOutputPorts: boolean;
     hasFormSchema: boolean;
+    isTrigger?: boolean;
+    hasLiveData?: boolean;
+    showDebugPreview?: boolean;
+    isOutputDefault?: boolean;
   };
+  requiresInfra?: boolean;
   entry: unknown[];
   span?: Span;
   header_span?: Span;
@@ -159,9 +169,10 @@ export interface CatalogEntry {
   fields: FieldDef[];
   entry: unknown[];
   requires_infra?: boolean;
+  // KEEP IN SYNC with `NodeFeatures` in
+  // `weft/crates/weft-core/src/node.rs`.
   features?: {
     oneOfRequired?: string[][];
-    correlatedPorts?: string[][];
     canAddInputPorts?: boolean;
     canAddOutputPorts?: boolean;
     hasFormSchema?: boolean;
@@ -196,10 +207,18 @@ export interface LaneFrame {
 // Minimal shape the webview needs to paint node state. Richer
 // journal fields (cost_usd, pulse_id) flow directly in follow-up
 // messages when we need them.
+//
+// `input` and `output` carry the per-node payload verbatim from
+// the dispatcher event when the exec follower has it. The modal
+// inspector renders them as JSON trees; without these filled in
+// it falls back to "(none)" for every node, even when the
+// execution actually moved data.
 export interface NodeExecEvent {
   nodeId: string;
   state: NodeExecutionStatus | 'started' | 'running';
   error?: string;
+  input?: unknown;
+  output?: unknown;
 }
 
 export interface LiveDataItem {
@@ -217,16 +236,46 @@ export interface EdgeActiveEvent {
 
 // ─── Messages: extension host -> webview ────────────────────────────────
 
+export type InfraNodeStatus = 'running' | 'stopped';
+
+export interface InfraStatusSnapshot {
+  /// One entry per provisioned infra node. Empty array = nothing
+  /// provisioned (fresh project / after terminate).
+  nodes: Array<{ nodeId: string; status: InfraNodeStatus; endpointUrl: string | null }>;
+  /// Coarse rollup for the ActionBar: 'running' if all nodes are
+  /// running, 'stopped' if all are stopped, 'mixed' otherwise, or
+  /// 'none' if no nodes are provisioned.
+  rollup: 'running' | 'stopped' | 'mixed' | 'none';
+}
+
+export interface TriggerStatusSnapshot {
+  /// Dispatcher's ProjectStatus for this project: 'registered' |
+  /// 'active' | 'inactive'. The ActionBar reads 'active' as "the
+  /// trigger URLs are minted and listener is running."
+  projectStatus: 'registered' | 'active' | 'inactive' | 'unknown';
+}
+
 export type HostMessage =
   | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string }
   | { kind: 'parseError'; error: string }
+  | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   | { kind: 'layoutHint'; positions: Record<string, { x: number; y: number }> }
   | { kind: 'settings'; parseDebounceMs: number; layoutDebounceMs: number }
   | { kind: 'execEvent'; event: NodeExecEvent }
   | { kind: 'edgeActive'; event: EdgeActiveEvent }
   | { kind: 'liveData'; nodeId: string; items: LiveDataItem[] }
+  | { kind: 'infraStatus'; snapshot: InfraStatusSnapshot }
+  | { kind: 'triggerStatus'; snapshot: TriggerStatusSnapshot }
+  | { kind: 'actionFailed'; action: 'infraStart' | 'infraStop' | 'infraTerminate' | 'activate' | 'deactivate'; message: string }
+  | { kind: 'followStatus'; status: FollowStatus }
   | { kind: 'execReset' };
+
+export interface FollowStatus {
+  mode: 'latest' | 'pinned';
+  color: string | undefined;
+  pendingCount: number;
+}
 
 // ─── Messages: webview -> extension host ────────────────────────────────
 
@@ -237,7 +286,14 @@ export type WebviewMessage =
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string }
   | { kind: 'runProject' }
   | { kind: 'stopProject' }
-  | { kind: 'nodeSelected'; nodeId: string | null };
+  | { kind: 'nodeSelected'; nodeId: string | null }
+  | { kind: 'infraStart' }
+  | { kind: 'infraStop' }
+  | { kind: 'infraTerminate' }
+  | { kind: 'activateProject' }
+  | { kind: 'deactivateProject' }
+  | { kind: 'followTogglePin' }
+  | { kind: 'followCatchUp' };
 
 // The v1 editor performs all text surgery in-process and sends the
 // resulting source with `saveWeft`. No semantic mutation protocol

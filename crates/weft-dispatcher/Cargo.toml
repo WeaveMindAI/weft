@@ -38,3 +38,4 @@ cron = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
+weft-listener = { path = "../weft-listener" }

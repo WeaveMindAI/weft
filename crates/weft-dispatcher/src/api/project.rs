@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use weft_compiler::{Diagnostic, Severity};
-use weft_core::primitive::WakeSignalKind;
 use weft_core::project::EdgeIndex;
 use weft_core::ProjectDefinition;
 use weft_catalog::stdlib_catalog;
@@ -17,7 +16,6 @@ use weft_catalog::stdlib_catalog;
 use crate::backend::WakeContext;
 use weft_core::primitive::RootSeed;
 use crate::events::DispatcherEvent;
-use crate::journal::EntryKind;
 use crate::project_store::ProjectStatus;
 use crate::state::DispatcherState;
 
@@ -305,7 +303,10 @@ pub async fn run(
                     }
                 };
                 queued.push_back(crate::slots::QueuedWake::Start(
-                    weft_core::primitive::WakeMessage::Fresh { seeds: core_seeds },
+                    weft_core::primitive::WakeMessage::Fresh {
+                        seeds: core_seeds,
+                        phase: weft_core::context::Phase::Fire,
+                    },
                 ));
             })
         })
@@ -376,17 +377,80 @@ fn compute_root_seeds(
         .collect()
 }
 
-/// Seeds for a trigger fire. Steps:
-///   1. Walk downstream from `firing_node_id` to collect every node
-///      it can reach through outgoing edges.
-///   2. Intersect with output nodes (`is_output: true`).
-///   3. Compute the upstream subgraph that feeds those outputs.
-///   4. Every root of that subgraph is a seed. The firing trigger
-///      gets `payload`; every other root (including other triggers
-///      reachable in the subgraph) gets `null`.
+/// Seeds for a TriggerSetup-phase sub-execution.
 ///
-/// Returns an empty vec if the firing trigger doesn't reach any
-/// output node; the caller treats that as "nothing to run."
+/// Target set = every trigger node. Walk upstream (no terminators);
+/// every node in the closure runs. Triggers call `ctx.register_signal`
+/// under this phase; infra nodes return their `/outputs`; regular
+/// upstream nodes do their normal work.
+///
+/// Returns an empty vec if the project has no triggers (activate is
+/// a no-op in that case).
+pub fn compute_trigger_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
+    let edge_idx = EdgeIndex::build(project);
+
+    // A node counts as a trigger for setup-phase purposes if it
+    // either declares static entry_signals in its metadata (legacy
+    // path: ApiPost declaring Webhook) OR its features mark it as
+    // a trigger (runtime-registered path: WhatsAppReceive, future
+    // SSE triggers). Both are expected to call ctx.register_signal
+    // during TriggerSetup phase; the metadata flag is just a hint
+    // so we know to run them in that phase.
+    let triggers: Vec<String> = project
+        .nodes
+        .iter()
+        .filter(|n| !n.entry_signals.is_empty() || n.features.is_trigger)
+        .map(|n| n.id.clone())
+        .collect();
+    if triggers.is_empty() {
+        return Vec::new();
+    }
+
+    let in_subgraph = upstream_closure(project, &edge_idx, &triggers);
+    roots_of(project, &edge_idx, &in_subgraph)
+        .into_iter()
+        .map(|id| RootSeed {
+            node_id: id,
+            value: Value::Null,
+        })
+        .collect()
+}
+
+/// Seeds for an InfraSetup-phase sub-execution.
+///
+/// Target set = every node flagged `requires_infra: true`. Infra
+/// nodes are the only thing that runs in this phase; we don't walk
+/// upstream because `provision` is self-contained (the node's config
+/// carries everything the sidecar spec needs).
+pub fn compute_infra_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
+    project
+        .nodes
+        .iter()
+        .filter(|n| n.requires_infra)
+        .map(|n| RootSeed {
+            node_id: n.id.clone(),
+            value: Value::Null,
+        })
+        .collect()
+}
+
+/// Seeds for a trigger fire.
+///
+/// Rule: walk upstream from every output node, but treat trigger
+/// nodes as terminators. A node ends up in the fire-time subgraph
+/// iff it is reachable upstream from some output WITHOUT passing
+/// through a trigger. Triggers themselves are included as seeds
+/// (the firing trigger carries the payload; other triggers reachable
+/// in the subgraph carry null).
+///
+/// Why terminators: at fire time the firing trigger's outputs are
+/// the payload, not a function of its inputs. Nodes that exist only
+/// to produce inputs for triggers (e.g. setup-time config) must not
+/// re-run every time the trigger fires. If a node also feeds non-
+/// trigger paths that reach the output, it re-runs via those paths.
+///
+/// Returns an empty vec if no output is reachable via a non-trigger
+/// path; the caller treats that as "nothing to run."
 pub fn compute_trigger_seeds(
     project: &ProjectDefinition,
     firing_node_id: &str,
@@ -394,37 +458,50 @@ pub fn compute_trigger_seeds(
 ) -> Vec<RootSeed> {
     let edge_idx = EdgeIndex::build(project);
 
-    // 1. Downstream closure from firing trigger.
-    let mut downstream: HashSet<String> = HashSet::new();
-    let mut frontier: Vec<String> = vec![firing_node_id.to_string()];
-    while let Some(node_id) = frontier.pop() {
-        if !downstream.insert(node_id.clone()) {
-            continue;
-        }
-        for edge in edge_idx.get_outgoing(project, &node_id) {
-            if !downstream.contains(&edge.target) {
-                frontier.push(edge.target.clone());
-            }
-        }
+    // Set of trigger nodes. A node counts as a trigger if either
+    // its metadata pre-declares entry_signals (legacy path:
+    // ApiPost / Cron resolved at enrich time) OR its features
+    // mark it as a trigger (runtime-registered path:
+    // WhatsAppReceive via ctx.register_signal). Both end up in
+    // signal_tracker, so both need to be recognized here as
+    // fire targets.
+    let triggers: HashSet<String> = project
+        .nodes
+        .iter()
+        .filter(|n| !n.entry_signals.is_empty() || n.features.is_trigger)
+        .map(|n| n.id.clone())
+        .collect();
+    if !triggers.contains(firing_node_id) {
+        return Vec::new();
     }
 
-    // 2. Output nodes inside the downstream set.
+    // Targets = every output node in the project.
     let targets: Vec<String> = project
         .nodes
         .iter()
-        .filter(|n| downstream.contains(&n.id) && n.is_output())
+        .filter(|n| n.is_output())
         .map(|n| n.id.clone())
         .collect();
     if targets.is_empty() {
         return Vec::new();
     }
 
-    // 3. Upstream closure from those outputs.
-    let in_subgraph = upstream_closure(project, &edge_idx, &targets);
+    // Upstream closure from outputs, stopping at triggers (include
+    // the trigger but do not walk through its incoming edges).
+    let in_subgraph = upstream_closure_stop_at(project, &edge_idx, &targets, &triggers);
 
-    // 4. Roots of the subgraph. The firing trigger gets the payload;
-    //    every other root gets null.
-    roots_of(project, &edge_idx, &in_subgraph)
+    // If the firing trigger isn't in the subgraph, nothing its
+    // payload would feed is reachable upstream from an output;
+    // nothing to run.
+    if !in_subgraph.contains(firing_node_id) {
+        return Vec::new();
+    }
+
+    // Roots of the subgraph. Triggers are always roots (they were
+    // terminators); nodes in the subgraph with no in-subgraph
+    // parent are roots too. A firing trigger carries the payload;
+    // every other root carries null.
+    roots_of_with_forced(project, &edge_idx, &in_subgraph, &triggers)
         .into_iter()
         .map(|id| {
             let value = if id == firing_node_id {
@@ -444,10 +521,27 @@ fn upstream_closure(
     edge_idx: &EdgeIndex,
     targets: &[String],
 ) -> HashSet<String> {
+    upstream_closure_stop_at(project, edge_idx, targets, &HashSet::new())
+}
+
+/// BFS upstream from `targets`, but do not walk through any node in
+/// `stop_at`. Stopped nodes are still included in the returned set
+/// (so they can be seeded as roots), but their incoming edges are
+/// not followed. Used by the fire-time subgraph so triggers act as
+/// terminators.
+fn upstream_closure_stop_at(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    targets: &[String],
+    stop_at: &HashSet<String>,
+) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut frontier: Vec<String> = targets.to_vec();
     while let Some(node_id) = frontier.pop() {
         if !seen.insert(node_id.clone()) {
+            continue;
+        }
+        if stop_at.contains(&node_id) {
             continue;
         }
         for edge in edge_idx.get_incoming(project, &node_id) {
@@ -467,8 +561,25 @@ fn roots_of(
     edge_idx: &EdgeIndex,
     in_subgraph: &HashSet<String>,
 ) -> Vec<String> {
+    roots_of_with_forced(project, edge_idx, in_subgraph, &HashSet::new())
+}
+
+/// Like `roots_of`, but nodes in `force_roots` are always treated
+/// as roots regardless of their in-subgraph parents. Used at fire
+/// time so triggers (which are terminators, not computed from their
+/// inputs at fire time) always end up as seed roots.
+fn roots_of_with_forced(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    in_subgraph: &HashSet<String>,
+    force_roots: &HashSet<String>,
+) -> Vec<String> {
     let mut roots = Vec::new();
     for node_id in in_subgraph {
+        if force_roots.contains(node_id) {
+            roots.push(node_id.clone());
+            continue;
+        }
         let has_in_subgraph_parent = edge_idx
             .get_incoming(project, node_id)
             .iter()
@@ -492,11 +603,16 @@ pub struct ActivationUrl {
     pub url: String,
 }
 
-/// Activate a project. For each node that declares an entry
-/// primitive, mint an entry token and return the user-facing URL.
-/// Webhook tokens under `/w/{token}/{path}`, cron tokens are
-/// registered for scheduled firing (future), manual ones just get
-/// surfaced for completeness.
+/// Activate a project. Preconditions: every `requires_infra: true`
+/// node has been provisioned via `weft infra up`. Steps:
+/// 1. Tear down any previous listener + tracked signals.
+/// 2. Spawn a fresh listener.
+/// 3. Run the TriggerSetup sub-execution. Trigger nodes register
+///    themselves via `ctx.register_signal`; dispatcher's WS handler
+///    forwards each registration to the listener and fills
+///    `signal_tracker`.
+/// 4. Mark project Active, publish TriggerUrlChanged events, return
+///    the listener-minted URLs.
 pub async fn activate(
     State(state): State<DispatcherState>,
     Path(id_str): Path<String>,
@@ -514,121 +630,74 @@ pub async fn activate(
         .get(id)
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
-
-    // Drop stale tokens before minting fresh ones. The scheduler's
-    // prior timers are replaced atomically at the end of this
-    // handler via `replace_project`, so we don't wipe them yet.
     let project_id = id.to_string();
+
+    // Pre-flight: every requires_infra node must be provisioned
+    // AND in the Running state. A stopped sidecar is just as bad
+    // as a missing one from the trigger-setup subgraph's point of
+    // view (the worker will try to query /outputs and fail).
+    let missing: Vec<String> = project
+        .nodes
+        .iter()
+        .filter(|n| n.requires_infra)
+        .filter(|n| state.infra_registry.handle_if_running(&project_id, &n.id).is_none())
+        .map(|n| n.id.clone())
+        .collect();
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            format!(
+                "infra not running for: {}. Run `weft infra start` first.",
+                missing.join(", ")
+            ),
+        ));
+    }
+
+    // Re-activation: tear down everything from last time.
+    state.signal_tracker.remove_project(&project_id);
+    if let Some(_old) = state.listeners.remove(&project_id) {
+        let _ = state.listener_backend.stop(&project_id).await;
+    }
     state
         .journal
         .drop_entry_tokens(&project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drop tokens: {e}")))?;
 
-    let base = format!("http://localhost:{}", state.config.http_port);
-    let mut urls = Vec::new();
-    let mut timer_registrations: Vec<crate::scheduler::TimerRegistration> = Vec::new();
+    // Spawn listener.
+    // Listeners run inside the cluster (K8sListenerBackend) or
+    // alongside the dispatcher (SubprocessListenerBackend); either
+    // way the "dispatcher URL" the listener uses to POST
+    // /signal-fired must be reachable from the listener. Default
+    // to cluster DNS when running in-pod (WEFT_NAMESPACE is set by
+    // the Deployment manifest); otherwise fall back to 127.0.0.1.
+    let dispatcher_url = match std::env::var("WEFT_NAMESPACE") {
+        Ok(ns) => format!(
+            "http://weft-dispatcher.{ns}.svc.cluster.local:{port}",
+            port = state.config.http_port,
+        ),
+        Err(_) => format!("http://127.0.0.1:{}", state.config.http_port),
+    };
+    let handle = state
+        .listener_backend
+        .spawn(&project_id, &dispatcher_url)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn listener: {e}")))?;
+    state.listeners.insert(project_id.clone(), handle);
 
-    for node in &project.nodes {
-        for spec in &node.entry_signals {
-            // Entry-use specs must be is_resume=false; validated here
-            // as a runtime guard (compiler will enforce this earlier
-            // in Slice 1+).
-            if spec.is_resume {
-                tracing::warn!(
-                    target: "weft_dispatcher::activate",
-                    node = %node.id,
-                    "entry signal with is_resume=true; skipping (invalid)"
-                );
-                continue;
-            }
-            let (kind_str, path_hint, auth_json, url) = match &spec.kind {
-                WakeSignalKind::Webhook { path, auth } => {
-                    let auth_json = serde_json::to_value(auth).ok();
-                    let token = state
-                        .journal
-                        .mint_entry_token(
-                            &project_id,
-                            &node.id,
-                            EntryKind::Webhook,
-                            Some(path.as_str()),
-                            auth_json.clone(),
-                        )
-                        .await
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mint: {e}")))?;
-                    let url = if path.is_empty() {
-                        format!("{base}/w/{token}")
-                    } else {
-                        format!("{base}/w/{token}/{path}")
-                    };
-                    ("webhook", Some(path.clone()), auth_json, url)
-                }
-                WakeSignalKind::Timer { spec: timer } => {
-                    // `timer` is already fully resolved from the
-                    // node's config by enrich. Mint the tracking
-                    // token and collect a registration; we hand the
-                    // whole batch to the scheduler atomically at
-                    // the end so concurrent activates cannot leave
-                    // orphan timers.
-                    let serialized = serde_json::to_value(timer).ok();
-                    let token = state
-                        .journal
-                        .mint_entry_token(
-                            &project_id,
-                            &node.id,
-                            EntryKind::Cron,
-                            None,
-                            serialized,
-                        )
-                        .await
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mint: {e}")))?;
-                    timer_registrations.push(crate::scheduler::TimerRegistration {
-                        node_id: node.id.clone(),
-                        entry_token: token.clone(),
-                        spec: timer.clone(),
-                        binary_path: summary.binary_path.clone(),
-                    });
-                    let url = format!("timer (token {token})");
-                    ("timer", None, None, url)
-                }
-                WakeSignalKind::Form { form_type, .. } => {
-                    // Form entry (HumanTrigger style). Minted as a
-                    // webhook-flavored token for now; Slice 3 will
-                    // route form submissions properly.
-                    let token = state
-                        .journal
-                        .mint_entry_token(
-                            &project_id,
-                            &node.id,
-                            EntryKind::Webhook,
-                            Some(form_type.as_str()),
-                            None,
-                        )
-                        .await
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mint: {e}")))?;
-                    let url = format!("{base}/f/{token}");
-                    ("form", Some(form_type.clone()), None, url)
-                }
-                WakeSignalKind::Socket { .. } => {
-                    // Phase B.
-                    continue;
-                }
-            };
-
-            let _ = (path_hint, auth_json);
-            urls.push(ActivationUrl {
-                node_id: node.id.clone(),
-                kind: kind_str.to_string(),
-                url,
-            });
-        }
+    // Compute the trigger-setup subgraph. If the project has no
+    // triggers there's nothing to register and we're done.
+    let seeds = compute_trigger_setup_seeds(&project);
+    if !seeds.is_empty() {
+        run_trigger_setup(&state, id, &summary.binary_path, seeds).await?;
     }
 
-    // Atomic swap: abort any prior timer tasks for this project
-    // and spawn the new set in one critical section.
-    state
-        .scheduler
-        .replace_project(project_id.clone(), timer_registrations, state.clone());
+    // Collect the URLs that landed in signal_tracker during the
+    // sub-exec. The signal_tracker carries only routing metadata,
+    // not URLs; the listener minted them. We need a small lookup
+    // pass: for each tracked signal in this project, ask the
+    // listener for the URL.
+    let urls = collect_listener_urls(&state, &project_id).await;
 
     state.projects.set_status(id, ProjectStatus::Active).await;
     for url in &urls {
@@ -655,26 +724,382 @@ pub async fn deactivate(
     let id = id_str
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
+    let existed = deactivate_project(&state, id).await?;
+    if !existed {
+        return Err((StatusCode::NOT_FOUND, "project not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Shared deactivation logic. Used both by the explicit
+/// `/deactivate` endpoint and auto-called from `infra stop` /
+/// `infra terminate`, because a stopped or terminated sidecar
+/// leaves the project's listener-registered triggers pointing at
+/// a dead endpoint. Returns true if the project existed, false if
+/// we silently no-op'd (useful for the auto-call path where a
+/// project might not have been activated in the first place).
+pub async fn deactivate_project(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+) -> Result<bool, (StatusCode, String)> {
     let project_id = id.to_string();
     state
         .journal
         .drop_entry_tokens(&project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drop tokens: {e}")))?;
-    state.scheduler.cancel_project(&project_id);
-    if !state.projects.set_status(id, ProjectStatus::Inactive).await {
-        return Err((StatusCode::NOT_FOUND, "project not found".into()));
+    state.signal_tracker.remove_project(&project_id);
+    if state.listeners.remove(&project_id).is_some() {
+        let _ = state.listener_backend.stop(&project_id).await;
     }
-    state
-        .events
-        .publish(DispatcherEvent::ProjectDeactivated { project_id })
-        .await;
-    Ok(StatusCode::NO_CONTENT)
+    let existed = state.projects.set_status(id, ProjectStatus::Inactive).await;
+    if existed {
+        state
+            .events
+            .publish(DispatcherEvent::ProjectDeactivated { project_id })
+            .await;
+    }
+    Ok(existed)
 }
+
+/// Spawn a worker to run the TriggerSetup sub-execution and wait
+/// for it to complete. Blocks the activate handler until every
+/// trigger node has had a chance to call `ctx.register_signal`.
+async fn run_trigger_setup(
+    state: &DispatcherState,
+    project_id_uuid: uuid::Uuid,
+    binary_path: &std::path::Path,
+    seeds: Vec<RootSeed>,
+) -> Result<(), (StatusCode, String)> {
+    let project_id = project_id_uuid.to_string();
+    let color = uuid::Uuid::new_v4();
+    let now = unix_now();
+
+    // Journal the sub-exec.
+    state
+        .journal
+        .record_event(&crate::journal::ExecEvent::ExecutionStarted {
+            color,
+            project_id: project_id.clone(),
+            entry_node: seeds[0].node_id.clone(),
+            at_unix: now,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+    for seed in &seeds {
+        let _ = state
+            .journal
+            .record_event(&crate::journal::ExecEvent::PulseSeeded {
+                color,
+                node_id: seed.node_id.clone(),
+                port: "__seed__".to_string(),
+                lane: Vec::new(),
+                value: seed.value.clone(),
+                at_unix: now,
+            })
+            .await;
+    }
+
+    // Subscribe to the project's event bus BEFORE spawning the
+    // worker so we don't race on the completion signal.
+    let mut events = state.events.subscribe_project(&project_id).await;
+
+    // Queue the Fresh wake with Phase::TriggerSetup.
+    state
+        .slots
+        .with_slot(color, {
+            let seeds = seeds.clone();
+            move |slot| {
+                Box::pin(async move {
+                    let queued = match slot {
+                        crate::slots::Slot::Idle { queued, .. }
+                        | crate::slots::Slot::Starting { queued, .. }
+                        | crate::slots::Slot::WaitingReconnect { queued, .. } => queued,
+                        crate::slots::Slot::Live { .. } => {
+                            *slot = crate::slots::Slot::Idle {
+                                queued: std::collections::VecDeque::new(),
+                            };
+                            let crate::slots::Slot::Idle { queued, .. } = slot else {
+                                unreachable!()
+                            };
+                            queued
+                        }
+                    };
+                    queued.push_back(crate::slots::QueuedWake::Start(
+                        weft_core::primitive::WakeMessage::Fresh {
+                            seeds,
+                            phase: weft_core::context::Phase::TriggerSetup,
+                        },
+                    ));
+                })
+            }
+        })
+        .await;
+
+    let wake = WakeContext {
+        project_id: project_id.clone(),
+        color,
+    };
+    let worker = state
+        .workers
+        .spawn_worker(binary_path, wake)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+    let _ = state
+        .journal
+        .record_event(&crate::journal::ExecEvent::WorkerSpawned {
+            color,
+            at_unix: unix_now(),
+        })
+        .await;
+    state
+        .slots
+        .with_slot(color, move |slot| {
+            Box::pin(async move {
+                if let crate::slots::Slot::Starting { worker: w, .. } = slot {
+                    *w = Some(worker);
+                }
+            })
+        })
+        .await;
+
+    // Wait for completion or failure. 30s timeout is generous;
+    // trigger setup should be near-instant (nodes just call
+    // register_signal and return).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "trigger setup for {color} timed out after 30s without an ExecutionCompleted or ExecutionFailed event"
+                ),
+            ));
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(crate::events::DispatcherEvent::ExecutionCompleted { color: c, .. })) if c == color => {
+                return Ok(());
+            }
+            Ok(Ok(crate::events::DispatcherEvent::ExecutionFailed { color: c, error, .. })) if c == color => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("trigger setup failed: {error}"),
+                ));
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "trigger setup event stream closed".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// After a trigger-setup sub-exec, collect every tracked signal
+/// for the project that has a user-facing URL. These become the
+/// `urls` in ActivateResponse.
+async fn collect_listener_urls(state: &DispatcherState, project_id: &str) -> Vec<ActivationUrl> {
+    let mut out = Vec::new();
+    for meta in state.signal_tracker.list_for_project(project_id) {
+        if meta.is_resume {
+            // Only entry signals get surfaced by activate.
+            continue;
+        }
+        if let Some(url) = meta.user_url.clone() {
+            out.push(ActivationUrl {
+                node_id: meta.node_id.clone(),
+                kind: meta.kind.clone(),
+                url,
+            });
+        }
+    }
+    out
+}
+
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod trigger_seed_tests {
+    use super::*;
+
+    /// Build a minimal ProjectDefinition from a JSON spec. Tests
+    /// only care about node id, trigger status, output status, and
+    /// edges; everything else is defaulted.
+    fn project(nodes: &[(&str, bool, bool)], edges: &[(&str, &str)]) -> ProjectDefinition {
+        let mut n_json = Vec::new();
+        for (id, is_trigger, is_output) in nodes {
+            let entry_signals = if *is_trigger {
+                serde_json::json!([{
+                    "kind": { "kind": "webhook", "path": "", "auth": { "kind": "none" } },
+                    "is_resume": false
+                }])
+            } else {
+                serde_json::json!([])
+            };
+            n_json.push(serde_json::json!({
+                "id": id,
+                "nodeType": "T",
+                "label": null,
+                "config": {},
+                "position": { "x": 0, "y": 0 },
+                "features": { "isOutputDefault": is_output },
+                "entrySignals": entry_signals,
+            }));
+        }
+        let e_json: Vec<Value> = edges
+            .iter()
+            .map(|(s, t)| {
+                serde_json::json!({
+                    "id": format!("e_{}_{}", s, t),
+                    "source": s,
+                    "sourcePort": "out",
+                    "target": t,
+                    "targetPort": "in"
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "name": "t",
+            "description": null,
+            "nodes": n_json,
+            "edges": e_json,
+            "groups": []
+        });
+        serde_json::from_value(body).expect("valid test project")
+    }
+
+    fn ids(seeds: &[RootSeed]) -> Vec<String> {
+        let mut v: Vec<String> = seeds.iter().map(|s| s.node_id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn probe_entry_signals_roundtrip() {
+        let p = project(&[("t", true, false)], &[]);
+        assert_eq!(
+            p.nodes[0].entry_signals.len(),
+            1,
+            "entrySignals should parse into a single WakeSignalSpec"
+        );
+    }
+
+    #[test]
+    fn trigger_only_upstream_node_is_skipped() {
+        // A ──► TriggerX ──► B ──► Out
+        // A feeds only the trigger; nothing past the trigger reaches Out
+        // through A, so A must not run at fire time.
+        let p = project(
+            &[
+                ("a", false, false),
+                ("trigger_x", true, false),
+                ("b", false, false),
+                ("out", false, true),
+            ],
+            &[("a", "trigger_x"), ("trigger_x", "b"), ("b", "out")],
+        );
+        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::String("payload".into()));
+        assert_eq!(
+            ids(&seeds),
+            vec!["trigger_x".to_string()],
+            "only the firing trigger should be a seed"
+        );
+        assert_eq!(seeds[0].value, Value::String("payload".into()));
+    }
+
+    #[test]
+    fn node_shared_with_non_trigger_path_runs() {
+        //        ┌──► TriggerX ──► C ──► Out
+        //  A ────┤
+        //        └──► B ───────────────► Out
+        // A feeds both the trigger AND B. B → Out is a non-trigger
+        // path. A must run at fire time (via the B path).
+        let p = project(
+            &[
+                ("a", false, false),
+                ("trigger_x", true, false),
+                ("b", false, false),
+                ("c", false, false),
+                ("out", false, true),
+            ],
+            &[
+                ("a", "trigger_x"),
+                ("a", "b"),
+                ("trigger_x", "c"),
+                ("c", "out"),
+                ("b", "out"),
+            ],
+        );
+        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::String("payload".into()));
+        assert_eq!(
+            ids(&seeds),
+            vec!["a".to_string(), "trigger_x".to_string()],
+            "A must run via its non-trigger path; trigger carries payload"
+        );
+        for s in &seeds {
+            if s.node_id == "trigger_x" {
+                assert_eq!(s.value, Value::String("payload".into()));
+            } else {
+                assert_eq!(s.value, Value::Null);
+            }
+        }
+    }
+
+    #[test]
+    fn non_firing_triggers_in_subgraph_get_null() {
+        // TriggerX ──► Out ◄── TriggerY
+        // Firing TriggerX: TriggerY still gets seeded (with null)
+        // because it's reachable upstream from Out.
+        let p = project(
+            &[
+                ("trigger_x", true, false),
+                ("trigger_y", true, false),
+                ("out", false, true),
+            ],
+            &[("trigger_x", "out"), ("trigger_y", "out")],
+        );
+        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::String("fire".into()));
+        let sorted = ids(&seeds);
+        assert_eq!(sorted, vec!["trigger_x".to_string(), "trigger_y".to_string()]);
+        for s in &seeds {
+            if s.node_id == "trigger_x" {
+                assert_eq!(s.value, Value::String("fire".into()));
+            } else {
+                assert_eq!(s.value, Value::Null);
+            }
+        }
+    }
+
+    #[test]
+    fn no_output_downstream_returns_empty() {
+        // TriggerX with no reachable output = nothing to run.
+        let p = project(
+            &[("trigger_x", true, false), ("dead_end", false, false)],
+            &[("trigger_x", "dead_end")],
+        );
+        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::Null);
+        assert!(seeds.is_empty());
+    }
+
+    #[test]
+    fn firing_non_trigger_returns_empty() {
+        // Defensive: caller must never pass a non-trigger id. We
+        // return empty rather than silently fabricating seeds.
+        let p = project(
+            &[("a", false, false), ("out", false, true)],
+            &[("a", "out")],
+        );
+        let seeds = compute_trigger_seeds(&p, "a", &Value::Null);
+        assert!(seeds.is_empty());
+    }
 }

@@ -25,6 +25,7 @@ import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/proje
 import { ExecutionsProvider, ExecutionNode, type ExecutionSummary } from './sidebar/executions';
 import { InspectorView, type InspectorSelection } from './sidebar/inspector';
 import { ExecutionFollower } from './execFollower';
+import { AutoFollowController } from './autoFollow';
 
 export function activate(context: vscode.ExtensionContext) {
   const dispatcher = new DispatcherClient(getDispatcherUrl());
@@ -47,8 +48,17 @@ export function activate(context: vscode.ExtensionContext) {
     (nodeId, patch) => inspector.updateLive(nodeId, patch),
   );
 
+  const autoFollow = new AutoFollowController(
+    dispatcher,
+    follower,
+    (msg) => graphView.post(msg),
+  );
+
   graphView.setRunHandler(() => runPinned());
   graphView.setStopHandler(() => stopPinned());
+  graphView.setFollowTogglePinHandler(() => autoFollow.togglePin());
+  graphView.setFollowCatchUpHandler(() => autoFollow.catchUpToLatest());
+  graphView.setLifecycleStartHandler(() => autoFollow.pinAndFollow(undefined));
   graphView.setNodeSelectionHandler((sel) => {
     if (!pinnedProject) return;
     inspector.setSelection(
@@ -69,6 +79,7 @@ export function activate(context: vscode.ExtensionContext) {
   async function pinProject(project: WeftProject): Promise<void> {
     pinnedProject = project;
     executionsProvider.setPinnedProject(project);
+    autoFollow.setProject(project.id);
     const doc = await vscode.workspace.openTextDocument(project.entryPath);
     await vscode.window.showTextDocument(doc, { preview: false });
     await graphView.open(doc, project.id);
@@ -93,7 +104,7 @@ export function activate(context: vscode.ExtensionContext) {
       });
       const resp = await dispatcher.post<{ color: string }>(`/projects/${pinnedProject.id}/run`, {});
       pinnedExecution = resp.color;
-      follower.follow(resp.color);
+      autoFollow.pinAndFollow(resp.color);
       await executionsProvider.refresh();
     } catch (err) {
       void vscode.window.showErrorMessage(`Run failed: ${err}`);
@@ -112,13 +123,14 @@ export function activate(context: vscode.ExtensionContext) {
 
   async function viewExecution(summary: ExecutionSummary): Promise<void> {
     // Find (or hint) the project that produced this execution and
-    // switch the graph to it, then replay journaled events.
+    // switch the graph to it, then pin auto-follow on it. The
+    // controller handles the replay itself.
     const match = projectsProvider.projects().find((p) => p.id === summary.project_id);
     if (match && pinnedProject?.id !== match.id) {
       await pinProject(match);
     }
     pinnedExecution = summary.color;
-    await follower.replay(summary.color);
+    autoFollow.pinToExecution(summary.color);
   }
 
   async function deleteExecution(summary: ExecutionSummary): Promise<void> {
@@ -159,9 +171,15 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('weft.projects', projectsProvider),
     vscode.window.registerTreeDataProvider('weft.executions', executionsProvider),
+    // Close the executions tree's SSE subscription on extension
+    // shutdown so reloading VS Code doesn't pile up stale streams
+    // against the dispatcher.
+    { dispose: () => executionsProvider.dispose() },
+    { dispose: () => autoFollow.dispose() },
     vscode.window.registerWebviewViewProvider('weft.inspector', inspector),
 
     vscode.commands.registerCommand('weft.refreshProjects', () => projectsProvider.refresh()),
+    vscode.commands.registerCommand('weft.refreshExecutions', () => executionsProvider.refresh()),
     vscode.commands.registerCommand('weft.openInEditor', (p: ProjectNode | WeftProject) => {
       const project = 'project' in p ? p.project : p;
       return pinProject(project);

@@ -109,6 +109,8 @@ pub fn enrich_with_policy(
         node.inputs = inputs;
         node.outputs = outputs;
         node.features = meta.features.clone();
+        node.requires_infra = meta.requires_infra;
+        node.sidecar = meta.features.sidecar.clone();
 
         // Resolve each declared entry signal's tag against the
         // node's config. Each `WakeSignalKind` variant documents

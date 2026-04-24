@@ -21,7 +21,8 @@ import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import type { HostMessage, NodeExecEvent, LiveDataItem, EdgeActiveEvent } from './shared/protocol';
 
-type DispatcherEvent =
+export type DispatcherEvent =
+  | { kind: 'execution_started'; color: string; entry_node: string; project_id: string }
   | { kind: 'node_started'; color: string; node: string; lane: string; input: unknown; project_id: string }
   | { kind: 'node_completed'; color: string; node: string; lane: string; output: unknown; project_id: string }
   | { kind: 'node_failed'; color: string; node: string; lane: string; error: string; project_id: string }
@@ -105,6 +106,7 @@ export class ExecutionFollower implements vscode.Disposable {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
           state: 'running',
+          input: e.input,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         const inputs = toRecord(e.input);
@@ -123,6 +125,7 @@ export class ExecutionFollower implements vscode.Disposable {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
           state: 'completed',
+          output: e.output,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         const outputs = toRecord(e.output);
@@ -154,9 +157,16 @@ export class ExecutionFollower implements vscode.Disposable {
       }
       case 'execution_completed':
       case 'execution_failed':
-        // Top-level terminal events - nothing specific for the
-        // node canvas. The sidebar picks them up via its own
-        // /executions refresh.
+        // Top-level terminal events. Flip the ActionBar's running
+        // flag explicitly so the Stop button hides even if one of
+        // the per-node events was dropped (SSE overruns, closed
+        // connection, etc.). The sidebar picks them up via its
+        // own /executions refresh.
+        this.post({
+          kind: 'execTerminal',
+          color: e.color,
+          state: e.kind === 'execution_completed' ? 'completed' : 'failed',
+        });
         break;
     }
   }

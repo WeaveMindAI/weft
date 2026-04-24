@@ -140,6 +140,15 @@ pub struct NodeDefinition {
     /// catalog at activation time.
     #[serde(default, rename = "entrySignals", alias = "entry")]
     pub entry_signals: Vec<crate::primitive::WakeSignalSpec>,
+    /// `true` if this node requires a sidecar-backed infra
+    /// instance. Mirrored from NodeMetadata so the dispatcher can
+    /// drive `weft infra up/down` without a catalog lookup.
+    #[serde(default, rename = "requiresInfra")]
+    pub requires_infra: bool,
+    /// Sidecar declaration for `requires_infra: true` nodes.
+    /// Mirrored from NodeMetadata.sidecar at enrich time.
+    #[serde(default, rename = "sidecar", skip_serializing_if = "Option::is_none")]
+    pub sidecar: Option<crate::node::SidecarSpec>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]

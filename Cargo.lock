@@ -3204,6 +3204,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3275,6 +3276,7 @@ dependencies = [
  "weft-catalog",
  "weft-compiler",
  "weft-core",
+ "weft-listener",
 ]
 
 [[package]]
@@ -3292,6 +3294,29 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tracing",
  "url",
+ "uuid",
+ "weft-core",
+]
+
+[[package]]
+name = "weft-listener"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "cron",
+ "dashmap",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "weft-core",
 ]

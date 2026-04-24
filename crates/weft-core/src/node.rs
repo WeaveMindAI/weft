@@ -218,6 +218,18 @@ pub enum Condition {
 }
 
 /// Node-level semantic constraints. All optional; empty by default.
+///
+/// KEEP IN SYNC with the TypeScript `NodeDefinition.features` shape
+/// in `extension-vscode/src/shared/protocol.ts`. Serde silently drops
+/// unknown fields from node metadata.json when this struct doesn't
+/// declare them, so a field that only exists in TS (or only in
+/// metadata.json) will be invisible to the dispatcher and lost on
+/// the wire back to the webview. If you add a feature here, also:
+///   1. Add the matching camelCase field to `NodeDefinition.features`
+///      in protocol.ts.
+///   2. Update any webview code that switches on the new feature.
+/// TODO(codegen): replace with ts-rs or specta so TS mirrors Rust
+/// automatically.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeFeatures {
     /// Each inner list is a port group where at least ONE port must
@@ -226,10 +238,6 @@ pub struct NodeFeatures {
     /// `one_of_required: [["message", "media"]]`.
     #[serde(default, rename = "oneOfRequired")]
     pub one_of_required: Vec<Vec<String>>,
-    /// Port groups where values across the listed ports must share
-    /// the same parent lane (for fan-out correlation).
-    #[serde(default, rename = "correlatedPorts")]
-    pub correlated_ports: Vec<Vec<String>>,
     /// The node accepts ad-hoc extra input ports declared in weft
     /// source. If unset, extra ports cause a compile error.
     #[serde(default, rename = "canAddInputPorts")]
@@ -255,6 +263,14 @@ pub struct NodeFeatures {
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview")]
     pub show_debug_preview: bool,
+    /// Webview hint: the node opts into the inline live-data
+    /// strip (in/out chips) under its body. Nodes that don't opt
+    /// in fall back to the modal inspector for inputs/outputs.
+    /// Used by WhatsAppBridge (QR + connection status) where
+    /// live telemetry from the sidecar is core UX. Regular
+    /// action nodes (Send/Receive/Debug) leave this off.
+    #[serde(default, rename = "hasLiveData")]
+    pub has_live_data: bool,
     /// Default value of the node's `is_output` config flag. Nodes that
     /// are semantically "produce this thing" (Debug, Output) default
     /// to true. Any project can override by setting `is_output` in the
@@ -262,6 +278,11 @@ pub struct NodeFeatures {
     /// subgraph to execute (see docs/v2-design.md section 3.0).
     #[serde(default, rename = "isOutputDefault")]
     pub is_output_default: bool,
+    /// Sidecar spec for `requires_infra: true` nodes. Declares the
+    /// image/port/manifests the dispatcher applies during
+    /// `weft infra up`. None for non-infra nodes.
+    #[serde(default, rename = "sidecar", skip_serializing_if = "Option::is_none")]
+    pub sidecar: Option<SidecarSpec>,
     /// Hidden from node picker and describe-nodes output. Used for
     /// compiler-internal node types (Passthrough) that are real
     /// executing nodes but must not appear in user-facing tooling.
@@ -404,6 +425,28 @@ pub struct NodeOutput {
     /// One value per declared output port. Missing ports are treated
     /// as "no pulse emitted" (not "null pulse emitted").
     pub outputs: std::collections::HashMap<String, Value>,
+}
+
+/// Sidecar declaration on an infra node. Declarative; the
+/// dispatcher reads it during `weft infra up` and applies the
+/// manifests through its `InfraBackend`. Node code is never
+/// invoked during provisioning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarSpec {
+    /// Short name used to construct the image tag
+    /// (e.g. `whatsapp-bridge` → `ghcr.io/weavemindai/sidecar-whatsapp-bridge:latest`).
+    pub name: String,
+    /// Port the sidecar listens on.
+    pub port: u16,
+    /// Optional path suffix for the action endpoint
+    /// (e.g. `/action`). Defaults to empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_path: Option<String>,
+    /// Raw k8s manifests to apply. Placeholders like
+    /// `__INSTANCE_ID__` and `__NAMESPACE__` are substituted by
+    /// the infra backend before apply.
+    #[serde(default)]
+    pub manifests: Vec<Value>,
 }
 
 impl NodeOutput {

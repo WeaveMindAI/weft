@@ -3,6 +3,7 @@
 
 pub mod new;
 pub mod build;
+pub mod ensure;
 pub mod run;
 pub mod follow;
 pub mod stop;

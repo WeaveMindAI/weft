@@ -3,9 +3,10 @@ use std::sync::Arc;
 use crate::backend::{InfraBackend, WorkerBackend};
 use crate::config::DispatcherConfig;
 use crate::events::EventBus;
+use crate::infra::InfraRegistry;
 use crate::journal::Journal;
+use crate::listener::{ListenerBackend, ListenerRegistry, SignalTracker};
 use crate::project_store::ProjectStore;
-use crate::scheduler::Scheduler;
 use crate::slots::Slots;
 
 /// Top-level dispatcher state. Shared across HTTP handlers via
@@ -19,8 +20,15 @@ pub struct DispatcherState {
     pub projects: ProjectStore,
     pub events: EventBus,
     pub slots: Slots,
-    /// Background tasks that fire `WakeSignalKind::Timer` triggers
-    /// at their scheduled times. Registered on activate, cancelled
-    /// on deactivate.
-    pub scheduler: Scheduler,
+    /// Spawns per-project listener instances.
+    pub listener_backend: Arc<dyn ListenerBackend>,
+    /// Per-project listener handles. One entry per active project.
+    pub listeners: ListenerRegistry,
+    /// Every signal currently registered with any listener. Used to
+    /// look up a fire relay back to its owning project + node.
+    pub signal_tracker: SignalTracker,
+    /// Provisioned sidecars per (project, node). Populated by
+    /// `weft infra up`, cleared by `weft infra down`. Looked up by
+    /// `ctx.sidecar_endpoint()` to resolve a node's endpoint URL.
+    pub infra_registry: InfraRegistry,
 }

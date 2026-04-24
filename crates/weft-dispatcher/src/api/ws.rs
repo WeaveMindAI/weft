@@ -546,21 +546,49 @@ async fn handle_message(
         }
         WorkerToDispatcher::SuspensionRequest { request_id, node_id, lane, spec } => {
             let token = uuid::Uuid::new_v4().to_string();
-            let user_url = match &spec.kind {
-                weft_core::primitive::WakeSignalKind::Webhook { .. } => Some(format!(
-                    "http://localhost:{}/w/{token}",
-                    state.config.http_port
-                )),
-                weft_core::primitive::WakeSignalKind::Form { .. } => Some(format!(
-                    "http://localhost:{}/f/{token}",
-                    state.config.http_port
-                )),
-                _ => None,
+
+            // Look up this color's project + its active listener,
+            // then let the listener own URL-minting and any
+            // kind-specific setup (timer tasks, sse loops, etc).
+            let project_id = match state.journal.execution_project(color).await {
+                Ok(Some(p)) => p,
+                _ => {
+                    tracing::error!(
+                        target: "weft_dispatcher::ws",
+                        %color,
+                        "no project for color; cannot register suspension"
+                    );
+                    return false;
+                }
+            };
+            let listener = state.listeners.get(&project_id);
+            let user_url = if let Some(listener) = &listener {
+                match crate::listener::register_signal(listener, &token, &spec, &node_id).await {
+                    Ok(url) => url,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "weft_dispatcher::ws",
+                            %color,
+                            error = %e,
+                            "listener register failed"
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                tracing::error!(
+                    target: "weft_dispatcher::ws",
+                    %color,
+                    %project_id,
+                    "project has no active listener; activate first"
+                );
+                return false;
             };
 
-            // Persist the suspension so form/webhook endpoints can
-            // resolve the token back to its color+node, and append
-            // a SuspensionRegistered event to the replayable log.
+            // Persist the suspension so the signal-fired endpoint
+            // can resolve the token back to its color+node, and
+            // append a SuspensionRegistered event to the replayable
+            // log.
             let metadata = serde_json::json!({
                 "spec": spec,
                 "node_id": node_id,
@@ -586,12 +614,109 @@ async fn handle_message(
                 })
                 .await;
 
+            // Track so /signal-fired can route the resume.
+            let kind_label = kind_of(&spec.kind);
+            state.signal_tracker.insert(
+                token.clone(),
+                crate::listener::RegisteredSignalMeta {
+                    project_id,
+                    token: token.clone(),
+                    node_id: node_id.clone(),
+                    is_resume: true,
+                    user_url: user_url.clone(),
+                    kind: kind_label.into(),
+                },
+            );
+
             let _ = tx
                 .send(DispatcherToWorker::SuspensionToken {
                     request_id,
                     token,
                     user_url,
                 })
+                .await;
+            true
+        }
+        WorkerToDispatcher::RegisterSignalRequest { request_id, node_id, spec } => {
+            // TriggerSetup-phase entry registration from a node.
+            // Same listener registration as SuspensionRequest but the
+            // tracker entry is `is_resume: false` and the signal
+            // persists (not single-use).
+            let project_id = match state.journal.execution_project(color).await {
+                Ok(Some(p)) => p,
+                _ => {
+                    tracing::error!(
+                        target: "weft_dispatcher::ws",
+                        %color,
+                        "no project for color; cannot register entry signal"
+                    );
+                    return false;
+                }
+            };
+            let listener = match state.listeners.get(&project_id) {
+                Some(l) => l,
+                None => {
+                    tracing::error!(
+                        target: "weft_dispatcher::ws",
+                        %color,
+                        %project_id,
+                        "project has no active listener; activate must have spawned one first"
+                    );
+                    return false;
+                }
+            };
+            let token = uuid::Uuid::new_v4().to_string();
+            let user_url = match crate::listener::register_signal(&listener, &token, &spec, &node_id).await {
+                Ok(url) => url,
+                Err(e) => {
+                    tracing::error!(
+                        target: "weft_dispatcher::ws",
+                        %color,
+                        error = %e,
+                        "listener register (entry) failed"
+                    );
+                    return false;
+                }
+            };
+            let kind_label = kind_of(&spec.kind);
+            state.signal_tracker.insert(
+                token.clone(),
+                crate::listener::RegisteredSignalMeta {
+                    project_id,
+                    token: token.clone(),
+                    node_id: node_id.clone(),
+                    is_resume: false,
+                    user_url: user_url.clone(),
+                    kind: kind_label.into(),
+                },
+            );
+            let _ = tx
+                .send(DispatcherToWorker::RegisterSignalAck {
+                    request_id,
+                    token,
+                    user_url,
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::SidecarEndpointRequest { request_id, node_id } => {
+            let project_id = match state.journal.execution_project(color).await {
+                Ok(Some(p)) => p,
+                _ => String::new(),
+            };
+            let endpoint = if project_id.is_empty() {
+                None
+            } else {
+                // handle_if_running returns None for a Stopped
+                // sidecar so the worker fails loudly instead of
+                // calling a dead DNS name.
+                state
+                    .infra_registry
+                    .handle_if_running(&project_id, &node_id)
+                    .and_then(|h| h.endpoint_url)
+            };
+            let _ = tx
+                .send(DispatcherToWorker::SidecarEndpoint { request_id, endpoint })
                 .await;
             true
         }
@@ -955,3 +1080,15 @@ async fn spawn_respawn(state: &DispatcherState, color: Color) {
     }
 }
 
+
+
+fn kind_of(kind: &weft_core::primitive::WakeSignalKind) -> &'static str {
+    use weft_core::primitive::WakeSignalKind;
+    match kind {
+        WakeSignalKind::Webhook { .. } => "webhook",
+        WakeSignalKind::Timer { .. } => "timer",
+        WakeSignalKind::Form { .. } => "form",
+        WakeSignalKind::Sse { .. } => "sse",
+        WakeSignalKind::Socket { .. } => "socket",
+    }
+}

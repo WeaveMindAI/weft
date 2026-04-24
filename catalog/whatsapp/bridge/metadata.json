@@ -1,0 +1,94 @@
+{
+  "type": "WhatsAppBridge",
+  "label": "WhatsApp Bridge",
+  "description": "Provision a per-project WhatsApp sidecar (Baileys + WhatsApp Web). Connect with a phone via QR code on first start; the bridge persists its auth state in a PVC so subsequent starts reuse the session.",
+  "category": "Communication",
+  "tags": ["whatsapp", "infra", "sidecar"],
+  "icon": "MessageCircle",
+  "color": "#25D366",
+  "inputs": [],
+  "outputs": [
+    { "name": "instanceId", "type": "String", "required": false },
+    { "name": "endpointUrl", "type": "String", "required": false },
+    { "name": "status", "type": "String", "required": false },
+    { "name": "phoneNumber", "type": "String", "required": false },
+    { "name": "jid", "type": "String", "required": false }
+  ],
+  "fields": [],
+  "entrySignals": [],
+  "requires_infra": true,
+  "features": {
+    "hasLiveData": true,
+    "sidecar": {
+      "name": "whatsapp-bridge",
+      "port": 8090,
+      "action_path": "/action",
+      "manifests": [
+        {
+          "apiVersion": "v1",
+          "kind": "PersistentVolumeClaim",
+          "metadata": { "name": "__INSTANCE_ID__-auth" },
+          "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": { "requests": { "storage": "100Mi" } }
+          }
+        },
+        {
+          "apiVersion": "apps/v1",
+          "kind": "Deployment",
+          "metadata": { "name": "__INSTANCE_ID__" },
+          "spec": {
+            "replicas": 1,
+            "selector": { "matchLabels": { "app": "__INSTANCE_ID__" } },
+            "template": {
+              "metadata": { "labels": { "app": "__INSTANCE_ID__" } },
+              "spec": {
+                "containers": [{
+                  "name": "whatsapp",
+                  "image": "__SIDECAR_IMAGE__",
+                  "imagePullPolicy": "IfNotPresent",
+                  "ports": [{ "containerPort": 8090 }],
+                  "env": [
+                    { "name": "PORT", "value": "8090" },
+                    { "name": "AUTH_DIR", "value": "/data/auth" }
+                  ],
+                  "volumeMounts": [{
+                    "name": "authdata",
+                    "mountPath": "/data/auth"
+                  }],
+                  "resources": {
+                    "requests": { "cpu": "100m", "memory": "128Mi" },
+                    "limits": { "cpu": "500m", "memory": "512Mi" }
+                  },
+                  "readinessProbe": {
+                    "httpGet": { "path": "/health", "port": 8090 },
+                    "initialDelaySeconds": 5,
+                    "periodSeconds": 5
+                  }
+                }],
+                "volumes": [{
+                  "name": "authdata",
+                  "persistentVolumeClaim": { "claimName": "__INSTANCE_ID__-auth" }
+                }]
+              }
+            }
+          }
+        },
+        {
+          "apiVersion": "v1",
+          "kind": "Service",
+          "metadata": { "name": "__INSTANCE_ID__" },
+          "spec": {
+            "selector": { "app": "__INSTANCE_ID__" },
+            "ports": [{
+              "name": "action",
+              "port": 8090,
+              "targetPort": 8090,
+              "protocol": "TCP"
+            }]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -8,7 +8,7 @@ pub mod project;
 pub mod pulse;
 pub mod weft_type;
 
-pub use context::ExecutionContext;
+pub use context::{ExecutionContext, Phase};
 pub use error::{WeftError, WeftResult};
 pub use lane::{Lane, LaneFrame};
 pub use node::{

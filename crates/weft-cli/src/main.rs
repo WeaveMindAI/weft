@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod client;
 mod commands;
+pub mod images;
 
 #[derive(Debug, Parser)]
 #[command(name = "weft", version, about = "Weft CLI")]
@@ -36,11 +37,12 @@ enum Cmd {
     Follow { target: String },
     /// Cancel an execution by color.
     Stop { color: String },
-    /// Activate a registered project (mint trigger URLs).
-    Activate { project: String },
+    /// Activate a project. Without a project id, discovers the cwd
+    /// project, compiles + registers it first, then activates.
+    Activate { project: Option<String> },
     /// Deactivate a registered project (kill trigger URLs, cancel
     /// pending suspensions).
-    Deactivate { project: String },
+    Deactivate { project: Option<String> },
     /// List every project registered with the dispatcher.
     Ps,
     /// Unregister a project entirely (journal gone, logs gone).
@@ -117,20 +119,41 @@ impl From<TokenAction> for commands::token::TokenAction {
 
 #[derive(Debug, Subcommand)]
 enum InfraAction {
-    Up,
-    Down,
+    /// Provision the project's sidecars (first time) or scale them
+    /// back to 1 (after stop). Errors if infra is already running.
+    Start,
+    /// Scale sidecars to 0 replicas. PVC + Service stay so the
+    /// next `start` resumes the same instance with its persisted
+    /// state (auth, credentials, etc).
+    Stop,
+    /// Delete every k8s resource the sidecars own, PVC included.
+    /// Irreversible: the next `start` is a fresh provision.
+    Terminate,
+    /// Print the current lifecycle state of each infra node.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
-    /// Start the daemon in the background.
-    Start,
-    /// Stop the running daemon.
+    /// Start the daemon. Ensures the kind cluster, ingress, images,
+    /// and dispatcher Deployment exist, then opens a port-forward
+    /// so the CLI can talk to it on localhost.
+    Start {
+        /// Force-rebuild the dispatcher and listener images.
+        #[arg(long)]
+        rebuild: bool,
+    },
+    /// Stop the running daemon. Scales the dispatcher Deployment to
+    /// 0 and tears down the local port-forward. The kind cluster
+    /// and persistent state stay intact.
     Stop,
     /// Report whether the daemon is reachable.
     Status,
     /// Stop then start the daemon.
-    Restart,
+    Restart {
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Tail the daemon's stderr log.
     Logs {
         /// Number of lines to print.
@@ -145,8 +168,10 @@ enum DaemonAction {
 impl From<InfraAction> for commands::infra::InfraAction {
     fn from(value: InfraAction) -> Self {
         match value {
-            InfraAction::Up => commands::infra::InfraAction::Up,
-            InfraAction::Down => commands::infra::InfraAction::Down,
+            InfraAction::Start => commands::infra::InfraAction::Start,
+            InfraAction::Stop => commands::infra::InfraAction::Stop,
+            InfraAction::Terminate => commands::infra::InfraAction::Terminate,
+            InfraAction::Status => commands::infra::InfraAction::Status,
         }
     }
 }
@@ -154,10 +179,10 @@ impl From<InfraAction> for commands::infra::InfraAction {
 impl From<DaemonAction> for commands::daemon::DaemonAction {
     fn from(value: DaemonAction) -> Self {
         match value {
-            DaemonAction::Start => commands::daemon::DaemonAction::Start,
+            DaemonAction::Start { rebuild } => commands::daemon::DaemonAction::Start { rebuild },
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
             DaemonAction::Status => commands::daemon::DaemonAction::Status,
-            DaemonAction::Restart => commands::daemon::DaemonAction::Restart,
+            DaemonAction::Restart { rebuild } => commands::daemon::DaemonAction::Restart { rebuild },
             DaemonAction::Logs { tail, follow } => {
                 commands::daemon::DaemonAction::Logs { tail, follow }
             }

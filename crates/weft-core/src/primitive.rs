@@ -107,6 +107,23 @@ pub enum WakeSignalKind {
         description: Option<String>,
     },
 
+    /// Long-lived outbound Server-Sent Events subscription. The
+    /// listener opens a GET to `url` with
+    /// `Accept: text/event-stream`, parses `data: ...` lines,
+    /// relays events whose JSON contains `"event": event_name` (or
+    /// every event if `event_name` is empty).
+    ///
+    /// Used by infra-backed triggers (e.g. WhatsAppReceive
+    /// subscribes to `bridge-url/events`). Spec-only; nothing on
+    /// the node's config.
+    Sse {
+        /// Full URL the listener subscribes to.
+        url: String,
+        /// Optional event-name filter. Empty = relay everything.
+        #[serde(default)]
+        event_name: String,
+    },
+
     /// Long-lived bidirectional connection. Phase B scope; reserved
     /// so the enum shape is known.
     Socket { spec: SocketSpec },
@@ -123,6 +140,7 @@ pub enum WakeSignalKindTag {
     Webhook,
     Timer,
     Form,
+    Sse,
     Socket,
 }
 
@@ -243,6 +261,20 @@ impl WakeSignalKind {
                     },
                     title,
                     description,
+                })
+            }
+            WakeSignalKindTag::Sse => {
+                // SSE signals are constructed at runtime in the
+                // trigger node's execute (TriggerSetup phase); they
+                // don't come from pre-declared config. If a node
+                // were to declare `entrySignals: [{kind: "sse"}]`
+                // it would need config support here. Today only the
+                // TriggerSetup-phase code path builds SSE specs.
+                Err(SignalResolveError {
+                    kind: WakeSignalKindTag::Sse,
+                    message: "SSE wake signals are not declarable in metadata; \
+                              build them at runtime via ctx.register_signal"
+                        .into(),
                 })
             }
             WakeSignalKindTag::Socket => Err(SignalResolveError {
@@ -409,6 +441,21 @@ pub enum DispatcherToWorker {
         token: String,
         user_url: Option<String>,
     },
+    /// Dispatcher reply to `RegisterSignalRequest`. `user_url` is
+    /// the listener-minted externally-facing URL (if the signal
+    /// kind has one; None for Timer / Socket / SSE).
+    RegisterSignalAck {
+        request_id: u64,
+        token: String,
+        user_url: Option<String>,
+    },
+    /// Dispatcher reply to `SidecarEndpointRequest`. On failure
+    /// (infra not up, unknown node), `endpoint` is `None` and the
+    /// caller surfaces an error.
+    SidecarEndpoint {
+        request_id: u64,
+        endpoint: Option<String>,
+    },
     /// Dispatcher acknowledgement for `Stalled`; worker may now exit.
     StalledAck,
     /// Cancel the execution. Worker should stop ASAP.
@@ -435,6 +482,22 @@ pub enum WorkerToDispatcher {
         node_id: String,
         lane: crate::lane::Lane,
         spec: WakeSignalSpec,
+    },
+    /// Worker wants to register an entry wake signal (TriggerSetup
+    /// phase). Dispatcher forwards the spec to the project's
+    /// listener, journals the registration, replies with
+    /// `RegisterSignalAck` carrying the user-facing URL (if any).
+    RegisterSignalRequest {
+        request_id: u64,
+        node_id: String,
+        spec: WakeSignalSpec,
+    },
+    /// Worker wants the cluster-local endpoint URL of its sidecar.
+    /// Dispatcher resolves via InfraRegistry, replies with
+    /// `SidecarEndpoint`.
+    SidecarEndpointRequest {
+        request_id: u64,
+        node_id: String,
     },
     /// Worker has nothing left to run and at least one lane is
     /// waiting. Under the event-sourced model the dispatcher already
@@ -489,7 +552,15 @@ pub enum WorkerToDispatcher {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WakeMessage {
-    Fresh { seeds: Vec<RootSeed> },
+    Fresh {
+        seeds: Vec<RootSeed>,
+        /// Which lifecycle phase this run is for. Propagated to every
+        /// node's `ExecutionContext.phase`. Resume runs don't carry
+        /// a phase because they always continue the original run's
+        /// phase (the snapshot carries it).
+        #[serde(default)]
+        phase: crate::context::Phase,
+    },
     Resume,
 }
 

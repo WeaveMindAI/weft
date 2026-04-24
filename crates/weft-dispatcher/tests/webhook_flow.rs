@@ -1,30 +1,38 @@
-//! Integration test: spin up a dispatcher in-process, register a
-//! project with a webhook, activate it, fire a POST to the minted
-//! URL, verify a worker spawned. This exercises the full CLI-free
-//! lifecycle end to end.
-//!
-//! Note: the subprocess worker backend shells out to `weft-runner`,
-//! which is awkward in a cargo test. We use a stub worker backend
-//! that captures spawn calls without actually running the binary.
-//! That's enough to verify the dispatcher's routing is correct.
+//! Integration: register a signal directly with a live in-process
+//! listener, simulate the listener firing by POSTing
+//! `/signal-fired` on the dispatcher, verify the dispatcher spawns
+//! a worker. Bypasses the full activate flow (which would need a
+//! real worker to run the TriggerSetup sub-execution); activation
+//! gets its own higher-level coverage in the slice's end-to-end
+//! story.
 
-use std::path::PathBuf;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use tokio::sync::Mutex;
-use tower::ServiceExt;
-
-use weft_dispatcher::api::router;
-use weft_dispatcher::backend::{
-    EventStream, InfraBackend, InfraHandle, InfraSpec, WakeContext, WorkerBackend, WorkerHandle,
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
 };
-use weft_dispatcher::journal::sqlite::SqliteJournal;
-use weft_dispatcher::{DispatcherConfig, DispatcherState, ProjectStore};
+use tokio::sync::Mutex;
+use tower::util::ServiceExt;
+use uuid::Uuid;
 
-// ----- Test-only backends --------------------------------------------
+use weft_dispatcher::{
+    api::router,
+    backend::{EventStream, InfraBackend, InfraHandle, InfraSpec, WakeContext, WorkerBackend, WorkerHandle},
+    config::DispatcherConfig,
+    journal::sqlite::SqliteJournal,
+    listener::{
+        register_signal, ListenerBackend, ListenerHandle, ListenerRegistry, RegisteredSignalMeta,
+        SignalTracker,
+    },
+    project_store::ProjectStore,
+    slots::Slots,
+    DispatcherState,
+};
+
+// ----- Stub backends ------------------------------------------------
 
 struct RecordingWorkerBackend {
     spawned: Arc<Mutex<Vec<WakeContext>>>,
@@ -38,9 +46,11 @@ impl WorkerBackend for RecordingWorkerBackend {
         wake: WakeContext,
     ) -> anyhow::Result<WorkerHandle> {
         self.spawned.lock().await.push(wake);
-        Ok(WorkerHandle { id: "stub".into() })
+        Ok(WorkerHandle {
+            id: uuid::Uuid::new_v4().to_string(),
+        })
     }
-    async fn kill_worker(&self, _h: WorkerHandle) -> anyhow::Result<()> {
+    async fn kill_worker(&self, _handle: WorkerHandle) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -52,7 +62,13 @@ impl InfraBackend for StubInfraBackend {
     async fn provision(&self, _spec: InfraSpec) -> anyhow::Result<InfraHandle> {
         anyhow::bail!("not used in this test")
     }
-    async fn deprovision(&self, _h: InfraHandle) -> anyhow::Result<()> {
+    async fn scale_to_zero(&self, _h: &InfraHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn scale_up(&self, _h: &InfraHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn delete(&self, _h: InfraHandle) -> anyhow::Result<()> {
         Ok(())
     }
     async fn stream_events(&self, _h: InfraHandle) -> anyhow::Result<EventStream> {
@@ -61,15 +77,52 @@ impl InfraBackend for StubInfraBackend {
     }
 }
 
+/// In-process listener: runs the real weft-listener code as a tokio
+/// server on an ephemeral port. No subprocess needed.
+struct InProcessListenerBackend;
+
+#[async_trait]
+impl ListenerBackend for InProcessListenerBackend {
+    async fn spawn(
+        &self,
+        project_id: &str,
+        dispatcher_url: &str,
+    ) -> anyhow::Result<ListenerHandle> {
+        use weft_listener::{router as listener_router, ListenerConfig, ListenerState};
+        let tcp =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = tcp.local_addr()?;
+        let admin_url = format!("http://{addr}");
+        let admin_token = Uuid::new_v4().to_string();
+        let relay_token = Uuid::new_v4().to_string();
+        let cfg = ListenerConfig {
+            project_id: project_id.to_string(),
+            http_port: addr.port(),
+            public_base_url: admin_url.clone(),
+            dispatcher_url: dispatcher_url.to_string(),
+            relay_token: relay_token.clone(),
+            admin_token: admin_token.clone(),
+        };
+        let state = ListenerState::new(cfg);
+        let app = listener_router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(tcp, app).await;
+        });
+        Ok(ListenerHandle {
+            admin_url: admin_url.clone(),
+            public_base_url: admin_url,
+            admin_token,
+            relay_token,
+        })
+    }
+    async fn stop(&self, _project_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 // ----- Helpers -------------------------------------------------------
 
 fn hello_project() -> (uuid::Uuid, serde_json::Value) {
-    // ApiPost -> Debug. The webhook URL targets `receive`; when
-    // `curl` fires it, the runner wakes `receive`, pulses through to
-    // `print`, which logs the body.
-    //
-    // The dispatcher compiles + enriches source on register, so the
-    // test just hands it the raw weft + a stable id.
     let source = r#"
 # Project: Hello Webhook
 
@@ -108,14 +161,17 @@ async fn build_state(tmp: &tempfile::TempDir) -> (DispatcherState, Arc<Mutex<Vec
         infra: Arc::new(StubInfraBackend),
         projects,
         events: weft_dispatcher::EventBus::new(),
-        slots: weft_dispatcher::slots::Slots::new(),
-        scheduler: weft_dispatcher::scheduler::Scheduler::new(),
+        slots: Slots::new(),
+        listener_backend: Arc::new(InProcessListenerBackend),
+        listeners: ListenerRegistry::new(),
+        signal_tracker: SignalTracker::new(),
+        infra_registry: weft_dispatcher::infra::InfraRegistry::new(),
     };
     (state, spawned)
 }
 
 fn req(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request<Body> {
-    let mut b = Request::builder().method(method).uri(uri);
+    let b = Request::builder().method(method).uri(uri);
     match body {
         Some(v) => b
             .header("content-type", "application/json")
@@ -128,9 +184,15 @@ fn req(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request<Body
 // ----- The test -----------------------------------------------------
 
 #[tokio::test]
-async fn webhook_round_trip() {
+async fn signal_fired_spawns_worker() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, spawned) = build_state(&tmp).await;
+    let signal_tracker = state.signal_tracker.clone();
+    let listeners = state.listeners.clone();
+    let listener_backend = state.listener_backend.clone();
+    let journal = state.journal.clone();
+    let project_store = state.projects.clone();
+
     let app = router(state);
 
     // 1. Register the project.
@@ -142,49 +204,71 @@ async fn webhook_round_trip() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 2. Activate to mint webhook URLs.
+    // 2. Journal an ExecutionStarted so /signal-fired's resume
+    //    lookup (if any) has a project-for-color binding, then
+    //    manually set up a listener + register a signal with it.
+    //    Skip the full activate path (which needs a live worker).
+    let handle = listener_backend
+        .spawn(&project_id.to_string(), "http://127.0.0.1:65535")
+        .await
+        .unwrap();
+    listeners.insert(project_id.to_string(), handle.clone());
+
+    // Register a webhook signal.
+    let token = "tok-webhook".to_string();
+    let spec = weft_core::primitive::WakeSignalSpec {
+        kind: weft_core::primitive::WakeSignalKind::Webhook {
+            path: "".into(),
+            auth: weft_core::primitive::WebhookAuth::None,
+        },
+        is_resume: false,
+    };
+    let user_url = register_signal(&handle, &token, &spec, "receive")
+        .await
+        .expect("listener register");
+    assert!(user_url.is_some());
+
+    // Put a tracker entry so /signal-fired routes correctly.
+    signal_tracker.insert(
+        token.clone(),
+        RegisteredSignalMeta {
+            project_id: project_id.to_string(),
+            token: token.clone(),
+            node_id: "receive".to_string(),
+            is_resume: false,
+            user_url: user_url.clone(),
+            kind: "webhook".to_string(),
+        },
+    );
+
+    // Sanity: the project store has this project registered.
+    assert!(project_store.get(project_id).await.is_some());
+    // Silence the journal import if not otherwise referenced.
+    let _ = &journal;
+
+    // 3. Simulate the listener firing by POSTing /signal-fired.
+    let fire_body = serde_json::json!({
+        "project_id": project_id.to_string(),
+        "token": token,
+        "payload": { "hello": "world" },
+    });
     let resp = app
         .clone()
-        .oneshot(req("POST", &format!("/projects/{project_id}/activate"), None))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/signal-fired")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", handle.relay_token))
+                .body(Body::from(serde_json::to_vec(&fire_body).unwrap()))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let activate_body: serde_json::Value =
-        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
-    let urls = activate_body.get("urls").and_then(|v| v.as_array()).unwrap().clone();
-    assert_eq!(urls.len(), 1, "expected one webhook URL");
-    let url = urls[0].get("url").and_then(|v| v.as_str()).unwrap();
-    // Extract token from /w/{token} suffix.
-    let after = url.split("/w/").nth(1).unwrap();
-    let token = after.split('/').next().unwrap();
 
-    // 3. Fire the webhook with a JSON body.
-    let resp = app
-        .clone()
-        .oneshot(req(
-            "POST",
-            &format!("/w/{token}"),
-            Some(serde_json::json!({"hello": "world"})),
-        ))
-        .await
-        .unwrap();
-    let status = resp.status();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(
-        status,
-        StatusCode::ACCEPTED,
-        "expected 202 from /w/{token}, got {status}: {}",
-        String::from_utf8_lossy(&body_bytes)
-    );
-
-    // 4. Confirm a worker spawn was recorded. Under Slice 3 the
-    // wake payload lives in the slot queue (delivered over WS once
-    // the worker connects), not on WakeContext; only `project_id`
-    // and `color` sit on the spawn-time handoff. The WS round-trip
-    // is covered by its own integration test.
+    // 4. Confirm a worker was spawned.
     let spawned = spawned.lock().await;
     assert_eq!(spawned.len(), 1, "exactly one worker should have spawned");
-    let wake = &spawned[0];
-    assert_eq!(wake.project_id, project_id.to_string());
+    assert_eq!(spawned[0].project_id, project_id.to_string());
 }

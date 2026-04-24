@@ -11,7 +11,8 @@
 
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
-import type { HostMessage, ProjectDefinition, WebviewMessage } from './shared/protocol';
+import type { HostMessage, LiveDataItem, ProjectDefinition, WebviewMessage } from './shared/protocol';
+import { readProjectIdFromToml } from './sidebar/projects';
 
 export interface SelectedNode {
   nodeId: string;
@@ -33,11 +34,39 @@ export class GraphViewController {
   private runHandler: (() => void) | undefined;
   private stopHandler: (() => void) | undefined;
   private selectionHandler: ((sel: SelectedNode | undefined) => void) | undefined;
+  private followTogglePinHandler: (() => void) | undefined;
+  private followCatchUpHandler: (() => void) | undefined;
+  /// Hooks fired when the user triggers an action that spawns an
+  /// execution whose color we don't yet know (activate / infra
+  /// start). Extension.ts uses these to tell AutoFollow "next
+  /// ExecutionStarted on this project, jump to it."
+  private lifecycleStartHandler: ((verb: 'activate' | 'infraStart') => void) | undefined;
   // Set while we're applying our own TextEdit to the document.
   // onDidChangeTextDocument fires during the edit; if we parsed
   // twice (once for the webview save, once for the VS Code change)
   // we'd loop.
   private suppressReparse = false;
+  // One entry per (project, infra node) we're polling /live for.
+  // Keyed by nodeId. Cleared on parseResult and dispose.
+  private liveTimers: Map<string, NodeJS.Timeout> = new Map();
+  // Interval between polls for infra /live. 3s matches v1; the
+  // sidecar's /live is cheap (returns current state snapshot), so
+  // this is fine.
+  private readonly liveIntervalMs = 3000;
+  // Infra status poller: one timer per open panel, polling the
+  // dispatcher's /infra/status endpoint so the ActionBar reflects
+  // the actual cluster state (running / stopped / none).
+  private infraStatusTimer: NodeJS.Timeout | undefined;
+  // Trigger status poller: tells the ActionBar whether the project
+  // is currently activated (dispatcher status == Active).
+  private triggerStatusTimer: NodeJS.Timeout | undefined;
+  // Whether the open project has any infra nodes at all. Cached
+  // from the latest parse so we can skip the poll when there's
+  // nothing to report.
+  private hasInfraNodes = false;
+  // Whether the open project has any trigger nodes. Drives
+  // visibility of the trigger section of the ActionBar.
+  private hasTriggerNodes = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -49,6 +78,11 @@ export class GraphViewController {
   setRunHandler(fn: () => void): void { this.runHandler = fn; }
   setStopHandler(fn: () => void): void { this.stopHandler = fn; }
   setNodeSelectionHandler(fn: (sel: SelectedNode | undefined) => void): void { this.selectionHandler = fn; }
+  setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
+  setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
+  setLifecycleStartHandler(fn: (verb: 'activate' | 'infraStart') => void): void {
+    this.lifecycleStartHandler = fn;
+  }
 
   /** Public so execFollower can push events into the panel. */
   post(msg: HostMessage): void {
@@ -81,7 +115,14 @@ export class GraphViewController {
   }
 
   async open(doc: vscode.TextDocument, projectId?: string): Promise<void> {
-    if (projectId) this.watchedProjectId = projectId;
+    // Resolve the project id for this file. Explicit caller arg
+    // wins (sidebar pin path); otherwise walk up from the .weft
+    // file looking for a `weft.toml` that declares an id. Falling
+    // back to undefined means the dispatcher returns nil UUID on
+    // /parse, which breaks every /projects/{id}/... endpoint for
+    // this panel (live poll, infra status, trigger status).
+    const resolved = projectId ?? readProjectIdFromToml(doc.uri.fsPath);
+    if (resolved) this.watchedProjectId = resolved;
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside);
       this.watchedDoc = doc;
@@ -120,6 +161,12 @@ export class GraphViewController {
       vscode.window.onDidChangeActiveTextEditor((ed) => {
         if (ed && ed.document.languageId === 'weft') {
           this.watchedDoc = ed.document;
+          // Re-resolve project id for the new file: different
+          // .weft files can belong to different projects, and the
+          // old watchedProjectId must not leak into the polls we
+          // kick off from triggerParse below.
+          const newId = readProjectIdFromToml(ed.document.uri.fsPath);
+          if (newId) this.watchedProjectId = newId;
           void this.triggerParse();
         }
       }),
@@ -141,13 +188,258 @@ export class GraphViewController {
     try {
       const response = await this.client.parse(source, this.watchedProjectId);
       this.lastProject = response.project;
+      // Latch the parsed project id as the authoritative watch id
+      // when we don't already have one. Guards against the case
+      // where weft.toml lookup failed on open but the dispatcher
+      // returns a real uuid (e.g. a project registered by the CLI
+      // that knows the id from its own weft.toml).
+      const nilUuid = '00000000-0000-0000-0000-000000000000';
+      if (
+        response.project.id &&
+        response.project.id !== nilUuid &&
+        !this.watchedProjectId
+      ) {
+        this.watchedProjectId = response.project.id;
+      }
       this.post({ kind: 'parseResult', response, source, layoutCode });
+      this.syncInfraLivePollers(response);
     } catch (err) {
       this.post({
         kind: 'parseError',
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  /** Compare the latest parse to the set of infra nodes we're
+   *  currently polling `/live` for. Start pollers for any newly-
+   *  introduced infra nodes, stop those that no longer exist. The
+   *  dispatcher answers 404 cleanly when `weft infra up` hasn't run
+   *  yet, so starting a poller is harmless either way.
+   *
+   *  Also drives the ActionBar's infra + trigger status pollers
+   *  based on which node families the project contains.
+   */
+  private syncInfraLivePollers(response: { project: ProjectDefinition; catalog: Record<string, { requires_infra?: boolean; features?: { isTrigger?: boolean } }> }): void {
+    const projectId = response.project.id;
+    if (!projectId) {
+      this.stopAllLivePollers();
+      return;
+    }
+    const infraNodeIds = new Set(
+      response.project.nodes
+        .filter((n) => {
+          const entry = response.catalog[n.nodeType];
+          // NodeDefinition serializes `requires_infra` as camelCase
+          // `requiresInfra`; the catalog entry uses snake_case (its
+          // serde config differs). Check both so either one flips
+          // polling on.
+          const nodeFlag = (n as unknown as { requiresInfra?: boolean }).requiresInfra;
+          return nodeFlag ?? entry?.requires_infra ?? false;
+        })
+        .map((n) => n.id),
+    );
+
+    // Stop pollers for nodes no longer in the project (or no longer
+    // requires_infra).
+    for (const [id, timer] of this.liveTimers.entries()) {
+      if (!infraNodeIds.has(id)) {
+        clearInterval(timer);
+        this.liveTimers.delete(id);
+      }
+    }
+    // Start pollers for new infra nodes.
+    for (const id of infraNodeIds) {
+      if (this.liveTimers.has(id)) continue;
+      this.liveTimers.set(id, this.startLivePoller(projectId, id));
+    }
+
+    // Keep the infra-status poller alive while this project has
+    // infra nodes; tear it down otherwise.
+    const hadInfra = this.hasInfraNodes;
+    this.hasInfraNodes = infraNodeIds.size > 0;
+    if (this.hasInfraNodes && !hadInfra) {
+      this.startInfraStatusPoller(projectId);
+    } else if (!this.hasInfraNodes && hadInfra) {
+      this.stopInfraStatusPoller();
+    }
+
+    // Trigger-status poller runs as long as the project has any
+    // trigger node. `features.isTrigger` is mirrored onto the
+    // NodeDefinition during enrich; the protocol uses camelCase.
+    const triggerIds = new Set(
+      response.project.nodes
+        .filter((n) => {
+          const entry = response.catalog[n.nodeType];
+          return (n.features?.isTrigger ?? entry?.features?.isTrigger) ?? false;
+        })
+        .map((n) => n.id),
+    );
+    const hadTriggers = this.hasTriggerNodes;
+    this.hasTriggerNodes = triggerIds.size > 0;
+    if (this.hasTriggerNodes && !hadTriggers) {
+      this.startTriggerStatusPoller(projectId);
+    } else if (!this.hasTriggerNodes && hadTriggers) {
+      this.stopTriggerStatusPoller();
+    }
+  }
+
+  private startLivePoller(projectId: string, nodeId: string): NodeJS.Timeout {
+    // Fire one poll immediately so the user doesn't wait 3s to see
+    // the QR on first activation, then repeat on the interval.
+    const tick = async () => {
+      try {
+        const body = await this.client.get<{ items: unknown[] }>(
+          `/projects/${projectId}/infra/nodes/${nodeId}/live`,
+        );
+        const items = Array.isArray(body.items)
+          ? body.items.filter(isLiveDataItem)
+          : [];
+        this.post({ kind: 'liveData', nodeId, items });
+      } catch {
+        // Infra not provisioned yet (404) or sidecar down (BAD_GATEWAY).
+        // Clear any previous render with an empty items list so the
+        // node stops showing stale data.
+        this.post({ kind: 'liveData', nodeId, items: [] });
+      }
+    };
+    void tick();
+    return setInterval(() => void tick(), this.liveIntervalMs);
+  }
+
+  private stopAllLivePollers(): void {
+    for (const timer of this.liveTimers.values()) clearInterval(timer);
+    this.liveTimers.clear();
+  }
+
+  private startInfraStatusPoller(projectId: string): void {
+    this.stopInfraStatusPoller();
+    const tick = async () => {
+      try {
+        const body = await this.client.get<{
+          nodes: Array<{ node_id: string; status: 'running' | 'stopped'; endpoint_url: string | null }>;
+        }>(`/projects/${projectId}/infra/status`);
+        const nodes = (body.nodes ?? []).map((n) => ({
+          nodeId: n.node_id,
+          status: n.status,
+          endpointUrl: n.endpoint_url,
+        }));
+        const rollup: 'running' | 'stopped' | 'mixed' | 'none' =
+          nodes.length === 0
+            ? 'none'
+            : nodes.every((n) => n.status === 'running')
+              ? 'running'
+              : nodes.every((n) => n.status === 'stopped')
+                ? 'stopped'
+                : 'mixed';
+        this.post({ kind: 'infraStatus', snapshot: { nodes, rollup } });
+      } catch {
+        this.post({ kind: 'infraStatus', snapshot: { nodes: [], rollup: 'none' } });
+      }
+    };
+    void tick();
+    this.infraStatusTimer = setInterval(() => void tick(), this.liveIntervalMs);
+  }
+
+  private stopInfraStatusPoller(): void {
+    if (this.infraStatusTimer) {
+      clearInterval(this.infraStatusTimer);
+      this.infraStatusTimer = undefined;
+    }
+  }
+
+  private startTriggerStatusPoller(projectId: string): void {
+    this.stopTriggerStatusPoller();
+    const tick = async () => {
+      try {
+        const body = await this.client.get<{ status: string }>(
+          `/projects/${projectId}`,
+        );
+        const s = body.status as 'registered' | 'active' | 'inactive';
+        this.post({
+          kind: 'triggerStatus',
+          snapshot: {
+            projectStatus:
+              s === 'active' || s === 'inactive' || s === 'registered' ? s : 'unknown',
+          },
+        });
+      } catch {
+        this.post({ kind: 'triggerStatus', snapshot: { projectStatus: 'unknown' } });
+      }
+    };
+    void tick();
+    this.triggerStatusTimer = setInterval(() => void tick(), this.liveIntervalMs);
+  }
+
+  private stopTriggerStatusPoller(): void {
+    if (this.triggerStatusTimer) {
+      clearInterval(this.triggerStatusTimer);
+      this.triggerStatusTimer = undefined;
+    }
+  }
+
+  /** Fire `activate` or `deactivate` against the dispatcher and
+   *  kick a fresh trigger-status poll so the ActionBar settles
+   *  immediately. */
+  private async callProjectLifecycle(verb: 'activate' | 'deactivate'): Promise<void> {
+    const projectId = this.lastProject?.id ?? this.watchedProjectId;
+    if (!projectId) return;
+    if (verb === 'activate') {
+      // Prime auto-follow before firing the request: the trigger
+      // setup sub-exec's ExecutionStarted can arrive over SSE
+      // before the HTTP response returns.
+      this.lifecycleStartHandler?.('activate');
+    }
+    try {
+      await this.client.post<unknown>(`/projects/${projectId}/${verb}`, {});
+    } catch (err) {
+      this.reportActionFailure(verb, err);
+    }
+    if (this.hasTriggerNodes) {
+      this.startTriggerStatusPoller(projectId);
+    }
+  }
+
+  /** Fire-and-forget: hit the dispatcher's infra endpoint on the
+   *  watched project's behalf, then force a poll so the ActionBar
+   *  reflects the new state without waiting for the next tick. */
+  private async callInfra(verb: 'start' | 'stop' | 'terminate'): Promise<void> {
+    const projectId = this.lastProject?.id ?? this.watchedProjectId;
+    if (!projectId) return;
+    if (verb === 'start') {
+      // Prime auto-follow: first-time provision spawns no child
+      // exec, but scale_up eventually does if the user then hits
+      // activate. We still prime on start so the next exec after
+      // readiness auto-follows.
+      this.lifecycleStartHandler?.('infraStart');
+    }
+    try {
+      await this.client.post<unknown>(`/projects/${projectId}/infra/${verb}`, {});
+    } catch (err) {
+      this.reportActionFailure(`infra${verb.charAt(0).toUpperCase()}${verb.slice(1)}` as
+        | 'infraStart'
+        | 'infraStop'
+        | 'infraTerminate', err);
+    }
+    // Refresh status immediately; the next interval tick will
+    // pick up any late k8s transitions (starting → running).
+    if (this.hasInfraNodes) {
+      this.startInfraStatusPoller(projectId);
+    }
+  }
+
+  /** Shared failure path for the ActionBar verbs. Posts an
+   *  `actionFailed` message so the webview can clear its optimistic
+   *  transitional state, and surfaces a toast so the user isn't
+   *  left guessing why nothing happened. */
+  private reportActionFailure(
+    action: 'infraStart' | 'infraStop' | 'infraTerminate' | 'activate' | 'deactivate',
+    err: unknown,
+  ): void {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[weft/action] ${action} failed:`, err);
+    this.post({ kind: 'actionFailed', action, message });
+    void vscode.window.showErrorMessage(`Weft: ${action} failed — ${message}`);
   }
 
   private onMessage(msg: WebviewMessage): void {
@@ -169,6 +461,27 @@ export class GraphViewController {
         break;
       case 'stopProject':
         this.stopHandler?.();
+        break;
+      case 'infraStart':
+        void this.callInfra('start');
+        break;
+      case 'infraStop':
+        void this.callInfra('stop');
+        break;
+      case 'infraTerminate':
+        void this.callInfra('terminate');
+        break;
+      case 'activateProject':
+        void this.callProjectLifecycle('activate');
+        break;
+      case 'deactivateProject':
+        void this.callProjectLifecycle('deactivate');
+        break;
+      case 'followTogglePin':
+        this.followTogglePinHandler?.();
+        break;
+      case 'followCatchUp':
+        this.followCatchUpHandler?.();
         break;
       case 'nodeSelected':
         if (msg.nodeId === null) {
@@ -267,6 +580,16 @@ export class GraphViewController {
 
   private onDispose(): void {
     if (this.parseTimer) clearTimeout(this.parseTimer);
+    this.stopAllLivePollers();
+    this.stopInfraStatusPoller();
+    this.stopTriggerStatusPoller();
+    // Reset the "did the last parse see infra / triggers?" flags
+    // so a subsequent reopen triggers the 0→N transition in
+    // syncInfraLivePollers and the pollers restart. Without this
+    // a close/reopen cycle leaves the new webview with
+    // `isLoading: true` forever (no poller = no status message).
+    this.hasInfraNodes = false;
+    this.hasTriggerNodes = false;
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
     this.panel = undefined;
@@ -305,4 +628,12 @@ function randomNonce(): string {
   let out = '';
   for (let i = 0; i < 24; i++) out += chars[Math.floor(Math.random() * chars.length)];
   return out;
+}
+
+function isLiveDataItem(v: unknown): v is LiveDataItem {
+  if (!v || typeof v !== 'object') return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o.label !== 'string') return false;
+  if (typeof o.data !== 'string' && typeof o.data !== 'number') return false;
+  return o.type === 'text' || o.type === 'image' || o.type === 'progress';
 }

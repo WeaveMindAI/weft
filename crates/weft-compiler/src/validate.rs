@@ -48,6 +48,7 @@ pub fn validate_with_mode(
     check_port_coverage(project, catalog, &mut d);
     check_lane_mechanics(project, &mut d);
     check_warnings(project, &mut d);
+    check_output_reachability(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
     d
 }
@@ -899,6 +900,84 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     );
                 }
             }
+        }
+    }
+}
+
+/// no-output / unreachable-node: the project's output set is every
+/// node whose `is_output()` resolves to true (Debug defaults to true,
+/// any node can set `is_output: true` in its config). Emit:
+///   - **Error** if no node resolves as output: the project can
+///     never produce anything.
+///   - **Warning** on every node that isn't upstream of some output
+///     and isn't a trigger (triggers are entry points, not part of
+///     the user-visible output DAG).
+///
+/// Passthroughs (group boundaries) are exempt: they exist to bridge
+/// scopes, not as standalone targets. Trigger nodes are exempt:
+/// they'd otherwise warn even when they're correctly wired into
+/// fire-time subgraphs.
+fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    let outputs: Vec<&str> = project
+        .nodes
+        .iter()
+        .filter(|n| n.is_output())
+        .map(|n| n.id.as_str())
+        .collect();
+
+    if outputs.is_empty() {
+        push(
+            d,
+            0,
+            Severity::Error,
+            "no-output-node",
+            "project has no output node (Debug, or any node with `is_output: true`). \
+             The run will have nothing to produce.",
+        );
+        return;
+    }
+
+    // BFS upstream from every output. The result is the set of
+    // nodes that contribute to at least one output.
+    let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut frontier: Vec<&str> = outputs.clone();
+    while let Some(id) = frontier.pop() {
+        if !reached.insert(id) {
+            continue;
+        }
+        for edge in &project.edges {
+            if edge.target == id {
+                frontier.push(edge.source.as_str());
+            }
+        }
+    }
+
+    for node in &project.nodes {
+        // Group boundaries are plumbing, not user-visible nodes.
+        if node.node_type == "Passthrough" {
+            continue;
+        }
+        // Triggers are entry points: they legitimately lack
+        // downstream paths in the setup graph, and fire-time graphs
+        // are computed separately per trigger. Don't warn.
+        if node.features.is_trigger {
+            continue;
+        }
+        if !reached.contains(node.id.as_str()) {
+            let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+            push(
+                d,
+                line,
+                Severity::Warning,
+                "unreachable-from-output",
+                format!(
+                    "node '{}' is not upstream of any output. \
+                     Its value won't appear in run results. \
+                     Add an output (e.g. a Debug node) downstream, or \
+                     flip the node's config `is_output: true`.",
+                    node.id
+                ),
+            );
         }
     }
 }

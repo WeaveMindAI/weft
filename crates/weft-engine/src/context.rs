@@ -152,6 +152,42 @@ impl ContextHandle for RunnerHandle {
         Err(WeftError::Suspended { token: reply.token })
     }
 
+    async fn sidecar_endpoint(&self) -> WeftResult<String> {
+        let link = self.require_link()?;
+        let endpoint = link
+            .request_sidecar_endpoint(self.node_id.clone())
+            .await
+            .map_err(|e| WeftError::Suspension(format!("sidecar_endpoint: {e}")))?;
+        endpoint.ok_or_else(|| {
+            WeftError::Config(format!(
+                "infra for node '{}' is not provisioned; run `weft infra up` first",
+                self.node_id
+            ))
+        })
+    }
+
+    async fn register_signal(&self, spec: WakeSignalSpec) -> WeftResult<Option<String>> {
+        let link = self.require_link()?;
+        if spec.is_resume {
+            return Err(WeftError::Suspension(
+                "register_signal requires is_resume=false (entry signal)".into(),
+            ));
+        }
+        let reply = link
+            .request_register_signal(self.node_id.clone(), spec)
+            .await
+            .map_err(|e| WeftError::Suspension(format!("register_signal: {e}")))?;
+        tracing::info!(
+            target: "weft_engine::register",
+            node = %self.node_id,
+            color = %self.color,
+            token = %reply.token,
+            url = reply.user_url.as_deref().unwrap_or(""),
+            "register_signal: dispatcher ack"
+        );
+        Ok(reply.user_url)
+    }
+
     fn report_cost(&self, report: CostReport) {
         let Some(link) = &self.link else {
             tracing::info!(

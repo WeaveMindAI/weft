@@ -44,23 +44,23 @@
     "commands": [
       {
         "command": "weft.openGraphView",
-        "title": "Weft: Open Graph View",
+        "title": "Open Graph View",
         "category": "Weft"
       },
       {
         "command": "weft.openLoomView",
-        "title": "Weft: Open Runner View",
+        "title": "Open Runner View",
         "category": "Weft"
       },
       {
         "command": "weft.runProject",
-        "title": "Weft: Run Project",
+        "title": "Run Project",
         "category": "Weft",
         "icon": "$(play)"
       },
       {
         "command": "weft.stopProject",
-        "title": "Weft: Stop Project",
+        "title": "Stop Project",
         "category": "Weft",
         "icon": "$(stop)"
       },
@@ -91,6 +91,12 @@
       {
         "command": "weft.refreshProjects",
         "title": "Refresh",
+        "category": "Weft",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "weft.refreshExecutions",
+        "title": "Refresh Executions",
         "category": "Weft",
         "icon": "$(refresh)"
       },
@@ -135,9 +141,14 @@
           "group": "navigation"
         },
         {
+          "command": "weft.refreshExecutions",
+          "when": "view == weft.executions",
+          "group": "navigation@1"
+        },
+        {
           "command": "weft.clearExecutions",
           "when": "view == weft.executions",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [

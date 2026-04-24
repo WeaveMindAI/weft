@@ -20,21 +20,27 @@ use crate::state::DispatcherState;
 pub mod project;
 mod execution;
 mod events;
-mod webhook;
-mod form;
 mod extension;
 mod dashboard;
 mod describe;
+mod infra;
 mod parse;
+mod signal;
 pub mod ws;
 
 pub fn router(state: DispatcherState) -> Router {
     Router::new()
+        .route("/health", get(|| async { "ok" }))
         .route("/projects", get(project::list).post(project::register))
         .route("/projects/{id}", get(project::get).delete(project::remove))
         .route("/projects/{id}/run", post(project::run))
         .route("/projects/{id}/activate", post(project::activate))
         .route("/projects/{id}/deactivate", post(project::deactivate))
+        .route("/projects/{id}/infra/start", post(infra::start))
+        .route("/projects/{id}/infra/stop", post(infra::stop))
+        .route("/projects/{id}/infra/terminate", post(infra::terminate))
+        .route("/projects/{id}/infra/status", get(infra::status))
+        .route("/projects/{id}/infra/nodes/{node_id}/live", get(infra::live))
         .route("/executions/{color}/cancel", post(execution::cancel))
         .route("/executions/{color}/logs", get(execution::list_logs))
         .route("/executions/{color}/replay", get(execution::replay))
@@ -45,9 +51,6 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/executions", get(execution::list_executions))
         .route("/events/project/{id}", get(events::project_stream))
         .route("/events/execution/{color}", get(events::execution_stream))
-        .route("/w/{token}", post(webhook::handle_root))
-        .route("/w/{token}/{*path}", post(webhook::handle))
-        .route("/f/{token}", post(form::submit))
         .route("/ext/{token}/tasks", get(extension::list_tasks))
         .route("/ext/{token}/tasks/{execution_id}/complete", post(extension::complete_task))
         .route("/ext/{token}/triggers/{trigger_task_id}/submit", post(extension::submit_trigger))
@@ -64,6 +67,7 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/describe/project/{id}", get(describe::project_catalog))
         .route("/parse", post(parse::parse))
         .route("/validate", post(parse::validate))
+        .route("/signal-fired", post(signal::signal_fired))
         .route("/ws/executions/{color}", get(ws::connect))
         .with_state(state)
 }

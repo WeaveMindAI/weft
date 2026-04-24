@@ -22,6 +22,7 @@ import type {
   PortDefinition as V1Port,
   LaneMode,
 } from './lib/types';
+import { parseLayoutCode } from './lib/ai/weft-editor';
 
 function toV1Port(p: HostPort): V1Port {
   return {
@@ -160,6 +161,25 @@ export function translateProject(
     structuralNodes.push(toV1Node(n, groupIds));
   }
   const edges = host.edges.map((e) => toV1Edge(e, groupIds));
+
+  // The dispatcher's ProjectDefinition always emits position=(0,0);
+  // persistent positions live in the sidecar `.layout.json` file
+  // (v1 convention). Apply them here so the graph opens where the
+  // user last saved it instead of a stack at the origin. Same logic
+  // as project-hydration.ts, but we do it post-translate because our
+  // flow goes through /parse rather than parseWeft.
+  if (layoutCode) {
+    const layoutMap = parseLayoutCode(layoutCode);
+    for (const n of structuralNodes) {
+      const entry = layoutMap[n.id];
+      if (!entry) continue;
+      n.position = { x: entry.x, y: entry.y };
+      if (entry.w !== undefined) (n.config as Record<string, unknown>).width = entry.w;
+      if (entry.h !== undefined) (n.config as Record<string, unknown>).height = entry.h;
+      if (entry.expanded !== undefined) (n.config as Record<string, unknown>).expanded = entry.expanded;
+    }
+  }
+
   return {
     id: host.id,
     name: host.name,

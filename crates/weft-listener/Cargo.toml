@@ -1,0 +1,30 @@
+[package]
+name = "weft-listener"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "weft-listener"
+path = "src/main.rs"
+
+[dependencies]
+weft-core = { path = "../weft-core" }
+
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+cron = "0.12"
+dashmap = "6"
+futures-util = "0.3"
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

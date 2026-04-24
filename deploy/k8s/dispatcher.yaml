@@ -1,0 +1,135 @@
+---
+# ServiceAccount + RBAC so the dispatcher can manage Deployments,
+# Services, Pods, PVCs, ConfigMaps in its own namespace. These are
+# needed by KindInfraBackend (sidecars), K8sListenerBackend
+# (listener per project), and K8sWorkerBackend (worker per exec).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weft-dispatcher
+  namespace: wm-local
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: weft-dispatcher
+  namespace: wm-local
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, configmaps, persistentvolumeclaims, events]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    verbs: [get, update, patch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: weft-dispatcher
+  namespace: wm-local
+subjects:
+  - kind: ServiceAccount
+    name: weft-dispatcher
+    namespace: wm-local
+roleRef:
+  kind: Role
+  name: weft-dispatcher
+  apiGroup: rbac.authorization.k8s.io
+---
+# Persistent storage for the journal + project store. Losing this
+# on a dispatcher restart means every active project comes back as
+# Inactive and every in-flight execution orphans; a PVC keeps them.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: weft-dispatcher-data
+  namespace: wm-local
+  labels:
+    weft.dev/role: dispatcher
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-dispatcher
+  namespace: wm-local
+  labels:
+    app: weft-dispatcher
+spec:
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: only one instance holds the
+    # journal lock. Phase B makes it HA.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: weft-dispatcher
+  template:
+    metadata:
+      labels:
+        app: weft-dispatcher
+    spec:
+      serviceAccountName: weft-dispatcher
+      containers:
+        - name: dispatcher
+          image: weft-dispatcher:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9999
+              name: http
+          env:
+            - name: WEFT_HTTP_PORT
+              value: "9999"
+            - name: WEFT_DATA_DIR
+              value: /var/lib/weft
+            - name: WEFT_NAMESPACE
+              value: wm-local
+            - name: WEFT_LISTENER_IMAGE
+              value: weft-listener:local
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/weft
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9999
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9999
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: weft-dispatcher-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-dispatcher
+  namespace: wm-local
+  labels:
+    app: weft-dispatcher
+spec:
+  selector:
+    app: weft-dispatcher
+  ports:
+    - name: http
+      port: 9999
+      targetPort: 9999

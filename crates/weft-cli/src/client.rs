@@ -42,6 +42,13 @@ impl DispatcherClient {
         resp.error_for_status()?;
         Ok(())
     }
+
+    /// POST with no body, parse the JSON response.
+    pub async fn post_json_empty(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.post(&url).send().await.with_context(|| format!("POST {url}"))?;
+        resp.error_for_status()?.json().await.context("parse response")
+    }
 }
 
 pub fn resolve_dispatcher_url(override_url: Option<&str>) -> String {

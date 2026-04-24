@@ -99,6 +99,16 @@ pub fn parse_only(
         }
     }
 
+    // Structural validate so the IDE gets inline feedback for
+    // graph-shape problems (no-output-node, unreachable-from-output,
+    // duplicate ids, etc.) directly from /parse. Runtime-only rules
+    // still only fire from the dedicated /validate endpoint.
+    diagnostics.extend(validate::validate_with_mode(
+        &project,
+        catalog,
+        validate::ValidationMode::Structural,
+    ));
+
     (project, diagnostics)
 }
 

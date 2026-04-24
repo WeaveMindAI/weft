@@ -1029,7 +1029,23 @@
 				nodes = nodes.map(n => {
 					const nodeType = n.data.nodeType as string;
 					const nodeTypeConfig = NODE_TYPE_CONFIG[nodeType];
-					const debugData = nodeTypeConfig?.features?.showDebugPreview ? nodeOutputs[n.id] : undefined;
+					// Debug-style preview: show the node's output if
+					// it has one; otherwise (Debug, any future sink)
+					// show what flowed IN, since that's what makes
+					// the preview meaningful. Read the latest exec
+					// row's input payload when no outputs exist on
+					// the node type.
+					let debugData: unknown = undefined;
+					if (nodeTypeConfig?.features?.showDebugPreview) {
+						const hasOutputs = (nodeTypeConfig.outputs?.length ?? 0) > 0;
+						if (hasOutputs) {
+							debugData = nodeOutputs[n.id];
+						} else {
+							const rows = nodeExecutions[n.id];
+							const latest = rows?.[rows.length - 1];
+							debugData = latest?.input;
+						}
+					}
 
 					let executions: import('$lib/types').NodeExecution[];
 

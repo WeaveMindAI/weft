@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# install.sh — build the weft CLI + dispatcher + runner in release
-# mode and symlink them into ~/.local/bin, and/or build the VS Code
-# extension into a .vsix package.
+# install.sh — build and install the weft CLI + the VS Code
+# extension.
+#
+# The dispatcher and listener are no longer host binaries: they run
+# as Pod images inside a local kind cluster. `weft daemon start`
+# builds those images on first use. The only host-side binary is
+# `weft` itself.
 #
 # Usage:
 #   ./install.sh                  # build + install both (CLI + extension)
@@ -46,10 +50,14 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage: ./install.sh [--cli-only|--extension-only] [--debug] [--prefix PATH] [--uninstall]
 
-By default builds BOTH the Rust CLI (weft / weft-dispatcher / weft-
-runner, symlinked into PREFIX/bin) AND the VS Code extension
-(packaged as extension-vscode/weft-vscode-*.vsix; install it
-yourself with \`code --install-extension <vsix>\`).
+By default builds BOTH the Rust CLI (\`weft\`, symlinked into
+PREFIX/bin) AND the VS Code extension (packaged as
+extension-vscode/weft-vscode-*.vsix; install it yourself with
+\`code --install-extension <vsix>\`).
+
+The dispatcher + listener images are NOT built or installed here;
+\`weft daemon start\` builds them on demand and loads them into a
+kind cluster.
 
   --cli-only        Skip the VS Code extension.
   --extension-only  Skip the Rust CLI.
@@ -67,7 +75,7 @@ EOF
 done
 
 bin_dir="${prefix}/bin"
-binaries=(weft weft-dispatcher weft-runner)
+binaries=(weft)
 
 # ─── uninstall ────────────────────────────────────────────────────
 
@@ -90,10 +98,10 @@ if [[ $build_cli -eq 1 ]]; then
   mkdir -p "${bin_dir}"
 
   if [[ "${profile}" == "release" ]]; then
-    cargo build --release -p weft-cli -p weft-dispatcher -p weft-runner
+    cargo build --release -p weft-cli
     target_dir="${here}/target/release"
   else
-    cargo build -p weft-cli -p weft-dispatcher -p weft-runner
+    cargo build -p weft-cli
     target_dir="${here}/target/debug"
   fi
 
@@ -108,7 +116,7 @@ if [[ $build_cli -eq 1 ]]; then
     echo "linked ${dst} -> ${src}"
   done
   echo
-  echo "CLI done. binaries live under ${bin_dir}."
+  echo "CLI done. run \`weft daemon start\` to bring up the kind cluster."
 fi
 
 # ─── VS Code extension ────────────────────────────────────────────

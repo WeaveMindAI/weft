@@ -14,7 +14,25 @@ export function extractInfraSubgraph(
 	edges: Edge[],
 ): SubgraphResult {
 	return extractSubgraph(nodes, edges, {
-		seedFilter: (n) => !!n.features?.isInfrastructure,
+		// v2 renamed the metadata flag from `isInfrastructure` to
+		// `requires_infra` (mirrored onto NodeDefinition as
+		// `requiresInfra` by the compiler's enrich pass). Check
+		// both on the node instance and on the catalog entry so
+		// projects parsed before the rename still work.
+		seedFilter: (n) => {
+			const catalog = NODE_TYPE_CONFIG[n.nodeType];
+			const catalogFlag = !!(
+				(catalog as { requires_infra?: boolean } | undefined)?.requires_infra
+				?? (catalog?.features as { requiresInfra?: boolean; isInfrastructure?: boolean } | undefined)?.requiresInfra
+				?? (catalog?.features as { isInfrastructure?: boolean } | undefined)?.isInfrastructure
+			);
+			const nodeFlag = !!(
+				(n as unknown as { requiresInfra?: boolean }).requiresInfra
+				?? (n.features as { requiresInfra?: boolean; isInfrastructure?: boolean } | undefined)?.requiresInfra
+				?? (n.features as { isInfrastructure?: boolean } | undefined)?.isInfrastructure
+			);
+			return nodeFlag || catalogFlag;
+		},
 		validateNode: (n) => {
 			const isTrigger = n.features?.isTrigger
 				|| NODE_TYPE_CONFIG[n.nodeType]?.features?.isTrigger;

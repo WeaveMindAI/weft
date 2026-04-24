@@ -101,6 +101,7 @@ pub async fn run_loop(
         &mut pulses,
         &mut executions,
         HashMap::new(),
+        weft_core::context::Phase::Fire,
     )
     .await
 }
@@ -129,6 +130,14 @@ pub async fn run_with_link(
     // restore pulses + executions. When absent (unusual: event log
     // empty), we seed from the wake message.
     let had_snapshot = snapshot.is_some();
+    // Phase for this worker lifetime. Fresh runs carry it on the
+    // wake; Resume continues the original phase (Fire, since no
+    // snapshotted run was ever launched in InfraSetup or
+    // TriggerSetup).
+    let phase = match &wake {
+        WakeMessage::Fresh { phase, .. } => *phase,
+        WakeMessage::Resume => weft_core::context::Phase::Fire,
+    };
     if let Some(snap) = snapshot {
         for (token, value) in snap.pending_deliveries.clone() {
             link.seed_delivery(token, value).await;
@@ -151,6 +160,7 @@ pub async fn run_with_link(
         &mut pulses,
         &mut executions,
         expected_tokens,
+        phase,
     )
     .await?;
 
@@ -225,7 +235,7 @@ fn seed_from_wake_message(
 ) -> anyhow::Result<()> {
     let _ = (project, edge_idx);
     match wake {
-        WakeMessage::Fresh { seeds } => {
+        WakeMessage::Fresh { seeds, phase: _ } => {
             for seed in seeds {
                 pulses.entry(seed.node_id.clone()).or_default().push(Pulse::new(
                     color,
@@ -347,6 +357,7 @@ async fn drive(
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     mut expected_tokens: HashMap<(String, weft_core::lane::Lane), String>,
+    phase: weft_core::context::Phase,
 ) -> anyhow::Result<LoopOutcome> {
     let (result_tx, mut result_rx) = mpsc::unbounded_channel::<NodeTaskResult>();
     let mut in_flight: JoinSet<()> = JoinSet::new();
@@ -356,6 +367,25 @@ async fn drive(
     // the worker tells the dispatcher "I'm just waiting, please
     // kill me" and exits.
     let mut waiting: HashMap<String, (String, weft_core::lane::Lane)> = HashMap::new();
+
+    // Phase-scoped subgraph. In TriggerSetup we only want the
+    // triggers (features.is_trigger) and their upstream closure to
+    // execute; any node outside that set must be auto-skipped when
+    // a pulse lands on it, otherwise downstream nodes of the
+    // triggers (e.g. the WhatsAppSend reply in an echo bot) block
+    // forever waiting for inputs that TriggerSetup never produces.
+    //
+    // Empty set means "no scoping" (Fire / InfraSetup phases).
+    let phase_scope: Option<std::collections::HashSet<String>> =
+        match phase {
+            weft_core::context::Phase::TriggerSetup => {
+                Some(compute_trigger_setup_scope(project, edge_idx))
+            }
+            _ => None,
+        };
+    if let Some(scope) = phase_scope.as_ref() {
+        drop_out_of_scope_pulses(pulses, scope);
+    }
 
     loop {
         // Pause dispatching when the link is not Live. In-flight
@@ -396,10 +426,20 @@ async fn drive(
         // Dispatch every ready group that isn't already Running for
         // this (node_id, color, lane). Each dispatch either short-
         // circuits (skip/failure) or spawns a task.
-        for (node_id, group) in ready {
+        for (node_id, mut group) in ready {
             let Some(node_def) = project.nodes.iter().find(|n| n.id == node_id) else {
                 continue;
             };
+            // TriggerSetup scoping: if this node isn't in the
+            // trigger-upstream closure, skip it. The pulses that got
+            // it into `ready` still need to be absorbed, and
+            // downstream should still see null pulses so cascading
+            // skips terminate cleanly.
+            if let Some(scope) = phase_scope.as_ref() {
+                if !scope.contains(&node_id) {
+                    group.should_skip = true;
+                }
+            }
             // Absorb input pulses for this dispatch.
             if let Some(bucket) = pulses.get_mut(&node_id) {
                 for p in bucket.iter_mut() {
@@ -521,6 +561,7 @@ async fn drive(
                 group.lane.clone(),
                 config,
                 input,
+                phase,
                 handle,
             );
 
@@ -576,6 +617,7 @@ async fn drive(
             executions,
             link,
             &mut waiting,
+            phase_scope.as_ref(),
         )
         .await;
 
@@ -617,6 +659,7 @@ async fn apply_results(
     executions: &mut NodeExecutionTable,
     link: Option<&DispatcherLink>,
     waiting: &mut HashMap<String, (String, weft_core::lane::Lane)>,
+    phase_scope: Option<&std::collections::HashSet<String>>,
 ) -> bool {
     let mut any = false;
     while let Ok(result) = rx.try_recv() {
@@ -647,6 +690,14 @@ async fn apply_results(
                     edge_idx,
                     executions,
                 );
+                // TriggerSetup: drop any pulses that just landed on
+                // nodes outside the trigger-upstream closure. Those
+                // nodes' inputs are incomplete by design (their
+                // non-scope upstream won't fire) and the engine
+                // would otherwise wedge on them.
+                if let Some(scope) = phase_scope.as_ref() {
+                    drop_out_of_scope_pulses(pulses, scope);
+                }
             }
             NodeTaskOutcome::Failed(err) => {
                 mark_failed(executions, &result.node_id, result.color, &result.lane, &err);
@@ -845,4 +896,53 @@ fn mark_skipped(
             e.completed_at = Some(now_unix());
         }
     }
+}
+
+
+/// Remove every pending pulse whose target is not in `scope`.
+/// Called after each successful node completion to prevent
+/// out-of-scope downstream nodes from wedging TriggerSetup.
+fn drop_out_of_scope_pulses(
+    pulses: &mut PulseTable,
+    scope: &std::collections::HashSet<String>,
+) {
+    let out_of_scope: Vec<String> = pulses
+        .keys()
+        .filter(|k| !scope.contains(*k))
+        .cloned()
+        .collect();
+    for key in out_of_scope {
+        pulses.remove(&key);
+    }
+}
+
+/// Compute the node-id set that a `Phase::TriggerSetup` run should
+/// execute: every trigger node plus its upstream closure. Any node
+/// outside this set will receive pulses (bridge output fans out to
+/// its downstream), but we auto-skip them so the loop terminates
+/// instead of blocking on inputs that will never arrive (e.g. the
+/// reply node of an echo bot).
+fn compute_trigger_setup_scope(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+) -> std::collections::HashSet<String> {
+    let triggers: Vec<String> = project
+        .nodes
+        .iter()
+        .filter(|n| n.features.is_trigger || !n.entry_signals.is_empty())
+        .map(|n| n.id.clone())
+        .collect();
+    let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: Vec<String> = triggers;
+    while let Some(id) = frontier.pop() {
+        if !scope.insert(id.clone()) {
+            continue;
+        }
+        for edge in edge_idx.get_incoming(project, &id) {
+            if !scope.contains(&edge.source) {
+                frontier.push(edge.source.clone());
+            }
+        }
+    }
+    scope
 }

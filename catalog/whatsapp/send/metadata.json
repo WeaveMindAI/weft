@@ -1,0 +1,22 @@
+{
+  "type": "WhatsAppSend",
+  "label": "WhatsApp Send",
+  "description": "Send a text message via the project's WhatsApp bridge. Wire `endpointUrl` from a WhatsAppBridge; set `to` to a jid (e.g. `1234567890@s.whatsapp.net`) and `message` to the text body.",
+  "category": "Communication",
+  "tags": ["whatsapp", "send", "message"],
+  "icon": "MessageCircle",
+  "color": "#25D366",
+  "inputs": [
+    { "name": "endpointUrl", "type": "String", "required": true },
+    { "name": "to", "type": "String", "required": true },
+    { "name": "message", "type": "String", "required": true }
+  ],
+  "outputs": [
+    { "name": "messageId", "type": "String", "required": false },
+    { "name": "success", "type": "Boolean", "required": false }
+  ],
+  "fields": [],
+  "entrySignals": [],
+  "requires_infra": false,
+  "features": {}
+}

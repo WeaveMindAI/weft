@@ -67,19 +67,105 @@ pub async fn list_logs(
     ))
 }
 
-/// Replay a past execution: returns all node events in order so
-/// the webview can animate the execution from its beginning.
+/// Replay a past execution: returns journaled node events shaped
+/// as `DispatcherEvent` so the webview's live-SSE handler can
+/// process them with the same code path.
+///
+/// We also surface the terminal execution_completed /
+/// execution_failed event at the end when the summary row tells
+/// us the run settled. Without that, the extension's ActionBar
+/// can't flip its `isRunning` flag off and the Stop Execution
+/// button stays visible.
 pub async fn replay(
     State(state): State<DispatcherState>,
     Path(color_str): Path<String>,
-) -> Result<Json<Vec<crate::journal::NodeExecEvent>>, StatusCode> {
+) -> Result<Json<Vec<DispatcherEvent>>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let events = state
+    let project_id = state
+        .journal
+        .execution_project(color)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let raw_events = state
         .journal
         .events_for(color)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(events))
+    let mut out: Vec<DispatcherEvent> = raw_events
+        .into_iter()
+        .map(|e| node_event_to_dispatcher(e, project_id.clone()))
+        .collect();
+
+    // Infer the terminal state from the execution summary so the
+    // UI sees ExecutionCompleted / ExecutionFailed and flips out
+    // of "running" mode. A still-running exec (no terminal yet)
+    // returns only node events; the live SSE will deliver the
+    // terminal event when it happens.
+    if let Some(summary) = state
+        .journal
+        .list_executions(500)
+        .await
+        .ok()
+        .and_then(|list| list.into_iter().find(|s| s.color == color))
+    {
+        match summary.status.to_ascii_lowercase().as_str() {
+            "completed" => out.push(DispatcherEvent::ExecutionCompleted {
+                color,
+                project_id: project_id.clone(),
+                outputs: serde_json::Value::Null,
+            }),
+            "failed" => out.push(DispatcherEvent::ExecutionFailed {
+                color,
+                project_id: project_id.clone(),
+                // Per-node errors are already in the stream; the
+                // summary doesn't carry one so we leave it empty.
+                error: String::new(),
+            }),
+            _ => {}
+        }
+    }
+    Ok(Json(out))
+}
+
+/// Translate a journaled per-node event into the SSE-shaped
+/// `DispatcherEvent` the extension's apply handler expects. Same
+/// field names live wire uses (`node`, `lane`, `project_id`).
+fn node_event_to_dispatcher(
+    e: crate::journal::NodeExecEvent,
+    project_id: String,
+) -> DispatcherEvent {
+    use crate::journal::NodeExecKind;
+    match e.kind {
+        NodeExecKind::Started => DispatcherEvent::NodeStarted {
+            color: e.color,
+            node: e.node_id,
+            lane: e.lane,
+            input: e.input.unwrap_or(serde_json::Value::Null),
+            project_id,
+        },
+        NodeExecKind::Completed => DispatcherEvent::NodeCompleted {
+            color: e.color,
+            node: e.node_id,
+            lane: e.lane,
+            output: e.output.unwrap_or(serde_json::Value::Null),
+            project_id,
+        },
+        NodeExecKind::Failed => DispatcherEvent::NodeFailed {
+            color: e.color,
+            node: e.node_id,
+            lane: e.lane,
+            error: e.error.unwrap_or_default(),
+            project_id,
+        },
+        NodeExecKind::Skipped => DispatcherEvent::NodeSkipped {
+            color: e.color,
+            node: e.node_id,
+            lane: e.lane,
+            project_id,
+        },
+    }
 }
 
 pub async fn list_executions(

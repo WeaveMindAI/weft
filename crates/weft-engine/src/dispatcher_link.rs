@@ -69,6 +69,13 @@ struct LinkInner {
 #[derive(Default)]
 struct PendingState {
     awaiting_token: HashMap<u64, oneshot::Sender<TokenReply>>,
+    /// Trigger-setup-phase register_signal calls awaiting the
+    /// dispatcher's RegisterSignalAck. Same shape as awaiting_token
+    /// but populated from `ctx.register_signal` rather than
+    /// `ctx.await_signal`.
+    awaiting_register: HashMap<u64, oneshot::Sender<TokenReply>>,
+    /// `ctx.sidecar_endpoint()` calls awaiting SidecarEndpoint replies.
+    awaiting_endpoint: HashMap<u64, oneshot::Sender<Option<String>>>,
     /// Suspensions waiting for a delivery. When a `Deliver` arrives
     /// the value either flows through an `Ongoing` oneshot (a node
     /// is already waiting) or gets stashed in `Ready` so a later
@@ -192,6 +199,54 @@ impl DispatcherLink {
         })
         .await;
         rx.await.map_err(|_| anyhow::anyhow!("token channel closed"))
+    }
+
+    /// `ctx.sidecar_endpoint()` round-trip: ask the dispatcher
+    /// for this node's sidecar endpoint URL. Returns `Ok(None)`
+    /// when infra isn't provisioned; caller surfaces the error.
+    pub async fn request_sidecar_endpoint(
+        &self,
+        node_id: String,
+    ) -> anyhow::Result<Option<String>> {
+        let (tx, rx) = oneshot::channel();
+        let request_id = {
+            let mut p = self.inner.pending.lock().await;
+            let id = p.next_request_id;
+            p.next_request_id += 1;
+            p.awaiting_endpoint.insert(id, tx);
+            id
+        };
+        self.send(WorkerToDispatcher::SidecarEndpointRequest {
+            request_id,
+            node_id,
+        })
+        .await;
+        rx.await.map_err(|_| anyhow::anyhow!("sidecar endpoint channel closed"))
+    }
+
+    /// TriggerSetup-phase `register_signal` round-trip: ship the
+    /// spec to the dispatcher, wait for the ack carrying the
+    /// listener-minted user URL.
+    pub async fn request_register_signal(
+        &self,
+        node_id: String,
+        spec: weft_core::primitive::WakeSignalSpec,
+    ) -> anyhow::Result<TokenReply> {
+        let (tx, rx) = oneshot::channel();
+        let request_id = {
+            let mut p = self.inner.pending.lock().await;
+            let id = p.next_request_id;
+            p.next_request_id += 1;
+            p.awaiting_register.insert(id, tx);
+            id
+        };
+        self.send(WorkerToDispatcher::RegisterSignalRequest {
+            request_id,
+            node_id,
+            spec,
+        })
+        .await;
+        rx.await.map_err(|_| anyhow::anyhow!("register_signal ack channel closed"))
     }
 
     /// Whether a delivery for `token` has already been seeded into
@@ -447,6 +502,18 @@ async fn route_inbound(ctx: &SupervisorCtx, msg: DispatcherToWorker) -> bool {
             let mut p = ctx.pending.lock().await;
             if let Some(tx) = p.awaiting_token.remove(&request_id) {
                 let _ = tx.send(TokenReply { token, user_url });
+            }
+        }
+        DispatcherToWorker::RegisterSignalAck { request_id, token, user_url } => {
+            let mut p = ctx.pending.lock().await;
+            if let Some(tx) = p.awaiting_register.remove(&request_id) {
+                let _ = tx.send(TokenReply { token, user_url });
+            }
+        }
+        DispatcherToWorker::SidecarEndpoint { request_id, endpoint } => {
+            let mut p = ctx.pending.lock().await;
+            if let Some(tx) = p.awaiting_endpoint.remove(&request_id) {
+                let _ = tx.send(endpoint);
             }
         }
         DispatcherToWorker::Deliver(Delivery { token, value }) => {

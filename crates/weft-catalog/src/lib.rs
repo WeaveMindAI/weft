@@ -205,6 +205,13 @@ pub struct NodeDeps {
 /// Layout: `<weft-repo>/crates/weft-catalog` → parent → parent →
 /// `catalog`. If the repo layout changes, update this function.
 pub fn stdlib_root() -> PathBuf {
+    // Container images (dispatcher / worker) bake the catalog at
+    // /catalog and set `WEFT_CATALOG_ROOT` so binaries don't rely
+    // on cargo's compile-time source layout. Local development
+    // uses the CARGO_MANIFEST_DIR fallback.
+    if let Ok(override_path) = std::env::var("WEFT_CATALOG_ROOT") {
+        return PathBuf::from(override_path);
+    }
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())

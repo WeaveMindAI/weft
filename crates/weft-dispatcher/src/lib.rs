@@ -15,9 +15,10 @@ pub mod api;
 pub mod backend;
 pub mod config;
 pub mod events;
+pub mod infra;
 pub mod journal;
+pub mod listener;
 pub mod project_store;
-pub mod scheduler;
 pub mod slots;
 pub mod state;
 

@@ -6,11 +6,14 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
 
-/** Stable per-path project ID. Deterministic so reopening a file
- *  keeps its execution history consistent across sessions. Uses
- *  the UUIDv5 namespace algorithm (sha1-based) under a fixed
- *  namespace so the caller doesn't need the uuid package. */
+/** Fallback per-path project ID for folders without a weft.toml.
+ *  Deterministic UUIDv5-style so reopening a file keeps the same
+ *  id if we never write one to disk. Real projects should always
+ *  have an id in their weft.toml: the CLI's `weft.toml` is the
+ *  canonical source of truth and every `weft run/build` guarantees
+ *  it exists. */
 const NAMESPACE = Buffer.from('6ba7b810-9dad-11d1-80b4-00c04fd430c8', 'hex');
 export function deriveProjectId(fsPath: string): string {
   const h = crypto.createHash('sha1').update(NAMESPACE).update(fsPath).digest();
@@ -18,6 +21,50 @@ export function deriveProjectId(fsPath: string): string {
   h[8] = (h[8] & 0x3f) | 0x80;
   const hex = h.slice(0, 16).toString('hex');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/** Read the project id from a `weft.toml` next to the entry file,
+ *  or higher up the tree. Matches what `weft-compiler::project`
+ *  does on the CLI side so the extension, CLI, and dispatcher all
+ *  agree on one id per project. Returns undefined if no weft.toml
+ *  is found or if it has no `[package].id`.
+ *
+ *  Tiny hand-rolled parser: we only want one field, and pulling in
+ *  a TOML dep for this is overkill.
+ */
+export function readProjectIdFromToml(entryFsPath: string): string | undefined {
+  let dir = path.dirname(entryFsPath);
+  for (let i = 0; i < 8; i++) {
+    const candidate = path.join(dir, 'weft.toml');
+    if (fs.existsSync(candidate)) {
+      try {
+        const text = fs.readFileSync(candidate, 'utf8');
+        return extractPackageId(text);
+      } catch {
+        return undefined;
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+function extractPackageId(toml: string): string | undefined {
+  // Match `id = "..."` inside a `[package]` section.
+  let inPackage = false;
+  for (const rawLine of toml.split('\n')) {
+    const line = rawLine.trim();
+    if (line.startsWith('[')) {
+      inPackage = line === '[package]';
+      continue;
+    }
+    if (!inPackage) continue;
+    const m = line.match(/^id\s*=\s*"([^"]+)"/);
+    if (m) return m[1];
+  }
+  return undefined;
 }
 
 export interface WeftProject {
@@ -103,7 +150,11 @@ async function discoverProjects(): Promise<WeftProject[]> {
     files.sort();
     for (const f of files) {
       projects.push({
-        id: deriveProjectId(f),
+        // weft.toml is the source of truth when present (matches
+        // CLI + dispatcher). Fall back to the path-derived id only
+        // for orphan .weft files with no weft.toml anywhere up the
+        // tree.
+        id: readProjectIdFromToml(f) ?? deriveProjectId(f),
         label: path.basename(dir),
         entryPath: f,
         rootPath: dir,

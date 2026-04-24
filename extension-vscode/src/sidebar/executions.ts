@@ -11,7 +11,7 @@
 
 import * as vscode from 'vscode';
 
-import type { DispatcherClient } from '../dispatcher';
+import type { DispatcherClient, SseSubscription } from '../dispatcher';
 import type { WeftProject } from './projects';
 
 export interface ExecutionSummary {
@@ -29,12 +29,52 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<ExecutionNode
 
   private cache: ExecutionSummary[] = [];
   private pinnedProject: WeftProject | undefined;
+  private eventSubscription: SseSubscription | undefined;
+  // Tight refresh burst after an event: avoids piling a second
+  // refresh when multiple events land within milliseconds of each
+  // other (ExecutionStarted + NodeStarted arrive back-to-back).
+  private refreshDebounceTimer: NodeJS.Timeout | undefined;
 
   constructor(private readonly client: DispatcherClient) {}
 
   setPinnedProject(project: WeftProject | undefined): void {
+    if (this.pinnedProject?.id === project?.id) return;
     this.pinnedProject = project;
-    this._onDidChange.fire();
+    this.resubscribe();
+    // Always refresh on pin changes so the tree shows the new
+    // project's runs immediately instead of waiting for the first
+    // event to arrive (which might never if the project is idle).
+    void this.refresh();
+  }
+
+  /** Drop any prior SSE connection and, if a project is pinned,
+   *  open a fresh one against `/events/project/{id}`. Every event
+   *  (ExecutionStarted / ExecutionCompleted / NodeStarted / etc.)
+   *  triggers a debounced list refresh. */
+  private resubscribe(): void {
+    this.eventSubscription?.close();
+    this.eventSubscription = undefined;
+    if (!this.pinnedProject) return;
+    const projectId = this.pinnedProject.id;
+    this.eventSubscription = this.client.subscribe(
+      `/events/project/${projectId}`,
+      () => this.scheduleRefresh(),
+    );
+  }
+
+  private scheduleRefresh(): void {
+    if (this.refreshDebounceTimer) clearTimeout(this.refreshDebounceTimer);
+    this.refreshDebounceTimer = setTimeout(() => {
+      this.refreshDebounceTimer = undefined;
+      void this.refresh();
+    }, 250);
+  }
+
+  /** Called by extension.ts when the panel is disposed so we don't
+   *  leak the SSE connection past its lifetime. */
+  dispose(): void {
+    this.eventSubscription?.close();
+    if (this.refreshDebounceTimer) clearTimeout(this.refreshDebounceTimer);
   }
 
   async refresh(): Promise<void> {
