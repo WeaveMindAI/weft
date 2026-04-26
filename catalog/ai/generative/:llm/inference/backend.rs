@@ -20,7 +20,7 @@ impl Node for LlmNode {
             inputs: vec![
                 PortDef::new("prompt", "String", true),
                 PortDef::new("systemPrompt", "String", false),
-                PortDef::wired_only("config", "Dict[String, String | Number | Boolean]", false),
+                PortDef::wired_only("config", "JsonDict", false),
             ],
             outputs: vec![
                 PortDef::new("response", "MustOverride", false),

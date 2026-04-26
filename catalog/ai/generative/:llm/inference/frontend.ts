@@ -27,7 +27,7 @@ export const LlmNode: NodeTemplate = {
 	defaultInputs: [
 		{ name: 'prompt', portType: 'String', required: true, description: 'The prompt to send to the LLM' },
 		{ name: 'systemPrompt', portType: 'String', required: false, description: 'Optional system prompt. Can be wired or set as a config field.' },
-		{ name: 'config', portType: 'Dict[String, String | Number | Boolean]', required: false, description: 'Optional LlmConfig node. When wired, overrides this node\'s own config fields.', configurable: false },
+		{ name: 'config', portType: 'JsonDict', required: false, description: 'Optional LlmConfig node. When wired, overrides this node\'s own config fields.', configurable: false },
 	],
 	defaultOutputs: [
 		{ name: 'response', portType: 'MustOverride', required: false, description: 'LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly (e.g. keywords: List[String]).' },
