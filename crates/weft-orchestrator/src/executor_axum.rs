@@ -621,12 +621,15 @@ async fn process_execution_callback(
             let callback_id = req.waitingMetadata.as_ref()
                 .map(|m| m.callbackId.clone())
                 .unwrap_or_else(|| format!("{}-{}-{}", execution_id, req.nodeId, pulse_id));
+            let runner_instance_id = req.waitingMetadata.as_ref()
+                .and_then(|m| m.runnerInstanceId.clone());
 
             // Update NodeExecution record
             if let Some(execs) = mt.node_executions.get_mut(&req.nodeId) {
                 if let Some(exec) = execs.iter_mut().find(|e| e.pulseId == pulse_id) {
                     exec.status = NodeExecutionStatus::WaitingForInput;
                     exec.callbackId = Some(callback_id.clone());
+                    exec.runnerInstanceId = runner_instance_id.clone();
                 }
             }
 
@@ -843,16 +846,15 @@ async fn handle_provide_input(
         None => return (StatusCode::NOT_FOUND, "execution not found").into_response(),
     };
 
-    let imm = &exec.imm;
-
-    // Verify NodeExecution is waiting and read callback_id
-    let callback_id = {
+    // Verify NodeExecution is waiting and read (callback_id, runner_instance_id)
+    let (callback_id, runner_instance_id) = {
         let mt = exec.mt.lock().await;
         let exec_rec = mt.node_executions.get(&req.nodeId)
             .and_then(|execs| execs.iter().find(|e| e.pulseId == req.pulseId));
         match exec_rec {
             Some(e) if e.status == NodeExecutionStatus::WaitingForInput => {
-                e.callbackId.clone().unwrap_or_else(|| format!("{}-{}-{}", execution_id, req.nodeId, req.pulseId))
+                let cb = e.callbackId.clone().unwrap_or_else(|| format!("{}-{}-{}", execution_id, req.nodeId, req.pulseId));
+                (cb, e.runnerInstanceId.clone())
             }
             Some(e) => {
                 return (StatusCode::BAD_REQUEST, format!("execution not waiting (status: {})", e.status.as_str())).into_response();
@@ -873,14 +875,29 @@ async fn handle_provide_input(
         // endpoint. The node decides how to handle it (typically returns null output).
     }
 
-    // Find the node service instance and forward the human's input
-    let node_def = imm.project.nodes.iter().find(|n| n.id == req.nodeId);
-    let node_type_str = node_def.map(|n| n.nodeType.to_string()).unwrap_or_else(|| "Unknown".to_string());
+    // Route the form submission back to the same node-runner pod that registered
+    // the in-memory channel. Form-input channels are per-pod, so a random pod
+    // would 404. If runner_instance_id is missing the WaitingForInput record
+    // predates this fix and there is no way to recover the originating pod;
+    // tell the user to refresh.
+    let runner_id = match runner_instance_id.as_deref() {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "form session predates the routing fix, please retry" })),
+            ).into_response();
+        }
+    };
 
-    let instance = find_instance_via_restate(&state, &node_type_str).await;
-    let inst = match instance {
+    let inst = match find_instance_by_id_via_restate(&state, runner_id).await {
         Some(inst) => inst,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, format!("No node service for '{}'", node_type_str)).into_response(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": format!("runner instance '{}' is gone (pod restarted?)", runner_id) })),
+            ).into_response();
+        }
     };
 
     // Forward the human's response to the node's /input_response endpoint.
@@ -903,7 +920,9 @@ async fn handle_provide_input(
         }
     }
 
-    let url = format!("{}/input_response/{}", inst.endpoint, callback_id);
+    // The runner_id segment pins the request through cloud-api / load-balanced
+    // Services to the exact pod holding the in-memory form-input channel.
+    let url = format!("{}/input_response/{}/{}", inst.endpoint, runner_id, callback_id);
     tracing::info!("[axum] provide_input: POSTing to {}", url);
     // Internal client: node-runner is operator-controlled.
     match state.http_client.post(&url).json(&input_payload).send().await {
@@ -1092,6 +1111,7 @@ fn collect_dispatch_work(
                     pulseId: String::new(),
                     error: Some(error_msg.clone()),
                     callbackId: None,
+                    runnerInstanceId: None,
                     startedAt: now_ms,
                     completedAt: Some(now_ms),
                     input: Some(group.input.clone()),
@@ -1113,6 +1133,7 @@ fn collect_dispatch_work(
                     pulseId: String::new(),
                     error: None,
                     callbackId: None,
+                    runnerInstanceId: None,
                     startedAt: now_ms,
                     completedAt: Some(now_ms),
                     input: Some(group.input.clone()),
@@ -1141,6 +1162,7 @@ fn collect_dispatch_work(
                                     pulseId: String::new(),
                                     error: None,
                                     callbackId: None,
+                                    runnerInstanceId: None,
                                     startedAt: now_ms,
                                     completedAt: Some(now_ms),
                                     input: None,
@@ -1171,6 +1193,7 @@ fn collect_dispatch_work(
                                 pulseId: String::new(),
                                 error: None,
                                 callbackId: None,
+                                runnerInstanceId: None,
                                 startedAt: now_ms,
                                 completedAt: Some(now_ms),
                                 input: None,
@@ -1221,6 +1244,7 @@ fn collect_dispatch_work(
                     pulseId: String::new(),
                     error: None,
                     callbackId: None,
+                    runnerInstanceId: None,
                     startedAt: now_ms,
                     completedAt: Some(now_ms),
                     input: Some(group.input.clone()),
@@ -1246,6 +1270,7 @@ fn collect_dispatch_work(
                     pulseId: String::new(),
                     error: None,
                     callbackId: None,
+                    runnerInstanceId: None,
                     startedAt: now_ms,
                     completedAt: Some(now_ms),
                     input: Some(sanitized.clone()),
@@ -1270,6 +1295,7 @@ fn collect_dispatch_work(
                     pulseId: String::new(),
                     error: None,
                     callbackId: None,
+                    runnerInstanceId: None,
                     startedAt: now_ms,
                     completedAt: Some(now_ms),
                     input: Some(group.input.clone()),
@@ -1293,6 +1319,7 @@ fn collect_dispatch_work(
                     pulseId: pulse_id.clone(),
                     error: None,
                     callbackId: None,
+                    runnerInstanceId: None,
                     startedAt: now_ms,
                     completedAt: None,
                     input: Some(group.input.clone()),
@@ -1663,6 +1690,16 @@ async fn complete_task_via_restate(state: &SharedState, callback_id: &str) {
 async fn find_instance_via_restate(state: &SharedState, node_type: &str) -> Option<NodeInstance> {
     let url = format!("{}/NodeInstanceRegistry/global/find_instance_for_node_type", state.restate_url);
     match state.http_client.post(&url).json(&node_type).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<Option<NodeInstance>>().await.ok().flatten()
+        }
+        _ => None,
+    }
+}
+
+async fn find_instance_by_id_via_restate(state: &SharedState, instance_id: &str) -> Option<NodeInstance> {
+    let url = format!("{}/NodeInstanceRegistry/global/find_instance_by_id", state.restate_url);
+    match state.http_client.post(&url).json(&instance_id).send().await {
         Ok(resp) if resp.status().is_success() => {
             resp.json::<Option<NodeInstance>>().await.ok().flatten()
         }

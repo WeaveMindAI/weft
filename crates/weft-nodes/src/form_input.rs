@@ -11,7 +11,7 @@
 //! 1. Registering a oneshot channel keyed by a unique callback_id
 //! 2. POSTing a WaitingForInput callback to the executor (which registers the task)
 //! 3. Awaiting the oneshot receiver
-//! 4. The executor forwards form input to `/input_response/{callback_id}` on this service
+//! 4. The executor forwards form input to `/input_response/{runner_id}/{callback_id}` on this service
 //! 5. The handler resolves the channel, the node continues
 
 use std::collections::HashMap;
@@ -27,6 +27,9 @@ pub struct FormInputChannels {
     /// Monotonic counter for generating unique callback IDs when a node
     /// calls request_form_input multiple times in a loop.
     seq: AtomicU64,
+    /// Id of this runner instance, included in WaitingMetadata so the
+    /// orchestrator routes the form submission back to this exact pod.
+    runner_instance_id: String,
 }
 
 impl std::fmt::Debug for FormInputChannels {
@@ -36,11 +39,16 @@ impl std::fmt::Debug for FormInputChannels {
 }
 
 impl FormInputChannels {
-    pub fn new() -> Self {
+    pub fn new(runner_instance_id: String) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
+            runner_instance_id,
         }
+    }
+
+    pub fn runner_instance_id(&self) -> &str {
+        &self.runner_instance_id
     }
 
     /// Generate a unique callback ID for a form input request.
@@ -138,6 +146,7 @@ pub(crate) async fn request_form_input_impl(
             description: request.description,
             formSchema: Some(request.form_schema),
             metadata: request.metadata,
+            runnerInstanceId: Some(channels.runner_instance_id.clone()),
         }),
         pulseId: pulse_id.to_string(),
         costUsd: 0.0,

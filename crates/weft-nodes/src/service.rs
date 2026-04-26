@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use axum::{routing::{get, post}, Router, Json, http::StatusCode, extract::DefaultBodyLimit};
 use serde::{Serialize, Deserialize};
 use tower_http::cors::CorsLayer;
-use weft_core::{NodeInstance, NodeInstanceStatus, NodeExecuteRequest, NodeExecutionStatus, NodeCallbackRequest, WaitingMetadata, FormSchema};
+use weft_core::{NodeInstance, NodeInstanceStatus, NodeExecuteRequest, NodeExecutionStatus, NodeCallbackRequest, WaitingMetadata};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeResult {
@@ -19,27 +19,6 @@ impl NodeResult {
             status: NodeExecutionStatus::Completed,
             output: Some(output),
             waitingMetadata: None,
-            costUsd: 0.0,
-        }
-    }
-
-    pub fn waiting(
-        callback_id: String,
-        title: Option<String>,
-        description: Option<String>,
-        data: Option<serde_json::Value>,
-        form_schema: Option<FormSchema>,
-    ) -> Self {
-        Self {
-            status: NodeExecutionStatus::WaitingForInput,
-            output: data,
-            waitingMetadata: Some(WaitingMetadata {
-                callbackId: callback_id,
-                title,
-                description,
-                formSchema: form_schema,
-                metadata: serde_json::Value::Object(serde_json::Map::new()),
-            }),
             costUsd: 0.0,
         }
     }

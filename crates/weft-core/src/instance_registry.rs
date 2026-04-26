@@ -42,6 +42,9 @@ pub trait NodeInstanceRegistry {
     
     #[shared]
     async fn find_instance_for_node_type(nodeType: String) -> Result<Option<Json<NodeInstance>>, HandlerError>;
+
+    #[shared]
+    async fn find_instance_by_id(instanceId: String) -> Result<Option<Json<NodeInstance>>, HandlerError>;
 }
 
 pub struct NodeInstanceRegistryImpl;
@@ -137,6 +140,17 @@ impl NodeInstanceRegistry for NodeInstanceRegistryImpl {
         
         Ok(instance.map(Json))
     }
+
+    async fn find_instance_by_id(
+        &self,
+        ctx: SharedObjectContext<'_>,
+        instance_id: String,
+    ) -> Result<Option<Json<NodeInstance>>, HandlerError> {
+        let instances_json: String = ctx.get("instances").await?.unwrap_or_else(|| "[]".to_string());
+        let instances: Vec<NodeInstance> = serde_json::from_str(&instances_json)
+            .map_err(|e| TerminalError::new(format!("Failed to deserialize instances: {}", e)))?;
+        Ok(instances.into_iter().find(|i| i.id == instance_id).map(Json))
+    }
 }
 
 // =============================================================================
@@ -225,5 +239,9 @@ pub struct WaitingMetadata {
     /// Free-form metadata for consumer filtering (e.g., { "source": "human" }).
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Id of the node-runner instance that registered the form-input channel.
+    /// Used by the orchestrator to route the submission back to the same pod.
+    #[serde(default)]
+    pub runnerInstanceId: Option<String>,
 }
 

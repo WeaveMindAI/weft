@@ -552,6 +552,7 @@ fn test_group_expand_input_full_lifecycle() {
     
             error: None,
             callbackId: None,
+            runnerInstanceId: None,
             startedAt: 0,
             completedAt: Some(1),
             input: None,
@@ -1015,6 +1016,7 @@ fn test_gather_output_collected_list_type_check() {
     
             error: None,
             callbackId: None,
+            runnerInstanceId: None,
             startedAt: 0,
             completedAt: Some(1),
             input: None,
@@ -1199,6 +1201,7 @@ fn test_output_type_mismatch_sets_execution_to_failed() {
 
         error: None,
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1253,6 +1256,7 @@ fn test_output_type_match_keeps_execution_completed() {
 
         error: None,
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1282,6 +1286,7 @@ fn test_node_execution_summary_shows_failed_on_type_error() {
 
         error: Some("Output port 'result': expected String, got Number".to_string()),
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1330,6 +1335,7 @@ fn node_execution_summary_mixed_completed_and_failed() {
     
             error: None,
             callbackId: None,
+            runnerInstanceId: None,
             startedAt: 0,
             completedAt: Some(1),
             input: None,
@@ -1364,6 +1370,7 @@ fn node_execution_summary_single_execution_no_breakdown() {
 
         error: None,
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1393,6 +1400,7 @@ fn build_outputs_includes_error_for_failed_execution() {
 
         error: Some("something broke".to_string()),
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1420,6 +1428,7 @@ fn build_outputs_uses_output_for_completed_execution() {
 
         error: None,
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1515,6 +1524,7 @@ fn check_completion_not_done_with_running_execution() {
 
         error: None,
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: None,
         input: None,
@@ -1540,6 +1550,7 @@ fn check_completion_done_all_terminal() {
 
         error: None,
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1565,6 +1576,7 @@ fn check_completion_done_with_failure() {
 
         error: Some("boom".to_string()),
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,
@@ -1602,6 +1614,7 @@ fn make_completed_exec(node_id: &str, output: serde_json::Value) -> NodeExecutio
         pulseId: "p1".to_string(),
         error: None,
         callbackId: None,
+        runnerInstanceId: None,
         startedAt: 0,
         completedAt: Some(1),
         input: None,

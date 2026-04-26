@@ -191,6 +191,9 @@ pub struct NodeExecution {
     pub error: Option<String>,
     /// Callback ID for human-in-the-loop routing.
     pub callbackId: Option<String>,
+    /// Id of the node-runner instance holding the in-memory form-input channel.
+    #[serde(default)]
+    pub runnerInstanceId: Option<String>,
     pub startedAt: u64,
     pub completedAt: Option<u64>,
     /// Node input value (the data the node received).

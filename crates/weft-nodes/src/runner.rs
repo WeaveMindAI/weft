@@ -40,17 +40,20 @@ impl NodeRunner {
 
         tracing::info!("NodeRunner initialized with node types: {:?}", node_types);
 
+        let config = NodeServiceConfig::from_env(
+            "NODE_ID",
+            "NODE_PORT",
+            "node-runner",
+            "9080",
+            node_types,
+        );
+        let channels = Arc::new(FormInputChannels::new(config.nodeId.clone()));
+
         Self {
-            config: NodeServiceConfig::from_env(
-                "NODE_ID",
-                "NODE_PORT",
-                "node-runner",
-                "9080",
-                node_types,
-            ),
+            config,
             client: reqwest::Client::new(),
             registry,
-            channels: Arc::new(FormInputChannels::new()),
+            channels,
         }
     }
 
@@ -59,15 +62,21 @@ impl NodeRunner {
         self.registry
     }
 
-    /// Handler for `/input_response/{callback_id}`.
-    /// Called by the executor when a form is submitted.
-    /// Resolves the waiting oneshot channel so the node can continue.
+    /// Handler for `/input_response/{runner_id}/{callback_id}`.
+    /// Called by the executor when a form is submitted. The runner_id check
+    /// guards against stale URLs that name a different pod (e.g. submission
+    /// arriving after this pod was rescheduled to the same IP).
     async fn input_response_handler(
         axum::extract::State(runner): axum::extract::State<Self>,
-        axum::extract::Path(callback_id): axum::extract::Path<String>,
+        axum::extract::Path((runner_id, callback_id)): axum::extract::Path<(String, String)>,
         Json(input): Json<serde_json::Value>,
     ) -> StatusCode {
-        tracing::info!("[runner] input_response for callback_id={}", callback_id);
+        tracing::info!("[runner] input_response for runner={} callback_id={}", runner_id, callback_id);
+        let own_id = runner.channels.runner_instance_id();
+        if runner_id != own_id {
+            tracing::warn!("[runner] Routed to wrong pod: requested runner='{}', this pod is '{}'", runner_id, own_id);
+            return StatusCode::NOT_FOUND;
+        }
         if runner.channels.resolve(&callback_id, input).await {
             StatusCode::OK
         } else {
@@ -124,7 +133,7 @@ impl NodeService for NodeRunner {
         Router::new()
             .route("/health", axum::routing::get(Self::health_handler))
             .route("/execute", post(Self::execute_handler))
-            .route("/input_response/{callback_id}", post(Self::input_response_handler))
+            .route("/input_response/{runner_id}/{callback_id}", post(Self::input_response_handler))
             .with_state(self)
             .layer(CorsLayer::permissive())
             // Increase body size limit to 15MB (default is 2MB) to handle audio files
