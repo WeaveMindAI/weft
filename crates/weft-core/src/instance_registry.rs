@@ -126,18 +126,29 @@ impl NodeInstanceRegistry for NodeInstanceRegistryImpl {
         let instances_json: String = ctx.get("instances").await?.unwrap_or_else(|| "[]".to_string());
         let instances: Vec<NodeInstance> = serde_json::from_str(&instances_json)
             .map_err(|e| TerminalError::new(format!("Failed to deserialize instances: {}", e)))?;
-        
+
         // Filter to online instances that support this node type
         let matching: Vec<_> = instances.into_iter()
             .filter(|i| i.status == NodeInstanceStatus::Online && i.nodeTypes.contains(&node_type))
             .collect();
-        
+
         // Prefer hybrid-cloud-api if available (for cloud mode hybrid routing)
-        let instance = matching.iter()
-            .find(|i| i.id.contains("hybrid"))
-            .cloned()
-            .or_else(|| matching.into_iter().next());
-        
+        let instance = if let Some(hybrid) = matching.iter().find(|i| i.id.contains("hybrid")).cloned() {
+            Some(hybrid)
+        } else if matching.is_empty() {
+            None
+        } else {
+            // Pick a random match. Without this, N node-runner pods registering
+            // under distinct ids all collapse onto the first one (no load
+            // balancing). This is a #[shared] handler so non-determinism is fine
+            // (no journaled replay).
+            let idx = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0) as usize) % matching.len();
+            Some(matching.into_iter().nth(idx).unwrap())
+        };
+
         Ok(instance.map(Json))
     }
 

@@ -8,7 +8,7 @@
 //!
 //! Architecture: each execution is split into:
 //! - ExecImmutable (Arc): project, edge_idx, initial_input (never changes)
-//! - ExecMutable (Mutex): pulses, cancelled, instance_cache
+//! - ExecMutable (Mutex): pulses, cancelled
 //! This lets us borrow project/edge_idx while mutating pulses.
 
 use std::sync::Arc;
@@ -77,7 +77,6 @@ struct Execution {
 
 pub struct ExecutorState {
     executions: DashMap<String, Arc<Execution>>,
-    instance_cache: DashMap<String, NodeInstance>,
     restate_url: String,
     api_url: String,
     /// Carries `x-internal-api-key` by default. Internal targets only
@@ -134,7 +133,6 @@ impl ExecutorState {
             .expect("failed to build external HTTP client");
         Self {
             executions: DashMap::new(),
-            instance_cache: DashMap::new(),
             restate_url,
             api_url,
             http_client,
@@ -885,7 +883,9 @@ async fn handle_provide_input(
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "form session predates the routing fix, please retry" })),
+                Json(serde_json::json!({
+                    "error": "This form session is too old to recover (started before the latest deploy). Please re-trigger the workflow to get a fresh form."
+                })),
             ).into_response();
         }
     };
@@ -893,9 +893,12 @@ async fn handle_provide_input(
     let inst = match find_instance_by_id_via_restate(&state, runner_id).await {
         Some(inst) => inst,
         None => {
+            tracing::error!("[axum] provide_input: runner instance '{}' missing from registry (cb={})", runner_id, callback_id);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": format!("runner instance '{}' is gone (pod restarted?)", runner_id) })),
+                Json(serde_json::json!({
+                    "error": "The server handling your form has restarted, the form session was lost. Please re-trigger the workflow to retry."
+                })),
             ).into_response();
         }
     };
@@ -924,20 +927,49 @@ async fn handle_provide_input(
     // Services to the exact pod holding the in-memory form-input channel.
     let url = format!("{}/input_response/{}/{}", inst.endpoint, runner_id, callback_id);
     tracing::info!("[axum] provide_input: POSTing to {}", url);
-    // Internal client: node-runner is operator-controlled.
-    match state.http_client.post(&url).json(&input_payload).send().await {
-        Ok(r) if r.status().is_success() => {
-            (StatusCode::OK, "ok").into_response()
+
+    // Retry transient failures (node-runner can be momentarily unreachable
+    // during rolling deploys or under load spikes). Internal client: node-runner
+    // is operator-controlled.
+    let delays = [
+        std::time::Duration::from_millis(300),
+        std::time::Duration::from_secs(1),
+    ];
+    let mut last_status: Option<reqwest::StatusCode> = None;
+    let mut last_err: Option<String> = None;
+    for (attempt, delay) in std::iter::once(std::time::Duration::ZERO).chain(delays).enumerate() {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
-        Ok(r) => {
-            tracing::error!("[axum] input_response returned {}", r.status());
-            (StatusCode::BAD_GATEWAY, format!("Node input_response error: {}", r.status())).into_response()
-        }
-        Err(e) => {
-            tracing::error!("[axum] input_response failed: {}", e);
-            (StatusCode::BAD_GATEWAY, format!("Node input_response failed: {}", e)).into_response()
+        match state.http_client.post(&url).json(&input_payload).send().await {
+            Ok(r) if r.status().is_success() => {
+                if attempt > 0 {
+                    tracing::info!("[axum] input_response succeeded on retry {} (cb={})", attempt, callback_id);
+                }
+                return (StatusCode::OK, "ok").into_response();
+            }
+            Ok(r) => {
+                last_status = Some(r.status());
+                last_err = None;
+                tracing::warn!("[axum] input_response attempt {} returned {} (cb={})", attempt + 1, r.status(), callback_id);
+            }
+            Err(e) => {
+                last_status = None;
+                last_err = Some(e.to_string());
+                tracing::warn!("[axum] input_response attempt {} failed (cb={}): {}", attempt + 1, callback_id, e);
+            }
         }
     }
+    tracing::error!("[axum] input_response FAILED after retries (cb={}): status={:?} err={:?}", callback_id, last_status, last_err);
+    let user_msg = match last_status {
+        Some(s) if s.as_u16() == 404 => "The form session has expired or the server handling it has restarted. Please re-trigger the workflow.".to_string(),
+        Some(s) => format!("The server returned an error ({}) while submitting your form. The system may be overloaded, please retry in a moment.", s),
+        None => "Could not reach the server handling your form. The system may be overloaded, please retry in a moment.".to_string(),
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": user_msg })),
+    ).into_response()
 }
 
 async fn handle_get_status(
@@ -1441,14 +1473,11 @@ async fn dispatch_node_inmem(
         }
     }
 
-    // Instance lookup (shared cache on ExecutorState, lock-free)
-    if !state.instance_cache.contains_key(&node_type_str) {
-        if let Some(inst) = find_instance_via_restate(state, &node_type_str).await {
-            state.instance_cache.insert(node_type_str.clone(), inst);
-        }
-    }
-
-    let instance = match state.instance_cache.get(&node_type_str).map(|v| v.clone()) {
+    // Instance lookup. No cache: with N node-runner pods registered as distinct
+    // instances, caching pins all dispatch to the cached one (no load balancing).
+    // Restate handles read-only #[shared] lookups cheaply; cost not worth the
+    // load-balancing regression.
+    let instance = match find_instance_via_restate(state, &node_type_str).await {
         Some(inst) => inst,
         None => {
             let error_msg = format!("No node service available for type '{}'. The node service may not be running.", node_type_str);
@@ -1649,9 +1678,41 @@ async fn fire_node_failed(state: &SharedState, execution_id: &str, node_id: &str
 
 async fn register_task_via_restate(state: &SharedState, task: PendingTask) {
     let url = format!("{}/TaskRegistry/global/register_task", state.restate_url);
-    if let Err(e) = state.http_client.post(&url).json(&task).send().await {
-        tracing::error!("[axum] Failed to register task via Restate: {}", e);
+    let cb_id = task.executionId.clone();
+    // Retry with exponential backoff. Restate can be transiently overloaded
+    // (rocksdb stalls, partition flushing) but recovers within seconds.
+    // Without retries the user's pending task vanishes and they see no form.
+    let delays = [
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
+    ];
+    let mut last_err: String = "no attempt made".to_string();
+    for (attempt, delay) in std::iter::once(std::time::Duration::ZERO).chain(delays).enumerate() {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let fut = state.http_client.post(&url).json(&task).send();
+        match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                if attempt > 0 {
+                    tracing::info!("[axum] register_task succeeded on retry {} (cb={})", attempt, cb_id);
+                }
+                return;
+            }
+            Ok(Ok(resp)) => last_err = format!("Restate returned {}", resp.status()),
+            Ok(Err(e)) => last_err = format!("transport error: {}", e),
+            Err(_) => last_err = "timeout after 10s".to_string(),
+        }
+        tracing::warn!("[axum] register_task attempt {} failed (cb={}): {}", attempt + 1, cb_id, last_err);
     }
+    // All retries exhausted. The task is lost; the user's form will never appear.
+    // Loud error so this surfaces in alerting.
+    tracing::error!(
+        "[axum] register_task FAILED after retries (cb={}): {}. Form will not appear for the user. \
+         This usually means Restate is overloaded; check restate pod health and rocksdb stalls.",
+        cb_id, last_err
+    );
 }
 
 /// POST a status update (cancelled/completed/failed) to the dashboard's
@@ -1687,24 +1748,46 @@ async fn complete_task_via_restate(state: &SharedState, callback_id: &str) {
     }
 }
 
+/// Retries an idempotent registry lookup with exponential backoff.
+/// Returns None only after all attempts fail (transient or "not found").
+/// Distinguishing "transient failure" from "really not found" is hard from
+/// this side; if Restate returns success-with-None we treat it as a real
+/// "not found" and don't retry, otherwise we back off.
+async fn lookup_instance_with_retry(state: &SharedState, url: &str, body: serde_json::Value) -> Option<NodeInstance> {
+    let delays = [
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(3),
+    ];
+    let mut last_err = String::new();
+    for (attempt, delay) in std::iter::once(std::time::Duration::ZERO).chain(delays).enumerate() {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let fut = state.http_client.post(url).json(&body).send();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                // Treat successful empty body as a real "not found" (no retry).
+                return resp.json::<Option<NodeInstance>>().await.ok().flatten();
+            }
+            Ok(Ok(resp)) => last_err = format!("Restate returned {}", resp.status()),
+            Ok(Err(e)) => last_err = format!("transport: {}", e),
+            Err(_) => last_err = "timeout after 5s".to_string(),
+        }
+        tracing::warn!("[axum] instance lookup attempt {} failed: {}", attempt + 1, last_err);
+    }
+    tracing::error!("[axum] instance lookup exhausted retries: {}", last_err);
+    None
+}
+
 async fn find_instance_via_restate(state: &SharedState, node_type: &str) -> Option<NodeInstance> {
     let url = format!("{}/NodeInstanceRegistry/global/find_instance_for_node_type", state.restate_url);
-    match state.http_client.post(&url).json(&node_type).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<Option<NodeInstance>>().await.ok().flatten()
-        }
-        _ => None,
-    }
+    lookup_instance_with_retry(state, &url, serde_json::Value::String(node_type.to_string())).await
 }
 
 async fn find_instance_by_id_via_restate(state: &SharedState, instance_id: &str) -> Option<NodeInstance> {
     let url = format!("{}/NodeInstanceRegistry/global/find_instance_by_id", state.restate_url);
-    match state.http_client.post(&url).json(&instance_id).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<Option<NodeInstance>>().await.ok().flatten()
-        }
-        _ => None,
-    }
+    lookup_instance_with_retry(state, &url, serde_json::Value::String(instance_id.to_string())).await
 }
 
 
