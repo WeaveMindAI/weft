@@ -15,6 +15,7 @@
 		onResyncTrigger,
 		onRun,
 		onStop,
+		onCancelBuild,
 		onToggleInfraSubgraph,
 		showInfraSubgraph = false,
 		onToggleTriggerSubgraph,
@@ -41,7 +42,7 @@
 			hasError?: boolean;
 			isStale?: boolean;
 		};
-		executionState?: { isRunning: boolean; isStarting?: boolean; isStopping?: boolean; activeEdges?: Set<string>; nodeOutputs?: Record<string, unknown>; nodeStatuses?: Record<string, string> };
+		executionState?: { isRunning: boolean; isStarting?: boolean; isStopping?: boolean; activeEdges?: Set<string>; nodeOutputs?: Record<string, unknown>; nodeStatuses?: Record<string, string>; buildVerb?: 'run' | 'activate' | 'infraStart' };
 		onCheckInfraStatus?: () => void;
 		onStartInfra?: () => void;
 		onStopInfra?: () => void;
@@ -51,6 +52,12 @@
 		onResyncTrigger?: () => void;
 		onRun?: () => void;
 		onStop?: () => void;
+		/// Cancels the in-flight `weft build` child process. Wired
+		/// to the Stop button that replaces "Building..." while a
+		/// Run / Activate / InfraStart is rebuilding the worker
+		/// image. The cache key is not updated for cancelled builds
+		/// so the next attempt rebuilds.
+		onCancelBuild?: () => void;
 		onToggleInfraSubgraph?: () => void;
 		showInfraSubgraph?: boolean;
 		onToggleTriggerSubgraph?: () => void;
@@ -220,7 +227,16 @@
      ════════════════════════════════════════════════════════════ -->
 
 {#snippet infraButtons()}
-	{#if infraIsTransitional}
+	{#if executionState?.buildVerb === 'infraStart'}
+		<button
+			class="{btn} {isCard ? 'bg-destructive/10 text-destructive hover:bg-destructive/20' : 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100'}"
+			onclick={onCancelBuild}
+			title="Cancel build"
+		>
+			<Loader2 class="w-3.5 h-3.5 animate-spin" />
+			<span class={label}>{isCard ? 'Building... (Stop)' : 'Building Infra... (Stop)'}</span>
+		</button>
+	{:else if infraIsTransitional}
 		<button class="{btn} {isCard ? 'bg-muted text-muted-foreground' : 'bg-blue-50 text-blue-600 border border-blue-200 opacity-75 cursor-not-allowed'}" disabled>
 			<Loader2 class="w-3.5 h-3.5 animate-spin" />
 			<span class={label}>
@@ -319,6 +335,16 @@
 {/snippet}
 
 {#snippet triggerButton()}
+	{#if executionState?.buildVerb === 'activate'}
+		<button
+			class="{btn} {isCard ? 'bg-destructive/10 text-destructive hover:bg-destructive/20' : 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100'}"
+			onclick={onCancelBuild}
+			title="Cancel build"
+		>
+			<Loader2 class="w-3.5 h-3.5 animate-spin" />
+			<span class={label}>Building... (Stop)</span>
+		</button>
+	{:else}
 	<button
 		class="{btn} {btnDisabled} {triggerState?.isActive
 			? (isCard ? 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100' : 'bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700')
@@ -366,6 +392,7 @@
 			<span class={label}>Activate</span>
 		{/if}
 	</button>
+	{/if}
 {/snippet}
 
 {#snippet resyncButton()}
@@ -386,7 +413,16 @@
 {/snippet}
 
 {#snippet runStopButton()}
-	{#if executionState?.isStarting}
+	{#if executionState?.buildVerb === 'run'}
+		<button
+			class="{btn} {isCard ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90' : 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100'}"
+			onclick={onCancelBuild}
+			title="Cancel build"
+		>
+			<Loader2 class="w-3.5 h-3.5 animate-spin" />
+			<span class={label}>Building... (Stop)</span>
+		</button>
+	{:else if executionState?.isStarting}
 		<button
 			class="{btn} {btnDisabled} {isCard ? 'bg-primary text-primary-foreground' : 'px-6 bg-zinc-900 border-zinc-900 text-white shadow'}"
 			disabled

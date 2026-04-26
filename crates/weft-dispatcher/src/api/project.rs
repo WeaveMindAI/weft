@@ -47,16 +47,10 @@ pub struct RegisterRequest {
     pub id: uuid::Uuid,
     pub name: String,
     pub source: String,
-    /// Absolute path to the project root. Unused today; reserved for
-    /// multi-file imports once the compiler resolves them.
+    /// Absolute path to the project root. Unused today; reserved
+    /// for multi-file imports once the compiler resolves them.
     #[serde(default)]
     pub root: Option<String>,
-    /// Absolute path to the compiled project binary. Supplied by
-    /// `weft run` / `weft build` after the local compile step. The
-    /// dispatcher spawns this binary per wake; if it doesn't exist
-    /// at spawn time, the wake fails with a clear error.
-    #[serde(default)]
-    pub binary_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,8 +115,7 @@ pub async fn register(
         ));
     }
 
-    let binary_path = req.binary_path.clone().map(std::path::PathBuf::from);
-    let summary = state.projects.register(project, binary_path).await.map_err(|e| {
+    let summary = state.projects.register(project).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(RegisterError {
@@ -313,9 +306,10 @@ pub async fn run(
         .await;
 
     let wake = WakeContext { project_id: id.to_string(), color };
+    let _ = &summary;
     let worker = state
         .workers
-        .spawn_worker(&summary.binary_path, wake)
+        .spawn_worker(wake)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
     let _ = state
@@ -432,6 +426,153 @@ pub fn compute_infra_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
             value: Value::Null,
         })
         .collect()
+}
+
+/// Spawn a worker to run the InfraSetup sub-execution for the
+/// given nodes and wait for it to complete. Each node's
+/// `execute()` runs with `Phase::InfraSetup` and calls
+/// `ctx.provision_sidecar(spec)` to get its sidecar applied.
+/// Mirrors `run_trigger_setup` but seeds the infra subgraph.
+pub async fn run_infra_setup(
+    state: &DispatcherState,
+    project_id_uuid: uuid::Uuid,
+    node_ids: Vec<String>,
+) -> Result<(), (StatusCode, String)> {
+    if node_ids.is_empty() {
+        return Ok(());
+    }
+    let project_id = project_id_uuid.to_string();
+    let color = uuid::Uuid::new_v4();
+    let now = unix_now();
+
+    let seeds: Vec<RootSeed> = node_ids
+        .into_iter()
+        .map(|node_id| RootSeed {
+            node_id,
+            value: Value::Null,
+        })
+        .collect();
+
+    state
+        .journal
+        .record_event(&crate::journal::ExecEvent::ExecutionStarted {
+            color,
+            project_id: project_id.clone(),
+            entry_node: seeds[0].node_id.clone(),
+            at_unix: now,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+    for seed in &seeds {
+        let _ = state
+            .journal
+            .record_event(&crate::journal::ExecEvent::PulseSeeded {
+                color,
+                node_id: seed.node_id.clone(),
+                port: "__seed__".to_string(),
+                lane: Vec::new(),
+                value: seed.value.clone(),
+                at_unix: now,
+            })
+            .await;
+    }
+
+    let mut events = state.events.subscribe_project(&project_id).await;
+
+    state
+        .slots
+        .with_slot(color, {
+            let seeds = seeds.clone();
+            move |slot| {
+                Box::pin(async move {
+                    let queued = match slot {
+                        crate::slots::Slot::Idle { queued, .. }
+                        | crate::slots::Slot::Starting { queued, .. }
+                        | crate::slots::Slot::WaitingReconnect { queued, .. } => queued,
+                        crate::slots::Slot::Live { .. } => {
+                            *slot = crate::slots::Slot::Idle {
+                                queued: std::collections::VecDeque::new(),
+                            };
+                            let crate::slots::Slot::Idle { queued, .. } = slot else {
+                                unreachable!()
+                            };
+                            queued
+                        }
+                    };
+                    queued.push_back(crate::slots::QueuedWake::Start(
+                        weft_core::primitive::WakeMessage::Fresh {
+                            seeds,
+                            phase: weft_core::context::Phase::InfraSetup,
+                        },
+                    ));
+                })
+            }
+        })
+        .await;
+
+    let wake = WakeContext {
+        project_id: project_id.clone(),
+        color,
+    };
+    let worker = state
+        .workers
+        .spawn_worker(wake)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+    let _ = state
+        .journal
+        .record_event(&crate::journal::ExecEvent::WorkerSpawned {
+            color,
+            at_unix: unix_now(),
+        })
+        .await;
+    state
+        .slots
+        .with_slot(color, move |slot| {
+            Box::pin(async move {
+                if let crate::slots::Slot::Starting { worker: w, .. } = slot {
+                    *w = Some(worker);
+                }
+            })
+        })
+        .await;
+
+    // Wait for completion. The broadcast channel returns Err on
+    // lag or close; treat both as transient and keep waiting (the
+    // deadline backstops runaway work).
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(300));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            res = events.recv() => {
+                match res {
+                    Ok(crate::events::DispatcherEvent::ExecutionCompleted { color: c, .. })
+                        if c == color => return Ok(()),
+                    Ok(crate::events::DispatcherEvent::ExecutionFailed { color: c, error, .. })
+                        if c == color => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("infra setup failed: {error}"),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "event bus closed during infra setup".into(),
+                        ));
+                    }
+                }
+            }
+            _ = &mut deadline => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "infra setup timed out after 300s".into(),
+                ));
+            }
+        }
+    }
 }
 
 /// Seeds for a trigger fire.
@@ -613,6 +754,88 @@ pub struct ActivationUrl {
 ///    `signal_tracker`.
 /// 4. Mark project Active, publish TriggerUrlChanged events, return
 ///    the listener-minted URLs.
+#[derive(Debug, Serialize)]
+pub struct ProjectStatusResponse {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub listener_running: bool,
+    pub infra: Vec<ProjectInfraEntry>,
+    pub executions: ProjectExecutionsSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectInfraEntry {
+    pub node_id: String,
+    pub status: String,
+    pub endpoint_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectExecutionsSummary {
+    pub total: usize,
+    pub last_completed_at: Option<u64>,
+    pub last_color: Option<String>,
+    pub last_status: Option<String>,
+}
+
+/// Aggregate view for `weft status`. Returns registration,
+/// listener state, per-node infra state, and a rollup of recent
+/// executions in one response so the CLI doesn't need to
+/// stitch three separate calls.
+pub async fn status(
+    State(state): State<DispatcherState>,
+    Path(id_str): Path<String>,
+) -> Result<Json<ProjectStatusResponse>, (StatusCode, String)> {
+    let id = id_str
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
+    let summary = state
+        .projects
+        .get(id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    let project_id = id.to_string();
+    let listener_running = state.listeners.get(&project_id).is_some();
+
+    let infra_entries = state.infra_registry.list_for_project(&project_id);
+    let mut infra = Vec::new();
+    for (node_id, entry) in infra_entries {
+        infra.push(ProjectInfraEntry {
+            node_id,
+            status: format!("{:?}", entry.status).to_lowercase(),
+            endpoint_url: entry.handle.endpoint_url.clone(),
+        });
+    }
+
+    let execs = state
+        .journal
+        .list_executions(500)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+    let project_execs: Vec<&crate::journal::ExecutionSummary> = execs
+        .iter()
+        .filter(|e| e.project_id == project_id)
+        .collect();
+    let total = project_execs.len();
+    let last = project_execs.first();
+    let executions = ProjectExecutionsSummary {
+        total,
+        last_completed_at: last.and_then(|l| l.completed_at),
+        last_color: last.map(|l| l.color.to_string()),
+        last_status: last.map(|l| l.status.clone()),
+    };
+
+    Ok(Json(ProjectStatusResponse {
+        id: project_id,
+        name: summary.name,
+        status: summary.status.as_str().to_string(),
+        listener_running,
+        infra,
+        executions,
+    }))
+}
+
 pub async fn activate(
     State(state): State<DispatcherState>,
     Path(id_str): Path<String>,
@@ -687,9 +910,10 @@ pub async fn activate(
 
     // Compute the trigger-setup subgraph. If the project has no
     // triggers there's nothing to register and we're done.
+    let _ = &summary;
     let seeds = compute_trigger_setup_seeds(&project);
     if !seeds.is_empty() {
-        run_trigger_setup(&state, id, &summary.binary_path, seeds).await?;
+        run_trigger_setup(&state, id, seeds).await?;
     }
 
     // Collect the URLs that landed in signal_tracker during the
@@ -768,7 +992,6 @@ pub async fn deactivate_project(
 async fn run_trigger_setup(
     state: &DispatcherState,
     project_id_uuid: uuid::Uuid,
-    binary_path: &std::path::Path,
     seeds: Vec<RootSeed>,
 ) -> Result<(), (StatusCode, String)> {
     let project_id = project_id_uuid.to_string();
@@ -842,7 +1065,7 @@ async fn run_trigger_setup(
     };
     let worker = state
         .workers
-        .spawn_worker(binary_path, wake)
+        .spawn_worker(wake)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
     let _ = state

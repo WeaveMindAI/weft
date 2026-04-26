@@ -503,7 +503,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             continue;
         }
 
-        if !weft_core::weft_type::WeftType::is_compatible(&src_port.port_type, &tgt_port.port_type) {
+        if !weft_core::weft_type::WeftType::is_edge_compatible(&src_port.port_type, &tgt_port.port_type) {
             push(d, line, Severity::Error, "type-mismatch",
                 format!(
                     "cannot connect '{}.{}: {}' to '{}.{}: {}'",
@@ -741,28 +741,38 @@ fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         let src_depth = list_depth(&src_port.port_type);
         let tgt_depth = list_depth(&tgt_port.port_type);
 
-        if src_depth > tgt_depth {
-            // Source deeper than target: auto-expand (informational
-            // warning v1 emits; kept for parity).
-            push(d, line, Severity::Warning, "implicit-expand",
-                format!(
-                    "implicit expand on '{}.{} -> {}.{}' (source has {} more List level(s))",
-                    edge.source, src_port.name, edge.target, tgt_port.name,
-                    src_depth - tgt_depth,
-                ));
-        } else if tgt_depth > src_depth {
-            // Target deeper: gather.
-            push(d, line, Severity::Warning, "implicit-gather",
-                format!(
-                    "implicit gather on '{}.{} -> {}.{}' (target has {} more List level(s))",
-                    edge.source, src_port.name, edge.target, tgt_port.name,
-                    tgt_depth - src_depth,
-                ));
+        // implicit-expand / implicit-gather: noisy only when the
+        // user didn't write the types. If both sides are
+        // user-typed in the .weft source, the depth difference is
+        // an explicit contract; staying silent. If either side
+        // came from catalog metadata, warn so the user knows the
+        // language inferred a lane mechanic.
+        let user_typed_both = src_port.user_typed && tgt_port.user_typed;
 
-            // Gather-null-warning: the gathered value is always a
-            // List even if zero items arrive. If the target inner
-            // type doesn't admit Null, we might silently drop nulls
-            // upstream. Warn.
+        if src_depth > tgt_depth {
+            if !user_typed_both {
+                push(d, line, Severity::Warning, "implicit-expand",
+                    format!(
+                        "implicit expand on '{}.{} -> {}.{}' (source has {} more List level(s))",
+                        edge.source, src_port.name, edge.target, tgt_port.name,
+                        src_depth - tgt_depth,
+                    ));
+            }
+        } else if tgt_depth > src_depth {
+            if !user_typed_both {
+                push(d, line, Severity::Warning, "implicit-gather",
+                    format!(
+                        "implicit gather on '{}.{} -> {}.{}' (target has {} more List level(s))",
+                        edge.source, src_port.name, edge.target, tgt_port.name,
+                        tgt_depth - src_depth,
+                    ));
+            }
+
+            // gather-null-warning is a real semantic concern
+            // independent of who declared the types: a gathered
+            // List of `Number` swallows null upstream pulses
+            // because the inner type doesn't admit them. Always
+            // warn, user_typed or not.
             if let Some(inner) = innermost(&tgt_port.port_type) {
                 if !admits_null(inner) {
                     push(d, line, Severity::Warning, "gather-null-warning",
@@ -774,20 +784,25 @@ fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             }
         }
 
-        // gather-insufficient-depth: if the target's declared lane
-        // depth is greater than the actual structural difference, the
-        // runtime will under-peel. V1 surfaces this when an explicit
-        // gather directive is over-specified.
+        // gather-insufficient-depth: the target's declared gather
+        // depth must match the structural difference. Implicit
+        // gather means `tgt_depth > src_depth` and the depth is
+        // `tgt_depth - src_depth`. Explicit gather on a same-depth
+        // edge is the v1 pattern where a node declares an output as
+        // gathered regardless of upstream type. Both cases: the
+        // delta must match declared_lane when declared_lane > 0.
         let declared_lane = tgt_port.lane_depth as usize;
         if tgt_port.lane_mode == weft_core::project::LaneMode::Gather
-            && declared_lane > src_depth.saturating_sub(tgt_depth)
+            && declared_lane > 0
         {
-            push(d, line, Severity::Error, "gather-insufficient-depth",
-                format!(
-                    "gather at '{}.{}' requests depth {} but only {} List level(s) available above target type",
-                    edge.target, tgt_port.name, declared_lane,
-                    src_depth.saturating_sub(tgt_depth),
-                ));
+            let available = tgt_depth.saturating_sub(src_depth);
+            if declared_lane > available.max(1) {
+                push(d, line, Severity::Error, "gather-insufficient-depth",
+                    format!(
+                        "gather at '{}.{}' requests depth {} but only {} List level(s) between source and target",
+                        edge.target, tgt_port.name, declared_lane, available,
+                    ));
+            }
         }
     }
 }

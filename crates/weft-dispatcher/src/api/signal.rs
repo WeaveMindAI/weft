@@ -166,13 +166,14 @@ async fn route_entry(
         })
         .await;
 
+    let _ = &summary;
     let wake = crate::backend::WakeContext {
         project_id: meta.project_id.clone(),
         color,
     };
     let worker = state
         .workers
-        .spawn_worker(&summary.binary_path, wake)
+        .spawn_worker(wake)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
     let _ = state
@@ -225,11 +226,12 @@ async fn route_resume(
     let project_uuid: uuid::Uuid = project_id_str
         .parse()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad project id".into()))?;
-    let summary = state
-        .projects
-        .get(project_uuid)
-        .await
-        .ok_or((StatusCode::GONE, "project not registered".into()))?;
+    // Project lookup confirms registration; the binary identity is
+    // implicit in the project id (the worker image tag derives from
+    // it), so we only need to confirm it exists.
+    if state.projects.get(project_uuid).await.is_none() {
+        return Err((StatusCode::GONE, "project not registered".into()));
+    }
 
     state
         .journal
@@ -251,7 +253,7 @@ async fn route_resume(
     state.signal_tracker.remove(token);
 
     // Respawn the worker if the slot is idle.
-    ensure_worker(state, color, &project_id_str, &summary.binary_path).await?;
+    ensure_worker(state, color, &project_id_str).await?;
 
     state
         .events
@@ -279,7 +281,6 @@ async fn ensure_worker(
     state: &DispatcherState,
     color: weft_core::Color,
     project_id: &str,
-    binary_path: &std::path::Path,
 ) -> Result<(), (StatusCode, String)> {
     let must_spawn = state
         .slots
@@ -320,7 +321,7 @@ async fn ensure_worker(
     };
     let worker = state
         .workers
-        .spawn_worker(binary_path, wake)
+        .spawn_worker(wake)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
     let _ = state

@@ -450,11 +450,19 @@ pub enum DispatcherToWorker {
         user_url: Option<String>,
     },
     /// Dispatcher reply to `SidecarEndpointRequest`. On failure
-    /// (infra not up, unknown node), `endpoint` is `None` and the
-    /// caller surfaces an error.
+    /// (infra not up, unknown node), `endpoint` is `None` and
+    /// the caller surfaces an error.
     SidecarEndpoint {
         request_id: u64,
         endpoint: Option<String>,
+    },
+    /// Dispatcher reply to `ProvisionSidecarRequest`. Carries
+    /// the handle on success, `error` filled on failure.
+    ProvisionSidecarReply {
+        request_id: u64,
+        instance_id: Option<String>,
+        endpoint_url: Option<String>,
+        error: Option<String>,
     },
     /// Dispatcher acknowledgement for `Stalled`; worker may now exit.
     StalledAck,
@@ -492,12 +500,21 @@ pub enum WorkerToDispatcher {
         node_id: String,
         spec: WakeSignalSpec,
     },
-    /// Worker wants the cluster-local endpoint URL of its sidecar.
-    /// Dispatcher resolves via InfraRegistry, replies with
-    /// `SidecarEndpoint`.
+    /// Worker wants the cluster-local endpoint URL of its
+    /// sidecar. Dispatcher resolves via InfraRegistry, replies
+    /// with `SidecarEndpoint`.
     SidecarEndpointRequest {
         request_id: u64,
         node_id: String,
+    },
+    /// Worker (an infra node running in `Phase::InfraSetup`)
+    /// wants its sidecar provisioned. Dispatcher delegates to
+    /// `InfraBackend::provision`, registers the instance, and
+    /// replies with `ProvisionSidecarReply`.
+    ProvisionSidecarRequest {
+        request_id: u64,
+        node_id: String,
+        spec: crate::node::SidecarSpec,
     },
     /// Worker has nothing left to run and at least one lane is
     /// waiting. Under the event-sourced model the dispatcher already

@@ -3,7 +3,6 @@
 	import { NODE_TYPE_CONFIG, ALL_NODES, type NodeType } from "$lib/nodes";
 	import { browser } from "$app/environment";
 	import { STORAGE_KEYS } from "$lib/utils";
-	import * as te from "$lib/telemetry-events";
 	import {
 		Search, BrainCircuit, ChartBar, GitFork, Server, Wrench, Bug, Zap,
 		Undo2, Redo2, Copy, Trash2, CheckSquare, Maximize2, LayoutDashboard,
@@ -14,12 +13,10 @@
 		open = $bindable(false),
 		onAddNode,
 		onAction,
-		playground = false,
 	}: {
 		open: boolean;
 		onAddNode: (type: NodeType) => void;
 		onAction?: (action: string) => void;
-		playground?: boolean;
 	} = $props();
 	
 	let searchValue = $state("");
@@ -103,12 +100,6 @@
 			.sort((a, b) => a.order - b.order);
 	});
 	
-	// Actions available in the palette
-	// (Retained for parity with v1 plumbing; empty in the VS Code
-	//  build since unhelpful actions are already pruned from the
-	//  list above.)
-	const playgroundHiddenActions = new Set<string>();
-
 	// VS Code embedding: save/run/export/import are handled by the
 	// extension (Ctrl+S writes the document, execution is an editor
 	// command). We keep only actions that map to the webview itself.
@@ -142,7 +133,7 @@
 		return -1;
 	}
 
-	const visibleActions = $derived(playground ? actions.filter(a => !playgroundHiddenActions.has(a.id)) : actions);
+	const visibleActions = $derived(actions);
 
 	let filteredItems = $derived.by(() => {
 		const query = searchValue.toLowerCase().trim();
@@ -193,7 +184,6 @@
 	});
 	
 	function handleSelectNode(type: NodeType) {
-		te.palette.nodeSelected(type);
 		addToRecents(type);
 		onAddNode(type);
 		open = false;
@@ -201,7 +191,6 @@
 	}
 
 	function handleSelectAction(actionId: string) {
-		te.palette.actionSelected(actionId);
 		onAction?.(actionId);
 		open = false;
 		searchValue = "";

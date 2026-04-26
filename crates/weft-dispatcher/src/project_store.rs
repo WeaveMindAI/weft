@@ -1,11 +1,10 @@
 //! Project store. Keyed by project id. Holds the registered
-//! ProjectDefinition + the path to the binary the worker backend
-//! spawns against + the lifecycle status.
+//! ProjectDefinition + the lifecycle status.
 //!
-//! Persists as one JSON file per project under `{data_dir}`. That
-//! buys us durability across dispatcher restarts without pulling
-//! in a database. Phase B replaces this with postgres once
-//! multi-user / multi-tenant work lands.
+//! Persists as one JSON file per project under `{data_dir}`.
+//! That buys us durability across dispatcher restarts without
+//! pulling in a database. Phase B replaces this with postgres
+//! once multi-user / multi-tenant work lands.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,8 +18,9 @@ use weft_core::ProjectDefinition;
 #[derive(Clone)]
 pub struct ProjectStore {
     inner: Arc<RwLock<HashMap<uuid::Uuid, StoredProject>>>,
-    /// Directory where `{id}.json` files land. Survives dispatcher
-    /// restarts via the PVC; see `deploy/k8s/dispatcher.yaml`.
+    /// Directory where `{id}.json` files land. Survives
+    /// dispatcher restarts via the PVC; see
+    /// `deploy/k8s/dispatcher.yaml`.
     data_dir: PathBuf,
 }
 
@@ -28,19 +28,14 @@ pub struct StoredProject {
     pub id: uuid::Uuid,
     pub name: String,
     pub status: ProjectStatus,
-    pub binary_path: PathBuf,
     pub project: ProjectDefinition,
 }
 
-/// Serializable shape we write to disk. Same fields as
-/// `StoredProject` but the status is a `&str` that round-trips
-/// cleanly through JSON.
 #[derive(Serialize, Deserialize)]
 struct PersistedProject {
     id: uuid::Uuid,
     name: String,
     status: String,
-    binary_path: PathBuf,
     project: ProjectDefinition,
 }
 
@@ -69,9 +64,6 @@ impl ProjectStatus {
 }
 
 impl ProjectStore {
-    /// Open the store at `data_dir`, creating the directory if
-    /// needed and loading every `{id}.json` it finds. Corrupt files
-    /// are logged and skipped rather than aborting startup.
     pub fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let mut map: HashMap<uuid::Uuid, StoredProject> = HashMap::new();
@@ -117,7 +109,6 @@ impl ProjectStore {
                             s
                         }
                     },
-                    binary_path: persisted.binary_path,
                     project: persisted.project,
                 },
             );
@@ -128,20 +119,14 @@ impl ProjectStore {
         })
     }
 
-    /// Register a project. If a binary path isn't provided we
-    /// still persist the row so describe/list endpoints work; the
-    /// spawn path fails with a clear error at run time.
+    /// Register (or update) a project. Called by `POST /projects`
+    /// with a parsed ProjectDefinition. Idempotent on id.
     pub async fn register(
         &self,
         project: ProjectDefinition,
-        binary_path: Option<PathBuf>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name = project.name.clone();
-        let binary_path = match binary_path {
-            Some(p) => p,
-            None => self.data_dir.join(format!("{id}.missing-binary")),
-        };
 
         {
             let mut lock = self.inner.write().await;
@@ -151,13 +136,12 @@ impl ProjectStore {
                     id,
                     name: name.clone(),
                     status: ProjectStatus::Registered,
-                    binary_path: binary_path.clone(),
                     project,
                 },
             );
             self.persist_locked(&lock, id)?;
         }
-        Ok(StoredProjectSummary { id, name, status: ProjectStatus::Registered, binary_path })
+        Ok(StoredProjectSummary { id, name, status: ProjectStatus::Registered })
     }
 
     pub async fn list(&self) -> Vec<StoredProjectSummary> {
@@ -167,7 +151,6 @@ impl ProjectStore {
                 id: p.id,
                 name: p.name.clone(),
                 status: p.status,
-                binary_path: p.binary_path.clone(),
             })
             .collect()
     }
@@ -178,14 +161,12 @@ impl ProjectStore {
             id: p.id,
             name: p.name.clone(),
             status: p.status,
-            binary_path: p.binary_path.clone(),
         })
     }
 
     pub async fn remove(&self, id: uuid::Uuid) -> bool {
         let mut lock = self.inner.write().await;
-        if let Some(p) = lock.remove(&id) {
-            let _ = std::fs::remove_file(&p.binary_path);
+        if lock.remove(&id).is_some() {
             let _ = std::fs::remove_file(self.file_for(id));
             true
         } else {
@@ -225,8 +206,9 @@ impl ProjectStore {
         self.data_dir.join(format!("{id}.json"))
     }
 
-    /// Write the single record for `id` to disk. Caller holds the
-    /// map's write lock, so we pass a ref in to avoid re-locking.
+    /// Write the single record for `id` to disk. Caller holds
+    /// the map's write lock, so we pass a ref in to avoid
+    /// re-locking.
     fn persist_locked(
         &self,
         map: &HashMap<uuid::Uuid, StoredProject>,
@@ -237,7 +219,6 @@ impl ProjectStore {
             id: p.id,
             name: p.name.clone(),
             status: p.status.as_str().to_string(),
-            binary_path: p.binary_path.clone(),
             project: p.project.clone(),
         };
         let json = serde_json::to_string_pretty(&persisted)?;
@@ -251,7 +232,6 @@ pub struct StoredProjectSummary {
     pub id: uuid::Uuid,
     pub name: String,
     pub status: ProjectStatus,
-    pub binary_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]

@@ -247,8 +247,12 @@ impl WeftType {
 
     // ── Compatibility ───────────────────────────────────────────────────
 
-    /// Compile-time compatibility: can a value of type `source` flow into a port of type `target`?
-    /// Stack depth is NOT checked here : it's handled by the expand/gather validation pass.
+    /// Strict structural compatibility: can a value of type
+    /// `source` flow into a port of type `target` WITHOUT any
+    /// expand/gather inference? Depth-mismatched lists are
+    /// rejected. Used by the runtime value checker (validates
+    /// inferred JSON types against declared port types) and by
+    /// merge_ports where narrowing must preserve list depth.
     pub fn is_compatible(source: &WeftType, target: &WeftType) -> bool {
         if source.is_unresolved() || target.is_unresolved() {
             return true;
@@ -283,6 +287,62 @@ impl WeftType {
             // Union into single: all variants must be compatible
             (WeftType::Union(sources), tgt) => {
                 sources.iter().all(|s| Self::is_compatible(s, tgt))
+            }
+            _ => false,
+        }
+    }
+
+    /// Edge-level compatibility: tolerates list-depth mismatch
+    /// because the lane mechanics pass interprets a deeper source
+    /// as an implicit expand and a deeper target as an implicit
+    /// gather. Every other rule mirrors `is_compatible`. Use this
+    /// from the compile-time edge validator, not from runtime
+    /// value checks.
+    pub fn is_edge_compatible(source: &WeftType, target: &WeftType) -> bool {
+        if source.is_unresolved() || target.is_unresolved() {
+            return true;
+        }
+        if matches!(source, WeftType::Primitive(WeftPrimitive::Empty)) {
+            return true;
+        }
+
+        // Depth-reconciliation: strip one List level off the
+        // deeper side and recurse. Only applied when the shallower
+        // side isn't itself a Union (a union is a shape choice, we
+        // want to check each variant). Lists on both sides fall
+        // through to the strict recursion below.
+        if let (WeftType::List(inner), other) = (source, target) {
+            if !matches!(other, WeftType::List(_) | WeftType::Union(_)) {
+                return Self::is_edge_compatible(inner, other);
+            }
+        }
+        if let (other, WeftType::List(inner)) = (source, target) {
+            if !matches!(other, WeftType::List(_) | WeftType::Union(_)) {
+                return Self::is_edge_compatible(other, inner);
+            }
+        }
+
+        match (source, target) {
+            (WeftType::Primitive(a), WeftType::Primitive(b)) => a == b,
+            (WeftType::List(a), WeftType::List(b)) => Self::is_edge_compatible(a, b),
+            (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => {
+                Self::is_edge_compatible(ak, bk) && Self::is_edge_compatible(av, bv)
+            }
+            (WeftType::JsonDict, WeftType::JsonDict) => true,
+            (WeftType::JsonDict, WeftType::Dict(k, _)) => {
+                matches!(k.as_ref(), WeftType::Primitive(WeftPrimitive::String))
+            }
+            (WeftType::Dict(k, _), WeftType::JsonDict) => {
+                matches!(k.as_ref(), WeftType::Primitive(WeftPrimitive::String))
+            }
+            (WeftType::Union(sources), WeftType::Union(targets)) => sources
+                .iter()
+                .all(|s| targets.iter().any(|t| Self::is_edge_compatible(s, t))),
+            (src, WeftType::Union(targets)) => {
+                targets.iter().any(|t| Self::is_edge_compatible(src, t))
+            }
+            (WeftType::Union(sources), tgt) => {
+                sources.iter().all(|s| Self::is_edge_compatible(s, tgt))
             }
             _ => false,
         }

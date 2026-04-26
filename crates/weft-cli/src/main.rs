@@ -45,10 +45,37 @@ enum Cmd {
     Deactivate { project: Option<String> },
     /// List every project registered with the dispatcher.
     Ps,
-    /// Unregister a project entirely (journal gone, logs gone).
-    Rm { project: String },
-    /// Tail historical + live logs for a project or execution.
-    Logs { target: String },
+    /// Remove a project at the level you ask for. No flags → the
+    /// cwd project is deactivated + unregistered on the
+    /// dispatcher. Add flags to escalate: `--infra` terminates
+    /// sidecars, `--journal` drops execution history,
+    /// `--image` removes the worker image from docker + kind,
+    /// `--local` wipes `.weft/target/` on the host, `--all`
+    /// implies every flag. An explicit project id overrides the
+    /// cwd discovery.
+    Rm {
+        #[arg(value_name = "project")]
+        project: Option<String>,
+        #[arg(long)]
+        infra: bool,
+        #[arg(long)]
+        journal: bool,
+        #[arg(long)]
+        image: bool,
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Tail logs. No arg → latest execution of the cwd project.
+    /// UUID arg → that specific execution.
+    Logs {
+        #[arg(value_name = "color")]
+        target: Option<String>,
+    },
+    /// Print a summary of the cwd project's current state.
+    /// Registration, listener, infra per-node, recent executions.
+    Status,
     /// Manage the local dispatcher daemon (start, stop, status,
     /// restart, logs). The dispatcher is the long-lived process that
     /// owns projects, executions, and infra; `weft run` and the
@@ -208,8 +235,15 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Activate { project } => commands::activate::run(ctx, project).await,
         Cmd::Deactivate { project } => commands::deactivate::run(ctx, project).await,
         Cmd::Ps => commands::ps::run(ctx).await,
-        Cmd::Rm { project } => commands::rm::run(ctx, project).await,
+        Cmd::Rm { project, infra, journal, image, local, all } => {
+            commands::rm::run(
+                ctx,
+                commands::rm::RmArgs { project, infra, journal, image, local, all },
+            )
+            .await
+        }
         Cmd::Logs { target } => commands::logs::run(ctx, target).await,
+        Cmd::Status => commands::status::run(ctx).await,
         Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
         Cmd::Infra { action } => commands::infra::run(ctx, action.into()).await,
         Cmd::Add { source } => commands::add::run(ctx, source).await,

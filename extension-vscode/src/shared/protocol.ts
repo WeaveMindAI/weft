@@ -216,6 +216,13 @@ export interface LaneFrame {
 export interface NodeExecEvent {
   nodeId: string;
   state: NodeExecutionStatus | 'started' | 'running';
+  /// Lane identity from the dispatcher's NodeStarted /
+  /// NodeCompleted events. Stringified JSON of the lane stack
+  /// (e.g. `[{"count":5,"index":2}]`). The webview uses this to
+  /// match a `completed` event to the SAME lane's `running`
+  /// row, so parallel fan-outs don't cross-correlate inputs to
+  /// outputs.
+  lane: string;
   error?: string;
   input?: unknown;
   output?: unknown;
@@ -269,7 +276,19 @@ export type HostMessage =
   | { kind: 'triggerStatus'; snapshot: TriggerStatusSnapshot }
   | { kind: 'actionFailed'; action: 'infraStart' | 'infraStop' | 'infraTerminate' | 'activate' | 'deactivate'; message: string }
   | { kind: 'followStatus'; status: FollowStatus }
-  | { kind: 'execReset' };
+  | { kind: 'execReset' }
+  /// Whether the watched .weft source is currently visible in
+  /// some editor tab. The webview uses this to swap the "Source"
+  /// button into an active/dark state when the source is on
+  /// screen, so the user can see at a glance whether clicking it
+  /// reveals an existing tab vs opens a new one.
+  | { kind: 'sourceState'; open: boolean }
+  /// Host signals the worker image is being rebuilt right now.
+  /// `verb` identifies which graph-bar action triggered it so
+  /// the ActionBar can show "Building..." in place of
+  /// "Running..." / "Starting..." / "Starting Infra..." until
+  /// the build completes. `verb: undefined` resets the state.
+  | { kind: 'buildState'; active: boolean; verb?: 'run' | 'activate' | 'infraStart' };
 
 export interface FollowStatus {
   mode: 'latest' | 'pinned';
@@ -293,7 +312,15 @@ export type WebviewMessage =
   | { kind: 'activateProject' }
   | { kind: 'deactivateProject' }
   | { kind: 'followTogglePin' }
-  | { kind: 'followCatchUp' };
+  | { kind: 'followCatchUp' }
+  /// User clicked the "open .weft source" button on the graph.
+  /// Host opens the watched document in a side editor.
+  | { kind: 'openSource' }
+  /// User clicked the Stop button while a `weft build` was in
+  /// flight (Run / Activate / InfraStart pending). Host kills
+  /// the child process. The cache key is NOT updated because
+  /// the build never completed, so the next attempt rebuilds.
+  | { kind: 'cancelBuild' };
 
 // The v1 editor performs all text surgery in-process and sends the
 // resulting source with `saveWeft`. No semantic mutation protocol

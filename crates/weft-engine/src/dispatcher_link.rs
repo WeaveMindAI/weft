@@ -76,6 +76,10 @@ struct PendingState {
     awaiting_register: HashMap<u64, oneshot::Sender<TokenReply>>,
     /// `ctx.sidecar_endpoint()` calls awaiting SidecarEndpoint replies.
     awaiting_endpoint: HashMap<u64, oneshot::Sender<Option<String>>>,
+    /// `ctx.provision_sidecar()` calls awaiting
+    /// ProvisionSidecarReply. Carries an optional handle or
+    /// the error message the dispatcher returned.
+    awaiting_provision: HashMap<u64, oneshot::Sender<ProvisionReply>>,
     /// Suspensions waiting for a delivery. When a `Deliver` arrives
     /// the value either flows through an `Ongoing` oneshot (a node
     /// is already waiting) or gets stashed in `Ready` so a later
@@ -102,6 +106,14 @@ struct ControlState {
 pub struct TokenReply {
     pub token: String,
     pub user_url: Option<String>,
+}
+
+/// Reply from the dispatcher to `provision_sidecar`. Either the
+/// handle is populated (success) or `error` carries a message.
+#[derive(Debug)]
+pub struct ProvisionReply {
+    pub handle: Option<weft_core::context::SidecarHandle>,
+    pub error: Option<String>,
 }
 
 /// Initial message the dispatcher sends after the worker's `Ready`.
@@ -222,6 +234,31 @@ impl DispatcherLink {
         })
         .await;
         rx.await.map_err(|_| anyhow::anyhow!("sidecar endpoint channel closed"))
+    }
+
+    /// InfraSetup-phase `provision_sidecar` round-trip: ship the
+    /// SidecarSpec to the dispatcher, wait for the ack carrying
+    /// the allocated endpoint URL.
+    pub async fn request_provision_sidecar(
+        &self,
+        node_id: String,
+        spec: weft_core::node::SidecarSpec,
+    ) -> anyhow::Result<ProvisionReply> {
+        let (tx, rx) = oneshot::channel();
+        let request_id = {
+            let mut p = self.inner.pending.lock().await;
+            let id = p.next_request_id;
+            p.next_request_id += 1;
+            p.awaiting_provision.insert(id, tx);
+            id
+        };
+        self.send(WorkerToDispatcher::ProvisionSidecarRequest {
+            request_id,
+            node_id,
+            spec,
+        })
+        .await;
+        rx.await.map_err(|_| anyhow::anyhow!("provision_sidecar ack channel closed"))
     }
 
     /// TriggerSetup-phase `register_signal` round-trip: ship the
@@ -514,6 +551,24 @@ async fn route_inbound(ctx: &SupervisorCtx, msg: DispatcherToWorker) -> bool {
             let mut p = ctx.pending.lock().await;
             if let Some(tx) = p.awaiting_endpoint.remove(&request_id) {
                 let _ = tx.send(endpoint);
+            }
+        }
+        DispatcherToWorker::ProvisionSidecarReply {
+            request_id,
+            instance_id,
+            endpoint_url,
+            error,
+        } => {
+            let mut p = ctx.pending.lock().await;
+            if let Some(tx) = p.awaiting_provision.remove(&request_id) {
+                let handle = match (instance_id, endpoint_url) {
+                    (Some(i), Some(u)) => Some(weft_core::context::SidecarHandle {
+                        instance_id: i,
+                        endpoint_url: u,
+                    }),
+                    _ => None,
+                };
+                let _ = tx.send(ProvisionReply { handle, error });
             }
         }
         DispatcherToWorker::Deliver(Delivery { token, value }) => {

@@ -1,11 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import ProjectEditor from './lib/components/project/ProjectEditor.svelte';
-  import FollowBadge from './lib/components/project/FollowBadge.svelte';
+  import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
   import { send, onMessage } from './vscode';
   import {
     setCachedParseResponse,
-    setRemoteParseTrigger,
     type WeftParseError,
   } from './lib/ai/weft-parser';
   import { registerCatalog, type CatalogEntry } from './lib/nodes';
@@ -65,6 +64,8 @@
   let followMode = $state<'latest' | 'pinned'>('latest');
   let followColor = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
+  let sourceOpen = $state(false);
+  let buildVerb = $state<'run' | 'activate' | 'infraStart' | undefined>(undefined);
 
   // Per-node gate for the inline live-data strip. Only nodes
   // whose type declares `features.hasLiveData` opt into having
@@ -101,12 +102,6 @@
   });
 
   onMount(() => {
-    setRemoteParseTrigger((_source) => {
-      // Webview text surgery produced a new source; the host writes
-      // it to the document and re-parses. The resulting parseResult
-      // message lands through onMessage below.
-    });
-
     const unsub = onMessage((msg) => {
       if (msg.kind === 'catalogAll') {
         registerCatalog(msg.catalog as unknown as Record<string, CatalogEntry>);
@@ -195,71 +190,76 @@
           ...executionState.nodeStatuses,
           [e.nodeId]: state,
         };
-        // Also maintain a NodeExecution row so ProjectEditorInner's
-        // per-node class derivation works (it reads the LATEST row's
-        // .status). We keep history, matching v1 semantics.
+        // Maintain a NodeExecution row per lane so parallel
+        // fan-outs don't cross-correlate inputs and outputs.
+        // Match completion / failure / skip events to the open
+        // row whose `laneKey` equals the event's lane string.
         const now = Date.now();
         const rows = executionState.nodeExecutions[e.nodeId] ?? [];
-        const last = rows[rows.length - 1];
+        const laneKey = e.lane ?? '';
         let nextRows: NodeExecution[];
         if (state === 'running') {
-          // Open a new execution row with the input payload so the
-          // modal inspector can render it even before the node has
-          // completed.
+          // Open a new execution row keyed by lane.
           nextRows = [
             ...rows,
             {
-              id: `${e.nodeId}-${now}`,
+              id: `${e.nodeId}-${laneKey}-${now}`,
               nodeId: e.nodeId,
               status: 'running',
               pulseIdsAbsorbed: [],
-              pulseId: `${e.nodeId}-${now}`,
+              pulseId: `${e.nodeId}-${laneKey}-${now}`,
               startedAt: now,
               costUsd: 0,
               logs: [],
               color: '',
               lane: [],
+              laneKey,
               input: e.input,
             },
           ];
-        } else if (last && last.status === 'running') {
-          // Close the open row in place. Keep whatever input was
-          // stashed at start; add output now.
-          nextRows = rows.map((r) =>
-            r.id === last.id
-              ? {
-                  ...r,
-                  status: state as NodeExecution['status'],
-                  completedAt: now,
-                  error: e.error,
-                  output: e.output ?? r.output,
-                }
-              : r,
-          );
         } else {
-          // No open row (unexpected ordering or skipped without a
-          // start, which is how the engine reports downstream
-          // skips). Record a terminal row carrying whatever the
-          // event contained so the modal has something to show.
-          nextRows = [
-            ...rows,
-            {
-              id: `${e.nodeId}-${now}`,
-              nodeId: e.nodeId,
-              status: state as NodeExecution['status'],
-              pulseIdsAbsorbed: [],
-              pulseId: `${e.nodeId}-${now}`,
-              startedAt: now,
-              completedAt: now,
-              error: e.error,
-              costUsd: 0,
-              logs: [],
-              color: '',
-              lane: [],
-              input: e.input,
-              output: e.output,
-            },
-          ];
+          const matchIdx = rows.findIndex(
+            (r) => r.laneKey === laneKey && r.status === 'running',
+          );
+          if (matchIdx >= 0) {
+            // Close the matching lane's row in place.
+            nextRows = rows.map((r, i) =>
+              i === matchIdx
+                ? {
+                    ...r,
+                    status: state as NodeExecution['status'],
+                    completedAt: now,
+                    error: e.error,
+                    output: e.output ?? r.output,
+                  }
+                : r,
+            );
+          } else {
+            // No matching open row (skipped without start, or
+            // re-ordered; the engine reports downstream skips
+            // without a corresponding start). Append a terminal
+            // row carrying the event's payload.
+            nextRows = [
+              ...rows,
+              {
+                id: `${e.nodeId}-${laneKey}-${now}`,
+                nodeId: e.nodeId,
+                status: state as NodeExecution['status'],
+                pulseIdsAbsorbed: [],
+                pulseId: `${e.nodeId}-${laneKey}-${now}`,
+                startedAt: now,
+                completedAt: now,
+                error: e.error,
+                costUsd: 0,
+                logs: [],
+                color: '',
+                lane: [],
+                laneKey,
+                input: e.input,
+                output: e.output,
+              },
+            ];
+          }
         }
         executionState.nodeExecutions = {
           ...executionState.nodeExecutions,
@@ -314,6 +314,14 @@
         followMode = msg.status.mode;
         followColor = msg.status.color;
         followPendingCount = msg.status.pendingCount;
+        return;
+      }
+      if (msg.kind === 'sourceState') {
+        sourceOpen = msg.open;
+        return;
+      }
+      if (msg.kind === 'buildState') {
+        buildVerb = msg.active ? msg.verb : undefined;
         return;
       }
       if (msg.kind === 'actionFailed') {
@@ -401,7 +409,19 @@
   }
 
   function onRun() {
-    executionState.isRunning = true;
+    // Don't flip isRunning here. The host posts buildState=true
+    // first (drives the "Building..." button), and the actual
+    // run-started signal arrives via the dispatcher's
+    // ExecutionStarted SSE event, which sets isRunning through
+    // the execEvent handler. Setting isRunning=true here would
+    // leave the UI showing "Stop" if the build is cancelled
+    // (since cancellation never reaches the run-started path).
+    //
+    // Flush any pending debounced saves first. The graph editor
+    // debounces saveWeft for ~1s after every keystroke; without
+    // this flush, clicking Run while a save is still queued
+    // builds against the stale on-disk source.
+    editorRef?.flushAllPendingSaves?.();
     send({ kind: 'runProject' });
   }
 
@@ -410,6 +430,7 @@
   }
 
   function onStartInfra() {
+    editorRef?.flushAllPendingSaves?.();
     infraTransitional = 'starting';
     send({ kind: 'infraStart' });
   }
@@ -427,6 +448,7 @@
       triggerTransitional = 'deactivating';
       send({ kind: 'deactivateProject' });
     } else {
+      editorRef?.flushAllPendingSaves?.();
       triggerTransitional = 'activating';
       send({ kind: 'activateProject' });
     }
@@ -437,12 +459,14 @@
   {#if error}
     <div class="p-4 text-destructive">parse error: {error}</div>
   {:else if project}
-    <FollowBadge
+    <GraphToolbar
       mode={followMode}
       color={followColor}
       pendingCount={followPendingCount}
       onTogglePin={() => send({ kind: 'followTogglePin' })}
       onCatchUp={() => send({ kind: 'followCatchUp' })}
+      onOpenSource={() => send({ kind: 'openSource' })}
+      sourceOpen={sourceOpen}
     />
     <ProjectEditor
       bind:this={editorRef}
@@ -450,7 +474,8 @@
       {onSave}
       {onRun}
       {onStop}
-      {executionState}
+      onCancelBuild={() => send({ kind: 'cancelBuild' })}
+      executionState={{ ...executionState, buildVerb }}
       {infraState}
       {triggerState}
       {onToggleTrigger}
@@ -458,7 +483,6 @@
       {onStopInfra}
       {onTerminateInfra}
       infraLiveData={liveDataByNode}
-      playground={true}
     />
   {:else}
     <div class="p-4 text-muted-foreground">loading graph...</div>

@@ -15,6 +15,10 @@
 // talk to the center through shared callbacks.
 
 import * as vscode from 'vscode';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { promises as fsp } from 'node:fs';
+import * as nodePath from 'node:path';
 
 import { DispatcherClient } from './dispatcher';
 import { GraphViewController } from './graphView';
@@ -59,6 +63,8 @@ export function activate(context: vscode.ExtensionContext) {
   graphView.setFollowTogglePinHandler(() => autoFollow.togglePin());
   graphView.setFollowCatchUpHandler(() => autoFollow.catchUpToLatest());
   graphView.setLifecycleStartHandler(() => autoFollow.pinAndFollow(undefined));
+  graphView.setEnsureBuildHandler((verb) => ensurePinnedBuild(verb));
+  graphView.setCancelBuildHandler(() => cancelActiveBuild());
   graphView.setNodeSelectionHandler((sel) => {
     if (!pinnedProject) return;
     inspector.setSelection(
@@ -80,8 +86,11 @@ export function activate(context: vscode.ExtensionContext) {
     pinnedProject = project;
     executionsProvider.setPinnedProject(project);
     autoFollow.setProject(project.id);
+    // Load the document so graphView has something to watch, but
+    // do NOT show the text editor: the graph is the default surface
+    // for a .weft. Users open the source via the graph's "Open
+    // source" button (lands in ViewColumn.Beside).
     const doc = await vscode.workspace.openTextDocument(project.entryPath);
-    await vscode.window.showTextDocument(doc, { preview: false });
     await graphView.open(doc, project.id);
   }
 
@@ -91,10 +100,7 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     try {
-      // Register the project with the dispatcher (idempotent) then
-      // trigger a run. The dispatcher mints a fresh execution color
-      // and broadcasts a NodeStarted event that our follower picks
-      // up and forwards to the webview.
+      await ensurePinnedBuild('run');
       const source = await readFile(pinnedProject.entryPath);
       await dispatcher.post(`/projects`, {
         id: pinnedProject.id,
@@ -109,6 +115,208 @@ export function activate(context: vscode.ExtensionContext) {
     } catch (err) {
       void vscode.window.showErrorMessage(`Run failed: ${err}`);
     }
+  }
+
+  /// Rebuild the pinned project's worker image when the source
+  /// has changed since the last build, or when the cached image
+  /// is missing from local docker. Runs before any graph-bar
+  /// verb that spawns worker pods (Run, Activate, InfraStart).
+  ///
+  /// Skip semantics: hash main.weft + weft.toml + every file
+  /// under nodes/ → compare against last-build hash. If equal
+  /// AND the worker image still exists in docker, the build is
+  /// a no-op so we save the multi-second docker round-trip.
+  /// Either signal mismatched → run `weft build` and refresh
+  /// the cache.
+  ///
+  /// `verb` lets the webview show "Building..." in place of
+  /// "Running..." / "Starting..." while the cargo+docker work
+  /// is in flight. Skipped builds emit no buildState transition
+  /// so the UI never flickers.
+  ///
+  /// Serialized via `buildChain`: every call appends its work to
+  /// a single chain so no two builds ever overlap. The cache
+  /// check inside the work IIFE runs AFTER any prior build has
+  /// finished, so two callers arriving close together (Run +
+  /// Activate clicked back-to-back) see the same eventual cache
+  /// hit and the second one skips. Without this, both would
+  /// spawn `weft build` in parallel — racing for the same docker
+  /// image tag and cargo target/, and `cancelActiveBuild` could
+  /// only see (and kill) the second of the two children.
+  let buildChain: Promise<void> = Promise.resolve();
+
+  async function ensurePinnedBuild(
+    verb: 'run' | 'activate' | 'infraStart',
+  ): Promise<void> {
+    if (!pinnedProject) return;
+    const work = buildChain.catch(() => undefined).then(async () => {
+      // Re-snapshot pinnedProject AFTER the chain settles. The
+      // user may have switched projects while we were queued;
+      // we want the project that's pinned NOW, not the one
+      // pinned at call time.
+      const project = pinnedProject;
+      if (!project) return;
+      // The graph editor's debounced saveWeft may still be in
+      // flight when the user clicks Run / Activate / InfraStart.
+      // Wait for it to land on disk so the hash + readFile see
+      // the freshest source. graphView resolves immediately if
+      // nothing is pending.
+      await graphView.waitForPendingSave();
+      const hash = await hashProjectInputs(project.rootPath);
+      const cacheKey = `weft.lastBuild.${project.id}`;
+      const last = context.workspaceState.get<string>(cacheKey);
+      const tag = `weft-worker-${project.id}:latest`;
+      if (last === hash && (await dockerImageExists(tag))) {
+        // Source unchanged + image still present: nothing to do.
+        return;
+      }
+      graphView.post({ kind: 'buildState', active: true, verb });
+      try {
+        await runWeftCli(['build'], project.rootPath);
+        await context.workspaceState.update(cacheKey, hash);
+      } finally {
+        graphView.post({ kind: 'buildState', active: false });
+      }
+    });
+    buildChain = work;
+    return work;
+  }
+
+  async function hashProjectInputs(root: string): Promise<string> {
+    const h = createHash('sha256');
+    const files: string[] = [];
+    const candidates = ['main.weft', 'weft.toml'];
+    for (const rel of candidates) {
+      const abs = nodePath.join(root, rel);
+      try {
+        await fsp.access(abs);
+        files.push(abs);
+      } catch {
+        // File missing — skip; the build will fail loudly.
+      }
+    }
+    const nodesDir = nodePath.join(root, 'nodes');
+    try {
+      await collectFiles(nodesDir, files);
+    } catch {
+      // No nodes/ dir is fine.
+    }
+    files.sort();
+    for (const abs of files) {
+      const buf = await fsp.readFile(abs);
+      h.update(nodePath.relative(root, abs));
+      h.update('\0');
+      h.update(buf);
+      h.update('\0');
+    }
+    return h.digest('hex');
+  }
+
+  async function collectFiles(dir: string, out: string[]): Promise<void> {
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const abs = nodePath.join(dir, e.name);
+      if (e.isDirectory()) {
+        await collectFiles(abs, out);
+      } else if (e.isFile()) {
+        out.push(abs);
+      }
+    }
+  }
+
+  async function dockerImageExists(tag: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const child = spawn('docker', ['image', 'inspect', tag], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+      });
+      child.on('error', () => resolve(false));
+      child.on('close', (code) => resolve(code === 0));
+    });
+  }
+
+  /// Tracks the currently-running `weft build` child so the
+  /// webview's "Stop" button can kill it. Only one build runs
+  /// at a time (Run/Activate/InfraStart all serialize through
+  /// ensurePinnedBuild).
+  let activeBuildChild: ReturnType<typeof spawn> | undefined;
+
+  function cancelActiveBuild(): void {
+    const child = activeBuildChild;
+    if (!child || child.pid === undefined) return;
+    const channel = getWeftOutputChannel();
+    channel.appendLine('> build cancelled by user');
+    // `weft build` shells out to docker / cargo / kind, which all
+    // run as grandchildren. SIGTERM to the `weft` parent alone
+    // leaves them orphaned (still building in the background).
+    // We spawn `weft` detached so it leads its own process group,
+    // then SIGKILL the whole group via the negative pid: a clean
+    // way to take everything down at once. `process.kill(-pid)`
+    // is POSIX-portable; on Windows the spawn options don't
+    // create a process group so we fall back to killing the
+    // child alone (Windows isn't supported by the dispatcher's
+    // kind-based local mode anyway).
+    try {
+      if (process.platform === 'win32') {
+        child.kill('SIGKILL');
+      } else {
+        process.kill(-child.pid, 'SIGKILL');
+      }
+    } catch (err) {
+      console.warn('[weft] cancelActiveBuild kill failed:', err);
+      // Fallback: kill just the parent. Children may linger but
+      // the runWeftCli promise still rejects on close, so the
+      // UI returns to idle.
+      try { child.kill('SIGKILL'); } catch { /* nothing else to try */ }
+    }
+  }
+
+  /// Shell `weft <args>` in the project root and surface output
+  /// through a dedicated VS Code OutputChannel so the user can
+  /// see compile / docker progress without leaving the editor.
+  /// Detached spawn so the child leads its own process group;
+  /// cancelActiveBuild kills the group so cargo / docker / kind
+  /// children die with the parent instead of leaking.
+  async function runWeftCli(args: string[], cwd: string): Promise<void> {
+    const channel = getWeftOutputChannel();
+    channel.show(true);
+    channel.appendLine(`> weft ${args.join(' ')}  (${cwd})`);
+    return new Promise((resolve, reject) => {
+      const child = spawn('weft', args, {
+        cwd,
+        env: process.env,
+        detached: process.platform !== 'win32',
+      });
+      activeBuildChild = child;
+      child.stdout?.on('data', (chunk: Buffer) =>
+        channel.append(chunk.toString()),
+      );
+      child.stderr?.on('data', (chunk: Buffer) =>
+        channel.append(chunk.toString()),
+      );
+      child.on('error', (err) => {
+        activeBuildChild = undefined;
+        reject(err);
+      });
+      child.on('close', (code, signal) => {
+        activeBuildChild = undefined;
+        if (code === 0) {
+          resolve();
+        } else if (signal) {
+          reject(new Error(`weft ${args.join(' ')} terminated by ${signal}`));
+        } else {
+          reject(new Error(`weft ${args.join(' ')} exited ${code}`));
+        }
+      });
+    });
+  }
+
+  let weftOutputChannel: vscode.OutputChannel | undefined;
+  function getWeftOutputChannel(): vscode.OutputChannel {
+    if (!weftOutputChannel) {
+      weftOutputChannel = vscode.window.createOutputChannel('Weft');
+      context.subscriptions.push(weftOutputChannel);
+    }
+    return weftOutputChannel;
   }
 
   async function stopPinned(): Promise<void> {
@@ -221,17 +429,90 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   );
 
-  // Keep the inspector + executions list fresh when the active
-  // editor changes (new .weft file -> new project pin).
+  // .weft files default to the graph view, not the text editor.
+  // When a .weft becomes the active text editor AND the graph
+  // panel doesn't exist yet (cold open via Ctrl+P, explorer
+  // double-click, restored editor on startup), pin its project,
+  // open the graph in the same column, and close the underlying
+  // text tab. The user can summon the text via the graph's
+  // "Open source" button when they want it.
+  graphView.setOpenSourceHandler(async () => {
+    if (!pinnedProject) return;
+    const target = pinnedProject.entryPath;
+    // Already open somewhere? Reveal the existing tab instead of
+    // creating a new one. Otherwise repeated clicks pile up tabs.
+    const existing = vscode.window.tabGroups.all
+      .flatMap((g) => g.tabs.map((t) => ({ tab: t, group: g })))
+      .find(
+        (e) =>
+          e.tab.input instanceof vscode.TabInputText
+          && e.tab.input.uri.fsPath === target,
+      );
+    if (existing) {
+      const column = existing.group.viewColumn;
+      const doc = await vscode.workspace.openTextDocument(target);
+      await vscode.window.showTextDocument(doc, {
+        preview: false,
+        viewColumn: column,
+        preserveFocus: false,
+      });
+      return;
+    }
+    // Source opens in `Beside` (column 2). The graph webview
+    // stays in column 1.
+    //
+    // We tried hard to get source-on-the-LEFT, graph-on-the-
+    // right via `panel.reveal(Two)` then `showTextDocument(One)`,
+    // but moving a webview between columns destroys its iframe
+    // (microsoft/vscode#141001) and the canvas blanks out. There
+    // is also no built-in command to swap editor GROUPS
+    // (microsoft/vscode#85123, closed as backlog). So we settle
+    // for the inverse layout the platform supports: graph on
+    // the left, source on the right.
+    const doc = await vscode.workspace.openTextDocument(target);
+    await vscode.window.showTextDocument(doc, {
+      preview: false,
+      viewColumn: vscode.ViewColumn.Beside,
+    });
+  });
+
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor(async (ed) => {
       if (!ed || ed.document.languageId !== 'weft') return;
       const found = projectsProvider
         .projects()
         .find((p) => p.entryPath === ed.document.uri.fsPath);
-      if (found) {
-        pinnedProject = found;
-        executionsProvider.setPinnedProject(found);
+      if (!found) return;
+      pinnedProject = found;
+      executionsProvider.setPinnedProject(found);
+      autoFollow.setProject(found.id);
+
+      // Discriminator: does the graph panel already exist?
+      //
+      // - Yes → user is refocusing or opened source via the
+      //   "Source" button. Leave the text tab alone.
+      // - No → cold open (Ctrl+P, explorer click, restored
+      //   editor on startup). Swap the text for the graph in
+      //   the same column.
+      //
+      // Counting tabs doesn't work because VS Code has already
+      // created the text tab by the time this event fires, in
+      // both cases.
+      if (graphView.isOpen()) {
+        return;
+      }
+
+      const docUri = ed.document.uri;
+      await pinProject(found);
+      const tabs = vscode.window.tabGroups.all
+        .flatMap((g) => g.tabs)
+        .filter(
+          (t) =>
+            t.input instanceof vscode.TabInputText
+            && t.input.uri.toString() === docUri.toString(),
+        );
+      if (tabs.length > 0) {
+        await vscode.window.tabGroups.close(tabs);
       }
     }),
   );

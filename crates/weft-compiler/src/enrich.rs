@@ -1,19 +1,9 @@
 //! Post-compilation enrichment. Given a parsed ProjectDefinition and
 //! a NodeCatalog, populate each NodeDefinition's inputs/outputs/features
-//! from the catalog, materialize form-derived ports, and validate
-//! that every referenced node type exists.
-//!
-//! v1's enrich lives at `crates-v1/weft-nodes/src/enrich.rs` and is
-//! much larger (~1600 lines). It also handles:
-//! - Custom weft-added ports (canAddInputPorts/canAddOutputPorts).
-//! - `T_Auto` per-field-instance TypeVar replacement.
-//! - Merging weft-declared ports with catalog ports (weft overrides
-//!   `required`).
-//! - Filtering UI-only nodes.
-//!
-//! This v2 port starts with the minimum required for the 5 starter
-//! nodes to work end to end. The other features get added as
-//! additional nodes need them.
+//! from the catalog, materialize form-derived ports, merge
+//! weft-declared custom ports for nodes with
+//! canAddInputPorts/canAddOutputPorts, and validate that every
+//! referenced node type exists.
 
 use serde_json::Value;
 
@@ -22,6 +12,142 @@ use weft_core::project::{PortDefinition, ProjectDefinition};
 use weft_core::weft_type::WeftType;
 
 use crate::error::{CompileError, CompileResult};
+
+/// Which side of a port we're merging. Only used for human-readable
+/// diagnostic messages from `merge_ports`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortDirection {
+    Input,
+    Output,
+}
+
+impl PortDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+}
+
+/// Merge weft-declared ports with catalog ports. Rules:
+///
+/// 1. Every catalog port is present in the result. Catalog is the
+///    source of truth for port identity, lane_mode, and type
+///    (except when catalog type is `MustOverride`, where the
+///    weft-declared type becomes the real type).
+/// 2. A weft port that matches a catalog port by name can:
+///    - override `required` (either direction),
+///    - narrow the type if catalog's type is MustOverride, or
+///      compatible with the weft declaration.
+///    - Incompatible types produce an enrich error tied to the
+///      node id.
+/// 3. A weft port with no matching catalog port:
+///    - If the node has `can_add` for this direction, added to
+///      the result verbatim (must carry a real type).
+///    - Else a warning is logged and the port is dropped. The
+///      compile still succeeds (the weft graph just loses the
+///      connection, which downstream validate flags).
+fn merge_ports(
+    catalog_ports: &[PortDefinition],
+    weft_ports: &[PortDefinition],
+    can_add: bool,
+    node_id: &str,
+    direction: PortDirection,
+    errors: &mut Vec<String>,
+) -> Vec<PortDefinition> {
+    use std::collections::HashMap;
+
+    let catalog_by_name: HashMap<&str, &PortDefinition> = catalog_ports
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+
+    // Walk catalog ports first so the result carries them all, in
+    // declaration order. For each one, if the weft source re-stated
+    // it, apply the override rules.
+    let mut result: Vec<PortDefinition> = catalog_ports
+        .iter()
+        .map(|cp| {
+            let Some(wp) = weft_ports.iter().find(|w| w.name == cp.name) else {
+                return cp.clone();
+            };
+            let mut merged = cp.clone();
+            // required: weft wins in either direction.
+            merged.required = wp.required;
+
+            // Type override. Catalog `MustOverride` means "the node
+            // doesn't know yet, whoever wires me tells me." In that
+            // case the weft type IS the type. Otherwise the weft
+            // type must be compatible with (a subtype / narrowing
+            // of) the catalog type; incompatible → hard error.
+            if !wp.port_type.is_must_override() {
+                if cp.port_type.is_must_override()
+                    || WeftType::is_compatible(&wp.port_type, &cp.port_type)
+                {
+                    merged.port_type = wp.port_type.clone();
+                    // The user RESTATED the type in the .weft
+                    // source: surface that to validate so the
+                    // implicit-expand/gather warnings can stay
+                    // quiet for edges where both sides are
+                    // user-stated.
+                    merged.user_typed = true;
+                } else {
+                    errors.push(format!(
+                        "node '{}': {} port '{}' declared type {} incompatible with catalog type {}",
+                        node_id,
+                        direction.as_str(),
+                        cp.name,
+                        wp.port_type,
+                        cp.port_type,
+                    ));
+                }
+            }
+
+            if wp.lane_mode != cp.lane_mode && wp.lane_mode != Default::default() {
+                tracing::warn!(
+                    "enrich: node '{}' {} port '{}': weft lane_mode {:?} differs from catalog {:?}; using catalog",
+                    node_id,
+                    direction.as_str(),
+                    cp.name,
+                    wp.lane_mode,
+                    cp.lane_mode,
+                );
+            }
+            merged
+        })
+        .collect();
+
+    // Then: weft ports that are NOT in the catalog. These are only
+    // valid on nodes with can_add_<direction>_ports.
+    for wp in weft_ports {
+        if catalog_by_name.contains_key(wp.name.as_str()) {
+            continue;
+        }
+        if !can_add {
+            tracing::warn!(
+                "enrich: node '{}' declares custom {} port '{}' but node type does not support custom {} ports; dropping",
+                node_id,
+                direction.as_str(),
+                wp.name,
+                direction.as_str(),
+            );
+            continue;
+        }
+        if wp.port_type.is_must_override() {
+            errors.push(format!(
+                "node '{}': custom {} port '{}' needs a concrete type",
+                node_id,
+                direction.as_str(),
+                wp.name,
+            ));
+            continue;
+        }
+        result.push(wp.clone());
+    }
+
+    result
+}
 
 /// Policy for handling unknown node types during enrichment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +198,19 @@ pub fn enrich_with_policy(
             continue;
         }
 
-        // Base ports from catalog.
-        let mut inputs: Vec<PortDefinition> = meta
+        // Snapshot the weft-declared ports before we overwrite from
+        // catalog. The parser stores whatever the user wrote in the
+        // `NodeType(in: T) -> (out: U)` header into node.inputs /
+        // node.outputs. merge_ports below consumes these to respect
+        // user-declared custom ports on nodes with canAddInputPorts /
+        // canAddOutputPorts, and to override `required` on catalog
+        // ports that the user re-stated with `*`.
+        let weft_inputs = std::mem::take(&mut node.inputs);
+        let weft_outputs = std::mem::take(&mut node.outputs);
+
+        // Base ports from catalog. user_typed=false because the
+        // type came from metadata.json, not the .weft source.
+        let catalog_inputs: Vec<PortDefinition> = meta
             .inputs
             .iter()
             .map(|p| PortDefinition {
@@ -84,9 +221,10 @@ pub fn enrich_with_policy(
                 lane_mode: p.lane_mode,
                 lane_depth: 1,
                 configurable: p.configurable || p.port_type.is_default_configurable(),
+                user_typed: false,
             })
             .collect();
-        let mut outputs: Vec<PortDefinition> = meta
+        let catalog_outputs: Vec<PortDefinition> = meta
             .outputs
             .iter()
             .map(|p| PortDefinition {
@@ -97,8 +235,26 @@ pub fn enrich_with_policy(
                 lane_mode: p.lane_mode,
                 lane_depth: 1,
                 configurable: false,
+                user_typed: false,
             })
             .collect();
+
+        let mut inputs = merge_ports(
+            &catalog_inputs,
+            &weft_inputs,
+            meta.features.can_add_input_ports,
+            &node.id,
+            PortDirection::Input,
+            &mut errors,
+        );
+        let mut outputs = merge_ports(
+            &catalog_outputs,
+            &weft_outputs,
+            meta.features.can_add_output_ports,
+            &node.id,
+            PortDirection::Output,
+            &mut errors,
+        );
 
         // Form-derived ports (for nodes declaring has_form_schema).
         if meta.features.has_form_schema {
@@ -148,7 +304,67 @@ pub fn enrich_with_policy(
     }
 
     resolve_type_vars(project)?;
+    infer_lane_modes(project);
     Ok(())
+}
+
+/// Walk edges; infer `lane_mode` + `lane_depth` on the target
+/// port whenever source and target disagree on list depth.
+/// A `List[T]` source into a `T` target is implicit expand (set
+/// the target's `lane_mode = Expand, lane_depth = delta`). A
+/// `T` source into a `List[T]` target is implicit gather (set
+/// the target's `lane_mode = Gather`). Matches the warnings
+/// already emitted by validate.rs so runtime and compiler agree.
+fn infer_lane_modes(project: &mut ProjectDefinition) {
+    use weft_core::project::LaneMode;
+
+    let mut edits: Vec<(String, String, LaneMode, u32)> = Vec::new();
+    for edge in &project.edges {
+        let Some(src_handle) = edge.source_handle.as_deref() else { continue };
+        let Some(tgt_handle) = edge.target_handle.as_deref() else { continue };
+        let Some(src_node) = project.nodes.iter().find(|n| n.id == edge.source) else { continue };
+        let Some(tgt_node) = project.nodes.iter().find(|n| n.id == edge.target) else { continue };
+        let Some(src_port) = src_node.outputs.iter().find(|p| p.name == src_handle) else { continue };
+        let Some(tgt_port) = tgt_node.inputs.iter().find(|p| p.name == tgt_handle) else { continue };
+
+        let src_depth = list_depth(&src_port.port_type);
+        let tgt_depth = list_depth(&tgt_port.port_type);
+        if src_depth > tgt_depth {
+            let delta = (src_depth - tgt_depth) as u32;
+            edits.push((
+                edge.target.clone(),
+                tgt_handle.to_string(),
+                LaneMode::Expand,
+                delta,
+            ));
+        } else if tgt_depth > src_depth {
+            let delta = (tgt_depth - src_depth) as u32;
+            edits.push((
+                edge.target.clone(),
+                tgt_handle.to_string(),
+                LaneMode::Gather,
+                delta,
+            ));
+        }
+    }
+
+    for (node_id, port_name, mode, depth) in edits {
+        let Some(node) = project.nodes.iter_mut().find(|n| n.id == node_id) else { continue };
+        let Some(port) = node.inputs.iter_mut().find(|p| p.name == port_name) else { continue };
+        // Don't clobber an explicit Expand/Gather on the port
+        // (the node catalog declared its own lane mechanics).
+        if port.lane_mode == LaneMode::Single {
+            port.lane_mode = mode;
+            port.lane_depth = depth;
+        }
+    }
+}
+
+fn list_depth(ty: &WeftType) -> usize {
+    match ty {
+        WeftType::List(inner) => 1 + list_depth(inner),
+        _ => 0,
+    }
 }
 
 /// Walk edges; wherever one end is a concrete type and the other is
@@ -315,5 +531,8 @@ fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> Por
         lane_mode: Default::default(),
         lane_depth: 1,
         configurable: !is_output && port_type.is_default_configurable(),
+        // Form-derived ports come from form_field_specs in the
+        // node's metadata, not the .weft source.
+        user_typed: false,
     }
 }

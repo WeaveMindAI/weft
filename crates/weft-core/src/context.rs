@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 
 use crate::error::{WeftError, WeftResult};
 use crate::lane::Lane;
+use crate::node::SidecarSpec;
 use crate::primitive::{CostReport, WakeSignalSpec};
 use crate::Color;
 
@@ -119,15 +120,33 @@ impl ExecutionContext {
     // ----- Infra primitive ----------------------------------------
 
     /// Retrieve the cluster-local endpoint URL of this node's
-    /// sidecar. Only valid for nodes declared `requires_infra: true`
-    /// and only after `weft infra up` has run. Returns an error
-    /// otherwise.
+    /// sidecar. Only valid for nodes declared `requires_infra:
+    /// true` and only after `weft infra start` has run. Returns
+    /// an error otherwise.
     ///
-    /// Node code uses this to call its sidecar (e.g. POST /action,
-    /// GET /outputs, subscribe /live). The dispatcher resolves the
-    /// URL from its InfraRegistry so node code never touches k8s.
+    /// Node code uses this to call its sidecar (POST /action,
+    /// GET /outputs, subscribe /live). The dispatcher resolves
+    /// the URL from its InfraRegistry so node code never touches
+    /// k8s.
     pub async fn sidecar_endpoint(&self) -> WeftResult<String> {
         self.handle.sidecar_endpoint().await
+    }
+
+    /// Provision this node's sidecar. Called by infra nodes
+    /// during `Phase::InfraSetup`. Mirrors v1's `infra_provision`
+    /// helper: the node hands its SidecarSpec to the dispatcher,
+    /// the dispatcher applies k8s manifests via its
+    /// `InfraBackend` and returns the allocated endpoint URL.
+    ///
+    /// Readiness polling stays on the caller: the node decides
+    /// what "ready" means (HTTP /health, a custom ping, nothing
+    /// at all). Keeping it here would force a one-size-fits-all
+    /// protocol.
+    pub async fn provision_sidecar(
+        &self,
+        spec: SidecarSpec,
+    ) -> WeftResult<SidecarHandle> {
+        self.handle.provision_sidecar(spec).await
     }
 
     // ----- Fire-and-forget primitives --------------------------------
@@ -242,8 +261,19 @@ pub trait ContextHandle: Send + Sync {
     async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value>;
     async fn register_signal(&self, spec: WakeSignalSpec) -> WeftResult<Option<String>>;
     async fn sidecar_endpoint(&self) -> WeftResult<String>;
+    async fn provision_sidecar(&self, spec: SidecarSpec) -> WeftResult<SidecarHandle>;
     fn report_cost(&self, report: CostReport);
     fn log(&self, level: LogLevel, message: String);
     fn is_cancelled(&self) -> bool;
     fn cancellation(&self) -> Arc<Notify>;
+}
+
+/// Result of `provision_sidecar`: the handle identifies the
+/// provisioned sidecar in the infra registry, the endpoint URL
+/// is where the node should send its `/action` / `/outputs`
+/// requests at fire time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarHandle {
+    pub instance_id: String,
+    pub endpoint_url: String,
 }

@@ -34,6 +34,8 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/projects", get(project::list).post(project::register))
         .route("/projects/{id}", get(project::get).delete(project::remove))
         .route("/projects/{id}/run", post(project::run))
+        .route("/projects/{id}/status", get(project::status))
+        .route("/projects/{id}/executions/latest", get(execution::latest_for_project))
         .route("/projects/{id}/activate", post(project::activate))
         .route("/projects/{id}/deactivate", post(project::deactivate))
         .route("/projects/{id}/infra/start", post(infra::start))

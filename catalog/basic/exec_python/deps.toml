@@ -1,0 +1,48 @@
+# ExecPython embeds CPython via PyO3.
+#
+# Build stage: needs libpython3-dev and pkg-config so PyO3's build
+# script can link against the interpreter's shared library. The
+# linker writes a NEEDED entry for whichever libpython3.X is
+# available at build time.
+#
+# Runtime stage: needs the same libpython3.X the builder linked
+# against. Because the builder and runtime containers are
+# derived from the SAME base image, the installed Python version
+# matches by construction. No stable-ABI config shim, no manual
+# version pinning.
+#
+# See docs/build-system.md for the per-distro matrix pattern.
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["auto-initialize"] }
+
+[system.build.apt]
+# python3 at build time: PyO3's build script runs it to probe
+# the interpreter's sysconfig (version, lib dir, lib name). Kept
+# separate from python3-dev even though dev depends on python3
+# on Debian; being explicit is cheaper than surprise.
+default = ["python3", "libpython3-dev", "pkg-config"]
+
+[system.build.apk]
+default = ["python3", "python3-dev", "pkgconfig"]
+
+[system.build.yum]
+default = ["python3", "python3-devel", "pkg-config"]
+
+[system.runtime.apt]
+# `libpython3.X` (no suffix) is the package that ships
+# `libpython3.X.so.1.0`, which the PyO3 build links against by
+# soname at build time. `python3` pulls the stdlib alongside so
+# `import json` etc work at runtime. Keep per-distro entries
+# because the libpython minor version is distro-specific.
+default = ["python3", "libpython3.11"]
+debian_12 = ["python3", "libpython3.11"]
+debian_13 = ["python3", "libpython3.13"]
+ubuntu_22_04 = ["python3", "libpython3.10"]
+ubuntu_24_04 = ["python3", "libpython3.12"]
+
+[system.runtime.apk]
+default = ["python3"]
+
+[system.runtime.yum]
+default = ["python3"]

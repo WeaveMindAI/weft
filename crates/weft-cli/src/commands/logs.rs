@@ -1,19 +1,35 @@
-//! `weft logs <color>`: print the log lines the dispatcher has
-//! journaled for an execution. Use `weft follow <color>` for live
-//! updates.
+//! `weft logs [color]`: print log lines the dispatcher has
+//! journaled for an execution.
+//!
+//! - No argument: resolve the cwd project, fetch its most recent
+//!   execution, show those logs.
+//! - UUID argument: treat as color, show those logs.
 
-use super::Ctx;
+use super::{resolve_project_id, Ctx};
 
-pub async fn run(ctx: Ctx, target: String) -> anyhow::Result<()> {
-    // Phase A: we only have per-execution logs (keyed by color).
-    // Project-level logs (aggregation across executions) arrive in
-    // phase B; until then, accept only a color.
-    if uuid::Uuid::parse_str(&target).is_err() {
-        anyhow::bail!("expected an execution color (UUID). Project-wide log view is phase B.");
-    }
+pub async fn run(ctx: Ctx, target: Option<String>) -> anyhow::Result<()> {
+    let color = match target {
+        Some(raw) if uuid::Uuid::parse_str(&raw).is_ok() => raw,
+        Some(other) => {
+            anyhow::bail!("expected a UUID color; got '{other}'. Run with no arg for the cwd project's latest.")
+        }
+        None => {
+            let project_id = resolve_project_id(None)?;
+            let resp: serde_json::Value = ctx
+                .client()
+                .get_json(&format!("/projects/{project_id}/executions/latest"))
+                .await
+                .map_err(|e| anyhow::anyhow!("no executions for project {project_id}: {e}"))?;
+            resp.get("color")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("dispatcher response missing color"))?
+                .to_string()
+        }
+    };
+
     let lines: serde_json::Value = ctx
         .client()
-        .get_json(&format!("/executions/{target}/logs"))
+        .get_json(&format!("/executions/{color}/logs"))
         .await?;
     let Some(arr) = lines.as_array() else {
         println!("(no logs)");

@@ -2143,6 +2143,7 @@ fn collect_group_definitions(
             lane_mode: p.lane_mode,
             lane_depth: 1,
             configurable: p.port_type.is_default_configurable(),
+            user_typed: true,
         })
         .collect();
     let out_ports: Vec<PortDefinition> = group
@@ -2156,6 +2157,7 @@ fn collect_group_definitions(
             lane_mode: LaneMode::Single,
             lane_depth: 1,
             configurable: p.port_type.is_default_configurable(),
+            user_typed: true,
         })
         .collect();
 
@@ -2218,6 +2220,7 @@ fn flatten_group(
         lane_mode: p.lane_mode,
         lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
+        user_typed: true,
     }).collect();
     let in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -2227,6 +2230,7 @@ fn flatten_group(
         lane_mode: LaneMode::Single,
         lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
+        user_typed: true,
     }).collect();
 
     // Copy the group's @require_one_of directives onto the In passthrough's
@@ -2265,6 +2269,7 @@ fn flatten_group(
         lane_mode: LaneMode::Single,
         lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
+        user_typed: true,
     }).collect();
     let out_pt_outputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -2274,6 +2279,7 @@ fn flatten_group(
         lane_mode: LaneMode::Single,
         lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
+        user_typed: true,
     }).collect();
 
     nodes.push(NodeDefinition {
@@ -2334,6 +2340,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         lane_mode: p.lane_mode,
         lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
+        user_typed: true,
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -2343,6 +2350,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         lane_mode: p.lane_mode,
         lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
+        user_typed: true,
     }).collect();
     let mut features = NodeFeatures::default();
     features.one_of_required = pn.one_of_required.clone();

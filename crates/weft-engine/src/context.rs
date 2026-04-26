@@ -188,6 +188,27 @@ impl ContextHandle for RunnerHandle {
         Ok(reply.user_url)
     }
 
+    async fn provision_sidecar(
+        &self,
+        spec: weft_core::node::SidecarSpec,
+    ) -> WeftResult<weft_core::context::SidecarHandle> {
+        let link = self.require_link()?;
+        let reply = link
+            .request_provision_sidecar(self.node_id.clone(), spec)
+            .await
+            .map_err(|e| WeftError::Config(format!("provision_sidecar: {e}")))?;
+        if let Some(msg) = reply.error {
+            return Err(WeftError::Config(format!(
+                "provision_sidecar: {msg}"
+            )));
+        }
+        reply.handle.ok_or_else(|| {
+            WeftError::Config(
+                "provision_sidecar: dispatcher returned no handle and no error".into(),
+            )
+        })
+    }
+
     fn report_cost(&self, report: CostReport) {
         let Some(link) = &self.link else {
             tracing::info!(

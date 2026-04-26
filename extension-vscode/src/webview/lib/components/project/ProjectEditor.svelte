@@ -11,6 +11,13 @@
 		return inner?.patchFromProject(newProject) ?? Promise.resolve();
 	}
 
+	/// Flush every pending debounced save. Called by App.svelte
+	/// before posting runProject so the host sees the user's
+	/// freshest edits in the build.
+	export function flushAllPendingSaves(): void {
+		inner?.flushAllPendingSaves();
+	}
+
 	export function applyExternalSource(weftCode: string, layoutCode: string): void {
 		inner?.applyExternalSource(weftCode, layoutCode);
 	}
@@ -48,11 +55,12 @@
 		inner?.updateNodeConfigs(configUpdates);
 	}
 
-	let { project, onSave, onRun, onStop, executionState, triggerState, onToggleTrigger, onResyncTrigger, infraState, onCheckInfraStatus, onStartInfra, onStopInfra, onTerminateInfra, onForceRetry, validationErrors, autoOrganizeOnMount = false, fitViewAfterOrganize = false, onExport, onImport, onShare, viewMode, onSetViewMode, onPublish, hasPublications = false, infraLiveData, structuralLock = false, testMode = false, onOpenTestConfig, playground = false }: {
-		project: ProjectDefinition; 
+	let { project, onSave, onRun, onStop, onCancelBuild, executionState, triggerState, onToggleTrigger, onResyncTrigger, infraState, onCheckInfraStatus, onStartInfra, onStopInfra, onTerminateInfra, onForceRetry, validationErrors, autoOrganizeOnMount = false, fitViewAfterOrganize = false, infraLiveData, structuralLock = false }: {
+		project: ProjectDefinition;
 		onSave: (data: { name?: string; description?: string; weftCode?: string; loomCode?: string }) => void;
 		onRun?: () => void;
 		onStop?: () => void;
+		onCancelBuild?: () => void;
 		executionState?: {
 			isRunning: boolean;
 			activeEdges: Set<string>;
@@ -88,21 +96,12 @@
 		validationErrors?: Map<string, ValidationError[]>;
 		autoOrganizeOnMount?: boolean;
 		fitViewAfterOrganize?: boolean;
-		onExport?: (stripSensitive: boolean) => void;
-		onImport?: () => void;
-		onShare?: () => void;
-		viewMode?: 'builder' | 'runner';
-		onSetViewMode?: (mode: 'builder' | 'runner') => void;
-		onPublish?: () => void;
-		hasPublications?: boolean;
 		infraLiveData?: Record<string, import('$lib/types').LiveDataItem[]>;
 		structuralLock?: boolean;
-		testMode?: boolean;
-		onOpenTestConfig?: () => void;
 		playground?: boolean;
 	} = $props();
 </script>
 
 <SvelteFlowProvider>
-	<ProjectEditorInner bind:this={inner} {project} {onSave} {onRun} {onStop} {executionState} {triggerState} {onToggleTrigger} {onResyncTrigger} {infraState} {onCheckInfraStatus} {onStartInfra} {onStopInfra} {onTerminateInfra} {onForceRetry} {validationErrors} {autoOrganizeOnMount} {fitViewAfterOrganize} {onExport} {...(onImport ? { onImport } : {})} {...(onShare ? { onShare } : {})} {...(onSetViewMode ? { viewMode, onSetViewMode } : {})} {...(onPublish ? { onPublish } : {})} {hasPublications} {infraLiveData} {structuralLock} {testMode} {...(onOpenTestConfig ? { onOpenTestConfig } : {})} {playground} />
+	<ProjectEditorInner bind:this={inner} {project} {onSave} {onRun} {onStop} {onCancelBuild} {executionState} {triggerState} {onToggleTrigger} {onResyncTrigger} {infraState} {onCheckInfraStatus} {onStartInfra} {onStopInfra} {onTerminateInfra} {onForceRetry} {validationErrors} {autoOrganizeOnMount} {fitViewAfterOrganize} {infraLiveData} {structuralLock} />
 </SvelteFlowProvider>

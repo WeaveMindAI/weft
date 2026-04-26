@@ -106,6 +106,7 @@ export class ExecutionFollower implements vscode.Disposable {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
           state: 'running',
+          lane: e.lane,
           input: e.input,
         };
         this.post({ kind: 'execEvent', event: execEvent });
@@ -125,6 +126,7 @@ export class ExecutionFollower implements vscode.Disposable {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
           state: 'completed',
+          lane: e.lane,
           output: e.output,
         };
         this.post({ kind: 'execEvent', event: execEvent });
@@ -144,6 +146,7 @@ export class ExecutionFollower implements vscode.Disposable {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
           state: 'failed',
+          lane: e.lane,
           error: e.error,
         };
         this.post({ kind: 'execEvent', event: execEvent });
@@ -151,7 +154,7 @@ export class ExecutionFollower implements vscode.Disposable {
         break;
       }
       case 'node_skipped': {
-        const execEvent: NodeExecEvent = { nodeId: e.node, state: 'skipped' };
+        const execEvent: NodeExecEvent = { nodeId: e.node, state: 'skipped', lane: e.lane };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
       }

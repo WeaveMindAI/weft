@@ -21,10 +21,9 @@ use anyhow::Result;
 use tokio::process::Command;
 
 use super::Ctx;
+use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::images;
 use weft_catalog::stdlib_catalog;
-
-const CLUSTER_NAME: &str = "weft-local";
 
 pub enum InfraAction {
     Start,
@@ -169,8 +168,15 @@ async fn ensure_sidecar_images(project: &weft_compiler::project::Project) -> Res
         if !status.success() {
             anyhow::bail!("docker build for sidecar '{sidecar_name}' failed");
         }
-        images::kind_load(CLUSTER_NAME, &tag).await?;
-        println!("  {sidecar_name}: loaded into kind");
+        let cfg = cluster_config();
+        if cfg.backend == ClusterBackend::Kind {
+            images::kind_load(&cfg.cluster_name, &tag).await?;
+            println!("  {sidecar_name}: loaded into kind");
+        } else {
+            println!(
+                "  {sidecar_name}: backend=k8s; push '{tag}' to your registry manually",
+            );
+        }
     }
     Ok(())
 }

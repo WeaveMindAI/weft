@@ -149,6 +149,7 @@ t = Text
         lane_mode: Default::default(),
         lane_depth: 1,
         configurable: true,
+        user_typed: false,
     });
     t.config = serde_json::json!({ "value": 42 });
     let d = validate(&project, &catalog());
@@ -173,6 +174,7 @@ t = Text { value: "ok" }
         lane_mode: Default::default(),
         lane_depth: 1,
         configurable: false,
+        user_typed: false,
     });
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"required-port-unmet"), "{d:?}");

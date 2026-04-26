@@ -127,11 +127,9 @@ pub async fn complete_task(
     let project_id = project_id_str
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad project id".into()))?;
-    let summary = state
-        .projects
-        .get(project_id)
-        .await
-        .ok_or((StatusCode::GONE, "project no longer registered".into()))?;
+    if state.projects.get(project_id).await.is_none() {
+        return Err((StatusCode::GONE, "project no longer registered".into()));
+    }
 
     state
         .journal
@@ -187,7 +185,7 @@ pub async fn complete_task(
         let wake = WakeContext { project_id: project_id_str.to_string(), color };
         let worker = state
             .workers
-            .spawn_worker(&summary.binary_path, wake)
+            .spawn_worker(wake)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
         let _ = state

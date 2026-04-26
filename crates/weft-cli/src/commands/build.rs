@@ -1,23 +1,22 @@
-//! `weft build`: compile the current project to a native binary,
-//! then package it as a container image so the dispatcher can run
-//! it as a Pod in kind.
+//! `weft build`: compile the current project into a worker
+//! container image.
 //!
-//! The image is named `weft-worker-<project-id>:latest`, built from
-//! a minimal debian runtime, and loaded into the kind cluster. Same
-//! pipeline will target a registry push in cloud deploy; only the
-//! load step changes.
+//! The image is named `weft-worker-<project-id>:latest`. The
+//! worker binary is produced inside a multi-stage `docker build`
+//! (see `weft_compiler::worker_image`), which means the host
+//! needs ONLY docker + kind + kubectl. No Rust, no Python, no
+//! distro-specific libraries on the host.
 
 use std::env;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::process::Command;
 
 use super::Ctx;
+use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::images;
-use weft_compiler::build::build_project;
+use weft_compiler::build::{build_project, BuildResult};
 use weft_compiler::project::Project;
-
-const CLUSTER_NAME: &str = "weft-local";
 
 pub async fn run(_ctx: Ctx) -> Result<()> {
     let cwd = env::current_dir()?;
@@ -28,10 +27,8 @@ pub async fn run(_ctx: Ctx) -> Result<()> {
     let result = build_project(&project.root, true)
         .map_err(|e| anyhow::anyhow!("build failed: {e}"))?;
 
-    println!("built: {}", result.binary_path.display());
-
     let image_tag = worker_image_tag(&project);
-    ensure_worker_image(&project, &image_tag, &result.binary_path).await?;
+    ensure_worker_image(&project, &image_tag, &result).await?;
     Ok(())
 }
 
@@ -40,65 +37,71 @@ pub fn worker_image_tag(project: &Project) -> String {
 }
 
 /// Build the project's worker image and, if kind is available,
-/// load it into the local cluster. Shared between `weft build` and
-/// the auto-register helper (`ensure_registered`) so every
-/// code path that might spawn a worker ensures the image is
-/// present.
+/// load it into the local cluster. Shared between `weft build`
+/// and `ensure_registered` so every code path that might spawn a
+/// worker ensures the image is present.
 pub async fn ensure_worker_image(
-    project: &Project,
+    _project: &Project,
     tag: &str,
-    binary_path: &std::path::Path,
+    build: &BuildResult,
 ) -> Result<()> {
-    write_worker_dockerfile(project)?;
-    build_worker_image(project, tag, binary_path).await?;
-    if kind_available().await {
-        images::kind_load(CLUSTER_NAME, tag).await?;
-        println!("loaded {tag} into kind cluster '{CLUSTER_NAME}'");
+    let summary = &build.dockerfile_summary;
+    let distro = if summary.base.distro_key.is_empty() {
+        "default-only".to_string()
     } else {
-        println!("(kind cluster not available; image {tag} is in local docker only)");
+        summary.base.distro_key.clone()
+    };
+    println!(
+        "worker image base: {} [{}]",
+        summary.base.raw, distro,
+    );
+    if !summary.build_packages.is_empty() {
+        println!(
+            "  build: {} via {}: {}",
+            summary.build_packages.len(),
+            summary.base.manager.name(),
+            summary.build_packages.join(", "),
+        );
+    }
+    if !summary.runtime_packages.is_empty() {
+        println!(
+            "  runtime: {} via {}: {}",
+            summary.runtime_packages.len(),
+            summary.base.manager.name(),
+            summary.runtime_packages.join(", "),
+        );
+    }
+
+    docker_build(tag, &build.build_context).await?;
+    let cfg = cluster_config();
+    match cfg.backend {
+        ClusterBackend::Kind if kind_available(&cfg.cluster_name).await => {
+            images::kind_load(&cfg.cluster_name, tag).await?;
+            println!("loaded {tag} into kind cluster '{}'", cfg.cluster_name);
+        }
+        ClusterBackend::Kind => {
+            println!(
+                "(kind cluster '{}' not available; image {tag} is in local docker only)",
+                cfg.cluster_name,
+            );
+        }
+        ClusterBackend::K8s => {
+            // External cluster: we do NOT implicitly push to a
+            // registry. That's a distinct operation that needs
+            // credentials; the user wires it up separately.
+            println!("(backend=k8s; push image {tag} to your registry manually)");
+        }
     }
     Ok(())
 }
 
-fn write_worker_dockerfile(project: &Project) -> Result<()> {
-    // The Dockerfile reads the pre-built binary from the build
-    // output directory. Keeping it in the project so re-runs are
-    // reproducible and the user can inspect it if something
-    // breaks.
-    let path = project.root.join(".weft/target/Dockerfile.worker");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = r#"FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY worker /usr/local/bin/worker
-ENTRYPOINT ["/usr/local/bin/worker"]
-"#;
-    std::fs::write(&path, body)?;
-    Ok(())
-}
-
-async fn build_worker_image(
-    project: &Project,
-    tag: &str,
-    binary_path: &std::path::Path,
-) -> Result<()> {
-    let ctx_dir = project.root.join(".weft/target/worker-image");
-    std::fs::create_dir_all(&ctx_dir).context("create worker image build dir")?;
-    let dest = ctx_dir.join("worker");
-    std::fs::copy(binary_path, &dest)
-        .with_context(|| format!("copy binary to {}", dest.display()))?;
-    let dockerfile = project.root.join(".weft/target/Dockerfile.worker");
-    std::fs::copy(&dockerfile, ctx_dir.join("Dockerfile"))
-        .context("stage worker Dockerfile")?;
-
+async fn docker_build(tag: &str, ctx_dir: &std::path::Path) -> Result<()> {
     println!("building image {tag}");
     let status = Command::new("docker")
         .args(["build", "-t", tag, "-f"])
         .arg(ctx_dir.join("Dockerfile"))
-        .arg(&ctx_dir)
+        .arg(ctx_dir)
+        .env("DOCKER_BUILDKIT", "1")
         .status()
         .await?;
     if !status.success() {
@@ -107,14 +110,12 @@ async fn build_worker_image(
     Ok(())
 }
 
-async fn kind_available() -> bool {
-    // Treat missing kind, missing cluster, or docker unavailable as
-    // "not here, skip the load step." The build still succeeds.
+async fn kind_available(cluster_name: &str) -> bool {
     let which = Command::new("which").arg("kind").output().await;
     if !matches!(which, Ok(o) if o.status.success()) {
         return false;
     }
     let out = Command::new("kind").args(["get", "clusters"]).output().await;
     matches!(out, Ok(o) if o.status.success()
-        && String::from_utf8_lossy(&o.stdout).lines().any(|l| l == CLUSTER_NAME))
+        && String::from_utf8_lossy(&o.stdout).lines().any(|l| l == cluster_name))
 }

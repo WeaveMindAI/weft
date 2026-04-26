@@ -231,10 +231,21 @@ pub struct PortDefinition {
     /// the node instead of a wired edge.
     #[serde(default = "default_configurable")]
     pub configurable: bool,
+    /// True when the user explicitly typed this port in the .weft
+    /// source (inline `NodeType(x: T) -> (y: U)` syntax). False
+    /// when the type came from the catalog metadata. Used by
+    /// validate to suppress the implicit-expand / implicit-gather
+    /// warnings on edges where BOTH ends are user-typed: the user
+    /// wrote the depth difference deliberately, no surprise to
+    /// warn about. Catalog-typed ports keep the warning so a user
+    /// wiring two pre-typed ports sees the inferred lane mechanic.
+    #[serde(default, rename = "userTyped", skip_serializing_if = "is_false")]
+    pub user_typed: bool,
 }
 
 fn default_lane_depth() -> u32 { 1 }
 fn default_configurable() -> bool { true }
+fn is_false(b: &bool) -> bool { !*b }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {

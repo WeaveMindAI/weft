@@ -3,17 +3,12 @@
 	import { untrack, tick } from "svelte";
 	import "@xyflow/svelte/dist/style.css";
 	import { browser } from "$app/environment";
-	import * as te from "$lib/telemetry-events";
 	import ProjectNode from "./ProjectNode.svelte";
 	import GroupNode from "./GroupNode.svelte";
 	import AnnotationNode from "./AnnotationNode.svelte";
 	import CommandPalette from "./CommandPalette.svelte";
 	import CustomEdge from "./CustomEdge.svelte";
-	import ConfigPanel from "./ConfigPanel.svelte";
-	import RightSidebar from "./RightSidebar.svelte";
-	import HistoryPanel from "./HistoryPanel.svelte";
 	import ActionBar from "./ActionBar.svelte";
-	import ExportDialog from "./ExportDialog.svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "$lib/nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures } from "$lib/types";
 	import { getApiUrl } from "$lib/config";
@@ -25,7 +20,6 @@
 	import { extractTriggerSubgraph } from "$lib/utils/trigger-subgraph";
 	import { toast } from "svelte-sonner";
 
-	import ExecutionsPanel from "./ExecutionsPanel.svelte";
 
 	// Undo/Redo history
 	// History stores snapshots. historyIndex points to current state.
@@ -39,11 +33,12 @@
 	let lastPushTime = 0;
 	const DEBOUNCE_MS = 100; // Prevent multiple pushes within 100ms
 
-	let { project, onSave, onRun, onStop, executionState, triggerState, onToggleTrigger, onResyncTrigger, infraState, onCheckInfraStatus, onStartInfra, onStopInfra, onTerminateInfra, onForceRetry, validationErrors, autoOrganizeOnMount = false, fitViewAfterOrganize = false, onExport, onImport, onShare, viewMode = 'builder', onSetViewMode, onPublish, hasPublications = false, infraLiveData, structuralLock = false, testMode = false, onOpenTestConfig, playground = false }: {
-		project: ProjectDefinition; 
+	let { project, onSave, onRun, onStop, onCancelBuild, executionState, triggerState, onToggleTrigger, onResyncTrigger, infraState, onCheckInfraStatus, onStartInfra, onStopInfra, onTerminateInfra, onForceRetry, validationErrors, autoOrganizeOnMount = false, fitViewAfterOrganize = false, infraLiveData, structuralLock = false }: {
+		project: ProjectDefinition;
 		onSave: (data: { name?: string; description?: string; weftCode?: string; loomCode?: string; layoutCode?: string }) => void;
 		onRun?: () => void;
 		onStop?: () => void;
+		onCancelBuild?: () => void;
 		executionState?: {
 			isRunning: boolean;
 			activeEdges: Set<string>;
@@ -79,39 +74,14 @@
 		validationErrors?: Map<string, import('$lib/types').ValidationError[]>;
 		autoOrganizeOnMount?: boolean;
 		fitViewAfterOrganize?: boolean;
-		onExport?: (stripSensitive: boolean) => void;
-		onImport?: () => void;
-		onShare?: () => void;
-		viewMode?: 'builder' | 'runner';
-		onSetViewMode?: (mode: 'builder' | 'runner') => void;
-		onPublish?: () => void;
-		hasPublications?: boolean;
 		infraLiveData?: Record<string, import('$lib/types').LiveDataItem[]>;
 		structuralLock?: boolean;
-		testMode?: boolean;
-		onOpenTestConfig?: () => void;
-		playground?: boolean;
 	} = $props();
 
-	let showExportDialog = $state(false);
-	let rightPanelTab = $state<'config' | 'executions' | 'history'>('config');
-	let rightPanelCollapsed = $state(
-		untrack(() => playground) || (typeof localStorage !== 'undefined' && localStorage.getItem('wm_right_panel_collapsed') === 'true')
-	);
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	let configPanelRef: any = $state();
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	let historyPanelRef: any = $state();
-	// VS Code embedding: the code panel is redundant (the .weft file
-	// is already open as a text tab) and the mobile notice doesn't
-	// apply inside a webview. Force both to their no-render defaults
-	// on mount; the toolbar that toggles them is also removed below.
-	let showCodePanel = $state(false);
-	let mobileForceEditor = $state(true);
-	let mobileToolbarOpen = $state(false);
-	let codePanelMaximized = $state(false);
-	let codePanelWidth = $state(480);
-	let isResizingCodePanel = $state(false);
+	// VS Code embedding: dashboard chrome (right sidebar, code
+	// panel, mobile notice, export dialog) is removed. The text
+	// editor is the .weft tab in column 2; the activity-bar
+	// Inspector handles node inspection.
 	// Local editor state, intentionally captures initial value, not reactive to prop.
 	// The editor owns these after init; saves flow outward via onSave.
 	let weftCode = $state(untrack(() => project.weftCode) ?? '');
@@ -245,20 +215,37 @@
 
 	function parseWeftCode(rawCode: string): ReturnType<typeof parseWeft> {
 		const result = parseWeft('````weft\n' + rawCode + '\n````');
-		// Apply positions from layoutCode to parsed nodes
+		// Apply positions from layoutCode to parsed nodes. The
+		// parser cache holds shared `n.position` / `n.config`
+		// references; if we mutated them in place, two callers
+		// reading the cache with different `layoutCode` values
+		// would cross-contaminate. Clone the project + per-node
+		// position/config so each caller sees its own layout.
 		if (result.projects.length > 0) {
 			const layoutMap = parseLayoutCode(layoutCode);
-			for (const w of result.projects) {
-				for (const n of w.project.nodes) {
-					const entry = layoutMap[n.id];
-					if (entry) {
-						n.position = { x: entry.x, y: entry.y };
-						if (entry.w !== undefined) (n.config as Record<string, unknown>).width = entry.w;
-						if (entry.h !== undefined) (n.config as Record<string, unknown>).height = entry.h;
-						if (entry.expanded !== undefined) (n.config as Record<string, unknown>).expanded = entry.expanded;
-					}
-				}
-			}
+			result.projects = result.projects.map(w => ({
+				...w,
+				project: {
+					...w.project,
+					nodes: w.project.nodes.map(n => {
+						const entry = layoutMap[n.id];
+						if (!entry) {
+							// Even unmatched nodes get fresh position
+							// + config so callers can mutate freely.
+							return { ...n, position: { ...n.position }, config: { ...(n.config as Record<string, unknown>) } };
+						}
+						const config = { ...(n.config as Record<string, unknown>) };
+						if (entry.w !== undefined) config.width = entry.w;
+						if (entry.h !== undefined) config.height = entry.h;
+						if (entry.expanded !== undefined) config.expanded = entry.expanded;
+						return {
+							...n,
+							position: { x: entry.x, y: entry.y },
+							config,
+						};
+					}),
+				},
+			}));
 		}
 		return result;
 	}
@@ -278,8 +265,6 @@
 	let weftSyncTimer: ReturnType<typeof setTimeout> | null = null;
 	let codeEditInFlight = false;
 	const WEFT_SYNC_DEBOUNCE_MS = 500;
-	const CODE_PANEL_MIN_WIDTH = 280;
-	const CODE_PANEL_MAX_WIDTH = 1200;
 	let editingName = $state(false);
 	let editingNameValue = $state('');
 	let saveProjectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -290,24 +275,6 @@
 		if (el instanceof HTMLInputElement) {
 			el.select();
 		}
-	}
-
-	function buildLiveProject(): ProjectDefinition {
-		return {
-			...project,
-			nodes: nodes.map(n => ({
-				id: n.id,
-				nodeType: n.data.nodeType as string,
-				label: (n.data.label as string | null) || null,
-				config: (n.data.config as Record<string, unknown>) || {},
-				position: n.position,
-				parentId: (n.data.config as Record<string, unknown>)?.parentId as string | undefined,
-				inputs: (n.data.inputs as import('$lib/types').PortDefinition[]) || [],
-				outputs: (n.data.outputs as import('$lib/types').PortDefinition[]) || [],
-				features: { ...(NODE_TYPE_CONFIG[n.data.nodeType as string]?.features || {}), ...((n.data.features as import('$lib/types').NodeFeatures) || {}) },
-			})),
-			edges: edges.map(e => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle?.endsWith('__inner') ? e.sourceHandle.slice(0, -7) : (e.sourceHandle ?? null), targetHandle: e.targetHandle?.endsWith('__inner') ? e.targetHandle.slice(0, -7) : (e.targetHandle ?? null) })),
-		};
 	}
 
 	let weftInitialized = false;
@@ -361,31 +328,6 @@
 	}
 
 	// Sort/reorder removed, code ordering is user-controlled now
-
-	function startCodePanelResize(e: MouseEvent) {
-		e.preventDefault();
-		isResizingCodePanel = true;
-		document.body.style.userSelect = 'none';
-		document.body.style.cursor = 'col-resize';
-		const startX = e.clientX;
-		const startWidth = codePanelWidth;
-
-		function onMouseMove(ev: MouseEvent) {
-			const delta = ev.clientX - startX;
-			codePanelWidth = Math.min(CODE_PANEL_MAX_WIDTH, Math.max(CODE_PANEL_MIN_WIDTH, startWidth + delta));
-		}
-
-		function onMouseUp() {
-			isResizingCodePanel = false;
-			document.body.style.userSelect = '';
-			document.body.style.cursor = '';
-			document.removeEventListener('mousemove', onMouseMove);
-			document.removeEventListener('mouseup', onMouseUp);
-		}
-
-		document.addEventListener('mousemove', onMouseMove);
-		document.addEventListener('mouseup', onMouseUp);
-	}
 
 	const nodeTypes = { 
 		project: ProjectNode,
@@ -496,21 +438,6 @@
 	}
 
 	let configEditTimer: ReturnType<typeof setTimeout> | null = null;
-
-	function handleConfigPanelUpdate(nodeId: string, config: Record<string, unknown>) {
-		if (structuralLock) {
-			// Allow layout-only changes (collapse/expand, resize) through the lock
-			const layoutKeys = new Set(['expanded', 'width', 'height']);
-			const isLayoutOnly = Object.keys(config).every(k => layoutKeys.has(k));
-			if (!isLayoutOnly) return;
-		}
-		createNodeUpdateHandler(nodeId)({ config });
-	}
-
-	function handleConfigPanelPortUpdate(nodeId: string, inputs: PortDefinition[], outputs: PortDefinition[]) {
-		if (structuralLock) return;
-		createNodeUpdateHandler(nodeId)({ inputs, outputs });
-	}
 
 	/** Parse width/height from an xyflow node's style string + measured fallback */
 	function getNodeRect(n: Node): { width: number; height: number } {
@@ -1306,7 +1233,6 @@
 
 	function undo() {
 		if (historyIndex <= 0) return;
-		te.editor.undo();
 		isUndoRedo = true;
 		historyIndex--;
 		restoreFromHistory(history[historyIndex]);
@@ -1316,7 +1242,6 @@
 
 	function redo() {
 		if (historyIndex >= history.length - 1) return;
-		te.editor.redo();
 		isUndoRedo = true;
 		historyIndex++;
 		restoreFromHistory(history[historyIndex]);
@@ -1495,12 +1420,45 @@
 	/** VS Code embedding: the host owns the authoritative .weft text.
 	 *  Whenever it sends us a parseResult we may need to overwrite
 	 *  our local weftCode + layoutCode copy (e.g. the user edited
-	 *  the file directly in the text editor). Round-trips triggered
-	 *  by our own saveWeft send back the same source, so the guard
-	 *  below no-ops in the common case. */
+	 *  the file directly in the text editor).
+	 *
+	 *  Race window: in-graph config edits update `weftCode`
+	 *  locally, then debounce `saveProject` for ~1s. During that
+	 *  window, anything that triggers a host-side `triggerParse`
+	 *  (a focus-change, an iframe rebuild's `ready` re-emit, a
+	 *  background tick) reads the OLD source from disk and posts
+	 *  it back as a parseResult. If we naively accept that, the
+	 *  in-memory edit reverts to the disk version. We avoid that
+	 *  by treating any unsaved edit (saveProjectTimer pending OR
+	 *  fieldEditor with an active key) as authoritative and
+	 *  dropping the host echo until the saveWeft round-trip
+	 *  completes. */
 	export function applyExternalSource(newWeftCode: string, newLayoutCode: string): void {
 		if (newLayoutCode !== layoutCode) layoutCode = newLayoutCode;
-		if (newWeftCode === weftCode) return;
+		// Local copy is ahead of the host's view of the .weft. A
+		// pending saveProjectTimer is the canonical signal: a
+		// debounced saveWeft is in flight, the local weftCode
+		// reflects the user's most recent edits, and the host
+		// echo is necessarily stale. Drop the echo; the next
+		// round-trip after saveProjectTimer fires will reconcile.
+		if (saveProjectTimer !== null && newWeftCode !== weftCode) {
+			return;
+		}
+		// Fast path: if the source matches what we already have,
+		// the user-visible structure didn't change — but the
+		// COMPILER may have re-inferred port metadata that isn't
+		// captured in the source text (laneMode for implicit
+		// Gather/Expand, inferred concrete portTypes from edges).
+		// We need to refresh those without re-running ELK or
+		// rebuilding the node list. mergeInferredPortMetadata
+		// patches the existing nodes in place.
+		if (newWeftCode === weftCode) {
+			const cached = parseWeftCode(weftCode);
+			if (cached.projects.length > 0) {
+				mergeInferredPortMetadata(cached.projects[0].project);
+			}
+			return;
+		}
 		weftCode = newWeftCode;
 		const result = parseWeftCode(weftCode);
 		if (result.projects.length > 0) {
@@ -1512,6 +1470,43 @@
 		} else {
 			weftParseErrors = result.errors;
 		}
+	}
+
+	/// Update each existing graph node's `data.inputs` / `data.outputs`
+	/// to match the freshly-parsed project's port metadata. Used when
+	/// the source text didn't change but the compiler may have
+	/// re-inferred laneMode (implicit Gather/Expand) or concrete
+	/// portTypes. Only touches port arrays — positions, configs,
+	/// edge IDs are untouched, so xyflow doesn't relayout.
+	function mergeInferredPortMetadata(parsed: ProjectDefinition): void {
+		const byId = new Map(parsed.nodes.map(n => [n.id, n]));
+		let changed = false;
+		const next = nodes.map(n => {
+			const fresh = byId.get(n.id);
+			if (!fresh) return n;
+			const oldInputs = (n.data.inputs as PortDefinition[] | undefined) ?? [];
+			const oldOutputs = (n.data.outputs as PortDefinition[] | undefined) ?? [];
+			if (portsEqual(oldInputs, fresh.inputs) && portsEqual(oldOutputs, fresh.outputs)) {
+				return n;
+			}
+			changed = true;
+			return { ...n, data: { ...n.data, inputs: fresh.inputs, outputs: fresh.outputs } };
+		});
+		if (changed) {
+			nodes = next;
+		}
+	}
+
+	function portsEqual(a: PortDefinition[], b: PortDefinition[]): boolean {
+		if (a.length !== b.length) return false;
+		for (let i = 0; i < a.length; i++) {
+			const pa = a[i]; const pb = b[i];
+			if (pa.name !== pb.name) return false;
+			if (pa.portType !== pb.portType) return false;
+			if (pa.laneMode !== pb.laneMode) return false;
+			if (!!pa.required !== !!pb.required) return false;
+		}
+		return true;
 	}
 
 	export async function patchFromProject(newProject: ProjectDefinition, andFitView = false): Promise<void> {
@@ -1699,8 +1694,6 @@
 	}
 
 	export function getWeftCode(): string {
-		// Flush any in-flight config field edits so weftCode is up to date
-		configPanelRef?.flushPendingEdits();
 		return weftCode;
 	}
 
@@ -1812,7 +1805,6 @@
 				saveProject();
 				break;
 			case 'run':
-				te.execution.started(project.id, nodes.length, !!infraState, !!triggerState);
 				onRun?.();
 				break;
 			case 'add_group':
@@ -2037,10 +2029,7 @@
 		// Clear pending connection since we're making a real connection
 		pendingConnection = null;
 		if (structuralLock) return null;
-		const srcType = nodes.find(n => n.id === connection.source)?.data?.nodeType as string || 'unknown';
-		const tgtType = nodes.find(n => n.id === connection.target)?.data?.nodeType as string || 'unknown';
-		te.editor.connectionCreated(srcType, tgtType);
-		
+
 		if (wouldCreateCycle(connection.source!, connection.target!)) {
 			alert("Cannot create this connection - it would create a cycle (infinite loop)");
 			return null;
@@ -2110,7 +2099,6 @@
 
 	function addNode(type: NodeType) {
 		if (structuralLock) return;
-		te.editor.nodePlaced(type, contextMenuFlowPos ? 'context_menu' : 'palette');
 		const id = generateNodeId(type);
 		const typeConfig = NODE_TYPE_CONFIG[type];
 		const isGroup = type === 'Group';
@@ -2161,8 +2149,6 @@
 	function deleteNodes(nodeIds: string[]) {
 		if (nodeIds.length === 0) return;
 		if (structuralLock) return;
-		const firstType = nodes.find(n => n.id === nodeIds[0])?.data?.nodeType as string || 'unknown';
-		te.editor.nodeDeleted(firstType, nodeIds.length);
 
 		// Capture group labels before visual deletion removes them from the nodes array
 		const groupLabels = new Map<string, string>();
@@ -2720,7 +2706,6 @@
 		if (!nodeToDuplicate) return;
 
 		const nodeType = nodeToDuplicate.data.nodeType as string;
-		te.editor.nodeDuplicated(nodeType);
 		const newId = generateNodeId(nodeType);
 		const isGroup = nodeToDuplicate.type === 'group' || nodeToDuplicate.type === 'groupCollapsed';
 		const newPos = { x: nodeToDuplicate.position.x + 50, y: nodeToDuplicate.position.y + 50 };
@@ -2777,35 +2762,32 @@
 		}
 	}
 
-	// Flush config edits when switching away from config tab
-	$effect(() => {
-		const _ = rightPanelTab;
-		return () => { configPanelRef?.flushPendingEdits(); };
-	});
-
-	// Persist right panel collapsed state
-	$effect(() => {
-		localStorage.setItem('wm_right_panel_collapsed', String(rightPanelCollapsed));
-	});
-
-	// Auto-save version every 10 minutes
-	let autoSaveInterval: ReturnType<typeof setInterval> | null = null;
-	let lastAutoSavedCode = '';
-
-	function autoSaveVersion() {
-		if (!weftCode || weftCode === lastAutoSavedCode) return;
-		lastAutoSavedCode = weftCode;
-		historyPanelRef?.createVersion(weftCode, project.loomCode ?? null, null, 'auto');
+	/// Flush every pending debounced save. Called before the host
+	/// kicks off Run / Activate / InfraStart so the build always
+	/// sees the user's latest edits, even if the 1s saveProjectTimer
+	/// debounce hasn't elapsed yet.
+	export function flushAllPendingSaves(): void {
+		// Code panel (raw .weft text edits): commit pending sync.
+		flushPendingEdits();
+		// Config-edit history timer: just save state, no saveWeft.
+		if (configEditTimer) {
+			clearTimeout(configEditTimer);
+			configEditTimer = null;
+			saveToHistory();
+		}
+		// Debounced saveProject from createNodeUpdateHandler. This
+		// is the one that actually calls onSave({ weftCode }) which
+		// posts saveWeft to the host. Fire it now.
+		if (saveProjectTimer) {
+			clearTimeout(saveProjectTimer);
+			saveProjectTimer = null;
+			saveProject();
+		}
 	}
 
-	// Flush pending edits when the component is destroyed (e.g. view mode switch)
+	// Flush pending edits when the component is destroyed
 	$effect(() => {
-		autoSaveInterval = setInterval(autoSaveVersion, 10 * 60 * 1000);
-		return () => {
-			flushPendingEdits();
-			autoSaveVersion();
-			if (autoSaveInterval) clearInterval(autoSaveInterval);
-		};
+		return () => { flushPendingEdits(); };
 	});
 
 	function flashSaveStatus() {
@@ -2816,24 +2798,15 @@
 
 	</script>
 
-<svelte:window onkeydown={handleKeyDown} onbeforeunload={() => { flushPendingEdits(); autoSaveVersion(); }} onvisibilitychange={() => { if (document.hidden) { flushPendingEdits(); autoSaveVersion(); } }} />
+<svelte:window onkeydown={handleKeyDown} onbeforeunload={() => { flushPendingEdits(); }} onvisibilitychange={() => { if (document.hidden) { flushPendingEdits(); } }} />
 
 <!-- Command Palette -->
 <CommandPalette
 	bind:open={commandPaletteOpen}
 	onAddNode={addNode}
 	onAction={handlePaletteAction}
-	{playground}
 />
 
-<!-- Export Dialog -->
-{#if onExport}
-	<ExportDialog
-		bind:open={showExportDialog}
-		{project}
-		onExport={onExport}
-	/>
-{/if}
 
 <!-- VS Code embedding: mobile notice + IDE header toolbar removed.
      The extension host owns title, save status, run/stop controls;
@@ -2941,6 +2914,7 @@
 			{onResyncTrigger}
 			{onRun}
 			{onStop}
+			{onCancelBuild}
 			onToggleInfraSubgraph={() => { showInfraSubgraph = !showInfraSubgraph; if (showInfraSubgraph) showTriggerSubgraph = false; }}
 			{showInfraSubgraph}
 			onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
@@ -3010,61 +2984,9 @@
 		</div>
 	{/if}
 
-	<!-- Right Sidebar -->
-	{#snippet configIcon()}
-		<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-			<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
-			<circle cx="12" cy="12" r="3"/>
-		</svg>
-	{/snippet}
-	{#snippet executionsIcon()}
-		<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-			<polygon points="5 3 19 12 5 21 5 3"/>
-		</svg>
-	{/snippet}
-	{#snippet historyIcon()}
-		<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-			<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
-		</svg>
-	{/snippet}
-	{#if !playground}
-	<RightSidebar
-		tabs={[
-			{ id: 'config', label: 'Config', icon: configIcon },
-			{ id: 'executions', label: 'Runs', icon: executionsIcon },
-			{ id: 'history', label: 'History', icon: historyIcon },
-		]}
-		bind:activeTab={rightPanelTab}
-		bind:collapsed={rightPanelCollapsed}
-		projectId={project.id}
-	>
-		{#if rightPanelTab === 'config'}
-			<ConfigPanel
-				bind:this={configPanelRef}
-				project={buildLiveProject()}
-				onUpdateNode={handleConfigPanelUpdate}
-				onUpdateNodePorts={handleConfigPanelPortUpdate}
-			/>
-		{:else if rightPanelTab === 'executions'}
-			<ExecutionsPanel
-				projectId={project.id}
-				projectNodes={project.nodes?.map(n => ({ id: n.id, label: n.label ?? undefined, nodeType: String(n.nodeType) }))}
-			/>
-		{:else if rightPanelTab === 'history'}
-			<HistoryPanel
-				bind:this={historyPanelRef}
-				projectId={project.id}
-				getCurrentCode={() => ({ weftCode, loomCode: project.loomCode ?? null, layoutCode })}
-				onRestore={(restoredWeft, restoredLoom, restoredLayout) => {
-					weftCode = restoredWeft;
-					if (restoredLoom != null) project.loomCode = restoredLoom;
-					if (restoredLayout != null) layoutCode = restoredLayout;
-					handleWeftCodeChange(restoredWeft);
-				}}
-			/>
-		{/if}
-	</RightSidebar>
-	{/if}
+	<!-- VS Code embedding: right-sidebar (Config/Runs/History panels)
+	     deleted. The activity-bar Inspector covers node inspection;
+	     editing config happens inline on the node body. -->
 </div>
 </div>
 

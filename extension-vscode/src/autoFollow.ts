@@ -89,6 +89,18 @@ export class AutoFollowController {
     this.pendingCount = 0;
     this.pendingQueue = [];
     if (color) {
+      // Race window: the dispatcher's /run response arrives on the
+      // CLI's HTTP path AND the same ExecutionStarted is broadcast
+      // on the project SSE. Whichever arrives first triggers a
+      // replay. If the SSE-driven `onEvent` already started a
+      // replay for this exact color, don't kick a second one
+      // here (and vice-versa via onEvent's same guard). Two
+      // concurrent replays would double-deliver journaled events
+      // to the webview as the journal fills mid-execution.
+      if (this.color === color) {
+        this.emitStatus();
+        return;
+      }
       this.color = color;
       // `replay` handles the "already completed" and "mid-run"
       // cases uniformly: pulls journaled events, then continues
@@ -148,11 +160,18 @@ export class AutoFollowController {
   private onEvent(ev: DispatcherEvent): void {
     if (ev.kind !== 'execution_started') return;
     if (this.mode === 'latest') {
-      // Auto-jump. This also catches the Activate / Infra Start
-      // case where pinAndFollow(undefined) was just called.
-      // Use replay so we pick up any events that slipped in
-      // between dispatcher-side ExecutionStarted and our SSE
-      // subscribe (node_started often lands <5ms later).
+      // If we're already following this color (the run command
+      // called `pinAndFollow(color)` synchronously and the
+      // project SSE is now echoing the same ExecutionStarted),
+      // don't re-replay: the live stream is already delivering
+      // events and a second replay would re-apply whatever's
+      // landed in the journal so far, double-rendering pulses.
+      if (this.color === ev.color) {
+        return;
+      }
+      // Auto-jump for a NEW color (Activate / Infra Start path
+      // where `pinAndFollow(undefined)` was just called, or a
+      // trigger fire opening a fresh execution).
       this.color = ev.color;
       void this.follower.replay(ev.color);
       this.emitStatus();

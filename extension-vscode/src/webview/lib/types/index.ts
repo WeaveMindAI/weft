@@ -454,6 +454,10 @@ export interface NodeExecution {
 	logs: unknown[];
 	color: string;
 	lane: Array<{ count: number; index: number }>;
+	/// Stringified lane stack used to correlate completion
+	/// events to the right running row when several lanes run
+	/// in parallel. Empty for non-parallel runs.
+	laneKey?: string;
 }
 
 /** Node executions keyed by node ID. */

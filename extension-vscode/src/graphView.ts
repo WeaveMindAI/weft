@@ -41,6 +41,11 @@ export class GraphViewController {
   /// start). Extension.ts uses these to tell AutoFollow "next
   /// ExecutionStarted on this project, jump to it."
   private lifecycleStartHandler: ((verb: 'activate' | 'infraStart') => void) | undefined;
+  private openSourceHandler: (() => void) | undefined;
+  private cancelBuildHandler: (() => void) | undefined;
+  private ensureBuildHandler:
+    | ((verb: 'run' | 'activate' | 'infraStart') => Promise<void>)
+    | undefined;
   // Set while we're applying our own TextEdit to the document.
   // onDidChangeTextDocument fires during the edit; if we parsed
   // twice (once for the webview save, once for the VS Code change)
@@ -83,10 +88,36 @@ export class GraphViewController {
   setLifecycleStartHandler(fn: (verb: 'activate' | 'infraStart') => void): void {
     this.lifecycleStartHandler = fn;
   }
+  setOpenSourceHandler(fn: () => void): void { this.openSourceHandler = fn; }
+  /// Hook fired when the user clicks Stop during the Building
+  /// phase. Lets extension.ts kill the in-flight `weft build`
+  /// child process so the UI returns to its idle state.
+  setCancelBuildHandler(fn: () => void): void { this.cancelBuildHandler = fn; }
+  /// Hook fired whenever a graph-bar verb that may spawn worker
+  /// pods is about to fire (Run, Activate, InfraStart). Lets
+  /// extension.ts rebuild the worker image first so the spawned
+  /// pod runs the current source instead of the stale image
+  /// baked from the previous build. The verb lets the webview
+  /// show "Building..." in place of the verb's normal pending
+  /// state.
+  setEnsureBuildHandler(
+    fn: (verb: 'run' | 'activate' | 'infraStart') => Promise<void>,
+  ): void {
+    this.ensureBuildHandler = fn;
+  }
 
   /** Public so execFollower can push events into the panel. */
   post(msg: HostMessage): void {
     this.panel?.webview.postMessage(msg);
+  }
+
+  /** True iff the graph webview panel currently exists. The
+   *  cold-open handler in extension.ts uses this to distinguish
+   *  "user just opened a .weft and we should swap it to graph"
+   *  from "user is refocusing an already-pinned project's text
+   *  tab and we should leave it alone". */
+  isOpen(): boolean {
+    return this.panel !== undefined;
   }
 
   /** Infer which edges are currently pulsing from the latest node
@@ -123,8 +154,13 @@ export class GraphViewController {
     // this panel (live poll, infra status, trigger status).
     const resolved = projectId ?? readProjectIdFromToml(doc.uri.fsPath);
     if (resolved) this.watchedProjectId = resolved;
+    // Graph takes ViewColumn.Active so the .weft text doesn't
+    // show by default. The "Source" button opens the text in
+    // ViewColumn.Beside (column 2). We don't try to swap them
+    // because moving a webview between columns destroys the
+    // iframe (microsoft/vscode#141001).
     if (this.panel) {
-      this.panel.reveal(vscode.ViewColumn.Beside);
+      this.panel.reveal(vscode.ViewColumn.Active);
       this.watchedDoc = doc;
       await this.triggerParse();
       return;
@@ -133,7 +169,7 @@ export class GraphViewController {
     this.panel = vscode.window.createWebviewPanel(
       'weft.graph',
       `Weft Graph: ${doc.fileName.split(/[\\/]/).pop() ?? ''}`,
-      vscode.ViewColumn.Beside,
+      vscode.ViewColumn.Active,
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -146,8 +182,12 @@ export class GraphViewController {
     this.panel.webview.html = this.renderHtml();
     this.watchedDoc = doc;
 
-    void this.sendSettings();
-    void this.sendGlobalCatalog();
+    // Initial state (settings, catalog, parse result) is pushed
+    // from the 'ready' message handler. The webview emits 'ready'
+    // on every iframe boot, including after a column move (which
+    // destroys and rebuilds the iframe; see microsoft/vscode
+    // #172391 + #106693). Pushing from here would race the
+    // webview's onMessage subscription and lose messages.
 
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
@@ -162,15 +202,39 @@ export class GraphViewController {
         if (ed && ed.document.languageId === 'weft') {
           this.watchedDoc = ed.document;
           // Re-resolve project id for the new file: different
-          // .weft files can belong to different projects, and the
-          // old watchedProjectId must not leak into the polls we
-          // kick off from triggerParse below.
+          // .weft files can belong to different projects, and
+          // the old watchedProjectId must not leak into the
+          // polls we kick off from triggerParse below. If the
+          // new file has no weft.toml, clear the id so the
+          // dispatcher resolves it on /parse instead of using
+          // the stale previous-project id.
           const newId = readProjectIdFromToml(ed.document.uri.fsPath);
-          if (newId) this.watchedProjectId = newId;
+          this.watchedProjectId = newId ?? undefined;
           void this.triggerParse();
         }
       }),
+      // Push source-open state to the webview so the "Source"
+      // button can render as active when the .weft is visible in
+      // some tab. Fires on every tab change anywhere; the
+      // computeSourceOpen helper short-circuits when the watched
+      // doc hasn't moved.
+      vscode.window.tabGroups.onDidChangeTabs(() => this.pushSourceState()),
     );
+    // Initial state push.
+    this.pushSourceState();
+  }
+
+  private pushSourceState(): void {
+    if (!this.panel || !this.watchedDoc) return;
+    const target = this.watchedDoc.uri.fsPath;
+    const open = vscode.window.tabGroups.all.some((g) =>
+      g.tabs.some(
+        (t) =>
+          t.input instanceof vscode.TabInputText
+          && t.input.uri.fsPath === target,
+      ),
+    );
+    this.post({ kind: 'sourceState', open });
   }
 
   private scheduleParse(): void {
@@ -385,6 +449,15 @@ export class GraphViewController {
     const projectId = this.lastProject?.id ?? this.watchedProjectId;
     if (!projectId) return;
     if (verb === 'activate') {
+      // Trigger-setup spawns a worker pod that runs the project's
+      // binary; rebuild the image first so the run reflects the
+      // user's latest source. Skipped for deactivate (no spawn).
+      try {
+        await this.ensureBuildHandler?.('activate');
+      } catch (err) {
+        this.reportActionFailure('activate', err);
+        return;
+      }
       // Prime auto-follow before firing the request: the trigger
       // setup sub-exec's ExecutionStarted can arrive over SSE
       // before the HTTP response returns.
@@ -407,6 +480,16 @@ export class GraphViewController {
     const projectId = this.lastProject?.id ?? this.watchedProjectId;
     if (!projectId) return;
     if (verb === 'start') {
+      // Infra start now spawns an InfraSetup-phase worker pod
+      // (v2 model). The pod runs the project's binary, so the
+      // image needs to reflect the user's latest source. Stop /
+      // terminate don't spawn workers.
+      try {
+        await this.ensureBuildHandler?.('infraStart');
+      } catch (err) {
+        this.reportActionFailure('infraStart', err);
+        return;
+      }
       // Prime auto-follow: first-time provision spawns no child
       // exec, but scale_up eventually does if the user then hits
       // activate. We still prime on start so the next exec after
@@ -445,7 +528,16 @@ export class GraphViewController {
   private onMessage(msg: WebviewMessage): void {
     switch (msg.kind) {
       case 'ready':
+        // Webview just booted (initial open OR iframe rebuild
+        // after a column move). Re-send the full initial state:
+        // settings, catalog, source parse, source-open flag.
+        // Don't assume the webview retained anything; column
+        // moves destroy the iframe even with
+        // retainContextWhenHidden.
+        void this.sendSettings();
+        void this.sendGlobalCatalog();
         void this.triggerParse();
+        this.pushSourceState();
         break;
       case 'saveWeft':
         void this.saveWeft(msg.source);
@@ -483,6 +575,12 @@ export class GraphViewController {
       case 'followCatchUp':
         this.followCatchUpHandler?.();
         break;
+      case 'openSource':
+        this.openSourceHandler?.();
+        break;
+      case 'cancelBuild':
+        this.cancelBuildHandler?.();
+        break;
       case 'nodeSelected':
         if (msg.nodeId === null) {
           this.selectionHandler?.(undefined);
@@ -503,25 +601,66 @@ export class GraphViewController {
     }
   }
 
-  /** Replace the watched document's text with the webview's copy.
-   *  Simple full-range replace: VS Code diff-compresses this into a
-   *  proper TextEdit, preserves the user's cursor unless it was
-   *  inside a changed region. Suppress re-entry so we don't reparse
-   *  on our own edit. */
+  /// Promise that resolves when the most-recent saveWeft has
+  /// finished writing to disk. extension.ts's runPinned awaits
+  /// this before reading the .weft so the build always sees the
+  /// freshest source, even if the user clicked Run before the
+  /// debounced graph-edit save round-trip finished.
+  private pendingSaveWeft: Promise<void> | undefined;
+
+  /// Public: extension.ts's runPinned calls this before reading
+  /// the .weft from disk. Resolves immediately if no save is in
+  /// flight.
+  async waitForPendingSave(): Promise<void> {
+    if (this.pendingSaveWeft) {
+      await this.pendingSaveWeft;
+    }
+  }
+
+  /** Replace the watched document's text with the webview's copy
+   *  AND persist it to disk. The webview already debounces
+   *  saveWeft (~1s after the user stops editing), so this is
+   *  effectively "auto-save the .weft 1s after every graph edit
+   *  pause." Without persisting to disk, the .weft tab stays
+   *  dirty and `weft build` reads the stale on-disk version
+   *  when the user clicks Run.
+   *
+   *  Suppress re-entry so we don't reparse on our own edit.
+   *  Tracks the in-flight write via `pendingSaveWeft` so
+   *  runPinned can await it before reading the file from disk. */
   private async saveWeft(source: string): Promise<void> {
-    if (!this.watchedDoc) return;
-    if (this.watchedDoc.getText() === source) return;
+    // Capture watchedDoc at entry. If the user switches the
+    // active editor between now and when applyEdit/save runs,
+    // we must NOT redirect this write to the new doc — the
+    // source we were handed belongs to whatever was watched
+    // when the saveWeft message was queued.
+    const doc = this.watchedDoc;
+    if (!doc) return;
+    if (doc.getText() === source) return;
     const edit = new vscode.WorkspaceEdit();
-    const last = this.watchedDoc.lineCount - 1;
-    const end = this.watchedDoc.lineAt(last).range.end;
-    edit.replace(this.watchedDoc.uri, new vscode.Range(0, 0, end.line, end.character), source);
-    this.suppressReparse = true;
+    const last = doc.lineCount - 1;
+    const end = doc.lineAt(last).range.end;
+    edit.replace(doc.uri, new vscode.Range(0, 0, end.line, end.character), source);
+    const previous = this.pendingSaveWeft ?? Promise.resolve();
+    const work = (async () => {
+      await previous;
+      this.suppressReparse = true;
+      try {
+        await vscode.workspace.applyEdit(edit);
+        await doc.save();
+      } finally {
+        this.suppressReparse = false;
+      }
+    })();
+    this.pendingSaveWeft = work;
     try {
-      await vscode.workspace.applyEdit(edit);
-      // Parse on OUR schedule after the edit lands.
+      await work;
       void this.triggerParse();
     } finally {
-      this.suppressReparse = false;
+      // Clear only if no later saveWeft has taken over.
+      if (this.pendingSaveWeft === work) {
+        this.pendingSaveWeft = undefined;
+      }
     }
   }
 

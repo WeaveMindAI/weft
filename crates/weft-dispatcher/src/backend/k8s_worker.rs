@@ -7,8 +7,6 @@
 //! dispatcher replays from the journal on crash). A naked Pod is
 //! simpler and cleaner in the event log.
 
-use std::path::Path;
-
 use async_trait::async_trait;
 use tokio::process::Command;
 
@@ -29,17 +27,7 @@ impl K8sWorkerBackend {
 
 #[async_trait]
 impl WorkerBackend for K8sWorkerBackend {
-    async fn spawn_worker(
-        &self,
-        binary_path: &Path,
-        wake: WakeContext,
-    ) -> anyhow::Result<WorkerHandle> {
-        // The "binary_path" in this backend is a convention: the
-        // stem encodes the project id so we can derive the image
-        // tag. `weft run` already passes `binary_path` through the
-        // run pipeline; we read the project id from `wake` and
-        // ignore the physical path.
-        let _ = binary_path;
+    async fn spawn_worker(&self, wake: WakeContext) -> anyhow::Result<WorkerHandle> {
         let image = format!("weft-worker-{}:latest", wake.project_id);
         let pod_name = format!(
             "worker-{}-{}",

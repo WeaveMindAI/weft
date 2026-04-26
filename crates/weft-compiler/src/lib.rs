@@ -21,6 +21,7 @@ pub mod weft_compiler;
 pub mod enrich;
 pub mod validate;
 pub mod codegen;
+pub mod worker_image;
 pub mod build;
 pub mod describe;
 pub mod error;

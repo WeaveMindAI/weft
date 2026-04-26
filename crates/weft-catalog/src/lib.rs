@@ -188,13 +188,151 @@ impl FsCatalog {
 
 // ----- Per-node deps.toml --------------------------------------------
 
-/// Shape of a node's `deps.toml`. Just a wrapper around a
-/// `[dependencies]` table; the keys are crate names, values are
-/// whatever cargo accepts for a dependency spec.
+/// Shape of a node's `deps.toml`.
+///
+/// - `[dependencies]` → cargo deps (keys are crate names,
+///   values are whatever cargo accepts).
+/// - `[system]` → OS-level packages to install in the worker
+///   container image. One subkey per package manager
+///   (`apt`/`apk`/`yum`/`brew`). Each manager's value is itself
+///   a table keyed by `<distro>_<major>` (e.g. `debian_12`,
+///   `ubuntu_24_04`, `alpine_3_19`, `rocky_9`) plus a special
+///   `default` fallback for cases where the node doesn't
+///   distinguish versions.
+///
+/// Codegen looks up the project's base-image distro, checks the
+/// matching manager's table for the exact `<distro>_<major>`
+/// key, falls through to `default` otherwise, and errors out
+/// only if NEITHER is present. A node that supports every
+/// distro via one install line just fills `default`; a node
+/// whose package name varies (libpython) fills one key per
+/// (distro, version) it verified.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeDeps {
     #[serde(default)]
     pub dependencies: toml::Table,
+    #[serde(default)]
+    pub system: SystemPackages,
+    #[serde(default)]
+    pub build: BuildEnv,
+}
+
+/// Build-environment variables a node needs during `cargo build`.
+/// Merged (union) across every referenced node and emitted as
+/// `ENV` lines in the builder stage of the Dockerfile.
+///
+/// Keep narrow and declarative. General-purpose build logic
+/// belongs in the node's own `build.rs`, not here.
+///
+/// Values support one substitution: `{{catalog_path}}` expands
+/// to the node's directory inside the builder container's
+/// `/catalog` mount. Example, a node shipping a config file:
+///
+/// ```toml
+/// [build.env]
+/// FOO_CONFIG = "{{catalog_path}}/foo-config.txt"
+/// ```
+///
+/// resolves to `/catalog/basic/exec_python/foo-config.txt` if
+/// the node lives at `catalog/basic/exec_python/`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildEnv {
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Per-stage, per-manager system-package tables.
+///
+/// Two stages, two different concerns:
+///
+/// - `build`: packages the BUILDER container needs to COMPILE the
+///   worker binary. `libpython3-dev`, `pkg-config`, `libssl-dev`,
+///   and so on. These end up in the builder stage and are
+///   discarded before the runtime image is sealed.
+/// - `runtime`: packages the RUNTIME container needs to RUN the
+///   compiled binary. `libpython3.11-minimal`, `ca-certificates`.
+///
+/// Each stage has the same shape: a `BTreeMap<manager, BTreeMap<
+/// distro_key, Vec<String>>>`. `distro_key` is `<distro>_<major>`
+/// (e.g. `debian_12`, `ubuntu_24_04`, `alpine_3_19`, `rocky_9`)
+/// or the special `default` fallback.
+///
+/// ```toml
+/// [system.build.apt]
+/// default = ["libpython3-dev", "pkg-config"]
+///
+/// [system.runtime.apt]
+/// default = ["python3-minimal"]
+/// debian_12 = ["libpython3.11-minimal"]
+/// debian_13 = ["libpython3.13-minimal"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemPackages {
+    #[serde(default)]
+    pub build: StageSystemPackages,
+    #[serde(default)]
+    pub runtime: StageSystemPackages,
+}
+
+impl SystemPackages {
+    /// True when no stage has any entry on any manager.
+    pub fn is_empty(&self) -> bool {
+        self.build.is_empty() && self.runtime.is_empty()
+    }
+}
+
+/// Per-manager system-package table for a single build stage.
+/// Manager keys are `apt`/`apk`/`yum`/`brew`. Each maps distro
+/// key to the install list for THAT distro.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StageSystemPackages {
+    #[serde(default)]
+    pub apt: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub apk: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub yum: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub brew: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl StageSystemPackages {
+    pub fn is_empty(&self) -> bool {
+        self.apt.is_empty() && self.apk.is_empty() && self.yum.is_empty() && self.brew.is_empty()
+    }
+
+    /// Accessor for a single manager's table. Lets
+    /// worker_image.rs loop over references uniformly.
+    pub fn for_manager(
+        &self,
+        manager: SystemManagerKey,
+    ) -> &std::collections::BTreeMap<String, Vec<String>> {
+        match manager {
+            SystemManagerKey::Apt => &self.apt,
+            SystemManagerKey::Apk => &self.apk,
+            SystemManagerKey::Yum => &self.yum,
+            SystemManagerKey::Brew => &self.brew,
+        }
+    }
+}
+
+/// Abstract name for a package manager, decoupled from
+/// worker_image.rs so weft-catalog doesn't depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemManagerKey {
+    Apt,
+    Apk,
+    Yum,
+    Brew,
+}
+
+/// Which build stage we're asking about. Used by codegen when
+/// collecting package unions for the builder vs runtime
+/// Dockerfile layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStage {
+    Build,
+    Runtime,
 }
 
 // ----- Standard stdlib location --------------------------------------

@@ -23,7 +23,6 @@ export default defineConfig({
     // v1 tree under src/webview/lib.
     alias: [
       { find: /^\$app\/environment$/, replacement: path.join(shimRoot, 'app-environment.ts') },
-      { find: /^\$app\/navigation$/, replacement: path.join(shimRoot, 'app-navigation.ts') },
       { find: /^\$lib\/utils$/, replacement: path.join(libRoot, 'utils.ts') },
       { find: /^\$lib\/utils\.js$/, replacement: path.join(libRoot, 'utils.ts') },
       { find: /^\$lib\/utils\//, replacement: path.join(libRoot, 'utils') + '/' },

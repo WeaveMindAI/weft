@@ -5445,12 +5445,10 @@ export async function autoOrganize(
 // In the standalone dashboard, `parseWeft` runs the full parser
 // locally. In the VS Code extension we delegate parsing to the
 // dispatcher (single source of truth for the Rust compiler).
-// `parseWeft` becomes a synchronous read of the latest cached
-// dispatcher response, plus a side-effect that triggers a fresh
-// parse if the source changed. Callers upstream in ProjectEditor
-// already tolerate stale-then-updated flows; Svelte's reactivity
-// re-runs their effects when `setCachedParseResponse` updates the
-// state the cache is read through.
+// `parseWeft` is a synchronous read of the latest cached dispatcher
+// response. App.svelte calls `setCachedParseResponse` whenever a
+// `parseResult` host message lands; Svelte reactivity re-runs the
+// callers that read from the cache.
 
 import type { ProjectDefinition as HostProjectShape } from '../../../shared/protocol';
 import { translateProject } from '../../host-bridge';
@@ -5458,25 +5456,12 @@ import { translateProject } from '../../host-bridge';
 interface CachedParse {
 	projects: WeftParseMultiOutput['projects'];
 	errors: WeftParseError[];
-	// The raw response we mapped; used to detect staleness.
-	source: string;
 }
 
 let cached: CachedParse = {
 	projects: [],
 	errors: [],
-	source: '',
 };
-
-type RemoteParseTrigger = (source: string) => void;
-let onRemoteParse: RemoteParseTrigger | null = null;
-
-/** Install the hook that lets the parser shim request a fresh
- *  parse from the host when the current source drifts from the
- *  last cached one. App.svelte wires this at mount. */
-export function setRemoteParseTrigger(trigger: RemoteParseTrigger): void {
-	onRemoteParse = trigger;
-}
 
 /** Called by App.svelte when a `parseResult` message lands. Updates
  *  the cache the shim reads through. */
@@ -5500,30 +5485,15 @@ export function setCachedParseResponse(
 			},
 		],
 		errors: [],
-		source,
 	};
 }
 
-export function parseWeft(rawResponse: string): WeftParseMultiOutput {
-	// Strip the leading/trailing ```weft fence v1 wraps around the
-	// source before calling parseWeft (see ProjectEditorInner's
-	// parseWeftCode helper). The cache stores the inner source.
-	const inner = stripWeftFences(rawResponse);
-
-	// If the requested source differs from the cache, ask the host
-	// for a fresh parse. The cache updates asynchronously; callers
-	// re-run on Svelte reactivity when it lands.
-	if (inner !== cached.source && onRemoteParse) {
-		onRemoteParse(inner);
-	}
-
+export function parseWeft(_rawResponse: string): WeftParseMultiOutput {
+	// The cache is the source of truth. Callers' fence-wrapping
+	// of the raw source is irrelevant here; we hand back whatever
+	// the latest setCachedParseResponse stored.
 	return {
 		projects: cached.projects,
 		errors: cached.errors,
 	};
-}
-
-function stripWeftFences(raw: string): string {
-	const fenced = raw.match(/^```weft\s*\n([\s\S]*?)\n```\s*$/);
-	return fenced ? fenced[1] : raw;
 }

@@ -40,11 +40,7 @@ struct RecordingWorkerBackend {
 
 #[async_trait]
 impl WorkerBackend for RecordingWorkerBackend {
-    async fn spawn_worker(
-        &self,
-        _binary_path: &std::path::Path,
-        wake: WakeContext,
-    ) -> anyhow::Result<WorkerHandle> {
+    async fn spawn_worker(&self, wake: WakeContext) -> anyhow::Result<WorkerHandle> {
         self.spawned.lock().await.push(wake);
         Ok(WorkerHandle {
             id: uuid::Uuid::new_v4().to_string(),

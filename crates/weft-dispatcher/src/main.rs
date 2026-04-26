@@ -10,9 +10,7 @@ use tracing::info;
 
 use weft_dispatcher::{
     api::router,
-    backend::{
-        InfraBackend, K8sWorkerBackend, KindInfraBackend, SubprocessWorkerBackend, WorkerBackend,
-    },
+    backend::{InfraBackend, K8sWorkerBackend, KindInfraBackend, WorkerBackend},
     infra::InfraRegistry,
     journal::sqlite::SqliteJournal,
     listener::{
@@ -44,7 +42,6 @@ async fn main() -> anyhow::Result<()> {
         config.http_port = port;
     }
 
-    let self_url = format!("http://localhost:{}", config.http_port);
     let projects_dir = config.data_dir.join("projects");
     let projects = weft_dispatcher::ProjectStore::new(projects_dir)?;
     let journal_path = config.data_dir.join("journal.sqlite");
@@ -80,28 +77,21 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-    let worker_backend: Arc<dyn WorkerBackend> =
-        match std::env::var("WEFT_WORKER_BACKEND").as_deref() {
-            Ok("subprocess") => {
-                Arc::new(SubprocessWorkerBackend::new("", self_url.clone()))
-            }
-            _ => {
-                let namespace =
-                    std::env::var("WEFT_NAMESPACE").unwrap_or_else(|_| "wm-local".into());
-                // Workers talk to the dispatcher via cluster DNS
-                // because they live in the same namespace. Override
-                // via env for unusual setups.
-                let in_cluster_url = std::env::var("WEFT_DISPATCHER_CLUSTER_URL")
-                    .unwrap_or_else(|_| {
-                        format!(
-                            "http://weft-dispatcher.{ns}.svc.cluster.local:{port}",
-                            ns = namespace,
-                            port = config.http_port,
-                        )
-                    });
-                Arc::new(K8sWorkerBackend::new(namespace, in_cluster_url))
-            }
-        };
+    let worker_backend: Arc<dyn WorkerBackend> = {
+        let namespace = std::env::var("WEFT_NAMESPACE").unwrap_or_else(|_| "wm-local".into());
+        // Workers talk to the dispatcher via cluster DNS because
+        // they live in the same namespace. Override via env for
+        // unusual setups.
+        let in_cluster_url =
+            std::env::var("WEFT_DISPATCHER_CLUSTER_URL").unwrap_or_else(|_| {
+                format!(
+                    "http://weft-dispatcher.{ns}.svc.cluster.local:{port}",
+                    ns = namespace,
+                    port = config.http_port,
+                )
+            });
+        Arc::new(K8sWorkerBackend::new(namespace, in_cluster_url))
+    };
 
     let infra_backend = Arc::new(KindInfraBackend::new());
     let infra_registry = InfraRegistry::new();

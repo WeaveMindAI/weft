@@ -427,13 +427,10 @@ async fn handle_worker_crash(state: &DispatcherState, color: Color) {
             return;
         }
     };
-    let summary = match state.projects.get(project_uuid).await {
-        Some(s) => s,
-        None => {
-            state.slots.drop_slot(color).await;
-            return;
-        }
-    };
+    if state.projects.get(project_uuid).await.is_none() {
+        state.slots.drop_slot(color).await;
+        return;
+    }
 
     state
         .slots
@@ -449,7 +446,7 @@ async fn handle_worker_crash(state: &DispatcherState, color: Color) {
         .await;
 
     let wake = crate::backend::WakeContext { project_id: project_id.clone(), color };
-    let spawn_result = state.workers.spawn_worker(&summary.binary_path, wake).await;
+    let spawn_result = state.workers.spawn_worker(wake).await;
     match spawn_result {
         Ok(worker) => {
             let _ = state
@@ -697,6 +694,64 @@ async fn handle_message(
                     user_url,
                 })
                 .await;
+            true
+        }
+        WorkerToDispatcher::ProvisionSidecarRequest { request_id, node_id, spec } => {
+            let project_id = match state.journal.execution_project(color).await {
+                Ok(Some(p)) => p,
+                _ => String::new(),
+            };
+            let reply = if project_id.is_empty() {
+                DispatcherToWorker::ProvisionSidecarReply {
+                    request_id,
+                    instance_id: None,
+                    endpoint_url: None,
+                    error: Some("no project id for execution".into()),
+                }
+            } else {
+                // If already running, skip provisioning and hand
+                // back the existing handle. Mirrors v1's "idempotent
+                // provision on restart" behavior.
+                if let Some(existing) =
+                    state.infra_registry.handle_if_running(&project_id, &node_id)
+                {
+                    DispatcherToWorker::ProvisionSidecarReply {
+                        request_id,
+                        instance_id: Some(existing.id.clone()),
+                        endpoint_url: existing.endpoint_url.clone(),
+                        error: None,
+                    }
+                } else {
+                    let infra_spec = crate::backend::InfraSpec {
+                        project_id: project_id.clone(),
+                        infra_node_id: node_id.clone(),
+                        sidecar: spec,
+                        config: serde_json::Value::Null,
+                    };
+                    match state.infra.provision(infra_spec).await {
+                        Ok(handle) => {
+                            state.infra_registry.insert_running(
+                                project_id.clone(),
+                                node_id.clone(),
+                                handle.clone(),
+                            );
+                            DispatcherToWorker::ProvisionSidecarReply {
+                                request_id,
+                                instance_id: Some(handle.id.clone()),
+                                endpoint_url: handle.endpoint_url.clone(),
+                                error: None,
+                            }
+                        }
+                        Err(e) => DispatcherToWorker::ProvisionSidecarReply {
+                            request_id,
+                            instance_id: None,
+                            endpoint_url: None,
+                            error: Some(format!("{e}")),
+                        },
+                    }
+                }
+            };
+            let _ = tx.send(reply).await;
             true
         }
         WorkerToDispatcher::SidecarEndpointRequest { request_id, node_id } => {
@@ -1021,7 +1076,9 @@ async fn has_pending_deliveries(state: &DispatcherState, color: Color) -> bool {
 async fn spawn_respawn(state: &DispatcherState, color: Color) {
     let Some(project_id) = project_of(state, color).await else { return };
     let Ok(project_uuid) = project_id.parse::<uuid::Uuid>() else { return };
-    let Some(summary) = state.projects.get(project_uuid).await else { return };
+    if state.projects.get(project_uuid).await.is_none() {
+        return;
+    }
 
     // Reserve the spawn atomically: only transition Idle → Starting.
     let reserved = state
@@ -1050,7 +1107,7 @@ async fn spawn_respawn(state: &DispatcherState, color: Color) {
     }
 
     let wake = crate::backend::WakeContext { project_id: project_id.clone(), color };
-    match state.workers.spawn_worker(&summary.binary_path, wake).await {
+    match state.workers.spawn_worker(wake).await {
         Ok(worker) => {
             let _ = state
                 .journal

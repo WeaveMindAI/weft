@@ -179,6 +179,25 @@ pub async fn list_executions(
     Ok(Json(summaries))
 }
 
+/// Return the most recent execution for a project, or 404 if
+/// the project has none. Used by `weft logs` (no-arg form) to
+/// find the color to dump logs for.
+pub async fn latest_for_project(
+    State(state): State<DispatcherState>,
+    Path(id_str): Path<String>,
+) -> Result<Json<crate::journal::ExecutionSummary>, StatusCode> {
+    let summaries = state
+        .journal
+        .list_executions(500)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    summaries
+        .into_iter()
+        .find(|s| s.project_id == id_str)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 pub async fn delete_execution(
     State(state): State<DispatcherState>,
     Path(color_str): Path<String>,

@@ -1,22 +1,26 @@
 //! Infra lifecycle endpoints. Three verbs, matching v1:
 //!
-//!   - `POST /projects/{id}/infra/start` — bring infra up. If it's
-//!     never been provisioned, apply manifests. If it's stopped,
-//!     scale the Deployment back to 1. If it's already running,
-//!     return 409 so the user doesn't accidentally double-apply
-//!     and end up with two Deployments.
-//!   - `POST /projects/{id}/infra/stop` — scale running Deployments
-//!     to 0. Keeps PVC / Service / Ingress so `start` can resume
-//!     the same instance with its auth state.
+//!   - `POST /projects/{id}/infra/start` — bring infra up. Spawns
+//!     an `InfraSetup`-phase worker; the infra node's `execute()`
+//!     calls `ctx.provision_sidecar(spec)`, which round-trips to
+//!     the dispatcher's `InfraBackend` and returns the endpoint.
+//!     The WS handler also scales Stopped sidecars back to
+//!     Running before running the sub-exec so the node sees a
+//!     live sidecar via `provision_sidecar`'s idempotent short-
+//!     circuit path.
+//!   - `POST /projects/{id}/infra/stop` — scale running
+//!     Deployments to 0. Keeps PVC / Service / Ingress so
+//!     `start` can resume the same instance with its auth state.
 //!   - `POST /projects/{id}/infra/terminate` — delete every k8s
 //!     resource the sidecar owns. PVC goes too: next `start` is
 //!     fresh (e.g. WhatsApp re-pairing required). Idempotent.
 //!
 //! Plus:
-//!   - `GET /projects/{id}/infra/status` — list each infra node with
-//!     its current lifecycle status + endpoint URL.
-//!   - `GET /projects/{id}/infra/nodes/{node_id}/live` — unchanged,
-//!     proxies the sidecar's `/live` JSON for the extension poller.
+//!   - `GET /projects/{id}/infra/status` — list each infra node
+//!     with its current lifecycle status + endpoint URL.
+//!   - `GET /projects/{id}/infra/nodes/{node_id}/live` —
+//!     unchanged, proxies the sidecar's `/live` JSON for the
+//!     extension poller.
 
 use axum::{
     extract::{Path, State},
@@ -26,7 +30,6 @@ use axum::{
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::backend::InfraSpec;
 use crate::infra::InfraStatus;
 use crate::state::DispatcherState;
 
@@ -56,13 +59,16 @@ pub async fn start(
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
 
-    let mut nodes = Vec::new();
+    // Pre-flight: per-node status check. Any node already Running
+    // is an error; Stopped nodes need to be scaled back up so the
+    // InfraSetup worker's `provision_sidecar` call short-circuits
+    // to the existing handle instead of trying to re-apply.
+    let mut to_run: Vec<String> = Vec::new();
     for node in &project.nodes {
         if !node.requires_infra {
             continue;
         }
-        let entry_now = state.infra_registry.get(&project_id, &node.id);
-        match entry_now {
+        match state.infra_registry.get(&project_id, &node.id) {
             Some(e) if e.status == InfraStatus::Running => {
                 return Err((
                     StatusCode::CONFLICT,
@@ -73,19 +79,12 @@ pub async fn start(
                 ));
             }
             Some(e) => {
-                // Stopped → scale back up and wait until the
-                // Deployment's Pod passes readiness, so a
-                // follow-up `activate` won't race the sidecar.
-                state
-                    .infra
-                    .scale_up(&e.handle)
-                    .await
-                    .map_err(|err| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("scale_up {} failed: {err}", node.id),
-                        )
-                    })?;
+                state.infra.scale_up(&e.handle).await.map_err(|err| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("scale_up {} failed: {err}", node.id),
+                    )
+                })?;
                 state.infra.wait_ready(&e.handle).await.map_err(|err| {
                     (
                         StatusCode::GATEWAY_TIMEOUT,
@@ -95,55 +94,31 @@ pub async fn start(
                 state
                     .infra_registry
                     .set_status(&project_id, &node.id, InfraStatus::Running);
-                nodes.push(InfraStatusEntry {
-                    node_id: node.id.clone(),
-                    status: InfraStatus::Running,
-                    endpoint_url: e.handle.endpoint_url.clone(),
-                });
             }
             None => {
-                // First bring-up: apply manifests.
-                let sidecar = node.sidecar.clone().ok_or_else(|| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "node '{}' requires_infra but has no sidecar spec in metadata",
-                            node.id
-                        ),
-                    )
-                })?;
-                let spec = InfraSpec {
-                    project_id: project_id.clone(),
-                    infra_node_id: node.id.clone(),
-                    sidecar,
-                    config: node.config.clone(),
-                };
-                let handle = state.infra.provision(spec).await.map_err(|err| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("provision {} failed: {err}", node.id),
-                    )
-                })?;
-                // Don't return until the sidecar's /health is
-                // answering. Otherwise a back-to-back `activate`
-                // call races the k8s schedule + container startup
-                // and the trigger-setup sub-exec fails with
-                // "connection refused" on /outputs.
-                state.infra.wait_ready(&handle).await.map_err(|err| {
-                    (
-                        StatusCode::GATEWAY_TIMEOUT,
-                        format!("sidecar '{}' never became ready: {err}", node.id),
-                    )
-                })?;
-                nodes.push(InfraStatusEntry {
-                    node_id: node.id.clone(),
-                    status: InfraStatus::Running,
-                    endpoint_url: handle.endpoint_url.clone(),
-                });
-                state
-                    .infra_registry
-                    .insert_running(project_id.clone(), node.id.clone(), handle);
+                to_run.push(node.id.clone());
             }
+        }
+    }
+
+    // Nothing to newly provision? We already scaled up any Stopped
+    // instances; just return the current status.
+    if !to_run.is_empty() {
+        crate::api::project::run_infra_setup(&state, id, to_run).await?;
+    }
+
+    // Snapshot and return.
+    let mut nodes = Vec::new();
+    for node in &project.nodes {
+        if !node.requires_infra {
+            continue;
+        }
+        if let Some(e) = state.infra_registry.get(&project_id, &node.id) {
+            nodes.push(InfraStatusEntry {
+                node_id: node.id.clone(),
+                status: e.status,
+                endpoint_url: e.handle.endpoint_url.clone(),
+            });
         }
     }
     Ok(Json(InfraResponse { nodes }))
@@ -176,10 +151,10 @@ pub async fn stop(
             continue;
         }
         any_running = true;
-        state.infra.scale_to_zero(&entry.handle).await.map_err(|e| {
+        state.infra.scale_to_zero(&entry.handle).await.map_err(|err| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("scale_to_zero {node_id} failed: {e}"),
+                format!("scale_to_zero {node_id} failed: {err}"),
             )
         })?;
         state
@@ -188,19 +163,12 @@ pub async fn stop(
         out.push(InfraStatusEntry {
             node_id,
             status: InfraStatus::Stopped,
-            endpoint_url: entry.handle.endpoint_url,
+            endpoint_url: entry.handle.endpoint_url.clone(),
         });
     }
-    if !any_running {
-        return Err((
-            StatusCode::CONFLICT,
-            "infra is already stopped. Start it first or terminate it.".into(),
-        ));
+    if any_running {
+        let _ = crate::api::project::deactivate_project(&state, id).await;
     }
-    // Stopping infra leaves any previously-activated triggers
-    // pointing at a dead sidecar endpoint, so force-deactivate
-    // first. No-op if the project wasn't active.
-    let _ = crate::api::project::deactivate_project(&state, id).await;
     Ok(Json(InfraResponse { nodes: out }))
 }
 
@@ -209,20 +177,33 @@ pub async fn stop(
 pub async fn terminate(
     State(state): State<DispatcherState>,
     Path(id_str): Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<InfraResponse>, (StatusCode, String)> {
     let id = parse_id(&id_str)?;
     let project_id = id.to_string();
-    // Terminate implies deactivate: sidecar endpoints disappear,
-    // so any active listener subscribed to them is about to fail.
-    // Force-deactivate first so we tear the listener down cleanly
-    // rather than leave it spewing errors.
-    let _ = crate::api::project::deactivate_project(&state, id).await;
-    // Terminate is idempotent and nondestructive of the record: we
-    // clear the registry entirely (so start can re-provision fresh).
-    for (_node_id, entry) in state.infra_registry.remove_project(&project_id) {
-        let _ = state.infra.delete(entry.handle).await;
+    let entries = state.infra_registry.list_for_project(&project_id);
+    if entries.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no provisioned infra for this project; nothing to terminate".into(),
+        ));
     }
-    Ok(StatusCode::NO_CONTENT)
+    let _ = crate::api::project::deactivate_project(&state, id).await;
+    let mut out = Vec::new();
+    for (node_id, entry) in entries {
+        state.infra.delete(entry.handle.clone()).await.map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("delete {node_id} failed: {err}"),
+            )
+        })?;
+        state.infra_registry.remove(&project_id, &node_id);
+        out.push(InfraStatusEntry {
+            node_id,
+            status: InfraStatus::Stopped,
+            endpoint_url: None,
+        });
+    }
+    Ok(Json(InfraResponse { nodes: out }))
 }
 
 // ----- status -------------------------------------------------------
@@ -233,20 +214,29 @@ pub async fn status(
 ) -> Result<Json<InfraResponse>, (StatusCode, String)> {
     let id = parse_id(&id_str)?;
     let project_id = id.to_string();
-    let nodes = state
-        .infra_registry
-        .list_for_project(&project_id)
-        .into_iter()
-        .map(|(node_id, entry)| InfraStatusEntry {
-            node_id,
-            status: entry.status,
-            endpoint_url: entry.handle.endpoint_url,
-        })
-        .collect();
+    let project = state
+        .projects
+        .project(id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
+
+    let mut nodes = Vec::new();
+    for node in &project.nodes {
+        if !node.requires_infra {
+            continue;
+        }
+        if let Some(e) = state.infra_registry.get(&project_id, &node.id) {
+            nodes.push(InfraStatusEntry {
+                node_id: node.id.clone(),
+                status: e.status,
+                endpoint_url: e.handle.endpoint_url.clone(),
+            });
+        }
+    }
     Ok(Json(InfraResponse { nodes }))
 }
 
-// ----- live proxy (unchanged) ---------------------------------------
+// ----- live ---------------------------------------------------------
 
 pub async fn live(
     State(state): State<DispatcherState>,
@@ -254,46 +244,36 @@ pub async fn live(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let id = parse_id(&id_str)?;
     let project_id = id.to_string();
-    let handle = state
+    let entry = state
         .infra_registry
-        .handle_if_running(&project_id, &node_id)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("no running infra for node '{node_id}' (start it first)"),
-            )
-        })?;
-    let endpoint = handle.endpoint_url.ok_or_else(|| {
+        .get(&project_id, &node_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "no such infra node".into()))?;
+    let endpoint = entry.handle.endpoint_url.as_ref().ok_or_else(|| {
         (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "infra handle has no endpoint URL yet".into(),
+            StatusCode::NOT_FOUND,
+            "infra has no endpoint URL".to_string(),
         )
     })?;
-
-    let base = endpoint.trim_end_matches('/').trim_end_matches("/action");
-    let live_url = format!("{base}/live");
-    let resp = reqwest::Client::new()
+    let live_url = endpoint
+        .trim_end_matches("/action")
+        .trim_end_matches('/')
+        .to_string()
+        + "/live";
+    let client = reqwest::Client::new();
+    let resp = client
         .get(&live_url)
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("GET {live_url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("sidecar returned {}", resp.status()),
-        ));
-    }
-    let body: Value = resp.json().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("invalid JSON from sidecar: {e}"),
-        )
-    })?;
-    Ok(Json(body))
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("live fetch: {e}")))?;
+    let value: Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("live parse: {e}")))?;
+    Ok(Json(value))
 }
 
-fn parse_id(s: &str) -> Result<uuid::Uuid, (StatusCode, String)> {
-    s.parse::<uuid::Uuid>()
+fn parse_id(raw: &str) -> Result<uuid::Uuid, (StatusCode, String)> {
+    raw.parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))
 }

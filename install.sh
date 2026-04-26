@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# install.sh — build and install the weft CLI + the VS Code
-# extension.
+# install.sh: build and install the weft CLI, the VS Code
+# extension, and (when a daemon is up) the dispatcher + listener
+# images.
 #
-# The dispatcher and listener are no longer host binaries: they run
-# as Pod images inside a local kind cluster. `weft daemon start`
-# builds those images on first use. The only host-side binary is
-# `weft` itself.
+# The dispatcher and listener run as Pod images inside the local
+# kind cluster. Their source lives in this workspace, so a CLI
+# rebuild means the dispatcher needs a rebuild + restart too;
+# otherwise the running pod silently lags behind the CLI. This
+# script handles that for you.
 #
 # Usage:
-#   ./install.sh                  # build + install both (CLI + extension)
-#   ./install.sh --cli-only       # build + install the CLI only
-#   ./install.sh --extension-only # build the VS Code extension only
+#   ./install.sh                  # build CLI + extension (+ refresh daemon if running)
+#   ./install.sh --cli-only       # CLI only
+#   ./install.sh --extension-only # VS Code extension only
+#   ./install.sh --no-daemon      # skip daemon refresh (CLI install only)
 #   ./install.sh --debug          # use debug profile for the CLI
 #   ./install.sh --prefix /path   # install CLI into /path/bin instead
 #   ./install.sh --uninstall      # remove the CLI symlinks
@@ -23,6 +26,7 @@ prefix="${HOME}/.local"
 uninstall=0
 build_cli=1
 build_ext=1
+refresh_daemon=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,23 +48,29 @@ while [[ $# -gt 0 ]]; do
       ;;
     --extension-only)
       build_cli=0
+      refresh_daemon=0
+      shift
+      ;;
+    --no-daemon)
+      refresh_daemon=0
       shift
       ;;
     -h|--help)
       cat <<EOF
-Usage: ./install.sh [--cli-only|--extension-only] [--debug] [--prefix PATH] [--uninstall]
+Usage: ./install.sh [--cli-only|--extension-only|--no-daemon] [--debug] [--prefix PATH] [--uninstall]
 
-By default builds BOTH the Rust CLI (\`weft\`, symlinked into
-PREFIX/bin) AND the VS Code extension (packaged as
-extension-vscode/weft-vscode-*.vsix; install it yourself with
-\`code --install-extension <vsix>\`).
+Default: builds the Rust CLI (\`weft\`, symlinked into PREFIX/bin),
+the VS Code extension (\`extension-vscode/weft-vscode-*.vsix\`),
+AND, if the daemon is currently running, rebuilds + restarts the
+dispatcher and listener images so they pick up CLI/dispatcher
+source changes.
 
-The dispatcher + listener images are NOT built or installed here;
-\`weft daemon start\` builds them on demand and loads them into a
-kind cluster.
+If the daemon is NOT running, the rebuild step is skipped; the
+next \`weft daemon start\` will pick up the new sources.
 
-  --cli-only        Skip the VS Code extension.
-  --extension-only  Skip the Rust CLI.
+  --cli-only        Skip the VS Code extension. (Daemon refresh still runs.)
+  --extension-only  Skip the Rust CLI and the daemon refresh.
+  --no-daemon       Build the CLI but never touch the daemon.
   --debug           Build CLI with the debug profile.
   --prefix PATH     Install CLI into PATH/bin instead of ~/.local/bin.
   --uninstall       Remove installed CLI symlinks (no build).
@@ -116,7 +126,38 @@ if [[ $build_cli -eq 1 ]]; then
     echo "linked ${dst} -> ${src}"
   done
   echo
-  echo "CLI done. run \`weft daemon start\` to bring up the kind cluster."
+  echo "CLI done."
+fi
+
+# ─── Daemon refresh ───────────────────────────────────────────────
+#
+# A CLI rebuild that touches `weft-compiler` or `weft-dispatcher`
+# means the dispatcher pod is now running stale code. Detect a
+# live daemon and rebuild + restart the images. Skipped if the
+# daemon isn't up (next `weft daemon start` will pick up changes
+# anyway).
+
+if [[ $refresh_daemon -eq 1 ]]; then
+  weft_bin="${bin_dir}/weft"
+  if [[ ! -x "${weft_bin}" && ! -L "${weft_bin}" ]]; then
+    echo "  no weft binary at ${weft_bin}; skipping daemon refresh"
+  elif ! command -v docker >/dev/null 2>&1; then
+    echo "  docker not on PATH; skipping daemon refresh"
+  elif ! command -v kubectl >/dev/null 2>&1; then
+    echo "  kubectl not on PATH; skipping daemon refresh"
+  else
+    # Probe the dispatcher's HTTP /health. If it answers, the
+    # daemon is up and we should refresh; if not, skip.
+    dispatcher_url="${WEFT_DISPATCHER_URL:-http://127.0.0.1:9999}"
+    if curl --silent --max-time 2 "${dispatcher_url}/health" >/dev/null 2>&1; then
+      echo
+      echo "rebuilding dispatcher + listener images and restarting…"
+      WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon restart --rebuild
+    else
+      echo "  daemon not running at ${dispatcher_url}; skipping refresh"
+      echo "  (next \`weft daemon start\` will build fresh images)"
+    fi
+  fi
 fi
 
 # ─── VS Code extension ────────────────────────────────────────────

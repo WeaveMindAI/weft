@@ -20,12 +20,72 @@ use tokio::time::sleep;
 use super::Ctx;
 use crate::images;
 
-const CLUSTER_NAME: &str = "weft-local";
-const KUBE_CONTEXT: &str = "kind-weft-local";
-const NAMESPACE: &str = "wm-local";
-const DISPATCHER_IMAGE: &str = "weft-dispatcher:local";
-const LISTENER_IMAGE: &str = "weft-listener:local";
-const DISPATCHER_PORT: u16 = 9999;
+/// Cluster / namespace / image config the CLI talks to. Local
+/// development defaults to a kind cluster named `weft-local` in
+/// namespace `wm-local`; overrides via env var let the same
+/// CLI target a managed cluster without recompiling.
+pub struct ClusterConfig {
+    pub cluster_name: String,
+    pub kube_context: String,
+    pub namespace: String,
+    pub dispatcher_image: String,
+    pub listener_image: String,
+    pub dispatcher_port: u16,
+    /// `kind` for local dev (uses `kind create` + `kind load`);
+    /// `k8s` for targeting an external cluster (skips kind
+    /// bootstrap, images come from whatever registry the
+    /// cluster can pull from).
+    pub backend: ClusterBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterBackend {
+    Kind,
+    K8s,
+}
+
+/// Resolved once per process. Reads env vars, caches the
+/// result so repeated reads don't fan out to the OS.
+pub fn cluster_config() -> &'static ClusterConfig {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<ClusterConfig> = OnceLock::new();
+    CFG.get_or_init(ClusterConfig::from_env)
+}
+
+impl ClusterConfig {
+    pub fn from_env() -> Self {
+        let cluster_name = std::env::var("WEFT_CLUSTER_NAME")
+            .unwrap_or_else(|_| "weft-local".into());
+        let kube_context = std::env::var("WEFT_KUBE_CONTEXT")
+            .unwrap_or_else(|_| format!("kind-{cluster_name}"));
+        let namespace = std::env::var("WEFT_NAMESPACE")
+            .unwrap_or_else(|_| "wm-local".into());
+        let dispatcher_image = std::env::var("WEFT_DISPATCHER_IMAGE")
+            .unwrap_or_else(|_| "weft-dispatcher:local".into());
+        let listener_image = std::env::var("WEFT_LISTENER_IMAGE")
+            .unwrap_or_else(|_| "weft-listener:local".into());
+        let dispatcher_port = std::env::var("WEFT_DISPATCHER_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9999);
+        let backend = match std::env::var("WEFT_CLUSTER_BACKEND")
+            .as_deref()
+            .ok()
+        {
+            Some("k8s") => ClusterBackend::K8s,
+            _ => ClusterBackend::Kind,
+        };
+        Self {
+            cluster_name,
+            kube_context,
+            namespace,
+            dispatcher_image,
+            listener_image,
+            dispatcher_port,
+            backend,
+        }
+    }
+}
 
 pub enum DaemonAction {
     Start { rebuild: bool },
@@ -63,18 +123,22 @@ pub fn log_file_path() -> PathBuf {
 }
 
 async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
-    require_binary("kind").await?;
+    let cfg = cluster_config();
     require_binary("kubectl").await?;
     require_binary("docker").await?;
-
-    ensure_cluster().await?;
-    ensure_ingress_controller().await?;
+    if cfg.backend == ClusterBackend::Kind {
+        require_binary("kind").await?;
+        ensure_cluster(cfg).await?;
+        ensure_ingress_controller().await?;
+    }
     ensure_namespace().await?;
 
-    images::ensure_dispatcher_image(DISPATCHER_IMAGE, rebuild).await?;
-    images::ensure_listener_image(LISTENER_IMAGE, rebuild).await?;
-    images::kind_load(CLUSTER_NAME, DISPATCHER_IMAGE).await?;
-    images::kind_load(CLUSTER_NAME, LISTENER_IMAGE).await?;
+    images::ensure_dispatcher_image(&cfg.dispatcher_image, rebuild).await?;
+    images::ensure_listener_image(&cfg.listener_image, rebuild).await?;
+    if cfg.backend == ClusterBackend::Kind {
+        images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
+        images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
+    }
 
     let repo_root = images::repo_root()?;
     let manifests = repo_root.join("deploy/k8s");
@@ -84,24 +148,29 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
 
     wait_for_deployment_ready("weft-dispatcher").await?;
     start_port_forward().await?;
-    wait_for_http("http://127.0.0.1:9999/health").await?;
+    wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
 
     let _ = ctx;
+    let backend = match cfg.backend {
+        ClusterBackend::Kind => "kind",
+        ClusterBackend::K8s => "k8s",
+    };
     println!(
-        "daemon ready at http://127.0.0.1:{DISPATCHER_PORT} \
-         (kind cluster '{CLUSTER_NAME}', namespace '{NAMESPACE}')"
+        "daemon ready at http://127.0.0.1:{} ({} cluster '{}', namespace '{}')",
+        cfg.dispatcher_port, backend, cfg.cluster_name, cfg.namespace,
     );
     Ok(())
 }
 
 async fn stop() -> Result<()> {
+    let cfg = cluster_config();
     let pf = pid_file_path();
     if let Some(pid) = read_pid(&pf) {
         let _ = signal_term(pid);
         let _ = fs::remove_file(&pf);
     }
     let _ = kubectl(&[
-        "-n", NAMESPACE, "scale", "deployment/weft-dispatcher", "--replicas=0",
+        "-n", &cfg.namespace, "scale", "deployment/weft-dispatcher", "--replicas=0",
     ])
     .status()
     .await;
@@ -110,12 +179,15 @@ async fn stop() -> Result<()> {
 }
 
 async fn status(ctx: &Ctx) -> Result<()> {
+    let cfg = cluster_config();
     let pf_alive = read_pid(&pid_file_path()).map(process_alive).unwrap_or(false);
     match ctx.client().get_json("/projects").await {
         Ok(v) => {
             let n = v.as_array().map(|a| a.len()).unwrap_or(0);
             println!(
-                "daemon: running (cluster '{CLUSTER_NAME}', namespace '{NAMESPACE}', port-forward {}); {} project(s)",
+                "daemon: running (cluster '{}', namespace '{}', port-forward {}); {} project(s)",
+                cfg.cluster_name,
+                cfg.namespace,
                 if pf_alive { "up" } else { "down" },
                 n,
             );
@@ -128,9 +200,10 @@ async fn status(ctx: &Ctx) -> Result<()> {
 }
 
 async fn logs(tail: usize, follow: bool) -> Result<()> {
+    let cfg = cluster_config();
     let tail_arg = format!("--tail={tail}");
     let mut args: Vec<&str> = vec![
-        "-n", NAMESPACE, "logs", "deployment/weft-dispatcher", &tail_arg,
+        "-n", &cfg.namespace, "logs", "deployment/weft-dispatcher", &tail_arg,
     ];
     if follow {
         args.push("-f");
@@ -144,13 +217,16 @@ async fn logs(tail: usize, follow: bool) -> Result<()> {
 
 // ----- Cluster + ingress bootstrap ----------------------------------
 
-async fn ensure_cluster() -> Result<()> {
+async fn ensure_cluster(cfg: &ClusterConfig) -> Result<()> {
     let out = Command::new("kind").args(["get", "clusters"]).output().await?;
     let list = String::from_utf8_lossy(&out.stdout);
-    if list.lines().any(|n| n == CLUSTER_NAME) {
+    if list.lines().any(|n| n == cfg.cluster_name) {
         return Ok(());
     }
-    println!("creating kind cluster '{CLUSTER_NAME}' (first run)");
+    println!(
+        "creating kind cluster '{}' (first run)",
+        cfg.cluster_name,
+    );
     let config = r#"kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -172,7 +248,7 @@ nodes:
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), config)?;
     let status = Command::new("kind")
-        .args(["create", "cluster", "--name", CLUSTER_NAME, "--config"])
+        .args(["create", "cluster", "--name", &cfg.cluster_name, "--config"])
         .arg(tmp.path())
         .status()
         .await?;
@@ -224,8 +300,9 @@ async fn ensure_namespace() -> Result<()> {
 }
 
 async fn wait_for_deployment_ready(name: &str) -> Result<()> {
+    let cfg = cluster_config();
     let status = kubectl(&[
-        "-n", NAMESPACE,
+        "-n", &cfg.namespace,
         "rollout", "status", &format!("deployment/{name}"),
         "--timeout=180s",
     ])
@@ -238,6 +315,7 @@ async fn wait_for_deployment_ready(name: &str) -> Result<()> {
 }
 
 async fn start_port_forward() -> Result<()> {
+    let cfg = cluster_config();
     fs::create_dir_all(data_dir())?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -246,10 +324,10 @@ async fn start_port_forward() -> Result<()> {
     let err = log.try_clone()?;
     let child = std::process::Command::new("kubectl")
         .args([
-            "--context", KUBE_CONTEXT,
-            "-n", NAMESPACE,
+            "--context", &cfg.kube_context,
+            "-n", &cfg.namespace,
             "port-forward", "svc/weft-dispatcher",
-            &format!("{DISPATCHER_PORT}:9999"),
+            &format!("{}:9999", cfg.dispatcher_port),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -278,12 +356,12 @@ async fn wait_for_http(url: &str) -> Result<()> {
 
 // ----- Low-level helpers --------------------------------------------
 
-/// Build a kubectl Command pinned to the kind context. Every
-/// kubectl call in this module goes through this so the user's
-/// current-context (which might be GKE) never interferes.
+/// Build a kubectl Command pinned to the configured context so
+/// the user's current-context never interferes.
 fn kubectl(args: &[&str]) -> Command {
+    let cfg = cluster_config();
     let mut cmd = Command::new("kubectl");
-    cmd.arg("--context").arg(KUBE_CONTEXT);
+    cmd.arg("--context").arg(&cfg.kube_context);
     cmd.args(args);
     cmd
 }

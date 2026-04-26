@@ -1,8 +1,13 @@
-//! WhatsAppBridge: infra node. Provisioning is declarative (see
-//! metadata.json `sidecar` field); the dispatcher applies the
-//! manifests at `weft infra up`. At runtime (Fire phase) this node
-//! queries the sidecar's `/outputs` endpoint and forwards the
-//! result to its declared output ports.
+//! WhatsAppBridge: infra node.
+//!
+//! - `Phase::InfraSetup`: the node calls `ctx.provision_sidecar`
+//!   with its own SidecarSpec. The dispatcher applies k8s
+//!   manifests and returns the handle. The node emits
+//!   `endpointUrl` so downstream nodes that need it during the
+//!   same setup sub-execution can wire through edges.
+//! - `Phase::Fire` / `Phase::TriggerSetup`: the node queries the
+//!   sidecar's `/outputs` endpoint and forwards the fields to
+//!   its output ports.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -27,17 +32,37 @@ impl Node for WhatsAppBridgeNode {
 
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
         match ctx.phase {
-            Phase::InfraSetup | Phase::TriggerSetup | Phase::Fire => {
-                query_outputs(&ctx).await
-            }
+            Phase::InfraSetup => provision(&ctx).await,
+            Phase::Fire | Phase::TriggerSetup => query_outputs(&ctx).await,
         }
     }
 }
 
-/// Ask the dispatcher for this node's sidecar endpoint, call its
-/// `/outputs` helper, forward every top-level field to a matching
-/// output port. Also emits `endpointUrl` so downstream triggers
-/// can pick it up.
+/// InfraSetup: ask the dispatcher to apply this node's sidecar
+/// manifests. The spec comes from the node's own metadata, which
+/// the runtime receives as part of the `NodeMetadata` read at
+/// startup. Emit the endpoint URL + instance id as outputs so
+/// the setup subgraph can thread them to anything that needs them.
+async fn provision(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
+    let meta: NodeMetadata = serde_json::from_str(METADATA_JSON)
+        .expect("WhatsAppBridge metadata.json must be valid");
+    let spec = meta.features.sidecar.ok_or_else(|| {
+        weft_core::error::WeftError::Config(
+            "WhatsAppBridge metadata missing sidecar spec".into(),
+        )
+    })?;
+
+    let handle = ctx.provision_sidecar(spec).await?;
+
+    Ok(NodeOutput::empty()
+        .set("endpointUrl", Value::String(handle.endpoint_url.clone()))
+        .set("instanceId", Value::String(handle.instance_id.clone())))
+}
+
+/// Fire / TriggerSetup: ask the dispatcher for this node's
+/// sidecar endpoint, call its `/outputs` helper, forward every
+/// top-level field to a matching output port. Also emits
+/// `endpointUrl` so downstream triggers can pick it up.
 async fn query_outputs(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
     let endpoint = ctx.sidecar_endpoint().await?;
     let outputs_url = endpoint

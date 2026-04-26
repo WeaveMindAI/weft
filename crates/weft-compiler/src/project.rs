@@ -13,6 +13,8 @@ pub struct ProjectManifest {
     pub package: PackageSection,
     #[serde(default)]
     pub dispatcher: DispatcherSection,
+    #[serde(default)]
+    pub build: BuildSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,36 @@ pub struct DispatcherSection {
     /// URL of the dispatcher this project talks to. Defaults to
     /// `http://localhost:9999` if unset.
     pub url: Option<String>,
+}
+
+/// Optional `[build]` block in weft.toml. Controls how the
+/// project's worker container image gets generated. Left
+/// empty, codegen uses the built-in Debian-slim template and
+/// the package manager inferred from it (apt).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildSection {
+    #[serde(default)]
+    pub worker: WorkerBuildSection,
+}
+
+/// `[build.worker]` customization. Both fields are optional:
+///
+/// - `base_image`: Docker base image. Codegen picks a package
+///   manager from this string (`debian`/`ubuntu` → apt,
+///   `alpine` → apk, `rhel`/`centos`/`fedora`/`rocky`/`amazonlinux`
+///   → yum, `homebrew/brew` → brew). Unknown base images fall back
+///   to apt with a warning.
+/// - `dockerfile_template`: path (relative to the project root)
+///   to a user-provided Dockerfile template. When set,
+///   overrides the built-in template entirely. Supports the
+///   same `{{base_image}}` / `{{install_system_packages}}` /
+///   `{{copy_binary}}` substitution tokens.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerBuildSection {
+    #[serde(default)]
+    pub base_image: Option<String>,
+    #[serde(default)]
+    pub dockerfile_template: Option<String>,
 }
 
 pub struct Project {
@@ -72,6 +104,7 @@ impl Project {
                 description: None,
             },
             dispatcher: DispatcherSection::default(),
+            build: BuildSection::default(),
         };
         let raw = toml::to_string_pretty(&manifest)
             .map_err(|e| CompileError::Project(format!("serialize manifest: {e}")))?;

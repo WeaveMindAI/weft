@@ -1,14 +1,13 @@
-//! Pluggable backends. OSS weft ships `SubprocessWorkerBackend` +
-//! `KindInfraBackend` (local dev). The closed-source weavemind repo
-//! adds cloud implementations plugging into the same traits.
+//! Pluggable backends. OSS weft ships `K8sWorkerBackend` +
+//! `KindInfraBackend` (local dev on a kind cluster). The
+//! closed-source weavemind repo adds cloud implementations
+//! plugging into the same traits.
 
 pub mod k8s_worker;
 pub mod kind_infra;
-pub mod subprocess;
 
 pub use kind_infra::KindInfraBackend;
 pub use k8s_worker::K8sWorkerBackend;
-pub use subprocess::SubprocessWorkerBackend;
 
 
 use async_trait::async_trait;
@@ -19,14 +18,12 @@ use weft_core::Color;
 
 #[async_trait]
 pub trait WorkerBackend: Send + Sync {
-    /// Spawn a worker to run the given binary with the given wake
-    /// context. Returns a handle that can be used to kill the worker
-    /// later.
-    async fn spawn_worker(
-        &self,
-        binary_path: &std::path::Path,
-        wake: WakeContext,
-    ) -> anyhow::Result<WorkerHandle>;
+    /// Spawn a worker for this project's execution color.
+    /// The worker's image / binary identity is implicit in the
+    /// backend (k8s looks up `weft-worker-<project_id>:latest`;
+    /// a future cloud backend might pull from a registry). The
+    /// dispatcher never handles a host filesystem path anymore.
+    async fn spawn_worker(&self, wake: WakeContext) -> anyhow::Result<WorkerHandle>;
 
     async fn kill_worker(&self, handle: WorkerHandle) -> anyhow::Result<()>;
 }
