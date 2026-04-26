@@ -638,6 +638,18 @@ fn start_trigger_maintenance_task(state: Arc<AppState>) {
                 }
             }
 
+            // Sweep stale TaskRegistry entries: a HumanQuery whose user
+            // never answers stays in the registry forever (Restate has no
+            // TTL on virtual object state). With 2.6k users this accumulates
+            // quickly and the TaskRegistry/global virtual object instance
+            // funnels every read/write into a single rocksdb partition,
+            // causing rocksdb stalls and register_task POST timeouts.
+            //
+            // 14-day cutoff: most legitimate human-in-the-loop tasks are
+            // answered within minutes to hours; anything 2 weeks old is
+            // either abandoned or a leftover from a now-failed execution.
+            sweep_stale_tasks(&state.restate_url, &state.http_client, 14).await;
+
             // Try to claim any newly pending triggers
             match trigger_store::claim_pending_triggers(pool, &state.instance_id, 10).await {
                 Ok(triggers) if !triggers.is_empty() => {
@@ -668,6 +680,68 @@ fn start_trigger_maintenance_task(state: Arc<AppState>) {
             }
         }
     });
+}
+
+/// Sweep TaskRegistry entries older than `max_age_days`. The Restate
+/// virtual object that backs TaskRegistry has no TTL, so abandoned tasks
+/// accumulate indefinitely and pile up on a single rocksdb partition.
+async fn sweep_stale_tasks(restate_url: &str, http_client: &reqwest::Client, max_age_days: i64) {
+    let list_url = format!("{}/TaskRegistry/global/list_tasks", restate_url);
+    let send_fut = http_client.get(&list_url).timeout(std::time::Duration::from_secs(20)).send();
+    let list_resp = match send_fut.await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!("sweep_stale_tasks: list_tasks returned {}", r.status());
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("sweep_stale_tasks: list_tasks failed: {}", e);
+            return;
+        }
+    };
+
+    let body: serde_json::Value = match list_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("sweep_stale_tasks: parse failed: {}", e);
+            return;
+        }
+    };
+
+    let tasks = body.get("tasks").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days);
+
+    let stale_ids: Vec<String> = tasks.into_iter()
+        .filter_map(|t| {
+            let id = t.get("executionId").and_then(|v| v.as_str())?.to_string();
+            let created = t.get("createdAt").and_then(|v| v.as_str())?;
+            let dt = chrono::DateTime::parse_from_rfc3339(created).ok()?;
+            if dt.with_timezone(&chrono::Utc) < cutoff {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if stale_ids.is_empty() {
+        return;
+    }
+    tracing::info!("sweep_stale_tasks: removing {} task(s) older than {} days", stale_ids.len(), max_age_days);
+
+    let complete_url = format!("{}/TaskRegistry/global/complete_task", restate_url);
+    let mut removed = 0u32;
+    for id in stale_ids {
+        let fut = http_client.post(&complete_url).json(&id).timeout(std::time::Duration::from_secs(10)).send();
+        match fut.await {
+            Ok(r) if r.status().is_success() => removed += 1,
+            Ok(r) => tracing::warn!("sweep_stale_tasks: complete_task({}) returned {}", id, r.status()),
+            Err(e) => tracing::warn!("sweep_stale_tasks: complete_task({}) failed: {}", id, e),
+        }
+        // Pace the sweep so we don't hammer Restate during the cleanup.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tracing::info!("sweep_stale_tasks: removed {} task(s)", removed);
 }
 
 /// Backfill daily usage aggregation for any days missed during server downtime.
