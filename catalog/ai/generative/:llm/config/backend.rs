@@ -21,7 +21,7 @@ impl Node for LlmConfigNode {
                 PortDef::new("systemPrompt", "String", false),
             ],
             outputs: vec![
-                PortDef::new("config", "Dict[String, String | Number | Boolean]", false),
+                PortDef::new("config", "JsonDict", false),
             ],
             features: NodeFeatures {
                 ..Default::default()

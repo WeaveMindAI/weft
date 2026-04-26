@@ -28,7 +28,7 @@ export const LlmConfigNode: NodeTemplate = {
 		{ name: 'systemPrompt', portType: 'String', required: false, description: 'Optional system prompt. Can be wired from upstream or set as a config field.' },
 	],
 	defaultOutputs: [
-		{ name: 'config', portType: 'Dict[String, String | Number | Boolean]', required: false, description: 'LLM configuration object' },
+		{ name: 'config', portType: 'JsonDict', required: false, description: 'LLM configuration object' },
 	],
 	features: {
 	},
