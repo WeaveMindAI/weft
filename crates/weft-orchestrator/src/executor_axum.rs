@@ -8,7 +8,7 @@
 //!
 //! Architecture: each execution is split into:
 //! - ExecImmutable (Arc): project, edge_idx, initial_input (never changes)
-//! - ExecMutable (Mutex): pulses, cancelled
+//! - ExecMutable (Mutex): pulses, cancelled, instance_cache
 //! This lets us borrow project/edge_idx while mutating pulses.
 
 use std::sync::Arc;
@@ -77,6 +77,7 @@ struct Execution {
 
 pub struct ExecutorState {
     executions: DashMap<String, Arc<Execution>>,
+    instance_cache: DashMap<String, NodeInstance>,
     restate_url: String,
     api_url: String,
     /// Carries `x-internal-api-key` by default. Internal targets only
@@ -133,6 +134,7 @@ impl ExecutorState {
             .expect("failed to build external HTTP client");
         Self {
             executions: DashMap::new(),
+            instance_cache: DashMap::new(),
             restate_url,
             api_url,
             http_client,
@@ -1473,11 +1475,14 @@ async fn dispatch_node_inmem(
         }
     }
 
-    // Instance lookup. No cache: with N node-runner pods registered as distinct
-    // instances, caching pins all dispatch to the cached one (no load balancing).
-    // Restate handles read-only #[shared] lookups cheaply; cost not worth the
-    // load-balancing regression.
-    let instance = match find_instance_via_restate(state, &node_type_str).await {
+    // Instance lookup (shared cache on ExecutorState, lock-free)
+    if !state.instance_cache.contains_key(&node_type_str) {
+        if let Some(inst) = find_instance_via_restate(state, &node_type_str).await {
+            state.instance_cache.insert(node_type_str.clone(), inst);
+        }
+    }
+
+    let instance = match state.instance_cache.get(&node_type_str).map(|v| v.clone()) {
         Some(inst) => inst,
         None => {
             let error_msg = format!("No node service available for type '{}'. The node service may not be running.", node_type_str);

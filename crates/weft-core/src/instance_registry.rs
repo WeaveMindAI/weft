@@ -127,27 +127,29 @@ impl NodeInstanceRegistry for NodeInstanceRegistryImpl {
         let instances: Vec<NodeInstance> = serde_json::from_str(&instances_json)
             .map_err(|e| TerminalError::new(format!("Failed to deserialize instances: {}", e)))?;
 
-        // Filter to online instances that support this node type
+        // Filter to online instances that support this node type. We also drop
+        // instances whose lastHeartbeat is older than 90 seconds: registry
+        // entries linger after a pod dies (no proactive unregister), and
+        // dispatching to a dead pod's IP makes the orchestrator hang on a TCP
+        // connect that never completes.
+        let now = chrono::Utc::now();
         let matching: Vec<_> = instances.into_iter()
-            .filter(|i| i.status == NodeInstanceStatus::Online && i.nodeTypes.contains(&node_type))
+            .filter(|i| {
+                if i.status != NodeInstanceStatus::Online || !i.nodeTypes.contains(&node_type) {
+                    return false;
+                }
+                match chrono::DateTime::parse_from_rfc3339(&i.lastHeartbeat) {
+                    Ok(hb) => (now - hb.with_timezone(&chrono::Utc)).num_seconds() < 90,
+                    Err(_) => true,
+                }
+            })
             .collect();
 
         // Prefer hybrid-cloud-api if available (for cloud mode hybrid routing)
-        let instance = if let Some(hybrid) = matching.iter().find(|i| i.id.contains("hybrid")).cloned() {
-            Some(hybrid)
-        } else if matching.is_empty() {
-            None
-        } else {
-            // Pick a random match. Without this, N node-runner pods registering
-            // under distinct ids all collapse onto the first one (no load
-            // balancing). This is a #[shared] handler so non-determinism is fine
-            // (no journaled replay).
-            let idx = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0) as usize) % matching.len();
-            Some(matching.into_iter().nth(idx).unwrap())
-        };
+        let instance = matching.iter()
+            .find(|i| i.id.contains("hybrid"))
+            .cloned()
+            .or_else(|| matching.into_iter().next());
 
         Ok(instance.map(Json))
     }
