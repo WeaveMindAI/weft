@@ -1,13 +1,13 @@
 ---
 # Dispatcher ingress. Locally this is served by the nginx-ingress
 # controller installed into kind; traffic on
-# http://dispatcher.localhost (or http://localhost with the Host
-# header set) routes to the dispatcher service.
+# http://dispatcher.weft.local routes to the dispatcher service in
+# `weft-system`.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: weft-dispatcher
-  namespace: wm-local
+  namespace: weft-system
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
@@ -20,38 +20,6 @@ spec:
           - path: /
             pathType: Prefix
             backend:
-              service:
-                name: weft-dispatcher
-                port:
-                  number: 9999
----
-# Listener ingress. Routes any hostname in the form
-# `<project>.listener.weft.local` to the matching listener service.
-# v1 used a path-based scheme under `/w/` + `/f/` on the dispatcher;
-# v2 uses a dedicated hostname per project so webhook URLs are
-# cleaner and survive dispatcher migrations.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: weft-listeners
-  namespace: wm-local
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-spec:
-  ingressClassName: nginx
-  rules:
-    - host: "*.listener.weft.local"
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              # The listener service's name is filled in per project
-              # by the dispatcher creating a separate Ingress record
-              # at spawn time. This default rule is a placeholder;
-              # real routes land via K8sListenerBackend applying an
-              # Ingress manifest per listener Deployment.
               service:
                 name: weft-dispatcher
                 port:

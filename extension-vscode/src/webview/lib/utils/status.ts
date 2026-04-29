@@ -47,12 +47,30 @@ export function getStatusIcon(status: string): string {
 	switch (status) {
 		case 'completed': return '✓';
 		case 'running': return '●';
-		case 'waiting_for_input': return '◉';
+		case 'waiting_for_input':
+		case 'suspended': return '◉';
 		case 'failed': return '✕';
-		case 'cancelled': return '◼';
+		case 'cancelled': return '■';
 		case 'skipped': return '⊘';
 		case 'accumulating': return '◎';
 		default: return '○';
+	}
+}
+
+/// Override color for status badges so suspended/waiting reads
+/// "frozen / parked" (cyan) — distinct from running (the node's
+/// own color) and from completed/failed which carry semantic
+/// glyph coloring elsewhere. Returns `undefined` for statuses
+/// that should keep the node's own color.
+export function getStatusBadgeColor(status: string): string | undefined {
+	switch (status) {
+		case 'waiting_for_input':
+		case 'suspended':
+			return '#06b6d4';
+		case 'cancelled':
+			return '#71717a';
+		default:
+			return undefined;
 	}
 }
 
@@ -63,7 +81,9 @@ export function displayStatus(status: string): string {
 		case 'failed': return 'Failed';
 		case 'cancelled': return 'Cancelled';
 		case 'pending': return 'Pending';
-		case 'waiting_for_input': return 'Waiting for Input';
+		case 'waiting_for_input':
+		case 'suspended': return 'Suspended';
+		case 'cancelled': return 'Cancelled';
 		case 'skipped': return 'Skipped';
 		case 'accumulating': return 'Accumulating';
 		default: return status;

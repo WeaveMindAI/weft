@@ -1,15 +1,27 @@
 //! Browser extension API. Ported from v1's dashboard proxy; the v2
 //! extension talks directly to this dispatcher. Token = an opaque
-//! extension token (`wm_ext_*`) the user pasted into the browser.
+//! extension token (`wm_tk_*`) the user pasted into the browser.
 //! Suspension completion routes through the same form-submission
 //! pipeline used by /f/{token}.
 
 use axum::{extract::{Path, State}, http::StatusCode, Json};
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use weft_core::primitive::DispatcherToWorker;
 
 use crate::backend::WakeContext;
 use crate::state::DispatcherState;
+
+/// What complete_task should do after journaling the resolution.
+/// The slot's current state determines the path: deliver on the
+/// live WS, spawn a fresh worker, or rely on an in-flight spawn
+/// to pick up the pending delivery from its handshake snapshot.
+enum CompleteAction {
+    DeliverLive(mpsc::Sender<DispatcherToWorker>),
+    Spawn,
+    None,
+}
 
 #[derive(Debug, Serialize)]
 pub struct PendingTaskOut {
@@ -48,13 +60,31 @@ pub async fn list_tasks(
     let tasks = open
         .into_iter()
         .map(|s| {
+            // The metadata we journal is `{ spec: WakeSignalSpec,
+            // node_id, lane }`. Form schema + description live
+            // under `spec.kind`. WakeSignalKind::Form serializes
+            // to `{ "kind": "form", "form_type": ..., "schema": ...,
+            // "description": ... }`. Action variants will follow
+            // the same shape under different `kind` discriminants.
             let kind = s
                 .metadata
-                .get("kind")
+                .pointer("/spec/kind/kind")
                 .and_then(|v| v.as_str())
-                .unwrap_or("form");
-            let schema = s.metadata.get("schema").cloned();
-            let (task_type, title, form_schema, action_url) = match kind {
+                .unwrap_or("form")
+                .to_string();
+            let schema = s.metadata.pointer("/spec/kind/schema").cloned();
+            let description = s
+                .metadata
+                .pointer("/spec/kind/description")
+                .and_then(|v| v.as_str())
+                .map(|x| x.to_string());
+            let action_url = s
+                .metadata
+                .pointer("/spec/kind/action_url")
+                .and_then(|v| v.as_str())
+                .map(|x| x.to_string());
+
+            let (task_type, title, form_schema, action_url) = match kind.as_str() {
                 "form" => (
                     "Task",
                     schema_title(&schema).unwrap_or_else(|| format!("Input for {}", s.node)),
@@ -65,10 +95,7 @@ pub async fn list_tasks(
                     "Action",
                     schema_title(&schema).unwrap_or_else(|| format!("Action: {}", s.node)),
                     None,
-                    s.metadata
-                        .get("action_url")
-                        .and_then(|v| v.as_str())
-                        .map(|x| x.to_string()),
+                    action_url,
                 ),
                 _ => ("Task", format!("Input for {}", s.node), schema, None),
             };
@@ -76,11 +103,7 @@ pub async fn list_tasks(
                 execution_id: s.color.to_string(),
                 node_id: s.node,
                 title,
-                description: s
-                    .metadata
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(|x| x.to_string()),
+                description,
                 created_at: format_unix(s.created_at),
                 task_type: task_type.to_string(),
                 form_schema,
@@ -119,11 +142,14 @@ pub async fn complete_task(
         .find(|s| s.color == color)
         .ok_or((StatusCode::NOT_FOUND, "no open suspension for execution".into()))?;
 
-    let project_id_str = suspension
-        .metadata
-        .get("project_id")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "suspension missing project_id".into()))?;
+    // Resolve the project from the journal's execution-started
+    // event for this color. Keeps the suspension metadata lean.
+    let project_id_str = state
+        .journal
+        .execution_project(color)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "execution not journaled".into()))?;
     let project_id = project_id_str
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad project id".into()))?;
@@ -138,11 +164,15 @@ pub async fn complete_task(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("consume: {e}")))?;
 
     // Journal the fire. The worker's next fold will seed this
-    // delivery into its link via `pending_deliveries`.
+    // delivery into its link via `pending_deliveries`. We clone
+    // the body so the same value is available for direct WS
+    // delivery to a Live worker (see `CompleteAction::DeliverLive`
+    // below) without a journal round-trip.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let resolve_value = body.clone();
     let _ = state
         .journal
         .record_event(&crate::journal::ExecEvent::SuspensionResolved {
@@ -153,55 +183,102 @@ pub async fn complete_task(
         })
         .await;
 
-    // Ensure a worker is alive for this color. Atomic via the slot
-    // mutex: only the first concurrent POST that sees `Idle` spawns.
-    let must_spawn = state
-        .slots
-        .with_slot(color, move |slot| {
-            Box::pin(async move {
-                if matches!(slot, crate::slots::Slot::Idle { .. }) {
-                    let mut q = match std::mem::replace(
-                        slot,
-                        crate::slots::Slot::Idle {
-                            queued: std::collections::VecDeque::new(),
-                        },
-                    ) {
-                        crate::slots::Slot::Idle { queued } => queued,
-                        _ => unreachable!(),
-                    };
-                    q.push_front(crate::slots::QueuedWake::Start(
-                        weft_core::primitive::WakeMessage::Resume,
-                    ));
-                    *slot = crate::slots::Slot::Starting { queued: q, worker: None };
-                    true
-                } else {
-                    false
-                }
-            })
-        })
-        .await;
-
-    if must_spawn {
-        let wake = WakeContext { project_id: project_id_str.to_string(), color };
-        let worker = state
-            .workers
-            .spawn_worker(wake)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
-        let _ = state
-            .journal
-            .record_event(&crate::journal::ExecEvent::WorkerSpawned { color, at_unix: now })
-            .await;
+    // The slot can be in any of these states when a fire arrives:
+    //
+    //   * `Live`: a worker is parked in `await_signal`. We send
+    //     `Deliver` over the WS so its oneshot resolves immediately.
+    //     Without this, the worker waits forever even though the
+    //     submission has been journaled.
+    //
+    //   * `StalledGrace`: a worker stalled but hasn't exited yet.
+    //     Same Deliver send wakes it via the grace handler, which
+    //     promotes the slot back to Live.
+    //
+    //   * `Idle`: no worker. Queue a Resume start and spawn a fresh
+    //     worker; its handshake snapshot will surface the new
+    //     `pending_deliveries` entry and seed the delivery into
+    //     the link.
+    //
+    //   * `Starting` / `WaitingReconnect`: a spawn is already in
+    //     flight; the new worker's snapshot will pick up the
+    //     pending delivery. Nothing extra to do.
+    //
+    // The atomic block below classifies the slot and either grabs
+    // the WS sender (Live / StalledGrace) or flips Idle->Starting.
+    let action = {
         state
             .slots
             .with_slot(color, move |slot| {
                 Box::pin(async move {
-                    if let crate::slots::Slot::Starting { worker: w, .. } = slot {
-                        *w = Some(worker);
+                    use crate::slots::Slot;
+                    match slot {
+                        Slot::Live { sender, .. } => {
+                            CompleteAction::DeliverLive(sender.clone())
+                        }
+                        Slot::StalledGrace { sender, .. } => {
+                            CompleteAction::DeliverLive(sender.clone())
+                        }
+                        Slot::Idle { .. } => {
+                            let mut q = match std::mem::replace(
+                                slot,
+                                Slot::Idle {
+                                    queued: std::collections::VecDeque::new(),
+                                },
+                            ) {
+                                Slot::Idle { queued } => queued,
+                                _ => unreachable!(),
+                            };
+                            q.push_front(crate::slots::QueuedWake::Start(
+                                weft_core::primitive::WakeMessage::Resume,
+                            ));
+                            *slot = Slot::Starting { queued: q, worker: None };
+                            CompleteAction::Spawn
+                        }
+                        _ => CompleteAction::None,
                     }
                 })
             })
-            .await;
+            .await
+    };
+
+    match action {
+        CompleteAction::DeliverLive(sender) => {
+            let _ = sender
+                .send(weft_core::primitive::DispatcherToWorker::Deliver(
+                    weft_core::primitive::Delivery {
+                        token: suspension.token.clone(),
+                        value: resolve_value,
+                    },
+                ))
+                .await;
+        }
+        CompleteAction::Spawn => {
+            let wake = WakeContext::resolve(&state, project_id_str.to_string(), color);
+            let worker = state
+                .workers
+                .spawn_worker(wake)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?;
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::WorkerSpawned { color, at_unix: now })
+                .await;
+            state
+                .slots
+                .with_slot(color, move |slot| {
+                    Box::pin(async move {
+                        if let crate::slots::Slot::Starting { worker: w, .. } = slot {
+                            *w = Some(worker);
+                        }
+                    })
+                })
+                .await;
+        }
+        CompleteAction::None => {
+            // Spawn already in flight (Starting / WaitingReconnect).
+            // The new worker will see the pending_deliveries entry
+            // in its handshake snapshot and seed it itself.
+        }
     }
 
     state
@@ -249,6 +326,30 @@ pub async fn dismiss_action(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Hard-cancel the execution this task belongs to. Differs from
+/// `dismiss_action` (which only consumes the suspension and leaves
+/// the worker waiting forever) and from the form complete path
+/// (which delivers a value and resumes). The semantics here are
+/// "the user no longer wants this run to finish": we tell the
+/// worker to stop via `DispatcherToWorker::Cancel`, drop all open
+/// suspensions for this color, and emit `ExecutionFailed` on the
+/// project's SSE bus.
+pub async fn cancel_task(
+    State(state): State<DispatcherState>,
+    Path((token, execution_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_token(&state, &token)
+        .await
+        .map_err(|c| (c, "invalid token".into()))?;
+    let color = execution_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad execution id".into()))?;
+    crate::api::execution::cancel_color(&state, color)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn health(
     State(state): State<DispatcherState>,
     Path(token): Path<String>,
@@ -282,6 +383,16 @@ pub struct MintTokenBody {
     pub name: Option<String>,
     #[serde(default)]
     pub metadata: Option<Value>,
+    /// Token shape:
+    ///   - "friendly" (default): `wm_tk_<adj>-<noun>-<NN>`. Easy
+    ///     to read, low entropy. Fine on localhost where CORS
+    ///     blocks cross-origin probing.
+    ///   - "hard": `wm_tk_<32-hex>`. High entropy, ugly. Use
+    ///     when exposing the dispatcher beyond localhost.
+    /// Both share the `wm_tk_` prefix so a token always reads
+    /// as a Weavemind token at a glance.
+    #[serde(default)]
+    pub style: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,12 +405,32 @@ pub async fn mint_token(
     State(state): State<DispatcherState>,
     Json(body): Json<MintTokenBody>,
 ) -> Result<Json<MintedToken>, (StatusCode, String)> {
-    let token = state
+    // Pick the token shape. Default = friendly (`wm_tk_<adj>-
+    // <noun>-<NN>`); explicit "hard" gives a uuid-backed body
+    // for setups exposed beyond localhost.
+    let token = match body.style.as_deref() {
+        Some("hard") => crate::api::extension_names::hard_token(),
+        _ => crate::api::extension_names::friendly_token(),
+    };
+
+    // Optional human label, separate from the token itself. If
+    // the caller didn't supply one, mirror the token suffix
+    // (without the wm_tk_ prefix) so `weft token ls` still
+    // shows something readable instead of an empty column.
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| token.strip_prefix("wm_tk_").unwrap_or(&token).to_string());
+
+    state
         .journal
-        .mint_ext_token(body.name.as_deref(), body.metadata)
+        .mint_ext_token(&token, Some(&name), body.metadata)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-    Ok(Json(MintedToken { token, name: body.name }))
+    Ok(Json(MintedToken { token, name: Some(name) }))
 }
 
 pub async fn list_tokens(
@@ -320,14 +451,18 @@ pub async fn list_tokens(
 
 pub async fn revoke_token(
     State(state): State<DispatcherState>,
-    Path(token): Path<String>,
+    Path(identifier): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state
+    let removed = state
         .journal
-        .revoke_ext_token(&token)
+        .revoke_ext_token(&identifier)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-    Ok(StatusCode::NO_CONTENT)
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("no token matching '{identifier}'")))
+    }
 }
 
 async fn require_token(state: &DispatcherState, token: &str) -> Result<(), StatusCode> {
@@ -344,11 +479,11 @@ async fn require_token(state: &DispatcherState, token: &str) -> Result<(), Statu
 }
 
 fn schema_title(schema: &Option<Value>) -> Option<String> {
-    schema
-        .as_ref()?
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    let s = schema.as_ref()?.get("title")?.as_str()?;
+    if s.trim().is_empty() {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 fn format_unix(at: u64) -> String {

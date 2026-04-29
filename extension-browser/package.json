@@ -2,7 +2,7 @@
   "name": "weft-extension",
   "description": "Human-in-the-loop task manager for WeaveMind projects",
   "private": true,
-  "version": "1.0.31",
+  "version": "1.0.46",
   "type": "module",
   "scripts": {
     "dev": "wxt",

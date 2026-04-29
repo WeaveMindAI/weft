@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { fetchPendingTasks, dismissAction, cancelTask, clearAllTasks, clearTasksForExecution, checkConnection, getTokens, addToken, removeToken, type PendingTask, type ExtensionToken } from '../../lib/api';
+  import { fetchPendingTasks, dismissAction, cancelTask, clearAllTasks, clearTasksForExecution, getTokens, addToken, removeToken, type PendingTask, type ExtensionToken } from '../../lib/api';
 
   let allItems = $state<PendingTask[]>([]);
   let loading = $state(true);
@@ -54,15 +54,20 @@
     error = null;
     selectedTask = null;
     selectedAction = null;
-    
+
     try {
       tokens = await getTokens();
-      connected = await checkConnection();
-      if (connected) {
-        allItems = await fetchPendingTasks({ timeoutMs: 10000 });
-      } else {
+      if (tokens.length === 0) {
+        connected = false;
         allItems = [];
+        return;
       }
+      // Single round-trip: fetch tasks AND infer connectivity from
+      // it. The previous version did a separate /health probe per
+      // token first which doubled the network cost on every refresh.
+      const result = await fetchPendingTasks({ timeoutMs: 10000 });
+      allItems = result.tasks;
+      connected = result.anyReachable;
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to connect';
       connected = false;
@@ -231,20 +236,15 @@
     return str.slice(0, maxLength) + '...';
   }
 
-  function getTaskReviewUrl(task: PendingTask & { _tokenConfig?: ExtensionToken }): string | null {
-    if (!task._tokenConfig) return null;
-    const { dispatcherUrl } = task._tokenConfig;
-    // Phase A: the dispatcher doesn't yet serve a per-task runner
-    // page. Point at the ops dashboard so users land somewhere
-    // useful. Phase B wires a /tasks/{execId} runner UI.
-    return `${dispatcherUrl}/dashboard`;
-  }
-
-  function openTaskInDashboard(task: PendingTask) {
-    const url = getTaskReviewUrl(task as PendingTask & { _tokenConfig?: ExtensionToken });
-    if (url) {
-      window.open(url, '_blank');
-    }
+  /// Open the task in the extension-hosted full-page runner. The
+  /// runner lives at `tasks.html` (declared in the manifest's
+  /// web_accessible_resources by WXT auto-detection) and renders
+  /// the form against the dispatcher directly. The hash carries
+  /// the executionId so the runner knows which task to focus
+  /// among the cross-token list it loads.
+  function openTaskInRunner(task: PendingTask) {
+    const url = `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(task.executionId)}`;
+    browser.tabs.create({ url });
   }
 </script>
 
@@ -332,17 +332,17 @@
           {/if}
           
           <div class="add-token-form">
-            <input 
-              type="text" 
-              bind:value={newTokenUrl} 
-              placeholder="Paste token URL" 
+            <input
+              type="text"
+              bind:value={newTokenUrl}
+              placeholder="Paste token URL"
               disabled={addingToken}
               class="input"
             />
-            <input 
-              type="text" 
-              bind:value={newTokenName} 
-              placeholder="Name (optional)" 
+            <input
+              type="text"
+              bind:value={newTokenName}
+              placeholder="Name (optional)"
               disabled={addingToken}
               class="input"
             />
@@ -353,6 +353,9 @@
                 Add Token
               {/if}
             </button>
+            {#if error}
+              <div class="error-box">{error}</div>
+            {/if}
           </div>
         </div>
       </div>
@@ -445,7 +448,7 @@
         <div class="tasks-container">
           {#each tasks as task}
             <div class="task-card-wrapper">
-              <button class="task-card" onclick={() => openTaskInDashboard(task)}>
+              <button class="task-card" onclick={() => openTaskInRunner(task)}>
                 <div class="task-card-header">
                   <div class="task-dot"></div>
                   <span class="task-title">{task.title}</span>
@@ -480,7 +483,7 @@
         </div>
         <div class="tasks-container">
           {#each triggers as trigger}
-            <button class="task-card trigger-card" onclick={() => openTaskInDashboard(trigger)}>
+            <button class="task-card trigger-card" onclick={() => openTaskInRunner(trigger)}>
               <div class="task-card-header">
                 <div class="trigger-dot"></div>
                 <span class="task-title">{trigger.title}</span>
@@ -522,6 +525,25 @@
 </div>
 
 <style>
+  /* Browser popup chrome sizing. Scoped via `:global()` so it
+     lands in the popup's per-entry CSS chunk only — putting
+     these rules in popup/index.html's inline <style> would let
+     vite hoist them into the shared `app-*.css` and clamp the
+     full-tab tasks page (which loads the same shared chunk) to
+     popup width. Reference: vite extracts inline HTML <style>
+     blocks across entry points into a shared chunk by default. */
+  :global(html), :global(body) {
+    margin: 0;
+    padding: 0;
+    width: 340px;
+    min-height: 420px;
+    overflow: hidden;
+  }
+  :global(#app) {
+    width: 340px;
+    min-height: 420px;
+  }
+
   * {
     margin: 0;
     padding: 0;

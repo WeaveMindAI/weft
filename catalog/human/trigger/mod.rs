@@ -13,10 +13,12 @@ use serde_json::Value;
 
 use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{FormField, FormSchema, WakeSignalKind, WakeSignalSpec};
+use weft_core::primitive::{FormSchema, WakeSignalKind, WakeSignalSpec};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
-use super::form_helpers::{build_runtime_field, map_response_to_ports, parse_form_fields};
+use super::form_helpers::{
+    build_form_fields, human_form_field_specs, map_response_to_ports, parse_form_fields,
+};
 
 pub struct HumanTriggerNode;
 
@@ -33,6 +35,7 @@ impl Node for HumanTriggerNode {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+        let specs = human_form_field_specs();
         match ctx.phase {
             Phase::TriggerSetup => {
                 let raw_fields = parse_form_fields(&ctx.config.values);
@@ -49,10 +52,12 @@ impl Node for HumanTriggerNode {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let fields: Vec<FormField> = raw_fields
-                    .iter()
-                    .filter_map(build_runtime_field)
-                    .collect();
+                // Triggers don't have upstream input ports at
+                // setup time; pass an empty object so the helper
+                // doesn't try to project a value into prefilled
+                // / display fields.
+                let empty_input = Value::Object(serde_json::Map::new());
+                let fields = build_form_fields(&raw_fields, specs, &empty_input);
                 let schema = FormSchema {
                     title: title.clone(),
                     description: description.clone(),
@@ -71,6 +76,11 @@ impl Node for HumanTriggerNode {
                 Ok(NodeOutput::empty())
             }
             Phase::Fire => {
+                // The submission lands on `__seed__` as the raw
+                // form payload (a JSON object keyed by field key).
+                // Older webhook-shaped payloads wrapped it under
+                // `body`; we still unwrap that for compatibility
+                // with non-extension senders.
                 let payload = ctx
                     .input
                     .values
@@ -79,7 +89,7 @@ impl Node for HumanTriggerNode {
                     .unwrap_or(Value::Null);
                 let submission = payload.get("body").cloned().unwrap_or(payload);
                 let raw_fields = parse_form_fields(&ctx.config.values);
-                Ok(map_response_to_ports(&submission, &raw_fields))
+                Ok(map_response_to_ports(&submission, &raw_fields, specs))
             }
             Phase::InfraSetup => Ok(NodeOutput::empty()),
         }

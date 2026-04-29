@@ -52,48 +52,71 @@ export async function removeToken(tokenId: string): Promise<void> {
   await setTokens(tokens.filter(t => t.token !== tokenId));
 }
 
-/// Fetch pending tasks from all configured tokens
-export async function fetchPendingTasks({ timeoutMs }: { timeoutMs?: number } = {}): Promise<PendingTask[]> {
+export interface FetchTasksResult {
+  /// Tasks pulled across every token, in arbitrary order.
+  tasks: PendingTask[];
+  /// True iff at least one token's `/tasks` fetch returned 2xx.
+  /// Callers use this to flip a "connected" indicator without a
+  /// second `/health` round-trip.
+  anyReachable: boolean;
+  /// Per-token success/failure counts so callers can render
+  /// granular status.
+  tokenCount: number;
+  successCount: number;
+}
+
+/// Fetch pending tasks from every configured token IN PARALLEL.
+/// Sequential awaits in a for-loop multiplied total latency by N
+/// (one round-trip per token); `Promise.allSettled` lets each
+/// token round-trip in its own task and we collect once everything
+/// settles. Failures don't poison the others — a single token
+/// returning 500 still surfaces the others' tasks.
+export async function fetchPendingTasks(
+  { timeoutMs }: { timeoutMs?: number } = {},
+): Promise<FetchTasksResult> {
   const tokens = await getTokens();
-  
   if (tokens.length === 0) {
-    console.log('[WeaveMind] No tokens configured');
-    return [];
+    return { tasks: [], anyReachable: false, tokenCount: 0, successCount: 0 };
   }
-  
-  const allTasks: PendingTask[] = [];
-  
-  for (const tokenConfig of tokens) {
-    // Use dashboard proxy: /ext/{token}/tasks
+
+  const fetchOne = async (tokenConfig: ExtensionToken): Promise<PendingTask[]> => {
     const url = `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/tasks`;
-    console.log('[WeaveMind] Fetching tasks from:', url);
-    
-    try {
-      const fetchOptions: RequestInit = { method: 'GET' };
-      if (timeoutMs) fetchOptions.signal = AbortSignal.timeout(timeoutMs);
-      const response = await fetch(url, fetchOptions);
-      
-      if (!response.ok) {
-        console.warn(`[WeaveMind] Failed to fetch tasks for token ${tokenConfig.name}:`, response.status);
-        continue;
-      }
-      
-      const data = await response.json();
-      const tasks = (data.tasks || []) as PendingTask[];
-      console.log(`[WeaveMind] Got ${tasks.length} tasks from ${tokenConfig.name}`);
-      
-      // Add token info to tasks for later use when completing
-      for (const task of tasks) {
-        (task as PendingTask & { _tokenConfig: ExtensionToken })._tokenConfig = tokenConfig;
-        allTasks.push(task);
-      }
-    } catch (error) {
-      console.error(`[WeaveMind] Failed to fetch tasks for token ${tokenConfig.name}:`, error);
+    const fetchOptions: RequestInit = { method: 'GET' };
+    if (timeoutMs) fetchOptions.signal = AbortSignal.timeout(timeoutMs);
+    const response = await fetch(url, fetchOptions);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
-  }
-  
-  console.log(`[WeaveMind] Total tasks: ${allTasks.length}`);
-  return allTasks;
+    const data = await response.json();
+    // Dispatcher returns a flat array; v1's dashboard proxy
+    // wrapped it in { tasks: [...] }. Accept either shape.
+    const tasks = (Array.isArray(data) ? data : (data.tasks ?? [])) as PendingTask[];
+    for (const task of tasks) {
+      (task as PendingTask & { _tokenConfig: ExtensionToken })._tokenConfig = tokenConfig;
+    }
+    return tasks;
+  };
+
+  const results = await Promise.allSettled(tokens.map(fetchOne));
+  const allTasks: PendingTask[] = [];
+  let successCount = 0;
+  results.forEach((res, i) => {
+    if (res.status === 'fulfilled') {
+      allTasks.push(...res.value);
+      successCount += 1;
+    } else {
+      console.warn(
+        `[WeaveMind] Failed to fetch tasks for token ${tokens[i].name}:`,
+        res.reason,
+      );
+    }
+  });
+  return {
+    tasks: allTasks,
+    anyReachable: successCount > 0,
+    tokenCount: tokens.length,
+    successCount,
+  };
 }
 
 /// Dismiss an action (just removes from list, no project interaction)
@@ -174,7 +197,11 @@ export async function submitTrigger(
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ nodeId: trigger.nodeId, input }),
+    // Send the form payload directly. The dispatcher journals it
+    // as the suspension's resolved value; the worker's
+    // HumanTrigger node maps it to output ports per its
+    // form_field_specs.
+    body: JSON.stringify(input),
   });
 
   if (!response.ok) {
@@ -223,28 +250,25 @@ export async function clearTasksForExecution(
   return body.removed ?? 0;
 }
 
-/// Check if any token is connected
+/// Check if any token is reachable. Parallel, returns on first
+/// success. Callers that ALSO do a tasks fetch should NOT call
+/// this — infer connectivity from the tasks fetch result and save
+/// the round-trip.
 export async function checkConnection(): Promise<boolean> {
   const tokens = await getTokens();
-  
-  if (tokens.length === 0) {
+  if (tokens.length === 0) return false;
+  const probes = tokens.map(async (tokenConfig) => {
+    const response = await fetch(
+      `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/health`,
+      { method: 'GET', signal: AbortSignal.timeout(5000) },
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return true;
+  });
+  try {
+    await Promise.any(probes);
+    return true;
+  } catch {
     return false;
   }
-  
-  // Check if at least one token is valid via dashboard proxy
-  for (const tokenConfig of tokens) {
-    try {
-      const response = await fetch(`${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/health`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(5000),
-      });
-      if (response.ok) {
-        return true;
-      }
-    } catch (e) {
-      console.error(`[WeaveMind] Health check failed for ${tokenConfig.name}:`, e);
-    }
-  }
-  
-  return false;
 }

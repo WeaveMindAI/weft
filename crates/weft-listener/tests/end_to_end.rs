@@ -29,17 +29,20 @@ async fn signal_fired(
     State(state): State<MockDispatcher>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> StatusCode {
+) -> Result<Json<Value>, StatusCode> {
     let bearer: &str = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
     if bearer != state.relay_token.as_str() {
-        return StatusCode::UNAUTHORIZED;
+        return Err(StatusCode::UNAUTHORIZED);
     }
     state.fires.lock().await.push(body);
-    StatusCode::ACCEPTED
+    Ok(Json(serde_json::json!({
+        "ack": "consume",
+        "color": "00000000-0000-0000-0000-000000000000",
+    })))
 }
 
 async fn spawn_mock_dispatcher(relay_token: String) -> (MockDispatcher, String) {
@@ -69,7 +72,7 @@ async fn spawn_listener(dispatcher_url: String) -> (ListenerState, String, Strin
     let addr = listener.local_addr().unwrap();
     let public_base = format!("http://{addr}");
     let config = ListenerConfig {
-        project_id: "test-project".into(),
+        tenant_id: "test-tenant".into(),
         http_port: addr.port(),
         public_base_url: public_base.clone(),
         dispatcher_url,

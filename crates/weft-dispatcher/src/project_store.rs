@@ -1,27 +1,47 @@
 //! Project store. Keyed by project id. Holds the registered
 //! ProjectDefinition + the lifecycle status.
 //!
-//! Persists as one JSON file per project under `{data_dir}`.
-//! That buys us durability across dispatcher restarts without
-//! pulling in a database. Phase B replaces this with postgres
-//! once multi-user / multi-tenant work lands.
+//! Default impl is Postgres-backed (`PostgresProjectStore`), so
+//! every dispatcher Pod reads/writes the same `project` table.
+//! Tests use `MockProjectStore` (in-memory HashMap).
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use async_trait::async_trait;
+use sqlx::postgres::PgPool;
 
 use weft_core::ProjectDefinition;
 
+#[cfg(any(test, feature = "test-helpers"))]
+use std::collections::HashMap;
+#[cfg(any(test, feature = "test-helpers"))]
+use tokio::sync::RwLock;
+
+/// Backing store for project metadata. Implementations:
+/// - `PostgresProjectStore` (production)
+/// - `MockProjectStore` (tests, behind `test-helpers`).
+#[async_trait]
+pub trait ProjectStoreOps: Send + Sync {
+    async fn register(
+        &self,
+        project: ProjectDefinition,
+    ) -> anyhow::Result<StoredProjectSummary>;
+    async fn list(&self) -> Vec<StoredProjectSummary>;
+    async fn get(&self, id: uuid::Uuid) -> Option<StoredProjectSummary>;
+    async fn remove(&self, id: uuid::Uuid) -> bool;
+    async fn set_status(&self, id: uuid::Uuid, status: ProjectStatus) -> bool;
+    async fn entry_nodes(&self, id: uuid::Uuid) -> Vec<EntryNodeRef>;
+    async fn project(&self, id: uuid::Uuid) -> Option<ProjectDefinition>;
+}
+
+/// Cloneable handle to whatever the dispatcher uses as project
+/// storage. The thing on `DispatcherState` is this, not the
+/// concrete impl.
+pub type ProjectStore = Arc<dyn ProjectStoreOps>;
+
 #[derive(Clone)]
-pub struct ProjectStore {
-    inner: Arc<RwLock<HashMap<uuid::Uuid, StoredProject>>>,
-    /// Directory where `{id}.json` files land. Survives
-    /// dispatcher restarts via the PVC; see
-    /// `deploy/k8s/dispatcher.yaml`.
-    data_dir: PathBuf,
+pub struct PostgresProjectStore {
+    pool: PgPool,
 }
 
 pub struct StoredProject {
@@ -29,14 +49,6 @@ pub struct StoredProject {
     pub name: String,
     pub status: ProjectStatus,
     pub project: ProjectDefinition,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PersistedProject {
-    id: uuid::Uuid,
-    name: String,
-    status: String,
-    project: ProjectDefinition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,170 +75,6 @@ impl ProjectStatus {
     }
 }
 
-impl ProjectStore {
-    pub fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(&data_dir)?;
-        let mut map: HashMap<uuid::Uuid, StoredProject> = HashMap::new();
-        for entry in std::fs::read_dir(&data_dir)? {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("project_store: cannot read {}: {e}", path.display());
-                    continue;
-                }
-            };
-            let persisted: PersistedProject = match serde_json::from_str(&text) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("project_store: cannot parse {}: {e}", path.display());
-                    continue;
-                }
-            };
-            map.insert(
-                persisted.id,
-                StoredProject {
-                    id: persisted.id,
-                    name: persisted.name,
-                    // Any "active" from a previous session is
-                    // stale: the dispatcher pod restarted, the
-                    // listener Pod it spawned may be gone, the
-                    // signal tracker is empty. Downgrade to
-                    // inactive so the user (or an activate call)
-                    // brings it back up cleanly.
-                    status: {
-                        let s = ProjectStatus::from_str(&persisted.status);
-                        if s == ProjectStatus::Active {
-                            ProjectStatus::Inactive
-                        } else {
-                            s
-                        }
-                    },
-                    project: persisted.project,
-                },
-            );
-        }
-        Ok(Self {
-            inner: Arc::new(RwLock::new(map)),
-            data_dir,
-        })
-    }
-
-    /// Register (or update) a project. Called by `POST /projects`
-    /// with a parsed ProjectDefinition. Idempotent on id.
-    pub async fn register(
-        &self,
-        project: ProjectDefinition,
-    ) -> anyhow::Result<StoredProjectSummary> {
-        let id = project.id;
-        let name = project.name.clone();
-
-        {
-            let mut lock = self.inner.write().await;
-            lock.insert(
-                id,
-                StoredProject {
-                    id,
-                    name: name.clone(),
-                    status: ProjectStatus::Registered,
-                    project,
-                },
-            );
-            self.persist_locked(&lock, id)?;
-        }
-        Ok(StoredProjectSummary { id, name, status: ProjectStatus::Registered })
-    }
-
-    pub async fn list(&self) -> Vec<StoredProjectSummary> {
-        let lock = self.inner.read().await;
-        lock.values()
-            .map(|p| StoredProjectSummary {
-                id: p.id,
-                name: p.name.clone(),
-                status: p.status,
-            })
-            .collect()
-    }
-
-    pub async fn get(&self, id: uuid::Uuid) -> Option<StoredProjectSummary> {
-        let lock = self.inner.read().await;
-        lock.get(&id).map(|p| StoredProjectSummary {
-            id: p.id,
-            name: p.name.clone(),
-            status: p.status,
-        })
-    }
-
-    pub async fn remove(&self, id: uuid::Uuid) -> bool {
-        let mut lock = self.inner.write().await;
-        if lock.remove(&id).is_some() {
-            let _ = std::fs::remove_file(self.file_for(id));
-            true
-        } else {
-            false
-        }
-    }
-
-    pub async fn set_status(&self, id: uuid::Uuid, status: ProjectStatus) -> bool {
-        let mut lock = self.inner.write().await;
-        if let Some(p) = lock.get_mut(&id) {
-            p.status = status;
-            let _ = self.persist_locked(&lock, id);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub async fn entry_nodes(&self, id: uuid::Uuid) -> Vec<EntryNodeRef> {
-        let lock = self.inner.read().await;
-        let Some(p) = lock.get(&id) else { return Vec::new() };
-        p.project
-            .nodes
-            .iter()
-            .map(|n| EntryNodeRef { id: n.id.clone(), node_type: n.node_type.clone() })
-            .collect()
-    }
-
-    /// Read-only access to the full ProjectDefinition. Returns a
-    /// clone so the caller doesn't hold the store lock.
-    pub async fn project(&self, id: uuid::Uuid) -> Option<ProjectDefinition> {
-        let lock = self.inner.read().await;
-        lock.get(&id).map(|p| p.project.clone())
-    }
-
-    fn file_for(&self, id: uuid::Uuid) -> PathBuf {
-        self.data_dir.join(format!("{id}.json"))
-    }
-
-    /// Write the single record for `id` to disk. Caller holds
-    /// the map's write lock, so we pass a ref in to avoid
-    /// re-locking.
-    fn persist_locked(
-        &self,
-        map: &HashMap<uuid::Uuid, StoredProject>,
-        id: uuid::Uuid,
-    ) -> anyhow::Result<()> {
-        let Some(p) = map.get(&id) else { return Ok(()) };
-        let persisted = PersistedProject {
-            id: p.id,
-            name: p.name.clone(),
-            status: p.status.as_str().to_string(),
-            project: p.project.clone(),
-        };
-        let json = serde_json::to_string_pretty(&persisted)?;
-        std::fs::write(self.file_for(id), json)?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct StoredProjectSummary {
     pub id: uuid::Uuid,
@@ -238,4 +86,254 @@ pub struct StoredProjectSummary {
 pub struct EntryNodeRef {
     pub id: String,
     pub node_type: String,
+}
+
+impl PostgresProjectStore {
+    pub async fn new(pool: PgPool) -> anyhow::Result<Self> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS project (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                project_json TEXT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        // Downgrade any "active" rows from a previous run: a
+        // dispatcher restart wiped the in-memory listener pool;
+        // anything that was Active needs to be re-activated by an
+        // explicit call so trigger setup runs fresh.
+        sqlx::query(
+            "UPDATE project SET status = 'inactive' WHERE status = 'active'",
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl ProjectStoreOps for PostgresProjectStore {
+    /// Register (or update) a project. Idempotent on id.
+    async fn register(
+        &self,
+        project: ProjectDefinition,
+    ) -> anyhow::Result<StoredProjectSummary> {
+        let id = project.id;
+        let name = project.name.clone();
+        let project_json = serde_json::to_string(&project)?;
+        sqlx::query(
+            "INSERT INTO project (id, name, status, project_json, updated_at) \
+             VALUES ($1, $2, 'registered', $3, $4) \
+             ON CONFLICT (id) DO UPDATE SET \
+                name = EXCLUDED.name, \
+                project_json = EXCLUDED.project_json, \
+                updated_at = EXCLUDED.updated_at",
+        )
+        .bind(id)
+        .bind(&name)
+        .bind(&project_json)
+        .bind(now_unix() as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(StoredProjectSummary {
+            id,
+            name,
+            status: ProjectStatus::Registered,
+        })
+    }
+
+    async fn list(&self) -> Vec<StoredProjectSummary> {
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, name, status FROM project ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(id, name, status)| StoredProjectSummary {
+                id,
+                name,
+                status: ProjectStatus::from_str(&status),
+            })
+            .collect()
+    }
+
+    async fn get(&self, id: uuid::Uuid) -> Option<StoredProjectSummary> {
+        let row: Option<(uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, name, status FROM project WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        row.map(|(id, name, status)| StoredProjectSummary {
+            id,
+            name,
+            status: ProjectStatus::from_str(&status),
+        })
+    }
+
+    async fn remove(&self, id: uuid::Uuid) -> bool {
+        let res = sqlx::query("DELETE FROM project WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await;
+        res.map(|r| r.rows_affected() > 0).unwrap_or(false)
+    }
+
+    async fn set_status(&self, id: uuid::Uuid, status: ProjectStatus) -> bool {
+        let res = sqlx::query(
+            "UPDATE project SET status = $1, updated_at = $2 WHERE id = $3",
+        )
+        .bind(status.as_str())
+        .bind(now_unix() as i64)
+        .bind(id)
+        .execute(&self.pool)
+        .await;
+        res.map(|r| r.rows_affected() > 0).unwrap_or(false)
+    }
+
+    async fn entry_nodes(&self, id: uuid::Uuid) -> Vec<EntryNodeRef> {
+        let Some(project) = self.project(id).await else {
+            return Vec::new();
+        };
+        project
+            .nodes
+            .iter()
+            .map(|n| EntryNodeRef {
+                id: n.id.clone(),
+                node_type: n.node_type.clone(),
+            })
+            .collect()
+    }
+
+    /// Read-only access to the full ProjectDefinition.
+    async fn project(&self, id: uuid::Uuid) -> Option<ProjectDefinition> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT project_json FROM project WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        row.and_then(|(json,)| serde_json::from_str(&json).ok())
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct MockProjectStore {
+    inner: RwLock<HashMap<uuid::Uuid, (String, ProjectStatus, ProjectDefinition)>>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl MockProjectStore {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Default for MockProjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+#[async_trait]
+impl ProjectStoreOps for MockProjectStore {
+    async fn register(
+        &self,
+        project: ProjectDefinition,
+    ) -> anyhow::Result<StoredProjectSummary> {
+        let id = project.id;
+        let name = project.name.clone();
+        self.inner
+            .write()
+            .await
+            .insert(id, (name.clone(), ProjectStatus::Registered, project));
+        Ok(StoredProjectSummary {
+            id,
+            name,
+            status: ProjectStatus::Registered,
+        })
+    }
+
+    async fn list(&self) -> Vec<StoredProjectSummary> {
+        self.inner
+            .read()
+            .await
+            .iter()
+            .map(|(id, (name, status, _))| StoredProjectSummary {
+                id: *id,
+                name: name.clone(),
+                status: *status,
+            })
+            .collect()
+    }
+
+    async fn get(&self, id: uuid::Uuid) -> Option<StoredProjectSummary> {
+        self.inner
+            .read()
+            .await
+            .get(&id)
+            .map(|(name, status, _)| StoredProjectSummary {
+                id,
+                name: name.clone(),
+                status: *status,
+            })
+    }
+
+    async fn remove(&self, id: uuid::Uuid) -> bool {
+        self.inner.write().await.remove(&id).is_some()
+    }
+
+    async fn set_status(&self, id: uuid::Uuid, status: ProjectStatus) -> bool {
+        let mut g = self.inner.write().await;
+        if let Some(entry) = g.get_mut(&id) {
+            entry.1 = status;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn entry_nodes(&self, id: uuid::Uuid) -> Vec<EntryNodeRef> {
+        let g = self.inner.read().await;
+        let Some((_, _, project)) = g.get(&id) else {
+            return Vec::new();
+        };
+        project
+            .nodes
+            .iter()
+            .map(|n| EntryNodeRef {
+                id: n.id.clone(),
+                node_type: n.node_type.clone(),
+            })
+            .collect()
+    }
+
+    async fn project(&self, id: uuid::Uuid) -> Option<ProjectDefinition> {
+        self.inner
+            .read()
+            .await
+            .get(&id)
+            .map(|(_, _, project)| project.clone())
+    }
 }

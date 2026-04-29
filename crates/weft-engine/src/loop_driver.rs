@@ -34,7 +34,10 @@ use weft_core::project::EdgeIndex;
 use weft_core::pulse::{Pulse, PulseTable};
 use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
 
-use crate::context::{ship_node_event, RunnerHandle};
+use crate::context::{
+    ship_node_completed, ship_node_failed, ship_node_resumed, ship_node_skipped,
+    ship_node_started, ship_node_suspended, RunnerHandle,
+};
 use crate::dispatcher_link::{DispatcherLink, StartPacket};
 
 // Re-exported for backwards compat; the wake spec is now carried by
@@ -117,6 +120,11 @@ pub async fn run_with_link(
     cancellation: Arc<Notify>,
 ) -> anyhow::Result<LoopOutcome> {
     let (link, start) = DispatcherLink::connect(dispatcher_url, color).await?;
+    // Hook the link's Cancel handler up to our cancellation Notify
+    // so a `DispatcherToWorker::Cancel` actually wakes the loop's
+    // `cancellation.notified()` await. Without this, Cancel
+    // messages arrive at the link but are silently dropped.
+    link.set_cancellation(cancellation.clone()).await;
     let edge_idx = EdgeIndex::build(&project);
     let mut pulses: PulseTable = Default::default();
     let mut executions: NodeExecutionTable = Default::default();
@@ -149,37 +157,59 @@ pub async fn run_with_link(
     }
 
     let exec_id = uuid::Uuid::new_v4().to_string();
-    let outcome = drive(
-        &project,
-        &edge_idx,
-        catalog.as_ref(),
-        &exec_id,
-        color,
-        Some(&link),
-        &cancellation,
-        &mut pulses,
-        &mut executions,
-        expected_tokens,
-        phase,
-    )
-    .await?;
+    let mut expected_tokens = expected_tokens;
+    loop {
+        let outcome = drive(
+            &project,
+            &edge_idx,
+            catalog.as_ref(),
+            &exec_id,
+            color,
+            Some(&link),
+            &cancellation,
+            &mut pulses,
+            &mut executions,
+            std::mem::take(&mut expected_tokens),
+            phase,
+        )
+        .await?;
 
-    match &outcome {
-        LoopOutcome::Completed { outputs } => {
-            link.completed(outputs.clone()).await;
-        }
-        LoopOutcome::Failed { error } => {
-            link.failed(error.clone()).await;
-        }
-        LoopOutcome::Stalled => {
-            // The link already received the stalled snapshot inside
-            // `drive`; nothing more to ship.
-        }
-        LoopOutcome::Stuck => {
-            link.failed("execution stuck".into()).await;
+        match &outcome {
+            LoopOutcome::Completed { outputs } => {
+                link.completed(outputs.clone()).await;
+                return Ok(outcome);
+            }
+            LoopOutcome::Failed { error } => {
+                link.failed(error.clone()).await;
+                return Ok(outcome);
+            }
+            LoopOutcome::Stuck => {
+                link.failed("execution stuck".into()).await;
+                return Ok(outcome);
+            }
+            LoopOutcome::Stalled => {
+                // Worker is parked. Wait for the dispatcher to
+                // either send us a fresh Deliver (a fire landed
+                // during the grace window) or tell us to exit.
+                // `wait_after_stall` returns true if a delivery
+                // re-seeded the link and we should drive() again,
+                // false if the dispatcher is letting the worker
+                // exit cleanly.
+                if !link.wait_after_stall().await {
+                    return Ok(outcome);
+                }
+                // A Deliver landed. The previous suspended task's
+                // future has already exited (it returned Suspended);
+                // its exec is in WaitingForInput state and its pulse
+                // is Absorbed. To re-dispatch we have to un-absorb
+                // the pulse for the lane whose token the dispatcher
+                // just delivered. Without this drive() finds no
+                // ready work and stalls again immediately, looping
+                // forever (each iteration journals another Stalled).
+                wake_resuming_lanes_from_stall(&link, &mut pulses, &executions, &mut expected_tokens).await;
+            }
         }
     }
-    Ok(outcome)
 }
 
 fn seed_from_wake_spec(
@@ -237,13 +267,26 @@ fn seed_from_wake_message(
     match wake {
         WakeMessage::Fresh { seeds, phase: _ } => {
             for seed in seeds {
-                pulses.entry(seed.node_id.clone()).or_default().push(Pulse::new(
+                // Use the dispatcher-minted `seed.pulse_id` so the
+                // worker's pulse table and the dispatcher's
+                // journal-folded pulse table mint with identical
+                // UUIDs. NodeStarted's `pulses_absorbed` then
+                // matches on either side by exact UUID.
+                let id = seed
+                    .pulse_id
+                    .parse()
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4());
+                let pulse = Pulse {
+                    id,
                     color,
-                    Vec::new(),
-                    seed.node_id.clone(),
-                    "__seed__".to_string(),
-                    seed.value.clone(),
-                ));
+                    lane: Vec::new(),
+                    target_node: seed.node_id.clone(),
+                    target_port: "__seed__".to_string(),
+                    value: seed.value.clone(),
+                    status: weft_core::pulse::PulseStatus::Pending,
+                    gathered: false,
+                };
+                pulses.entry(seed.node_id.clone()).or_default().push(pulse);
             }
         }
         WakeMessage::Resume => {
@@ -290,44 +333,123 @@ fn apply_snapshot(
 ) {
     *pulses = snap.pulses;
     *executions = snap.executions;
-    for (token, info) in snap.suspensions {
-        expected_tokens.insert((info.node_id.clone(), info.lane.clone()), token);
+    for (token, info) in &snap.suspensions {
+        expected_tokens.insert(
+            (info.node_id.clone(), info.lane.clone()),
+            token.clone(),
+        );
     }
-    // Flip every WaitingForInput execution back to Running + clear
-    // the completed_at timestamp so the re-dispatch finds the node
-    // in the "pending work" state. The pulses bucket should still
-    // contain the absorbed pulses that triggered the original
-    // dispatch; find_ready_nodes will skip over absorbed ones but
-    // re-dispatch requires the prior execution record to be
-    // non-terminal. We simulate that by clearing it.
+
+    // A WaitingForInput exec resumes ONLY if its token has a
+    // pending delivery. Without this scoping, every fresh worker
+    // spawn would re-dispatch every still-suspended sibling, hit
+    // `await_signal`, find no delivery for its own token, and
+    // return Suspended again — churning the journal with N
+    // spurious NodeStarteds per resume.
     //
-    // Remove any non-terminal execution; the re-dispatch here will
-    // create a fresh Running record for it. For each removed exec,
-    // un-absorb the pulses it consumed (so find_ready_nodes
-    // re-dispatches the node). The fold marks pulses Absorbed at
-    // the granularity of "first N pending pulses per (node, lane)
-    // when NodeStarted fires"; we restore up to N per removed
-    // exec.
-    let mut restored_per_node: HashMap<(String, weft_core::lane::Lane), usize> = HashMap::new();
-    for execs in executions.values_mut() {
-        let (kept, removed): (Vec<_>, Vec<_>) = execs.drain(..).partition(|e| {
-            matches!(
-                e.status,
-                NodeExecutionStatus::Completed
-                    | NodeExecutionStatus::Failed
-                    | NodeExecutionStatus::Skipped
-            )
-        });
-        *execs = kept;
-        for e in removed {
-            *restored_per_node
-                .entry((e.node_id.clone(), e.lane.clone()))
-                .or_default() += e.pulses_absorbed.len().max(1);
+    // The mechanics: un-absorb the pulses for resuming lanes only.
+    // Their execs stay in WaitingForInput; the dispatch loop will
+    // detect (non-terminal exec exists + pulse Pending again) and
+    // ship `NodeResumed` instead of `NodeStarted` (same record,
+    // state Suspended → Running).
+    let resume_locations: std::collections::HashSet<(String, weft_core::lane::Lane)> = snap
+        .suspensions
+        .iter()
+        .filter(|(token, _)| snap.pending_deliveries.contains_key(*token))
+        .map(|(_, info)| (info.node_id.clone(), info.lane.clone()))
+        .collect();
+
+    // Crashed-worker recovery: any Running exec (no terminal event
+    // arrived because the worker died mid-flight) gets its pulses
+    // un-absorbed too so we re-dispatch it. We keep the exec
+    // record; the dispatch path will detect "non-terminal exec
+    // exists" and ship NodeResumed (state Running → Running, a
+    // no-op transition that's still a useful audit signal). Future
+    // refinement: ship NodeRetried for crashed-Running executions
+    // since they're effectively a fresh attempt.
+    let crashed_running: std::collections::HashSet<(String, weft_core::lane::Lane)> =
+        executions
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|e| e.status == NodeExecutionStatus::Running)
+            .map(|e| (e.node_id.clone(), e.lane.clone()))
+            .collect();
+
+    let to_un_absorb: std::collections::HashSet<(String, weft_core::lane::Lane)> =
+        resume_locations.union(&crashed_running).cloned().collect();
+
+    // Per location, recover the count of pulses to un-absorb (one
+    // per absorbed pulse the original dispatch consumed).
+    let mut un_absorb_counts: HashMap<(String, weft_core::lane::Lane), usize> = HashMap::new();
+    for execs in executions.values() {
+        for e in execs {
+            let key = (e.node_id.clone(), e.lane.clone());
+            if to_un_absorb.contains(&key) && !e.status.is_terminal() {
+                *un_absorb_counts.entry(key).or_default() +=
+                    e.pulses_absorbed.len().max(1);
+            }
         }
     }
-    // For each location with a removed exec, flip up to N Absorbed
-    // pulses back to Pending.
-    for ((node_id, lane), count) in restored_per_node {
+
+    for ((node_id, lane), count) in un_absorb_counts {
+        if let Some(bucket) = pulses.get_mut(&node_id) {
+            let mut remaining = count;
+            for p in bucket.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                if p.status == weft_core::pulse::PulseStatus::Absorbed && p.lane == lane {
+                    p.status = weft_core::pulse::PulseStatus::Pending;
+                    remaining -= 1;
+                }
+            }
+        }
+    }
+}
+
+/// After a stall is broken by a `Deliver`, find the (node, lane)
+/// pair whose token just got delivered, un-absorb its pulse, and
+/// repopulate `expected_tokens` so the next `drive()` sees the
+/// resume-correct state. Mirrors the resume-scoping branch of
+/// `apply_snapshot`, but operates on the in-memory state of a
+/// still-alive worker (no fresh fold).
+async fn wake_resuming_lanes_from_stall(
+    link: &DispatcherLink,
+    pulses: &mut PulseTable,
+    executions: &NodeExecutionTable,
+    expected_tokens: &mut HashMap<(String, weft_core::lane::Lane), String>,
+) {
+    let ready_tokens: std::collections::HashSet<String> =
+        link.ready_delivery_tokens().await.into_iter().collect();
+    if ready_tokens.is_empty() {
+        return;
+    }
+    // For every WaitingForInput exec whose callback_id matches a
+    // newly-Ready token: un-absorb pulses for that (node, lane) up
+    // to the count the original dispatch absorbed.
+    let mut un_absorb_counts: HashMap<(String, weft_core::lane::Lane), usize> = HashMap::new();
+    for execs in executions.values() {
+        for e in execs {
+            if e.status != NodeExecutionStatus::WaitingForInput {
+                continue;
+            }
+            let Some(tok) = e.callback_id.as_deref() else { continue };
+            if !ready_tokens.contains(tok) {
+                continue;
+            }
+            *un_absorb_counts
+                .entry((e.node_id.clone(), e.lane.clone()))
+                .or_default() += e.pulses_absorbed.len().max(1);
+            // Make sure expected_tokens has the mapping so the
+            // re-dispatched task picks up the seeded delivery via
+            // `await_signal`'s expected-token branch.
+            expected_tokens.insert(
+                (e.node_id.clone(), e.lane.clone()),
+                tok.to_string(),
+            );
+        }
+    }
+    for ((node_id, lane), count) in un_absorb_counts {
         if let Some(bucket) = pulses.get_mut(&node_id) {
             let mut remaining = count;
             for p in bucket.iter_mut() {
@@ -420,7 +542,11 @@ async fn drive(
             }
         }
 
-        preprocess_input(project, pulses);
+        let mut mutations = Vec::new();
+        preprocess_input(project, pulses, &mut mutations);
+        if !mutations.is_empty() {
+            crate::context::ship_pulse_mutations(link, std::mem::take(&mut mutations)).await;
+        }
         let ready = find_ready_nodes(project, pulses, edge_idx);
 
         // Dispatch every ready group that isn't already Running for
@@ -449,59 +575,66 @@ async fn drive(
                 }
             }
 
-            let dispatch_pulse_id = uuid::Uuid::new_v4();
-            let record = NodeExecution {
-                id: uuid::Uuid::new_v4(),
-                node_id: node_id.clone(),
-                status: NodeExecutionStatus::Running,
-                pulses_absorbed: group.pulse_ids.clone(),
-                dispatch_pulse: dispatch_pulse_id,
-                error: group.error.clone(),
-                callback_id: None,
-                started_at: now_unix(),
-                completed_at: None,
-                input: Some(group.input.clone()),
-                output: None,
-                cost_usd: 0.0,
-                logs: Vec::new(),
-                color: group.color,
-                lane: group.lane.clone(),
-            };
-            executions.entry(node_id.clone()).or_default().push(record);
+            // Resume detection: if a non-terminal exec already
+            // exists at this (node, lane), this dispatch continues
+            // that record (state Suspended → Running). Otherwise
+            // it's a first dispatch and we open a new record.
+            let existing = executions
+                .get(&node_id)
+                .and_then(|v| v.iter().rposition(|e| e.lane == group.lane && !e.status.is_terminal()));
+            let is_resume = existing.is_some();
+            let resume_token = expected_tokens.get(&(node_id.clone(), group.lane.clone())).cloned();
+
+            if is_resume {
+                if let Some(idx) = existing {
+                    if let Some(record) = executions.get_mut(&node_id).and_then(|v| v.get_mut(idx)) {
+                        record.status = NodeExecutionStatus::Running;
+                        // Refresh input only when the new dispatch
+                        // carries a different input (rare; we keep
+                        // the original input on a pure resume).
+                        if record.input.is_none() {
+                            record.input = Some(group.input.clone());
+                        }
+                    }
+                }
+            } else {
+                let dispatch_pulse_id = uuid::Uuid::new_v4();
+                let record = NodeExecution {
+                    id: uuid::Uuid::new_v4(),
+                    node_id: node_id.clone(),
+                    status: NodeExecutionStatus::Running,
+                    pulses_absorbed: group.pulse_ids.clone(),
+                    dispatch_pulse: dispatch_pulse_id,
+                    error: group.error.clone(),
+                    callback_id: None,
+                    started_at: now_unix(),
+                    completed_at: None,
+                    input: Some(group.input.clone()),
+                    output: None,
+                    cost_usd: 0.0,
+                    logs: Vec::new(),
+                    color: group.color,
+                    lane: group.lane.clone(),
+                    prior_attempts: Vec::new(),
+                };
+                executions.entry(node_id.clone()).or_default().push(record);
+            }
 
             if group.should_skip {
                 mark_skipped(executions, &node_id, group.color, &group.lane);
-                ship_node_event(
-                    link,
-                    group.color,
-                    &node_id,
-                    &group.lane,
-                    "skipped",
-                    None,
-                    None,
-                    None,
-                    &group.pulse_ids,
-                )
-                .await;
-                emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions);
+                ship_node_skipped(link, &node_id, &group.lane).await;
+                let mut muts = Vec::new();
+                emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
+                crate::context::ship_pulse_mutations(link, muts).await;
                 continue;
             }
 
             if let Some(err) = &group.error {
                 mark_failed(executions, &node_id, group.color, &group.lane, err);
-                ship_node_event(
-                    link,
-                    group.color,
-                    &node_id,
-                    &group.lane,
-                    "failed",
-                    None,
-                    None,
-                    Some(err),
-                    &group.pulse_ids,
-                )
-                .await;
-                emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions);
+                ship_node_failed(link, &node_id, &group.lane, err).await;
+                let mut muts = Vec::new();
+                emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
+                crate::context::ship_pulse_mutations(link, muts).await;
                 continue;
             }
 
@@ -510,22 +643,39 @@ async fn drive(
                 None => {
                     let err = format!("unknown node type: {}", node_def.node_type);
                     mark_failed(executions, &node_id, group.color, &group.lane, &err);
-                    ship_node_event(
-                        link,
-                        group.color,
-                        &node_id,
-                        &group.lane,
-                        "failed",
-                        None,
-                        None,
-                        Some(&err),
-                        &group.pulse_ids,
-                    )
-                    .await;
-                    emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions);
+                    ship_node_failed(link, &node_id, &group.lane, &err).await;
+                    let mut muts = Vec::new();
+                    emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
+                    crate::context::ship_pulse_mutations(link, muts).await;
                     continue;
                 }
             };
+
+            // Ship the lifecycle event AFTER the early-return
+            // checks so we don't emit Started/Resumed for a path
+            // that bails to skipped/failed.
+            if is_resume {
+                if let Some(token) = &resume_token {
+                    let value = link
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("link required for resume"))
+                        .ok();
+                    let value_for_event = match value {
+                        Some(l) => l.peek_seeded_delivery(token).await.unwrap_or(serde_json::Value::Null),
+                        None => serde_json::Value::Null,
+                    };
+                    ship_node_resumed(link, &node_id, &group.lane, token, &value_for_event).await;
+                } else {
+                    // Resume detected (non-terminal exec) but no
+                    // token: this is the crashed-Running recovery
+                    // path. Treat as resume-from-crash; ship
+                    // NodeResumed with empty token+value so the
+                    // dispatcher fold knows it's a continuation.
+                    ship_node_resumed(link, &node_id, &group.lane, "", &serde_json::Value::Null).await;
+                }
+            } else {
+                ship_node_started(link, &node_id, &group.lane, &group.input, &group.pulse_ids).await;
+            }
 
             let config = ConfigBag {
                 values: node_def.config.as_object().cloned().unwrap_or_default().into_iter().collect(),
@@ -565,18 +715,9 @@ async fn drive(
                 handle,
             );
 
-            ship_node_event(
-                link,
-                group.color,
-                &node_id,
-                &group.lane,
-                "started",
-                Some(&group.input),
-                None,
-                None,
-                &group.pulse_ids,
-            )
-            .await;
+            // The lifecycle event (NodeStarted or NodeResumed) was
+            // already shipped earlier in this loop body, before
+            // the spawn. Don't ship a second one here.
 
             // Spawn the node's execute as a task. It writes its
             // result back over `result_tx`; the main loop applies
@@ -668,18 +809,12 @@ async fn apply_results(
             NodeTaskOutcome::Completed(output) => {
                 mark_completed(executions, &result.node_id, result.color, &result.lane, &output);
                 let output_value = output_to_value(&output);
-                ship_node_event(
-                    link,
-                    result.color,
-                    &result.node_id,
-                    &result.lane,
-                    "completed",
-                    None,
-                    Some(&output_value),
-                    None,
-                    &[],
-                )
-                .await;
+                // NodeCompleted FIRST, then ship pulse-table
+                // mutations. The dispatcher's fold tolerates either
+                // order across nodes; within one node the emitted
+                // pulses logically follow completion.
+                ship_node_completed(link, &result.node_id, &result.lane, &output_value).await;
+                let mut muts = Vec::new();
                 postprocess_output(
                     &result.node_id,
                     &output_value,
@@ -689,30 +824,17 @@ async fn apply_results(
                     pulses,
                     edge_idx,
                     executions,
+                    &mut muts,
                 );
-                // TriggerSetup: drop any pulses that just landed on
-                // nodes outside the trigger-upstream closure. Those
-                // nodes' inputs are incomplete by design (their
-                // non-scope upstream won't fire) and the engine
-                // would otherwise wedge on them.
+                crate::context::ship_pulse_mutations(link, muts).await;
                 if let Some(scope) = phase_scope.as_ref() {
                     drop_out_of_scope_pulses(pulses, scope);
                 }
             }
             NodeTaskOutcome::Failed(err) => {
                 mark_failed(executions, &result.node_id, result.color, &result.lane, &err);
-                ship_node_event(
-                    link,
-                    result.color,
-                    &result.node_id,
-                    &result.lane,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err),
-                    &[],
-                )
-                .await;
+                ship_node_failed(link, &result.node_id, &result.lane, &err).await;
+                let mut muts = Vec::new();
                 emit_null_downstream(
                     &result.node_id,
                     result.color,
@@ -721,7 +843,9 @@ async fn apply_results(
                     pulses,
                     edge_idx,
                     executions,
+                    &mut muts,
                 );
+                crate::context::ship_pulse_mutations(link, muts).await;
             }
             NodeTaskOutcome::Waiting(token) => {
                 mark_waiting(
@@ -731,6 +855,7 @@ async fn apply_results(
                     &result.lane,
                     &token,
                 );
+                ship_node_suspended(link, &result.node_id, &result.lane, &token).await;
                 waiting.insert(token, (result.node_id, result.lane));
             }
         }
@@ -759,7 +884,14 @@ async fn terminate(
     link: Option<&DispatcherLink>,
     waiting: &HashMap<String, (String, weft_core::lane::Lane)>,
 ) -> anyhow::Result<LoopOutcome> {
-    let has_waiting = !waiting.is_empty();
+    // `waiting` only tracks suspensions that fired in *this* drive
+    // call. After a stall→resume, suspensions from the previous
+    // drive() are persisted in `executions` (status =
+    // WaitingForInput) but the local map starts empty — so we'd
+    // mis-classify a partially-resumed workflow as Stuck. Source of
+    // truth is the executions table.
+    let has_waiting = waiting_count(executions) > 0;
+    let local_waiting = waiting.len();
 
     let completion = check_completion(pulses, executions);
     match completion {
@@ -774,7 +906,8 @@ async fn terminate(
                 if let Some(link) = link {
                     tracing::info!(
                         target: "weft_engine",
-                        count = waiting.len(),
+                        local_waiting,
+                        persisted_waiting = waiting_count(executions),
                         "nothing active; all remaining work is waiting on signals: stalling"
                     );
                     link.stall().await;
@@ -789,6 +922,14 @@ async fn terminate(
             Ok(LoopOutcome::Stuck)
         }
     }
+}
+
+fn waiting_count(executions: &NodeExecutionTable) -> usize {
+    executions
+        .values()
+        .flat_map(|v| v.iter())
+        .filter(|e| e.status == NodeExecutionStatus::WaitingForInput)
+        .count()
 }
 
 // ---------- Task plumbing ----------

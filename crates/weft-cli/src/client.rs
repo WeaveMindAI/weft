@@ -32,7 +32,20 @@ impl DispatcherClient {
     pub async fn delete(&self, path: &str) -> anyhow::Result<()> {
         let url = format!("{}{}", self.base, path);
         let resp = self.http.delete(&url).send().await.with_context(|| format!("DELETE {url}"))?;
-        resp.error_for_status()?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Surface the dispatcher's body text rather than
+            // reqwest's stock "HTTP status client error (...) for
+            // url (...)" line, which buries the actual reason
+            // (e.g. "no token matching 'nope'") behind URL noise.
+            let body = resp.text().await.unwrap_or_default();
+            let msg = body.trim();
+            anyhow::bail!(if msg.is_empty() {
+                format!("dispatcher returned {status}")
+            } else {
+                msg.to_string()
+            });
+        }
         Ok(())
     }
 

@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenerConfig {
-    /// Project this listener serves. Included on every fire relay
-    /// so the dispatcher can route to the right project slot.
-    pub project_id: String,
+    /// Tenant this listener serves. One listener instance multiplexes
+    /// every project belonging to this tenant. Included on every
+    /// fire relay so the dispatcher can route fire authentication.
+    pub tenant_id: String,
     /// Port the HTTP server listens on. Public-facing for Webhook
     /// and Form kinds; dispatcher-only for /register.
     pub http_port: u16,

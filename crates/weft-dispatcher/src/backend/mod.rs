@@ -26,6 +26,16 @@ pub trait WorkerBackend: Send + Sync {
     async fn spawn_worker(&self, wake: WakeContext) -> anyhow::Result<WorkerHandle>;
 
     async fn kill_worker(&self, handle: WorkerHandle) -> anyhow::Result<()>;
+
+    /// Seconds the dispatcher keeps a worker alive after it stalls
+    /// on suspensions, before tearing the pod down. A fire that
+    /// arrives within the grace window forwards to the still-warm
+    /// worker, saving a respawn (and a cold-start delay). Default
+    /// is 0: kill immediately. K8s backend overrides to 10s
+    /// because pod cold-start is meaningfully expensive.
+    fn idle_grace_seconds(&self) -> u64 {
+        0
+    }
 }
 
 /// Re-export `RootSeed` from core so backends can reference it by
@@ -39,10 +49,37 @@ pub use weft_core::primitive::RootSeed;
 /// `Start` message after the worker's `Ready` handshake. The spawn
 /// call only needs enough to boot the worker and point it at the
 /// right socket.
+///
+/// `tenant` + `namespace` resolve where the worker pod runs. The
+/// dispatcher resolves both via `TenantRouter` + `NamespaceMapper`
+/// before calling `spawn_worker`; backends never look up tenants
+/// themselves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeContext {
     pub project_id: String,
     pub color: Color,
+    pub tenant: String,
+    pub namespace: String,
+}
+
+impl WakeContext {
+    /// Resolve a `WakeContext` from the dispatcher's tenant state.
+    /// Centralizes the "project → tenant → namespace" lookup so
+    /// every spawn site stays consistent.
+    pub fn resolve(
+        state: &crate::state::DispatcherState,
+        project_id: String,
+        color: Color,
+    ) -> Self {
+        let tenant = state.tenant_router.tenant_for_project(&project_id);
+        let namespace = state.namespace_mapper.namespace_for(&tenant);
+        Self {
+            project_id,
+            color,
+            tenant: tenant.to_string(),
+            namespace,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -62,8 +99,10 @@ pub trait InfraBackend: Send + Sync {
     /// to weft projects and return their handles. Called on
     /// dispatcher startup so a restart doesn't orphan resources.
     /// Default is empty (backends that don't persist anything
-    /// external).
-    async fn rehydrate(&self) -> anyhow::Result<Vec<AdoptedHandle>> {
+    /// external). The dispatcher passes the list of tenant
+    /// namespaces it knows about so the backend doesn't have to
+    /// guess where to look.
+    async fn rehydrate(&self, _namespaces: &[String]) -> anyhow::Result<Vec<AdoptedHandle>> {
         Ok(Vec::new())
     }
 
@@ -132,6 +171,10 @@ pub struct InfraSpec {
     /// env vars, resource limits, etc.
     #[serde(default)]
     pub config: Value,
+    /// Tenant + namespace resolved by the dispatcher. The backend
+    /// never resolves these on its own.
+    pub tenant: String,
+    pub namespace: String,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +185,10 @@ pub struct InfraHandle {
     /// None only for backends that can't resolve until the pod is
     /// scheduled; the dispatcher treats None as "not ready yet."
     pub endpoint_url: Option<String>,
+    /// Namespace the sidecar lives in. Set at provision time so
+    /// every later op (scale, delete, port-forward) can target the
+    /// right namespace without consulting an env var.
+    pub namespace: String,
 }
 
 /// One (project, node) pair adopted from the cluster at startup.

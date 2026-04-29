@@ -1,19 +1,28 @@
 [
   {
     "field_type": "display",
+    "label": "Display (read-only)",
     "render": { "component": "readonly" },
+    "required_config": [],
+    "optional_config": ["label"],
     "adds_inputs": [{ "name_template": "{key}", "port_type": "T_Auto" }],
     "adds_outputs": []
   },
   {
     "field_type": "display_image",
+    "label": "Display image (read-only)",
     "render": { "component": "image" },
+    "required_config": [],
+    "optional_config": ["label"],
     "adds_inputs": [{ "name_template": "{key}", "port_type": "Image" }],
     "adds_outputs": []
   },
   {
     "field_type": "approve_reject",
+    "label": "Approve / Reject",
     "render": { "component": "buttons", "source": "static" },
+    "required_config": [],
+    "optional_config": ["label", "approveLabel", "rejectLabel"],
     "adds_inputs": [],
     "adds_outputs": [
       { "name_template": "{key}_approved", "port_type": "Boolean" },
@@ -22,49 +31,73 @@
   },
   {
     "field_type": "select",
+    "label": "Select (single)",
     "render": { "component": "select", "source": "static" },
+    "required_config": ["options"],
+    "optional_config": ["label"],
     "adds_inputs": [],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
   },
   {
     "field_type": "multi_select",
+    "label": "Multi-select",
     "render": { "component": "select", "source": "static", "multiple": true },
+    "required_config": ["options"],
+    "optional_config": ["label"],
     "adds_inputs": [],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "List[String]" }]
   },
   {
     "field_type": "select_input",
+    "label": "Select (from input)",
     "render": { "component": "select", "source": "input" },
+    "required_config": [],
+    "optional_config": ["label"],
     "adds_inputs": [{ "name_template": "{key}", "port_type": "List[String]" }],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
   },
   {
     "field_type": "multi_select_input",
+    "label": "Multi-select (from input)",
     "render": { "component": "select", "source": "input", "multiple": true },
+    "required_config": [],
+    "optional_config": ["label"],
     "adds_inputs": [{ "name_template": "{key}", "port_type": "List[String]" }],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "List[String]" }]
   },
   {
     "field_type": "text_input",
+    "label": "Text input",
     "render": { "component": "text" },
+    "required_config": [],
+    "optional_config": ["label", "placeholder"],
     "adds_inputs": [],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
   },
   {
     "field_type": "textarea",
+    "label": "Textarea",
     "render": { "component": "textarea" },
+    "required_config": [],
+    "optional_config": ["label", "placeholder"],
     "adds_inputs": [],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
   },
   {
     "field_type": "editable_text_input",
+    "label": "Editable text (pre-filled)",
     "render": { "component": "text", "prefilled": true },
+    "required_config": [],
+    "optional_config": ["label", "placeholder"],
     "adds_inputs": [{ "name_template": "{key}", "port_type": "String" }],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
   },
   {
     "field_type": "editable_textarea",
+    "label": "Editable textarea (pre-filled)",
     "render": { "component": "textarea", "prefilled": true },
+    "required_config": [],
+    "optional_config": ["label", "placeholder"],
     "adds_inputs": [{ "name_template": "{key}", "port_type": "String" }],
     "adds_outputs": [{ "name_template": "{key}", "port_type": "String" }]
   }

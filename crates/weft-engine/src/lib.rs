@@ -16,6 +16,9 @@ pub mod context;
 pub mod dispatcher_link;
 pub mod loop_driver;
 
-pub use context::{ship_node_event, RunnerHandle};
+pub use context::{
+    ship_node_completed, ship_node_failed, ship_node_resumed, ship_node_skipped,
+    ship_node_started, ship_node_suspended, ship_pulse_mutations, RunnerHandle,
+};
 pub use dispatcher_link::{DispatcherLink, StartPacket};
 pub use loop_driver::{run_loop, run_with_link, LoopOutcome, RootSeed, WakeSpec};

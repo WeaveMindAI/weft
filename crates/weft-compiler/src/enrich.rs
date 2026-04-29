@@ -494,10 +494,20 @@ fn materialize_form_ports(
 
     for field in fields {
         let Some(obj) = field.as_object() else { continue };
+        // Field-type lookup accepts the v1-flat shape used by the
+        // .weft source and form_builder UI (`fieldType: "display"`)
+        // and, as a fallback, the v2-nested shape some early code
+        // paths produced (`field_type: { kind: "display" }`). The
+        // node's spec is keyed by the bare string in either case.
         let field_type = obj
-            .get("field_type")
-            .and_then(|v| v.get("kind"))
+            .get("fieldType")
             .and_then(|v| v.as_str())
+            .or_else(|| obj.get("field_type").and_then(|v| v.as_str()))
+            .or_else(|| {
+                obj.get("field_type")
+                    .and_then(|v| v.get("kind"))
+                    .and_then(|v| v.as_str())
+            })
             .unwrap_or_default();
         let key = obj.get("key").and_then(|v| v.as_str()).unwrap_or_default();
         if key.is_empty() || field_type.is_empty() {

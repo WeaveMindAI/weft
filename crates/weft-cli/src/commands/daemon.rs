@@ -20,14 +20,18 @@ use tokio::time::sleep;
 use super::Ctx;
 use crate::images;
 
-/// Cluster / namespace / image config the CLI talks to. Local
-/// development defaults to a kind cluster named `weft-local` in
-/// namespace `wm-local`; overrides via env var let the same
-/// CLI target a managed cluster without recompiling.
+/// Cluster / namespace / image config the CLI talks to.
+///
+/// Two namespace concepts: `system_namespace` (where the
+/// dispatcher Pod, its Service, PVC and Ingress live) and
+/// `default_user_namespace` (where workers, listeners, sidecars
+/// for tenant `local` run). Cloud adds more user namespaces, one
+/// per tenant; OSS sticks to a single one.
 pub struct ClusterConfig {
     pub cluster_name: String,
     pub kube_context: String,
-    pub namespace: String,
+    pub system_namespace: String,
+    pub default_user_namespace: String,
     pub dispatcher_image: String,
     pub listener_image: String,
     pub dispatcher_port: u16,
@@ -58,7 +62,9 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "weft-local".into());
         let kube_context = std::env::var("WEFT_KUBE_CONTEXT")
             .unwrap_or_else(|_| format!("kind-{cluster_name}"));
-        let namespace = std::env::var("WEFT_NAMESPACE")
+        let system_namespace = std::env::var("WEFT_SYSTEM_NAMESPACE")
+            .unwrap_or_else(|_| "weft-system".into());
+        let default_user_namespace = std::env::var("WEFT_DEFAULT_USER_NAMESPACE")
             .unwrap_or_else(|_| "wm-local".into());
         let dispatcher_image = std::env::var("WEFT_DISPATCHER_IMAGE")
             .unwrap_or_else(|_| "weft-dispatcher:local".into());
@@ -78,7 +84,8 @@ impl ClusterConfig {
         Self {
             cluster_name,
             kube_context,
-            namespace,
+            system_namespace,
+            default_user_namespace,
             dispatcher_image,
             listener_image,
             dispatcher_port,
@@ -100,13 +107,64 @@ pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
         DaemonAction::Start { rebuild } => start(&ctx, rebuild).await,
         DaemonAction::Stop => stop().await,
         DaemonAction::Status => status(&ctx).await,
-        DaemonAction::Restart { rebuild } => {
-            stop().await?;
-            sleep(Duration::from_millis(400)).await;
-            start(&ctx, rebuild).await
-        }
+        DaemonAction::Restart { rebuild } => restart(&ctx, rebuild).await,
         DaemonAction::Logs { tail, follow } => logs(tail, follow).await,
     }
+}
+
+/// `daemon restart` semantics: rebuild images if their inputs
+/// changed, then roll the StatefulSet pod ONLY if at least one
+/// image changed. If neither image changed AND the daemon is
+/// already healthy, this is a true no-op: no pod restart, no
+/// dropped WebSockets, no port-forward rebuild.
+async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
+    let cfg = cluster_config();
+    require_binary("kubectl").await?;
+    require_binary("docker").await?;
+
+    let dispatcher_built =
+        images::ensure_dispatcher_image(&cfg.dispatcher_image, rebuild).await?;
+    let listener_built = images::ensure_listener_image(&cfg.listener_image, rebuild).await?;
+    if dispatcher_built || listener_built {
+        if cfg.backend == ClusterBackend::Kind {
+            images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
+            images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
+        }
+        // Roll the dispatcher pod so it picks up the new image. The
+        // port-forward is bound to a single Pod IP, so a Pod
+        // recreate kills it; we refresh it after the rollout.
+        let status = kubectl(&[
+            "-n",
+            &cfg.system_namespace,
+            "rollout",
+            "restart",
+            "statefulset/weft-dispatcher",
+        ])
+        .status()
+        .await?;
+        if !status.success() {
+            anyhow::bail!("rollout restart failed");
+        }
+        wait_for_statefulset_ready("weft-dispatcher").await?;
+        kill_existing_port_forward();
+        start_port_forward().await?;
+        wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
+        // Also roll every per-tenant listener Deployment when the
+        // listener image rebuilt. The dispatcher creates these
+        // dynamically (named `listener-<tenant>`) and never
+        // restarts them on its own, so without this they stay on
+        // the old image, breaking the dispatcher↔listener wire
+        // contract whenever the FormField / WakeSignalKind types
+        // shift between releases.
+        if listener_built {
+            roll_listener_deployments(cfg).await?;
+        }
+        println!("daemon refreshed; new image rolled out");
+    } else {
+        println!("daemon already running with the latest images; nothing to do");
+    }
+    let _ = ctx;
+    Ok(())
 }
 
 pub fn data_dir() -> PathBuf {
@@ -131,7 +189,6 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
         ensure_cluster(cfg).await?;
         ensure_ingress_controller().await?;
     }
-    ensure_namespace().await?;
 
     images::ensure_dispatcher_image(&cfg.dispatcher_image, rebuild).await?;
     images::ensure_listener_image(&cfg.listener_image, rebuild).await?;
@@ -142,11 +199,15 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
 
     let repo_root = images::repo_root()?;
     let manifests = repo_root.join("deploy/k8s");
-    kubectl_apply_file(&manifests.join("namespace.yaml")).await?;
+    kubectl_apply_file(&manifests.join("system-namespace.yaml")).await?;
+    kubectl_apply_file(&manifests.join("user-namespace.yaml")).await?;
+    kubectl_apply_file(&manifests.join("postgres.yaml")).await?;
+    wait_for_deployment_ready("weft-postgres").await?;
+    ensure_internal_secret().await?;
     kubectl_apply_file(&manifests.join("dispatcher.yaml")).await?;
     kubectl_apply_file(&manifests.join("ingress.yaml")).await?;
 
-    wait_for_deployment_ready("weft-dispatcher").await?;
+    wait_for_statefulset_ready("weft-dispatcher").await?;
     start_port_forward().await?;
     wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
 
@@ -156,26 +217,37 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
         ClusterBackend::K8s => "k8s",
     };
     println!(
-        "daemon ready at http://127.0.0.1:{} ({} cluster '{}', namespace '{}')",
-        cfg.dispatcher_port, backend, cfg.cluster_name, cfg.namespace,
+        "daemon ready at http://127.0.0.1:{} ({} cluster '{}', system ns '{}', default user ns '{}')",
+        cfg.dispatcher_port,
+        backend,
+        cfg.cluster_name,
+        cfg.system_namespace,
+        cfg.default_user_namespace,
     );
     Ok(())
 }
 
 async fn stop() -> Result<()> {
     let cfg = cluster_config();
-    let pf = pid_file_path();
-    if let Some(pid) = read_pid(&pf) {
-        let _ = signal_term(pid);
-        let _ = fs::remove_file(&pf);
-    }
+    kill_existing_port_forward();
     let _ = kubectl(&[
-        "-n", &cfg.namespace, "scale", "deployment/weft-dispatcher", "--replicas=0",
+        "-n", &cfg.system_namespace, "scale", "statefulset/weft-dispatcher", "--replicas=0",
     ])
     .status()
     .await;
     println!("daemon stopped");
     Ok(())
+}
+
+/// Kill any running `kubectl port-forward` we previously spawned
+/// for the dispatcher Service. Called on stop and before we
+/// re-establish a port-forward after a Pod rollout. Idempotent.
+fn kill_existing_port_forward() {
+    let pf = pid_file_path();
+    if let Some(pid) = read_pid(&pf) {
+        let _ = signal_term(pid);
+        let _ = fs::remove_file(&pf);
+    }
 }
 
 async fn status(ctx: &Ctx) -> Result<()> {
@@ -185,9 +257,10 @@ async fn status(ctx: &Ctx) -> Result<()> {
         Ok(v) => {
             let n = v.as_array().map(|a| a.len()).unwrap_or(0);
             println!(
-                "daemon: running (cluster '{}', namespace '{}', port-forward {}); {} project(s)",
+                "daemon: running (cluster '{}', system ns '{}', user ns '{}', port-forward {}); {} project(s)",
                 cfg.cluster_name,
-                cfg.namespace,
+                cfg.system_namespace,
+                cfg.default_user_namespace,
                 if pf_alive { "up" } else { "down" },
                 n,
             );
@@ -203,7 +276,9 @@ async fn logs(tail: usize, follow: bool) -> Result<()> {
     let cfg = cluster_config();
     let tail_arg = format!("--tail={tail}");
     let mut args: Vec<&str> = vec![
-        "-n", &cfg.namespace, "logs", "deployment/weft-dispatcher", &tail_arg,
+        "-n", &cfg.system_namespace,
+        "logs", "-l", "app=weft-dispatcher", "--prefix",
+        &tail_arg,
     ];
     if follow {
         args.push("-f");
@@ -276,13 +351,17 @@ async fn ensure_ingress_controller() -> Result<()> {
     if !status.success() {
         anyhow::bail!("ingress install failed with {status}");
     }
+    // `kubectl wait --for=condition=ready pod --selector=...` errors
+    // immediately if zero pods exist at the moment of the call.
+    // Right after `kubectl apply`, the Deployment is created but the
+    // ReplicaSet hasn't materialized any pods yet. `rollout status`
+    // handles that case (polls until at least one replica is ready).
     let wait = kubectl(&[
-        "wait",
-        "--namespace",
+        "-n",
         "ingress-nginx",
-        "--for=condition=ready",
-        "pod",
-        "--selector=app.kubernetes.io/component=controller",
+        "rollout",
+        "status",
+        "deployment/ingress-nginx-controller",
         "--timeout=180s",
     ])
     .status()
@@ -293,16 +372,48 @@ async fn ensure_ingress_controller() -> Result<()> {
     Ok(())
 }
 
-async fn ensure_namespace() -> Result<()> {
-    let repo_root = images::repo_root()?;
-    let manifest = repo_root.join("deploy/k8s/namespace.yaml");
-    kubectl_apply_file(&manifest).await
+/// Create `weft-internal-secret` with a random value if it doesn't
+/// exist. Idempotent: subsequent runs see the existing Secret and
+/// no-op. Not in dispatcher.yaml because `kubectl apply` would
+/// reset the secret to a placeholder on every re-apply.
+async fn ensure_internal_secret() -> Result<()> {
+    let cfg = cluster_config();
+    let out = kubectl(&[
+        "-n",
+        &cfg.system_namespace,
+        "get",
+        "secret",
+        "weft-internal-secret",
+        "-o",
+        "name",
+    ])
+    .output()
+    .await?;
+    if out.status.success() && !out.stdout.is_empty() {
+        return Ok(());
+    }
+    let fresh = uuid::Uuid::new_v4().simple().to_string();
+    let status = kubectl(&[
+        "-n",
+        &cfg.system_namespace,
+        "create",
+        "secret",
+        "generic",
+        "weft-internal-secret",
+        &format!("--from-literal=WEFT_INTERNAL_SECRET={fresh}"),
+    ])
+    .status()
+    .await?;
+    if !status.success() {
+        anyhow::bail!("create internal secret failed");
+    }
+    Ok(())
 }
 
 async fn wait_for_deployment_ready(name: &str) -> Result<()> {
     let cfg = cluster_config();
     let status = kubectl(&[
-        "-n", &cfg.namespace,
+        "-n", &cfg.system_namespace,
         "rollout", "status", &format!("deployment/{name}"),
         "--timeout=180s",
     ])
@@ -310,6 +421,93 @@ async fn wait_for_deployment_ready(name: &str) -> Result<()> {
     .await?;
     if !status.success() {
         anyhow::bail!("{name} did not reach Ready within 180s");
+    }
+    Ok(())
+}
+
+async fn wait_for_statefulset_ready(name: &str) -> Result<()> {
+    let cfg = cluster_config();
+    let status = kubectl(&[
+        "-n", &cfg.system_namespace,
+        "rollout", "status", &format!("statefulset/{name}"),
+        "--timeout=180s",
+    ])
+    .status()
+    .await?;
+    if !status.success() {
+        anyhow::bail!("{name} did not reach Ready within 180s");
+    }
+    Ok(())
+}
+
+/// Roll every per-tenant listener Deployment in the user
+/// namespace so they pick up a freshly-loaded listener image.
+/// Listener Deployments are named `listener-<tenant>`; we list
+/// by name prefix and `rollout restart` each one. Best-effort:
+/// errors are surfaced as warnings rather than aborting the
+/// daemon refresh, since a listener that fails to roll today is
+/// still recoverable next time the dispatcher re-spawns it.
+async fn roll_listener_deployments(cfg: &ClusterConfig) -> Result<()> {
+    let out = kubectl(&[
+        "-n",
+        &cfg.default_user_namespace,
+        "get",
+        "deployments",
+        "-o",
+        "jsonpath={.items[*].metadata.name}",
+    ])
+    .output()
+    .await?;
+    if !out.status.success() {
+        tracing::warn!(
+            target: "weft_cli::daemon",
+            "listing listener deployments failed; skipping listener roll"
+        );
+        return Ok(());
+    }
+    let names = String::from_utf8_lossy(&out.stdout);
+    let listeners: Vec<&str> = names
+        .split_whitespace()
+        .filter(|n| n.starts_with("listener-"))
+        .collect();
+    for name in &listeners {
+        let status = kubectl(&[
+            "-n",
+            &cfg.default_user_namespace,
+            "rollout",
+            "restart",
+            &format!("deployment/{name}"),
+        ])
+        .status()
+        .await?;
+        if !status.success() {
+            tracing::warn!(
+                target: "weft_cli::daemon",
+                "rollout restart deployment/{name} failed"
+            );
+            continue;
+        }
+        // Block briefly on each rollout so subsequent register
+        // calls hit the new Pod, not the old one mid-termination.
+        let wait = kubectl(&[
+            "-n",
+            &cfg.default_user_namespace,
+            "rollout",
+            "status",
+            &format!("deployment/{name}"),
+            "--timeout=120s",
+        ])
+        .status()
+        .await?;
+        if !wait.success() {
+            tracing::warn!(
+                target: "weft_cli::daemon",
+                "deployment/{name} did not reach Ready within 120s"
+            );
+        }
+    }
+    if !listeners.is_empty() {
+        println!("rolled {} listener deployment(s)", listeners.len());
     }
     Ok(())
 }
@@ -325,7 +523,7 @@ async fn start_port_forward() -> Result<()> {
     let child = std::process::Command::new("kubectl")
         .args([
             "--context", &cfg.kube_context,
-            "-n", &cfg.namespace,
+            "-n", &cfg.system_namespace,
             "port-forward", "svc/weft-dispatcher",
             &format!("{}:9999", cfg.dispatcher_port),
         ])

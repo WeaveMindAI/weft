@@ -112,7 +112,9 @@ async fn unregister(
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_admin(&state, &headers)?;
     // Dropping the registered signal aborts its task via TaskGuard.
-    state.registry.remove(&req.token);
+    if state.registry.remove(&req.token).is_some() {
+        state.relay.maybe_notify_empty().await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

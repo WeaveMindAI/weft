@@ -5,7 +5,7 @@
 # No alpine/musl to avoid the TLS/DNS issues we'd hit later with
 # reqwest's rustls vs system roots.
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 
@@ -38,8 +38,5 @@ ENV WEFT_CATALOG_ROOT=/catalog
 # Dispatcher listens on 9999 by default; map via WEFT_HTTP_PORT.
 ENV WEFT_HTTP_PORT=9999
 EXPOSE 9999
-
-# Journal + project store land here.
-ENV WEFT_DATA_DIR=/var/lib/weft
 
 CMD ["weft-dispatcher"]

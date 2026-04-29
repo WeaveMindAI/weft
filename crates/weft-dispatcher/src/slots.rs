@@ -79,6 +79,16 @@ pub enum Slot {
         worker: Option<WorkerHandle>,
         worker_instance_id: String,
     },
+    /// Worker reported `Stalled` (parked on suspensions) and is
+    /// alive but idle. We hold the WS sender so a fire arriving
+    /// before `grace_until` forwards directly without a respawn.
+    /// On expiry, kill the worker and transition to Idle.
+    StalledGrace {
+        sender: WorkerSender,
+        worker: Option<WorkerHandle>,
+        worker_instance_id: String,
+        grace_until: Instant,
+    },
 }
 
 /// A wake message queued for the next worker. The only thing the

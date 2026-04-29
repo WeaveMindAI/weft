@@ -29,7 +29,10 @@ pub mod router;
 pub mod relay;
 
 pub use config::ListenerConfig;
-pub use protocol::{FireRelay, RegisterRequest, RegisterResponse, UnregisterRequest};
+pub use protocol::{
+    EmptyNotice, FireRelay, RegisterMeNotice, RegisterRequest, RegisterResponse,
+    SignalFailedNotice, SignalFiredAck, UnregisterRequest,
+};
 pub use registry::{Registry, RegisteredSignal};
 pub use router::router;
 
@@ -46,11 +49,8 @@ pub struct ListenerState {
 impl ListenerState {
     pub fn new(config: ListenerConfig) -> Self {
         let config = Arc::new(config);
-        let relay = Arc::new(relay::FireRelayer::new(config.clone()));
-        Self {
-            config,
-            registry: Arc::new(Registry::new()),
-            relay,
-        }
+        let registry = Arc::new(Registry::new());
+        let relay = Arc::new(relay::FireRelayer::new(config.clone(), registry.clone()));
+        Self { config, registry, relay }
     }
 }

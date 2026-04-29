@@ -7,6 +7,7 @@
 //! across focused modules to avoid the 1700-line monolith.
 
 pub mod execution;
+pub mod mutations;
 pub mod preprocess;
 pub mod ready;
 pub mod postprocess;
@@ -14,7 +15,8 @@ pub mod skip;
 pub mod completion;
 pub mod typecheck;
 
-pub use execution::{NodeExecution, NodeExecutionStatus, NodeExecutionTable};
+pub use execution::{NodeAttempt, NodeExecution, NodeExecutionStatus, NodeExecutionTable};
+pub use mutations::{ExpandedChild, PulseMutation};
 pub use preprocess::preprocess_input;
 pub use ready::{find_ready_nodes, ReadyGroup};
 pub use postprocess::postprocess_output;

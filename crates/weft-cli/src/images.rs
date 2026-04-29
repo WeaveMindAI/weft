@@ -39,34 +39,57 @@ pub fn repo_root() -> Result<PathBuf> {
 }
 
 /// Ensure `weft-dispatcher:local` exists in the local docker image
-/// cache. Rebuild if `rebuild == true` or if it's missing.
-pub async fn ensure_dispatcher_image(tag: &str, rebuild: bool) -> Result<()> {
+/// cache. Rebuild only when the build inputs changed (or the image
+/// is missing, or `rebuild == true && inputs changed`). Returns
+/// `true` if a rebuild actually happened, `false` if the cache hit.
+pub async fn ensure_dispatcher_image(tag: &str, rebuild: bool) -> Result<bool> {
     let root = repo_root()?;
-    ensure_image(
-        tag,
-        &root.join("deploy/docker/dispatcher.Dockerfile"),
-        &root,
-        rebuild,
-    )
-    .await
+    let dockerfile = root.join("deploy/docker/dispatcher.Dockerfile");
+    let inputs = vec![
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+        dockerfile.clone(),
+        root.join("crates"),
+        root.join("catalog"),
+    ];
+    ensure_image(tag, &dockerfile, &root, &inputs, rebuild).await
 }
 
-pub async fn ensure_listener_image(tag: &str, rebuild: bool) -> Result<()> {
+pub async fn ensure_listener_image(tag: &str, rebuild: bool) -> Result<bool> {
     let root = repo_root()?;
-    ensure_image(
-        tag,
-        &root.join("deploy/docker/listener.Dockerfile"),
-        &root,
-        rebuild,
-    )
-    .await
+    let dockerfile = root.join("deploy/docker/listener.Dockerfile");
+    let inputs = vec![
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+        dockerfile.clone(),
+        root.join("crates"),
+        root.join("catalog"),
+    ];
+    ensure_image(tag, &dockerfile, &root, &inputs, rebuild).await
 }
 
-async fn ensure_image(tag: &str, dockerfile: &Path, context: &Path, rebuild: bool) -> Result<()> {
-    if !rebuild && image_present(tag).await? {
-        return Ok(());
+async fn ensure_image(
+    tag: &str,
+    dockerfile: &Path,
+    context: &Path,
+    inputs: &[PathBuf],
+    rebuild: bool,
+) -> Result<bool> {
+    let want_hash = hash_inputs(inputs)?;
+    let stamp_path = stamp_path_for(tag);
+    let have_hash = std::fs::read_to_string(&stamp_path).ok().map(|s| s.trim().to_string());
+    let image_exists = image_present(tag).await?;
+
+    if image_exists && have_hash.as_deref() == Some(want_hash.as_str()) {
+        let reason = if rebuild { "no source changes" } else { "image cached" };
+        println!("image {tag} up to date ({reason}); skipping rebuild");
+        return Ok(false);
     }
-    println!("building image {tag} (this may take several minutes on first run)");
+
+    println!(
+        "building image {tag} (this may take several minutes on first run; \
+         subsequent builds are incremental)"
+    );
     let status = Command::new("docker")
         .args(["build", "-t", tag, "-f"])
         .arg(dockerfile)
@@ -76,7 +99,99 @@ async fn ensure_image(tag: &str, dockerfile: &Path, context: &Path, rebuild: boo
     if !status.success() {
         anyhow::bail!("docker build {tag} failed with {status}");
     }
+    if let Some(parent) = stamp_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&stamp_path, want_hash);
+    Ok(true)
+}
+
+/// Stable per-tag stamp file. `weft-dispatcher:local` ->
+/// `~/.local/share/weft/image-hashes/weft-dispatcher__local.hash`.
+fn stamp_path_for(tag: &str) -> PathBuf {
+    let safe_tag = tag.replace([':', '/'], "__");
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/share/weft/image-hashes");
+    base.join(format!("{safe_tag}.hash"))
+}
+
+/// Hash every regular file under each input path. Directory args
+/// recurse; file args hash the file content. We hash both the
+/// path (relative to the input root) and the content so a rename
+/// invalidates the cache too.
+fn hash_inputs(inputs: &[PathBuf]) -> Result<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for input in inputs {
+        if !input.exists() {
+            // Missing optional input: hash the path so a future
+            // appearance invalidates.
+            input.to_string_lossy().hash(&mut hasher);
+            continue;
+        }
+        if input.is_file() {
+            hash_file(input, &mut hasher)?;
+        } else if input.is_dir() {
+            hash_dir(input, &mut hasher)?;
+        }
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn hash_file(path: &Path, hasher: &mut std::collections::hash_map::DefaultHasher) -> Result<()> {
+    use std::hash::Hash;
+    path.to_string_lossy().hash(hasher);
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read {} for hashing", path.display()))?;
+    bytes.hash(hasher);
     Ok(())
+}
+
+fn hash_dir(dir: &Path, hasher: &mut std::collections::hash_map::DefaultHasher) -> Result<()> {
+    // Walk in deterministic order so the hash is stable across runs.
+    // We skip target/ and node_modules/ even if they appear inside
+    // an input dir; cargo / pnpm scratch should never invalidate
+    // the docker build hash.
+    let mut entries: Vec<PathBuf> = walk_dir(dir)?;
+    entries.sort();
+    for entry in entries {
+        if is_ignored(&entry) {
+            continue;
+        }
+        if entry.is_file() {
+            hash_file(&entry, hasher)?;
+        }
+    }
+    Ok(())
+}
+
+fn walk_dir(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("read_dir {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if is_ignored(&path) {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn is_ignored(path: &Path) -> bool {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    matches!(name, "target" | "node_modules" | ".git" | ".weft")
 }
 
 async fn image_present(tag: &str) -> Result<bool> {

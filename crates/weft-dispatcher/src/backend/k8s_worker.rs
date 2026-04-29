@@ -1,7 +1,7 @@
 //! K8s worker backend. Each execution runs as a short-lived Pod in
-//! the dispatcher's namespace. Image: `weft-worker-<project-id>`
-//! produced by `weft build`. Container args connect it back to the
-//! dispatcher over cluster DNS.
+//! the tenant's namespace (passed via `WakeContext`). Image:
+//! `weft-worker-<project-id>` produced by `weft build`. Container
+//! args connect it back to the dispatcher over cluster DNS.
 //!
 //! Why Pods and not Jobs: we don't need retry semantics (the
 //! dispatcher replays from the journal on crash). A naked Pod is
@@ -13,15 +13,21 @@ use tokio::process::Command;
 use crate::backend::{WakeContext, WorkerBackend, WorkerHandle};
 
 pub struct K8sWorkerBackend {
-    namespace: String,
     /// DNS name of the dispatcher service, reachable from inside
-    /// the cluster. e.g. `http://weft-dispatcher.wm-local.svc.cluster.local:9999`.
+    /// the cluster. e.g. `http://weft-dispatcher.weft-system.svc.cluster.local:9999`.
     dispatcher_url: String,
+    /// Stored separately from `WakeContext::namespace` so kill ops
+    /// on a stale handle still resolve to the right namespace via
+    /// a per-handle lookup. We index this map at spawn time.
+    handle_namespaces: dashmap::DashMap<String, String>,
 }
 
 impl K8sWorkerBackend {
-    pub fn new(namespace: String, dispatcher_url: String) -> Self {
-        Self { namespace, dispatcher_url }
+    pub fn new(dispatcher_url: String) -> Self {
+        Self {
+            dispatcher_url,
+            handle_namespaces: dashmap::DashMap::new(),
+        }
     }
 }
 
@@ -37,20 +43,42 @@ impl WorkerBackend for K8sWorkerBackend {
 
         let manifest = render_pod_manifest(
             &pod_name,
-            &self.namespace,
+            &wake.namespace,
             &image,
             &wake.color.to_string(),
             &self.dispatcher_url,
             &wake.project_id,
+            &wake.tenant,
         );
         kubectl_apply_manifest(&manifest).await?;
+        self.handle_namespaces.insert(pod_name.clone(), wake.namespace);
         Ok(WorkerHandle { id: pod_name })
     }
 
+    fn idle_grace_seconds(&self) -> u64 {
+        // K8s pod spawn is multi-second; keeping a parked worker
+        // around for a few seconds saves a cold-start when a human
+        // replies fast. Override via env if pod density is more
+        // valuable than respawn latency.
+        std::env::var("WEFT_K8S_WORKER_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10)
+    }
+
     async fn kill_worker(&self, handle: WorkerHandle) -> anyhow::Result<()> {
+        let ns = self
+            .handle_namespaces
+            .remove(&handle.id)
+            .map(|(_, ns)| ns);
+        let Some(ns) = ns else {
+            // No record of this handle. Either it was already
+            // killed or this is a foreign handle. Skip.
+            return Ok(());
+        };
         let _ = Command::new("kubectl")
             .args([
-                "-n", &self.namespace, "delete", "pod", &handle.id,
+                "-n", &ns, "delete", "pod", &handle.id,
                 "--ignore-not-found", "--wait=false",
             ])
             .status()
@@ -70,6 +98,7 @@ fn render_pod_manifest(
     color: &str,
     dispatcher_url: &str,
     project_id: &str,
+    tenant: &str,
 ) -> String {
     format!(
         r#"apiVersion: v1
@@ -79,6 +108,7 @@ metadata:
   namespace: {namespace}
   labels:
     weft.dev/role: worker
+    weft.dev/tenant: "{tenant}"
     weft.dev/project: "{project_id}"
     weft.dev/color: "{color}"
 spec:

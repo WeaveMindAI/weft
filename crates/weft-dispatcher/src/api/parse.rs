@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use weft_catalog::{FsCatalog, stdlib_catalog};
 use weft_compiler::Diagnostic;
-use weft_core::{node::NodeMetadata, MetadataCatalog, ProjectDefinition};
+use weft_core::node::{FormFieldSpec, NodeMetadata};
+use weft_core::{MetadataCatalog, ProjectDefinition};
 
 use crate::state::DispatcherState;
 
@@ -26,10 +27,17 @@ pub struct ParseRequest {
 }
 
 /// Catalog metadata for one node type, wire format for the VS Code
-/// extension. Mirrors the fields of `NodeMetadata` the webview needs
-/// to render a node (icon, color, description, fields, features,
-/// ports). The webview's `protocol.ts` has the matching TS type.
-pub type CatalogEntry = NodeMetadata;
+/// extension. Bundles `NodeMetadata` (icon/color/fields/features/
+/// ports) with the per-node `form_field_specs` so the form_builder
+/// editor can populate its field-type dropdown without a separate
+/// fetch. Same shape as `describe::NodeEntry`.
+#[derive(Debug, Serialize)]
+pub struct CatalogEntry {
+    #[serde(flatten)]
+    pub metadata: NodeMetadata,
+    #[serde(rename = "formFieldSpecs", default, skip_serializing_if = "Vec::is_empty")]
+    pub form_field_specs: Vec<FormFieldSpec>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ParseResponse {
@@ -54,9 +62,10 @@ pub async fn parse(
 }
 
 /// For each node type present in the project, pull its catalog entry
-/// (the `NodeMetadata` from metadata.json). Hidden node types (like
-/// Passthrough) are omitted. Unknown types are skipped: `/parse` is
-/// lenient, the webview renders them as placeholders.
+/// (the `NodeMetadata` from metadata.json + form_field_specs).
+/// Hidden node types (like Passthrough) are omitted. Unknown types
+/// are skipped: `/parse` is lenient, the webview renders them as
+/// placeholders.
 fn collect_catalog(
     project: &ProjectDefinition,
     catalog: &FsCatalog,
@@ -70,7 +79,11 @@ fn collect_catalog(
             if meta.features.hidden {
                 continue;
             }
-            out.insert(node.node_type.clone(), meta.clone());
+            let specs = catalog.form_field_specs(&node.node_type).to_vec();
+            out.insert(
+                node.node_type.clone(),
+                CatalogEntry { metadata: meta.clone(), form_field_specs: specs },
+            );
         }
     }
     out

@@ -70,7 +70,19 @@ pub async fn clean(
     color: Option<String>,
     keep_days: u32,
     all: bool,
+    images: bool,
+    build_cache: bool,
 ) -> anyhow::Result<()> {
+    if images || build_cache {
+        if images {
+            clean_worker_images(all).await?;
+        }
+        if build_cache {
+            clean_build_cache().await?;
+        }
+        return Ok(());
+    }
+
     let client = ctx.client();
     if let Some(c) = color {
         client.delete(&format!("/executions/{c}")).await?;
@@ -104,6 +116,62 @@ pub async fn clean(
         println!("deleted {count} executions (all)");
     } else {
         println!("deleted {count} executions older than {keep_days}d");
+    }
+    Ok(())
+}
+
+/// Reclaim dangling worker images. Without `--all`, scoped to the
+/// cwd project (whose id we read from `weft.toml`). With `--all`,
+/// nukes every dangling image labelled `weft.dev/project=...`.
+async fn clean_worker_images(all: bool) -> anyhow::Result<()> {
+    use tokio::process::Command;
+    let mut args: Vec<String> = vec![
+        "image".into(),
+        "prune".into(),
+        "--force".into(),
+        "--filter".into(),
+        "dangling=true".into(),
+        "--filter".into(),
+    ];
+    if all {
+        args.push("label=weft.dev/project".into());
+        println!("pruning dangling worker images for every project");
+    } else {
+        // cwd project. If we can't discover one, bail with a hint
+        // instead of silently nuking everything.
+        let cwd = std::env::current_dir()?;
+        let project = weft_compiler::project::Project::discover(&cwd).map_err(|e| {
+            anyhow::anyhow!(
+                "no Weft project discovered from {} ({e}); pass --all to clean every project's images",
+                cwd.display()
+            )
+        })?;
+        args.push(format!("label=weft.dev/project={}", project.id()));
+        println!(
+            "pruning dangling worker images for project {} ({})",
+            project.manifest.package.name,
+            project.id()
+        );
+    }
+    let status = Command::new("docker").args(&args).status().await?;
+    if !status.success() {
+        anyhow::bail!("docker image prune exited {status}");
+    }
+    Ok(())
+}
+
+/// `docker buildx prune` reclaims BuildKit's intermediate layers.
+/// This is the heavy reclaim: cargo deps, intermediate Rust compile
+/// state, etc. The next build will re-download deps and re-link.
+async fn clean_build_cache() -> anyhow::Result<()> {
+    use tokio::process::Command;
+    println!("pruning docker BuildKit cache (next build will be slower)…");
+    let status = Command::new("docker")
+        .args(["buildx", "prune", "--force"])
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("docker buildx prune exited {status}");
     }
     Ok(())
 }

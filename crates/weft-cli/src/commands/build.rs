@@ -72,7 +72,14 @@ pub async fn ensure_worker_image(
         );
     }
 
-    docker_build(tag, &build.build_context).await?;
+    let project_id = project_id_from_tag(tag);
+    docker_build(tag, &build.build_context, &project_id).await?;
+    // After a successful rebuild the previous content of the same
+    // tag is now a dangling `<none>:<none>` image. Prune those
+    // labelled with this project's id so accumulating rebuilds
+    // don't leave a trail of orphaned images. Cargo build cache
+    // (the heavy part) lives in BuildKit and survives this.
+    prune_dangling_for_project(&project_id).await;
     let cfg = cluster_config();
     match cfg.backend {
         ClusterBackend::Kind if kind_available(&cfg.cluster_name).await => {
@@ -95,10 +102,15 @@ pub async fn ensure_worker_image(
     Ok(())
 }
 
-async fn docker_build(tag: &str, ctx_dir: &std::path::Path) -> Result<()> {
+async fn docker_build(
+    tag: &str,
+    ctx_dir: &std::path::Path,
+    project_id: &str,
+) -> Result<()> {
     println!("building image {tag}");
+    let label = format!("weft.dev/project={project_id}");
     let status = Command::new("docker")
-        .args(["build", "-t", tag, "-f"])
+        .args(["build", "-t", tag, "--label", &label, "-f"])
         .arg(ctx_dir.join("Dockerfile"))
         .arg(ctx_dir)
         .env("DOCKER_BUILDKIT", "1")
@@ -108,6 +120,33 @@ async fn docker_build(tag: &str, ctx_dir: &std::path::Path) -> Result<()> {
         anyhow::bail!("docker build {tag} exited {status}");
     }
     Ok(())
+}
+
+/// `weft-worker-<id>:latest` -> `<id>`. Used as the docker label
+/// value so we can prune dangling images for one project without
+/// touching others.
+fn project_id_from_tag(tag: &str) -> String {
+    let prefix = "weft-worker-";
+    let stripped = tag.strip_prefix(prefix).unwrap_or(tag);
+    stripped.split(':').next().unwrap_or(stripped).to_string()
+}
+
+/// Remove every dangling image labelled with this project. Best
+/// effort: a transient docker error doesn't fail the build.
+async fn prune_dangling_for_project(project_id: &str) {
+    let label_filter = format!("label=weft.dev/project={project_id}");
+    let _ = Command::new("docker")
+        .args([
+            "image",
+            "prune",
+            "--force",
+            "--filter",
+            "dangling=true",
+            "--filter",
+            &label_filter,
+        ])
+        .status()
+        .await;
 }
 
 async fn kind_available(cluster_name: &str) -> bool {

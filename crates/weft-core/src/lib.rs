@@ -17,7 +17,7 @@ pub use node::{
     ValidationLevel, ValidationRule,
 };
 pub use primitive::{
-    CostReport, Delivery, DispatcherToWorker, ExecutionSnapshot, FormField, FormFieldType,
+    CostReport, Delivery, DispatcherToWorker, ExecutionSnapshot, FormField,
     FormSchema, RootSeed, SignalResolveError, SuspensionInfo, TimerSpec, WakeMessage,
     WakeSignalKind, WakeSignalKindTag, WakeSignalSpec, WakeSignalTag, WebhookAuth,
     WorkerToDispatcher,

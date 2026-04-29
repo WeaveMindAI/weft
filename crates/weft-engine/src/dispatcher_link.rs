@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures::{sink::SinkExt, stream::StreamExt};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -36,7 +36,19 @@ pub type WsConn = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// Maximum wall time the supervisor spends trying to reconnect
 /// after a socket drop before giving up. Matches the dispatcher
 /// side's grace window.
-const RECONNECT_BUDGET: Duration = Duration::from_secs(30);
+/// How long the worker waits for the dispatcher to come back. A
+/// rolling deploy of the dispatcher StatefulSet can take a few
+/// minutes if every Pod cycles. Default 5 minutes; override via
+/// env `WEFT_WORKER_RECONNECT_BUDGET_SECS`.
+const RECONNECT_BUDGET_DEFAULT_SECS: u64 = 300;
+
+fn reconnect_budget() -> Duration {
+    let secs = std::env::var("WEFT_WORKER_RECONNECT_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(RECONNECT_BUDGET_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
 /// Delay between reconnect attempts.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -99,13 +111,28 @@ enum DeliverySlot {
 #[derive(Default)]
 struct ControlState {
     stalled_ack: Option<oneshot::Sender<()>>,
-    cancel: Option<oneshot::Sender<()>>,
+    /// Cancellation Notify shared with the loop driver. When the
+    /// dispatcher sends `DispatcherToWorker::Cancel`, the link
+    /// fires this so `loop_driver` exits with `LoopOutcome::Failed`.
+    /// Set by `DispatcherLink::set_cancellation` at startup; left
+    /// `None` for code paths that don't want cancellation (tests).
+    cancel: Option<Arc<Notify>>,
+    /// Notifier the loop driver awaits after `link.stall()`. The
+    /// inbound router sets `post_stall_decision` (true on Deliver,
+    /// false on Exit / Cancel) and notifies. The driver reads the
+    /// decision and either re-enters `drive` or exits.
+    post_stall: Option<Arc<Notify>>,
+    post_stall_decision: Option<bool>,
 }
 
 #[derive(Debug)]
 pub struct TokenReply {
     pub token: String,
     pub user_url: Option<String>,
+    /// Filled when the dispatcher rejected the request (listener
+    /// spawn failed, transient cluster error). Caller fails just
+    /// the requesting node's lane; the WS stays open for siblings.
+    pub error: Option<String>,
 }
 
 /// Reply from the dispatcher to `provision_sidecar`. Either the
@@ -183,6 +210,17 @@ impl DispatcherLink {
     /// than `Live` and resumes dispatching when it flips back.
     pub fn status(&self) -> watch::Receiver<LinkStatus> {
         self.inner.status.clone()
+    }
+
+    /// Register the cancellation Notify the loop driver awaits. The
+    /// link fires it when the dispatcher sends
+    /// `DispatcherToWorker::Cancel`, which causes the loop to exit
+    /// with `LoopOutcome::Failed { error: "cancelled" }` on its next
+    /// scheduling tick. Without this, Cancel messages are silently
+    /// dropped — the protocol exists but the engine has no hook.
+    pub async fn set_cancellation(&self, notify: Arc<Notify>) {
+        let mut c = self.inner.control.lock().await;
+        c.cancel = Some(notify);
     }
 
     pub async fn send(&self, msg: WorkerToDispatcher) {
@@ -297,6 +335,36 @@ impl DispatcherLink {
         matches!(p.awaiting_value.get(token), Some(DeliverySlot::Ready(_)))
     }
 
+    /// Tokens that currently have a Ready delivery slot (a value
+    /// was either Deliver'd from the dispatcher or seeded from a
+    /// snapshot's pending_deliveries). The engine uses this after
+    /// a stall+wake to identify which lanes need their pulses
+    /// un-absorbed so `find_ready_nodes` re-dispatches them. Order
+    /// is unspecified.
+    pub async fn ready_delivery_tokens(&self) -> Vec<String> {
+        let p = self.inner.pending.lock().await;
+        p.awaiting_value
+            .iter()
+            .filter_map(|(k, v)| match v {
+                DeliverySlot::Ready(_) => Some(k.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Look at a seeded delivery without consuming it. Returns
+    /// `None` if no Ready slot exists for `token`. Used by the
+    /// dispatch loop to ship `NodeResumed { value }` before the
+    /// node's `await_signal` actually consumes the value via
+    /// `wait_for_delivery`.
+    pub async fn peek_seeded_delivery(&self, token: &str) -> Option<serde_json::Value> {
+        let p = self.inner.pending.lock().await;
+        match p.awaiting_value.get(token) {
+            Some(DeliverySlot::Ready(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     pub async fn wait_for_delivery(&self, token: String) -> anyhow::Result<serde_json::Value> {
         {
             let mut p = self.inner.pending.lock().await;
@@ -322,12 +390,34 @@ impl DispatcherLink {
 
     pub async fn stall(&self) {
         let (tx, rx) = oneshot::channel();
+        let post_stall = Arc::new(Notify::new());
         {
             let mut c = self.inner.control.lock().await;
             c.stalled_ack = Some(tx);
+            c.post_stall = Some(post_stall);
+            c.post_stall_decision = None;
         }
         self.send(WorkerToDispatcher::Stalled).await;
         let _ = rx.await;
+    }
+
+    /// Wait for the dispatcher's post-stall verdict. Returns true
+    /// when a `Deliver` arrived during the grace window (the loop
+    /// driver should re-enter `drive`). Returns false when the
+    /// dispatcher told us to exit (grace expired or cancel).
+    pub async fn wait_after_stall(&self) -> bool {
+        let notify = {
+            let c = self.inner.control.lock().await;
+            c.post_stall.clone()
+        };
+        let Some(notify) = notify else {
+            return false;
+        };
+        notify.notified().await;
+        let mut c = self.inner.control.lock().await;
+        let decision = c.post_stall_decision.take().unwrap_or(false);
+        c.post_stall = None;
+        decision
     }
 
     pub async fn completed(&self, outputs: serde_json::Value) {
@@ -394,7 +484,7 @@ async fn supervisor(mut ctx: SupervisorCtx, mut conn: SplitConn) {
                 tracing::warn!(
                     target: "weft_engine::link",
                     "socket dropped; entering reconnect loop (budget {}s)",
-                    RECONNECT_BUDGET.as_secs()
+                    reconnect_budget().as_secs()
                 );
                 let _ = ctx.status.send(LinkStatus::Disconnected);
             }
@@ -413,8 +503,9 @@ async fn supervisor(mut ctx: SupervisorCtx, mut conn: SplitConn) {
         };
 
         let start_time = std::time::Instant::now();
+        let budget = reconnect_budget();
         let mut new_conn: Option<SplitConn> = None;
-        while start_time.elapsed() < RECONNECT_BUDGET {
+        while start_time.elapsed() < budget {
             tokio::time::sleep(RECONNECT_INTERVAL).await;
             match connect_async(&ctx.url).await {
                 Ok((ws, _)) => {
@@ -535,16 +626,16 @@ async fn route_inbound(ctx: &SupervisorCtx, msg: DispatcherToWorker) -> bool {
         DispatcherToWorker::Start { .. } => {
             tracing::warn!(target: "weft_engine::link", "duplicate Start ignored");
         }
-        DispatcherToWorker::SuspensionToken { request_id, token, user_url } => {
+        DispatcherToWorker::SuspensionToken { request_id, token, user_url, error } => {
             let mut p = ctx.pending.lock().await;
             if let Some(tx) = p.awaiting_token.remove(&request_id) {
-                let _ = tx.send(TokenReply { token, user_url });
+                let _ = tx.send(TokenReply { token, user_url, error });
             }
         }
-        DispatcherToWorker::RegisterSignalAck { request_id, token, user_url } => {
+        DispatcherToWorker::RegisterSignalAck { request_id, token, user_url, error } => {
             let mut p = ctx.pending.lock().await;
             if let Some(tx) = p.awaiting_register.remove(&request_id) {
-                let _ = tx.send(TokenReply { token, user_url });
+                let _ = tx.send(TokenReply { token, user_url, error });
             }
         }
         DispatcherToWorker::SidecarEndpoint { request_id, endpoint } => {
@@ -572,14 +663,25 @@ async fn route_inbound(ctx: &SupervisorCtx, msg: DispatcherToWorker) -> bool {
             }
         }
         DispatcherToWorker::Deliver(Delivery { token, value }) => {
-            let mut p = ctx.pending.lock().await;
-            match p.awaiting_value.remove(&token) {
-                Some(DeliverySlot::Ongoing(tx)) => {
-                    let _ = tx.send(value);
+            {
+                let mut p = ctx.pending.lock().await;
+                match p.awaiting_value.remove(&token) {
+                    Some(DeliverySlot::Ongoing(tx)) => {
+                        let _ = tx.send(value);
+                    }
+                    Some(DeliverySlot::Ready(_)) | None => {
+                        p.awaiting_value.insert(token, DeliverySlot::Ready(value));
+                    }
                 }
-                Some(DeliverySlot::Ready(_)) | None => {
-                    p.awaiting_value.insert(token, DeliverySlot::Ready(value));
-                }
+            }
+            // If the worker is waiting after a stall, the arrival
+            // of a Deliver is the signal to unpark and re-enter
+            // the loop. Lock order: pending first, then control,
+            // so we don't deadlock with stall().
+            let mut c = ctx.control.lock().await;
+            if let Some(notify) = c.post_stall.clone() {
+                c.post_stall_decision = Some(true);
+                notify.notify_one();
             }
         }
         DispatcherToWorker::StalledAck => {
@@ -588,10 +690,28 @@ async fn route_inbound(ctx: &SupervisorCtx, msg: DispatcherToWorker) -> bool {
                 let _ = tx.send(());
             }
         }
-        DispatcherToWorker::Cancel => {
+        DispatcherToWorker::Exit => {
             let mut c = ctx.control.lock().await;
-            if let Some(tx) = c.cancel.take() {
-                let _ = tx.send(());
+            if let Some(notify) = c.post_stall.clone() {
+                c.post_stall_decision = Some(false);
+                notify.notify_one();
+            }
+        }
+        DispatcherToWorker::Cancel => {
+            // If parked post-stall, exit cleanly.
+            {
+                let mut c = ctx.control.lock().await;
+                if let Some(notify) = c.post_stall.clone() {
+                    c.post_stall_decision = Some(false);
+                    notify.notify_one();
+                }
+            }
+            let notify = {
+                let c = ctx.control.lock().await;
+                c.cancel.clone()
+            };
+            if let Some(notify) = notify {
+                notify.notify_one();
             }
         }
     }

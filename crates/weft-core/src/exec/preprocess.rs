@@ -20,13 +20,18 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::exec::mutations::{ExpandedChild, PulseMutation};
 use crate::exec::typecheck::runtime_type_check;
 use crate::lane::{Lane, LaneFrame};
 use crate::project::{LaneMode, NodeDefinition, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
 use crate::Color;
 
-pub fn preprocess_input(project: &ProjectDefinition, pulses: &mut PulseTable) -> bool {
+pub fn preprocess_input(
+    project: &ProjectDefinition,
+    pulses: &mut PulseTable,
+    mutations: &mut Vec<PulseMutation>,
+) -> bool {
     let mut work = Vec::new();
 
     for node in &project.nodes {
@@ -39,7 +44,7 @@ pub fn preprocess_input(project: &ProjectDefinition, pulses: &mut PulseTable) ->
     }
 
     for w in work {
-        apply(w, project, pulses);
+        apply(w, project, pulses, mutations);
     }
     true
 }
@@ -152,14 +157,24 @@ fn collect_gather_work(node: &NodeDefinition, pulses: &PulseTable, out: &mut Vec
 // Work application (mutating phase)
 // ---------------------------------------------------------------------------
 
-fn apply(work: Work, project: &ProjectDefinition, pulses: &mut PulseTable) {
+fn apply(
+    work: Work,
+    project: &ProjectDefinition,
+    pulses: &mut PulseTable,
+    mutations: &mut Vec<PulseMutation>,
+) {
     match work {
-        Work::Expand(w) => apply_expand(w, project, pulses),
-        Work::Gather(w) => apply_gather(w, project, pulses),
+        Work::Expand(w) => apply_expand(w, project, pulses, mutations),
+        Work::Gather(w) => apply_gather(w, project, pulses, mutations),
     }
 }
 
-fn apply_expand(w: ExpandWork, project: &ProjectDefinition, pulses: &mut PulseTable) {
+fn apply_expand(
+    w: ExpandWork,
+    project: &ProjectDefinition,
+    pulses: &mut PulseTable,
+    mutations: &mut Vec<PulseMutation>,
+) {
     if let Some(ps) = pulses.get_mut(&w.node_id) {
         if let Some(p) = ps.iter_mut().find(|p| p.id == w.absorb_pulse) {
             p.absorb();
@@ -174,6 +189,7 @@ fn apply_expand(w: ExpandWork, project: &ProjectDefinition, pulses: &mut PulseTa
         .map(|p| &p.port_type);
 
     let bucket = pulses.entry(w.node_id.clone()).or_default();
+    let mut children = Vec::with_capacity(w.leaves.len());
     for (lane_suffix, item) in &w.leaves {
         let mut child_lane = w.base_lane.clone();
         child_lane.extend_from_slice(lane_suffix);
@@ -190,11 +206,31 @@ fn apply_expand(w: ExpandWork, project: &ProjectDefinition, pulses: &mut PulseTa
             _ => item.clone(),
         };
 
-        bucket.push(Pulse::new(w.color, child_lane, w.node_id.clone(), w.port.clone(), checked));
+        let pulse = Pulse::new(w.color, child_lane, w.node_id.clone(), w.port.clone(), checked.clone());
+        children.push(ExpandedChild {
+            pulse_id: pulse.id,
+            lane_suffix: lane_suffix.clone(),
+            value: checked,
+        });
+        bucket.push(pulse);
     }
+
+    mutations.push(PulseMutation::Expanded {
+        node_id: w.node_id,
+        port: w.port,
+        absorbed_pulse_id: w.absorb_pulse,
+        color: w.color,
+        base_lane: w.base_lane,
+        children,
+    });
 }
 
-fn apply_gather(w: GatherWork, project: &ProjectDefinition, pulses: &mut PulseTable) {
+fn apply_gather(
+    w: GatherWork,
+    project: &ProjectDefinition,
+    pulses: &mut PulseTable,
+    mutations: &mut Vec<PulseMutation>,
+) {
     if let Some(ps) = pulses.get_mut(&w.node_id) {
         for p in ps.iter_mut() {
             if w.absorb_pulses.contains(&p.id) {
@@ -222,9 +258,20 @@ fn apply_gather(w: GatherWork, project: &ProjectDefinition, pulses: &mut PulseTa
     }
 
     let bucket = pulses.entry(w.node_id.clone()).or_default();
-    let mut pulse = Pulse::new(w.color, w.parent_lane, w.node_id, w.port, gathered);
+    let mut pulse = Pulse::new(w.color, w.parent_lane.clone(), w.node_id.clone(), w.port.clone(), gathered.clone());
     pulse.gathered = true;
+    let pulse_id = pulse.id;
     bucket.push(pulse);
+
+    mutations.push(PulseMutation::Gathered {
+        node_id: w.node_id,
+        port: w.port,
+        absorbed_pulse_ids: w.absorb_pulses,
+        color: w.color,
+        parent_lane: w.parent_lane,
+        pulse_id,
+        value: gathered,
+    });
 }
 
 // ---------------------------------------------------------------------------

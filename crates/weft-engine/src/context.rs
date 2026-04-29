@@ -77,29 +77,210 @@ impl RunnerHandle {
 /// the caller's control flow guarantees ordering: if you call
 /// ship_node_event(Started) then ship_node_event(Completed), the
 /// dispatcher sees them in that order.
-pub async fn ship_node_event(
+/// Ship `NodeStarted`: first dispatch of (node, lane). Creates
+/// the dispatcher's execution record. After this, the same
+/// record evolves through Suspended/Resumed/Completed/Failed —
+/// no second `NodeStarted` for the same logical execution.
+pub async fn ship_node_started(
     link: Option<&DispatcherLink>,
-    _color: Color,
     node_id: &str,
     lane: &weft_core::lane::Lane,
-    kind: &'static str,
-    input: Option<&serde_json::Value>,
-    output: Option<&serde_json::Value>,
-    error: Option<&str>,
+    input: &serde_json::Value,
     pulses_absorbed: &[uuid::Uuid],
 ) {
     let Some(link) = link else { return };
     let lane_str = serde_json::to_string(lane).unwrap_or_default();
-    let msg = WorkerToDispatcher::NodeEvent {
+    link.send(WorkerToDispatcher::NodeStarted {
         node_id: node_id.to_string(),
         lane: lane_str,
-        event: kind.to_string(),
-        input: input.cloned(),
-        output: output.cloned(),
-        error: error.map(|s| s.to_string()),
+        input: input.clone(),
         pulses_absorbed: pulses_absorbed.iter().map(|u| u.to_string()).collect(),
-    };
-    link.send(msg).await;
+    })
+    .await;
+}
+
+pub async fn ship_node_suspended(
+    link: Option<&DispatcherLink>,
+    node_id: &str,
+    lane: &weft_core::lane::Lane,
+    token: &str,
+) {
+    let Some(link) = link else { return };
+    let lane_str = serde_json::to_string(lane).unwrap_or_default();
+    link.send(WorkerToDispatcher::NodeSuspended {
+        node_id: node_id.to_string(),
+        lane: lane_str,
+        token: token.to_string(),
+    })
+    .await;
+}
+
+pub async fn ship_node_resumed(
+    link: Option<&DispatcherLink>,
+    node_id: &str,
+    lane: &weft_core::lane::Lane,
+    token: &str,
+    value: &serde_json::Value,
+) {
+    let Some(link) = link else { return };
+    let lane_str = serde_json::to_string(lane).unwrap_or_default();
+    link.send(WorkerToDispatcher::NodeResumed {
+        node_id: node_id.to_string(),
+        lane: lane_str,
+        token: token.to_string(),
+        value: value.clone(),
+    })
+    .await;
+}
+
+pub async fn ship_node_completed(
+    link: Option<&DispatcherLink>,
+    node_id: &str,
+    lane: &weft_core::lane::Lane,
+    output: &serde_json::Value,
+) {
+    let Some(link) = link else { return };
+    let lane_str = serde_json::to_string(lane).unwrap_or_default();
+    link.send(WorkerToDispatcher::NodeCompleted {
+        node_id: node_id.to_string(),
+        lane: lane_str,
+        output: output.clone(),
+    })
+    .await;
+}
+
+pub async fn ship_node_failed(
+    link: Option<&DispatcherLink>,
+    node_id: &str,
+    lane: &weft_core::lane::Lane,
+    error: &str,
+) {
+    let Some(link) = link else { return };
+    let lane_str = serde_json::to_string(lane).unwrap_or_default();
+    link.send(WorkerToDispatcher::NodeFailed {
+        node_id: node_id.to_string(),
+        lane: lane_str,
+        error: error.to_string(),
+    })
+    .await;
+}
+
+pub async fn ship_node_skipped(
+    link: Option<&DispatcherLink>,
+    node_id: &str,
+    lane: &weft_core::lane::Lane,
+) {
+    let Some(link) = link else { return };
+    let lane_str = serde_json::to_string(lane).unwrap_or_default();
+    link.send(WorkerToDispatcher::NodeSkipped {
+        node_id: node_id.to_string(),
+        lane: lane_str,
+    })
+    .await;
+}
+
+/// Ship every pulse-table mutation the engine just performed as
+/// its own worker→dispatcher message. Order is preserved so the
+/// dispatcher's fold replays them in the same sequence the engine
+/// applied them. Called after each `preprocess_input` and
+/// `postprocess_output` invocation; the caller drains the vec.
+pub async fn ship_pulse_mutations(
+    link: Option<&DispatcherLink>,
+    mutations: Vec<weft_core::exec::PulseMutation>,
+) {
+    let Some(link) = link else { return };
+    if mutations.is_empty() {
+        return;
+    }
+    let mut emitted: Vec<weft_core::primitive::EmittedPulse> = Vec::new();
+    for m in mutations {
+        match m {
+            weft_core::exec::PulseMutation::Emitted {
+                pulse_id,
+                source_node,
+                source_port,
+                target_node,
+                target_port,
+                color: _,
+                lane,
+                value,
+            } => {
+                emitted.push(weft_core::primitive::EmittedPulse {
+                    pulse_id: pulse_id.to_string(),
+                    source_node,
+                    source_port,
+                    target_node,
+                    target_port,
+                    lane,
+                    value,
+                });
+            }
+            weft_core::exec::PulseMutation::Expanded {
+                node_id,
+                port,
+                absorbed_pulse_id,
+                color,
+                base_lane,
+                children,
+            } => {
+                if !emitted.is_empty() {
+                    link.send(WorkerToDispatcher::PulsesEmitted {
+                        pulses: std::mem::take(&mut emitted),
+                    })
+                    .await;
+                }
+                let children = children
+                    .into_iter()
+                    .map(|c| weft_core::primitive::ExpandedChild {
+                        pulse_id: c.pulse_id.to_string(),
+                        lane_suffix: c.lane_suffix,
+                        value: c.value,
+                    })
+                    .collect();
+                link.send(WorkerToDispatcher::PulsesExpanded {
+                    node_id,
+                    port,
+                    absorbed_pulse_id: absorbed_pulse_id.to_string(),
+                    color,
+                    base_lane,
+                    children,
+                })
+                .await;
+            }
+            weft_core::exec::PulseMutation::Gathered {
+                node_id,
+                port,
+                absorbed_pulse_ids,
+                color,
+                parent_lane,
+                pulse_id,
+                value,
+            } => {
+                if !emitted.is_empty() {
+                    link.send(WorkerToDispatcher::PulsesEmitted {
+                        pulses: std::mem::take(&mut emitted),
+                    })
+                    .await;
+                }
+                link.send(WorkerToDispatcher::PulsesGathered {
+                    node_id,
+                    port,
+                    absorbed_pulse_ids: absorbed_pulse_ids
+                        .into_iter()
+                        .map(|u| u.to_string())
+                        .collect(),
+                    color,
+                    parent_lane,
+                    pulse_id: pulse_id.to_string(),
+                    value,
+                })
+                .await;
+            }
+        }
+    }
+    if !emitted.is_empty() {
+        link.send(WorkerToDispatcher::PulsesEmitted { pulses: emitted }).await;
+    }
 }
 
 #[async_trait]
@@ -141,6 +322,9 @@ impl ContextHandle for RunnerHandle {
             .request_suspension(self.node_id.clone(), self.node_lane.clone(), spec)
             .await
             .map_err(|e| WeftError::Suspension(format!("request token: {e}")))?;
+        if let Some(err) = reply.error {
+            return Err(WeftError::Suspension(err));
+        }
         tracing::info!(
             target: "weft_engine::suspend",
             node = %self.node_id,
@@ -177,6 +361,9 @@ impl ContextHandle for RunnerHandle {
             .request_register_signal(self.node_id.clone(), spec)
             .await
             .map_err(|e| WeftError::Suspension(format!("register_signal: {e}")))?;
+        if let Some(err) = reply.error {
+            return Err(WeftError::Suspension(err));
+        }
         tracing::info!(
             target: "weft_engine::register",
             node = %self.node_id,

@@ -14,6 +14,7 @@
 //! - `/describe/*`: catalog introspection for tooling.
 
 use axum::{routing::{get, post}, Router};
+use tower_http::cors::CorsLayer;
 
 use crate::state::DispatcherState;
 
@@ -21,9 +22,11 @@ pub mod project;
 mod execution;
 mod events;
 mod extension;
+mod extension_names;
 mod dashboard;
 mod describe;
 mod infra;
+pub(crate) mod internal;
 mod parse;
 mod signal;
 pub mod ws;
@@ -55,6 +58,7 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/events/execution/{color}", get(events::execution_stream))
         .route("/ext/{token}/tasks", get(extension::list_tasks))
         .route("/ext/{token}/tasks/{execution_id}/complete", post(extension::complete_task))
+        .route("/ext/{token}/tasks/{execution_id}/cancel", post(extension::cancel_task))
         .route("/ext/{token}/triggers/{trigger_task_id}/submit", post(extension::submit_trigger))
         .route("/ext/{token}/actions/{action_id}/dismiss", post(extension::dismiss_action))
         .route("/ext/{token}/health", get(extension::health))
@@ -70,6 +74,23 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/parse", post(parse::parse))
         .route("/validate", post(parse::validate))
         .route("/signal-fired", post(signal::signal_fired))
+        .route("/signal-failed", post(signal::signal_failed))
+        .route("/listener/empty", post(signal::listener_empty))
+        .route("/listener/inspect", get(signal::listener_inspect))
+        .route("/listener/register-me", post(signal::listener_register_me))
+        .route("/internal/deliver-color", post(internal::deliver_color))
+        .route("/internal/cancel-color", post(internal::cancel_color))
         .route("/ws/executions/{color}", get(ws::connect))
+        // Permissive CORS so the browser extension popup / hosted
+        // task page (origins like `moz-extension://<id>` or
+        // `chrome-extension://<id>`) can hit /ext/*. Localhost
+        // dev only; if the dispatcher is ever exposed publicly,
+        // tighten this to specific origins.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
         .with_state(state)
 }

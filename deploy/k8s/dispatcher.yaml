@@ -1,22 +1,22 @@
 ---
-# ServiceAccount + RBAC so the dispatcher can manage Deployments,
-# Services, Pods, PVCs, ConfigMaps in its own namespace. These are
-# needed by KindInfraBackend (sidecars), K8sListenerBackend
-# (listener per project), and K8sWorkerBackend (worker per exec).
+# ServiceAccount for the dispatcher. Lives in `weft-system` (the
+# system namespace, kept separate from tenant workloads). The
+# binding below grants it cluster-wide read/write on the resources
+# it needs to manage in tenant namespaces (workers, listeners,
+# sidecars).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: weft-dispatcher
-  namespace: wm-local
+  namespace: weft-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: weft-dispatcher
-  namespace: wm-local
 rules:
   - apiGroups: [""]
-    resources: [pods, pods/log, services, configmaps, persistentvolumeclaims, events]
+    resources: [pods, pods/log, services, configmaps, persistentvolumeclaims, events, namespaces]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [apps]
     resources: [deployments, replicasets]
@@ -32,48 +32,37 @@ rules:
     verbs: [get, list, watch, create, update, patch, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: weft-dispatcher
-  namespace: wm-local
 subjects:
   - kind: ServiceAccount
     name: weft-dispatcher
-    namespace: wm-local
+    namespace: weft-system
 roleRef:
-  kind: Role
+  kind: ClusterRole
   name: weft-dispatcher
   apiGroup: rbac.authorization.k8s.io
 ---
-# Persistent storage for the journal + project store. Losing this
-# on a dispatcher restart means every active project comes back as
-# Inactive and every in-flight execution orphans; a PVC keeps them.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: weft-dispatcher-data
-  namespace: wm-local
-  labels:
-    weft.dev/role: dispatcher
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 1Gi
----
+# StatefulSet for the dispatcher.
+# Note: the `weft-internal-secret` Secret is created imperatively
+# by `weft daemon start` (NOT in this manifest). Re-applying this
+# file does not touch the Secret, so the fresh random value
+# survives manifest re-applies. Stable Pod IDs
+# (`weft-dispatcher-0`, `-1`, ...) so the lease tables in Postgres
+# can record `owner_pod_id` and any Pod can route forwards via
+# headless Service DNS.
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: weft-dispatcher
-  namespace: wm-local
+  namespace: weft-system
   labels:
     app: weft-dispatcher
 spec:
+  serviceName: weft-dispatcher-headless
   replicas: 1
-  strategy:
-    # Recreate, not RollingUpdate: only one instance holds the
-    # journal lock. Phase B makes it HA.
-    type: Recreate
+  podManagementPolicy: OrderedReady
   selector:
     matchLabels:
       app: weft-dispatcher
@@ -83,6 +72,7 @@ spec:
         app: weft-dispatcher
     spec:
       serviceAccountName: weft-dispatcher
+      terminationGracePeriodSeconds: 60
       containers:
         - name: dispatcher
           image: weft-dispatcher:local
@@ -91,17 +81,27 @@ spec:
             - containerPort: 9999
               name: http
           env:
+            - name: WEFT_POD_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: WEFT_HTTP_PORT
               value: "9999"
-            - name: WEFT_DATA_DIR
-              value: /var/lib/weft
-            - name: WEFT_NAMESPACE
-              value: wm-local
+            - name: WEFT_SYSTEM_NAMESPACE
+              value: weft-system
+            - name: WEFT_TENANT_NS_PREFIX
+              value: wm-
+            - name: WEFT_DISPATCHER_CALLBACK_URL
+              value: http://weft-dispatcher.weft-system.svc.cluster.local:9999
+            - name: WEFT_INTERNAL_URL_TEMPLATE
+              value: http://{pod}.weft-dispatcher-headless.weft-system.svc.cluster.local:9999
             - name: WEFT_LISTENER_IMAGE
               value: weft-listener:local
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/weft
+            - name: WEFT_DATABASE_URL
+              value: postgres://weft:weft-local-dev@weft-postgres.weft-system.svc.cluster.local:5432/weft
+          envFrom:
+            - secretRef:
+                name: weft-internal-secret
           readinessProbe:
             httpGet:
               path: /health
@@ -114,19 +114,36 @@ spec:
               port: 9999
             initialDelaySeconds: 10
             periodSeconds: 15
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: weft-dispatcher-data
 ---
+# Round-robin Service: external clients (CLI, browser extension,
+# webhooks) hit this; k8s load-balances across Pods.
 apiVersion: v1
 kind: Service
 metadata:
   name: weft-dispatcher
-  namespace: wm-local
+  namespace: weft-system
   labels:
     app: weft-dispatcher
 spec:
+  selector:
+    app: weft-dispatcher
+  ports:
+    - name: http
+      port: 9999
+      targetPort: 9999
+---
+# Headless Service: gives every Pod a stable DNS name
+# (`weft-dispatcher-0.weft-dispatcher-headless.weft-system.svc.cluster.local`).
+# The routing layer uses these for Pod-to-Pod forwards.
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-dispatcher-headless
+  namespace: weft-system
+  labels:
+    app: weft-dispatcher
+spec:
+  clusterIP: None
   selector:
     app: weft-dispatcher
   ports:

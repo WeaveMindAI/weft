@@ -166,6 +166,10 @@ async fn handle_socket(socket: WebSocket, color: Color, state: DispatcherState) 
                         worker_instance_id: id.clone(),
                     };
                     Some(id)
+                } else if matches!(slot, Slot::StalledGrace { .. }) {
+                    // Worker exited cleanly post-Exit. Drop to Idle.
+                    *slot = Slot::Idle { queued: VecDeque::new() };
+                    None
                 } else {
                     None
                 }
@@ -219,6 +223,25 @@ async fn handle_ready(
     color: Color,
     tx: mpsc::Sender<DispatcherToWorker>,
 ) -> bool {
+    // Claim ownership of this color's slot. If another Pod already
+    // owns a live lease, abort: the worker will reconnect via the
+    // round-robin Service and eventually land on the right Pod.
+    match crate::routing::route_for_color(state, color).await {
+        Ok(crate::routing::ColorRoute::Local) => {}
+        Ok(crate::routing::ColorRoute::Forward { owner_pod_id }) => {
+            tracing::info!(
+                target: "weft_dispatcher::ws",
+                %color, owner = %owner_pod_id,
+                "slot owned by another Pod; rejecting Ready so worker retries"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::error!(target: "weft_dispatcher::ws", "claim_slot: {e}");
+            return false;
+        }
+    }
+
     let events = match state.journal.events_log(color).await {
         Ok(ev) => ev,
         Err(e) => {
@@ -254,7 +277,7 @@ async fn handle_ready(
                         Slot::Idle { queued, .. }
                         | Slot::Starting { queued, .. }
                         | Slot::WaitingReconnect { queued, .. } => queued,
-                        Slot::Live { .. } => VecDeque::new(),
+                        Slot::Live { .. } | Slot::StalledGrace { .. } => VecDeque::new(),
                     };
                     let wake = extract_start(&mut queued);
                     DispatcherToWorker::Start {
@@ -281,8 +304,30 @@ async fn handle_reconnect(
     worker_instance_id: &str,
     tx: mpsc::Sender<DispatcherToWorker>,
 ) -> bool {
+    // Same slot-ownership check as handle_ready. If we don't own
+    // the lease, drop the socket and let the worker retry.
+    match crate::routing::route_for_color(state, color).await {
+        Ok(crate::routing::ColorRoute::Local) => {}
+        Ok(crate::routing::ColorRoute::Forward { owner_pod_id }) => {
+            tracing::info!(
+                target: "weft_dispatcher::ws",
+                %color, owner = %owner_pod_id,
+                "slot owned by another Pod; rejecting Reconnected"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::error!(target: "weft_dispatcher::ws", "claim_slot on reconnect: {e}");
+            return false;
+        }
+    }
+
     let expected = worker_instance_id.to_string();
-    let deliveries = state
+    // Fast path: same Pod, transient drop. Slot is in
+    // WaitingReconnect with matching instance_id; preserve the
+    // worker's in-memory state by sending Start { Resume,
+    // snapshot: None }.
+    let same_pod_fast_path = state
         .slots
         .with_slot(color, {
             let expected = expected.clone();
@@ -313,23 +358,56 @@ async fn handle_reconnect(
         })
         .await;
 
-    if !deliveries {
-        tracing::warn!(
-            target: "weft_dispatcher::ws",
-            %color, instance = %worker_instance_id,
-            "rejecting Reconnected: slot not in WaitingReconnect or id mismatch"
-        );
-        return false;
+    if same_pod_fast_path {
+        let resume = DispatcherToWorker::Start {
+            wake: WakeMessage::Resume,
+            snapshot: None,
+            worker_instance_id: None,
+        };
+        return tx.send(resume).await.is_ok();
     }
 
-    // Resume after transient drop: no fresh state. The worker
-    // kept its in-memory tables. New fires that arrived during
-    // the disconnect are in the journal (SuspensionResolved
-    // events); on the next ready-scan those nodes will re-check
-    // via the resume path and pull the values.
+    // Slow path: cross-Pod adoption (or stale slot). The journal
+    // is the source of truth; fold it and ship a Start with the
+    // full snapshot. The worker reconciles its in-memory state on
+    // the spot. If anything was lost during the outage we can't
+    // recover it, but the journal IS the contract.
+    tracing::info!(
+        target: "weft_dispatcher::ws",
+        %color, instance = %worker_instance_id,
+        "adopting reconnected worker (cross-Pod or stale slot path)"
+    );
+
+    let events = match state.journal.events_log(color).await {
+        Ok(ev) => ev,
+        Err(e) => {
+            tracing::error!(target: "weft_dispatcher::ws", "events_log: {e}");
+            return false;
+        }
+    };
+    let folded_snapshot = if events.is_empty() {
+        None
+    } else {
+        Some(crate::journal::fold_to_snapshot(color, &events))
+    };
+    state
+        .slots
+        .with_slot(color, {
+            let tx = tx.clone();
+            let expected = expected.clone();
+            move |slot| {
+                Box::pin(async move {
+                    *slot = Slot::Live {
+                        sender: tx,
+                        worker_instance_id: expected,
+                    };
+                })
+            }
+        })
+        .await;
     let resume = DispatcherToWorker::Start {
         wake: WakeMessage::Resume,
-        snapshot: None,
+        snapshot: folded_snapshot,
         worker_instance_id: None,
     };
     tx.send(resume).await.is_ok()
@@ -445,7 +523,7 @@ async fn handle_worker_crash(state: &DispatcherState, color: Color) {
         })
         .await;
 
-    let wake = crate::backend::WakeContext { project_id: project_id.clone(), color };
+    let wake = crate::backend::WakeContext::resolve(state, project_id.clone(), color);
     let spawn_result = state.workers.spawn_worker(wake).await;
     match spawn_result {
         Ok(worker) => {
@@ -542,158 +620,71 @@ async fn handle_message(
             true
         }
         WorkerToDispatcher::SuspensionRequest { request_id, node_id, lane, spec } => {
-            let token = uuid::Uuid::new_v4().to_string();
-
-            // Look up this color's project + its active listener,
-            // then let the listener own URL-minting and any
-            // kind-specific setup (timer tasks, sse loops, etc).
-            let project_id = match state.journal.execution_project(color).await {
-                Ok(Some(p)) => p,
-                _ => {
+            match handle_signal_register(
+                state, color, &node_id, &lane, &spec, /*is_resume=*/ true,
+            )
+            .await
+            {
+                Ok((token, user_url)) => {
+                    let _ = tx
+                        .send(DispatcherToWorker::SuspensionToken {
+                            request_id,
+                            token,
+                            user_url,
+                            error: None,
+                        })
+                        .await;
+                }
+                Err(err) => {
                     tracing::error!(
                         target: "weft_dispatcher::ws",
-                        %color,
-                        "no project for color; cannot register suspension"
+                        %color, error = %err,
+                        "suspension register failed; replying with error"
                     );
-                    return false;
+                    let _ = tx
+                        .send(DispatcherToWorker::SuspensionToken {
+                            request_id,
+                            token: String::new(),
+                            user_url: None,
+                            error: Some(err),
+                        })
+                        .await;
                 }
-            };
-            let listener = state.listeners.get(&project_id);
-            let user_url = if let Some(listener) = &listener {
-                match crate::listener::register_signal(listener, &token, &spec, &node_id).await {
-                    Ok(url) => url,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "weft_dispatcher::ws",
-                            %color,
-                            error = %e,
-                            "listener register failed"
-                        );
-                        return false;
-                    }
-                }
-            } else {
-                tracing::error!(
-                    target: "weft_dispatcher::ws",
-                    %color,
-                    %project_id,
-                    "project has no active listener; activate first"
-                );
-                return false;
-            };
-
-            // Persist the suspension so the signal-fired endpoint
-            // can resolve the token back to its color+node, and
-            // append a SuspensionRegistered event to the replayable
-            // log.
-            let metadata = serde_json::json!({
-                "spec": spec,
-                "node_id": node_id,
-                "lane": lane,
-            });
-            if let Err(e) = state
-                .journal
-                .record_suspension_with_token(&token, color, &node_id, metadata)
-                .await
-            {
-                tracing::error!(target: "weft_dispatcher::ws", "record_suspension: {e}");
-                return false;
             }
-            let _ = state
-                .journal
-                .record_event(&crate::journal::ExecEvent::SuspensionRegistered {
-                    color,
-                    node_id: node_id.clone(),
-                    lane: lane.clone(),
-                    token: token.clone(),
-                    spec: spec.clone(),
-                    at_unix: now_unix(),
-                })
-                .await;
-
-            // Track so /signal-fired can route the resume.
-            let kind_label = kind_of(&spec.kind);
-            state.signal_tracker.insert(
-                token.clone(),
-                crate::listener::RegisteredSignalMeta {
-                    project_id,
-                    token: token.clone(),
-                    node_id: node_id.clone(),
-                    is_resume: true,
-                    user_url: user_url.clone(),
-                    kind: kind_label.into(),
-                },
-            );
-
-            let _ = tx
-                .send(DispatcherToWorker::SuspensionToken {
-                    request_id,
-                    token,
-                    user_url,
-                })
-                .await;
             true
         }
         WorkerToDispatcher::RegisterSignalRequest { request_id, node_id, spec } => {
-            // TriggerSetup-phase entry registration from a node.
-            // Same listener registration as SuspensionRequest but the
-            // tracker entry is `is_resume: false` and the signal
-            // persists (not single-use).
-            let project_id = match state.journal.execution_project(color).await {
-                Ok(Some(p)) => p,
-                _ => {
+            match handle_signal_register(
+                state, color, &node_id, &Default::default(), &spec, /*is_resume=*/ false,
+            )
+            .await
+            {
+                Ok((token, user_url)) => {
+                    let _ = tx
+                        .send(DispatcherToWorker::RegisterSignalAck {
+                            request_id,
+                            token,
+                            user_url,
+                            error: None,
+                        })
+                        .await;
+                }
+                Err(err) => {
                     tracing::error!(
                         target: "weft_dispatcher::ws",
-                        %color,
-                        "no project for color; cannot register entry signal"
+                        %color, error = %err,
+                        "entry signal register failed; replying with error"
                     );
-                    return false;
+                    let _ = tx
+                        .send(DispatcherToWorker::RegisterSignalAck {
+                            request_id,
+                            token: String::new(),
+                            user_url: None,
+                            error: Some(err),
+                        })
+                        .await;
                 }
-            };
-            let listener = match state.listeners.get(&project_id) {
-                Some(l) => l,
-                None => {
-                    tracing::error!(
-                        target: "weft_dispatcher::ws",
-                        %color,
-                        %project_id,
-                        "project has no active listener; activate must have spawned one first"
-                    );
-                    return false;
-                }
-            };
-            let token = uuid::Uuid::new_v4().to_string();
-            let user_url = match crate::listener::register_signal(&listener, &token, &spec, &node_id).await {
-                Ok(url) => url,
-                Err(e) => {
-                    tracing::error!(
-                        target: "weft_dispatcher::ws",
-                        %color,
-                        error = %e,
-                        "listener register (entry) failed"
-                    );
-                    return false;
-                }
-            };
-            let kind_label = kind_of(&spec.kind);
-            state.signal_tracker.insert(
-                token.clone(),
-                crate::listener::RegisteredSignalMeta {
-                    project_id,
-                    token: token.clone(),
-                    node_id: node_id.clone(),
-                    is_resume: false,
-                    user_url: user_url.clone(),
-                    kind: kind_label.into(),
-                },
-            );
-            let _ = tx
-                .send(DispatcherToWorker::RegisterSignalAck {
-                    request_id,
-                    token,
-                    user_url,
-                })
-                .await;
+            }
             true
         }
         WorkerToDispatcher::ProvisionSidecarRequest { request_id, node_id, spec } => {
@@ -722,11 +713,15 @@ async fn handle_message(
                         error: None,
                     }
                 } else {
+                    let tenant = state.tenant_router.tenant_for_project(&project_id);
+                    let namespace = state.namespace_mapper.namespace_for(&tenant);
                     let infra_spec = crate::backend::InfraSpec {
                         project_id: project_id.clone(),
                         infra_node_id: node_id.clone(),
                         sidecar: spec,
                         config: serde_json::Value::Null,
+                        tenant: tenant.to_string(),
+                        namespace,
                     };
                     match state.infra.provision(infra_spec).await {
                         Ok(handle) => {
@@ -783,30 +778,88 @@ async fn handle_message(
                     at_unix: now_unix(),
                 })
                 .await;
-            // Transition slot back to Idle.
-            state
-                .slots
-                .with_slot(color, move |slot| {
-                    Box::pin(async move {
-                        *slot = Slot::Idle { queued: VecDeque::new() };
-                    })
-                })
-                .await;
             let _ = tx.send(DispatcherToWorker::StalledAck).await;
 
-            // If the journal still has fires that weren't consumed
-            // by this worker (happens when concurrent form POSTs
-            // raced the worker's fold), auto-respawn from the event
-            // log. The new worker will seed those pending
-            // deliveries on Start.
+            // If a fire raced the stall (in journal but not consumed
+            // by this worker), forward it now via Deliver so the
+            // worker re-enters drive() instead of dying. Otherwise
+            // start the grace timer.
             if has_pending_deliveries(state, color).await {
-                spawn_respawn(state, color).await;
+                forward_pending_to_worker(state, color, tx).await;
+                // Stay Live: the worker just got a Deliver and is
+                // about to re-enter the loop.
+                return true;
             }
 
-            false
+            let grace_secs = state.workers.idle_grace_seconds();
+            if grace_secs == 0 {
+                // No grace: send Exit immediately. Worker closes WS.
+                let _ = tx.send(DispatcherToWorker::Exit).await;
+                state
+                    .slots
+                    .with_slot(color, move |slot| {
+                        Box::pin(async move {
+                            *slot = Slot::Idle { queued: VecDeque::new() };
+                        })
+                    })
+                    .await;
+                return true;
+            }
+
+            // Park the slot in StalledGrace. Spawn a watchdog that
+            // sends Exit after grace_secs unless the slot already
+            // moved (Deliver promoted it back to Live).
+            let grace_until = std::time::Instant::now()
+                + std::time::Duration::from_secs(grace_secs);
+            let live_state = state
+                .slots
+                .with_slot(color, {
+                    let tx = tx.clone();
+                    move |slot| {
+                        let tx = tx.clone();
+                        Box::pin(async move {
+                            match std::mem::replace(
+                                slot,
+                                Slot::Idle { queued: VecDeque::new() },
+                            ) {
+                                Slot::Live { sender, worker_instance_id } => {
+                                    *slot = Slot::StalledGrace {
+                                        sender: tx,
+                                        worker: None,
+                                        worker_instance_id,
+                                        grace_until,
+                                    };
+                                    let _ = sender;
+                                    Some(())
+                                }
+                                other => {
+                                    *slot = other;
+                                    None
+                                }
+                            }
+                        })
+                    }
+                })
+                .await;
+            if live_state.is_none() {
+                tracing::warn!(
+                    target: "weft_dispatcher::ws",
+                    %color, "Stalled while slot was not Live; ignoring"
+                );
+                return true;
+            }
+
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+                expire_stall_grace(&state_clone, color).await;
+            });
+
+            true
         }
         WorkerToDispatcher::Completed { outputs } => {
             state.slots.drop_slot(color).await;
+            cleanup_execution_signals(state, color).await;
             let _ = state
                 .journal
                 .record_event(&crate::journal::ExecEvent::ExecutionCompleted {
@@ -828,6 +881,7 @@ async fn handle_message(
         }
         WorkerToDispatcher::Failed { error } => {
             state.slots.drop_slot(color).await;
+            cleanup_execution_signals(state, color).await;
             let _ = state
                 .journal
                 .record_event(&crate::journal::ExecEvent::ExecutionFailed {
@@ -847,113 +901,295 @@ async fn handle_message(
                 .await;
             false
         }
-        WorkerToDispatcher::NodeEvent {
+        WorkerToDispatcher::NodeStarted {
             node_id,
             lane,
-            event,
             input,
-            output,
-            error,
             pulses_absorbed,
         } => {
-            let kind = match crate::journal::NodeExecKind::parse(&event) {
-                Some(k) => k,
-                None => {
-                    tracing::warn!(target: "weft_dispatcher::ws", "unknown node event: {event}");
-                    return true;
-                }
-            };
             let lane_struct: weft_core::lane::Lane =
                 serde_json::from_str(&lane).unwrap_or_default();
-
-            // Append to the unified event log. `events_for` (the
-            // replay reader) folds these back into NodeExecEvent.
-            let exec_event = match kind {
-                crate::journal::NodeExecKind::Started => {
-                    crate::journal::ExecEvent::NodeStarted {
-                        color,
-                        node_id: node_id.clone(),
-                        lane: lane_struct.clone(),
-                        input: input.clone().unwrap_or(serde_json::Value::Null),
-                        pulses_absorbed: pulses_absorbed.clone(),
-                        at_unix: now_unix(),
-                    }
-                }
-                crate::journal::NodeExecKind::Completed => {
-                    crate::journal::ExecEvent::NodeCompleted {
-                        color,
-                        node_id: node_id.clone(),
-                        lane: lane_struct.clone(),
-                        output: output.clone().unwrap_or(serde_json::Value::Null),
-                        at_unix: now_unix(),
-                    }
-                }
-                crate::journal::NodeExecKind::Failed => crate::journal::ExecEvent::NodeFailed {
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeStarted {
                     color,
                     node_id: node_id.clone(),
-                    lane: lane_struct.clone(),
-                    error: error.clone().unwrap_or_default(),
+                    lane: lane_struct,
+                    input: input.clone(),
+                    pulses_absorbed,
                     at_unix: now_unix(),
-                },
-                crate::journal::NodeExecKind::Skipped => crate::journal::ExecEvent::NodeSkipped {
-                    color,
-                    node_id: node_id.clone(),
-                    lane: lane_struct.clone(),
-                    at_unix: now_unix(),
-                },
-            };
-            let _ = state.journal.record_event(&exec_event).await;
-
-            // Derive PulseEmitted events from the project's edges.
-            // Running them here means replay doesn't have to call
-            // postprocess_output; the pulse table rebuilds straight
-            // from the events.
-            if matches!(
-                kind,
-                crate::journal::NodeExecKind::Completed | crate::journal::NodeExecKind::Skipped
-            ) {
-                let out_value = match kind {
-                    crate::journal::NodeExecKind::Completed => {
-                        output.clone().unwrap_or(serde_json::Value::Null)
-                    }
-                    crate::journal::NodeExecKind::Skipped
-                    | crate::journal::NodeExecKind::Failed => serde_json::Value::Null,
-                    _ => serde_json::Value::Null,
-                };
-                emit_pulse_events(state, color, &node_id, &lane_struct, &out_value).await;
-            }
-
+                })
+                .await;
             let project_id = project_of(state, color).await.unwrap_or_default();
-            let dispatcher_event = match kind {
-                crate::journal::NodeExecKind::Started => DispatcherEvent::NodeStarted {
+            state
+                .events
+                .publish(DispatcherEvent::NodeStarted {
                     color,
                     node: node_id,
                     lane,
-                    input: input.unwrap_or(serde_json::Value::Null),
+                    input,
                     project_id,
-                },
-                crate::journal::NodeExecKind::Completed => DispatcherEvent::NodeCompleted {
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::NodeSuspended { node_id, lane, token } => {
+            let lane_struct: weft_core::lane::Lane =
+                serde_json::from_str(&lane).unwrap_or_default();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeSuspended {
+                    color,
+                    node_id: node_id.clone(),
+                    lane: lane_struct,
+                    token: token.clone(),
+                    at_unix: now_unix(),
+                })
+                .await;
+            let project_id = project_of(state, color).await.unwrap_or_default();
+            state
+                .events
+                .publish(DispatcherEvent::NodeSuspended {
                     color,
                     node: node_id,
                     lane,
-                    output: output.unwrap_or(serde_json::Value::Null),
+                    token,
                     project_id,
-                },
-                crate::journal::NodeExecKind::Failed => DispatcherEvent::NodeFailed {
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::NodeResumed { node_id, lane, token, value } => {
+            let lane_struct: weft_core::lane::Lane =
+                serde_json::from_str(&lane).unwrap_or_default();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeResumed {
+                    color,
+                    node_id: node_id.clone(),
+                    lane: lane_struct,
+                    token: token.clone(),
+                    value: value.clone(),
+                    at_unix: now_unix(),
+                })
+                .await;
+            let project_id = project_of(state, color).await.unwrap_or_default();
+            state
+                .events
+                .publish(DispatcherEvent::NodeResumed {
                     color,
                     node: node_id,
                     lane,
-                    error: error.unwrap_or_default(),
+                    token,
+                    value,
                     project_id,
-                },
-                crate::journal::NodeExecKind::Skipped => DispatcherEvent::NodeSkipped {
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::NodeRetried { node_id, lane, reason } => {
+            let lane_struct: weft_core::lane::Lane =
+                serde_json::from_str(&lane).unwrap_or_default();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeRetried {
+                    color,
+                    node_id: node_id.clone(),
+                    lane: lane_struct,
+                    reason: reason.clone(),
+                    at_unix: now_unix(),
+                })
+                .await;
+            let project_id = project_of(state, color).await.unwrap_or_default();
+            state
+                .events
+                .publish(DispatcherEvent::NodeRetried {
+                    color,
+                    node: node_id,
+                    lane,
+                    reason,
+                    project_id,
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::NodeCompleted { node_id, lane, output } => {
+            let lane_struct: weft_core::lane::Lane =
+                serde_json::from_str(&lane).unwrap_or_default();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeCompleted {
+                    color,
+                    node_id: node_id.clone(),
+                    lane: lane_struct,
+                    output: output.clone(),
+                    at_unix: now_unix(),
+                })
+                .await;
+            let project_id = project_of(state, color).await.unwrap_or_default();
+            state
+                .events
+                .publish(DispatcherEvent::NodeCompleted {
+                    color,
+                    node: node_id,
+                    lane,
+                    output,
+                    project_id,
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::NodeFailed { node_id, lane, error } => {
+            let lane_struct: weft_core::lane::Lane =
+                serde_json::from_str(&lane).unwrap_or_default();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeFailed {
+                    color,
+                    node_id: node_id.clone(),
+                    lane: lane_struct,
+                    error: error.clone(),
+                    at_unix: now_unix(),
+                })
+                .await;
+            let project_id = project_of(state, color).await.unwrap_or_default();
+            state
+                .events
+                .publish(DispatcherEvent::NodeFailed {
+                    color,
+                    node: node_id,
+                    lane,
+                    error,
+                    project_id,
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::NodeSkipped { node_id, lane } => {
+            let lane_struct: weft_core::lane::Lane =
+                serde_json::from_str(&lane).unwrap_or_default();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeSkipped {
+                    color,
+                    node_id: node_id.clone(),
+                    lane: lane_struct,
+                    at_unix: now_unix(),
+                })
+                .await;
+            let project_id = project_of(state, color).await.unwrap_or_default();
+            state
+                .events
+                .publish(DispatcherEvent::NodeSkipped {
                     color,
                     node: node_id,
                     lane,
                     project_id,
-                },
-            };
-            state.events.publish(dispatcher_event).await;
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::NodeCancelled { node_id, lane, reason } => {
+            let lane_struct: weft_core::lane::Lane =
+                serde_json::from_str(&lane).unwrap_or_default();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::NodeCancelled {
+                    color,
+                    node_id: node_id.clone(),
+                    lane: lane_struct,
+                    reason: reason.clone(),
+                    at_unix: now_unix(),
+                })
+                .await;
+            let project_id = project_of(state, color).await.unwrap_or_default();
+            state
+                .events
+                .publish(DispatcherEvent::NodeCancelled {
+                    color,
+                    node: node_id,
+                    lane,
+                    reason,
+                    project_id,
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::PulsesEmitted { pulses } => {
+            // One journal entry per produced pulse, with the
+            // engine-minted `pulse_id`. Replay reconstructs each
+            // pulse with the same UUID; downstream `NodeStarted`
+            // events that absorbed these pulses match by UUID.
+            for ep in pulses {
+                let _ = state
+                    .journal
+                    .record_event(&crate::journal::ExecEvent::PulseEmitted {
+                        color,
+                        pulse_id: ep.pulse_id,
+                        source_node: ep.source_node,
+                        source_port: ep.source_port,
+                        target_node: ep.target_node,
+                        target_port: ep.target_port,
+                        lane: ep.lane,
+                        value: ep.value,
+                        at_unix: now_unix(),
+                    })
+                    .await;
+            }
+            true
+        }
+        WorkerToDispatcher::PulsesExpanded {
+            node_id,
+            port,
+            absorbed_pulse_id,
+            color: _,
+            base_lane,
+            children,
+        } => {
+            let children = children
+                .into_iter()
+                .map(|c| crate::journal::ExpandedChildRecord {
+                    pulse_id: c.pulse_id,
+                    lane_suffix: c.lane_suffix,
+                    value: c.value,
+                })
+                .collect();
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::PulsesExpanded {
+                    color,
+                    node_id,
+                    port,
+                    absorbed_pulse_id,
+                    base_lane,
+                    children,
+                    at_unix: now_unix(),
+                })
+                .await;
+            true
+        }
+        WorkerToDispatcher::PulsesGathered {
+            node_id,
+            port,
+            absorbed_pulse_ids,
+            color: _,
+            parent_lane,
+            pulse_id,
+            value,
+        } => {
+            let _ = state
+                .journal
+                .record_event(&crate::journal::ExecEvent::PulsesGathered {
+                    color,
+                    node_id,
+                    port,
+                    absorbed_pulse_ids,
+                    parent_lane,
+                    pulse_id,
+                    value,
+                    at_unix: now_unix(),
+                })
+                .await;
             true
         }
         WorkerToDispatcher::Log { level, message } => {
@@ -997,53 +1233,6 @@ async fn handle_message(
     }
 }
 
-/// Derive `PulseEmitted` events from the project's edges after a
-/// node completes or is skipped. Mirrors `postprocess_output` in
-/// `weft-core::exec::postprocess` but records instead of mutating a
-/// pulse table. Replay uses these events to rebuild the pulse
-/// table, so the engine and the journal agree by construction.
-async fn emit_pulse_events(
-    state: &DispatcherState,
-    color: Color,
-    source_node: &str,
-    lane: &weft_core::lane::Lane,
-    output: &serde_json::Value,
-) {
-    let project_id = match project_of(state, color).await {
-        Some(p) => p,
-        None => return,
-    };
-    let project_uuid = match project_id.parse::<uuid::Uuid>() {
-        Ok(u) => u,
-        Err(_) => return,
-    };
-    let project = match state.projects.project(project_uuid).await {
-        Some(p) => p,
-        None => return,
-    };
-    let edge_idx = weft_core::project::EdgeIndex::build(&project);
-    for edge in edge_idx.get_outgoing(&project, source_node) {
-        let source_port = edge.source_handle.as_deref().unwrap_or("default");
-        let target_port = edge.target_handle.as_deref().unwrap_or("default");
-        let routed = output
-            .get(source_port)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let _ = state
-            .journal
-            .record_event(&crate::journal::ExecEvent::PulseEmitted {
-                color,
-                source_node: source_node.to_string(),
-                source_port: source_port.to_string(),
-                target_node: edge.target.clone(),
-                target_port: target_port.to_string(),
-                lane: lane.clone(),
-                value: routed,
-                at_unix: now_unix(),
-            })
-            .await;
-    }
-}
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -1054,6 +1243,29 @@ fn now_unix() -> u64 {
 
 async fn project_of(state: &DispatcherState, color: Color) -> Option<String> {
     state.journal.execution_project(color).await.ok().flatten()
+}
+
+/// Tear down every wake-signal registration tied to a terminal
+/// execution. Removes the signal rows from the journal, asks the
+/// listener to unregister each token (so the per-tenant listener
+/// can exit when its registry hits zero), and consumes the
+/// matching suspensions. Mirrors the cancel path's cleanup
+/// (`api::execution::cancel`); without this, an execution that
+/// ends with active suspensions leaves orphan rows in the
+/// `signal` table, which then keeps the listener alive forever
+/// (the `/listener/empty` race-guard counts journal rows).
+async fn cleanup_execution_signals(state: &DispatcherState, color: Color) {
+    let removed = state
+        .journal
+        .signal_remove_for_color(color)
+        .await
+        .unwrap_or_default();
+    for meta in &removed {
+        if let Some(handle) = state.listeners.get(&meta.tenant_id) {
+            let _ = crate::listener::unregister_signal(&handle, &meta.token).await;
+        }
+        let _ = state.journal.consume_suspension(&meta.token).await;
+    }
 }
 
 /// Fold the journal and check whether any fires arrived that the
@@ -1069,76 +1281,6 @@ async fn has_pending_deliveries(state: &DispatcherState, color: Color) -> bool {
     !snap.pending_deliveries.is_empty()
 }
 
-/// Queue a Resume Start, spawn a fresh worker, transition slot to
-/// Starting. Used after a stall when the journal has unconsumed
-/// fires: the outgoing worker missed them, the new worker picks
-/// them up via the folded Start snapshot.
-async fn spawn_respawn(state: &DispatcherState, color: Color) {
-    let Some(project_id) = project_of(state, color).await else { return };
-    let Ok(project_uuid) = project_id.parse::<uuid::Uuid>() else { return };
-    if state.projects.get(project_uuid).await.is_none() {
-        return;
-    }
-
-    // Reserve the spawn atomically: only transition Idle → Starting.
-    let reserved = state
-        .slots
-        .with_slot(color, move |slot| {
-            Box::pin(async move {
-                if matches!(slot, Slot::Idle { .. }) {
-                    let mut q = match std::mem::replace(
-                        slot,
-                        Slot::Idle { queued: VecDeque::new() },
-                    ) {
-                        Slot::Idle { queued } => queued,
-                        _ => unreachable!(),
-                    };
-                    q.push_front(QueuedWake::Start(WakeMessage::Resume));
-                    *slot = Slot::Starting { queued: q, worker: None };
-                    true
-                } else {
-                    false
-                }
-            })
-        })
-        .await;
-    if !reserved {
-        return;
-    }
-
-    let wake = crate::backend::WakeContext { project_id: project_id.clone(), color };
-    match state.workers.spawn_worker(wake).await {
-        Ok(worker) => {
-            let _ = state
-                .journal
-                .record_event(&crate::journal::ExecEvent::WorkerSpawned {
-                    color,
-                    at_unix: now_unix(),
-                })
-                .await;
-            state
-                .slots
-                .with_slot(color, move |slot| {
-                    Box::pin(async move {
-                        if let Slot::Starting { worker: w, .. } = slot {
-                            *w = Some(worker);
-                        }
-                    })
-                })
-                .await;
-        }
-        Err(e) => {
-            tracing::error!(
-                target: "weft_dispatcher::ws",
-                %color, error = %e,
-                "auto-respawn after stall failed"
-            );
-        }
-    }
-}
-
-
-
 fn kind_of(kind: &weft_core::primitive::WakeSignalKind) -> &'static str {
     use weft_core::primitive::WakeSignalKind;
     match kind {
@@ -1148,4 +1290,147 @@ fn kind_of(kind: &weft_core::primitive::WakeSignalKind) -> &'static str {
         WakeSignalKind::Sse { .. } => "sse",
         WakeSignalKind::Socket { .. } => "socket",
     }
+}
+
+/// Drain any pending suspension fires sitting in the journal but
+/// not yet consumed, and forward each as a `Deliver` to the worker
+/// over `tx`. Used by the Stalled handler when fires raced the
+/// stall: instead of killing-and-respawning, we hand the new
+/// values to the worker so it can re-enter `drive()`.
+async fn forward_pending_to_worker(
+    state: &DispatcherState,
+    color: Color,
+    tx: &mpsc::Sender<DispatcherToWorker>,
+) {
+    let Ok(events) = state.journal.events_log(color).await else {
+        return;
+    };
+    let snap = crate::journal::fold_to_snapshot(color, &events);
+    for (token, value) in snap.pending_deliveries {
+        let _ = tx
+            .send(DispatcherToWorker::Deliver(
+                weft_core::primitive::Delivery { token, value },
+            ))
+            .await;
+    }
+}
+
+/// Watchdog body: when the grace timer expires, send `Exit` to the
+/// worker if the slot is still `StalledGrace`, then transition to
+/// `Idle`. If the slot moved (Deliver promoted it back to Live, or
+/// the worker exited on its own), this is a no-op.
+async fn expire_stall_grace(state: &DispatcherState, color: Color) {
+    let action = state
+        .slots
+        .with_slot(color, move |slot| {
+            Box::pin(async move {
+                let taken = std::mem::replace(slot, Slot::Idle { queued: VecDeque::new() });
+                match taken {
+                    Slot::StalledGrace { sender, worker_instance_id, .. } => {
+                        // Leave slot Idle.
+                        Some((sender, worker_instance_id))
+                    }
+                    other => {
+                        *slot = other;
+                        None
+                    }
+                }
+            })
+        })
+        .await;
+    if let Some((sender, instance)) = action {
+        tracing::info!(
+            target: "weft_dispatcher::ws",
+            %color, instance = %instance,
+            "stall grace expired; sending Exit"
+        );
+        let _ = sender.send(DispatcherToWorker::Exit).await;
+    }
+}
+
+/// Shared body for SuspensionRequest and RegisterSignalRequest:
+/// resolve tenant + ensure listener (lazy spawn), call /register
+/// on the listener, journal the registration (resume only),
+/// insert a SignalTracker entry. Returns `(token, user_url)` on
+/// success or an error message the caller surfaces to the worker.
+async fn handle_signal_register(
+    state: &DispatcherState,
+    color: Color,
+    node_id: &str,
+    lane: &weft_core::lane::Lane,
+    spec: &weft_core::primitive::WakeSignalSpec,
+    is_resume: bool,
+) -> Result<(String, Option<String>), String> {
+    let project_id = match state.journal.execution_project(color).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err("no project for color".into()),
+        Err(e) => return Err(format!("journal: {e}")),
+    };
+    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let namespace = state.namespace_mapper.namespace_for(&tenant);
+    let dispatcher_url = state.config.cluster_dispatcher_url();
+    let deploy_name = crate::listener::deploy_name_for_tenant(tenant.as_str());
+    let listener = state
+        .listeners
+        .ensure(
+            &tenant,
+            &namespace,
+            &dispatcher_url,
+            state.listener_backend.as_ref(),
+            &state.pg_pool,
+            &deploy_name,
+            state.pod_id.as_str(),
+        )
+        .await
+        .map_err(|e| format!("listener spawn failed: {e}"))?;
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let user_url = crate::listener::register_signal(&listener, &token, spec, node_id)
+        .await
+        .map_err(|e| format!("listener register failed: {e}"))?;
+
+    if is_resume {
+        let metadata = serde_json::json!({
+            "spec": spec,
+            "node_id": node_id,
+            "lane": lane,
+        });
+        state
+            .journal
+            .record_suspension_with_token(&token, color, node_id, metadata)
+            .await
+            .map_err(|e| format!("record_suspension: {e}"))?;
+        let _ = state
+            .journal
+            .record_event(&crate::journal::ExecEvent::SuspensionRegistered {
+                color,
+                node_id: node_id.to_string(),
+                lane: lane.clone(),
+                token: token.clone(),
+                spec: spec.clone(),
+                at_unix: now_unix(),
+            })
+            .await;
+    }
+
+    let kind_label = kind_of(&spec.kind);
+    let spec_json = serde_json::to_string(spec)
+        .map_err(|e| format!("serialize spec: {e}"))?;
+    state
+        .journal
+        .signal_insert(&crate::journal::SignalRegistration {
+            token: token.clone(),
+            tenant_id: tenant.to_string(),
+            project_id,
+            color: if is_resume { Some(color) } else { None },
+            node_id: node_id.to_string(),
+            is_resume,
+            user_url: user_url.clone(),
+            kind: kind_label.to_string(),
+            spec_json,
+        })
+        .await
+        .map_err(|e| format!("signal_insert: {e}"))?;
+
+    Ok((token, user_url))
 }

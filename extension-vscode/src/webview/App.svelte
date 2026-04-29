@@ -183,94 +183,72 @@
       }
       if (msg.kind === 'execEvent') {
         const e = msg.event;
-        // Normalize 'started' → 'running' so downstream class
-        // checks (which test === 'running') fire correctly.
+        // 'started' is a Started event from the wire; normalize
+        // for class checks (CSS tests 'running'). Suspended is a
+        // first-class state from the dispatcher's lifecycle.
         const state = e.state === 'started' ? 'running' : e.state;
         executionState.nodeStatuses = {
           ...executionState.nodeStatuses,
           [e.nodeId]: state,
         };
-        // Maintain a NodeExecution row per lane so parallel
-        // fan-outs don't cross-correlate inputs and outputs.
-        // Match completion / failure / skip events to the open
-        // row whose `laneKey` equals the event's lane string.
+        // One execution row per (nodeId, laneKey). The dispatcher
+        // produces lifecycle events (started/suspended/resumed/
+        // retried/completed/failed/skipped) on the same record;
+        // we mutate the existing row, not append. Failure +
+        // retry will close the live attempt into prior_attempts
+        // and reset the live fields — until that wires up, a
+        // fresh dispatch after a terminal row goes into the same
+        // row's history (one pulse per (node, lane)).
         const now = Date.now();
         const rows = executionState.nodeExecutions[e.nodeId] ?? [];
         const laneKey = e.lane ?? '';
+        const idx = rows.findIndex((r) => r.laneKey === laneKey);
         let nextRows: NodeExecution[];
-        if (state === 'running') {
-          // Open a new execution row keyed by lane.
+        if (idx < 0) {
+          // First event for this (node, lane). Open the record.
           nextRows = [
             ...rows,
             {
               id: `${e.nodeId}-${laneKey}-${now}`,
               nodeId: e.nodeId,
-              status: 'running',
+              status: state as NodeExecution['status'],
               pulseIdsAbsorbed: [],
               pulseId: `${e.nodeId}-${laneKey}-${now}`,
               startedAt: now,
+              completedAt:
+                state === 'completed' || state === 'failed' || state === 'skipped' || state === 'cancelled'
+                  ? now
+                  : undefined,
+              error: e.error,
               costUsd: 0,
               logs: [],
               color: '',
               lane: [],
               laneKey,
               input: e.input,
+              output: e.output,
             },
           ];
         } else {
-          const matchIdx = rows.findIndex(
-            (r) => r.laneKey === laneKey && r.status === 'running',
-          );
-          if (matchIdx >= 0) {
-            // Close the matching lane's row in place.
-            nextRows = rows.map((r, i) =>
-              i === matchIdx
-                ? {
-                    ...r,
-                    status: state as NodeExecution['status'],
-                    completedAt: now,
-                    error: e.error,
-                    output: e.output ?? r.output,
-                  }
-                : r,
-            );
-          } else {
-            // No matching open row (skipped without start, or
-            // re-ordered; the engine reports downstream skips
-            // without a corresponding start). Append a terminal
-            // row carrying the event's payload.
-            nextRows = [
-              ...rows,
-              {
-                id: `${e.nodeId}-${laneKey}-${now}`,
-                nodeId: e.nodeId,
-                status: state as NodeExecution['status'],
-                pulseIdsAbsorbed: [],
-                pulseId: `${e.nodeId}-${laneKey}-${now}`,
-                startedAt: now,
-                completedAt: now,
-                error: e.error,
-                costUsd: 0,
-                logs: [],
-                color: '',
-                lane: [],
-                laneKey,
-                input: e.input,
-                output: e.output,
-              },
-            ];
-          }
+          // Existing record: mutate in place per state.
+          nextRows = rows.map((r, i) => {
+            if (i !== idx) return r;
+            const updated: NodeExecution = { ...r, status: state as NodeExecution['status'] };
+            if (state === 'completed' || state === 'failed' || state === 'skipped' || state === 'cancelled') {
+              updated.completedAt = now;
+              if (e.output !== undefined) updated.output = e.output;
+              if (e.error !== undefined) updated.error = e.error;
+            }
+            if (state === 'running' && e.input !== undefined && r.input === undefined) {
+              updated.input = e.input;
+            }
+            return updated;
+          });
         }
         executionState.nodeExecutions = {
           ...executionState.nodeExecutions,
           [e.nodeId]: nextRows,
         };
-        if (state === 'completed' || state === 'failed' || state === 'skipped') {
-          const allDone = Object.values(executionState.nodeStatuses).every(
-            (s) => s === 'completed' || s === 'failed' || s === 'skipped' || s === 'cancelled',
-          );
-          if (allDone) executionState.isRunning = false;
-        }
         return;
       }
       if (msg.kind === 'edgeActive') {

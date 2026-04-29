@@ -14,14 +14,23 @@ export interface FormFieldRender {
 	prefilled?: boolean;
 }
 
+/** Port template emitted by a field type. The dispatcher ships
+ *  `{nameTemplate: "{key}_approved", portType: "Boolean"}`; the
+ *  resolver substitutes `{key}` with the field's user-supplied
+ *  key to get the concrete port name. */
+export interface FormFieldPort {
+	nameTemplate: string;
+	portType: PortType;
+}
+
 export interface FormFieldSpec {
 	fieldType: string;
 	label: string;
 	render: FormFieldRender;
 	requiredConfig: string[];
 	optionalConfig: string[];
-	addsInputs: PortDefinition[];
-	addsOutputs: PortDefinition[];
+	addsInputs: FormFieldPort[];
+	addsOutputs: FormFieldPort[];
 }
 
 export interface FormFieldDef {
@@ -32,8 +41,11 @@ export interface FormFieldDef {
 	required?: boolean;
 }
 
-export function port(name: string, portType: PortType): PortDefinition {
-	return { name, portType, required: false };
+/** Helper for constructing a FormFieldPort inline (used by tests
+ *  and by code paths that synthesize specs in TS rather than
+ *  reading them from the dispatcher). */
+export function port(nameTemplate: string, portType: PortType): FormFieldPort {
+	return { nameTemplate, portType };
 }
 
 function resolvePortName(template: string, key: string): string {
@@ -95,7 +107,7 @@ export function deriveInputsFromFields(
 		if (!spec || !f.key) continue;
 		for (const t of spec.addsInputs) {
 			ports.push({
-				name: resolvePortName(t.name, f.key),
+				name: resolvePortName(t.nameTemplate, f.key),
 				portType: resolveAutoTypeVars(t.portType, f.key),
 				// Form field ports default to required (same as the language default).
 				// Set "required": false explicitly to make a port optional.
@@ -116,7 +128,7 @@ export function deriveOutputsFromFields(
 		if (!spec || !f.key) continue;
 		for (const t of spec.addsOutputs) {
 			ports.push({
-				name: resolvePortName(t.name, f.key),
+				name: resolvePortName(t.nameTemplate, f.key),
 				portType: resolveAutoTypeVars(t.portType, f.key),
 				required: false,
 			});

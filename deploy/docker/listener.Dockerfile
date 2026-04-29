@@ -1,8 +1,8 @@
-# weft-listener: the per-project event-source daemon. One image
-# serves every project; the dispatcher spawns a Deployment per
-# project and feeds config via env vars.
+# weft-listener: per-tenant event-source daemon. One image serves
+# every tenant; the dispatcher spawns a Deployment per tenant and
+# feeds config (tenant id, dispatcher URL, tokens) via env vars.
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 

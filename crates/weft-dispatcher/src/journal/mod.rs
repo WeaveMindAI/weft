@@ -11,9 +11,14 @@
 //! auth). Those are indexes, not duplicates.
 
 pub mod events;
-pub mod sqlite;
+pub mod postgres;
 
-pub use events::{fold_to_snapshot, ExecEvent};
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod mock;
+#[cfg(any(test, feature = "test-helpers"))]
+pub use mock::MockJournal;
+
+pub use events::{fold_to_snapshot, ExecEvent, ExpandedChildRecord};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -70,17 +75,26 @@ pub trait Journal: Send + Sync {
 
     async fn drop_entry_tokens(&self, project_id: &str) -> anyhow::Result<()>;
 
+    /// Persist an extension token. The caller owns the token
+    /// string (so the api layer can pick its shape, e.g.
+    /// friendly `wm_tk_swift-falcon-23` vs hard
+    /// `wm_ext_<uuid>`); the journal just stores + indexes it.
     async fn mint_ext_token(
         &self,
+        token: &str,
         name: Option<&str>,
         metadata: Option<Value>,
-    ) -> anyhow::Result<String>;
+    ) -> anyhow::Result<()>;
 
     async fn ext_token_exists(&self, token: &str) -> anyhow::Result<bool>;
 
     async fn list_ext_tokens(&self) -> anyhow::Result<Vec<ExtToken>>;
 
-    async fn revoke_ext_token(&self, token: &str) -> anyhow::Result<()>;
+    /// Delete an extension token by its token string OR by its
+    /// human label. Returns true iff a row was actually removed,
+    /// so callers can return 404 rather than silently succeed
+    /// when the user typed an identifier that matched nothing.
+    async fn revoke_ext_token(&self, identifier: &str) -> anyhow::Result<bool>;
 
     // ----- Derived views over the event log --------------------------
 
@@ -101,6 +115,48 @@ pub trait Journal: Send + Sync {
     /// seen, newest first.
     async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>>;
 
+    // ----- Signal registry (durable replacement for in-RAM tracker) ----
+
+    /// Insert a signal registration. Caller mints the token.
+    async fn signal_insert(&self, sig: &SignalRegistration) -> anyhow::Result<()>;
+
+    /// Look up a single signal by its token.
+    async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
+
+    /// Remove a signal by token. Returns whether a row existed.
+    async fn signal_remove(&self, token: &str) -> anyhow::Result<bool>;
+
+    /// All signals currently registered for a project.
+    async fn signal_list_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<SignalRegistration>>;
+
+    /// All signals for a tenant. Used by listener rehydration so a
+    /// fresh listener Pod gets re-pushed every active registration.
+    async fn signal_list_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<SignalRegistration>>;
+
+    /// Count signals for a tenant. Used to decide whether the
+    /// tenant listener can be torn down.
+    async fn signal_count_for_tenant(&self, tenant_id: &str) -> anyhow::Result<usize>;
+
+    /// All signals tied to one execution color (resume signals).
+    /// Used on cancel to unregister everything that was waiting.
+    async fn signal_remove_for_color(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<Vec<SignalRegistration>>;
+
+    /// All signals tied to a project. Used by deactivate sweeps
+    /// after color-by-color cancel has run.
+    async fn signal_remove_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<SignalRegistration>>;
+
     // ----- Administrative ---------------------------------------------
 
     /// Delete all data for a color. Called only by `weft clean`.
@@ -109,6 +165,25 @@ pub trait Journal: Send + Sync {
     /// Mark a color cancelled. Phase A: no-op beyond a log event.
     /// Phase B: writes a control row so running workers can poll.
     async fn cancel(&self, color: Color) -> anyhow::Result<()>;
+}
+
+/// Durable replacement for the in-RAM `SignalTracker` row.
+#[derive(Debug, Clone)]
+pub struct SignalRegistration {
+    pub token: String,
+    pub tenant_id: String,
+    pub project_id: String,
+    /// `Some(color)` for resume (suspension) signals; `None` for
+    /// entry signals registered during trigger setup.
+    pub color: Option<Color>,
+    pub node_id: String,
+    pub is_resume: bool,
+    pub user_url: Option<String>,
+    pub kind: String,
+    /// JSON-serialized `WakeSignalSpec`. Stored so a listener
+    /// rehydrate after Pod restart can re-POST `/register` without
+    /// re-running trigger-setup.
+    pub spec_json: String,
 }
 
 // ----- Public types -----------------------------------------------
@@ -127,6 +202,15 @@ pub struct NodeExecEvent {
     pub output: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Wake-signal token. Set on Suspended/Resumed; None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Delivered value. Set on Resumed; None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    /// Reason for retry. Set on Retried; None otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub at_unix: u64,
 }
 
@@ -134,6 +218,10 @@ pub struct NodeExecEvent {
 #[serde(rename_all = "snake_case")]
 pub enum NodeExecKind {
     Started,
+    Suspended,
+    Resumed,
+    Retried,
+    Cancelled,
     Completed,
     Failed,
     Skipped,
@@ -143,6 +231,10 @@ impl NodeExecKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Started => "started",
+            Self::Suspended => "suspended",
+            Self::Resumed => "resumed",
+            Self::Retried => "retried",
+            Self::Cancelled => "cancelled",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Skipped => "skipped",
@@ -152,6 +244,10 @@ impl NodeExecKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "started" => Some(Self::Started),
+            "suspended" => Some(Self::Suspended),
+            "resumed" => Some(Self::Resumed),
+            "retried" => Some(Self::Retried),
+            "cancelled" => Some(Self::Cancelled),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "skipped" => Some(Self::Skipped),

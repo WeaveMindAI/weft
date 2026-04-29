@@ -174,7 +174,8 @@ interface RustFieldDef {
 }
 
 // Shape the dispatcher sends per node type. Mirrors Rust
-// NodeMetadata serialization.
+// NodeMetadata serialization plus the per-node FormFieldSpec[]
+// inlined by the dispatcher's `/describe/nodes` route.
 export interface CatalogEntry {
 	type: string;
 	label: string;
@@ -189,6 +190,7 @@ export interface CatalogEntry {
 	entry?: unknown[];
 	requires_infra?: boolean;
 	features?: NodeFeatures;
+	formFieldSpecs?: import('$lib/utils/form-field-specs').FormFieldSpec[];
 }
 
 function flattenField(f: RustFieldDef): FieldDefinition {
@@ -226,6 +228,11 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		defaultInputs: entry.inputs ?? [],
 		defaultOutputs: entry.outputs ?? [],
 		features: entry.features,
+		// The dispatcher's `/describe/nodes` ships the field-type
+		// vocabulary inline for nodes whose features.hasFormSchema
+		// is true; the form_builder editor reads it via
+		// `typeConfig.formFieldSpecs`.
+		formFieldSpecs: entry.formFieldSpecs,
 	};
 }
 

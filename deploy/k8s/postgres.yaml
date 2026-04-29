@@ -1,0 +1,96 @@
+---
+# Postgres backing store for the dispatcher StatefulSet. Holds the
+# event log, suspension/entry/ext token tables, the per-color slot
+# lease, and the per-tenant listener handle. Cross-Pod EventBus
+# fanout uses the same Postgres via LISTEN/NOTIFY.
+#
+# Local dev runs a single Pod with a 5Gi PVC. Cloud / enterprise
+# self-host swap this for a managed Postgres (Cloud SQL, RDS) by
+# pointing WEFT_DATABASE_URL elsewhere; this manifest stays optional.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: weft-postgres-data
+  namespace: weft-system
+  labels:
+    app: weft-postgres
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: weft-postgres-credentials
+  namespace: weft-system
+type: Opaque
+stringData:
+  POSTGRES_USER: weft
+  POSTGRES_PASSWORD: weft-local-dev
+  POSTGRES_DB: weft
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-postgres
+  namespace: weft-system
+  labels:
+    app: weft-postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: weft-postgres
+  template:
+    metadata:
+      labels:
+        app: weft-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          envFrom:
+            - secretRef:
+                name: weft-postgres-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "weft", "-d", "weft"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "weft", "-d", "weft"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: weft-postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-postgres
+  namespace: weft-system
+  labels:
+    app: weft-postgres
+spec:
+  selector:
+    app: weft-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

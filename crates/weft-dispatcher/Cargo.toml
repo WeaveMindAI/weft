@@ -30,12 +30,16 @@ clap = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json", "uuid", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { workspace = true }
 dashmap = "6"
 cron = "0.12"
 
+[features]
+test-helpers = []
+
 [dev-dependencies]
 tempfile = "3"
 weft-listener = { path = "../weft-listener" }
+weft-dispatcher = { path = ".", features = ["test-helpers"] }

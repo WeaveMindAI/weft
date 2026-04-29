@@ -1,15 +1,9 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DispatcherConfig {
     /// TCP port to bind the HTTP server. Default 9999 for local dev.
     pub http_port: u16,
-
-    /// Where to store persistent state (embedded restate data, local
-    /// project binaries, etc). Defaults to `~/.weft` on unix.
-    pub data_dir: PathBuf,
 
     /// Which worker backend to use. Values: "subprocess" (local
     /// default), "kubernetes" (cloud / BYOC). The closed-source
@@ -19,28 +13,44 @@ pub struct DispatcherConfig {
     /// Which infra backend to use. Values: "kind" (local),
     /// "kubernetes" (cloud / BYOC).
     pub infra_backend: String,
+
+    /// URL listeners and workers use to call back into the
+    /// dispatcher. Set to the cluster-internal Service DNS
+    /// (`http://weft-dispatcher.weft-system.svc.cluster.local:9999`)
+    /// when the dispatcher runs in-cluster, or to `http://127.0.0.1:PORT`
+    /// for subprocess-mode local dev.
+    pub dispatcher_callback_url: String,
+
+    /// Template for Pod-to-Pod internal URLs. `{pod}` is replaced
+    /// with the target Pod's id (StatefulSet pod name). Default:
+    /// `http://{pod}.weft-dispatcher-headless.weft-system.svc.cluster.local:9999`.
+    pub internal_url_template: String,
+
+    /// Shared secret for `/internal/*` routes. Loaded from env
+    /// `WEFT_INTERNAL_SECRET` or generated at first run.
+    pub internal_secret: String,
+}
+
+impl DispatcherConfig {
+    /// URL listeners and workers should use to reach the dispatcher
+    /// from inside their namespace. Mirrors `dispatcher_callback_url`
+    /// for now; kept as a method so callers don't have to know
+    /// about cluster vs subprocess routing.
+    pub fn cluster_dispatcher_url(&self) -> String {
+        self.dispatcher_callback_url.clone()
+    }
 }
 
 impl Default for DispatcherConfig {
     fn default() -> Self {
-        let data_dir = std::env::var_os("WEFT_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs_data_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("weft")
-            });
         Self {
             http_port: 9999,
-            data_dir,
             worker_backend: "subprocess".into(),
             infra_backend: "kind".into(),
+            dispatcher_callback_url: "http://127.0.0.1:9999".into(),
+            internal_url_template:
+                "http://{pod}.weft-dispatcher-headless.weft-system.svc.cluster.local:9999".into(),
+            internal_secret: "local-dev-internal-secret".into(),
         }
     }
-}
-
-fn dirs_data_dir() -> Option<PathBuf> {
-    // Phase A2: replace with a proper dirs crate. Avoid adding the
-    // dep during scaffolding to keep workspace minimal.
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
 }

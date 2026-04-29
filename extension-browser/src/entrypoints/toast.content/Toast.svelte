@@ -38,7 +38,11 @@
       // Action: open URL via background script and dismiss
       browser.runtime.sendMessage({ type: 'OPEN_AND_DISMISS_ACTION', actionUrl: toast.actionUrl });
     } else if (toast.taskUrl) {
-      window.open(toast.taskUrl, '_blank');
+      // Task: open the extension-hosted runner via the background.
+      // Content scripts can't navigate to chrome-extension:// URLs
+      // with window.open from a web origin, so we delegate to the
+      // background script which has tabs API access.
+      browser.runtime.sendMessage({ type: 'OPEN_TASK_RUNNER', url: toast.taskUrl });
     }
     removeToast(toast.id);
   }

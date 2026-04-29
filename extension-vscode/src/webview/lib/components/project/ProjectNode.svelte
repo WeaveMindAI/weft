@@ -9,7 +9,7 @@
 	import { toast } from "svelte-sonner";
 	import CopyButton from "$lib/components/ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromFields, deriveOutputsFromFields, type FormFieldDef, type FormFieldSpec } from '$lib/utils/form-field-specs';
-	import { getStatusIcon } from "$lib/utils/status";
+	import { getStatusBadgeColor, getStatusIcon } from "$lib/utils/status";
 	import { BadgeQuestionMark, Maximize2, Minimize2 } from '@lucide/svelte';
 	import { createFieldEditor } from '$lib/utils/field-editor.svelte';
 	import { handleBlobFieldUpload, validateExternalUrl, formatBytes } from '$lib/utils/blob-upload';
@@ -575,7 +575,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	bind:this={nodeElement}
-	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {displayedStatus === 'running' || displayedStatus === 'waiting_for_input' ? 'node-running-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''}"
+	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' || displayedStatus === 'suspended' ? 'node-suspended-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''}"
 	style="
 		width: 100%;
 		height: 100%;
@@ -599,7 +599,7 @@
 		class="px-3 py-2 flex items-center justify-between border-b border-black/5"
 	>
 		<div class="flex items-center gap-1.5">
-			<span class="text-xs {displayedStatus === 'running' || displayedStatus === 'waiting_for_input' ? 'animate-pulse' : ''}" style="color: {typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
+			<span class="text-base leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
 			<span class="text-[11px] font-semibold tracking-wide uppercase" style="color: {typeConfig.color};">{typeConfig.label}</span>
 			{#if data.infraNodeStatus}
 				<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none
@@ -970,7 +970,7 @@
 							<div class="nodrag nopan space-y-1.5" onclick={(e) => e.stopPropagation()}>
 								{#each getFormFields() as f, i}
 									<div class="flex items-center gap-1.5 bg-zinc-50 border border-zinc-200 rounded px-2 py-1 text-[10px]">
-										<span class="text-zinc-400 font-mono w-20 shrink-0 truncate">{f.fieldType}</span>
+										<span class="text-zinc-400 font-mono shrink-0 truncate" title={f.fieldType}>{nodeFormSpecMap[f.fieldType]?.label ?? f.fieldType}</span>
 										<span class="flex-1 text-zinc-700 font-mono truncate">{f.key}</span>
 										<button
 											class="ml-1 text-zinc-400 hover:text-red-500 transition-colors leading-none"
@@ -1078,10 +1078,15 @@
 						<span>✗</span>
 						<span>Execution failed{latestExecution?.error ? `: ${latestExecution.error}` : ''}</span>
 					</div>
-				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
+				{:else if displayedStatus === 'cancelled'}
+					<div class="debug-placeholder completed" style="color: #71717a;">
+						<span>■</span>
+						<span>{latestExecution?.error || 'Cancelled by user'}</span>
+					</div>
+				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input' || displayedStatus === 'suspended'}
 					<div class="debug-placeholder running">
 						<span class="debug-spinner"></span>
-						<span>Processing...</span>
+						<span>{displayedStatus === 'suspended' || displayedStatus === 'waiting_for_input' ? 'Suspended' : 'Processing...'}</span>
 					</div>
 				{:else}
 					<div class="debug-placeholder waiting">
@@ -1132,6 +1137,9 @@
 	}
 	:global(.node-running-glow) {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(245, 158, 11, 0.4) !important;
+	}
+	:global(.node-suspended-glow) {
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(6, 182, 212, 0.45) !important;
 	}
 	:global(.node-completed-glow) {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(16, 185, 129, 0.3) !important;

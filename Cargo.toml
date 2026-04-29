@@ -29,9 +29,6 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
-# durability
-restate-sdk = "0.7"
-
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

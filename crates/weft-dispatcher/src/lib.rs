@@ -17,12 +17,19 @@ pub mod config;
 pub mod events;
 pub mod infra;
 pub mod journal;
+pub mod lease;
 pub mod listener;
 pub mod project_store;
+pub mod routing;
 pub mod slots;
 pub mod state;
+pub mod tenant;
 
 pub use config::DispatcherConfig;
 pub use events::{DispatcherEvent, EventBus};
-pub use project_store::{ProjectStatus as StoreStatus, ProjectStore};
+pub use project_store::{
+    PostgresProjectStore, ProjectStatus as StoreStatus, ProjectStore, ProjectStoreOps,
+};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use project_store::MockProjectStore;
 pub use state::DispatcherState;

@@ -329,6 +329,16 @@ pub enum WebhookAuth {
 }
 
 // ----- Form primitives ------------------------------------------------
+//
+// FormField carries the runtime form's field-level data the way v1
+// did: a string `field_type` (keyed against the node's
+// FormFieldSpecs), a free-form `render` hint the consumer (browser
+// extension, dashboard) interprets, the optional pre-fill `value`
+// (for display/prefilled fields), and the original `config` (for
+// options, labels, custom button copy). Keeping the schema close to
+// the spec means the dispatcher doesn't have to lossily collapse
+// catalog-defined field types into a fixed enum, and consumers can
+// render anything the catalog declares.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormSchema {
@@ -338,25 +348,24 @@ pub struct FormSchema {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FormField {
+    pub field_type: String,
     pub key: String,
     pub label: String,
-    pub field_type: FormFieldType,
-    pub required: bool,
-    pub default: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FormFieldType {
-    Text,
-    Textarea,
-    Number,
-    Checkbox,
-    Select { options: Vec<String> },
-    Multiselect { options: Vec<String> },
-    Date,
-    File,
+    /// Render hint copied from the spec (component name + flags).
+    /// The dashboard / browser extension reads `render.component`
+    /// to pick the UI primitive.
+    #[serde(default)]
+    pub render: Value,
+    /// Pre-fill value for fields that need an upstream input port
+    /// value (display, display_image, editable_*, *_input). None
+    /// for purely interactive fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    /// Per-field config from the source (options, labels, etc).
+    #[serde(default)]
+    pub config: Value,
 }
 
 // ----- Cost report (fire-and-forget primitive) ------------------------
@@ -435,19 +444,29 @@ pub enum DispatcherToWorker {
     /// A wake signal fired while the worker is Live. Deliver to the
     /// lane that registered `token`.
     Deliver(Delivery),
-    /// Dispatcher reply to a `SuspensionRequest`.
+    /// Dispatcher reply to a `SuspensionRequest`. On failure
+    /// (listener spawn failed, transient cluster error) `error` is
+    /// `Some(msg)` and `token` is the empty string; the worker
+    /// surfaces a per-node failure for the requesting lane and
+    /// keeps the WS open.
     SuspensionToken {
         request_id: u64,
         token: String,
         user_url: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
     },
     /// Dispatcher reply to `RegisterSignalRequest`. `user_url` is
     /// the listener-minted externally-facing URL (if the signal
-    /// kind has one; None for Timer / Socket / SSE).
+    /// kind has one; None for Timer / Socket / SSE). `error` set
+    /// when the listener spawn or register fails; same per-node
+    /// failure semantics as `SuspensionToken`.
     RegisterSignalAck {
         request_id: u64,
         token: String,
         user_url: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
     },
     /// Dispatcher reply to `SidecarEndpointRequest`. On failure
     /// (infra not up, unknown node), `endpoint` is `None` and
@@ -464,8 +483,15 @@ pub enum DispatcherToWorker {
         endpoint_url: Option<String>,
         error: Option<String>,
     },
-    /// Dispatcher acknowledgement for `Stalled`; worker may now exit.
+    /// Dispatcher acknowledgement for `Stalled`. The worker stays
+    /// parked: it stops dispatching new nodes but keeps the WS
+    /// alive listening for `Deliver` (a fire arriving during the
+    /// grace window) or `Exit` (grace expired, time to die).
     StalledAck,
+    /// Grace window for a stalled worker has expired. Worker
+    /// should exit cleanly. The dispatcher kills the pod after
+    /// receiving the WS close.
+    Exit,
     /// Cancel the execution. Worker should stop ASAP.
     Cancel,
 }
@@ -530,18 +556,110 @@ pub enum WorkerToDispatcher {
     Failed {
         error: String,
     },
-    /// Per-node lifecycle events (for SSE stream + event-sourced
-    /// state reconstruction). `pulses_absorbed` is set on Started
-    /// events so replay can flip the matching pulses to Absorbed.
-    NodeEvent {
+    /// First dispatch of a (node, lane) attempt. Creates the
+    /// execution record on the dispatcher side. `pulses_absorbed`
+    /// is the engine-minted UUIDs of the pulses this attempt
+    /// consumed; the fold flips those to Absorbed by exact match.
+    NodeStarted {
         node_id: String,
         lane: String,
-        event: String,
-        input: Option<Value>,
-        output: Option<Value>,
-        error: Option<String>,
+        input: Value,
         #[serde(default)]
         pulses_absorbed: Vec<String>,
+    },
+    /// The current attempt called `await_signal` and parked. The
+    /// execution record's state flips Running → Suspended; the
+    /// `token` ties it to the wake signal registered with the
+    /// listener. No new exec record, no new pulse activity.
+    NodeSuspended {
+        node_id: String,
+        lane: String,
+        token: String,
+    },
+    /// The current attempt got its delivery and is continuing on
+    /// the same record. State flips Suspended → Running. Carries
+    /// the delivered value for replay correctness.
+    NodeResumed {
+        node_id: String,
+        lane: String,
+        token: String,
+        value: Value,
+    },
+    /// The current attempt finished successfully. Closes the
+    /// attempt and the record's state.
+    NodeCompleted {
+        node_id: String,
+        lane: String,
+        output: Value,
+    },
+    /// The current attempt failed. Closes the attempt with an
+    /// error; the record's state flips Failed (unless a future
+    /// retry policy opens a new attempt via NodeRetried).
+    NodeFailed {
+        node_id: String,
+        lane: String,
+        error: String,
+    },
+    /// The dispatch was skipped (e.g. group-boundary skip, pulse
+    /// arrived but no work to do).
+    NodeSkipped {
+        node_id: String,
+        lane: String,
+    },
+    /// User-initiated cancellation interrupted this attempt. The
+    /// dispatcher emits this for every non-terminal record on the
+    /// `cancel_color` path; the worker can also emit it if a node
+    /// observes its own task being cancelled mid-run. Closes the
+    /// record's state to Cancelled with `reason` as the error.
+    NodeCancelled {
+        node_id: String,
+        lane: String,
+        reason: String,
+    },
+    /// The previous attempt failed and a fresh attempt is opening
+    /// on the same execution record. Future-proofing: today no
+    /// path emits this, but the fold handles it so retries can
+    /// land without further wire-protocol changes.
+    NodeRetried {
+        node_id: String,
+        lane: String,
+        reason: String,
+    },
+    /// Pulse-table mutation: one or more pulses were emitted on
+    /// downstream edges. The engine ships this immediately after
+    /// each `postprocess_output` call; the dispatcher journals one
+    /// `PulseEmitted` per entry. The carried `pulse_id`s are the
+    /// UUIDs the engine actually minted in its pulse table, so
+    /// replay reconstructs the exact same pulses (and `NodeStarted`
+    /// events later flip them to Absorbed by UUID match).
+    PulsesEmitted {
+        pulses: Vec<EmittedPulse>,
+    },
+    /// Pulse-table mutation: an Expand work item ran in
+    /// `preprocess`. The absorbed pulse flips to Absorbed; the
+    /// engine appends N child-lane pulses to the same node's
+    /// bucket. `lane_suffix` carries the lane frames the Expand
+    /// added (one frame per `lane_depth` level; `expand_recursive`
+    /// can produce multiple frames in a single event).
+    PulsesExpanded {
+        node_id: String,
+        port: String,
+        absorbed_pulse_id: String,
+        color: Color,
+        base_lane: crate::lane::Lane,
+        children: Vec<ExpandedChild>,
+    },
+    /// Pulse-table mutation: a Gather work item ran in
+    /// `preprocess`. The absorbed pulses flip to Absorbed; the
+    /// engine appends one parent-lane pulse with `gathered: true`.
+    PulsesGathered {
+        node_id: String,
+        port: String,
+        absorbed_pulse_ids: Vec<String>,
+        color: Color,
+        parent_lane: crate::lane::Lane,
+        pulse_id: String,
+        value: Value,
     },
     /// Free-form log line (maps to dispatcher journal + SSE).
     Log {
@@ -582,10 +700,15 @@ pub enum WakeMessage {
 }
 
 /// Root seed for manual runs. Pulse is synthesized on the `__seed__`
-/// port; nodes with no inputs become ready immediately.
+/// port; nodes with no inputs become ready immediately. The
+/// dispatcher mints `pulse_id` and journals the same UUID in the
+/// `PulseSeeded` event, so a fresh worker's fold reconstructs the
+/// seed pulse with the same identity the live worker used and
+/// `NodeStarted.pulses_absorbed` matches by exact UUID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootSeed {
     pub node_id: String,
+    pub pulse_id: String,
     #[serde(default)]
     pub value: Value,
 }
@@ -595,5 +718,35 @@ pub struct RootSeed {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delivery {
     pub token: String,
+    pub value: Value,
+}
+
+/// A single pulse the engine produced for a downstream node
+/// during postprocess. The `pulse_id` is the UUID the engine
+/// minted in its pulse table; the dispatcher journals one
+/// `PulseEmitted` per entry, and `NodeStarted.pulses_absorbed`
+/// later carries the same UUID so replay can flip the matching
+/// pulse to Absorbed by exact match (no counting heuristics).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmittedPulse {
+    pub pulse_id: String,
+    pub source_node: String,
+    pub source_port: String,
+    pub target_node: String,
+    pub target_port: String,
+    pub lane: crate::lane::Lane,
+    pub value: Value,
+}
+
+/// One leaf produced by an Expand operation. `lane_suffix` is the
+/// list of frames the Expand added (could be > 1 when
+/// `lane_depth > 1` peels multiple list layers in a single
+/// operation). `pulse_id` is the UUID the engine minted for the
+/// child pulse so replay can flip it to Absorbed by exact match
+/// when the resulting `NodeStarted` arrives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandedChild {
+    pub pulse_id: String,
+    pub lane_suffix: crate::lane::Lane,
     pub value: Value,
 }

@@ -1,14 +1,15 @@
-//! Listener-backend abstraction. The dispatcher spawns a per-project
-//! listener at project activation; the listener owns all wake signal
-//! routing. Two backends exist:
+//! Listener-backend abstraction. The dispatcher spawns a per-tenant
+//! listener on demand; the listener owns all wake signal routing
+//! for every project belonging to that tenant. Two backends exist:
 //!
 //!   - `SubprocessListenerBackend`: spawns the `weft-listener` binary
 //!     as a local subprocess. Used for local development.
-//!   - `K8sListenerBackend` (future): spawns a pod in the project's
-//!     k8s namespace so the listener lives alongside infra sidecars.
+//!   - `K8sListenerBackend`: spawns a Deployment + Service + Ingress
+//!     in the tenant's k8s namespace so the listener lives alongside
+//!     workers and infra sidecars.
 //!
 //! Only the backend knows how to start a listener; the dispatcher
-//! only holds `ListenerHandle`s (URL + admin token) and POSTs to
+//! holds `ListenerHandle`s (URL + admin token) and POSTs to
 //! `/register`, `/unregister` on them.
 
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use weft_core::primitive::WakeSignalSpec;
+
+use crate::tenant::TenantId;
 
 /// Handle to a running listener. Held by the dispatcher for each
 /// active project so it can register / unregister signals.
@@ -46,27 +49,29 @@ pub struct ListenerHandle {
 
 #[async_trait]
 pub trait ListenerBackend: Send + Sync {
-    /// Spawn a listener instance for `project_id`. Returns the
-    /// handle to register signals against.
+    /// Spawn a listener instance for `tenant` in `namespace`.
+    /// Returns the handle to register signals against. Idempotent
+    /// at the orchestrator level: callers should serialize spawn
+    /// calls via `ListenerPool::ensure`.
     async fn spawn(
         &self,
-        project_id: &str,
+        tenant: &TenantId,
+        namespace: &str,
         dispatcher_url: &str,
     ) -> Result<ListenerHandle>;
 
-    /// Kill the listener for `project_id`. Called on deactivate.
-    async fn stop(&self, project_id: &str) -> Result<()>;
+    /// Kill the listener for `tenant` in `namespace`. Called when
+    /// the listener self-reports its registry is empty.
+    async fn stop(&self, tenant: &TenantId, namespace: &str) -> Result<()>;
 }
 
 /// Local-development backend: fork the `weft-listener` binary as
 /// a child process. Listener binds an OS-assigned port; backend
-/// reports the port back via the child's stdout (parsed line by
-/// line for a "listening on :PORT" log line) OR by pre-allocating
-/// a port (simpler, what we do here).
+/// pre-allocates one (simpler, dev-only pattern).
 pub struct SubprocessListenerBackend {
     /// Absolute path to the `weft-listener` binary.
     binary_path: PathBuf,
-    /// Running children keyed by project id. Dropping the `Child`
+    /// Running children keyed by tenant id. Dropping the `Child`
     /// doesn't kill it automatically (tokio::Child leaks); we call
     /// `.kill()` explicitly on stop.
     children: Arc<DashMap<String, Arc<Mutex<Child>>>>,
@@ -85,11 +90,10 @@ impl SubprocessListenerBackend {
 impl ListenerBackend for SubprocessListenerBackend {
     async fn spawn(
         &self,
-        project_id: &str,
+        tenant: &TenantId,
+        _namespace: &str,
         dispatcher_url: &str,
     ) -> Result<ListenerHandle> {
-        // Pre-allocate a port by binding then dropping (classic
-        // race-but-it's-dev-only pattern).
         let port = pick_free_port()?;
         let admin_url = format!("http://127.0.0.1:{port}");
         let public_base_url = admin_url.clone();
@@ -97,7 +101,7 @@ impl ListenerBackend for SubprocessListenerBackend {
         let relay_token = Uuid::new_v4().to_string();
 
         let mut cmd = Command::new(&self.binary_path);
-        cmd.env("WEFT_LISTENER_PROJECT_ID", project_id)
+        cmd.env("WEFT_LISTENER_TENANT_ID", tenant.as_str())
             .env("WEFT_LISTENER_PORT", port.to_string())
             .env("WEFT_LISTENER_PUBLIC_BASE_URL", &public_base_url)
             .env("WEFT_LISTENER_DISPATCHER_URL", dispatcher_url)
@@ -108,11 +112,10 @@ impl ListenerBackend for SubprocessListenerBackend {
             .kill_on_drop(true);
         let child = cmd
             .spawn()
-            .with_context(|| format!("spawn listener for {project_id}"))?;
+            .with_context(|| format!("spawn listener for tenant {tenant}"))?;
         self.children
-            .insert(project_id.to_string(), Arc::new(Mutex::new(child)));
+            .insert(tenant.to_string(), Arc::new(Mutex::new(child)));
 
-        // Wait for health.
         wait_for_health(&admin_url).await?;
 
         Ok(ListenerHandle {
@@ -123,8 +126,8 @@ impl ListenerBackend for SubprocessListenerBackend {
         })
     }
 
-    async fn stop(&self, project_id: &str) -> Result<()> {
-        if let Some((_, child)) = self.children.remove(project_id) {
+    async fn stop(&self, tenant: &TenantId, _namespace: &str) -> Result<()> {
+        if let Some((_, child)) = self.children.remove(tenant.as_str()) {
             let mut c = child.lock().await;
             let _ = c.kill().await;
         }
@@ -133,30 +136,29 @@ impl ListenerBackend for SubprocessListenerBackend {
 }
 
 /// K8s listener backend. The dispatcher Pod applies a Deployment +
-/// Service + Ingress per project into its own namespace via kubectl,
-/// then resolves URLs using cluster DNS (for internal calls) and
-/// ingress hostnames (for user-facing webhook/form URLs).
+/// Service + Ingress per tenant into the tenant's namespace via
+/// kubectl, then resolves URLs using cluster DNS (for internal
+/// calls) and ingress hostnames (for user-facing webhook/form
+/// URLs).
 ///
-/// Same manifest pattern as `KindInfraBackend`. Hidden from the
-/// manifest shape: the listener image tag is read from the
-/// `WEFT_LISTENER_IMAGE` env var on the dispatcher Pod so the CLI
-/// controls which version runs.
+/// Same manifest pattern as `KindInfraBackend`. Listener image tag
+/// comes from the `WEFT_LISTENER_IMAGE` env var on the dispatcher
+/// Pod so the CLI controls which version runs.
 pub struct K8sListenerBackend {
-    namespace: String,
     listener_image: String,
     /// External hostname suffix for ingress. Webhook URLs end up
     /// as `http://<short>.{ingress_host_suffix}`. Defaults to
     /// `listener.weft.local` for kind; cloud deploy sets the real
     /// public suffix.
     ingress_host_suffix: String,
-    /// Short suffix per deployed project so we can clean up on stop.
-    deployments: Arc<DashMap<String, String>>,
+    /// Tracks the deployment name + namespace per spawned tenant
+    /// so `stop` can address the right namespace on cleanup.
+    deployments: Arc<DashMap<String, (String, String)>>,
 }
 
 impl K8sListenerBackend {
-    pub fn new(namespace: String, listener_image: String, ingress_host_suffix: String) -> Self {
+    pub fn new(listener_image: String, ingress_host_suffix: String) -> Self {
         Self {
-            namespace,
             listener_image,
             ingress_host_suffix,
             deployments: Arc::new(DashMap::new()),
@@ -168,25 +170,25 @@ impl K8sListenerBackend {
 impl ListenerBackend for K8sListenerBackend {
     async fn spawn(
         &self,
-        project_id: &str,
+        tenant: &TenantId,
+        namespace: &str,
         dispatcher_url: &str,
     ) -> Result<ListenerHandle> {
-        let short = short_id(project_id);
+        let short = short_id(tenant.as_str());
         let deploy_name = format!("listener-{short}");
         let admin_token = Uuid::new_v4().to_string();
         let relay_token = Uuid::new_v4().to_string();
         let public_host = format!("{short}.{}", self.ingress_host_suffix);
         let public_base_url = format!("http://{public_host}");
         let admin_url = format!(
-            "http://{deploy_name}.{ns}.svc.cluster.local:8080",
-            ns = self.namespace,
+            "http://{deploy_name}.{namespace}.svc.cluster.local:8080",
         );
 
         let manifest = render_listener_manifest(
             &deploy_name,
-            &self.namespace,
+            namespace,
             &self.listener_image,
-            project_id,
+            tenant.as_str(),
             dispatcher_url,
             &public_base_url,
             &admin_token,
@@ -194,14 +196,13 @@ impl ListenerBackend for K8sListenerBackend {
             &public_host,
         );
         kubectl_apply_manifest(&manifest).await?;
-        kubectl_rollout_status(&self.namespace, &deploy_name).await?;
-        // Health-check through the cluster DNS; if the dispatcher
-        // Pod can't resolve the listener there's no point
-        // returning the handle.
+        kubectl_rollout_status(namespace, &deploy_name).await?;
         wait_for_health(&admin_url).await?;
 
-        self.deployments
-            .insert(project_id.to_string(), deploy_name);
+        self.deployments.insert(
+            tenant.to_string(),
+            (deploy_name, namespace.to_string()),
+        );
         Ok(ListenerHandle {
             admin_url,
             public_base_url,
@@ -210,14 +211,24 @@ impl ListenerBackend for K8sListenerBackend {
         })
     }
 
-    async fn stop(&self, project_id: &str) -> Result<()> {
-        let Some((_, deploy_name)) = self.deployments.remove(project_id) else {
-            return Ok(());
-        };
+    async fn stop(&self, tenant: &TenantId, namespace: &str) -> Result<()> {
+        // Prefer the cache (it has the exact deploy name we used);
+        // fall back to the deterministic name derived from tenant_id
+        // for cross-Pod kill where we have no cache.
+        let (deploy_name, ns) = self
+            .deployments
+            .remove(tenant.as_str())
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| {
+                (
+                    format!("listener-{}", short_id(tenant.as_str())),
+                    namespace.to_string(),
+                )
+            });
         for kind in ["ingress", "service", "deployment"] {
             let _ = Command::new("kubectl")
                 .args([
-                    "-n", &self.namespace, "delete", kind, &deploy_name,
+                    "-n", &ns, "delete", kind, &deploy_name,
                     "--ignore-not-found", "--wait=false",
                 ])
                 .status()
@@ -225,6 +236,15 @@ impl ListenerBackend for K8sListenerBackend {
         }
         Ok(())
     }
+}
+
+/// Deterministic listener Deployment name for a tenant. Used both
+/// at spawn time (`K8sListenerBackend::spawn` derives the same
+/// string) and at persistence time (`ListenerPool::ensure` records
+/// it) so cross-Pod re-attach + cross-Pod stop both work without a
+/// shared cache.
+pub fn deploy_name_for_tenant(tenant_id: &str) -> String {
+    format!("listener-{}", short_id(tenant_id))
 }
 
 fn short_id(project_id: &str) -> String {
@@ -242,7 +262,7 @@ fn render_listener_manifest(
     name: &str,
     namespace: &str,
     image: &str,
-    project_id: &str,
+    tenant_id: &str,
     dispatcher_url: &str,
     public_base_url: &str,
     admin_token: &str,
@@ -258,7 +278,7 @@ metadata:
   labels:
     app: {name}
     weft.dev/role: listener
-    weft.dev/project: "{project_id}"
+    weft.dev/tenant: "{tenant_id}"
 spec:
   replicas: 1
   selector:
@@ -269,6 +289,7 @@ spec:
       labels:
         app: {name}
         weft.dev/role: listener
+        weft.dev/tenant: "{tenant_id}"
     spec:
       containers:
         - name: listener
@@ -277,8 +298,8 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            - name: WEFT_LISTENER_PROJECT_ID
-              value: "{project_id}"
+            - name: WEFT_LISTENER_TENANT_ID
+              value: "{tenant_id}"
             - name: WEFT_LISTENER_PORT
               value: "8080"
             - name: WEFT_LISTENER_PUBLIC_BASE_URL
@@ -432,96 +453,139 @@ pub async fn unregister_signal(handle: &ListenerHandle, token: &str) -> Result<(
     Ok(())
 }
 
-/// In-memory map of per-project listener handles. Lives on
-/// DispatcherState.
+/// In-memory map of per-tenant listener handles. One listener
+/// instance multiplexes every project belonging to a tenant.
+/// Lives on DispatcherState.
+///
+/// `ensure` is the canonical entry point: it spawns the tenant
+/// listener if one isn't up, and is safe under concurrent calls
+/// (a per-tenant Mutex serializes the get-or-spawn check).
 #[derive(Default, Clone)]
-pub struct ListenerRegistry {
+pub struct ListenerPool {
     inner: Arc<DashMap<String, ListenerHandle>>,
+    /// Per-tenant spawn locks. We never remove entries from this
+    /// map: the lock is cheap to keep around and removing it would
+    /// race with a concurrent `ensure` that already grabbed an Arc.
+    spawn_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-impl ListenerRegistry {
+impl ListenerPool {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn insert(&self, project_id: String, handle: ListenerHandle) {
-        self.inner.insert(project_id, handle);
-    }
-    pub fn get(&self, project_id: &str) -> Option<ListenerHandle> {
-        self.inner.get(project_id).map(|h| h.clone())
-    }
-    pub fn remove(&self, project_id: &str) -> Option<ListenerHandle> {
-        self.inner.remove(project_id).map(|(_, v)| v)
-    }
-    /// Look up which project owns a relay token. Used by
-    /// `/signal-fired` to authenticate the incoming relay.
-    pub fn project_for_relay_token(&self, token: &str) -> Option<String> {
-        for e in self.inner.iter() {
-            if e.value().relay_token == token {
-                return Some(e.key().clone());
-            }
-        }
-        None
-    }
-}
 
-/// Simple metadata bundle for a signal registered with a listener.
-/// The dispatcher keeps this so a fire relay can be resolved back
-/// to a node id + expected next action (entry run vs resume).
-#[derive(Debug, Clone)]
-pub struct RegisteredSignalMeta {
-    pub project_id: String,
-    pub token: String,
-    pub node_id: String,
-    pub is_resume: bool,
-    /// The listener-minted user URL (if any). Stored here so
-    /// activate can surface it back without an extra round-trip.
-    pub user_url: Option<String>,
-    /// Kind label for the listing UI. "webhook", "timer", "form",
-    /// "socket". Populated at register time.
-    pub kind: String,
-}
-
-/// Per-dispatcher registry tracking every signal currently live on
-/// any listener. Populated on activate + suspension-register,
-/// cleared on deactivate + suspension-consume.
-#[derive(Default, Clone)]
-pub struct SignalTracker {
-    inner: Arc<DashMap<String, RegisteredSignalMeta>>,
-}
-
-impl SignalTracker {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn get(&self, tenant_id: &str) -> Option<ListenerHandle> {
+        self.inner.get(tenant_id).map(|h| h.clone())
     }
-    pub fn list_for_project(&self, project_id: &str) -> Vec<RegisteredSignalMeta> {
+
+    /// Snapshot of every (tenant_id, listener handle) this Pod
+    /// owns. Used by the diagnostic `/listener/inspect` endpoint
+    /// and by the periodic empty-listener sweeper.
+    pub fn list(&self) -> Vec<(String, ListenerHandle)> {
         self.inner
             .iter()
-            .filter(|e| e.value().project_id == project_id)
-            .map(|e| e.value().clone())
+            .map(|h| (h.key().clone(), h.value().clone()))
             .collect()
     }
-    pub fn insert(&self, token: String, meta: RegisteredSignalMeta) {
-        self.inner.insert(token, meta);
+
+    /// Insert a handle. Used by tests and by `ensure` after a
+    /// successful spawn. Production code should call `ensure`.
+    pub fn insert(&self, tenant_id: String, handle: ListenerHandle) {
+        self.inner.insert(tenant_id, handle);
     }
-    pub fn get(&self, token: &str) -> Option<RegisteredSignalMeta> {
-        self.inner.get(token).map(|v| v.clone())
+
+    /// Drop the entry. Called after the backend successfully
+    /// stopped the listener.
+    pub fn remove(&self, tenant_id: &str) -> Option<ListenerHandle> {
+        self.inner.remove(tenant_id).map(|(_, v)| v)
     }
-    pub fn remove(&self, token: &str) -> Option<RegisteredSignalMeta> {
-        self.inner.remove(token).map(|(_, v)| v)
-    }
-    pub fn remove_project(&self, project_id: &str) -> Vec<RegisteredSignalMeta> {
-        let mut out = Vec::new();
-        let keys: Vec<String> = self
-            .inner
-            .iter()
-            .filter(|e| e.value().project_id == project_id)
-            .map(|e| e.key().clone())
-            .collect();
-        for k in keys {
-            if let Some((_, v)) = self.inner.remove(&k) {
-                out.push(v);
-            }
+
+    /// Get-or-spawn a listener for `tenant`. Idempotent under
+    /// concurrent calls AND across Pods: if another Pod already
+    /// has a live listener for this tenant, we re-attach to it via
+    /// the persisted handle in `tenant_listener`. We don't take
+    /// ownership of someone else's listener; we just point at it.
+    pub async fn ensure(
+        &self,
+        tenant: &TenantId,
+        namespace: &str,
+        dispatcher_url: &str,
+        backend: &dyn ListenerBackend,
+        pg_pool: &sqlx::PgPool,
+        deploy_name: &str,
+        pod_id: &str,
+    ) -> Result<ListenerHandle> {
+        if let Some(h) = self.get(tenant.as_str()) {
+            return Ok(h);
         }
-        out
+        let lock = self
+            .spawn_locks
+            .entry(tenant.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        if let Some(h) = self.get(tenant.as_str()) {
+            return Ok(h);
+        }
+        // Cross-Pod re-attach: if another Pod has already spawned
+        // a listener for this tenant, use its persisted handle.
+        if let Some(persisted) =
+            crate::lease::lookup_tenant_listener(pg_pool, tenant.as_str()).await?
+        {
+            if crate::lease::is_lease_live(persisted.leased_until_unix) {
+                let handle = ListenerHandle {
+                    admin_url: persisted.admin_url,
+                    public_base_url: persisted.public_base_url,
+                    admin_token: persisted.admin_token,
+                    relay_token: persisted.relay_token,
+                };
+                self.insert(tenant.to_string(), handle.clone());
+                return Ok(handle);
+            }
+            // Lease expired: the previous owner died. We will
+            // re-spawn (or re-attach to the orphan Deployment if
+            // it's still up; the K8sListenerBackend's `spawn` is
+            // idempotent on its kubectl apply).
+        }
+        let handle = backend.spawn(tenant, namespace, dispatcher_url).await?;
+        self.insert(tenant.to_string(), handle.clone());
+        // Persist the handle so other Pods can re-attach and so we
+        // can survive a dispatcher restart without losing the URL.
+        crate::lease::upsert_tenant_listener(
+            pg_pool,
+            tenant.as_str(),
+            pod_id,
+            namespace,
+            deploy_name,
+            &handle.admin_url,
+            &handle.public_base_url,
+            &handle.admin_token,
+            &handle.relay_token,
+        )
+        .await?;
+        Ok(handle)
+    }
+
+    /// Kill the listener for `tenant`. Tells the backend to stop,
+    /// removes the local entry, deletes the persisted row.
+    pub async fn kill(
+        &self,
+        tenant: &TenantId,
+        namespace: &str,
+        backend: &dyn ListenerBackend,
+        pg_pool: &sqlx::PgPool,
+    ) -> Result<()> {
+        let lock = self
+            .spawn_locks
+            .entry(tenant.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        if self.inner.remove(tenant.as_str()).is_some() {
+            backend.stop(tenant, namespace).await?;
+        }
+        let _ = crate::lease::delete_tenant_listener(pg_pool, tenant.as_str()).await;
+        Ok(())
     }
 }
+

@@ -299,21 +299,44 @@ pub struct NodeFeatures {
 /// inputs/outputs on the NodeDefinition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormFieldSpec {
-    /// Value of the field's `field_type.kind` this spec matches
-    /// (e.g. "text", "select", "file").
+    /// Value of the field's `field_type` (or `field_type.kind`)
+    /// this spec matches (e.g. "text_input", "approve_reject").
+    /// Wire shape is camelCase across every field on this struct
+    /// so VS Code + browser extension can read the same TS
+    /// interface without per-field bridging. The snake_case
+    /// aliases let us still load the on-disk JSON files (which
+    /// pre-date this rename).
+    #[serde(rename = "fieldType", alias = "field_type")]
     pub field_type: String,
+    /// Human-readable label for the form_builder editor's
+    /// dropdown (e.g. "Text input", "Approve / Reject").
+    #[serde(default)]
+    pub label: String,
     /// Default render metadata applied to the field if not
-    /// overridden in the weft source.
+    /// overridden in the weft source. The dashboard / browser
+    /// extension reads `render.component` (and its sibling flags)
+    /// to pick a UI primitive without knowing field-type strings.
     pub render: Value,
-    #[serde(default)]
+    /// Config keys the form_builder editor must collect when the
+    /// user adds this field type (e.g. ["options"] for a static
+    /// select). The editor validates these before saving.
+    #[serde(default, rename = "requiredConfig", alias = "required_config")]
+    pub required_config: Vec<String>,
+    /// Config keys the editor exposes but doesn't require (e.g.
+    /// "approveLabel" / "rejectLabel" for approve_reject).
+    #[serde(default, rename = "optionalConfig", alias = "optional_config")]
+    pub optional_config: Vec<String>,
+    #[serde(default, rename = "addsInputs", alias = "adds_inputs")]
     pub adds_inputs: Vec<FormFieldPort>,
-    #[serde(default)]
+    #[serde(default, rename = "addsOutputs", alias = "adds_outputs")]
     pub adds_outputs: Vec<FormFieldPort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormFieldPort {
+    #[serde(rename = "nameTemplate", alias = "name_template", alias = "name")]
     pub name_template: String,
+    #[serde(rename = "portType", alias = "port_type")]
     pub port_type: WeftType,
 }
 

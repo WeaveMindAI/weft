@@ -11,7 +11,7 @@ One script, release build, symlinks into `~/.local/bin`:
 ```bash
 git clone <this repo>
 cd weft
-./install.sh
+./setup.sh
 ```
 
 That produces:
@@ -25,9 +25,12 @@ prints the exact line to add to your shell rc. The dispatcher
 auto-discovers `weft-runner` as a sibling of its own binary, so
 `WEFT_RUNNER_PATH` isn't needed.
 
-Re-run `./install.sh` anytime to rebuild and re-link. `./install.sh
---debug` uses the debug profile for faster incremental builds.
-`./install.sh --uninstall` removes the symlinks.
+Re-run `./setup.sh` anytime to rebuild and re-link. Component
+flags pick a subset (`--cli`, `--daemon`, `--vscode`, `--browser`)
+and combine. `./setup.sh --debug` uses the debug profile for
+faster incremental builds. `./setup.sh --uninstall` removes the
+installed pieces; add `--purge` to also delete the kind cluster
+and journal.
 
 ## Start the dispatcher
 
@@ -192,7 +195,7 @@ weft add <git-url>         Install an external node package (phase B).
 ## Troubleshooting
 
 - `dispatcher unreachable`: run `weft daemon start`.
-- `weft-runner not found`: re-run `./install.sh`; the dispatcher
+- `weft-runner not found`: re-run `./setup.sh`; the dispatcher
   expects `weft-runner` to sit next to its own binary.
 - Port 9999 in use: `WEFT_HTTP_PORT=19999 weft daemon start`, and
   pass `--dispatcher http://localhost:19999` to every `weft`

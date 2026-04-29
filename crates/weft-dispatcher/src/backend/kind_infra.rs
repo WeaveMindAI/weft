@@ -20,10 +20,6 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::backend::{EventStream, InfraBackend, InfraHandle, InfraSpec};
 
-fn namespace() -> String {
-    std::env::var("WEFT_NAMESPACE").unwrap_or_else(|_| "wm-local".into())
-}
-
 fn in_cluster() -> bool {
     // The k8s downward-API mount is only present inside a Pod.
     // When we're in-cluster we use the Pod's ServiceAccount via
@@ -44,23 +40,19 @@ impl KindInfraBackend {
         Self { handles: Arc::new(Mutex::new(std::collections::HashSet::new())) }
     }
 
-    /// Make sure the cluster + namespace exist before we start
-    /// applying Pod/Service manifests. When the dispatcher runs
-    /// in-cluster (the k8s deploy path) there's nothing to do:
-    /// the cluster is us, and the namespace was created by
-    /// `weft daemon start`. Outside the cluster, this path is
-    /// only hit by unit tests that run the dispatcher as a host
-    /// process; we skip kind bootstrap there too since
-    /// `weft daemon start` owns that.
-    async fn ensure_cluster(&self) -> anyhow::Result<()> {
+    /// Make sure the cluster + the named namespace exist before we
+    /// apply Pod/Service manifests. When the dispatcher runs
+    /// in-cluster (the k8s deploy path) there's nothing to do: the
+    /// cluster is us, and the namespace was created by
+    /// `weft daemon start`. Outside the cluster, this path is only
+    /// hit by unit tests that run the dispatcher as a host process;
+    /// we skip kind bootstrap there too since `weft daemon start`
+    /// owns that.
+    async fn ensure_namespace(&self, ns: &str) -> anyhow::Result<()> {
         if in_cluster() {
             return Ok(());
         }
-        // Outside the cluster: only usable when kubectl is on PATH
-        // and already points at a working cluster (the test harness
-        // sets up its own). Apply the namespace, no kind bootstrap.
         assert_binary("kubectl").await?;
-        let ns = namespace();
         let manifest = format!(
             "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {ns}\n",
         );
@@ -78,7 +70,8 @@ impl Default for KindInfraBackend {
 #[async_trait]
 impl InfraBackend for KindInfraBackend {
     async fn provision(&self, spec: InfraSpec) -> anyhow::Result<InfraHandle> {
-        self.ensure_cluster().await?;
+        let ns = spec.namespace.clone();
+        self.ensure_namespace(&ns).await?;
 
         let image = format!("ghcr.io/weavemindai/sidecar-{}:latest", spec.sidecar.name);
         let port = spec.sidecar.port;
@@ -94,7 +87,6 @@ impl InfraBackend for KindInfraBackend {
         // If the metadata provided raw manifests, apply them with
         // placeholder substitution. Otherwise fall back to a
         // minimal pod + service using the derived image/port.
-        let ns = namespace();
         let manifest = if spec.sidecar.manifests.is_empty() {
             format!(
                 "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {pod_name}\n  namespace: {ns}\n  labels:\n    app: {pod_name}\n    weft-project: \"{project}\"\nspec:\n  containers:\n  - name: sidecar\n    image: {image}\n    ports:\n    - containerPort: {port}\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: {pod_name}\n  namespace: {ns}\nspec:\n  selector:\n    app: {pod_name}\n  ports:\n  - port: {port}\n    targetPort: {port}\n",
@@ -146,22 +138,24 @@ impl InfraBackend for KindInfraBackend {
             ns = ns,
             port = port,
         ));
-        Ok(InfraHandle { id: handle_id, endpoint_url })
+        Ok(InfraHandle {
+            id: handle_id,
+            endpoint_url,
+            namespace: ns,
+        })
     }
 
     async fn scale_to_zero(&self, handle: &InfraHandle) -> anyhow::Result<()> {
-        let ns = namespace();
-        kubectl_scale(&ns, &handle.id, 0).await
+        kubectl_scale(&handle.namespace, &handle.id, 0).await
     }
 
     async fn scale_up(&self, handle: &InfraHandle) -> anyhow::Result<()> {
-        let ns = namespace();
-        kubectl_scale(&ns, &handle.id, 1).await
+        kubectl_scale(&handle.namespace, &handle.id, 1).await
     }
 
     async fn delete(&self, handle: InfraHandle) -> anyhow::Result<()> {
         self.handles.lock().await.remove(&handle.id);
-        let ns = namespace();
+        let ns = handle.namespace.clone();
         // Best-effort: delete resources both by name (the sidecar
         // manifests use `__INSTANCE_ID__` so Deployment / Service /
         // PVC share the handle id as their name) and by label
@@ -199,140 +193,148 @@ impl InfraBackend for KindInfraBackend {
         Ok(())
     }
 
-    async fn rehydrate(&self) -> anyhow::Result<Vec<crate::backend::AdoptedHandle>> {
-        let ns = namespace();
+    async fn rehydrate(
+        &self,
+        namespaces: &[String],
+    ) -> anyhow::Result<Vec<crate::backend::AdoptedHandle>> {
+        let mut adopted = Vec::new();
+        for ns in namespaces {
+            // Sweep legacy orphans. Any Deployment whose name starts
+            // with `weft-` but that DOESN'T carry the weft.dev
+            // adoption labels is dead state from a prior dispatcher
+            // that didn't know to label, or from a manual kubectl
+            // apply. Best to delete it so the next `infra start`
+            // provisions fresh. We explicitly skip the dispatcher's
+            // own resources and listener deployments (owned by a
+            // different backend).
+            for kind in ["deployment", "service", "pvc"] {
+                let out = Command::new("kubectl")
+                    .args(["-n", ns, "get", kind, "-o", "json"])
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    continue;
+                }
+                let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                for item in parsed
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    let metadata = item.get("metadata").cloned().unwrap_or_default();
+                    let name = metadata
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !name.starts_with("weft-") {
+                        continue;
+                    }
+                    if name == "weft-dispatcher"
+                        || name.starts_with("weft-dispatcher-")
+                        || name.starts_with("listener-")
+                    {
+                        continue;
+                    }
+                    let labels = metadata.get("labels").cloned().unwrap_or_default();
+                    let has_weft_label = labels
+                        .as_object()
+                        .map(|m| m.contains_key("weft.dev/project"))
+                        .unwrap_or(false);
+                    if has_weft_label {
+                        continue;
+                    }
+                    tracing::info!(
+                        target: "weft::infra::kind",
+                        %kind, %name, %ns,
+                        "sweeping unlabeled legacy weft resource"
+                    );
+                    let _ = Command::new("kubectl")
+                        .args([
+                            "-n", ns, "delete", kind, name,
+                            "--ignore-not-found", "--wait=false",
+                        ])
+                        .status()
+                        .await;
+                }
+            }
 
-        // Sweep legacy orphans. Any Deployment whose name starts
-        // with `weft-` but that DOESN'T carry the weft.dev adoption
-        // labels is dead state from a prior dispatcher that didn't
-        // know to label, or from a manual kubectl apply. Best to
-        // delete it so the next `infra start` provisions fresh.
-        // We explicitly skip the dispatcher's own resources and
-        // listener deployments (owned by a different backend).
-        for kind in ["deployment", "service", "pvc"] {
+            // Adopt everything that DID label itself in this namespace.
             let out = Command::new("kubectl")
-                .args(["-n", &ns, "get", kind, "-o", "json"])
+                .args([
+                    "-n", ns, "get", "deployment",
+                    "-l", "weft.dev/role=infra",
+                    "-o", "json",
+                ])
                 .output()
                 .await?;
             if !out.status.success() {
                 continue;
             }
-            let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for item in parsed.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-                let metadata = item.get("metadata").cloned().unwrap_or_default();
+            let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+                .map_err(|e| anyhow::anyhow!("parse kubectl get: {e}"))?;
+            let items = parsed
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for d in items {
+                let metadata = d.get("metadata").cloned().unwrap_or_default();
                 let name = metadata
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if !name.starts_with("weft-") {
-                    continue;
-                }
-                // Never touch the dispatcher itself or any of its
-                // owned resources (PVC, service, future siblings).
-                // Also the listener deployments + services are
-                // managed by a different backend; skip them.
-                if name == "weft-dispatcher"
-                    || name.starts_with("weft-dispatcher-")
-                    || name.starts_with("listener-")
-                {
-                    continue;
-                }
+                    .unwrap_or("")
+                    .to_string();
                 let labels = metadata.get("labels").cloned().unwrap_or_default();
-                let has_weft_label = labels
-                    .as_object()
-                    .map(|m| m.contains_key("weft.dev/project"))
-                    .unwrap_or(false);
-                if has_weft_label {
+                let project = labels
+                    .get("weft.dev/project")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let node = labels
+                    .get("weft.dev/node")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if project.is_empty() || node.is_empty() || name.is_empty() {
                     continue;
                 }
-                tracing::info!(
-                    target: "weft::infra::kind",
-                    %kind, %name,
-                    "sweeping unlabeled legacy weft resource"
-                );
-                let _ = Command::new("kubectl")
-                    .args([
-                        "-n", &ns, "delete", kind, name,
-                        "--ignore-not-found", "--wait=false",
-                    ])
-                    .status()
-                    .await;
+                let replicas = d
+                    .get("spec")
+                    .and_then(|s| s.get("replicas"))
+                    .and_then(|r| r.as_i64())
+                    .unwrap_or(1);
+                let port = d
+                    .get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                    .and_then(|s| s.get("containers"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.first())
+                    .and_then(|c| c.get("ports"))
+                    .and_then(|p| p.as_array())
+                    .and_then(|p| p.first())
+                    .and_then(|p| p.get("containerPort"))
+                    .and_then(|p| p.as_i64())
+                    .unwrap_or(8080) as u16;
+                let endpoint_url = Some(format!(
+                    "http://{name}.{ns}.svc.cluster.local:{port}"
+                ));
+                self.handles.lock().await.insert(name.clone());
+                adopted.push(crate::backend::AdoptedHandle {
+                    project_id: project,
+                    node_id: node,
+                    handle: InfraHandle {
+                        id: name,
+                        endpoint_url,
+                        namespace: ns.clone(),
+                    },
+                    running: replicas > 0,
+                });
             }
-        }
-
-        // Step 2: adopt everything that DID label itself.
-        let out = Command::new("kubectl")
-            .args([
-                "-n", &ns, "get", "deployment",
-                "-l", "weft.dev/role=infra",
-                "-o", "json",
-            ])
-            .output()
-            .await?;
-        if !out.status.success() {
-            return Ok(Vec::new());
-        }
-        let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow::anyhow!("parse kubectl get: {e}"))?;
-        let mut adopted = Vec::new();
-        let items = parsed.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        for d in items {
-            let metadata = d.get("metadata").cloned().unwrap_or_default();
-            let name = metadata
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let labels = metadata
-                .get("labels")
-                .cloned()
-                .unwrap_or_default();
-            let project = labels
-                .get("weft.dev/project")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let node = labels
-                .get("weft.dev/node")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if project.is_empty() || node.is_empty() || name.is_empty() {
-                continue;
-            }
-            let replicas = d
-                .get("spec")
-                .and_then(|s| s.get("replicas"))
-                .and_then(|r| r.as_i64())
-                .unwrap_or(1);
-            // Rebuild endpoint URL from the known Service naming
-            // convention (same name as the Deployment).
-            let port = d
-                .get("spec")
-                .and_then(|s| s.get("template"))
-                .and_then(|t| t.get("spec"))
-                .and_then(|s| s.get("containers"))
-                .and_then(|c| c.as_array())
-                .and_then(|c| c.first())
-                .and_then(|c| c.get("ports"))
-                .and_then(|p| p.as_array())
-                .and_then(|p| p.first())
-                .and_then(|p| p.get("containerPort"))
-                .and_then(|p| p.as_i64())
-                .unwrap_or(8080) as u16;
-            let endpoint_url = Some(format!(
-                "http://{name}.{ns}.svc.cluster.local:{port}"
-            ));
-            self.handles.lock().await.insert(name.clone());
-            adopted.push(crate::backend::AdoptedHandle {
-                project_id: project,
-                node_id: node,
-                handle: InfraHandle { id: name, endpoint_url },
-                running: replicas > 0,
-            });
         }
         Ok(adopted)
     }

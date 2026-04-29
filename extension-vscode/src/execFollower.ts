@@ -24,6 +24,10 @@ import type { HostMessage, NodeExecEvent, LiveDataItem, EdgeActiveEvent } from '
 export type DispatcherEvent =
   | { kind: 'execution_started'; color: string; entry_node: string; project_id: string }
   | { kind: 'node_started'; color: string; node: string; lane: string; input: unknown; project_id: string }
+  | { kind: 'node_suspended'; color: string; node: string; lane: string; token: string; project_id: string }
+  | { kind: 'node_resumed'; color: string; node: string; lane: string; token: string; value: unknown; project_id: string }
+  | { kind: 'node_retried'; color: string; node: string; lane: string; reason: string; project_id: string }
+  | { kind: 'node_cancelled'; color: string; node: string; lane: string; reason: string; project_id: string }
   | { kind: 'node_completed'; color: string; node: string; lane: string; output: unknown; project_id: string }
   | { kind: 'node_failed'; color: string; node: string; lane: string; error: string; project_id: string }
   | { kind: 'node_skipped'; color: string; node: string; lane: string; project_id: string }
@@ -120,6 +124,51 @@ export class ExecutionFollower implements vscode.Disposable {
           }));
           this.post({ kind: 'liveData', nodeId: e.node, items });
         }
+        break;
+      }
+      case 'node_suspended': {
+        const execEvent: NodeExecEvent = {
+          nodeId: e.node,
+          state: 'suspended',
+          lane: e.lane,
+          token: e.token,
+        };
+        this.post({ kind: 'execEvent', event: execEvent });
+        this.updateInspector(e.node, { lastStatus: 'suspended' });
+        break;
+      }
+      case 'node_resumed': {
+        const execEvent: NodeExecEvent = {
+          nodeId: e.node,
+          state: 'running',
+          lane: e.lane,
+          token: e.token,
+          resumeValue: e.value,
+        };
+        this.post({ kind: 'execEvent', event: execEvent });
+        this.updateInspector(e.node, { lastStatus: 'running' });
+        break;
+      }
+      case 'node_retried': {
+        const execEvent: NodeExecEvent = {
+          nodeId: e.node,
+          state: 'running',
+          lane: e.lane,
+          retryReason: e.reason,
+        };
+        this.post({ kind: 'execEvent', event: execEvent });
+        this.updateInspector(e.node, { lastStatus: 'running' });
+        break;
+      }
+      case 'node_cancelled': {
+        const execEvent: NodeExecEvent = {
+          nodeId: e.node,
+          state: 'cancelled',
+          lane: e.lane,
+          error: e.reason,
+        };
+        this.post({ kind: 'execEvent', event: execEvent });
+        this.updateInspector(e.node, { lastStatus: 'cancelled' });
         break;
       }
       case 'node_completed': {

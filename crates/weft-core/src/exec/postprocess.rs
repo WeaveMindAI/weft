@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::exec::execution::{NodeExecutionStatus, NodeExecutionTable};
+use crate::exec::mutations::PulseMutation;
 use crate::exec::typecheck::runtime_type_check;
 use crate::lane::{Lane, LaneFrame};
 use crate::project::{Edge, EdgeIndex, LaneMode, NodeDefinition, ProjectDefinition};
@@ -14,8 +15,17 @@ use crate::pulse::{Pulse, PulseTable};
 use crate::weft_type::WeftType;
 use crate::Color;
 
-/// Process a node's output. Emits pulses downstream. Returns true if
-/// a Gather fired (caller should re-run readiness).
+/// Outcome of `postprocess_output`. `gather_fired` lets the caller
+/// re-run readiness; mutations land in the caller-provided vec so
+/// the runtime can ship them to the dispatcher for journaling.
+#[derive(Debug, Default)]
+pub struct PostprocessResult {
+    pub gather_fired: bool,
+}
+
+/// Process a node's output. Emits pulses downstream and appends one
+/// `PulseMutation::Emitted` per produced pulse to `mutations`, so
+/// the runtime can ship a faithful journal record.
 pub fn postprocess_output(
     node_id: &str,
     output: &Value,
@@ -25,10 +35,12 @@ pub fn postprocess_output(
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
     node_executions: &mut NodeExecutionTable,
-) -> bool {
+    mutations: &mut Vec<PulseMutation>,
+) -> PostprocessResult {
+    let mut result = PostprocessResult::default();
     let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
         tracing::error!(target: "weft::exec::postprocess", node = node_id, "node not found in project");
-        return false;
+        return result;
     };
 
     let output_obj = output.as_object();
@@ -72,7 +84,6 @@ pub fn postprocess_output(
 
     // Collect gather-port values to process together at the end.
     let mut gather_values: HashMap<String, Value> = HashMap::new();
-    let mut gather_fired = false;
 
     for port in &node.outputs {
         let value = if failed_ports.contains(&port.name) {
@@ -84,8 +95,26 @@ pub fn postprocess_output(
                 .unwrap_or(Value::Null)
         };
         match port.lane_mode {
-            LaneMode::Single => emit_single(&outgoing, &port.name, &value, color, lane, pulses),
-            LaneMode::Expand => emit_expand(node_id, &outgoing, port, &value, color, lane, pulses),
+            LaneMode::Single => emit_single(
+                node_id,
+                &outgoing,
+                &port.name,
+                &value,
+                color,
+                lane,
+                pulses,
+                mutations,
+            ),
+            LaneMode::Expand => emit_expand(
+                node_id,
+                &outgoing,
+                port,
+                &value,
+                color,
+                lane,
+                pulses,
+                mutations,
+            ),
             LaneMode::Gather => {
                 gather_values.insert(port.name.clone(), value);
             }
@@ -94,12 +123,20 @@ pub fn postprocess_output(
 
     if !gather_values.is_empty() {
         if lane.is_empty() {
-            // Scalar: no siblings to wait for; emit directly.
             for (port_name, value) in &gather_values {
-                emit_single(&outgoing, port_name, value, color, lane, pulses);
+                emit_single(
+                    node_id,
+                    &outgoing,
+                    port_name,
+                    value,
+                    color,
+                    lane,
+                    pulses,
+                    mutations,
+                );
             }
         } else {
-            gather_fired = try_gather(
+            result.gather_fired = try_gather(
                 node_id,
                 node,
                 color,
@@ -108,22 +145,25 @@ pub fn postprocess_output(
                 &outgoing,
                 pulses,
                 node_executions,
+                mutations,
             );
         }
     }
 
-    gather_fired
+    result
 }
 
 /// Emit a Single output port value on every outgoing edge from that
 /// port.
 fn emit_single(
+    source_node: &str,
     outgoing: &[&Edge],
     port: &str,
     value: &Value,
     color: Color,
     lane: &Lane,
     pulses: &mut PulseTable,
+    mutations: &mut Vec<PulseMutation>,
 ) {
     for edge in outgoing {
         if edge.source_handle.as_deref() != Some(port) {
@@ -143,18 +183,32 @@ fn emit_single(
             continue;
         }
 
-        pulses.entry(edge.target.clone()).or_default().push(Pulse::new(
+        let pulse = Pulse::new(
             color,
             lane.clone(),
             edge.target.clone(),
             target_handle.to_string(),
             value.clone(),
-        ));
+        );
+        let pulse_id = pulse.id;
+        pulses.entry(edge.target.clone()).or_default().push(pulse);
+        mutations.push(PulseMutation::Emitted {
+            pulse_id,
+            source_node: source_node.to_string(),
+            source_port: port.to_string(),
+            target_node: edge.target.clone(),
+            target_port: target_handle.to_string(),
+            color,
+            lane: lane.clone(),
+            value: value.clone(),
+        });
     }
 }
 
 /// Emit an Expand port: split the array value into N child-lane
-/// pulses on each downstream edge.
+/// pulses on each downstream edge. Each downstream pulse becomes
+/// its own `PulseMutation::Emitted` so replay's NodeStarted
+/// matching is exact by UUID.
 fn emit_expand(
     node_id: &str,
     outgoing: &[&Edge],
@@ -163,6 +217,7 @@ fn emit_expand(
     color: Color,
     lane: &Lane,
     pulses: &mut PulseTable,
+    mutations: &mut Vec<PulseMutation>,
 ) {
     let items: Vec<Value> = if value.is_null() {
         vec![Value::Null]
@@ -202,13 +257,25 @@ fn emit_expand(
                 item.clone()
             };
 
-            pulses.entry(edge.target.clone()).or_default().push(Pulse::new(
+            let pulse = Pulse::new(
                 color,
-                child_lane,
+                child_lane.clone(),
                 edge.target.clone(),
                 target_handle.to_string(),
-                checked,
-            ));
+                checked.clone(),
+            );
+            let pulse_id = pulse.id;
+            pulses.entry(edge.target.clone()).or_default().push(pulse);
+            mutations.push(PulseMutation::Emitted {
+                pulse_id,
+                source_node: node_id.to_string(),
+                source_port: port.name.clone(),
+                target_node: edge.target.clone(),
+                target_port: target_handle.to_string(),
+                color,
+                lane: child_lane,
+                value: checked,
+            });
         }
     }
 }
@@ -225,6 +292,7 @@ fn try_gather(
     outgoing: &[&Edge],
     pulses: &mut PulseTable,
     node_executions: &NodeExecutionTable,
+    mutations: &mut Vec<PulseMutation>,
 ) -> bool {
     let top = lane.last().unwrap();
     let expected = top.count;
@@ -282,14 +350,15 @@ fn try_gather(
             }
         }
 
-        emit_single(outgoing, port_name, &gathered, color, &parent_lane, pulses);
+        emit_single(node_id, outgoing, port_name, &gathered, color, &parent_lane, pulses, mutations);
     }
 
     true
 }
 
 /// Emit null on every output port at the given lane. Used when a
-/// node is skipped or fails at dispatch time.
+/// node is skipped or fails at dispatch time. Mutations are
+/// appended to the caller's vec so the worker can ship them.
 pub fn emit_null_downstream(
     node_id: &str,
     color: Color,
@@ -298,8 +367,11 @@ pub fn emit_null_downstream(
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
     node_executions: &mut NodeExecutionTable,
-) {
-    let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else { return };
+    mutations: &mut Vec<PulseMutation>,
+) -> PostprocessResult {
+    let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
+        return PostprocessResult::default();
+    };
     let mut null_output = Map::new();
     for port in &node.outputs {
         null_output.insert(port.name.clone(), Value::Null);
@@ -313,5 +385,6 @@ pub fn emit_null_downstream(
         pulses,
         edge_idx,
         node_executions,
-    );
+        mutations,
+    )
 }

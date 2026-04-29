@@ -163,11 +163,17 @@ export function activate(context: vscode.ExtensionContext) {
       // nothing is pending.
       await graphView.waitForPendingSave();
       const hash = await hashProjectInputs(project.rootPath);
-      const cacheKey = `weft.lastBuild.${project.id}`;
+      // v3 cache key: bumped when we added the weft-binary fingerprint
+      // to `hashProjectInputs`. Old cached entries didn't include the
+      // engine's binary identity so worker images stayed stale across
+      // engine upgrades; the bump forces every project to re-check
+      // once and rebuild if needed.
+      const cacheKey = `weft.lastBuild.v4.${project.id}`;
       const last = context.workspaceState.get<string>(cacheKey);
       const tag = `weft-worker-${project.id}:latest`;
-      if (last === hash && (await dockerImageExists(tag))) {
-        // Source unchanged + image still present: nothing to do.
+      if (last === hash && (await workerImageInCluster(tag))) {
+        // Source + engine binary unchanged + image still loaded in
+        // the cluster: nothing to do.
         return;
       }
       graphView.post({ kind: 'buildState', active: true, verb });
@@ -209,7 +215,44 @@ export function activate(context: vscode.ExtensionContext) {
       h.update(buf);
       h.update('\0');
     }
+    // Fold the active `weft` binary's identity into the hash so the
+    // cache invalidates whenever the user rebuilds the CLI (which
+    // happens any time engine / catalog Rust source changes). The
+    // worker image bakes those crates into its build, so a stale
+    // engine + cached image drops back-channel updates the new
+    // engine relies on (e.g. emitted_pulses for expand-fan-out).
+    const weftFingerprint = await weftBinaryFingerprint();
+    h.update('weft-binary\0');
+    h.update(weftFingerprint);
     return h.digest('hex');
+  }
+
+  /// Return a stable identity string for the `weft` binary on PATH:
+  /// `<absolute-path>:<size>:<mtimeNs>`. Falls back to the literal
+  /// "weft" if resolution fails so we still hash *something*; that
+  /// case is rare (would mean weft isn't on PATH) and the build
+  /// would fail loudly anyway.
+  async function weftBinaryFingerprint(): Promise<string> {
+    try {
+      const which = await new Promise<string>((resolve, reject) => {
+        const child = spawn(process.platform === 'win32' ? 'where' : 'which', ['weft'], {
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        let out = '';
+        child.stdout?.on('data', (b: Buffer) => { out += b.toString(); });
+        child.on('error', reject);
+        child.on('close', (code) => {
+          if (code === 0) resolve(out.split(/\r?\n/)[0]?.trim() ?? '');
+          else reject(new Error(`which weft exited ${code}`));
+        });
+      });
+      if (!which) return 'weft';
+      const stat = await fsp.stat(which);
+      // mtime in ms is enough granularity for "did this file change."
+      return `${which}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return 'weft';
+    }
   }
 
   async function collectFiles(dir: string, out: string[]): Promise<void> {
@@ -224,13 +267,48 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  async function dockerImageExists(tag: string): Promise<boolean> {
+  /// Check whether the worker image is loaded into the kind
+  /// cluster's containerd. Host docker is irrelevant: the
+  /// dispatcher pod pulls from the cluster's runtime, not from
+  /// the host. A `setup.sh --purge` deletes the kind cluster but
+  /// leaves the host docker image; without this check the cache
+  /// would say "image is fine" while the cluster has nothing.
+  ///
+  /// Implementation note: `crictl images -q <ref>` returns exit 0
+  /// and dumps EVERY image ID when the ref doesn't match (it
+  /// silently ignores the filter), so we can't trust its exit
+  /// code. Instead parse the columnar `crictl images` output and
+  /// match the repository + tag pair exactly.
+  async function workerImageInCluster(tag: string): Promise<boolean> {
+    const cluster = process.env.WEFT_CLUSTER_NAME ?? 'weft-local';
+    const node = `${cluster}-control-plane`;
+    const colon = tag.lastIndexOf(':');
+    const namePart = colon >= 0 ? tag.slice(0, colon) : tag;
+    const tagPart = colon >= 0 ? tag.slice(colon + 1) : 'latest';
+    // kind load normalizes unprefixed tags to docker.io/library/<name>.
+    const expectedRepo = namePart.includes('/')
+      ? namePart
+      : `docker.io/library/${namePart}`;
     return new Promise((resolve) => {
-      const child = spawn('docker', ['image', 'inspect', tag], {
-        stdio: ['ignore', 'ignore', 'ignore'],
+      const child = spawn('docker', ['exec', node, 'crictl', 'images'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      let stdout = '';
+      child.stdout?.on('data', (chunk) => {
+        stdout += chunk.toString();
       });
       child.on('error', () => resolve(false));
-      child.on('close', (code) => resolve(code === 0));
+      child.on('close', () => {
+        for (const line of stdout.split('\n')) {
+          const cols = line.trim().split(/\s+/);
+          if (cols.length < 2) continue;
+          if (cols[0] === expectedRepo && cols[1] === tagPart) {
+            resolve(true);
+            return;
+          }
+        }
+        resolve(false);
+      });
     });
   }
 

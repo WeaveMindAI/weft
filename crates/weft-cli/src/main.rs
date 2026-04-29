@@ -109,24 +109,64 @@ enum Cmd {
     /// offline inspection; `weft replay <color>` drives the graph
     /// view animation.
     Events { color: String },
-    /// Remove journal data. With no color: all executions older than
-    /// `--keep` days (default 30). With a color: only that execution.
+    /// Inspect every active listener: per-tenant, prints the
+    /// journal's signal count alongside the listener's local
+    /// registry. Drift between the two means cleanup went wrong.
+    /// Operator command for diagnosing stuck listeners.
+    Listener {
+        #[command(subcommand)]
+        action: ListenerAction,
+    },
+    /// Remove stale state. Default subject is the journal: with no
+    /// flags, deletes executions older than --keep-days (30). Pass
+    /// a positional UUID to target one execution. Other subjects
+    /// are flag-driven and combinable.
+    ///
+    /// Subjects:
+    ///   (default)         journal cleanup (executions older than --keep-days)
+    ///   <UUID>            one execution
+    ///   --images          dangling worker images for the cwd project
+    ///                     (use --all to span every project)
+    ///   --build-cache     docker buildkit cache prune
+    ///   --all             with the journal subject: nuke every execution
+    ///                     with --images: every project's images
+    #[command(verbatim_doc_comment)]
     Clean {
+        /// Single execution UUID to delete. Mutually exclusive with --images / --build-cache.
         #[arg(value_name = "color")]
         color: Option<String>,
+        /// Bulk-delete journal cutoff in days.
         #[arg(long, default_value_t = 30)]
         keep_days: u32,
+        /// Wipe ALL executions (with no other flags) OR span every project (with --images).
         #[arg(long, default_value_t = false)]
         all: bool,
+        /// Reclaim dangling worker images. Cwd-scoped unless --all.
+        #[arg(long, default_value_t = false)]
+        images: bool,
+        /// Prune docker BuildKit cache (heavy: invalidates cargo dep cache).
+        #[arg(long, default_value_t = false)]
+        build_cache: bool,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum TokenAction {
-    /// Mint a new extension token.
+    /// Mint a new extension token. Default token shape is the
+    /// friendly `wm_tk_<adj>-<noun>-<NN>` (e.g. `wm_tk_swift-
+    /// falcon-23`); pass `--hard` for a uuid-backed token when
+    /// the dispatcher is exposed beyond localhost.
     Mint {
+        /// Optional human label, separate from the token itself.
+        /// Shown by `weft token ls`. Defaults to the token's own
+        /// readable suffix when omitted.
         #[arg(long)]
         name: Option<String>,
+        /// Use a high-entropy token (`wm_tk_<32-hex>`) instead of
+        /// the friendly default. Pick this when the dispatcher
+        /// isn't on localhost-only.
+        #[arg(long)]
+        hard: bool,
     },
     /// List existing extension tokens.
     Ls,
@@ -137,7 +177,7 @@ enum TokenAction {
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name } => commands::token::TokenAction::Mint { name },
+            TokenAction::Mint { name, hard } => commands::token::TokenAction::Mint { name, hard },
             TokenAction::Ls => commands::token::TokenAction::Ls,
             TokenAction::Revoke { token } => commands::token::TokenAction::Revoke { token },
         }
@@ -158,6 +198,14 @@ enum InfraAction {
     Terminate,
     /// Print the current lifecycle state of each infra node.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum ListenerAction {
+    /// Pretty-print every active listener: tenant, journal signal
+    /// count, listener registry. Drift highlights where cleanup
+    /// went wrong.
+    Inspect,
 }
 
 #[derive(Debug, Subcommand)]
@@ -251,8 +299,11 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
         Cmd::Executions { limit } => commands::executions::list(ctx, limit).await,
         Cmd::Events { color } => commands::executions::events(ctx, color).await,
-        Cmd::Clean { color, keep_days, all } => {
-            commands::executions::clean(ctx, color, keep_days, all).await
+        Cmd::Listener { action } => match action {
+            ListenerAction::Inspect => commands::listener::inspect(ctx).await,
+        },
+        Cmd::Clean { color, keep_days, all, images, build_cache } => {
+            commands::executions::clean(ctx, color, keep_days, all, images, build_cache).await
         }
     }
 }

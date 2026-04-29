@@ -156,6 +156,11 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let id = id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Deactivate first: cancels any in-flight executions, unregisters
+    // every wake signal (entry + resume) from the tenant's listener,
+    // drops entry tokens. Best-effort: if the project wasn't active
+    // there's nothing to deactivate and we proceed.
+    let _ = deactivate_project(&state, id).await;
     if state.projects.remove(id).await {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -252,11 +257,24 @@ pub async fn run(
             at_unix: now,
         })
         .await;
-    for seed in &seeds {
+    // Mint a pulse_id per seed. Both the journaled `PulseSeeded`
+    // event and the `RootSeed` shipped to the worker carry the
+    // same UUID, so a fresh worker's fold reconstructs the seed
+    // pulse with the same identity the live worker used.
+    let core_seeds: Vec<weft_core::primitive::RootSeed> = seeds
+        .into_iter()
+        .map(|s| weft_core::primitive::RootSeed {
+            node_id: s.node_id,
+            pulse_id: uuid::Uuid::new_v4().to_string(),
+            value: s.value,
+        })
+        .collect();
+    for seed in &core_seeds {
         let _ = state
             .journal
             .record_event(&crate::journal::ExecEvent::PulseSeeded {
                 color,
+                pulse_id: seed.pulse_id.clone(),
                 node_id: seed.node_id.clone(),
                 port: "__seed__".to_string(),
                 lane: Vec::new(),
@@ -265,14 +283,6 @@ pub async fn run(
             })
             .await;
     }
-
-    // Enqueue the Manual wake in the slot so it lands in the Start
-    // message the moment the worker connects. Seeds are cloned into
-    // the core type so the slot state is self-contained.
-    let core_seeds: Vec<weft_core::primitive::RootSeed> = seeds
-        .into_iter()
-        .map(|s| weft_core::primitive::RootSeed { node_id: s.node_id, value: s.value })
-        .collect();
     state
         .slots
         .with_slot(color, move |slot| {
@@ -281,10 +291,11 @@ pub async fn run(
                     crate::slots::Slot::Idle { queued, .. }
                     | crate::slots::Slot::Starting { queued, .. }
                     | crate::slots::Slot::WaitingReconnect { queued, .. } => queued,
-                    crate::slots::Slot::Live { .. } => {
-                        // Live shouldn't happen for a fresh run
-                        // (we minted a brand-new color). Defensive:
-                        // overwrite with Idle + queued.
+                    crate::slots::Slot::Live { .. }
+                    | crate::slots::Slot::StalledGrace { .. } => {
+                        // Live or stalled shouldn't happen for a
+                        // fresh run (we minted a brand-new color).
+                        // Defensive: overwrite with Idle.
                         *slot = crate::slots::Slot::Idle {
                             queued: std::collections::VecDeque::new(),
                         };
@@ -305,7 +316,7 @@ pub async fn run(
         })
         .await;
 
-    let wake = WakeContext { project_id: id.to_string(), color };
+    let wake = WakeContext::resolve(&state, id.to_string(), color);
     let _ = &summary;
     let worker = state
         .workers
@@ -367,7 +378,11 @@ fn compute_root_seeds(
     let in_subgraph = upstream_closure(project, &edge_idx, targets);
     roots_of(project, &edge_idx, &in_subgraph)
         .into_iter()
-        .map(|id| RootSeed { node_id: id, value: payload.clone() })
+        .map(|id| RootSeed {
+            node_id: id,
+            pulse_id: uuid::Uuid::new_v4().to_string(),
+            value: payload.clone(),
+        })
         .collect()
 }
 
@@ -405,6 +420,7 @@ pub fn compute_trigger_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed>
         .into_iter()
         .map(|id| RootSeed {
             node_id: id,
+            pulse_id: uuid::Uuid::new_v4().to_string(),
             value: Value::Null,
         })
         .collect()
@@ -423,6 +439,7 @@ pub fn compute_infra_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
         .filter(|n| n.requires_infra)
         .map(|n| RootSeed {
             node_id: n.id.clone(),
+            pulse_id: uuid::Uuid::new_v4().to_string(),
             value: Value::Null,
         })
         .collect()
@@ -449,6 +466,7 @@ pub async fn run_infra_setup(
         .into_iter()
         .map(|node_id| RootSeed {
             node_id,
+            pulse_id: uuid::Uuid::new_v4().to_string(),
             value: Value::Null,
         })
         .collect();
@@ -468,6 +486,7 @@ pub async fn run_infra_setup(
             .journal
             .record_event(&crate::journal::ExecEvent::PulseSeeded {
                 color,
+                pulse_id: seed.pulse_id.clone(),
                 node_id: seed.node_id.clone(),
                 port: "__seed__".to_string(),
                 lane: Vec::new(),
@@ -489,7 +508,8 @@ pub async fn run_infra_setup(
                         crate::slots::Slot::Idle { queued, .. }
                         | crate::slots::Slot::Starting { queued, .. }
                         | crate::slots::Slot::WaitingReconnect { queued, .. } => queued,
-                        crate::slots::Slot::Live { .. } => {
+                        crate::slots::Slot::Live { .. }
+                        | crate::slots::Slot::StalledGrace { .. } => {
                             *slot = crate::slots::Slot::Idle {
                                 queued: std::collections::VecDeque::new(),
                             };
@@ -510,10 +530,7 @@ pub async fn run_infra_setup(
         })
         .await;
 
-    let wake = WakeContext {
-        project_id: project_id.clone(),
-        color,
-    };
+    let wake = WakeContext::resolve(state, project_id.clone(), color);
     let worker = state
         .workers
         .spawn_worker(wake)
@@ -650,7 +667,11 @@ pub fn compute_trigger_seeds(
             } else {
                 Value::Null
             };
-            RootSeed { node_id: id, value }
+            RootSeed {
+                node_id: id,
+                pulse_id: uuid::Uuid::new_v4().to_string(),
+                value,
+            }
         })
         .collect()
 }
@@ -796,7 +817,8 @@ pub async fn status(
         .await
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     let project_id = id.to_string();
-    let listener_running = state.listeners.get(&project_id).is_some();
+    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let listener_running = state.listeners.get(tenant.as_str()).is_some();
 
     let infra_entries = state.infra_registry.list_for_project(&project_id);
     let mut infra = Vec::new();
@@ -876,37 +898,57 @@ pub async fn activate(
         ));
     }
 
-    // Re-activation: tear down everything from last time.
-    state.signal_tracker.remove_project(&project_id);
-    if let Some(_old) = state.listeners.remove(&project_id) {
-        let _ = state.listener_backend.stop(&project_id).await;
+    // Re-activation: cancel every still-running execution of this
+    // project. The user may have changed the source between
+    // activations; leaving in-flight runs around would let an old
+    // worker handle a fire that was registered against the new
+    // code. Then drop signals + tokens.
+    let summaries = state
+        .journal
+        .list_executions(500)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list execs: {e}")))?;
+    for s in summaries {
+        if s.project_id != project_id {
+            continue;
+        }
+        let settled = matches!(
+            s.status.to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "cancelled",
+        );
+        if settled {
+            continue;
+        }
+        let _ = crate::api::execution::cancel_color(&state, s.color).await;
     }
+
+    let _ = state
+        .journal
+        .signal_remove_for_project(&project_id)
+        .await;
     state
         .journal
         .drop_entry_tokens(&project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drop tokens: {e}")))?;
 
-    // Spawn listener.
-    // Listeners run inside the cluster (K8sListenerBackend) or
-    // alongside the dispatcher (SubprocessListenerBackend); either
-    // way the "dispatcher URL" the listener uses to POST
-    // /signal-fired must be reachable from the listener. Default
-    // to cluster DNS when running in-pod (WEFT_NAMESPACE is set by
-    // the Deployment manifest); otherwise fall back to 127.0.0.1.
-    let dispatcher_url = match std::env::var("WEFT_NAMESPACE") {
-        Ok(ns) => format!(
-            "http://weft-dispatcher.{ns}.svc.cluster.local:{port}",
-            port = state.config.http_port,
-        ),
-        Err(_) => format!("http://127.0.0.1:{}", state.config.http_port),
-    };
-    let handle = state
-        .listener_backend
-        .spawn(&project_id, &dispatcher_url)
+    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let namespace = state.namespace_mapper.namespace_for(&tenant);
+    let dispatcher_url = state.config.cluster_dispatcher_url();
+    let deploy_name = crate::listener::deploy_name_for_tenant(tenant.as_str());
+    state
+        .listeners
+        .ensure(
+            &tenant,
+            &namespace,
+            &dispatcher_url,
+            state.listener_backend.as_ref(),
+            &state.pg_pool,
+            &deploy_name,
+            state.pod_id.as_str(),
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn listener: {e}")))?;
-    state.listeners.insert(project_id.clone(), handle);
 
     // Compute the trigger-setup subgraph. If the project has no
     // triggers there's nothing to register and we're done.
@@ -967,15 +1009,60 @@ pub async fn deactivate_project(
     id: uuid::Uuid,
 ) -> Result<bool, (StatusCode, String)> {
     let project_id = id.to_string();
+
+    // Cancel every still-running execution for this project before
+    // tearing down trigger registrations / listener. Without this,
+    // workers keep chewing on a dead project (no listener, no
+    // tokens) until they finish their current node, which can be
+    // minutes for things like agent loops or long sidecar calls.
+    let summaries = state
+        .journal
+        .list_executions(500)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list execs: {e}")))?;
+    for s in summaries {
+        if s.project_id != project_id {
+            continue;
+        }
+        // Anything not yet settled (no completed/failed terminal
+        // event) is fair game. `terminal_for_color` reports an
+        // empty status for runs we haven't seen finish.
+        let settled = matches!(
+            s.status.to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "cancelled",
+        );
+        if settled {
+            continue;
+        }
+        // Best-effort: a single failed cancel shouldn't block the
+        // whole deactivate.
+        let _ = crate::api::execution::cancel_color(state, s.color).await;
+    }
+
     state
         .journal
         .drop_entry_tokens(&project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drop tokens: {e}")))?;
-    state.signal_tracker.remove_project(&project_id);
-    if state.listeners.remove(&project_id).is_some() {
-        let _ = state.listener_backend.stop(&project_id).await;
+    // Unregister this project's signals from the tenant's listener.
+    // The listener self-destructs (via /listener/empty) once its
+    // own registry hits zero. Other projects of the same tenant
+    // keep using it.
+    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let signals = state
+        .journal
+        .signal_list_for_project(&project_id)
+        .await
+        .unwrap_or_default();
+    if let Some(handle) = state.listeners.get(tenant.as_str()) {
+        for meta in &signals {
+            let _ = crate::listener::unregister_signal(&handle, &meta.token).await;
+        }
     }
+    let _ = state
+        .journal
+        .signal_remove_for_project(&project_id)
+        .await;
     let existed = state.projects.set_status(id, ProjectStatus::Inactive).await;
     if existed {
         state
@@ -1014,6 +1101,7 @@ async fn run_trigger_setup(
             .journal
             .record_event(&crate::journal::ExecEvent::PulseSeeded {
                 color,
+                pulse_id: seed.pulse_id.clone(),
                 node_id: seed.node_id.clone(),
                 port: "__seed__".to_string(),
                 lane: Vec::new(),
@@ -1038,7 +1126,8 @@ async fn run_trigger_setup(
                         crate::slots::Slot::Idle { queued, .. }
                         | crate::slots::Slot::Starting { queued, .. }
                         | crate::slots::Slot::WaitingReconnect { queued, .. } => queued,
-                        crate::slots::Slot::Live { .. } => {
+                        crate::slots::Slot::Live { .. }
+                        | crate::slots::Slot::StalledGrace { .. } => {
                             *slot = crate::slots::Slot::Idle {
                                 queued: std::collections::VecDeque::new(),
                             };
@@ -1059,10 +1148,7 @@ async fn run_trigger_setup(
         })
         .await;
 
-    let wake = WakeContext {
-        project_id: project_id.clone(),
-        color,
-    };
+    let wake = WakeContext::resolve(state, project_id.clone(), color);
     let worker = state
         .workers
         .spawn_worker(wake)
@@ -1121,14 +1207,18 @@ async fn run_trigger_setup(
     }
 }
 
-/// After a trigger-setup sub-exec, collect every tracked signal
+/// After a trigger-setup sub-exec, collect every persisted signal
 /// for the project that has a user-facing URL. These become the
 /// `urls` in ActivateResponse.
 async fn collect_listener_urls(state: &DispatcherState, project_id: &str) -> Vec<ActivationUrl> {
     let mut out = Vec::new();
-    for meta in state.signal_tracker.list_for_project(project_id) {
+    let signals = state
+        .journal
+        .signal_list_for_project(project_id)
+        .await
+        .unwrap_or_default();
+    for meta in signals {
         if meta.is_resume {
-            // Only entry signals get surfaced by activate.
             continue;
         }
         if let Some(url) = meta.user_url.clone() {

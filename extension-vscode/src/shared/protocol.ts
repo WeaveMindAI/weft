@@ -181,6 +181,42 @@ export interface CatalogEntry {
     showDebugPreview?: boolean;
     hidden?: boolean;
   };
+  /** Form-field vocabulary for nodes whose `features.hasFormSchema`
+   *  is true. Empty/undefined for everything else. The dispatcher's
+   *  `/describe/nodes` endpoint inlines this from each node's
+   *  `form_field_specs.json` so the form_builder editor can drive
+   *  the field-type dropdown without a separate fetch. */
+  formFieldSpecs?: FormFieldSpecWire[];
+}
+
+/** Render hint for one form field. Opaque to the host; the
+ *  consumer (browser extension, dashboard) reads `component` to
+ *  pick a UI primitive. */
+export interface FormFieldRenderWire {
+  component: string;
+  source?: 'static' | 'input';
+  multiple?: boolean;
+  prefilled?: boolean;
+}
+
+/** Port template emitted by a field type. */
+export interface FormFieldPortWire {
+  nameTemplate: string;
+  portType: string;
+}
+
+/** Wire shape of one `FormFieldSpec`. Mirrors `weft-core::node::
+ *  FormFieldSpec` (camelCase). The webview narrows this further
+ *  via its own `FormFieldSpec` interface in
+ *  `lib/utils/form-field-specs`. */
+export interface FormFieldSpecWire {
+  fieldType: string;
+  label: string;
+  render: FormFieldRenderWire;
+  requiredConfig: string[];
+  optionalConfig: string[];
+  addsInputs: FormFieldPortWire[];
+  addsOutputs: FormFieldPortWire[];
 }
 
 export interface ParseResponse {
@@ -215,7 +251,7 @@ export interface LaneFrame {
 // execution actually moved data.
 export interface NodeExecEvent {
   nodeId: string;
-  state: NodeExecutionStatus | 'started' | 'running';
+  state: NodeExecutionStatus | 'started' | 'running' | 'suspended' | 'cancelled';
   /// Lane identity from the dispatcher's NodeStarted /
   /// NodeCompleted events. Stringified JSON of the lane stack
   /// (e.g. `[{"count":5,"index":2}]`). The webview uses this to
@@ -226,6 +262,12 @@ export interface NodeExecEvent {
   error?: string;
   input?: unknown;
   output?: unknown;
+  /// Wake-signal token. Set on Suspended/Resumed.
+  token?: string;
+  /// Delivered value. Set on Resumed.
+  resumeValue?: unknown;
+  /// Reason. Set on Retried.
+  retryReason?: string;
 }
 
 export interface LiveDataItem {

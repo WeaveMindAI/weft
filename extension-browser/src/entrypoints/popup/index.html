@@ -5,20 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>WeaveMind</title>
     <meta name="manifest.type" content="browser_action" />
-    <style>
-      /* Reset body/html to prevent grey bar */
-      html, body {
-        margin: 0;
-        padding: 0;
-        width: 340px;
-        min-height: 420px;
-        overflow: hidden;
-      }
-      #app {
-        width: 340px;
-        min-height: 420px;
-      }
-    </style>
+    <!--
+      No html/body sizing here. Vite/WXT extracts inline <style>
+      blocks into a shared `app-*.css` chunk that BOTH popup.html
+      and tasks.html load; rules targeting `html`/`body`/`#app`
+      would clamp the full-tab task page to popup-popup width.
+      The popup's body-size constraints live in App.svelte's
+      `<style>` via `:global()` selectors so they only apply when
+      the popup component is actually mounted.
+    -->
   </head>
   <body>
     <div id="app"></div>

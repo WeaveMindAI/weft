@@ -66,6 +66,10 @@ impl Registry {
             .collect()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn clear(&self) {
         self.inner.clear();
     }

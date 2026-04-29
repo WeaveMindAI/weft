@@ -1,4 +1,4 @@
-import { fetchPendingTasks, checkConnection, type PendingTask, type ExtensionToken } from '../lib/api';
+import { fetchPendingTasks, type PendingTask, type ExtensionToken } from '../lib/api';
 
 const POLL_INTERVAL_MS = 30000; // 30 seconds
 
@@ -42,15 +42,22 @@ export default defineBackground(() => {
     }
   });
 
-  // Listen for messages from content scripts (e.g. toast dismiss)
-  browser.runtime.onMessage.addListener((message: { type: string; actionUrl?: string }) => {
-    if (message.type === 'OPEN_AND_DISMISS_ACTION' && message.actionUrl) {
-      // Open the URL in a new tab
-      browser.tabs.create({ url: message.actionUrl });
-      // Trigger a refresh to pick up the dismissed state
-      // (The action auto-expires from the task list on the server side)
-    }
-  });
+  // Listen for messages from content scripts (toast clicks).
+  browser.runtime.onMessage.addListener(
+    (message: { type: string; actionUrl?: string; url?: string }) => {
+      if (message.type === 'OPEN_AND_DISMISS_ACTION' && message.actionUrl) {
+        // Action toast: open the user's URL in a new tab. The
+        // dispatcher auto-expires the action from the task list.
+        browser.tabs.create({ url: message.actionUrl });
+      } else if (message.type === 'OPEN_TASK_RUNNER' && message.url) {
+        // Task toast: open the extension-hosted runner. Content
+        // scripts can't navigate to chrome-extension:// URLs with
+        // `window.open` from a web-origin so the toast delegates
+        // here.
+        browser.tabs.create({ url: message.url });
+      }
+    },
+  );
 
   // Initial poll
   pollForTasks();
@@ -58,14 +65,15 @@ export default defineBackground(() => {
 
 async function pollForTasks() {
   try {
-    const connected = await checkConnection();
-    if (!connected) {
-      console.log('[WeaveMind] Server not connected, skipping poll');
+    // Single round-trip: fetch tasks AND infer connectivity. The
+    // previous version did checkConnection() first which doubled
+    // the per-poll cost.
+    const result = await fetchPendingTasks();
+    if (!result.anyReachable) {
+      console.log('[WeaveMind] No reachable dispatcher, skipping poll');
       return;
     }
-
-    const tasks = await fetchPendingTasks();
-    console.log(`[WeaveMind] Polled ${tasks.length} pending tasks`);
+    const tasks = result.tasks;
 
     // Find tasks the user hasn't been notified about yet
     const newTasks = tasks.filter(t => !seenTaskIds.has(t.executionId));
@@ -96,14 +104,11 @@ async function showNotification(count: number, task: PendingTask & { _tokenConfi
     // Generate unique notification ID
     const notificationId = `task-${task.executionId}-${Date.now()}`;
     
-    // Build task URL if we have token config. Phase A: link to the
-    // dispatcher's ops dashboard; the per-task renderer (runner UI
-    // served from a /tasks/{execId} page) lands in phase B.
-    let taskUrl: string | undefined;
-    if (task._tokenConfig) {
-      const { dispatcherUrl } = task._tokenConfig;
-      taskUrl = `${dispatcherUrl}/dashboard`;
-    }
+    // Build the runner URL. The extension-hosted full-page runner
+    // (entrypoints/tasks/*) lives at tasks.html in the bundle. The
+    // hash fragment carries the executionId so clicking the toast
+    // lands on the right task.
+    const taskUrl = `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(task.executionId)}`;
 
     // Send toast message to all tabs via content script
     const isAction = task.taskType === 'Action';

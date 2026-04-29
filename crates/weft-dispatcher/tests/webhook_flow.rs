@@ -22,13 +22,12 @@ use weft_dispatcher::{
     api::router,
     backend::{EventStream, InfraBackend, InfraHandle, InfraSpec, WakeContext, WorkerBackend, WorkerHandle},
     config::DispatcherConfig,
-    journal::sqlite::SqliteJournal,
-    listener::{
-        register_signal, ListenerBackend, ListenerHandle, ListenerRegistry, RegisteredSignalMeta,
-        SignalTracker,
-    },
-    project_store::ProjectStore,
+    journal::MockJournal,
+    listener::{register_signal, ListenerBackend, ListenerHandle, ListenerPool},
+    journal::SignalRegistration,
+    project_store::MockProjectStore,
     slots::Slots,
+    tenant::{self, TenantId},
     DispatcherState,
 };
 
@@ -81,7 +80,8 @@ struct InProcessListenerBackend;
 impl ListenerBackend for InProcessListenerBackend {
     async fn spawn(
         &self,
-        project_id: &str,
+        tenant: &TenantId,
+        _namespace: &str,
         dispatcher_url: &str,
     ) -> anyhow::Result<ListenerHandle> {
         use weft_listener::{router as listener_router, ListenerConfig, ListenerState};
@@ -92,7 +92,7 @@ impl ListenerBackend for InProcessListenerBackend {
         let admin_token = Uuid::new_v4().to_string();
         let relay_token = Uuid::new_v4().to_string();
         let cfg = ListenerConfig {
-            project_id: project_id.to_string(),
+            tenant_id: tenant.to_string(),
             http_port: addr.port(),
             public_base_url: admin_url.clone(),
             dispatcher_url: dispatcher_url.to_string(),
@@ -111,7 +111,7 @@ impl ListenerBackend for InProcessListenerBackend {
             relay_token,
         })
     }
-    async fn stop(&self, _project_id: &str) -> anyhow::Result<()> {
+    async fn stop(&self, _tenant: &TenantId, _namespace: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -136,32 +136,41 @@ print.value = receive.body
     (id, payload)
 }
 
-async fn build_state(tmp: &tempfile::TempDir) -> (DispatcherState, Arc<Mutex<Vec<WakeContext>>>) {
-    let data_dir = tmp.path().to_path_buf();
-    let projects_dir = data_dir.join("projects");
-    let projects = ProjectStore::new(projects_dir).unwrap();
-    let journal = SqliteJournal::open(&data_dir.join("journal.sqlite"))
-        .await
-        .unwrap();
+async fn build_state(_tmp: &tempfile::TempDir) -> (DispatcherState, Arc<Mutex<Vec<WakeContext>>>) {
+    let projects: weft_dispatcher::ProjectStore = Arc::new(MockProjectStore::new());
+    let journal = MockJournal::new();
     let spawned = Arc::new(Mutex::new(Vec::new()));
     let config = DispatcherConfig {
         http_port: 0,
-        data_dir,
         worker_backend: "stub".into(),
         infra_backend: "stub".into(),
+        dispatcher_callback_url: "http://127.0.0.1:0".into(),
+        internal_url_template: "http://{pod}.test:9999".into(),
+        internal_secret: "test-secret".into(),
     };
+    // The test never touches leases so a lazy pool that never
+    // opens a real connection is safe. `connect_lazy` returns
+    // immediately and only attempts I/O on first query.
+    let pg_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy("postgres://test:test@127.0.0.1:1/test")
+        .expect("lazy pool");
+
     let state = DispatcherState {
         config: Arc::new(config),
+        pod_id: weft_dispatcher::state::PodId("test-pod".into()),
         journal: Arc::new(journal),
+        pg_pool,
         workers: Arc::new(RecordingWorkerBackend { spawned: spawned.clone() }),
         infra: Arc::new(StubInfraBackend),
         projects,
         events: weft_dispatcher::EventBus::new(),
         slots: Slots::new(),
         listener_backend: Arc::new(InProcessListenerBackend),
-        listeners: ListenerRegistry::new(),
-        signal_tracker: SignalTracker::new(),
+        listeners: ListenerPool::new(),
         infra_registry: weft_dispatcher::infra::InfraRegistry::new(),
+        tenant_router: tenant::local_router(),
+        namespace_mapper: tenant::local_namespace_mapper(),
     };
     (state, spawned)
 }
@@ -183,7 +192,6 @@ fn req(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request<Body
 async fn signal_fired_spawns_worker() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, spawned) = build_state(&tmp).await;
-    let signal_tracker = state.signal_tracker.clone();
     let listeners = state.listeners.clone();
     let listener_backend = state.listener_backend.clone();
     let journal = state.journal.clone();
@@ -204,11 +212,12 @@ async fn signal_fired_spawns_worker() {
     //    lookup (if any) has a project-for-color binding, then
     //    manually set up a listener + register a signal with it.
     //    Skip the full activate path (which needs a live worker).
+    let tenant = TenantId::local();
     let handle = listener_backend
-        .spawn(&project_id.to_string(), "http://127.0.0.1:65535")
+        .spawn(&tenant, "wm-local", "http://127.0.0.1:65535")
         .await
         .unwrap();
-    listeners.insert(project_id.to_string(), handle.clone());
+    listeners.insert(tenant.to_string(), handle.clone());
 
     // Register a webhook signal.
     let token = "tok-webhook".to_string();
@@ -224,18 +233,21 @@ async fn signal_fired_spawns_worker() {
         .expect("listener register");
     assert!(user_url.is_some());
 
-    // Put a tracker entry so /signal-fired routes correctly.
-    signal_tracker.insert(
-        token.clone(),
-        RegisteredSignalMeta {
-            project_id: project_id.to_string(),
+    // Persist a signal row so /signal-fired routes correctly.
+    journal
+        .signal_insert(&SignalRegistration {
             token: token.clone(),
+            tenant_id: tenant.to_string(),
+            project_id: project_id.to_string(),
+            color: None,
             node_id: "receive".to_string(),
             is_resume: false,
             user_url: user_url.clone(),
             kind: "webhook".to_string(),
-        },
-    );
+            spec_json: serde_json::to_string(&spec).unwrap(),
+        })
+        .await
+        .unwrap();
 
     // Sanity: the project store has this project registered.
     assert!(project_store.get(project_id).await.is_some());
@@ -244,7 +256,7 @@ async fn signal_fired_spawns_worker() {
 
     // 3. Simulate the listener firing by POSTing /signal-fired.
     let fire_body = serde_json::json!({
-        "project_id": project_id.to_string(),
+        "tenant_id": tenant.to_string(),
         "token": token,
         "payload": { "hello": "world" },
     });
