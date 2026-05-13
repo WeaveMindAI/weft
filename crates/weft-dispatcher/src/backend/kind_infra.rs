@@ -8,17 +8,18 @@
 //! The backend shells out to `kind` and `kubectl`. Both must be on
 //! PATH; we fail loudly with an actionable message if they aren't.
 //!
-//! Phase A: provision/deprovision + port-forwarded access via
-//! kubectl. Phase B: wire the SSE /events stream back into the
-//! dispatcher's event bus (currently stubbed).
+//! Provisions/deprovisions sidecars and exposes port-forwarded
+//! access via kubectl. The SSE /events stream from sidecars back
+//! into the dispatcher event bus is not wired (sidecars don't emit
+//! events the dispatcher needs today).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
-use crate::backend::{EventStream, InfraBackend, InfraHandle, InfraSpec};
+use crate::backend::{InfraBackend, InfraHandle, InfraSpec};
 
 fn in_cluster() -> bool {
     // The k8s downward-API mount is only present inside a Pod.
@@ -73,7 +74,20 @@ impl InfraBackend for KindInfraBackend {
         let ns = spec.namespace.clone();
         self.ensure_namespace(&ns).await?;
 
-        let image = format!("ghcr.io/weavemindai/sidecar-{}:latest", spec.sidecar.name);
+        // Hash-tagged image. Local kind clusters don't go through
+        // the ghcr.io registry; the CLI builds the image locally
+        // with the same tag and `kind load`s it into the node.
+        // For external k8s clusters, the user pushes a matching tag
+        // to their registry of record.
+        let hash = spec.sidecar_hash.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "provision sidecar {}: no hash set on InfraSpec; the CLI must \
+                 send sidecar_hashes in the /infra/start (or /infra/upgrade) body \
+                 before provision runs",
+                spec.sidecar.name,
+            )
+        })?;
+        let image = format!("weft-sidecar-{}:{}", spec.sidecar.name, hash);
         let port = spec.sidecar.port;
 
         // Pod name: predictable + unique so re-provisions don't
@@ -84,41 +98,34 @@ impl InfraBackend for KindInfraBackend {
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
 
-        // If the metadata provided raw manifests, apply them with
-        // placeholder substitution. Otherwise fall back to a
-        // minimal pod + service using the derived image/port.
-        let manifest = if spec.sidecar.manifests.is_empty() {
-            format!(
-                "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {pod_name}\n  namespace: {ns}\n  labels:\n    app: {pod_name}\n    weft-project: \"{project}\"\nspec:\n  containers:\n  - name: sidecar\n    image: {image}\n    ports:\n    - containerPort: {port}\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: {pod_name}\n  namespace: {ns}\nspec:\n  selector:\n    app: {pod_name}\n  ports:\n  - port: {port}\n    targetPort: {port}\n",
-                project = spec.project_id,
-            )
-        } else {
-            // Each manifest doc needs to be applied separately:
-            // kubectl's `apply -f -` accepts one JSON document OR
-            // a YAML stream with `---` separators, but not multiple
-            // JSON docs. Easiest is to apply them one at a time.
-            //
-            // Before apply we inject the weft.dev/* labels onto
-            // every manifest's metadata so a post-restart registry
-            // rebuild can find them by label selector, and so
-            // delete-by-label sweeps catch everything the sidecar
-            // owns (not just Deployment / Service / PVC we have
-            // hard-coded names for).
-            for raw in &spec.sidecar.manifests {
-                let mut doc = raw.clone();
-                inject_weft_labels(&mut doc, &pod_name, &spec.project_id, &spec.infra_node_id);
-                let s = serde_json::to_string(&doc)
-                    .map_err(|e| anyhow::anyhow!("serialize manifest: {e}"))?;
-                let s = s
-                    .replace("__INSTANCE_ID__", &pod_name)
-                    .replace("__NAMESPACE__", &ns)
-                    .replace("__SIDECAR_IMAGE__", &image);
-                kubectl_apply_manifest(&s).await?;
-            }
-            String::new()
-        };
-        if !manifest.is_empty() {
-            kubectl_apply_manifest(&manifest).await?;
+        // Node authors own the sidecar's manifest content (security
+        // context, resource limits, volumes, probes, ...). The
+        // dispatcher only injects the `weft.dev/*` labels (so the
+        // tenant NetworkPolicy `sidecar-policy` selects the pod,
+        // and the delete-by-label sweep finds everything the
+        // sidecar owns) and substitutes the `__INSTANCE_ID__` /
+        // `__NAMESPACE__` placeholders.
+        //
+        // Each manifest doc is applied separately: kubectl's
+        // `apply -f -` accepts one JSON document OR a YAML stream
+        // with `---` separators, but not multiple JSON docs.
+        if spec.sidecar.manifests.is_empty() {
+            anyhow::bail!(
+                "infra node '{node}' declares a sidecar but no manifests; \
+                 fill `manifests` on SidecarSpec (see docs/authoring-nodes.md).",
+                node = spec.infra_node_id
+            );
+        }
+        for raw in &spec.sidecar.manifests {
+            let mut doc = raw.clone();
+            inject_weft_labels(&mut doc, &pod_name, &spec.project_id, &spec.infra_node_id);
+            let s = serde_json::to_string(&doc)
+                .map_err(|e| anyhow::anyhow!("serialize manifest: {e}"))?;
+            let s = s
+                .replace("__INSTANCE_ID__", &pod_name)
+                .replace("__NAMESPACE__", &ns)
+                .replace("__SIDECAR_IMAGE__", &image);
+            kubectl_apply_manifest(&s).await?;
         }
 
         let handle_id = pod_name.clone();
@@ -156,40 +163,22 @@ impl InfraBackend for KindInfraBackend {
     async fn delete(&self, handle: InfraHandle) -> anyhow::Result<()> {
         self.handles.lock().await.remove(&handle.id);
         let ns = handle.namespace.clone();
-        // Best-effort: delete resources both by name (the sidecar
-        // manifests use `__INSTANCE_ID__` so Deployment / Service /
-        // PVC share the handle id as their name) and by label
-        // selector (catches anything the manifest tagged with
-        // `app=<id>` — e.g. Ingress or additional Services we
-        // haven't hard-coded names for). `--ignore-not-found` makes
-        // both sweeps idempotent.
-        for kind in ["deployment", "service", "ingress", "pvc", "pod"] {
+        // Delete every k8s object we tagged at provision time via
+        // `weft.dev/instance=<id>`. `inject_weft_labels` stamps that
+        // label on every manifest in the sidecar bundle, so this
+        // single label selector catches Deployments, Services, PVCs,
+        // Ingresses, and any additional resource the catalog ships,
+        // generic to any sidecar (no per-node hardcoding).
+        let selector = format!("weft.dev/instance={}", handle.id);
+        for kind in ["deployment", "service", "ingress", "pvc", "pod", "configmap", "secret"] {
             let _ = Command::new("kubectl")
                 .args([
-                    "-n", &ns, "delete", kind, &handle.id,
-                    "--ignore-not-found", "--wait=false",
-                ])
-                .status()
-                .await;
-            let _ = Command::new("kubectl")
-                .args([
-                    "-n", &ns, "delete", kind, "-l",
-                    &format!("app={}", handle.id),
+                    "-n", &ns, "delete", kind, "-l", &selector,
                     "--ignore-not-found", "--wait=false",
                 ])
                 .status()
                 .await;
         }
-        // WhatsApp's sidecar creates an auth PVC named
-        // `<id>-auth`; the delete-by-label sweep misses it because
-        // the manifest doesn't label PVCs.
-        let _ = Command::new("kubectl")
-            .args([
-                "-n", &ns, "delete", "pvc", &format!("{}-auth", handle.id),
-                "--ignore-not-found", "--wait=false",
-            ])
-            .status()
-            .await;
         Ok(())
     }
 
@@ -199,14 +188,14 @@ impl InfraBackend for KindInfraBackend {
     ) -> anyhow::Result<Vec<crate::backend::AdoptedHandle>> {
         let mut adopted = Vec::new();
         for ns in namespaces {
-            // Sweep legacy orphans. Any Deployment whose name starts
-            // with `weft-` but that DOESN'T carry the weft.dev
-            // adoption labels is dead state from a prior dispatcher
-            // that didn't know to label, or from a manual kubectl
-            // apply. Best to delete it so the next `infra start`
-            // provisions fresh. We explicitly skip the dispatcher's
-            // own resources and listener deployments (owned by a
-            // different backend).
+            // Sweep unlabeled orphans: any Deployment named
+            // `weft-*` that lacks the `weft.dev/project` adoption
+            // label. Such resources came from a manual kubectl
+            // apply or a dispatcher that crashed mid-provision
+            // before labeling. Delete them so the next `infra
+            // start` provisions fresh. Skip the dispatcher's own
+            // resources and listener deployments (different
+            // backend owns them).
             for kind in ["deployment", "service", "pvc"] {
                 let out = Command::new("kubectl")
                     .args(["-n", ns, "get", kind, "-o", "json"])
@@ -250,7 +239,7 @@ impl InfraBackend for KindInfraBackend {
                     tracing::info!(
                         target: "weft::infra::kind",
                         %kind, %name, %ns,
-                        "sweeping unlabeled legacy weft resource"
+                        "sweeping unlabeled orphan weft resource"
                     );
                     let _ = Command::new("kubectl")
                         .args([
@@ -339,21 +328,13 @@ impl InfraBackend for KindInfraBackend {
         Ok(adopted)
     }
 
-    async fn stream_events(&self, _handle: InfraHandle) -> anyhow::Result<EventStream> {
-        // Phase A: empty stream. When the first infra-backed node
-        // ships (e.g. DiscordReceive), wire a background task that
-        // port-forwards to the pod's /events SSE and bridges every
-        // payload into this channel.
-        let (_tx, rx) = mpsc::channel(64);
-        Ok(rx)
-    }
 }
 
 /// Apply a YAML manifest by piping it to `kubectl apply -f -`.
 /// Merge weft-owned labels into every manifest's metadata.labels
 /// map. On restart we scan Deployments by these labels to rebuild
-/// the in-memory infra registry without touching the cluster's
-/// actual state.
+/// the `infra_pod` table from cluster state without touching the
+/// cluster's actual workloads.
 fn inject_weft_labels(
     doc: &mut serde_json::Value,
     instance_id: &str,

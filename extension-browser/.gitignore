@@ -8,11 +8,21 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-.output
 stats.html
 stats-*.json
 .wxt
 web-ext.config.ts
+
+# Build output: ignore unpacked builds + sources zip; track the
+# distributable per-browser zips (and the signed Firefox xpi)
+# so the latest committed build always matches the repo state.
+# Filenames are unversioned (set in wxt.config.ts) so each rebuild
+# overwrites the tracked file in place.
+build/*
+!build/weft-extension-*.zip
+!build/weft-extension-*.xpi
+# Sources zip is a publish artifact; not for git.
+build/weft-extension-sources.zip
 
 # Editor directories and files
 .vscode/*

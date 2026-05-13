@@ -11,17 +11,9 @@
 
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
+import { HttpError } from './dispatcher';
 import type { HostMessage, LiveDataItem, ProjectDefinition, WebviewMessage } from './shared/protocol';
 import { readProjectIdFromToml } from './sidebar/projects';
-
-export interface SelectedNode {
-  nodeId: string;
-  nodeType: string;
-  label?: string;
-  config?: Record<string, unknown>;
-  inputs?: Array<{ name: string; type: string }>;
-  outputs?: Array<{ name: string; type: string }>;
-}
 
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
@@ -32,46 +24,68 @@ export class GraphViewController {
   private lastProject: ProjectDefinition | undefined;
   // Host-side callbacks wired by extension.ts.
   private runHandler: (() => void) | undefined;
-  private stopHandler: (() => void) | undefined;
-  private selectionHandler: ((sel: SelectedNode | undefined) => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
   /// Hooks fired when the user triggers an action that spawns an
   /// execution whose color we don't yet know (activate / infra
   /// start). Extension.ts uses these to tell AutoFollow "next
   /// ExecutionStarted on this project, jump to it."
-  private lifecycleStartHandler: ((verb: 'activate' | 'infraStart') => void) | undefined;
+  private lifecycleStartHandler: (() => void) | undefined;
   private openSourceHandler: (() => void) | undefined;
-  private cancelBuildHandler: (() => void) | undefined;
-  private ensureBuildHandler:
-    | ((verb: 'run' | 'activate' | 'infraStart') => Promise<void>)
+  /// Stop / Cancel button on the action bar. Extension inspects
+  /// the current ActionBarState to decide whether to kill the CLI
+  /// process or POST /executions/{color}/cancel.
+  private stopActionHandler: (() => void) | undefined;
+  /// User dismissed the action-bar error banner. Extension.ts
+  /// clears the slot's `error` field via `actionBar.clearError`.
+  private dismissErrorHandler: (() => void) | undefined;
+  /// Architecture-4: every action-bar verb (activate, deactivate,
+  /// resync, infra start/stop/terminate/upgrade) shells out to the
+  /// CLI. Extension.ts installs this; graphView calls it with the
+  /// verb name + arg list.
+  private cliVerbHandler:
+    | ((verb: string, args: string[]) => Promise<void>)
     | undefined;
+  /// Runs `weft status --json` and pushes drift bits + available
+  /// actions into the action-bar state machine. Used on graph
+  /// open + after every action + on file-change debounce + on
+  /// user-clicked Refresh.
+  private cliStatusHandler: (() => Promise<void>) | undefined;
+  /// Called whenever the webview signals `ready` (initial mount,
+  /// or iframe rebuild after a column move). Lets extension.ts
+  /// re-push state that's owned outside graphView (action bar
+  /// state, status snapshot); without this, those messages can
+  /// race the webview's listener registration and get dropped on
+  /// VS Code restart with a .weft already open.
+  private readyHandler: (() => void) | undefined;
+  /// Called every time a parse succeeds. Extension uses this to
+  /// schedule a debounced status refetch so live source edits keep
+  /// the action bar's drift signals (source / infra) current.
+  private parseSuccessHandler: (() => void) | undefined;
   // Set while we're applying our own TextEdit to the document.
   // onDidChangeTextDocument fires during the edit; if we parsed
   // twice (once for the webview save, once for the VS Code change)
   // we'd loop.
   private suppressReparse = false;
   // One entry per (project, infra node) we're polling /live for.
-  // Keyed by nodeId. Cleared on parseResult and dispose.
+  // Keyed by nodeId. Cleared on parseResult and dispose. Posts
+  // `infraLive` messages to the webview.
   private liveTimers: Map<string, NodeJS.Timeout> = new Map();
+  // Same shape, for trigger nodes' signal display info (mount URL,
+  // freshly-minted api keys, etc). Keyed by nodeId. Polls
+  // `/projects/{id}/signals/{node_id}/display` and posts
+  // `signalDisplay` messages. A node is either infra OR trigger;
+  // never both, so a node never has both timers.
+  private signalDisplayTimers: Map<string, NodeJS.Timeout> = new Map();
   // Interval between polls for infra /live. 3s matches v1; the
   // sidecar's /live is cheap (returns current state snapshot), so
   // this is fine.
   private readonly liveIntervalMs = 3000;
-  // Infra status poller: one timer per open panel, polling the
-  // dispatcher's /infra/status endpoint so the ActionBar reflects
-  // the actual cluster state (running / stopped / none).
-  private infraStatusTimer: NodeJS.Timeout | undefined;
-  // Trigger status poller: tells the ActionBar whether the project
-  // is currently activated (dispatcher status == Active).
-  private triggerStatusTimer: NodeJS.Timeout | undefined;
-  // Whether the open project has any infra nodes at all. Cached
-  // from the latest parse so we can skip the poll when there's
-  // nothing to report.
-  private hasInfraNodes = false;
-  // Whether the open project has any trigger nodes. Drives
-  // visibility of the trigger section of the ActionBar.
-  private hasTriggerNodes = false;
+  // Action bar state, drift, and per-node infra status come from
+  // the host's `weft status --json` calls (handled by extension.ts'
+  // ActionBarStore). graphView used to run its own infra/trigger
+  // pollers; those are gone now because the single status endpoint
+  // delivers all the data in one shot.
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -81,29 +95,37 @@ export class GraphViewController {
   /** Called by extension.ts so sidebar-initiated runs and action-bar
    *  clicks route through the same business logic. */
   setRunHandler(fn: () => void): void { this.runHandler = fn; }
-  setStopHandler(fn: () => void): void { this.stopHandler = fn; }
-  setNodeSelectionHandler(fn: (sel: SelectedNode | undefined) => void): void { this.selectionHandler = fn; }
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
-  setLifecycleStartHandler(fn: (verb: 'activate' | 'infraStart') => void): void {
+  setLifecycleStartHandler(fn: () => void): void {
     this.lifecycleStartHandler = fn;
   }
   setOpenSourceHandler(fn: () => void): void { this.openSourceHandler = fn; }
-  /// Hook fired when the user clicks Stop during the Building
-  /// phase. Lets extension.ts kill the in-flight `weft build`
-  /// child process so the UI returns to its idle state.
-  setCancelBuildHandler(fn: () => void): void { this.cancelBuildHandler = fn; }
-  /// Hook fired whenever a graph-bar verb that may spawn worker
-  /// pods is about to fire (Run, Activate, InfraStart). Lets
-  /// extension.ts rebuild the worker image first so the spawned
-  /// pod runs the current source instead of the stale image
-  /// baked from the previous build. The verb lets the webview
-  /// show "Building..." in place of the verb's normal pending
-  /// state.
-  setEnsureBuildHandler(
-    fn: (verb: 'run' | 'activate' | 'infraStart') => Promise<void>,
+  /// Stop / Cancel pressed on the action bar. Extension dispatches
+  /// based on whether the bar is in cli_running (kill CLI) or
+  /// execution_running (POST /cancel) state.
+  setStopActionHandler(fn: () => void): void { this.stopActionHandler = fn; }
+  /// X-button on the action-bar error banner. Extension clears
+  /// the pinned project's slot.error.
+  setDismissErrorHandler(fn: () => void): void { this.dismissErrorHandler = fn; }
+  /// Architecture-4: graphView delegates every action-bar verb to
+  /// extension.ts via this handler, which shells out to the CLI.
+  /// The CLI handles build, hash-skip, registry push, dispatcher
+  /// call, and any user prompts.
+  setCliVerbHandler(
+    fn: (verb: string, args: string[]) => Promise<void>,
   ): void {
-    this.ensureBuildHandler = fn;
+    this.cliVerbHandler = fn;
+  }
+  setReadyHandler(fn: () => void): void {
+    this.readyHandler = fn;
+  }
+  setParseSuccessHandler(fn: () => void): void {
+    this.parseSuccessHandler = fn;
+  }
+
+  setCliStatusHandler(fn: () => Promise<void>): void {
+    this.cliStatusHandler = fn;
   }
 
   /** Public so execFollower can push events into the panel. */
@@ -120,30 +142,6 @@ export class GraphViewController {
     return this.panel !== undefined;
   }
 
-  /** Infer which edges are currently pulsing from the latest node
-   *  lifecycle event. Called by ExecutionFollower. */
-  approximateActiveEdges(
-    nodeId: string,
-    kind: 'started' | 'completed' | 'failed' | 'skipped',
-  ): void {
-    if (!this.lastProject) return;
-    const relevant: string[] = [];
-    if (kind === 'started') {
-      for (const e of this.lastProject.edges) {
-        if (e.target === nodeId) relevant.push(e.id);
-      }
-    } else if (kind === 'completed') {
-      for (const e of this.lastProject.edges) {
-        if (e.source === nodeId) relevant.push(e.id);
-      }
-    }
-    for (const edgeId of relevant) {
-      this.post({ kind: 'edgeActive', event: { edgeId, active: true } });
-      setTimeout(() => {
-        this.post({ kind: 'edgeActive', event: { edgeId, active: false } });
-      }, 200);
-    }
-  }
 
   async open(doc: vscode.TextDocument, projectId?: string): Promise<void> {
     // Resolve the project id for this file. Explicit caller arg
@@ -267,6 +265,8 @@ export class GraphViewController {
       }
       this.post({ kind: 'parseResult', response, source, layoutCode });
       this.syncInfraLivePollers(response);
+      this.syncSignalDisplayPollers(response);
+      this.parseSuccessHandler?.();
     } catch (err) {
       this.post({
         kind: 'parseError',
@@ -293,13 +293,12 @@ export class GraphViewController {
     const infraNodeIds = new Set(
       response.project.nodes
         .filter((n) => {
+          // The catalog entry's NodeMetadata still uses snake_case
+          // (`requires_infra`), so we check both. NodeDefinition's
+          // own field is `requiresInfra` (camelCase) per its wire
+          // schema.
           const entry = response.catalog[n.nodeType];
-          // NodeDefinition serializes `requires_infra` as camelCase
-          // `requiresInfra`; the catalog entry uses snake_case (its
-          // serde config differs). Check both so either one flips
-          // polling on.
-          const nodeFlag = (n as unknown as { requiresInfra?: boolean }).requiresInfra;
-          return nodeFlag ?? entry?.requires_infra ?? false;
+          return n.requiresInfra ?? entry?.requires_infra ?? false;
         })
         .map((n) => n.id),
     );
@@ -318,34 +317,6 @@ export class GraphViewController {
       this.liveTimers.set(id, this.startLivePoller(projectId, id));
     }
 
-    // Keep the infra-status poller alive while this project has
-    // infra nodes; tear it down otherwise.
-    const hadInfra = this.hasInfraNodes;
-    this.hasInfraNodes = infraNodeIds.size > 0;
-    if (this.hasInfraNodes && !hadInfra) {
-      this.startInfraStatusPoller(projectId);
-    } else if (!this.hasInfraNodes && hadInfra) {
-      this.stopInfraStatusPoller();
-    }
-
-    // Trigger-status poller runs as long as the project has any
-    // trigger node. `features.isTrigger` is mirrored onto the
-    // NodeDefinition during enrich; the protocol uses camelCase.
-    const triggerIds = new Set(
-      response.project.nodes
-        .filter((n) => {
-          const entry = response.catalog[n.nodeType];
-          return (n.features?.isTrigger ?? entry?.features?.isTrigger) ?? false;
-        })
-        .map((n) => n.id),
-    );
-    const hadTriggers = this.hasTriggerNodes;
-    this.hasTriggerNodes = triggerIds.size > 0;
-    if (this.hasTriggerNodes && !hadTriggers) {
-      this.startTriggerStatusPoller(projectId);
-    } else if (!this.hasTriggerNodes && hadTriggers) {
-      this.stopTriggerStatusPoller();
-    }
   }
 
   private startLivePoller(projectId: string, nodeId: string): NodeJS.Timeout {
@@ -359,12 +330,14 @@ export class GraphViewController {
         const items = Array.isArray(body.items)
           ? body.items.filter(isLiveDataItem)
           : [];
-        this.post({ kind: 'liveData', nodeId, items });
-      } catch {
-        // Infra not provisioned yet (404) or sidecar down (BAD_GATEWAY).
-        // Clear any previous render with an empty items list so the
-        // node stops showing stale data.
-        this.post({ kind: 'liveData', nodeId, items: [] });
+        this.post({ kind: 'infraLive', nodeId, state: 'ok', items });
+      } catch (err) {
+        // 404 = infra not provisioned. Anything else (BAD_GATEWAY,
+        // network) is a real failure; surface the underlying message.
+        const error = err instanceof HttpError && err.status === 404
+          ? "Infra not running. Start it from the project's action bar."
+          : err instanceof Error ? err.message : String(err);
+        this.post({ kind: 'infraLive', nodeId, state: 'error', error });
       }
     };
     void tick();
@@ -374,155 +347,288 @@ export class GraphViewController {
   private stopAllLivePollers(): void {
     for (const timer of this.liveTimers.values()) clearInterval(timer);
     this.liveTimers.clear();
+    for (const timer of this.signalDisplayTimers.values()) clearInterval(timer);
+    this.signalDisplayTimers.clear();
   }
 
-  private startInfraStatusPoller(projectId: string): void {
-    this.stopInfraStatusPoller();
-    const tick = async () => {
-      try {
-        const body = await this.client.get<{
-          nodes: Array<{ node_id: string; status: 'running' | 'stopped'; endpoint_url: string | null }>;
-        }>(`/projects/${projectId}/infra/status`);
-        const nodes = (body.nodes ?? []).map((n) => ({
-          nodeId: n.node_id,
-          status: n.status,
-          endpointUrl: n.endpoint_url,
-        }));
-        const rollup: 'running' | 'stopped' | 'mixed' | 'none' =
-          nodes.length === 0
-            ? 'none'
-            : nodes.every((n) => n.status === 'running')
-              ? 'running'
-              : nodes.every((n) => n.status === 'stopped')
-                ? 'stopped'
-                : 'mixed';
-        this.post({ kind: 'infraStatus', snapshot: { nodes, rollup } });
-      } catch {
-        this.post({ kind: 'infraStatus', snapshot: { nodes: [], rollup: 'none' } });
+  /** Mirror of `syncInfraLivePollers` for trigger nodes. Starts a
+   *  /display poller per trigger node so the inspector shows the
+   *  signal's mount URL + minted plaintext key. The dispatcher
+   *  returns 404 until activate registers the signal; we render an
+   *  empty items list in that case so the inspector clears stale
+   *  data instead of showing it forever.
+   */
+  private syncSignalDisplayPollers(response: { project: ProjectDefinition; catalog: Record<string, { features?: { isTrigger?: boolean } }> }): void {
+    const projectId = response.project.id;
+    if (!projectId) {
+      for (const timer of this.signalDisplayTimers.values()) clearInterval(timer);
+      this.signalDisplayTimers.clear();
+      return;
+    }
+    const triggerNodeIds = new Set(
+      response.project.nodes
+        .filter((n) => {
+          const entry = response.catalog[n.nodeType];
+          return n.features?.isTrigger ?? entry?.features?.isTrigger ?? false;
+        })
+        .map((n) => n.id),
+    );
+    for (const [id, timer] of this.signalDisplayTimers.entries()) {
+      if (!triggerNodeIds.has(id)) {
+        clearInterval(timer);
+        this.signalDisplayTimers.delete(id);
       }
-    };
-    void tick();
-    this.infraStatusTimer = setInterval(() => void tick(), this.liveIntervalMs);
-  }
-
-  private stopInfraStatusPoller(): void {
-    if (this.infraStatusTimer) {
-      clearInterval(this.infraStatusTimer);
-      this.infraStatusTimer = undefined;
+    }
+    for (const id of triggerNodeIds) {
+      if (this.signalDisplayTimers.has(id)) continue;
+      this.signalDisplayTimers.set(id, this.startSignalDisplayPoller(projectId, id));
     }
   }
 
-  private startTriggerStatusPoller(projectId: string): void {
-    this.stopTriggerStatusPoller();
+  private startSignalDisplayPoller(projectId: string, nodeId: string): NodeJS.Timeout {
     const tick = async () => {
       try {
-        const body = await this.client.get<{ status: string }>(
-          `/projects/${projectId}`,
+        const body = await this.client.get<Record<string, unknown>>(
+          `/projects/${projectId}/signals/${nodeId}/display`,
         );
-        const s = body.status as 'registered' | 'active' | 'inactive';
-        this.post({
-          kind: 'triggerStatus',
-          snapshot: {
-            projectStatus:
-              s === 'active' || s === 'inactive' || s === 'registered' ? s : 'unknown',
-          },
-        });
-      } catch {
-        this.post({ kind: 'triggerStatus', snapshot: { projectStatus: 'unknown' } });
+        const items = signalDisplayToLiveItems(body);
+        this.post({ kind: 'signalDisplay', nodeId, state: 'ok', items });
+      } catch (err) {
+        // 404 = signal not registered (project not activated, or
+        // trigger setup failed). Anything else (listener down,
+        // BAD_GATEWAY) is a real failure; surface the message.
+        const error = err instanceof HttpError && err.status === 404
+          ? "Trigger not registered. Activate the project from the action bar."
+          : err instanceof Error ? err.message : String(err);
+        this.post({ kind: 'signalDisplay', nodeId, state: 'error', error });
       }
     };
     void tick();
-    this.triggerStatusTimer = setInterval(() => void tick(), this.liveIntervalMs);
+    return setInterval(() => void tick(), this.liveIntervalMs);
   }
 
-  private stopTriggerStatusPoller(): void {
-    if (this.triggerStatusTimer) {
-      clearInterval(this.triggerStatusTimer);
-      this.triggerStatusTimer = undefined;
-    }
-  }
-
-  /** Fire `activate` or `deactivate` against the dispatcher and
-   *  kick a fresh trigger-status poll so the ActionBar settles
-   *  immediately. */
-  private async callProjectLifecycle(verb: 'activate' | 'deactivate'): Promise<void> {
-    const projectId = this.lastProject?.id ?? this.watchedProjectId;
+  /** Architecture-4 / control-plane unification: every action-bar
+   *  verb shells out to the CLI via the cliVerbHandler installed by
+   *  extension.ts. The CLI owns build, hash-skip, registry push,
+   *  dispatcher call, and confirmation prompts. graphView's role is
+   *  reduced to button-routing; the host's ActionBarStore owns all
+   *  state transitions and surfaces them via actionBarState.
+   */
+  /// Show a quick-pick for preservation mode and dispatch
+  /// `weft deactivate --mode <choice>`. The CLI's interactive prompt
+  /// only fires for human terminals; under `--json` it would silently
+  /// pick "wipe", which is dangerous (HumanQuery flows mid-suspension
+  /// would die). Surfacing the picker host-side keeps the choice
+  /// explicit and matches the terminal-CLI behavior.
+  /// Trigger a kind-specific action on a signal (e.g. regenerate
+  /// an api key). Hits the dispatcher's per-project action proxy;
+  /// the listener's kind impl owns the action's payload schema.
+  /// On success, force an immediate /display poll so the inspector
+  /// reflects the updated state without waiting for the next tick.
+  ///
+  /// When `confirm` is set, asks the user via VS Code's QuickPick
+  /// before invoking. Same UX as the deactivate-mode picker so the
+  /// experience stays consistent across destructive actions.
+  private async runSignalAction(
+    nodeId: string,
+    actionKind: string,
+    payload: unknown,
+    confirm: string | undefined,
+  ): Promise<void> {
+    const projectId = this.watchedProjectId;
     if (!projectId) return;
-    if (verb === 'activate') {
-      // Trigger-setup spawns a worker pod that runs the project's
-      // binary; rebuild the image first so the run reflects the
-      // user's latest source. Skipped for deactivate (no spawn).
-      try {
-        await this.ensureBuildHandler?.('activate');
-      } catch (err) {
-        this.reportActionFailure('activate', err);
-        return;
-      }
-      // Prime auto-follow before firing the request: the trigger
-      // setup sub-exec's ExecutionStarted can arrive over SSE
-      // before the HTTP response returns.
-      this.lifecycleStartHandler?.('activate');
+    if (confirm) {
+      const choice = await vscode.window.showQuickPick(
+        [
+          { label: 'Confirm', detail: confirm, value: true },
+          { label: 'Cancel', detail: 'Abort the action.', value: false },
+        ],
+        { placeHolder: confirm, ignoreFocusOut: true },
+      );
+      if (!choice || !choice.value) return;
     }
     try {
-      await this.client.post<unknown>(`/projects/${projectId}/${verb}`, {});
-    } catch (err) {
-      this.reportActionFailure(verb, err);
-    }
-    if (this.hasTriggerNodes) {
-      this.startTriggerStatusPoller(projectId);
-    }
-  }
-
-  /** Fire-and-forget: hit the dispatcher's infra endpoint on the
-   *  watched project's behalf, then force a poll so the ActionBar
-   *  reflects the new state without waiting for the next tick. */
-  private async callInfra(verb: 'start' | 'stop' | 'terminate'): Promise<void> {
-    const projectId = this.lastProject?.id ?? this.watchedProjectId;
-    if (!projectId) return;
-    if (verb === 'start') {
-      // Infra start now spawns an InfraSetup-phase worker pod
-      // (v2 model). The pod runs the project's binary, so the
-      // image needs to reflect the user's latest source. Stop /
-      // terminate don't spawn workers.
-      try {
-        await this.ensureBuildHandler?.('infraStart');
-      } catch (err) {
-        this.reportActionFailure('infraStart', err);
-        return;
+      await this.client.post(
+        `/projects/${projectId}/signals/${nodeId}/action`,
+        { kind: actionKind, payload: payload ?? null },
+      );
+      // Force-refresh the display poller for this node so the new
+      // plaintext key (etc) shows up immediately.
+      const timer = this.signalDisplayTimers.get(nodeId);
+      if (timer) {
+        clearInterval(timer);
+        this.signalDisplayTimers.set(
+          nodeId,
+          this.startSignalDisplayPoller(projectId, nodeId),
+        );
       }
-      // Prime auto-follow: first-time provision spawns no child
-      // exec, but scale_up eventually does if the user then hits
-      // activate. We still prime on start so the next exec after
-      // readiness auto-follows.
-      this.lifecycleStartHandler?.('infraStart');
-    }
-    try {
-      await this.client.post<unknown>(`/projects/${projectId}/infra/${verb}`, {});
     } catch (err) {
-      this.reportActionFailure(`infra${verb.charAt(0).toUpperCase()}${verb.slice(1)}` as
-        | 'infraStart'
-        | 'infraStop'
-        | 'infraTerminate', err);
-    }
-    // Refresh status immediately; the next interval tick will
-    // pick up any late k8s transitions (starting → running).
-    if (this.hasInfraNodes) {
-      this.startInfraStatusPoller(projectId);
+      // 409 means the signal's queue already has the maximum
+      // submission this token accepts (today: resume signals are
+      // capped at one pending answer). Show the user a clean
+      // "already received" message instead of a generic HTTP error
+      // toast.
+      if (err instanceof HttpError && err.status === 409) {
+        void vscode.window.showInformationMessage(
+          `This submission was already received and is being processed.`,
+        );
+      } else {
+        void vscode.window.showErrorMessage(
+          `Signal action '${actionKind}' failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
 
-  /** Shared failure path for the ActionBar verbs. Posts an
-   *  `actionFailed` message so the webview can clear its optimistic
-   *  transitional state, and surfaces a toast so the user isn't
-   *  left guessing why nothing happened. */
-  private reportActionFailure(
-    action: 'infraStart' | 'infraStop' | 'infraTerminate' | 'activate' | 'deactivate',
-    err: unknown,
-  ): void {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[weft/action] ${action} failed:`, err);
-    this.post({ kind: 'actionFailed', action, message });
-    void vscode.window.showErrorMessage(`Weft: ${action} failed — ${message}`);
+  private async runDeactivate(): Promise<void> {
+    // Step 1: preservation mode (wipe vs hibernate vs park).
+    const modes: Array<{
+      label: string;
+      detail: string;
+      mode: 'wipe' | 'hibernate' | 'park';
+    }> = [
+      {
+        label: 'Wipe',
+        detail:
+          'Drop every signal + cancel suspended runs. Reactivate is a fresh boot.',
+        mode: 'wipe',
+      },
+      {
+        label: 'Hibernate',
+        detail:
+          'Park submissions for a grace window, then refuse them. Project hidden from consumer enumeration the entire time.',
+        mode: 'hibernate',
+      },
+      {
+        label: 'Park',
+        detail:
+          'Park submissions indefinitely. Project visible to consumers; submissions drained on reactivate.',
+        mode: 'park',
+      },
+    ];
+    const modeChoice = await vscode.window.showQuickPick(modes, {
+      placeHolder: 'Choose preservation mode',
+      ignoreFocusOut: true,
+    });
+    if (!modeChoice) return;
+
+    // Step 2: running-execution policy. Skipped for wipe (which
+    // forces cancel because waiting before wiping is contradictory).
+    // For preservation modes, wait is the safe default (in-flight
+    // runs finish naturally; new fires already park). Cancel is
+    // the panic button.
+    let runningPolicy: 'wait' | 'cancel';
+    if (modeChoice.mode === 'wipe') {
+      runningPolicy = 'cancel';
+    } else {
+      const runningPolicies: Array<{
+        label: string;
+        detail: string;
+        value: 'wait' | 'cancel';
+      }> = [
+        {
+          label: 'Wait for running executions to finish',
+          detail:
+            'Status flips to "deactivating": new fires already park; in-flight runs drain naturally; project becomes inactive once the last finishes. You can cancel running anytime.',
+          value: 'wait',
+        },
+        {
+          label: 'Cancel running executions immediately',
+          detail:
+            'Kills every running, non-suspended execution right away. Project flips to inactive at once.',
+          value: 'cancel',
+        },
+      ];
+      const runningChoice = await vscode.window.showQuickPick(runningPolicies, {
+        placeHolder: 'How should running executions be handled?',
+        ignoreFocusOut: true,
+      });
+      if (!runningChoice) return;
+      runningPolicy = runningChoice.value;
+    }
+
+    // Step 3: hibernate-specific grace window.
+    const args = [
+      '--mode',
+      modeChoice.mode,
+      '--running-policy',
+      runningPolicy,
+    ];
+    if (modeChoice.mode === 'hibernate') {
+      const grace = await vscode.window.showInputBox({
+        prompt:
+          'Hibernate grace window (minutes). Submissions arriving after this point are refused.',
+        value: '15',
+        ignoreFocusOut: true,
+        validateInput: (v) => {
+          const n = Number(v.trim());
+          if (!Number.isInteger(n) || n < 0) {
+            return 'Enter a non-negative integer (minutes).';
+          }
+          return null;
+        },
+      });
+      if (grace === undefined) return;
+      args.push('--grace', String(Number(grace.trim())));
+    }
+    void this.dispatchVerb('deactivate', args);
+  }
+
+  /// Cancel running while in `deactivating`. Shells out to
+  /// `weft cancel-running` so the architecture-4 rule "every action
+  /// bar verb goes through the CLI" stays uniform. The CLI POSTs
+  /// the dispatcher's `/cancel-running` endpoint; the drain watcher
+  /// CASes status to `inactive` once the running set empties.
+  /// The lifecycle target the original deactivate wrote stays in
+  /// place (mode/visibility/deadline are unchanged).
+  private async runCancelRunning(): Promise<void> {
+    void this.dispatchVerb('cancel-running', []);
+  }
+
+  /// Cancel an in-flight activate (status=Activating). Wipes
+  /// partial trigger registrations; CASes status Activating →
+  /// Inactive.
+  private async runCancelActivate(): Promise<void> {
+    void this.dispatchVerb('cancel-activate', []);
+  }
+
+  /// Resume Active during `deactivating`. Same activate verb as
+  /// the normal flow; the dispatcher's activate handler handles
+  /// the "rolling back from deactivating" case naturally (it just
+  /// flips lifecycle to active and runs the drain pass against
+  /// anything that parked during the transient).
+  private async runResumeActive(): Promise<void> {
+    void this.dispatchVerb('activate', []);
+  }
+
+  private async dispatchVerb(verb: string, args: string[]): Promise<void> {
+    if (
+      verb === 'activate'
+      || verb === 'resync'
+      || (verb === 'infra' && (args[0] === 'start' || args[0] === 'upgrade'))
+    ) {
+      this.lifecycleStartHandler?.();
+    }
+    // Errors flow through the host's CLI runner: the spawned `weft
+    // <verb> --json` emits an `error` phase event; the host's
+    // ActionBarStore picks it up and renders an error banner.
+    // graphView no longer needs its own try/catch -> reportActionFailure
+    // shim because the bar reads error state directly from
+    // actionBarState.
+    await this.cliVerbHandler?.(verb, args);
+    void this.refreshActionAvailability();
+  }
+
+  /// Run `weft status --json` via the host. Pulls the latest drift
+  /// bits + project status + per-node infra status into the
+  /// host's ActionBarStore, which broadcasts to the webview.
+  async refreshActionAvailability(): Promise<void> {
+    if (!this.cliStatusHandler) return;
+    try {
+      await this.cliStatusHandler();
+    } catch (err) {
+      console.warn('[weft] refreshActionAvailability failed', err);
+    }
   }
 
   private onMessage(msg: WebviewMessage): void {
@@ -530,14 +636,15 @@ export class GraphViewController {
       case 'ready':
         // Webview just booted (initial open OR iframe rebuild
         // after a column move). Re-send the full initial state:
-        // settings, catalog, source parse, source-open flag.
-        // Don't assume the webview retained anything; column
-        // moves destroy the iframe even with
-        // retainContextWhenHidden.
-        void this.sendSettings();
+        // catalog, source parse, source-open flag. Don't assume the
+        // webview retained anything; column moves destroy the iframe
+        // even with retainContextWhenHidden.
         void this.sendGlobalCatalog();
         void this.triggerParse();
         this.pushSourceState();
+        // External state (action bar, status snapshot) lives in
+        // extension.ts. Hand off so it can re-push.
+        this.readyHandler?.();
         break;
       case 'saveWeft':
         void this.saveWeft(msg.source);
@@ -551,23 +658,50 @@ export class GraphViewController {
       case 'runProject':
         this.runHandler?.();
         break;
-      case 'stopProject':
-        this.stopHandler?.();
-        break;
       case 'infraStart':
-        void this.callInfra('start');
+        void this.dispatchVerb('infra', ['start']);
         break;
       case 'infraStop':
-        void this.callInfra('stop');
+        void this.dispatchVerb('infra', ['stop']);
         break;
       case 'infraTerminate':
-        void this.callInfra('terminate');
+        void this.dispatchVerb('infra', ['terminate']);
         break;
       case 'activateProject':
-        void this.callProjectLifecycle('activate');
+        void this.dispatchVerb('activate', []);
         break;
       case 'deactivateProject':
-        void this.callProjectLifecycle('deactivate');
+        void this.runDeactivate();
+        break;
+      case 'reactivateProject':
+        // Same CLI verb as activate; the CLI's own reactivate-
+        // choice prompt picks up via stdin (or the host's
+        // maybePromptReactivateChoice round-trips it via JSON).
+        void this.dispatchVerb('activate', []);
+        break;
+      case 'cancelRunning':
+        void this.runCancelRunning();
+        break;
+      case 'cancelActivate':
+        void this.runCancelActivate();
+        break;
+      case 'resumeActive':
+        void this.runResumeActive();
+        break;
+      case 'signalAction':
+        void this.runSignalAction(msg.nodeId, msg.actionKind, msg.payload, msg.confirm);
+        break;
+      case 'dismissError':
+        this.dismissErrorHandler?.();
+        break;
+      case 'resyncProject':
+        void this.dispatchVerb('resync', []);
+        break;
+      case 'infraUpgrade':
+        void this.dispatchVerb('infra', ['upgrade']);
+        break;
+      case 'refreshStatus':
+        void this.refreshActionAvailability();
         break;
       case 'followTogglePin':
         this.followTogglePinHandler?.();
@@ -578,25 +712,8 @@ export class GraphViewController {
       case 'openSource':
         this.openSourceHandler?.();
         break;
-      case 'cancelBuild':
-        this.cancelBuildHandler?.();
-        break;
-      case 'nodeSelected':
-        if (msg.nodeId === null) {
-          this.selectionHandler?.(undefined);
-        } else {
-          const node = this.lastProject?.nodes.find((n) => n.id === msg.nodeId);
-          if (node) {
-            this.selectionHandler?.({
-              nodeId: node.id,
-              nodeType: node.nodeType,
-              label: node.label ?? undefined,
-              config: node.config,
-              inputs: node.inputs.map((p) => ({ name: p.name, type: p.portType })),
-              outputs: node.outputs.map((p) => ({ name: p.name, type: p.portType })),
-            });
-          }
-        }
+      case 'stopAction':
+        this.stopActionHandler?.();
         break;
     }
   }
@@ -631,7 +748,7 @@ export class GraphViewController {
   private async saveWeft(source: string): Promise<void> {
     // Capture watchedDoc at entry. If the user switches the
     // active editor between now and when applyEdit/save runs,
-    // we must NOT redirect this write to the new doc — the
+    // we must NOT redirect this write to the new doc; the
     // source we were handed belongs to whatever was watched
     // when the saveWeft message was queued.
     const doc = this.watchedDoc;
@@ -708,27 +825,9 @@ export class GraphViewController {
     }
   }
 
-  private async sendSettings(): Promise<void> {
-    const cfg = vscode.workspace.getConfiguration('weft');
-    this.post({
-      kind: 'settings',
-      parseDebounceMs: cfg.get<number>('parse.debounceMs', 100),
-      layoutDebounceMs: cfg.get<number>('layout.debounceMs', 400),
-    });
-  }
-
   private onDispose(): void {
     if (this.parseTimer) clearTimeout(this.parseTimer);
     this.stopAllLivePollers();
-    this.stopInfraStatusPoller();
-    this.stopTriggerStatusPoller();
-    // Reset the "did the last parse see infra / triggers?" flags
-    // so a subsequent reopen triggers the 0→N transition in
-    // syncInfraLivePollers and the pollers restart. Without this
-    // a close/reopen cycle leaves the new webview with
-    // `isLoading: true` forever (no poller = no status message).
-    this.hasInfraNodes = false;
-    this.hasTriggerNodes = false;
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
     this.panel = undefined;
@@ -769,10 +868,85 @@ function randomNonce(): string {
   return out;
 }
 
+/// Set of allowed live-data kinds. New kinds: add the string here
+/// AND a render branch in ProjectNode.svelte. The type guard rejects
+/// anything else so a malformed payload never reaches the renderer.
+const LIVE_DATA_TYPES = ['text', 'image', 'progress', 'secret'] as const;
+type LiveDataType = (typeof LIVE_DATA_TYPES)[number];
+function isLiveDataType(v: unknown): v is LiveDataType {
+  return typeof v === 'string' && (LIVE_DATA_TYPES as readonly string[]).includes(v);
+}
+
 function isLiveDataItem(v: unknown): v is LiveDataItem {
   if (!v || typeof v !== 'object') return false;
   const o = v as Record<string, unknown>;
   if (typeof o.label !== 'string') return false;
   if (typeof o.data !== 'string' && typeof o.data !== 'number') return false;
-  return o.type === 'text' || o.type === 'image' || o.type === 'progress';
+  if (!isLiveDataType(o.type)) return false;
+  if (o.action !== undefined) {
+    if (!o.action || typeof o.action !== 'object') return false;
+    const a = o.action as Record<string, unknown>;
+    if (typeof a.label !== 'string') return false;
+    if (typeof a.actionKind !== 'string') return false;
+  }
+  return true;
+}
+
+/** Convert the listener's signal /display JSON into the
+ *  `LiveDataItem[]` shape the trigger node body panel renders.
+ *
+ *  The listener returns a free-form blob; the inspector knows
+ *  about a few standard fields:
+ *    - surface.kind  → "PublicEntry" / "TaskCallback"
+ *    - surface.path  → for PublicEntry, the mount path
+ *    - auth.kind     → "None" / "ApiKey"
+ *    - auth.header_name → for ApiKey
+ *    - secret        → plaintext, only present when listener still
+ *                      holds a freshly-minted key
+ */
+function signalDisplayToLiveItems(body: Record<string, unknown>): LiveDataItem[] {
+  const items: LiveDataItem[] = [];
+  const surface = body.surface as Record<string, unknown> | undefined;
+  if (surface && surface.kind === 'public_entry') {
+    const path = typeof surface.path === 'string' ? surface.path : '';
+    items.push({
+      type: 'text',
+      label: 'Path',
+      data: path === '' ? '/' : `/${path.replace(/^\//, '')}`,
+    });
+  }
+  const auth = body.auth as Record<string, unknown> | undefined;
+  if (auth && auth.kind === 'api_key') {
+    const header = typeof auth.header_name === 'string' ? auth.header_name : 'X-Api-Key';
+    items.push({ type: 'text', label: 'Auth header', data: header });
+  } else if (auth && auth.kind === 'none') {
+    items.push({ type: 'text', label: 'Auth', data: 'public (no key)' });
+  }
+  if (typeof body.secret === 'string' && body.secret.length > 0) {
+    items.push({
+      type: 'secret',
+      label: 'API key',
+      data: body.secret,
+      action: {
+        label: 'Regenerate',
+        actionKind: 'regenerate_api_key',
+        confirm: 'Regenerate the API key? The current key will stop working.',
+      },
+    });
+  } else if (auth && auth.kind === 'api_key') {
+    // Auth is api_key but the listener doesn't hold plaintext (pod
+    // restarted, original mint dropped). Show a placeholder text
+    // item with the regenerate button so the user can recover.
+    items.push({
+      type: 'text',
+      label: 'API key',
+      data: '(hidden by listener restart; click Regenerate to mint a new one)',
+      action: {
+        label: 'Regenerate',
+        actionKind: 'regenerate_api_key',
+        confirm: 'Mint a new API key? Replaces any current key.',
+      },
+    });
+  }
+  return items;
 }

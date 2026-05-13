@@ -4,6 +4,17 @@ import { defineConfig } from 'wxt';
 export default defineConfig({
   srcDir: 'src',
   modules: ['@wxt-dev/module-svelte'],
+  // Single build dir under the extension folder so the project tree
+  // stays self-contained: unpacked output lives under build/<browser>/,
+  // zipped artifacts under build/zips/. The zip filenames are
+  // unversioned (`{{name}}-{{browser}}.zip`) so each rebuild
+  // overwrites the previous output; git tracks the latest zip
+  // and the version bump lives in package.json.
+  outDir: 'build',
+  zip: {
+    artifactTemplate: '{{name}}-{{browser}}.zip',
+    sourcesTemplate: '{{name}}-sources.zip',
+  },
   runner: {
     startUrls: [],
     openDevtools: false,

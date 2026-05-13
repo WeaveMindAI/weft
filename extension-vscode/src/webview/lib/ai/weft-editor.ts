@@ -421,7 +421,7 @@ function expandNodeToMultiLine(code: string, node: ParsedNode): string {
 	const lineIndent = line.match(/^(\s*)/)?.[1] ?? '';
 	const bodyIndent = lineIndent + '  ';
 
-	// Case A: one-liner with a brace body — `id = Type { body }` or
+	// Case A: one-liner with a brace body, `id = Type { body }` or
 	// `host.data = Type { body }.port` or `  data: Type { body }.port`.
 	const span = extractInlineBodySpan(line);
 	if (span) {
@@ -435,7 +435,7 @@ function expandNodeToMultiLine(code: string, node: ParsedNode): string {
 		return lines.join('\n');
 	}
 
-	// Case B: bare inline anon — `host.data = Type.port` or `  data: Type.port`.
+	// Case B: bare inline anon, `host.data = Type.port` or `  data: Type.port`.
 	const anonBareMatch = line.match(/^(.*?)(\b\w+)(\.\w+)\s*$/);
 	if (anonBareMatch && /[:=]\s*$/.test(anonBareMatch[1])) {
 		const [, beforeType, typeName, dotPort] = anonBareMatch;
@@ -447,7 +447,7 @@ function expandNodeToMultiLine(code: string, node: ParsedNode): string {
 		return lines.join('\n');
 	}
 
-	// Case C: bare canonical node — `id = Type` (optionally with signatures).
+	// Case C: bare canonical node, `id = Type` (optionally with signatures).
 	const canonicalBareMatch = line.match(/^(\s*\w+\s*=\s*\w+(?:\s*\([^)]*\))?(?:\s*->\s*\([^)]*\))?)\s*$/);
 	if (canonicalBareMatch) {
 		const out = [
@@ -821,7 +821,7 @@ function tryMaterializeAnon(lines: string[], anonId: string): string | null {
 	const connMatch = firstLine.match(connFormRe);
 
 	if (connMatch && anonStart >= parentEnd + 1) {
-		// Connection-line form: `parent.field = Type { ... }.port` — the anon
+		// Connection-line form: `parent.field = Type { ... }.port`. The anon
 		// is declared OUTSIDE (after) the parent block. Rewrite this line and
 		// the last line of the anon's block.
 		const [, indent, afterEq] = connMatch;

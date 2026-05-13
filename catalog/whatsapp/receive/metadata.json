@@ -20,7 +20,6 @@
     { "name": "messageType", "type": "String", "required": false }
   ],
   "fields": [],
-  "entrySignals": [],
   "requires_infra": false,
   "features": {
     "isTrigger": true,

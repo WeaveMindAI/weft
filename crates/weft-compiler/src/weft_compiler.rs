@@ -1854,10 +1854,16 @@ fn dedent(s: &str) -> String {
     }
 }
 
+/// Reserved per-instance config keys (any key starting with `_`).
+/// `_label` is hoisted to `NodeDefinition.label`; `_is_output` and
+/// `_tags` stay in `node.config` and are read via the
+/// `NodeDefinition::is_output()` / `tags()` accessors. Validators
+/// skip these keys when checking that config keys match declared
+/// ports.
 fn try_extract_label(s: &str) -> Option<String> {
     let colon = s.find(':')?;
     let key = s[..colon].trim();
-    if key != "label" { return None; }
+    if key != "_label" { return None; }
     let val = s[colon + 1..].trim();
     if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
         Some(unescape(&val[1..val.len() - 1]))
@@ -1865,6 +1871,7 @@ fn try_extract_label(s: &str) -> Option<String> {
         Some(val.to_string())
     }
 }
+
 
 // ─── Connection Parsing ─────────────────────────────────────────────────────
 
@@ -1976,6 +1983,42 @@ fn parse_kv(
         return;
     }
 
+    // Hard break: pre-arch4 keys were renamed to leading-underscore
+    // form. Surface a clear migration error so projects don't pick
+    // up the old behavior silently.
+    if key == "label" {
+        errors.push(CompileError {
+            line,
+            message: "'label' was renamed to '_label' (reserved internal key)".into(),
+        });
+        return;
+    }
+    if key == "is_output" {
+        errors.push(CompileError {
+            line,
+            message: "'is_output' was renamed to '_is_output' (reserved internal key)".into(),
+        });
+        return;
+    }
+
+    // Reserved internal keys: only specific ones are valid; anything
+    // else with a leading underscore is rejected so the user doesn't
+    // accidentally collide with a future reserved field.
+    if key.starts_with('_') {
+        const ALLOWED: &[&str] = &["_label", "_is_output", "_tags"];
+        if !ALLOWED.contains(&key) {
+            errors.push(CompileError {
+                line,
+                message: format!(
+                    "'{key}' starts with '_' which is reserved for internal config keys. \
+                     Allowed reserved keys: {}",
+                    ALLOWED.join(", ")
+                ),
+            });
+            return;
+        }
+    }
+
     let value = if raw == "true" {
         serde_json::Value::Bool(true)
     } else if raw == "false" {
@@ -2001,6 +2044,33 @@ fn parse_kv(
     } else {
         serde_json::Value::String(raw.to_string())
     };
+
+    // _tags is the only reserved key that carries user-supplied
+    // strings used downstream as filter values (token-scoped
+    // enumeration). Validate the charset at parse time so the same
+    // rule fires regardless of whether the project came from a
+    // hand-edited .weft or from the AI builder.
+    if key == "_tags" {
+        if let Some(arr) = value.as_array() {
+            let tags: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if let Err(e) = weft_core::tag::validate_tags(&tags) {
+                errors.push(CompileError {
+                    line,
+                    message: format!("invalid _tags: {e}"),
+                });
+                return;
+            }
+        } else {
+            errors.push(CompileError {
+                line,
+                message: "_tags must be a list of strings, e.g. _tags: [\"support\"]".into(),
+            });
+            return;
+        }
+    }
 
     config.insert(key.to_string(), value);
 }
@@ -2118,7 +2188,6 @@ fn flatten(state: ParseState, project_id: Uuid) -> Result<ProjectDefinition, Vec
         nodes,
         edges,
         groups,
-        status: Default::default(),
         created_at: now,
         updated_at: now,
     })
@@ -2250,7 +2319,6 @@ fn flatten_group(
         features: in_features,
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
-        entry_signals: Vec::new(),
         requires_infra: false,
         sidecar: None,
         span: None,
@@ -2293,7 +2361,6 @@ fn flatten_group(
         features: NodeFeatures::default(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
-        entry_signals: Vec::new(),
         requires_infra: false,
         sidecar: None,
         span: None,
@@ -2369,7 +2436,6 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         features,
         scope,
         group_boundary: None,
-        entry_signals: Vec::new(),
         requires_infra: false,
         sidecar: None,
         span: pn.span,

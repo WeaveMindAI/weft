@@ -10,7 +10,7 @@
 	import CopyButton from "$lib/components/ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromFields, deriveOutputsFromFields, type FormFieldDef, type FormFieldSpec } from '$lib/utils/form-field-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "$lib/utils/status";
-	import { BadgeQuestionMark, Maximize2, Minimize2 } from '@lucide/svelte';
+	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2 } from '@lucide/svelte';
 	import { createFieldEditor } from '$lib/utils/field-editor.svelte';
 	import { handleBlobFieldUpload, validateExternalUrl, formatBytes } from '$lib/utils/blob-upload';
 	import FilePicker from './FilePicker.svelte';
@@ -35,7 +35,13 @@
 			debugData?: unknown;
 			executions?: import('$lib/types').NodeExecution[];
 			executionCount?: number;
-			liveDataItems?: import('$lib/types').LiveDataItem[];
+			/// Body-panel feed for this node, set ONLY for infra
+			/// (sidecar /live) and trigger (listener /display) nodes.
+			/// Other nodes get undefined and render no body panel
+			/// here. Distinct from `debugData` which is the JSON
+			/// preview chip Debug-style nodes show under the body
+			/// from the last execution's output.
+			bodyFeed?: import('../../../../shared/protocol').NodeFeedState;
 		};
 		id: string;
 		selected?: boolean;
@@ -175,6 +181,13 @@
 	let newInputName = $state('');
 	let newOutputName = $state('');
 	let portContextMenu = $state<{ portName: string; side: 'input' | 'output'; x: number; y: number } | null>(null);
+
+	/// Per-secret-item reveal state, keyed by item label. A secret
+	/// is hidden by default (••••); clicking the eye icon toggles
+	/// visibility for that label only. Local to this node instance;
+	/// closing/reopening the inspector resets to hidden, which is
+	/// the desired security default.
+	let revealedSecrets = $state<Record<string, boolean>>({});
 	let nodeElement: HTMLDivElement;
 
 	function setPortType(portName: string, side: 'input' | 'output', newType: string) {
@@ -604,17 +617,11 @@
 			{#if data.infraNodeStatus}
 				<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none
 					{data.infraNodeStatus === 'running' ? 'bg-green-100 text-green-700' : ''}
-					{data.infraNodeStatus === 'starting' ? 'bg-blue-100 text-blue-700' : ''}
 					{data.infraNodeStatus === 'stopped' ? 'bg-amber-100 text-amber-700' : ''}
-					{data.infraNodeStatus === 'failed' ? 'bg-red-100 text-red-700' : ''}
-					{data.infraNodeStatus === 'terminated' ? 'bg-zinc-100 text-zinc-500' : ''}
 				">
 					<span class="w-1.5 h-1.5 rounded-full
 						{data.infraNodeStatus === 'running' ? 'bg-green-500' : ''}
-						{data.infraNodeStatus === 'starting' ? 'bg-blue-500 animate-pulse' : ''}
 						{data.infraNodeStatus === 'stopped' ? 'bg-amber-500' : ''}
-						{data.infraNodeStatus === 'failed' ? 'bg-red-500' : ''}
-						{data.infraNodeStatus === 'terminated' ? 'bg-zinc-400' : ''}
 					"></span>
 					{data.infraNodeStatus}
 				</span>
@@ -775,33 +782,104 @@
 			</div>
 		</div>
 
-		<!-- Live Data Items - always visible regardless of expanded state -->
-		{#if data.liveDataItems && data.liveDataItems.length > 0}
-			<div class="mt-2 pt-2 border-t live-data-container space-y-2">
-				{#each data.liveDataItems as item}
-					{#if item.type === 'image' && typeof item.data === 'string'}
-						<div class="live-data-item">
-							<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
-							<img src={item.data} alt={item.label} class="w-full rounded border border-zinc-200 mt-1" />
-						</div>
-					{:else if item.type === 'text'}
-						<div class="live-data-item">
-							<span class="text-[10px] text-muted-foreground font-medium block mb-1">{item.label}</span>
-							<div class="relative">
-								<div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 pr-7 break-all border border-zinc-200 select-text cursor-text">{item.data}</div>
-								<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
+		<!-- Live Data Items - always visible regardless of expanded state.
+		     One render branch per item.type. Adding a new presentation
+		     kind: extend LiveDataItem.type and add a branch here. The
+		     action button (if any) is shared via the {@render actionBtn}
+		     snippet so it doesn't drift across kinds. -->
+		{#snippet actionBtn(item: import('$lib/types').LiveDataItem)}
+			{#if item.action}
+				<button
+					type="button"
+					class="mt-1 text-[10px] px-2 py-0.5 rounded border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-700"
+					onclick={(e) => {
+						e.stopPropagation();
+						const action = item.action!;
+						// Confirmation prompt is owned by the host
+						// (VS Code QuickPick); the webview just fires
+						// the action message with the `confirm` string
+						// attached.
+						const ev = new CustomEvent('weft-signal-action', {
+							detail: {
+								nodeId: id,
+								actionKind: action.actionKind,
+								payload: action.payload,
+								confirm: action.confirm,
+							},
+							bubbles: true,
+						});
+						(e.currentTarget as HTMLElement).dispatchEvent(ev);
+					}}
+				>
+					{item.action.label}
+				</button>
+			{/if}
+		{/snippet}
+		{#if data.bodyFeed}
+			{#if data.bodyFeed.state === 'error'}
+				<div class="mt-2 pt-2 border-t live-data-container">
+					<div class="flex items-start gap-1.5 text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1.5">
+						<span class="font-medium shrink-0">Error</span>
+						<span class="break-all">{data.bodyFeed.error}</span>
+					</div>
+				</div>
+			{:else if data.bodyFeed.items.length > 0}
+				<div class="mt-2 pt-2 border-t live-data-container space-y-2">
+					{#each data.bodyFeed.items as item}
+						{#if item.type === 'image' && typeof item.data === 'string'}
+							<div class="live-data-item">
+								<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
+								<img src={item.data} alt={item.label} class="w-full rounded border border-zinc-200 mt-1" />
+								{@render actionBtn(item)}
 							</div>
-						</div>
-					{:else if item.type === 'progress' && typeof item.data === 'number'}
-						<div class="live-data-item">
-							<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
-							<div class="w-full h-1.5 bg-zinc-200 rounded-full mt-1 overflow-hidden">
-								<div class="h-full bg-emerald-500 rounded-full transition-all" style="width: {Math.round(item.data * 100)}%"></div>
+						{:else if item.type === 'text'}
+							<div class="live-data-item">
+								<span class="text-[10px] text-muted-foreground font-medium block mb-1">{item.label}</span>
+								<div class="relative">
+									<div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 pr-7 break-all border border-zinc-200 select-text cursor-text">{item.data}</div>
+									<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
+								</div>
+								{@render actionBtn(item)}
 							</div>
-						</div>
-					{/if}
-				{/each}
-			</div>
+						{:else if item.type === 'secret'}
+							{@const revealed = revealedSecrets[item.label] ?? false}
+							<div class="live-data-item">
+								<span class="text-[10px] text-muted-foreground font-medium block mb-1">{item.label}</span>
+								<div class="relative">
+									<div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 pr-12 break-all border border-zinc-200 select-text cursor-text">
+										{#if revealed}{item.data}{:else}{'•'.repeat(Math.min(String(item.data).length, 32))}{/if}
+									</div>
+									<button
+										type="button"
+										class="absolute top-1 right-7 p-0.5 text-zinc-500 hover:text-zinc-700"
+										title={revealed ? 'Hide' : 'Reveal'}
+										onclick={(e) => {
+											e.stopPropagation();
+											revealedSecrets = { ...revealedSecrets, [item.label]: !revealed };
+										}}
+									>
+										{#if revealed}
+											<EyeOff class="w-3 h-3" />
+										{:else}
+											<Eye class="w-3 h-3" />
+										{/if}
+									</button>
+									<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
+								</div>
+								{@render actionBtn(item)}
+							</div>
+						{:else if item.type === 'progress' && typeof item.data === 'number'}
+							<div class="live-data-item">
+								<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
+								<div class="w-full h-1.5 bg-zinc-200 rounded-full mt-1 overflow-hidden">
+									<div class="h-full bg-emerald-500 rounded-full transition-all" style="width: {Math.round(item.data * 100)}%"></div>
+								</div>
+								{@render actionBtn(item)}
+							</div>
+						{/if}
+					{/each}
+				</div>
+			{/if}
 		{/if}
 
 		<!-- Expanded Config Fields -->

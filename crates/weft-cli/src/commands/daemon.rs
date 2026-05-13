@@ -31,9 +31,11 @@ pub struct ClusterConfig {
     pub cluster_name: String,
     pub kube_context: String,
     pub system_namespace: String,
+    pub db_namespace: String,
     pub default_user_namespace: String,
     pub dispatcher_image: String,
     pub listener_image: String,
+    pub broker_image: String,
     pub dispatcher_port: u16,
     /// `kind` for local dev (uses `kind create` + `kind load`);
     /// `k8s` for targeting an external cluster (skips kind
@@ -64,12 +66,16 @@ impl ClusterConfig {
             .unwrap_or_else(|_| format!("kind-{cluster_name}"));
         let system_namespace = std::env::var("WEFT_SYSTEM_NAMESPACE")
             .unwrap_or_else(|_| "weft-system".into());
+        let db_namespace = std::env::var("WEFT_DB_NAMESPACE")
+            .unwrap_or_else(|_| "weft-db".into());
         let default_user_namespace = std::env::var("WEFT_DEFAULT_USER_NAMESPACE")
             .unwrap_or_else(|_| "wm-local".into());
         let dispatcher_image = std::env::var("WEFT_DISPATCHER_IMAGE")
             .unwrap_or_else(|_| "weft-dispatcher:local".into());
         let listener_image = std::env::var("WEFT_LISTENER_IMAGE")
             .unwrap_or_else(|_| "weft-listener:local".into());
+        let broker_image = std::env::var("WEFT_BROKER_IMAGE")
+            .unwrap_or_else(|_| "weft-broker:local".into());
         let dispatcher_port = std::env::var("WEFT_DISPATCHER_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -85,9 +91,11 @@ impl ClusterConfig {
             cluster_name,
             kube_context,
             system_namespace,
+            db_namespace,
             default_user_namespace,
             dispatcher_image,
             listener_image,
+            broker_image,
             dispatcher_port,
             backend,
         }
@@ -116,7 +124,7 @@ pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
 /// changed, then roll the StatefulSet pod ONLY if at least one
 /// image changed. If neither image changed AND the daemon is
 /// already healthy, this is a true no-op: no pod restart, no
-/// dropped WebSockets, no port-forward rebuild.
+/// port-forward rebuild.
 async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     let cfg = cluster_config();
     require_binary("kubectl").await?;
@@ -125,14 +133,26 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     let dispatcher_built =
         images::ensure_dispatcher_image(&cfg.dispatcher_image, rebuild).await?;
     let listener_built = images::ensure_listener_image(&cfg.listener_image, rebuild).await?;
-    if dispatcher_built || listener_built {
+    let broker_built = images::ensure_broker_image(&cfg.broker_image, rebuild).await?;
+
+    // Re-apply k8s manifests on every restart. NetworkPolicy /
+    // ClusterRole / SA-label tweaks land via the manifest files in
+    // deploy/k8s; without re-applying them on restart, a manifest
+    // change picked up only by a fresh `daemon start`. Apply is
+    // idempotent: unchanged manifests are no-ops at the
+    // kube-apiserver layer (resourceVersion match).
+    let manifests_changed = apply_static_manifests(cfg).await?;
+
+    if dispatcher_built || listener_built || broker_built || manifests_changed {
         if cfg.backend == ClusterBackend::Kind {
             images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
             images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
+            images::kind_load(&cfg.cluster_name, &cfg.broker_image).await?;
         }
-        // Roll the dispatcher pod so it picks up the new image. The
-        // port-forward is bound to a single Pod IP, so a Pod
-        // recreate kills it; we refresh it after the rollout.
+        // Roll the dispatcher pod so it picks up the new image OR
+        // the new manifest (e.g. an updated env var or resource
+        // limit). The port-forward is bound to a single Pod IP, so
+        // a Pod recreate kills it; we refresh it after the rollout.
         let status = kubectl(&[
             "-n",
             &cfg.system_namespace,
@@ -154,17 +174,51 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         // dynamically (named `listener-<tenant>`) and never
         // restarts them on its own, so without this they stay on
         // the old image, breaking the dispatcher↔listener wire
-        // contract whenever the FormField / WakeSignalKind types
+        // contract whenever the SignalSpec / form schema types
         // shift between releases.
         if listener_built {
             roll_listener_deployments(cfg).await?;
         }
-        println!("daemon refreshed; new image rolled out");
+        if broker_built {
+            let _ = kubectl(&[
+                "-n",
+                &cfg.db_namespace,
+                "rollout",
+                "restart",
+                "deployment/weft-broker",
+            ])
+            .status()
+            .await;
+        }
+        println!("daemon refreshed; new image / manifests rolled out");
     } else {
-        println!("daemon already running with the latest images; nothing to do");
+        println!("daemon already running with the latest images and manifests; nothing to do");
     }
     let _ = ctx;
     Ok(())
+}
+
+/// Apply every static manifest in `deploy/k8s`. Returns true iff
+/// `kubectl apply` reported a change (non-`unchanged` line) on any
+/// manifest, signalling that a pod rollout is warranted.
+async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
+    let repo_root = weft_compiler::build::resolve_weft_root()
+        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+    let manifests = repo_root.join("deploy/k8s");
+    let mut any_changed = false;
+    for name in [
+        "system-namespace.yaml",
+        "db-namespace.yaml",
+        "postgres.yaml",
+        "broker.yaml",
+        "dispatcher.yaml",
+        "ingress.yaml",
+    ] {
+        let changed = kubectl_apply_file_changed(&manifests.join(name)).await?;
+        any_changed = any_changed || changed;
+    }
+    let _ = cfg;
+    Ok(any_changed)
 }
 
 pub fn data_dir() -> PathBuf {
@@ -192,18 +246,25 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
 
     images::ensure_dispatcher_image(&cfg.dispatcher_image, rebuild).await?;
     images::ensure_listener_image(&cfg.listener_image, rebuild).await?;
+    images::ensure_broker_image(&cfg.broker_image, rebuild).await?;
     if cfg.backend == ClusterBackend::Kind {
         images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
         images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
+        images::kind_load(&cfg.cluster_name, &cfg.broker_image).await?;
     }
 
-    let repo_root = images::repo_root()?;
+    let repo_root = weft_compiler::build::resolve_weft_root()
+        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let manifests = repo_root.join("deploy/k8s");
     kubectl_apply_file(&manifests.join("system-namespace.yaml")).await?;
-    kubectl_apply_file(&manifests.join("user-namespace.yaml")).await?;
+    kubectl_apply_file(&manifests.join("db-namespace.yaml")).await?;
+    // No static `wm-local` namespace: the dispatcher renders the
+    // per-tenant bundle (Namespace + SAs + NetworkPolicies) on first
+    // project register via `tenant_namespace::ensure_tenant_namespace`.
     kubectl_apply_file(&manifests.join("postgres.yaml")).await?;
-    wait_for_deployment_ready("weft-postgres").await?;
-    ensure_internal_secret().await?;
+    wait_for_deployment_ready_in_ns("weft-postgres", &cfg.db_namespace).await?;
+    kubectl_apply_file(&manifests.join("broker.yaml")).await?;
+    wait_for_deployment_ready_in_ns("weft-broker", &cfg.db_namespace).await?;
     kubectl_apply_file(&manifests.join("dispatcher.yaml")).await?;
     kubectl_apply_file(&manifests.join("ingress.yaml")).await?;
 
@@ -372,48 +433,9 @@ async fn ensure_ingress_controller() -> Result<()> {
     Ok(())
 }
 
-/// Create `weft-internal-secret` with a random value if it doesn't
-/// exist. Idempotent: subsequent runs see the existing Secret and
-/// no-op. Not in dispatcher.yaml because `kubectl apply` would
-/// reset the secret to a placeholder on every re-apply.
-async fn ensure_internal_secret() -> Result<()> {
-    let cfg = cluster_config();
-    let out = kubectl(&[
-        "-n",
-        &cfg.system_namespace,
-        "get",
-        "secret",
-        "weft-internal-secret",
-        "-o",
-        "name",
-    ])
-    .output()
-    .await?;
-    if out.status.success() && !out.stdout.is_empty() {
-        return Ok(());
-    }
-    let fresh = uuid::Uuid::new_v4().simple().to_string();
+async fn wait_for_deployment_ready_in_ns(name: &str, namespace: &str) -> Result<()> {
     let status = kubectl(&[
-        "-n",
-        &cfg.system_namespace,
-        "create",
-        "secret",
-        "generic",
-        "weft-internal-secret",
-        &format!("--from-literal=WEFT_INTERNAL_SECRET={fresh}"),
-    ])
-    .status()
-    .await?;
-    if !status.success() {
-        anyhow::bail!("create internal secret failed");
-    }
-    Ok(())
-}
-
-async fn wait_for_deployment_ready(name: &str) -> Result<()> {
-    let cfg = cluster_config();
-    let status = kubectl(&[
-        "-n", &cfg.system_namespace,
+        "-n", namespace,
         "rollout", "status", &format!("deployment/{name}"),
         "--timeout=180s",
     ])
@@ -565,11 +587,32 @@ fn kubectl(args: &[&str]) -> Command {
 }
 
 async fn kubectl_apply_file(path: &Path) -> Result<()> {
-    let status = kubectl(&["apply", "-f"]).arg(path).status().await?;
-    if !status.success() {
-        anyhow::bail!("kubectl apply -f {} failed", path.display());
+    kubectl_apply_file_changed(path).await.map(|_| ())
+}
+
+/// `kubectl apply -f path`. Returns true iff at least one resource
+/// in the manifest reported a change (`created` / `configured`).
+/// `unchanged` lines mean the resourceVersion-match was a no-op at
+/// the kube-apiserver. Used by `restart` to decide whether to roll
+/// the dispatcher pod.
+async fn kubectl_apply_file_changed(path: &Path) -> Result<bool> {
+    let out = kubectl(&["apply", "-f"]).arg(path).output().await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("kubectl apply -f {} failed: {stderr}", path.display());
     }
-    Ok(())
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Lines look like:
+    //   `networkpolicy.networking.k8s.io/foo created`
+    //   `networkpolicy.networking.k8s.io/foo configured`
+    //   `networkpolicy.networking.k8s.io/foo unchanged`
+    let changed = stdout.lines().any(|l| {
+        let trimmed = l.trim();
+        !trimmed.is_empty()
+            && !trimmed.ends_with(" unchanged")
+    });
+    print!("{stdout}");
+    Ok(changed)
 }
 
 async fn require_binary(name: &str) -> Result<()> {

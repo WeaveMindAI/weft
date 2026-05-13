@@ -6,8 +6,6 @@
     title: string;
     message: string;
     taskUrl?: string;
-    actionUrl?: string;
-    taskType?: 'Task' | 'Action';
   }
 
   let toasts = $state<ToastData[]>([]);
@@ -34,10 +32,7 @@
   }
 
   function handleClick(toast: ToastData) {
-    if (toast.taskType === 'Action' && toast.actionUrl) {
-      // Action: open URL via background script and dismiss
-      browser.runtime.sendMessage({ type: 'OPEN_AND_DISMISS_ACTION', actionUrl: toast.actionUrl });
-    } else if (toast.taskUrl) {
+    if (toast.taskUrl) {
       // Task: open the extension-hosted runner via the background.
       // Content scripts can't navigate to chrome-extension:// URLs
       // with window.open from a web origin, so we delegate to the
@@ -50,10 +45,9 @@
 
 <div class="weavemind-toast-container">
   {#each toasts as toast (toast.id)}
-    <div 
-      class="toast" 
-      class:action={toast.taskType === 'Action'}
-      onclick={() => handleClick(toast)} 
+    <div
+      class="toast"
+      onclick={() => handleClick(toast)}
       onkeydown={(e) => e.key === 'Enter' && handleClick(toast)}
       role="button"
       tabindex="0"
@@ -64,9 +58,7 @@
         <button type="button" class="toast-close" onclick={(e) => { e.stopPropagation(); removeToast(toast.id); }} aria-label="Dismiss">×</button>
       </div>
       <p class="toast-message">{toast.message}</p>
-      {#if toast.taskType === 'Action' && toast.actionUrl}
-        <p class="toast-hint">Click to open</p>
-      {:else if toast.taskUrl}
+      {#if toast.taskUrl}
         <p class="toast-hint">Click to review task</p>
       {/if}
     </div>
@@ -94,14 +86,6 @@
     cursor: pointer;
     animation: slideIn 0.3s ease-out;
     border-left: 3px solid #f59e0b;
-  }
-
-  .toast.action {
-    border-left-color: #22c55e;
-  }
-
-  .toast.action .toast-dot {
-    background: #22c55e;
   }
 
   .toast:hover {

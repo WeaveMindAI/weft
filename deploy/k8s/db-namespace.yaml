@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: weft-db
+  labels:
+    weft.dev/role: db
+    # Explicit metadata.name label is what other namespaces match on
+    # in NetworkPolicy `namespaceSelector` rules. kube-apiserver auto-
+    # applies this on every namespace, but we set it here to make
+    # the intent explicit.
+    kubernetes.io/metadata.name: weft-db

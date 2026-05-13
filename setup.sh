@@ -460,16 +460,16 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     #    user chained --purge, those things are already gone.
     if [[ $do_purge -eq 0 ]]; then
       printf '\n%s%sWhat is preserved:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-      printf '  %skind cluster%s ${C_DIM}\x27%s\x27 (postgres, history, projects)%s\n' \
-        "${C_CYAN}" "${C_RESET}${C_DIM}" "${WEFT_CLUSTER_NAME:-weft-local}" "${C_RESET}"
-      printf '  %sdocker images%s ${C_DIM}(dispatcher, listener, weft-worker-*)%s\n' \
-        "${C_CYAN}" "${C_RESET}" "${C_RESET}"
-      printf '  %sworkspace target/%s ${C_DIM}(cargo cache)%s\n' \
-        "${C_CYAN}" "${C_RESET}" "${C_RESET}"
-      printf '  %s~/.local/share/weft/%s ${C_DIM}(port-forward state, build hashes)%s\n' \
-        "${C_CYAN}" "${C_RESET}" "${C_RESET}"
-      printf '  %sbrowser extensions%s ${C_DIM}(remove manually from each browser if installed)%s\n' \
-        "${C_CYAN}" "${C_RESET}" "${C_RESET}"
+      printf "  %skind cluster%s %s'%s' (postgres, history, projects)%s\n" \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${WEFT_CLUSTER_NAME:-weft-local}" "${C_RESET}"
+      printf '  %sdocker images%s %s(dispatcher, listener, weft-worker-*)%s\n' \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+      printf '  %sworkspace target/%s %s(cargo cache)%s\n' \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+      printf '  %s~/.local/share/weft/%s %s(port-forward state, build hashes)%s\n' \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+      printf '  %sbrowser extensions%s %s(remove manually from each browser if installed)%s\n' \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '\n%sTo wipe everything too:%s ./setup.sh --uninstall --purge\n' \
         "${C_DIM}" "${C_RESET}"
     fi
@@ -492,10 +492,10 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
     # 2. Reclaim every weft-related host docker image.
     if command -v docker >/dev/null 2>&1; then
-      for tag in weft-dispatcher:local weft-listener:local; do
+      for tag in weft-dispatcher:local weft-listener:local weft-broker:local; do
         docker image rm -f "${tag}" >/dev/null 2>&1 || true
       done
-      ok "removed dispatcher + listener images"
+      ok "removed dispatcher + listener + broker images"
 
       docker image prune --force \
         --filter "label=weft.dev/project" >/dev/null 2>&1 || true
@@ -546,18 +546,10 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       ok "removed ${C_DIM}~/.local/share/weft/${C_RESET}"
     fi
 
-    # 5. Browser-extension build artifacts.
-    removed_browser_any=0
-    for path in \
-      "${here}/extension-build" \
-      "${here}/extension-browser/.output" \
-      "${here}/extension-browser/web-ext-artifacts"; do
-      if [[ -d "${path}" ]]; then
-        rm -rf "${path}"
-        removed_browser_any=1
-      fi
-    done
-    if [[ ${removed_browser_any} -eq 1 ]]; then
+    # 5. Browser-extension build artifacts. WXT writes everything
+    # into extension-browser/build/ (configured via wxt.config.ts).
+    if [[ -d "${here}/extension-browser/build" ]]; then
+      rm -rf "${here}/extension-browser/build"
       ok "removed browser-extension build artifacts"
     fi
 
@@ -585,8 +577,8 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       fi
     fi
     if [[ ${#skipped_lines[@]} -gt 0 ]]; then
-      printf '\n  %s%sShared base images kept%s ${C_DIM}(reused by other docker projects)${C_RESET}\n' \
-        "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
+      printf '\n  %s%sShared base images kept%s %s(reused by other docker projects)%s\n' \
+        "${C_BOLD}" "${C_BLUE}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       for entry in "${skipped_lines[@]}"; do
         skipped_image="${entry%%|*}"
         skipped_flag="${entry##*|}"
@@ -599,7 +591,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     fi
   fi
 
-  printf '\n%s%s%s ${C_BOLD}Done.${C_RESET}\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}"
+  printf '\n%s%s%s %sDone.%s\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
   exit 0
 fi
 
@@ -824,7 +816,11 @@ if [[ $build_browser -eq 1 ]]; then
   section "Browser extension"
   hint "${C_DIM}default install does NOT rebuild this; pass --browser to refresh${C_RESET}"
   bx_dir="${here}/extension-browser"
-  out_dir="${here}/extension-build"
+  # WXT writes both unpacked builds (build/<browser>-mv*) and zipped
+  # artifacts (build/weft-extension-<browser>.zip) into this dir.
+  # Filenames are unversioned, so each rebuild overwrites the
+  # previous output and git tracks the latest zip directly.
+  out_dir="${bx_dir}/build"
   if [[ ! -d "${bx_dir}" ]]; then
     fail "${bx_dir} not found"
     exit 1
@@ -854,7 +850,10 @@ if [[ $build_browser -eq 1 ]]; then
 
   pushd "${bx_dir}" >/dev/null
 
-  # Bump version unless --no-bump.
+  # Bump version unless --no-bump. The version in package.json is
+  # the source of truth; zip filenames stay unversioned so callers
+  # always reference the same path. Git history + the bumped
+  # package.json track which version is in each commit.
   current_version="$(node -p "require('./package.json').version")"
   if [[ $do_bump -eq 1 ]]; then
     npm version patch --no-git-tag-version >/dev/null
@@ -871,77 +870,61 @@ if [[ $build_browser -eq 1 ]]; then
     pnpm install
   fi
 
-  # Per-target build.
+  # Per-target unpacked build.
   [[ $target_chrome  -eq 1 ]] && pnpm -s build
   [[ $target_firefox -eq 1 ]] && pnpm -s build:firefox
   [[ $target_edge    -eq 1 ]] && pnpm -s build:edge
   [[ $target_opera   -eq 1 ]] && pnpm -s build:opera
   [[ $target_safari  -eq 1 ]] && pnpm -s build:safari
 
-  # Purge prior-version zips before re-zipping so .output stays clean.
-  rm -f .output/*.zip
-
+  # Per-target zip. WXT writes build/weft-extension-<browser>.zip
+  # for each. The unversioned name means each rebuild overwrites
+  # cleanly; no purge step needed.
   [[ $target_chrome  -eq 1 ]] && pnpm -s zip
   [[ $target_firefox -eq 1 ]] && pnpm -s zip:firefox
   [[ $target_edge    -eq 1 ]] && pnpm -s zip:edge
   [[ $target_opera   -eq 1 ]] && pnpm -s zip:opera
   [[ $target_safari  -eq 1 ]] && pnpm -s zip:safari
 
-  # Optional Firefox signing.
-  signed_xpi=""
+  # Optional Firefox signing. web-ext sign drops a .xpi into
+  # build/ alongside the zips; we name it unversioned for the
+  # same reason as the zips.
   if [[ $do_sign -eq 1 && $target_firefox -eq 1 ]]; then
-    rm -f web-ext-artifacts/*.xpi
+    rm -f build/weft-extension-firefox.xpi
     hint "signing Firefox with web-ext ${C_DIM}(1-2 min)${C_RESET}"
     spin "web-ext sign (Firefox)" web-ext sign \
-      --source-dir .output/firefox-mv2 \
+      --source-dir build/firefox-mv2 \
+      --artifacts-dir build \
       --api-key="${WEB_EXT_API_KEY}" \
       --api-secret="${WEB_EXT_API_SECRET}" \
       --channel unlisted
-    signed_xpi="$(ls -t web-ext-artifacts/*.xpi 2>/dev/null | head -1 || true)"
+    # web-ext picks its own filename; rename to unversioned.
+    signed_xpi="$(ls -t build/*.xpi 2>/dev/null | head -1 || true)"
     if [[ -z "${signed_xpi}" ]]; then
-      fail "signed .xpi not found in web-ext-artifacts/"
+      fail "signed .xpi not found in build/"
       exit 1
     fi
-  fi
-
-  # Collect artifacts.
-  mkdir -p "${out_dir}"
-  find "${out_dir}" -maxdepth 1 -type f \( -name 'weavemind-*-v*.zip' -o -name 'weavemind-*-v*.xpi' \) -delete
-
-  src_prefix="weft-extension-${version}"
-  copy_zip() {
-    local target="$1"
-    local label="$2"
-    cp ".output/${src_prefix}-${target}.zip" "${out_dir}/weavemind-${target}-v${version}.zip"
-    ok "weavemind-${target}-v${version}.zip ${C_DIM}(${label})${C_RESET}"
-  }
-  [[ $target_chrome  -eq 1 ]] && copy_zip "chrome"  "Chrome / Brave / Vivaldi / Arc"
-  [[ $target_firefox -eq 1 ]] && copy_zip "firefox" "Firefox unsigned, load via about:debugging"
-  [[ $target_edge    -eq 1 ]] && copy_zip "edge"    "Edge"
-  [[ $target_opera   -eq 1 ]] && copy_zip "opera"   "Opera"
-  [[ $target_safari  -eq 1 ]] && copy_zip "safari"  "Safari (needs xcrun on macOS)"
-
-  if [[ -n "${signed_xpi}" ]]; then
-    cp "${signed_xpi}" "${out_dir}/weavemind-firefox-v${version}.xpi"
-    ok "weavemind-firefox-v${version}.xpi ${C_DIM}(Firefox signed)${C_RESET}"
-  fi
-
-  # Stable unversioned symlinks. Re-point or remove on every run.
-  for t in chrome firefox edge opera safari; do
-    var="target_${t}"
-    if [[ "${!var}" -eq 1 ]]; then
-      ln -sf "weavemind-${t}-v${version}.zip" "${out_dir}/weavemind-${t}.zip"
-    else
-      rm -f "${out_dir}/weavemind-${t}.zip"
-    fi
-  done
-  if [[ -n "${signed_xpi}" ]]; then
-    ln -sf "weavemind-firefox-v${version}.xpi" "${out_dir}/weavemind-firefox.xpi"
-  else
-    rm -f "${out_dir}/weavemind-firefox.xpi"
+    mv -f "${signed_xpi}" "build/weft-extension-firefox.xpi"
   fi
 
   popd >/dev/null
+
+  # Per-target completion summary.
+  for t in chrome firefox edge opera safari; do
+    var="target_${t}"
+    [[ "${!var}" -ne 1 ]] && continue
+    case "$t" in
+      chrome)  label="Chrome / Brave / Vivaldi / Arc" ;;
+      firefox) label="Firefox unsigned, load via about:debugging" ;;
+      edge)    label="Edge" ;;
+      opera)   label="Opera" ;;
+      safari)  label="Safari (needs xcrun on macOS)" ;;
+    esac
+    ok "weft-extension-${t}.zip ${C_DIM}(${label})${C_RESET}"
+  done
+  if [[ $do_sign -eq 1 && $target_firefox -eq 1 ]]; then
+    ok "weft-extension-firefox.xpi ${C_DIM}(Firefox signed)${C_RESET}"
+  fi
 
   ok "browser extension v${version} ready in ${C_DIM}${out_dir}/${C_RESET}"
 fi
@@ -973,12 +956,14 @@ if [[ $build_cli -eq 1 ]]; then
     printf '%s%s%s %s%sSetup complete.%s\n\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
 
     printf '%s%sRunning:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-    printf '  %s%s%s dispatcher  ${C_DIM}%s${C_RESET}  ${C_DIM}(kind cluster, weft-system ns)${C_RESET}\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "http://127.0.0.1:9999"
-    printf '  %s%s%s postgres    ${C_DIM}in-cluster, durable across daemon restarts${C_RESET}\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}"
-    printf '  %s%s%s VS Code     ${C_DIM}installed (reload your window if it is open)${C_RESET}\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}"
+    printf '  %s%s%s dispatcher  %s%s%s  %s(kind cluster, weft-system ns)%s\n' \
+      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" \
+      "${C_DIM}" "http://127.0.0.1:9999" "${C_RESET}" \
+      "${C_DIM}" "${C_RESET}"
+    printf '  %s%s%s postgres    %sin-cluster, durable across daemon restarts%s\n' \
+      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+    printf '  %s%s%s VS Code     %sinstalled (reload your window if it is open)%s\n' \
+      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
 
     printf '\n%s%sTry it out:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
     printf '  %s%s%s sanity-check       %sweft daemon status%s\n' \
@@ -988,12 +973,12 @@ if [[ $build_cli -eq 1 ]]; then
     printf '  %s%s%s open dashboard     %shttp://127.0.0.1:9999%s\n' \
       "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
 
-    printf '\n%s%sBrowser extension%s ${C_DIM}(HumanQuery / in-page weaves)${C_RESET}\n' \
-      "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
+    printf '\n%s%sBrowser extension%s %s(HumanQuery / in-page weaves)%s\n' \
+      "${C_BOLD}" "${C_BLUE}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
     printf '  %sbuild it once:%s     %s./setup.sh --browser --no-sign --no-bump%s\n' \
       "${C_DIM}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %sthen load %sextension-build/weavemind-chrome.zip%s ${C_DIM}via chrome://extensions${C_RESET}\n' \
-      "${C_DIM}" "${C_RESET}${C_BOLD}" "${C_RESET}"
+    printf '  %sthen load %sextension-build/weavemind-chrome.zip%s %svia chrome://extensions%s\n' \
+      "${C_DIM}" "${C_RESET}${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
 
     printf '\n%s%sDay-to-day:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
     printf '  %s%s%s tail logs          %sweft daemon logs --tail 200 -f%s\n' \

@@ -35,7 +35,7 @@ pub async fn inspect(ctx: Ctx) -> anyhow::Result<()> {
             println!("  ⚠ DRIFT: journal and listener disagree.");
         }
         if reachable && registry_count == 0 && journal == 0 {
-            println!("  (idle — should be reaped on next cleanup tick)");
+            println!("  (idle: should be reaped on next cleanup tick)");
         }
         if let Some(arr) = registry.and_then(|v| v.as_array()) {
             for sig in arr {

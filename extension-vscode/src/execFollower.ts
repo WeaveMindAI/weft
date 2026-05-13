@@ -3,14 +3,13 @@
 //
 // The dispatcher exposes /events/execution/{color} as SSE. Each
 // event arrives with kind + payload, tagged to match
-// DispatcherEvent in weft-dispatcher/src/events.rs. We translate a
-// subset into the wire-level messages the webview already expects:
-//   NodeStarted   → execEvent { state: 'running', inputs }
-//   NodeCompleted → execEvent { state: 'completed', outputs }
-//                 + liveData for inspector
-//                 + edgeActive pulses for the outgoing edges
-//   NodeFailed    → execEvent { state: 'failed', error }
-//   NodeSkipped   → execEvent { state: 'skipped' }
+// DispatcherEvent in weft-dispatcher/src/events.rs. We translate
+// each event into one `execEvent` (graph state: running /
+// completed / failed / ...).
+//
+// The follower does NOT post node-body panel content. That panel is
+// fed by graphView's `/live` (infra) and `/display` (trigger)
+// pollers, which run independently of execution.
 //
 // A single follower tracks a single color at a time. Switching
 // follows (the user picks a different past execution in the
@@ -19,23 +18,22 @@
 import * as vscode from 'vscode';
 
 import type { DispatcherClient } from './dispatcher';
-import type { HostMessage, NodeExecEvent, LiveDataItem, EdgeActiveEvent } from './shared/protocol';
+import type { HostMessage, NodeExecEvent } from './shared/protocol';
 
 export type DispatcherEvent =
   | { kind: 'execution_started'; color: string; entry_node: string; project_id: string }
   | { kind: 'node_started'; color: string; node: string; lane: string; input: unknown; project_id: string }
   | { kind: 'node_suspended'; color: string; node: string; lane: string; token: string; project_id: string }
   | { kind: 'node_resumed'; color: string; node: string; lane: string; token: string; value: unknown; project_id: string }
-  | { kind: 'node_retried'; color: string; node: string; lane: string; reason: string; project_id: string }
   | { kind: 'node_cancelled'; color: string; node: string; lane: string; reason: string; project_id: string }
   | { kind: 'node_completed'; color: string; node: string; lane: string; output: unknown; project_id: string }
   | { kind: 'node_failed'; color: string; node: string; lane: string; error: string; project_id: string }
   | { kind: 'node_skipped'; color: string; node: string; lane: string; project_id: string }
   | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown }
-  | { kind: 'execution_failed'; color: string; project_id: string; error: string };
+  | { kind: 'execution_failed'; color: string; project_id: string; error: string }
+  | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string };
 
 export type PostFn = (msg: HostMessage) => void;
-export type InspectorUpdateFn = (nodeId: string, patch: { lastInputs?: Record<string, unknown>; lastOutputs?: Record<string, unknown>; lastStatus?: string }) => void;
 
 export class ExecutionFollower implements vscode.Disposable {
   private eventSource: { close: () => void } | undefined;
@@ -44,7 +42,6 @@ export class ExecutionFollower implements vscode.Disposable {
   constructor(
     private readonly client: DispatcherClient,
     private readonly post: PostFn,
-    private readonly updateInspector: InspectorUpdateFn,
   ) {}
 
   /** Stop the current follow (if any) and start following a new
@@ -55,13 +52,9 @@ export class ExecutionFollower implements vscode.Disposable {
     this.currentColor = color;
     this.post({ kind: 'execReset' });
 
-    // The protocol SSE messages arrive as JSON. `subscribe` opens
-    // an EventSource through the client; each `message` event has
-    // data = JSON-encoded DispatcherEvent.
     this.eventSource = this.client.subscribe(`/events/execution/${color}`, (ev) => {
       try {
-        const raw = JSON.parse(ev.data) as DispatcherEvent;
-        this.apply(raw);
+        this.apply(JSON.parse(ev.data) as DispatcherEvent);
       } catch (err) {
         console.warn('[weft/execFollower] bad SSE payload', err);
       }
@@ -84,7 +77,6 @@ export class ExecutionFollower implements vscode.Disposable {
       console.warn('[weft/execFollower] replay failed', err);
     }
 
-    // Continue live-following in case the execution is still in-flight.
     this.eventSource = this.client.subscribe(`/events/execution/${color}`, (ev) => {
       try {
         this.apply(JSON.parse(ev.data) as DispatcherEvent);
@@ -114,16 +106,6 @@ export class ExecutionFollower implements vscode.Disposable {
           input: e.input,
         };
         this.post({ kind: 'execEvent', event: execEvent });
-        const inputs = toRecord(e.input);
-        if (inputs) {
-          this.updateInspector(e.node, { lastInputs: inputs, lastStatus: 'running' });
-          const items: LiveDataItem[] = Object.entries(inputs).map(([port, value]) => ({
-            type: 'text',
-            label: `in.${port}`,
-            data: formatLive(value),
-          }));
-          this.post({ kind: 'liveData', nodeId: e.node, items });
-        }
         break;
       }
       case 'node_suspended': {
@@ -134,7 +116,6 @@ export class ExecutionFollower implements vscode.Disposable {
           token: e.token,
         };
         this.post({ kind: 'execEvent', event: execEvent });
-        this.updateInspector(e.node, { lastStatus: 'suspended' });
         break;
       }
       case 'node_resumed': {
@@ -146,18 +127,6 @@ export class ExecutionFollower implements vscode.Disposable {
           resumeValue: e.value,
         };
         this.post({ kind: 'execEvent', event: execEvent });
-        this.updateInspector(e.node, { lastStatus: 'running' });
-        break;
-      }
-      case 'node_retried': {
-        const execEvent: NodeExecEvent = {
-          nodeId: e.node,
-          state: 'running',
-          lane: e.lane,
-          retryReason: e.reason,
-        };
-        this.post({ kind: 'execEvent', event: execEvent });
-        this.updateInspector(e.node, { lastStatus: 'running' });
         break;
       }
       case 'node_cancelled': {
@@ -168,7 +137,6 @@ export class ExecutionFollower implements vscode.Disposable {
           error: e.reason,
         };
         this.post({ kind: 'execEvent', event: execEvent });
-        this.updateInspector(e.node, { lastStatus: 'cancelled' });
         break;
       }
       case 'node_completed': {
@@ -179,16 +147,6 @@ export class ExecutionFollower implements vscode.Disposable {
           output: e.output,
         };
         this.post({ kind: 'execEvent', event: execEvent });
-        const outputs = toRecord(e.output);
-        if (outputs) {
-          this.updateInspector(e.node, { lastOutputs: outputs, lastStatus: 'completed' });
-          const items: LiveDataItem[] = Object.entries(outputs).map(([port, value]) => ({
-            type: 'text',
-            label: `out.${port}`,
-            data: formatLive(value),
-          }));
-          this.post({ kind: 'liveData', nodeId: e.node, items });
-        }
         break;
       }
       case 'node_failed': {
@@ -199,7 +157,6 @@ export class ExecutionFollower implements vscode.Disposable {
           error: e.error,
         };
         this.post({ kind: 'execEvent', event: execEvent });
-        this.updateInspector(e.node, { lastStatus: 'failed' });
         break;
       }
       case 'node_skipped': {
@@ -209,35 +166,18 @@ export class ExecutionFollower implements vscode.Disposable {
       }
       case 'execution_completed':
       case 'execution_failed':
-        // Top-level terminal events. Flip the ActionBar's running
-        // flag explicitly so the Stop button hides even if one of
-        // the per-node events was dropped (SSE overruns, closed
-        // connection, etc.). The sidebar picks them up via its
-        // own /executions refresh.
+      case 'execution_cancelled':
         this.post({
           kind: 'execTerminal',
           color: e.color,
-          state: e.kind === 'execution_completed' ? 'completed' : 'failed',
+          state:
+            e.kind === 'execution_completed'
+              ? 'completed'
+              : e.kind === 'execution_cancelled'
+                ? 'cancelled'
+                : 'failed',
         });
         break;
     }
   }
 }
-
-function toRecord(v: unknown): Record<string, unknown> | undefined {
-  if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>;
-  return undefined;
-}
-
-function formatLive(v: unknown): string {
-  if (typeof v === 'string') return v.length > 120 ? v.slice(0, 117) + '…' : v;
-  try {
-    const s = JSON.stringify(v);
-    return s.length > 200 ? s.slice(0, 197) + '…' : s;
-  } catch {
-    return String(v);
-  }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-type _UnusedEdgeActive = EdgeActiveEvent;

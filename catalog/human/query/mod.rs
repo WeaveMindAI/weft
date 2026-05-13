@@ -1,7 +1,11 @@
+//! HumanQuery: pauses mid-execution waiting for a human form
+//! submission. Single-phase: `execute` builds a Form signal with
+//! `is_resume=true`, awaits its fire, maps the submission to outputs.
+
 use async_trait::async_trait;
 
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{FormSchema, WakeSignalKind, WakeSignalSpec};
+use weft_core::signal::{Form, FormSchema};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
 use super::form_helpers::{
@@ -57,16 +61,15 @@ impl Node for HumanQueryNode {
             fields,
         };
 
-        let spec = WakeSignalSpec {
-            kind: WakeSignalKind::Form {
+        let submission = ctx
+            .await_signal(Form {
                 form_type: "human-query".to_string(),
                 schema,
                 title: if title.is_empty() { None } else { Some(title) },
                 description,
-            },
-            is_resume: true,
-        };
-        let submission = ctx.await_signal(spec).await?;
+                consumer_kind: Some("human_in_the_loop".into()),
+            })
+            .await?;
         Ok(map_response_to_ports(&submission, &raw_fields, specs))
     }
 }

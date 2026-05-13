@@ -1,13 +1,10 @@
 use std::sync::Arc;
 
 use crate::backend::{InfraBackend, WorkerBackend};
-use crate::config::DispatcherConfig;
 use crate::events::EventBus;
-use crate::infra::InfraRegistry;
 use crate::journal::Journal;
 use crate::listener::{ListenerBackend, ListenerPool};
 use crate::project_store::ProjectStore;
-use crate::slots::Slots;
 use crate::tenant::{NamespaceMapper, TenantRouter};
 
 /// Stable identifier for this dispatcher Pod. Derived from
@@ -42,7 +39,6 @@ impl std::fmt::Display for PodId {
 /// `axum::extract::State`. All fields are `Arc`-friendly.
 #[derive(Clone)]
 pub struct DispatcherState {
-    pub config: Arc<DispatcherConfig>,
     pub pod_id: PodId,
     pub journal: Arc<dyn Journal>,
     /// Direct Postgres pool handle. Owned here (not threaded
@@ -54,19 +50,31 @@ pub struct DispatcherState {
     pub infra: Arc<dyn InfraBackend>,
     pub projects: ProjectStore,
     pub events: EventBus,
-    pub slots: Slots,
     /// Spawns per-tenant listener instances.
     pub listener_backend: Arc<dyn ListenerBackend>,
     /// Per-tenant listener pool. One entry per active tenant; the
     /// listener multiplexes every project the tenant owns.
     pub listeners: ListenerPool,
-    /// Provisioned sidecars per (project, node). Populated by
-    /// `weft infra up`, cleared by `weft infra down`. Looked up by
-    /// `ctx.sidecar_endpoint()` to resolve a node's endpoint URL.
-    pub infra_registry: InfraRegistry,
     /// Resolves a tenant for a given project. OSS returns `local`;
     /// cloud derives from request auth.
     pub tenant_router: Arc<dyn TenantRouter>,
     /// Resolves a tenant to its kubernetes namespace.
     pub namespace_mapper: Arc<dyn NamespaceMapper>,
+    /// Externally-reachable base URL of this dispatcher. Used to
+    /// mint user-facing signal URLs (`<base>/signal/<token>`) at
+    /// register time. Architecture-4: the dispatcher hosts every
+    /// external URL; the listener has no public surface.
+    pub public_base_url: String,
+    /// Cluster Pod / Service CIDRs. Threaded into rendered tenant
+    /// namespace NetworkPolicies so `ipBlock except <cluster-cidrs>`
+    /// expresses "internet but not other Pods." Must be the cluster
+    /// operator's actual CIDRs; defaults are Kind's.
+    pub cluster_pod_cidr: String,
+    pub cluster_service_cidr: String,
+    /// Kubernetes namespace name of the cluster's ingress controller
+    /// (ingress-nginx by default; Traefik / Contour / etc. use
+    /// different namespaces). Threaded into rendered sidecar policies
+    /// so public-facing sidecars accept ingress from the right
+    /// controller.
+    pub cluster_ingress_namespace: String,
 }

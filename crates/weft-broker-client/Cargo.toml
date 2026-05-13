@@ -1,0 +1,22 @@
+[package]
+name = "weft-broker-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+weft-core = { workspace = true }
+weft-journal = { workspace = true }
+weft-task-store = { workspace = true }
+weft-infra = { path = "../weft-infra" }
+
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }

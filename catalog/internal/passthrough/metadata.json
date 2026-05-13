@@ -9,7 +9,6 @@
   "inputs": [],
   "outputs": [],
   "fields": [],
-  "entrySignals": [],
   "requires_infra": false,
   "features": {
     "canAddInputPorts": true,

@@ -10,7 +10,6 @@
 //! tokens (form URL→color lookup), extension tokens (reviewer
 //! auth). Those are indexes, not duplicates.
 
-pub mod events;
 pub mod postgres;
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -18,7 +17,7 @@ pub mod mock;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use mock::MockJournal;
 
-pub use events::{fold_to_snapshot, ExecEvent, ExpandedChildRecord};
+use weft_journal::ExecEvent;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -33,68 +32,42 @@ pub trait Journal: Send + Sync {
     /// user-initiated `weft clean` removes events.
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()>;
 
+    /// Idempotent variant: a retry with the same `dedup_key` is a
+    /// no-op via a partial UNIQUE index. Used by dispatcher tasks
+    /// (e.g. route_entry) that may re-execute after a crash.
+    async fn record_event_dedup(
+        &self,
+        event: &ExecEvent,
+        dedup_key: &str,
+    ) -> anyhow::Result<()>;
+
     /// Full ordered event log for a color.
     async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>>;
 
-    // ----- Token indexes (not state duplication) ---------------------
-
-    /// Journal a mid-execution suspension with a caller-supplied
-    /// token. This is a lookup table: token → (color, node,
-    /// metadata) so form URLs can route fires to the right lane.
-    /// Does NOT record a state event; the caller emits
-    /// `ExecEvent::SuspensionRegistered` separately if it wants
-    /// the fact journaled.
-    async fn record_suspension_with_token(
-        &self,
-        token: &str,
-        color: Color,
-        node: &str,
-        metadata: Value,
-    ) -> anyhow::Result<()>;
-
-    async fn resolve_wake(&self, token: &str) -> anyhow::Result<Option<WakeTarget>>;
-
-    /// Remove the suspension once it has been resolved. Returns
-    /// true if the token existed.
+    /// Drop the signal row for a single-use resume token. Called
+    /// when a suspension's fire is consumed (the engine has handed
+    /// the value back to the waiting lane). Returns true if a row
+    /// was deleted. Entry-trigger rows (`is_resume=false`) stay
+    /// untouched; the deactivate path manages those separately.
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool>;
 
-    /// Return every live suspension across all projects. Used by
-    /// the browser extension's task listing.
-    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>>;
+    /// Persist an API token (token-scoped enumeration credential).
+    /// The caller owns the token string (so the api layer can pick
+    /// its shape, e.g. friendly `wm_tk_swift-falcon-23` vs hard
+    /// `wm_tk_<uuid>`); the journal stores + indexes it along with
+    /// the scope vectors. Empty scope vector = wildcard for that
+    /// dimension.
+    async fn mint_api_token(&self, token: &ApiToken) -> anyhow::Result<()>;
 
-    async fn mint_entry_token(
-        &self,
-        project_id: &str,
-        node_id: &str,
-        kind: EntryKind,
-        path: Option<&str>,
-        auth: Option<Value>,
-    ) -> anyhow::Result<String>;
+    /// Read the full token row including its scope vectors. Used by
+    /// the signal-listing handler to filter visible signals.
+    async fn get_api_token(&self, token: &str) -> anyhow::Result<Option<ApiToken>>;
 
-    async fn resolve_entry_token(&self, token: &str) -> anyhow::Result<Option<EntryTarget>>;
+    async fn list_api_tokens(&self) -> anyhow::Result<Vec<ApiToken>>;
 
-    async fn drop_entry_tokens(&self, project_id: &str) -> anyhow::Result<()>;
-
-    /// Persist an extension token. The caller owns the token
-    /// string (so the api layer can pick its shape, e.g.
-    /// friendly `wm_tk_swift-falcon-23` vs hard
-    /// `wm_ext_<uuid>`); the journal just stores + indexes it.
-    async fn mint_ext_token(
-        &self,
-        token: &str,
-        name: Option<&str>,
-        metadata: Option<Value>,
-    ) -> anyhow::Result<()>;
-
-    async fn ext_token_exists(&self, token: &str) -> anyhow::Result<bool>;
-
-    async fn list_ext_tokens(&self) -> anyhow::Result<Vec<ExtToken>>;
-
-    /// Delete an extension token by its token string OR by its
-    /// human label. Returns true iff a row was actually removed,
-    /// so callers can return 404 rather than silently succeed
-    /// when the user typed an identifier that matched nothing.
-    async fn revoke_ext_token(&self, identifier: &str) -> anyhow::Result<bool>;
+    /// Delete an API token by its token string OR by its human
+    /// label. Returns true iff a row was actually removed.
+    async fn revoke_api_token(&self, identifier: &str) -> anyhow::Result<bool>;
 
     // ----- Derived views over the event log --------------------------
 
@@ -107,13 +80,23 @@ pub trait Journal: Send + Sync {
     /// `ExecEvent::LogLine` events.
     async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
 
-    /// Per-node lifecycle events for a color, oldest first.
-    /// Folded from `ExecEvent::Node{Started,Completed,Failed,Skipped}`.
+    /// Per-node lifecycle events for a color, oldest first. Folded
+    /// from `ExecEvent::Node{Started, Suspended, Resumed, Cancelled,
+    /// Completed, Failed, Skipped}`.
     async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>>;
 
     /// Summary row for every execution the dispatcher has ever
     /// seen, newest first.
     async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>>;
+
+    /// Every color belonging to `project_id` whose journal has no
+    /// terminal event yet. Used by wipe / cancel_running to enumerate
+    /// what needs cancelling without the limit-truncation problem of
+    /// `list_executions`. Single SQL roundtrip, no per-color fold.
+    async fn list_non_terminal_colors_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<Color>>;
 
     // ----- Signal registry (durable replacement for in-RAM tracker) ----
 
@@ -126,21 +109,26 @@ pub trait Journal: Send + Sync {
     /// Remove a signal by token. Returns whether a row existed.
     async fn signal_remove(&self, token: &str) -> anyhow::Result<bool>;
 
+    /// Remove signals by token in one SQL statement. Returns the
+    /// deleted rows so the caller can drive listener-unregister
+    /// against them. Atomic: either every matching row is gone or
+    /// the call fails entirely; no partial-loop leaks.
+    async fn signal_remove_many(
+        &self,
+        tokens: &[String],
+    ) -> anyhow::Result<Vec<SignalRegistration>>;
+
     /// All signals currently registered for a project.
     async fn signal_list_for_project(
         &self,
         project_id: &str,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// All signals for a tenant. Used by listener rehydration so a
-    /// fresh listener Pod gets re-pushed every active registration.
-    async fn signal_list_for_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> anyhow::Result<Vec<SignalRegistration>>;
-
-    /// Count signals for a tenant. Used to decide whether the
-    /// tenant listener can be torn down.
+    /// Count signals for a tenant. Used by `/listener/inspect` to
+    /// surface a journal vs registry comparison. The reaper-side
+    /// "is the listener needed" check uses a richer SQL query
+    /// (joining `project.status`) so it doesn't go through this
+    /// method.
     async fn signal_count_for_tenant(&self, tenant_id: &str) -> anyhow::Result<usize>;
 
     /// All signals tied to one execution color (resume signals).
@@ -161,10 +149,6 @@ pub trait Journal: Send + Sync {
 
     /// Delete all data for a color. Called only by `weft clean`.
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()>;
-
-    /// Mark a color cancelled. Phase A: no-op beyond a log event.
-    /// Phase B: writes a control row so running workers can poll.
-    async fn cancel(&self, color: Color) -> anyhow::Result<()>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.
@@ -178,12 +162,75 @@ pub struct SignalRegistration {
     pub color: Option<Color>,
     pub node_id: String,
     pub is_resume: bool,
-    pub user_url: Option<String>,
-    pub kind: String,
-    /// JSON-serialized `WakeSignalSpec`. Stored so a listener
+    /// JSON-serialized `SignalSpec`. Stored so a listener
     /// rehydrate after Pod restart can re-POST `/register` without
     /// re-running trigger-setup.
     pub spec_json: String,
+    /// Free-form consumer label from `SignalSpec.consumer_kind`.
+    /// `None` for fire-only signals (raw webhook entries) that
+    /// have no enumeration consumer. The api_token enumeration
+    /// filter compares against this.
+    pub consumer_kind: Option<String>,
+    /// Tags copied from the registering node's `_tags` config.
+    /// Used by the api_token enumeration filter (allowed_tags
+    /// overlap). Charset validated upstream by the parser.
+    pub tags: Vec<String>,
+    /// Rendered consumer payload (form schema, decorated webhook
+    /// shape, etc). Computed once at register time on the listener
+    /// `/render` endpoint; cached here so consumer enumeration is
+    /// a pure SQL read with no listener round-trip. Park-mode
+    /// projects can serve `/api-token/.../signals` even with the
+    /// listener pod reaped because the payload is on the row.
+    pub consumer_payload: Option<serde_json::Value>,
+    /// `signal.surface_kind` discriminant: 'public_entry' or
+    /// 'task_callback'. Read by `public_url()` to format the
+    /// activate-response URLs.
+    pub surface_kind: String,
+    /// `signal.mount_path`. Some(path) for PublicEntry,
+    /// None for TaskCallback. Empty string means root '/'.
+    /// UNIQUE in DB. Read by `public_url()`.
+    pub mount_path: Option<String>,
+    /// `signal.auth_kind` discriminant. Stored on the row and
+    /// read directly by the fire-gate SQL in `fire_public_entry`;
+    /// the field is part of the struct so writes go through one
+    /// shape but reads of this field happen via SQL, not struct.
+    pub auth_kind: String,
+    /// `signal.auth_config`. Per-auth-kind JSON (e.g. for
+    /// api_key: `{header_name, value_hash}`). Plaintext NEVER
+    /// stored here. Same write-through-struct / read-via-SQL
+    /// pattern as `auth_kind`.
+    pub auth_config: Option<Value>,
+    /// Opaque per-kind state persisted at register time and read
+    /// back at rehydrate time. Empty (`{}`) for most kinds. Timer
+    /// uses it to remember absolute `next_fire_at_unix` for
+    /// After-style schedules so a listener restart doesn't reset
+    /// the clock. The dispatcher treats this field as opaque
+    /// JSON; only the kind's handler interprets it.
+    pub kind_state: Value,
+}
+
+impl SignalRegistration {
+    /// Compute the public URL for this signal given a dispatcher
+    /// base URL. PublicEntry → `<base>/<mount_path>` (handling
+    /// the empty-path → root convention). TaskCallback →
+    /// `<base>/signal/<token>`. Returns None for surface kinds
+    /// that don't expose a public URL.
+    pub fn public_url(&self, dispatcher_base: &str) -> Option<String> {
+        let base = dispatcher_base.trim_end_matches('/');
+        match self.surface_kind.as_str() {
+            "public_entry" => {
+                let path = self.mount_path.as_deref().unwrap_or("");
+                let path = path.trim_start_matches('/');
+                if path.is_empty() {
+                    Some(format!("{base}/"))
+                } else {
+                    Some(format!("{base}/{path}"))
+                }
+            }
+            "task_callback" => Some(format!("{base}/signal/{}", self.token)),
+            _ => None,
+        }
+    }
 }
 
 // ----- Public types -----------------------------------------------
@@ -208,7 +255,7 @@ pub struct NodeExecEvent {
     /// Delivered value. Set on Resumed; None otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
-    /// Reason for retry. Set on Retried; None otherwise.
+    /// Cancellation reason. Set on Cancelled; None otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub at_unix: u64,
@@ -220,7 +267,6 @@ pub enum NodeExecKind {
     Started,
     Suspended,
     Resumed,
-    Retried,
     Cancelled,
     Completed,
     Failed,
@@ -233,7 +279,6 @@ impl NodeExecKind {
             Self::Started => "started",
             Self::Suspended => "suspended",
             Self::Resumed => "resumed",
-            Self::Retried => "retried",
             Self::Cancelled => "cancelled",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -246,7 +291,6 @@ impl NodeExecKind {
             "started" => Some(Self::Started),
             "suspended" => Some(Self::Suspended),
             "resumed" => Some(Self::Resumed),
-            "retried" => Some(Self::Retried),
             "cancelled" => Some(Self::Cancelled),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
@@ -266,19 +310,25 @@ pub struct ExecutionSummary {
     pub completed_at: Option<u64>,
 }
 
+/// Token-scoped enumeration credential. Used by external consumers
+/// (browser extension, future Slack bot, etc.) to fetch the subset
+/// of signals they're authorized to see. Each scope vector is
+/// independent; empty = wildcard.
 #[derive(Debug, Clone)]
-pub struct ExtToken {
+pub struct ApiToken {
     pub token: String,
     pub name: Option<String>,
-    pub created_at: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct OpenSuspension {
-    pub token: String,
-    pub color: Color,
-    pub node: String,
-    pub metadata: Value,
+    /// Allowed `consumer_kind` values. Empty = any kind. The
+    /// signal-listing handler filters with `consumer_kind = ANY($1)`.
+    pub allowed_kinds: Vec<String>,
+    /// Allowed project ids. Empty = any project in the tenant.
+    pub allowed_projects: Vec<uuid::Uuid>,
+    /// Allowed signal tags. Empty = any tag (including untagged).
+    /// Strict-untagged rule: when this vector is non-empty, signals
+    /// with no tags do NOT match (the array overlap operator
+    /// returns false against an empty signal-side array).
+    pub allowed_tags: Vec<String>,
+    pub metadata: Option<Value>,
     pub created_at: u64,
 }
 
@@ -287,46 +337,4 @@ pub struct LogEntry {
     pub at_unix: u64,
     pub level: String,
     pub message: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct WakeTarget {
-    pub color: Color,
-    pub node: String,
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    Webhook,
-    Cron,
-    Manual,
-}
-
-impl EntryKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Webhook => "webhook",
-            Self::Cron => "cron",
-            Self::Manual => "manual",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "webhook" => Some(Self::Webhook),
-            "cron" => Some(Self::Cron),
-            "manual" => Some(Self::Manual),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct EntryTarget {
-    pub project_id: String,
-    pub node_id: String,
-    pub kind: EntryKind,
-    pub path: Option<String>,
-    pub auth: Option<Value>,
 }

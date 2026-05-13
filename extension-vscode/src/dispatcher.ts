@@ -58,6 +58,20 @@ function subscribeSse(
     };
 }
 
+/// Thrown by `DispatcherClient` for any non-2xx response. Carries
+/// the status code so callers can match (e.g. show a kind-specific
+/// hint on 404) without parsing strings.
+export class HttpError extends Error {
+  constructor(
+    public readonly method: string,
+    public readonly path: string,
+    public readonly status: number,
+  ) {
+    super(`${method} ${path}: ${status}`);
+    this.name = 'HttpError';
+  }
+}
+
 export class DispatcherClient {
   constructor(private baseUrl: string) {}
 
@@ -67,7 +81,7 @@ export class DispatcherClient {
 
   async get<T>(path: string): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`);
-    if (!res.ok) throw new Error(`GET ${path}: ${res.status}`);
+    if (!res.ok) throw new HttpError('GET', path, res.status);
     return (await res.json()) as T;
   }
 
@@ -77,14 +91,14 @@ export class DispatcherClient {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`POST ${path}: ${res.status}`);
+    if (!res.ok) throw new HttpError('POST', path, res.status);
     const text = await res.text();
     return (text ? JSON.parse(text) : ({} as unknown)) as T;
   }
 
   async del(path: string): Promise<void> {
     const res = await fetch(`${this.baseUrl}${path}`, { method: 'DELETE' });
-    if (!res.ok && res.status !== 204) throw new Error(`DELETE ${path}: ${res.status}`);
+    if (!res.ok && res.status !== 204) throw new HttpError('DELETE', path, res.status);
   }
 
   subscribe(path: string, onEvent: (ev: { data: string }) => void): SseSubscription {

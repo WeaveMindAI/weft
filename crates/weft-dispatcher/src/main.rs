@@ -11,20 +11,19 @@ use tracing::info;
 use weft_dispatcher::{
     api::router,
     backend::{InfraBackend, K8sWorkerBackend, KindInfraBackend, WorkerBackend},
-    infra::InfraRegistry,
     journal::postgres::PostgresJournal,
     listener::{
         K8sListenerBackend, ListenerBackend, ListenerPool, SubprocessListenerBackend,
     },
     tenant::{self, NamespaceMapper, TenantId, TenantRouter},
-    DispatcherConfig, DispatcherState,
+    DispatcherState,
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "weft-dispatcher", version)]
 struct Args {
-    #[arg(long, env = "WEFT_HTTP_PORT")]
-    http_port: Option<u16>,
+    #[arg(long, env = "WEFT_HTTP_PORT", default_value_t = 9999)]
+    http_port: u16,
 }
 
 #[tokio::main]
@@ -37,10 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let mut config = DispatcherConfig::default();
-    if let Some(port) = args.http_port {
-        config.http_port = port;
-    }
+    let http_port = args.http_port;
 
     // Tenant routing. OSS hardcodes a single tenant `local`; cloud
     // installs a router that derives tenant from the request's
@@ -52,34 +48,6 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => tenant::local_namespace_mapper(),
     };
 
-    // Resolve the URL listeners + workers use to call us back. In
-    // cluster, that's the Service DNS for `weft-dispatcher` in the
-    // system namespace. Locally (subprocess mode) it's loopback.
-    let system_namespace =
-        std::env::var("WEFT_SYSTEM_NAMESPACE").unwrap_or_else(|_| "weft-system".into());
-    let dispatcher_callback_url =
-        std::env::var("WEFT_DISPATCHER_CALLBACK_URL").unwrap_or_else(|_| {
-            // Default depends on whether we're in cluster. The k8s
-            // downward-API mount only exists inside a Pod.
-            if std::path::Path::new("/var/run/secrets/kubernetes.io").exists() {
-                format!(
-                    "http://weft-dispatcher.{ns}.svc.cluster.local:{port}",
-                    ns = system_namespace,
-                    port = config.http_port,
-                )
-            } else {
-                format!("http://127.0.0.1:{}", config.http_port)
-            }
-        });
-    config.dispatcher_callback_url = dispatcher_callback_url.clone();
-
-    if let Ok(t) = std::env::var("WEFT_INTERNAL_URL_TEMPLATE") {
-        config.internal_url_template = t;
-    }
-    if let Ok(s) = std::env::var("WEFT_INTERNAL_SECRET") {
-        config.internal_secret = s;
-    }
-
     let database_url = std::env::var("WEFT_DATABASE_URL")
         .context("WEFT_DATABASE_URL is required (postgres://user:pass@host:port/db)")?;
     let journal = PostgresJournal::connect(&database_url)
@@ -88,11 +56,38 @@ async fn main() -> anyhow::Result<()> {
     weft_dispatcher::lease::migrate(journal.pool())
         .await
         .context("apply lease migrations")?;
+    weft_task_store::migrate(journal.pool())
+        .await
+        .context("apply task-store migrations")?;
+    weft_dispatcher::infra::migrate(journal.pool())
+        .await
+        .context("apply infra_pod migrations")?;
+    weft_dispatcher::journal_bridge::migrate(journal.pool())
+        .await
+        .context("apply journal_bridge cursor migrations")?;
     let projects: weft_dispatcher::ProjectStore = std::sync::Arc::new(
         weft_dispatcher::PostgresProjectStore::new(journal.pool().clone())
             .await
             .context("init project store")?,
     );
+
+    // Broker URL: every tenant pod (listener / worker / sidecar)
+    // talks to the broker instead of touching Postgres. Required
+    // in-cluster; subprocess dev wires it through env.
+    let in_cluster_for_broker = std::env::var("KUBERNETES_SERVICE_HOST").is_ok();
+    let broker_url = match std::env::var("WEFT_BROKER_URL") {
+        Ok(v) => v,
+        Err(_) => {
+            if in_cluster_for_broker {
+                anyhow::bail!(
+                    "WEFT_BROKER_URL is required in-cluster; \
+                     set it on the dispatcher Deployment to the in-cluster \
+                     broker URL (typically http://weft-broker.weft-db.svc.cluster.local:9090)"
+                );
+            }
+            "http://localhost:9090".to_string()
+        }
+    };
 
     let listener_backend: Arc<dyn ListenerBackend> =
         match std::env::var("WEFT_LISTENER_BACKEND").as_deref() {
@@ -111,23 +106,74 @@ async fn main() -> anyhow::Result<()> {
             _ => {
                 let image = std::env::var("WEFT_LISTENER_IMAGE")
                     .unwrap_or_else(|_| "weft-listener:local".into());
-                let suffix = std::env::var("WEFT_LISTENER_HOST_SUFFIX")
-                    .unwrap_or_else(|_| "listener.weft.local".into());
-                Arc::new(K8sListenerBackend::new(image, suffix))
+                Arc::new(K8sListenerBackend::new(image, broker_url.clone()))
             }
         };
 
     let worker_backend: Arc<dyn WorkerBackend> =
-        Arc::new(K8sWorkerBackend::new(dispatcher_callback_url.clone()));
+        Arc::new(K8sWorkerBackend::new(broker_url.clone()));
+
+    // Cluster CIDR knobs. Required in-cluster so the dispatcher can
+    // render NetworkPolicies that allow internet egress while denying
+    // intra-cluster Pod traffic. Subprocess dev defaults are Kind's.
+    let cluster_pod_cidr = match std::env::var("WEFT_CLUSTER_POD_CIDR") {
+        Ok(v) => v,
+        Err(_) => {
+            if in_cluster_for_broker {
+                anyhow::bail!(
+                    "WEFT_CLUSTER_POD_CIDR is required in-cluster; \
+                     set it to the cluster's Pod CIDR (e.g. 10.244.0.0/16 for Kind)"
+                );
+            }
+            "10.244.0.0/16".to_string()
+        }
+    };
+    let cluster_service_cidr = match std::env::var("WEFT_CLUSTER_SERVICE_CIDR") {
+        Ok(v) => v,
+        Err(_) => {
+            if in_cluster_for_broker {
+                anyhow::bail!(
+                    "WEFT_CLUSTER_SERVICE_CIDR is required in-cluster; \
+                     set it to the cluster's Service CIDR (e.g. 10.96.0.0/12 for Kind)"
+                );
+            }
+            "10.96.0.0/12".to_string()
+        }
+    };
+    // Sanity-check CIDRs. We don't do full IP arithmetic, but a
+    // typo'd value silently produces broken NetworkPolicies (allows
+    // traffic the policy meant to block). The shape is `<ip>/<prefix>`
+    // with both halves present.
+    for (name, value) in [
+        ("WEFT_CLUSTER_POD_CIDR", &cluster_pod_cidr),
+        ("WEFT_CLUSTER_SERVICE_CIDR", &cluster_service_cidr),
+    ] {
+        let mut parts = value.splitn(2, '/');
+        let ip = parts.next().unwrap_or("");
+        let prefix = parts.next().unwrap_or("");
+        if ip.is_empty()
+            || prefix.is_empty()
+            || prefix.parse::<u8>().is_err()
+            || ip.split('.').count() != 4
+        {
+            anyhow::bail!(
+                "{name}='{value}' is not a valid IPv4 CIDR (expected `a.b.c.d/N`)"
+            );
+        }
+    }
+
+    let cluster_ingress_namespace = std::env::var("WEFT_CLUSTER_INGRESS_NAMESPACE")
+        .unwrap_or_else(|_| "ingress-nginx".to_string());
 
     let infra_backend = Arc::new(KindInfraBackend::new());
-    let infra_registry = InfraRegistry::new();
 
-    // Rehydrate sidecars from each known tenant namespace. Without
-    // this a dispatcher restart orphans every sidecar.
-    let known_namespaces: Vec<String> =
-        vec![namespace_mapper.namespace_for(&TenantId::local())];
-    match infra_backend.rehydrate(&known_namespaces).await {
+    // Rehydrate sidecars from each tenant namespace. Without this a
+    // dispatcher restart orphans every sidecar. Pulled from the
+    // `project` table (DISTINCT tenant_id) rather than hardcoded so
+    // cloud's per-user tenants get covered automatically.
+    let boot_namespaces =
+        active_tenant_namespaces(journal.pool(), namespace_mapper.as_ref()).await?;
+    match infra_backend.rehydrate(&boot_namespaces).await {
         Ok(adopted) => {
             for a in adopted {
                 let status = if a.running {
@@ -135,7 +181,23 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     weft_dispatcher::infra::InfraStatus::Stopped
                 };
-                infra_registry.insert_with_status(a.project_id, a.node_id, a.handle, status);
+                if let Err(e) = weft_dispatcher::infra::upsert_with_status(
+                    journal.pool(),
+                    &a.project_id,
+                    &a.node_id,
+                    &a.handle,
+                    status,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        target: "weft_dispatcher",
+                        error = %e,
+                        project = %a.project_id,
+                        node = %a.node_id,
+                        "infra rehydrate row insert failed"
+                    );
+                }
             }
         }
         Err(e) => {
@@ -147,57 +209,47 @@ async fn main() -> anyhow::Result<()> {
     info!("dispatcher pod identity: {}", pod_id);
 
     let pg_pool = journal.pool().clone();
-    let event_bus =
-        weft_dispatcher::EventBus::with_postgres(pg_pool.clone(), pod_id.to_string());
+    let event_bus = weft_dispatcher::EventBus::with_notify(pg_pool.clone()).await?;
 
-    // Rehydrate ListenerPool from `tenant_listener` rows. We adopt
-    // every row whose previous owner is not us: either a Pod that
-    // just shut down (graceful drop) or a dead one (lease expired).
-    // The persisted handle (URL + tokens) stays the same so the
-    // listener Pod's env still matches; we just take over renewal.
+    // ListenerPool is stateless: every `with_listener` call reads
+    // the `tenant_listener` row through an advisory-locked transaction
+    // and returns the fresh handle. No RAM cache means no staleness
+    // possible, at the cost of one DB round-trip per listener call.
     let listener_pool = ListenerPool::new();
-    match weft_dispatcher::lease::list_tenant_listeners(&pg_pool).await {
-        Ok(rows) => {
-            for row in rows {
-                let handle = weft_dispatcher::listener::ListenerHandle {
-                    admin_url: row.admin_url.clone(),
-                    public_base_url: row.public_base_url.clone(),
-                    admin_token: row.admin_token.clone(),
-                    relay_token: row.relay_token.clone(),
-                };
-                if row.owner_pod_id != pod_id.as_str() {
-                    if let Err(e) = weft_dispatcher::lease::upsert_tenant_listener(
-                        &pg_pool,
-                        &row.tenant_id,
-                        pod_id.as_str(),
-                        &row.namespace,
-                        &row.deploy_name,
-                        &row.admin_url,
-                        &row.public_base_url,
-                        &row.admin_token,
-                        &row.relay_token,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            target: "weft_dispatcher",
-                            tenant = %row.tenant_id,
-                            error = %e,
-                            "failed to adopt tenant_listener on startup"
-                        );
-                        continue;
-                    }
-                }
-                listener_pool.insert(row.tenant_id, handle);
+
+    // Public base URL: this is what users hit for webhooks /
+    // activation URLs. In-cluster the manifest must set
+    // WEFT_DISPATCHER_PUBLIC_BASE_URL to the external ingress;
+    // outside the cluster (local dev), localhost is the right
+    // default. Detect the cluster via KUBERNETES_SERVICE_HOST
+    // (always set inside a Pod). In-cluster, the URL must be the
+    // real external ingress: fail loud if the env var is unset OR
+    // its host is loopback. Outside the cluster (local dev), the
+    // localhost default is fine.
+    let in_cluster = std::env::var("KUBERNETES_SERVICE_HOST").is_ok();
+    let public_base_url = match std::env::var("WEFT_DISPATCHER_PUBLIC_BASE_URL") {
+        Ok(v) => {
+            if in_cluster && is_loopback_url(&v) {
+                anyhow::bail!(
+                    "WEFT_DISPATCHER_PUBLIC_BASE_URL='{v}' resolves to a loopback \
+                     host in-cluster; set it on the dispatcher Deployment to the \
+                     external ingress URL before deploying"
+                );
             }
+            v
         }
-        Err(e) => {
-            tracing::warn!("listener rehydrate failed: {e}");
+        Err(_) => {
+            if in_cluster {
+                anyhow::bail!(
+                    "WEFT_DISPATCHER_PUBLIC_BASE_URL is required in-cluster; \
+                     set it on the dispatcher Deployment to the external ingress URL"
+                );
+            }
+            format!("http://localhost:{}", http_port)
         }
-    }
+    };
 
     let state = DispatcherState {
-        config: Arc::new(config.clone()),
         pod_id,
         journal: Arc::new(journal),
         pg_pool,
@@ -205,108 +257,159 @@ async fn main() -> anyhow::Result<()> {
         infra: infra_backend,
         projects,
         events: event_bus,
-        slots: weft_dispatcher::slots::Slots::new(),
         listener_backend,
         listeners: listener_pool,
-        infra_registry,
         tenant_router,
         namespace_mapper,
+        public_base_url,
+        cluster_pod_cidr,
+        cluster_service_cidr,
+        cluster_ingress_namespace,
     };
 
-    let shutdown_state = state.clone();
     let renewer_state = state.clone();
     tokio::spawn(async move {
         lease_renewer(renewer_state).await;
     });
 
-    // Cross-Pod event fanout: subscribe to the Postgres NOTIFY
-    // channel and ingest every payload into the local EventBus.
-    let event_state = state.clone();
+    // Journal-to-EventBus bridge: convert new exec_event rows
+    // (written by workers and listeners directly) into
+    // DispatcherEvent broadcasts so SSE consumers see live events.
+    let bridge_state = state.clone();
     tokio::spawn(async move {
-        event_subscriber(event_state).await;
+        weft_dispatcher::journal_bridge::run(bridge_state).await;
     });
 
-    // Periodic worker-pod sweeper. Worker pods exit cleanly with
-    // restartPolicy: Never, so K8s leaves them in Succeeded/Failed
-    // phase forever. They consume only an etcd record (no CPU /
-    // memory), but the user's `kubectl get pods` clutters fast.
-    // Active workers and stalled-grace workers are in Running
-    // phase, so this sweeper never touches them.
-    let sweeper_namespaces = known_namespaces.clone();
+    // Reapers: sweep stale worker_pod rows and retain-old terminal
+    // task rows. Every dispatcher Pod runs them; FOR UPDATE SKIP
+    // LOCKED + idempotent ops keep them safe under concurrency.
+    weft_dispatcher::reaper::spawn_all(state.clone());
+
+    // Task picker loop. Each dispatcher Pod runs one and competes
+    // for tasks via SKIP LOCKED.
+    use weft_task_store::TaskKind;
+    let registry = weft_dispatcher::task_executor::TaskRegistry::builder()
+        .register(
+            TaskKind::SpawnPod,
+            Arc::new(weft_dispatcher::task_kinds::SpawnPodExecutor),
+        )
+        .register(
+            TaskKind::RegisterSignal,
+            Arc::new(weft_dispatcher::task_kinds::RegisterSignalExecutor),
+        )
+        .register(
+            TaskKind::ProvisionSidecar,
+            Arc::new(weft_dispatcher::task_kinds::ProvisionSidecarExecutor),
+        )
+        .register(
+            TaskKind::RouteEntry,
+            Arc::new(weft_dispatcher::task_kinds::RouteEntryExecutor),
+        )
+        .register(
+            TaskKind::FireSignal,
+            Arc::new(weft_dispatcher::task_kinds::FireSignalExecutor),
+        )
+        .register(
+            TaskKind::RecordCost,
+            Arc::new(weft_dispatcher::task_kinds::RecordCostExecutor),
+        )
+        .register(
+            TaskKind::RecordLog,
+            Arc::new(weft_dispatcher::task_kinds::RecordLogExecutor),
+        )
+        .build();
+    let picker_state = state.clone();
+    let picker_store: Arc<dyn weft_task_store::TaskStoreClient> = Arc::new(
+        weft_task_store::PostgresTaskStoreClient::new(state.pg_pool.clone()),
+    );
+    let picker_pod = state.pod_id.as_str().to_string();
     tokio::spawn(async move {
-        worker_pod_sweeper(sweeper_namespaces).await;
+        weft_dispatcher::task_executor::run_picker_loop(
+            picker_store,
+            picker_state,
+            registry,
+            picker_pod,
+        )
+        .await;
+    });
+
+    // Cold-start trigger: if pending worker tasks exist for a project
+    // with no live Pod, enqueue a `spawn_pod` task. Dedup-keyed so
+    // concurrent dispatchers converge on one spawn per project.
+    weft_dispatcher::cold_start::spawn(state.clone());
+
+    // Periodic worker-pod sweeper. Worker pods run with
+    // `restartPolicy: OnFailure`: k8s restarts the container on
+    // crash, but a clean exit (worker drains and exits 0) leaves
+    // the Pod in Succeeded phase forever. They consume only an
+    // etcd record, but the user's `kubectl get pods` clutters
+    // fast. Active workers stay in Running phase; sweeper skips them.
+    let sweeper_pool = state.pg_pool.clone();
+    let sweeper_mapper = state.namespace_mapper.clone();
+    tokio::spawn(async move {
+        worker_pod_sweeper(sweeper_pool, sweeper_mapper).await;
     });
 
     let app = router(state);
-    let addr = format!("0.0.0.0:{}", config.http_port);
+    let addr = format!("0.0.0.0:{}", http_port);
     let listener = TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
     info!("weft-dispatcher listening on {}", addr);
     axum::serve(listener, app)
-        .with_graceful_shutdown(graceful_shutdown(shutdown_state))
+        .with_graceful_shutdown(graceful_shutdown())
         .await?;
     Ok(())
 }
 
-/// Subscribe to the cross-Pod NOTIFY channel and ingest every
-/// payload into the local EventBus. Reconnects on errors.
-async fn event_subscriber(state: DispatcherState) {
-    use sqlx::postgres::PgListener;
-    loop {
-        let listener = match PgListener::connect_with(&state.pg_pool).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(
-                    target: "weft_dispatcher::events",
-                    error = %e,
-                    "event listener connect failed; retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        let mut listener = listener;
-        if let Err(e) = listener
-            .listen(weft_dispatcher::events::NOTIFY_CHANNEL)
-            .await
-        {
-            tracing::warn!(target: "weft_dispatcher::events", "LISTEN failed: {e}");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            continue;
-        }
-        loop {
-            match listener.recv().await {
-                Ok(notification) => {
-                    state.events.ingest_remote(notification.payload()).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_dispatcher::events",
-                        error = %e,
-                        "event listener disconnected; reconnecting"
-                    );
-                    break;
-                }
-            }
-        }
+/// Resolve the set of currently-active tenant namespaces from the
+/// `project` table. Used at boot for sidecar rehydrate and at every
+/// sweep tick so newly-registered tenants get covered without a
+/// dispatcher restart.
+async fn active_tenant_namespaces(
+    pool: &sqlx::PgPool,
+    namespace_mapper: &dyn NamespaceMapper,
+) -> anyhow::Result<Vec<String>> {
+    use sqlx::Row;
+    let rows = sqlx::query("SELECT DISTINCT tenant_id FROM project")
+        .fetch_all(pool)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let tenant_id: String = row.try_get("tenant_id")?;
+        out.push(namespace_mapper.namespace_for(&TenantId(tenant_id)));
     }
+    Ok(out)
 }
 
 /// Periodic sweeper that deletes worker pods in terminal phase
 /// (Succeeded/Failed) older than the grace window. Workers run
-/// with `restartPolicy: Never`, so the K8s record stays around
-/// after the process exits — eats etcd space, clutters
-/// `kubectl get`. Active workers (mid-run, mid-stall-grace) are
-/// in Running phase, so this sweeper never touches them.
+/// with `restartPolicy: OnFailure`, so a clean exit leaves the
+/// Pod in Succeeded phase indefinitely (eats etcd space, clutters
+/// `kubectl get`). Active workers stay in Running phase, so this
+/// sweeper never touches them.
 ///
 /// Interval: every 5 minutes.
 /// Threshold: pod must have been terminal for >10 minutes. Keeps
 /// just-finished pods inspectable for `kubectl logs` for a bit.
-async fn worker_pod_sweeper(namespaces: Vec<String>) {
+async fn worker_pod_sweeper(
+    pool: sqlx::PgPool,
+    namespace_mapper: Arc<dyn NamespaceMapper>,
+) {
     use tokio::process::Command;
     let interval = std::time::Duration::from_secs(300);
     let min_age_secs: i64 = 600;
     loop {
         tokio::time::sleep(interval).await;
+        let namespaces = match active_tenant_namespaces(&pool, namespace_mapper.as_ref()).await {
+            Ok(ns) => ns,
+            Err(e) => {
+                tracing::warn!(
+                    target: "weft_dispatcher::sweeper",
+                    error = %e,
+                    "skipping sweep tick: active_tenant_namespaces failed"
+                );
+                continue;
+            }
+        };
         for ns in &namespaces {
             let out = Command::new("kubectl")
                 .args([
@@ -360,26 +463,9 @@ async fn lease_renewer(state: DispatcherState) {
     let pod_id = state.pod_id.as_str().to_string();
     loop {
         tokio::time::sleep(interval).await;
-
         let pool = state.pg_pool.clone();
         let pid = pod_id.clone();
 
-        // Renew slot leases.
-        let slot_rows: Result<Vec<(String,)>, _> = sqlx::query_as(
-            "SELECT color FROM slot_lease WHERE owner_pod_id = $1",
-        )
-        .bind(&pid)
-        .fetch_all(&pool)
-        .await;
-        if let Ok(rows) = slot_rows {
-            for (color_str,) in rows {
-                if let Ok(color) = color_str.parse::<weft_core::Color>() {
-                    let _ = lease::renew_slot(&pool, color, &pid).await;
-                }
-            }
-        }
-
-        // Renew tenant listener leases.
         let tenant_rows: Result<Vec<(String,)>, _> = sqlx::query_as(
             "SELECT tenant_id FROM tenant_listener WHERE owner_pod_id = $1",
         )
@@ -388,17 +474,24 @@ async fn lease_renewer(state: DispatcherState) {
         .await;
         if let Ok(rows) = tenant_rows {
             for (tenant_id,) in rows {
-                let _ = lease::renew_tenant_listener(&pool, &tenant_id, &pid).await;
+                if let Err(e) = lease::renew_tenant_listener(&pool, &tenant_id, &pid).await {
+                    tracing::warn!(
+                        target: "weft_dispatcher",
+                        tenant = %tenant_id,
+                        error = %e,
+                        "tenant_listener renewal failed"
+                    );
+                }
             }
         }
     }
 }
 
-/// Wait for SIGTERM / Ctrl+C, then release every lease this Pod
-/// owns before letting axum drain. Fast handover: the next claim
-/// from another Pod sees a free row instead of having to wait
-/// `LEASE_DURATION_SECS` for expiry.
-async fn graceful_shutdown(state: DispatcherState) {
+/// Wait for SIGTERM / Ctrl+C and let axum drain. Tenant listener
+/// rows stay so the next dispatcher Pod re-attaches with the same
+/// URL + tokens; the listener Pod itself doesn't care which
+/// dispatcher Pod owns its lease.
+async fn graceful_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut sigterm = match signal(SignalKind::terminate()) {
@@ -409,47 +502,59 @@ async fn graceful_shutdown(state: DispatcherState) {
         }
     };
     tokio::select! {
-        _ = sigterm.recv() => {
-            tracing::info!("SIGTERM received; releasing leases");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl+C received; releasing leases");
-        }
-    }
-
-    if let Err(e) = release_owned_leases(&state).await {
-        tracing::warn!("releasing leases failed (ignoring): {e}");
+        _ = sigterm.recv() => tracing::info!("SIGTERM received; draining"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl+C received; draining"),
     }
 }
 
-async fn release_owned_leases(state: &DispatcherState) -> anyhow::Result<()> {
-    let pool = state.pg_pool.clone();
-    let pod_id = state.pod_id.as_str();
+/// Whether `url` resolves to a loopback address from the dispatcher
+/// pod's perspective. Catches both `http://localhost:9999` (the
+/// hostname literal) and `http://127.0.0.1` / `http://[::1]` (loopback
+/// IPs). Anything that fails to parse as a URL also counts as
+/// loopback, since a malformed prod URL is a bug we want to surface.
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return true;
+    };
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => true,
+    }
+}
 
-    // Release every slot we own. The next dispatcher Pod can claim
-    // them immediately instead of waiting for the lease to expire.
-    let slot_rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT color FROM slot_lease WHERE owner_pod_id = $1",
-    )
-    .bind(pod_id)
-    .fetch_all(&pool)
-    .await?;
-    for (color_str,) in slot_rows {
-        if let Ok(color) = color_str.parse::<weft_core::Color>() {
-            let _ = weft_dispatcher::lease::release_slot(&pool, color, pod_id).await;
-        }
+#[cfg(test)]
+mod is_loopback_url_tests {
+    use super::is_loopback_url;
+
+    #[test]
+    fn localhost_hostname() {
+        assert!(is_loopback_url("http://localhost:9999"));
+        assert!(is_loopback_url("https://LOCALHOST/path"));
     }
 
-    // Tenant listener rows STAY. The listener Pod itself doesn't
-    // care which dispatcher Pod owns its lease; what matters is
-    // the URL + tokens stored in the row. Deleting the row would
-    // make the next dispatcher Pod re-spawn the listener with a
-    // fresh `kubectl apply`, generating new tokens. But the old
-    // listener Pod is still running with the OLD tokens until the
-    // new Pod rolls out, so register requests in that window get
-    // 401 from the still-alive old Pod. Keeping the row preserves
-    // tokens across dispatcher restarts: the next Pod re-attaches
-    // to the same listener Deployment, same tokens, no spawn.
-    Ok(())
+    #[test]
+    fn loopback_v4() {
+        assert!(is_loopback_url("http://127.0.0.1:9999"));
+        assert!(is_loopback_url("http://127.0.0.42"));
+    }
+
+    #[test]
+    fn loopback_v6() {
+        assert!(is_loopback_url("http://[::1]:9999"));
+    }
+
+    #[test]
+    fn external_host() {
+        assert!(!is_loopback_url("https://api.example.com"));
+        assert!(!is_loopback_url("http://10.0.0.5:9999"));
+    }
+
+    #[test]
+    fn malformed_url_is_loopback() {
+        assert!(is_loopback_url("not a url"));
+        assert!(is_loopback_url(""));
+    }
 }
 

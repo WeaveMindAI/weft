@@ -193,7 +193,7 @@ export function translateProject(
   };
 }
 
-// Cache of the latest parse response — v1's parseWeft shim reads
+// Cache of the latest parse response. v1's parseWeft shim reads
 // from here. Declared in its own module so weft-parser's shim can
 // import without App.svelte circular dep.
 let latestResponse: ParseResponse | null = null;

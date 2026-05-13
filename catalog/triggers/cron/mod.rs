@@ -1,7 +1,7 @@
 //! Cron: fires an execution on a schedule. Two phases:
 //!
 //!   - `Phase::TriggerSetup`: resolve the timer spec from config
-//!     (`cron` / `after_ms` / `at`) and register with the listener.
+//!     (`cron` / `after_ms` / `at`) and register a Timer signal.
 //!
 //!   - `Phase::Fire`: the listener's timer tick seeded `__seed__`
 //!     with `{scheduledTime, actualTime}`. Forward them to outputs.
@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{TimerSpec, WakeSignalKind, WakeSignalSpec};
+use weft_core::signal::{Timer, TimerSpec};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
 pub struct CronNode;
@@ -32,11 +32,7 @@ impl Node for CronNode {
         match ctx.phase {
             Phase::TriggerSetup => {
                 let spec = cron_spec_from_config(&ctx)?;
-                ctx.register_signal(WakeSignalSpec {
-                    kind: WakeSignalKind::Timer { spec },
-                    is_resume: false,
-                })
-                .await?;
+                ctx.register_signal(Timer { spec }).await?;
                 Ok(NodeOutput::empty())
             }
             Phase::Fire => {

@@ -14,77 +14,47 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::Color;
-
 #[async_trait]
 pub trait WorkerBackend: Send + Sync {
-    /// Spawn a worker for this project's execution color.
-    /// The worker's image / binary identity is implicit in the
-    /// backend (k8s looks up `weft-worker-<project_id>:latest`;
-    /// a future cloud backend might pull from a registry). The
-    /// dispatcher never handles a host filesystem path anymore.
-    async fn spawn_worker(&self, wake: WakeContext) -> anyhow::Result<WorkerHandle>;
+    /// Spawn a worker Pod for `spec.project_id`'s pool. The Pod claims
+    /// any pending `target=worker` task scoped to its project; one Pod
+    /// multiplexes many concurrent executions. Cold-start path called
+    /// by the dispatcher when no live Pod exists for the project.
+    ///
+    /// Pod name is chosen by the caller (deterministic from the
+    /// spawn task id) so a partial-success retry collides on the
+    /// same name instead of creating a second Pod.
+    async fn spawn_pod(
+        &self,
+        pod_name: &str,
+        spec: SpawnPodSpec,
+    ) -> anyhow::Result<WorkerHandle>;
 
-    async fn kill_worker(&self, handle: WorkerHandle) -> anyhow::Result<()>;
-
-    /// Seconds the dispatcher keeps a worker alive after it stalls
-    /// on suspensions, before tearing the pod down. A fire that
-    /// arrives within the grace window forwards to the still-warm
-    /// worker, saving a respawn (and a cold-start delay). Default
-    /// is 0: kill immediately. K8s backend overrides to 10s
-    /// because pod cold-start is meaningfully expensive.
-    fn idle_grace_seconds(&self) -> u64 {
-        0
-    }
+    async fn kill_pod(&self, pod_name: String, namespace: String) -> anyhow::Result<()>;
 }
 
-/// Re-export `RootSeed` from core so backends can reference it by
-/// the canonical type. Kept here for compatibility with existing
-/// callers; new code should use `weft_core::RootSeed` directly.
-pub use weft_core::primitive::RootSeed;
-
-/// Minimal handoff passed to `spawn_worker`. The dispatcher-to-worker
-/// channel is the WebSocket (`/ws/executions/{color}`), so all the
-/// actual wake data lives on the slot and is delivered in the
-/// `Start` message after the worker's `Ready` handshake. The spawn
-/// call only needs enough to boot the worker and point it at the
-/// right socket.
-///
-/// `tenant` + `namespace` resolve where the worker pod runs. The
-/// dispatcher resolves both via `TenantRouter` + `NamespaceMapper`
-/// before calling `spawn_worker`; backends never look up tenants
-/// themselves.
+/// Spec for spawning a worker Pod. The Pod runs the project's
+/// hash-tagged image (`weft-worker-<project_id>:<hash>`), claims
+/// tasks for that project, and scale-to-zeros when idle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WakeContext {
+pub struct SpawnPodSpec {
     pub project_id: String,
-    pub color: Color,
     pub tenant: String,
     pub namespace: String,
-}
-
-impl WakeContext {
-    /// Resolve a `WakeContext` from the dispatcher's tenant state.
-    /// Centralizes the "project → tenant → namespace" lookup so
-    /// every spawn site stays consistent.
-    pub fn resolve(
-        state: &crate::state::DispatcherState,
-        project_id: String,
-        color: Color,
-    ) -> Self {
-        let tenant = state.tenant_router.tenant_for_project(&project_id);
-        let namespace = state.namespace_mapper.namespace_for(&tenant);
-        Self {
-            project_id,
-            color,
-            tenant: tenant.to_string(),
-            namespace,
-        }
-    }
+    /// Dispatcher Pod id stamped on the worker_pod row for traceability.
+    pub owner_dispatcher: String,
+    /// Source hash that identifies which worker image to pull.
+    /// None when the project has never been built/registered with
+    /// a hash by the CLI; backends should fail loudly in that case
+    /// rather than fall back to `:latest` so a misconfigured CLI
+    /// doesn't silently spawn the wrong image.
+    pub source_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct WorkerHandle {
-    pub id: String,
+    /// k8s pod name minted by the spawn (worker_pod PRIMARY KEY).
+    pub pod_name: String,
 }
 
 #[async_trait]
@@ -154,10 +124,6 @@ pub trait InfraBackend: Send + Sync {
     /// Service, Ingress, PVC. Idempotent. After `delete` the
     /// instance's state is gone; `provision` has to apply fresh.
     async fn delete(&self, handle: InfraHandle) -> anyhow::Result<()>;
-
-    /// Stream events from an infra node back to the dispatcher.
-    /// Events arrive as serialized JSON payloads.
-    async fn stream_events(&self, handle: InfraHandle) -> anyhow::Result<EventStream>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +141,13 @@ pub struct InfraSpec {
     /// never resolves these on its own.
     pub tenant: String,
     pub namespace: String,
+    /// Source-hash that identifies which sidecar image to pull.
+    /// Becomes the docker tag suffix (`weft-sidecar-<name>:<hash>`).
+    /// None when the dispatcher couldn't resolve a hash for this
+    /// node (e.g. a CLI-less invocation); backends should fail
+    /// loudly rather than fall back to `:latest` in that case.
+    #[serde(default, rename = "sidecarHash", alias = "sidecar_hash")]
+    pub sidecar_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +165,7 @@ pub struct InfraHandle {
 }
 
 /// One (project, node) pair adopted from the cluster at startup.
-/// The dispatcher seeds these into `InfraRegistry` with the status
+/// The dispatcher upserts these into `infra_pod` with the status
 /// implied by the Deployment's current replica count.
 #[derive(Debug, Clone)]
 pub struct AdoptedHandle {
@@ -202,5 +175,3 @@ pub struct AdoptedHandle {
     /// true when the Deployment is at replicas=1+, false when at 0.
     pub running: bool,
 }
-
-pub type EventStream = tokio::sync::mpsc::Receiver<Value>;

@@ -1,217 +1,238 @@
-//! Execution state read endpoints. Writers (cost, log, suspension,
-//! node events, status) live on the worker-to-dispatcher WebSocket
-//! in `api::ws`. What's left here is: cancel (control), delete
-//! (cleanup), and the reader endpoints the CLI, VS Code extension,
-//! and dashboard hit over HTTP: logs, replay, list_executions, get.
+//! Execution state read endpoints. Writers journal events directly
+//! to Postgres from the worker. What's left here is: cancel
+//! (control), delete (cleanup), and the reader endpoints the CLI
+//! and VS Code extension hit over HTTP: logs, replay,
+//! list_executions, get.
 
 use axum::{extract::{Path, State}, http::StatusCode, Json};
 use serde::Serialize;
 use serde_json::Value;
 
 use weft_core::Color;
-use weft_core::primitive::DispatcherToWorker;
 
 use crate::events::DispatcherEvent;
-use crate::slots::Slot;
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 use crate::state::DispatcherState;
 
 pub async fn cancel(
     State(state): State<DispatcherState>,
     Path(color_str): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    cancel_color(&state, color)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+) -> Result<StatusCode, (StatusCode, String)> {
+    let color: Color = color_str
+        .parse()
+        .map_err(|e: uuid::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    cancel_color(&state, color).await.map_err(|e| {
+        tracing::error!(target: "weft_dispatcher::cancel", color = %color, error = %e, "cancel_color failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Cancel a single execution end-to-end:
+/// Cancel a single execution.
 ///
-///  1. Tell the live worker (if any) to stop via
-///     `DispatcherToWorker::Cancel`. The engine wires this to the
-///     cancellation `Notify` so the loop driver exits with
-///     `LoopOutcome::Failed { error: "cancelled" }`.
-///  2. Tear down every wake signal still registered on behalf of
-///     this color: ask the tenant's listener to unregister each
-///     token, drop the matching SignalTracker entries, drop the
-///     journal's suspension lookup rows. Without this, webhooks /
-///     timers / forms would keep firing into a dead execution.
-///  3. Append an `ExecutionFailed { error: "cancelled" }` event
-///     to the journal.
-///  4. Broadcast `ExecutionFailed` on the project's SSE bus so
-///     UIs flip out of "running" immediately.
-///  5. Drop the dispatcher's slot so a future wake on this color
-///     gets a fresh slot rather than reaching the dead worker.
+/// Two paths converge to a single observable outcome (the journal
+/// reaches `ExecutionCancelled`):
 ///
-/// Used both by the public `/executions/{color}/cancel` route and
-/// internally by `extension::cancel_task` and
-/// `project::deactivate_project`.
+///   - When a worker Pod is alive for this project, it might be
+///     actively running this color's loop driver. We enqueue a
+///     `cancel_execution` task; the worker fires the per-color
+///     `CancellationFlag`, the loop driver exits, the worker would
+///     try to journal terminals (idempotent: skips if already done).
+///   - In every case, the dispatcher writes the terminal events
+///     itself (NodeCancelled per non-terminal node + ExecutionCancelled).
+///     This handles the suspended-execution case (no Pod alive, the
+///     worker exited cleanly when it stalled) and races where the
+///     worker is alive but not running this color.
+///
+/// Order matters:
+///   1. Strip wake signals so webhooks / timers / forms can no
+///      longer revive the execution.
+///   2. Enqueue the cancel task IF a live worker exists. We don't
+///      want orphan tasks accumulating for projects with no worker
+///      (the queue would leak).
+///   3. Journal NodeCancelled for non-terminal nodes (the worker's
+///      same code path is idempotent on `has_terminal_event` so it
+///      won't double-write).
+///   4. Journal ExecutionCancelled.
+///   5. The journal bridge polls these new rows and publishes them
+///      onto the project's SSE bus so the frontend exits the
+///      "Cancelling..." pending state.
 pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Result<()> {
-    // 1. Send Cancel over the WS AND kill the underlying worker
-    //    Pod. The Cancel message is for a worker that's currently
-    //    connected and running; kill_worker handles the pod that's
-    //    in ImagePullBackOff or otherwise alive but not yet on the
-    //    WS. Without the kill, k8s eventually schedules the pod,
-    //    the worker connects, and runs the workflow as a zombie
-    //    even after the user pressed Stop.
-    let lease = crate::lease::lookup_slot(&state.pg_pool, color).await.ok().flatten();
-    if let Some((owner, leased_until)) = lease {
-        if owner == state.pod_id.as_str() {
-            // Pull both the live WS sender and the worker handle
-            // out of the slot in one pass; the kill happens after
-            // we drop the lock so we don't block other waiters.
-            let (live_sender, worker_handle) = state
-                .slots
-                .with_slot(color, |slot| {
-                    Box::pin(async move {
-                        match slot {
-                            Slot::Live { sender, .. } => (Some(sender.clone()), None),
-                            Slot::StalledGrace { sender, worker, .. } => {
-                                (Some(sender.clone()), worker.take())
-                            }
-                            Slot::Starting { worker, .. } => (None, worker.take()),
-                            Slot::WaitingReconnect { worker, .. } => (None, worker.take()),
-                            Slot::Idle { .. } => (None, None),
-                        }
-                    })
-                })
-                .await;
-            if let Some(sender) = live_sender {
-                let _ = sender.send(DispatcherToWorker::Cancel).await;
-            }
-            if let Some(handle) = worker_handle {
-                let _ = state.workers.kill_worker(handle).await;
-            }
-        } else if crate::lease::is_lease_live(leased_until) {
-            // Forward to the owning Pod over internal HTTP.
-            let req = crate::api::internal::CancelColorRequest {
-                color: color.to_string(),
-            };
-            if let Err(e) = crate::routing::forward_to_pod_noreply(
-                state,
-                &owner,
-                "/internal/cancel-color",
-                &req,
-            )
-            .await
-            {
-                tracing::warn!(
-                    target: "weft_dispatcher::cancel",
-                    %color, owner = %owner, error = %e,
-                    "internal cancel forward failed; continuing with journal-side cleanup"
-                );
-            }
-        }
-    }
+    tracing::info!(
+        target: "weft_dispatcher::cancel",
+        color = %color,
+        "cancel_color start"
+    );
 
-    // 2. Strip every wake-signal registration tied to this color.
+    // 1. Strip wake-signal registrations. Must be first: if we
+    //    journaled terminals first, a webhook could fire in the
+    //    gap and resume a dead execution. A DB failure here MUST
+    //    abort the cancel: continuing past it leaves the wake
+    //    signals registered, so the next webhook revives a
+    //    "cancelled" execution.
     let removed = state
         .journal
         .signal_remove_for_color(color)
-        .await
-        .unwrap_or_default();
-    for meta in &removed {
-        if let Some(handle) = state.listeners.get(&meta.tenant_id) {
-            let _ = crate::listener::unregister_signal(&handle, &meta.token).await;
+        .await?;
+    tracing::info!(
+        target: "weft_dispatcher::cancel",
+        color = %color,
+        signals_removed = removed.len(),
+        "wake signals stripped"
+    );
+    state
+        .listeners
+        .unregister_many_if_alive(&state.pg_pool, &removed)
+        .await;
+
+    let project_id = match state.journal.execution_project(color).await? {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                target: "weft_dispatcher::cancel",
+                color = %color,
+                "no project_id for color; nothing to do"
+            );
+            return Ok(());
         }
-        let _ = state.journal.consume_suspension(&meta.token).await;
+    };
+
+    // 2. Always enqueue cancel_execution. If a worker is alive AND
+    //    is currently running this color, the task fires the
+    //    per-color CancellationFlag fast (~50ms), the loop driver
+    //    exits, and the worker stops emitting node events. If no
+    //    worker is running this color (suspended, or no worker at
+    //    all), the task is a harmless no-op when claimed (or
+    //    eventually reaped). The dispatcher's terminal-journal
+    //    write below still runs in every case, so the frontend's
+    //    "Cancelling..." state always exits.
+    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let enqueued = crate::task_kinds::execute::enqueue_cancel(
+        &state.pg_pool,
+        &project_id,
+        color,
+        Some(tenant.as_str()),
+    )
+    .await?;
+    if enqueued {
+        tracing::info!(
+            target: "weft_dispatcher::cancel",
+            color = %color,
+            project = %project_id,
+            "cancel task enqueued"
+        );
+    } else {
+        tracing::debug!(
+            target: "weft_dispatcher::cancel",
+            color = %color,
+            project = %project_id,
+            "no live worker pod; cancel is a no-op (execution already terminal)"
+        );
     }
 
-    // 3. Per-node cancellation. Fold the current journal, find
-    //    every non-terminal record (Running, WaitingForInput),
-    //    and journal one NodeCancelled per. Without this, the
-    //    graph would leave parked nodes in their last lifecycle
-    //    state forever (the modal would show no clear "Cancelled
-    //    by user" reason). Frontends apply each NodeCancelled to
-    //    flip the matching record visually.
-    let project_id = state.journal.execution_project(color).await.ok().flatten();
-    let now = unix_now();
-    let cancel_reason = "Cancelled by user".to_string();
-    let events_for_fold = state.journal.events_log(color).await.unwrap_or_default();
-    let snapshot = crate::journal::fold_to_snapshot(color, &events_for_fold);
-    let mut to_cancel: Vec<(String, weft_core::lane::Lane)> = Vec::new();
-    for (node_id, execs) in &snapshot.executions {
-        for e in execs {
-            if !e.status.is_terminal() {
-                to_cancel.push((node_id.clone(), e.lane.clone()));
-            }
-        }
-    }
-    for (node_id, lane) in to_cancel {
-        let _ = state
-            .journal
-            .record_event(&crate::journal::ExecEvent::NodeCancelled {
-                color,
-                node_id: node_id.clone(),
-                lane: lane.clone(),
-                reason: cancel_reason.clone(),
-                at_unix: now,
-            })
-            .await;
-        if let Some(project_id) = &project_id {
-            let lane_str = serde_json::to_string(&lane).unwrap_or_default();
-            state
-                .events
-                .publish(DispatcherEvent::NodeCancelled {
-                    color,
-                    node: node_id,
-                    lane: lane_str,
-                    reason: cancel_reason.clone(),
-                    project_id: project_id.clone(),
-                })
-                .await;
-        }
-    }
+    // 3 + 4. Journal terminal events directly. Done in every path
+    // (live worker or not). The worker's own terminal-write path
+    // is idempotent and skips if these rows already exist.
+    journal_cancel_terminals(state, color).await?;
 
-    // 4. Journal cancellation. Also drops any straggler suspension
-    //    rows the loop above missed (e.g. tracker entry was lost
-    //    on dispatcher restart but the journal still has it).
-    state.journal.cancel(color).await?;
-
-    // Race guard: a SuspensionRequest could land in the WS handler
-    // between step 1's Cancel send and the worker observing it.
-    // Sweep again so a freshly-registered token doesn't orphan.
-    let stragglers = state
-        .journal
-        .signal_remove_for_color(color)
-        .await
-        .unwrap_or_default();
-    for meta in &stragglers {
-        if let Some(handle) = state.listeners.get(&meta.tenant_id) {
-            let _ = crate::listener::unregister_signal(&handle, &meta.token).await;
-        }
-        let _ = state.journal.consume_suspension(&meta.token).await;
-    }
-
-    // 4. Broadcast on the project's SSE bus.
-    if let Some(project_id) = project_id {
-        state
-            .events
-            .publish(DispatcherEvent::ExecutionFailed {
-                color,
-                project_id,
-                error: "cancelled".into(),
-            })
-            .await;
-    }
-
-    // 5. Drop the slot so a future wake on this color gets a
-    //    fresh slot rather than reaching the dead worker.
-    state.slots.drop_slot(color).await;
     Ok(())
 }
 
-pub async fn get(State(_state): State<DispatcherState>, Path(_color): Path<String>) -> Json<Value> {
-    // Phase B: execution status + cost aggregation.
-    Json(serde_json::json!({ "status": "unknown" }))
+/// Write NodeCancelled per non-terminal node + ExecutionCancelled
+/// directly from the dispatcher. Used when
+/// the worker isn't going to do it (suspended execution, no live
+/// worker, race window). Idempotent: skips entirely if the journal
+/// already shows a terminal for this color.
+async fn journal_cancel_terminals(state: &DispatcherState, color: Color) -> anyhow::Result<()> {
+    use weft_journal::ExecEvent;
+
+    if has_terminal_event(&state.pg_pool, color).await? {
+        tracing::info!(
+            target: "weft_dispatcher::cancel",
+            color = %color,
+            "terminal already journaled; skipping dispatcher-side write"
+        );
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Per-node cancellation MUST land before ExecutionCancelled.
+    // Otherwise a partial run that journaled the terminal event
+    // first would set has_terminal_event=true, and a retry would
+    // skip the per-node writes forever, leaving node UI states
+    // stuck on "running".
+    let events = state.journal.events_log(color).await?;
+    let snapshot = weft_journal::fold_to_snapshot(color, &events);
+    let mut wrote_node_count = 0usize;
+    for (node_id, execs) in &snapshot.executions {
+        for e in execs {
+            if e.status.is_terminal() {
+                continue;
+            }
+            let event = ExecEvent::NodeCancelled {
+                color,
+                node_id: node_id.clone(),
+                lane: e.lane.clone(),
+                reason: "Cancelled by user".to_string(),
+                at_unix: now,
+            };
+            state.journal.record_event(&event).await?;
+            wrote_node_count += 1;
+        }
+    }
+
+    let terminal = ExecEvent::ExecutionCancelled {
+        color,
+        reason: "Cancelled by user".to_string(),
+        at_unix: now,
+    };
+    state.journal.record_event(&terminal).await?;
+    tracing::info!(
+        target: "weft_dispatcher::cancel",
+        color = %color,
+        node_cancellations = wrote_node_count,
+        "journaled ExecutionCancelled"
+    );
+    Ok(())
+}
+
+async fn has_terminal_event(pool: &sqlx::PgPool, color: Color) -> anyhow::Result<bool> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT kind FROM exec_event \
+         WHERE color = $1 \
+           AND kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
+         LIMIT 1",
+    )
+    .bind(color.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+pub async fn get(
+    State(state): State<DispatcherState>,
+    Path(color_str): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let summary = state
+        .journal
+        .list_executions(1024)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .find(|s| s.color == color)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "color": summary.color.to_string(),
+        "project_id": summary.project_id,
+        "entry_node": summary.entry_node,
+        "status": summary.status,
+        "started_at": summary.started_at,
+        "completed_at": summary.completed_at,
+    })))
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +320,11 @@ pub async fn replay(
                 // summary doesn't carry one so we leave it empty.
                 error: String::new(),
             }),
+            "cancelled" => out.push(DispatcherEvent::ExecutionCancelled {
+                color,
+                project_id: project_id.clone(),
+                reason: "Cancelled by user".to_string(),
+            }),
             _ => {}
         }
     }
@@ -334,13 +360,6 @@ fn node_event_to_dispatcher(
             lane: e.lane,
             token: e.token.unwrap_or_default(),
             value: e.value.unwrap_or(serde_json::Value::Null),
-            project_id,
-        },
-        NodeExecKind::Retried => DispatcherEvent::NodeRetried {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            reason: e.reason.unwrap_or_default(),
             project_id,
         },
         NodeExecKind::Cancelled => DispatcherEvent::NodeCancelled {

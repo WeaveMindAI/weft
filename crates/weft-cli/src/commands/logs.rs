@@ -14,7 +14,7 @@ pub async fn run(ctx: Ctx, target: Option<String>) -> anyhow::Result<()> {
             anyhow::bail!("expected a UUID color; got '{other}'. Run with no arg for the cwd project's latest.")
         }
         None => {
-            let project_id = resolve_project_id(None)?;
+            let project_id = resolve_project_id(&ctx, None)?;
             let resp: serde_json::Value = ctx
                 .client()
                 .get_json(&format!("/projects/{project_id}/executions/latest"))

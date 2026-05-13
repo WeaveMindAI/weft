@@ -1,6 +1,7 @@
-//! `weft follow <target>`: subscribe to the dispatcher's SSE stream
-//! and render live events for a project id or a specific execution
-//! color.
+//! `weft follow <project>`: subscribe to the dispatcher's SSE stream
+//! for a project and render live events. The single-execution stream
+//! is reached via `weft run`'s internal call to `follow_color` after
+//! it kicks off a run; users don't address it directly.
 
 use anyhow::Context;
 use eventsource_client::Client;
@@ -8,33 +9,13 @@ use futures::StreamExt;
 
 use super::Ctx;
 
-pub async fn run(ctx: Ctx, target: String) -> anyhow::Result<()> {
+pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
     let client = ctx.client();
-    // Target is a project id if it doesn't parse as a color; follow
-    // either path on the dispatcher.
-    let is_color = uuid::Uuid::parse_str(&target).is_ok();
-    let _ = is_color;
-    follow_target(&client, &target).await
+    follow_sse(&client, &format!("/events/project/{project}")).await
 }
 
 pub async fn follow_color(client: &crate::client::DispatcherClient, color: &str) -> anyhow::Result<()> {
-    let path = format!("/events/execution/{color}");
-    follow_sse(client, &path).await
-}
-
-async fn follow_target(client: &crate::client::DispatcherClient, target: &str) -> anyhow::Result<()> {
-    let path = if uuid::Uuid::parse_str(target).is_ok() {
-        // Could be a project id OR a color; prefer execution stream
-        // only if the dispatcher has an active execution. Simplest
-        // rule: treat any valid uuid as a project id; users call
-        // `weft follow <color>` explicitly when they want the
-        // per-execution stream. (Future: dispatcher resolves the
-        // ambiguity.)
-        format!("/events/project/{target}")
-    } else {
-        format!("/events/project/{target}")
-    };
-    follow_sse(client, &path).await
+    follow_sse(client, &format!("/events/execution/{color}")).await
 }
 
 async fn follow_sse(client: &crate::client::DispatcherClient, path: &str) -> anyhow::Result<()> {

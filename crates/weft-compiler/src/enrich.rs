@@ -191,10 +191,8 @@ pub fn enrich_with_policy(
         // Passthrough is a real catalog entry, but its ports are
         // written by the compiler's group-flatten pass, not derived
         // from metadata. Skip port enrichment; let features through.
-        // entry_signals is empty by construction for passthroughs.
         if node.node_type == "Passthrough" {
             node.features = meta.features.clone();
-            node.entry_signals = Vec::new();
             continue;
         }
 
@@ -267,36 +265,6 @@ pub fn enrich_with_policy(
         node.features = meta.features.clone();
         node.requires_infra = meta.requires_infra;
         node.sidecar = meta.features.sidecar.clone();
-
-        // Resolve each declared entry signal's tag against the
-        // node's config. Each `WakeSignalKind` variant documents
-        // which config fields it expects; contract failures
-        // (missing field, bad type) become enrich errors tied to
-        // this node.
-        let config_map = match node.config.as_object() {
-            Some(obj) => obj.clone().into_iter().collect(),
-            None => std::collections::HashMap::new(),
-        };
-        let mut resolved_signals =
-            Vec::with_capacity(meta.entry_signals.len());
-        for tag in &meta.entry_signals {
-            match weft_core::primitive::WakeSignalKind::resolve_from_config(
-                tag.kind,
-                &config_map,
-            ) {
-                Ok(resolved) => resolved_signals.push(
-                    weft_core::primitive::WakeSignalSpec {
-                        kind: resolved,
-                        is_resume: tag.is_resume,
-                    },
-                ),
-                Err(e) => errors.push(format!(
-                    "node '{}' entry signal: {}",
-                    node.id, e.message
-                )),
-            }
-        }
-        node.entry_signals = resolved_signals;
     }
 
     if !errors.is_empty() {

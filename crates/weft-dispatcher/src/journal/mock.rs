@@ -7,23 +7,26 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::Color;
 
-use crate::journal::events::ExecEvent;
+use weft_journal::ExecEvent;
 use crate::journal::{
-    EntryKind, EntryTarget, ExecutionSummary, ExtToken, Journal, LogEntry, NodeExecEvent,
-    NodeExecKind, OpenSuspension, SignalRegistration, WakeTarget,
+    ApiToken, ExecutionSummary, Journal, LogEntry, NodeExecEvent, NodeExecKind, SignalRegistration,
 };
 
 #[derive(Default)]
 struct MockState {
     events: Vec<ExecEvent>,
-    suspensions: HashMap<String, (Color, String, Value, u64)>,
-    entry_tokens: HashMap<String, EntryTarget>,
-    ext_tokens: HashMap<String, (Option<String>, u64)>,
+    api_tokens: HashMap<String, ApiToken>,
     signals: HashMap<String, SignalRegistration>,
+    dedup_keys: std::collections::HashSet<String>,
+    /// Mirror of the Postgres `execution_color` denormalization:
+    /// seeded on `ExecutionStarted`, cleared on `delete_execution`.
+    /// Tests that exercise `list_non_terminal_colors_for_project`
+    /// or `delete_execution` cleanup paths depend on this matching
+    /// real-DB semantics.
+    execution_colors: HashMap<Color, String>,
 }
 
 #[derive(Default)]
@@ -37,17 +40,29 @@ impl MockJournal {
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[async_trait]
 impl Journal for MockJournal {
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
-        self.inner.lock().unwrap().events.push(event.clone());
+        let mut g = self.inner.lock().unwrap();
+        if let ExecEvent::ExecutionStarted { color, project_id, .. } = event {
+            g.execution_colors.entry(*color).or_insert_with(|| project_id.clone());
+        }
+        g.events.push(event.clone());
+        Ok(())
+    }
+
+    async fn record_event_dedup(
+        &self,
+        event: &ExecEvent,
+        dedup_key: &str,
+    ) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        if g.dedup_keys.insert(dedup_key.to_string()) {
+            if let ExecEvent::ExecutionStarted { color, project_id, .. } = event {
+                g.execution_colors.entry(*color).or_insert_with(|| project_id.clone());
+            }
+            g.events.push(event.clone());
+        }
         Ok(())
     }
 
@@ -63,133 +78,49 @@ impl Journal for MockJournal {
             .collect())
     }
 
-    async fn record_suspension_with_token(
-        &self,
-        token: &str,
-        color: Color,
-        node: &str,
-        metadata: Value,
-    ) -> anyhow::Result<()> {
-        self.inner.lock().unwrap().suspensions.insert(
-            token.to_string(),
-            (color, node.to_string(), metadata, now_unix()),
-        );
-        Ok(())
-    }
-
-    async fn resolve_wake(&self, token: &str) -> anyhow::Result<Option<WakeTarget>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .suspensions
-            .get(token)
-            .map(|(color, node, metadata, _)| WakeTarget {
-                color: *color,
-                node: node.clone(),
-                metadata: metadata.clone(),
-            }))
-    }
-
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool> {
-        Ok(self.inner.lock().unwrap().suspensions.remove(token).is_some())
-    }
-
-    async fn list_open_suspensions(&self) -> anyhow::Result<Vec<OpenSuspension>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .suspensions
-            .iter()
-            .map(|(token, (color, node, metadata, created_at))| OpenSuspension {
-                token: token.clone(),
-                color: *color,
-                node: node.clone(),
-                metadata: metadata.clone(),
-                created_at: *created_at,
-            })
-            .collect())
-    }
-
-    async fn mint_entry_token(
-        &self,
-        project_id: &str,
-        node_id: &str,
-        kind: EntryKind,
-        path: Option<&str>,
-        auth: Option<Value>,
-    ) -> anyhow::Result<String> {
-        let token = uuid::Uuid::new_v4().to_string();
-        self.inner.lock().unwrap().entry_tokens.insert(
-            token.clone(),
-            EntryTarget {
-                project_id: project_id.to_string(),
-                node_id: node_id.to_string(),
-                kind,
-                path: path.map(String::from),
-                auth,
-            },
-        );
-        Ok(token)
-    }
-
-    async fn resolve_entry_token(&self, token: &str) -> anyhow::Result<Option<EntryTarget>> {
-        Ok(self.inner.lock().unwrap().entry_tokens.get(token).cloned())
-    }
-
-    async fn drop_entry_tokens(&self, project_id: &str) -> anyhow::Result<()> {
+        // Mirror the postgres impl: drop the signal row for a
+        // single-use resume token. Entry-trigger rows stay.
         let mut g = self.inner.lock().unwrap();
-        g.entry_tokens.retain(|_, target| target.project_id != project_id);
-        Ok(())
+        match g.signals.get(token) {
+            Some(s) if s.is_resume => {
+                g.signals.remove(token);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
-    async fn mint_ext_token(
-        &self,
-        token: &str,
-        name: Option<&str>,
-        _metadata: Option<Value>,
-    ) -> anyhow::Result<()> {
+    async fn mint_api_token(&self, tok: &ApiToken) -> anyhow::Result<()> {
         self.inner
             .lock()
             .unwrap()
-            .ext_tokens
-            .insert(token.to_string(), (name.map(String::from), now_unix()));
+            .api_tokens
+            .insert(tok.token.clone(), tok.clone());
         Ok(())
     }
 
-    async fn ext_token_exists(&self, token: &str) -> anyhow::Result<bool> {
-        Ok(self.inner.lock().unwrap().ext_tokens.contains_key(token))
+    async fn get_api_token(&self, token: &str) -> anyhow::Result<Option<ApiToken>> {
+        Ok(self.inner.lock().unwrap().api_tokens.get(token).cloned())
     }
 
-    async fn list_ext_tokens(&self) -> anyhow::Result<Vec<ExtToken>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .ext_tokens
-            .iter()
-            .map(|(token, (name, created_at))| ExtToken {
-                token: token.clone(),
-                name: name.clone(),
-                created_at: *created_at,
-            })
-            .collect())
+    async fn list_api_tokens(&self) -> anyhow::Result<Vec<ApiToken>> {
+        Ok(self.inner.lock().unwrap().api_tokens.values().cloned().collect())
     }
 
-    async fn revoke_ext_token(&self, identifier: &str) -> anyhow::Result<bool> {
+    async fn revoke_api_token(&self, identifier: &str) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
         let keys: Vec<String> = g
-            .ext_tokens
+            .api_tokens
             .iter()
-            .filter(|(t, (name, _))| {
-                t.as_str() == identifier || name.as_deref() == Some(identifier)
+            .filter(|(t, tok)| {
+                t.as_str() == identifier || tok.name.as_deref() == Some(identifier)
             })
             .map(|(t, _)| t.clone())
             .collect();
         let removed = !keys.is_empty();
         for k in keys {
-            g.ext_tokens.remove(&k);
+            g.api_tokens.remove(&k);
         }
         Ok(removed)
     }
@@ -279,23 +210,6 @@ impl Journal for MockJournal {
                         at_unix: *at_unix,
                     })
                 }
-                ExecEvent::NodeRetried { color: c, node_id, lane, reason, at_unix }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
-                        kind: NodeExecKind::Retried,
-                        input: None,
-                        output: None,
-                        error: None,
-                        token: None,
-                        value: None,
-                        reason: Some(reason.clone()),
-                        at_unix: *at_unix,
-                    })
-                }
                 ExecEvent::NodeCancelled { color: c, node_id, lane, reason, at_unix }
                     if *c == color =>
                 {
@@ -377,7 +291,7 @@ impl Journal for MockJournal {
         let g = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for e in g.events.iter() {
-            if let ExecEvent::ExecutionStarted { color, project_id, entry_node, at_unix } = e {
+            if let ExecEvent::ExecutionStarted { color, project_id, entry_node, at_unix, .. } = e {
                 let mut status = "running".to_string();
                 let mut completed_at = None;
                 for tail in g.events.iter().filter(|e2| e2.color() == *color) {
@@ -390,8 +304,8 @@ impl Journal for MockJournal {
                             status = "failed".into();
                             completed_at = Some(*at_unix);
                         }
-                        ExecEvent::Stalled { at_unix, .. } => {
-                            status = "stalled".into();
+                        ExecEvent::ExecutionCancelled { at_unix, .. } => {
+                            status = "cancelled".into();
                             completed_at = Some(*at_unix);
                         }
                         _ => {}
@@ -411,21 +325,42 @@ impl Journal for MockJournal {
         Ok(out)
     }
 
+    async fn list_non_terminal_colors_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<Color>> {
+        // Read from `execution_colors` (mirror of Postgres
+        // `execution_color`) instead of scanning `events`. Keeps
+        // mock semantics aligned with the real DB: `delete_execution`
+        // clears the row so cleaned colors don't keep appearing as
+        // non-terminal.
+        let g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for (color, pid) in g.execution_colors.iter() {
+            if pid != project_id {
+                continue;
+            }
+            let terminal = g.events.iter().any(|e2| {
+                e2.color() == *color
+                    && matches!(
+                        e2,
+                        ExecEvent::ExecutionCompleted { .. }
+                            | ExecEvent::ExecutionFailed { .. }
+                            | ExecEvent::ExecutionCancelled { .. }
+                    )
+            });
+            if !terminal {
+                out.push(*color);
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         g.events.retain(|e| e.color() != color);
-        g.suspensions.retain(|_, (c, _, _, _)| *c != color);
-        Ok(())
-    }
-
-    async fn cancel(&self, color: Color) -> anyhow::Result<()> {
-        let mut g = self.inner.lock().unwrap();
-        g.suspensions.retain(|_, (c, _, _, _)| *c != color);
-        g.events.push(ExecEvent::ExecutionFailed {
-            color,
-            error: "cancelled".into(),
-            at_unix: now_unix(),
-        });
+        g.signals.retain(|_, s| s.color != Some(color));
+        g.execution_colors.remove(&color);
         Ok(())
     }
 
@@ -446,6 +381,20 @@ impl Journal for MockJournal {
         Ok(self.inner.lock().unwrap().signals.remove(token).is_some())
     }
 
+    async fn signal_remove_many(
+        &self,
+        tokens: &[String],
+    ) -> anyhow::Result<Vec<SignalRegistration>> {
+        let mut g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for t in tokens {
+            if let Some(sig) = g.signals.remove(t) {
+                out.push(sig);
+            }
+        }
+        Ok(out)
+    }
+
     async fn signal_list_for_project(
         &self,
         project_id: &str,
@@ -457,21 +406,6 @@ impl Journal for MockJournal {
             .signals
             .values()
             .filter(|s| s.project_id == project_id)
-            .cloned()
-            .collect())
-    }
-
-    async fn signal_list_for_tenant(
-        &self,
-        tenant_id: &str,
-    ) -> anyhow::Result<Vec<SignalRegistration>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .signals
-            .values()
-            .filter(|s| s.tenant_id == tenant_id)
             .cloned()
             .collect())
     }

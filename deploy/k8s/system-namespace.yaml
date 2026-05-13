@@ -4,3 +4,74 @@ metadata:
   name: weft-system
   labels:
     weft.dev/role: system
+    kubernetes.io/metadata.name: weft-system
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weft-system-default-deny
+  namespace: weft-system
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Dispatcher ingress. Allowed sources:
+#   - public ingress controller (CLI / extension / external webhooks)
+#   - intra-namespace (other dispatcher Pods, headless Service)
+# Tenant pods CANNOT reach the dispatcher: their NetworkPolicy denies
+# egress to weft-system.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dispatcher-ingress
+  namespace: weft-system
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-dispatcher
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 9999
+    - from:
+        - podSelector:
+            matchLabels:
+              app: weft-dispatcher
+      ports:
+        - protocol: TCP
+          port: 9999
+---
+# Dispatcher egress: god mode. The dispatcher is the control plane:
+# it reaches every tenant listener (admin POSTs to /register, /process,
+# etc), every tenant sidecar (endpoint resolution, health), every
+# external webhook target nodes spec, plus the kube-apiserver via
+# kubectl. Any rule that tries to enumerate "what the dispatcher
+# talks to" goes stale the moment a node author adds a new outbound
+# call from a kind impl on the dispatcher path. So: open egress for
+# the dispatcher specifically, lock it down for everything else in
+# weft-system via the baseline.
+#
+# The asymmetry with `dispatcher-ingress` (which IS tightly scoped)
+# is deliberate: ingress is the attack surface (anyone can try to
+# POST), egress is initiated by trusted code we already control.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dispatcher-egress
+  namespace: weft-system
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-dispatcher
+  policyTypes:
+    - Egress
+  egress:
+    - {}

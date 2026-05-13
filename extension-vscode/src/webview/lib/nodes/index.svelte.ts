@@ -1,5 +1,5 @@
 /**
- * Node Registry — VS Code extension build.
+ * Node Registry: VS Code extension build.
  *
  * v1's standalone dashboard ships one `.ts` file per node template
  * under this folder and auto-discovers them at build time. The VS
@@ -223,7 +223,6 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		icon: resolveIcon(entry.icon),
 		color: entry.color ?? '#71717a',
 		category: entry.category as NodeCategory,
-		tags: entry.tags ?? [],
 		fields: (entry.fields ?? []).map(flattenField),
 		defaultInputs: entry.inputs ?? [],
 		defaultOutputs: entry.outputs ?? [],

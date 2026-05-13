@@ -6,7 +6,10 @@ use clap::{Parser, Subcommand};
 
 mod client;
 mod commands;
+pub mod hash;
 pub mod images;
+pub mod progress;
+mod walk;
 
 #[derive(Debug, Parser)]
 #[command(name = "weft", version, about = "Weft CLI")]
@@ -18,6 +21,13 @@ struct Cli {
     /// `weft.toml` or `http://localhost:9999`.
     #[arg(long, env = "WEFT_DISPATCHER_URL", global = true)]
     dispatcher: Option<String>,
+
+    /// Emit JSON progress events to stdout (one object per line)
+    /// instead of human-readable output. Used by the VS Code
+    /// extension to drive its action bar from CLI output. Each
+    /// line is a {"phase": ..., "detail": ...} object.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -32,17 +42,67 @@ enum Cmd {
         #[arg(long)]
         detach: bool,
     },
-    /// Subscribe to the dispatcher's SSE stream for a project or a
-    /// specific execution color.
-    Follow { target: String },
+    /// Subscribe to the dispatcher's SSE stream for a project.
+    Follow { project: String },
     /// Cancel an execution by color.
     Stop { color: String },
     /// Activate a project. Without a project id, discovers the cwd
     /// project, compiles + registers it first, then activates.
-    Activate { project: Option<String> },
-    /// Deactivate a registered project (kill trigger URLs, cancel
-    /// pending suspensions).
-    Deactivate { project: Option<String> },
+    ///
+    /// `--reactivate-choice` is forwarded to the dispatcher when the
+    /// project is in hibernate/park: one of
+    /// `execute_parked_keep_suspended`, `keep_suspended_only`,
+    /// `wipe_all`. Without it the human-terminal prompt fires;
+    /// `--json` mode requires it explicitly when there is preserved
+    /// state.
+    Activate {
+        project: Option<String>,
+        #[arg(long = "reactivate-choice", value_name = "choice")]
+        reactivate_choice: Option<String>,
+    },
+    /// Deactivate a registered project. By default WIPEs (drops
+    /// signals + cancels suspended runs); pass `--mode hibernate`
+    /// or `--mode park` to preserve in-flight HumanQuery work
+    /// across the inactive window.
+    ///
+    /// `--running-policy` controls how in-flight executions are
+    /// handled: `wait` (default) leaves running executions to
+    /// drain, parking new fires meanwhile; `cancel` kills running
+    /// executions and flips the project straight to inactive.
+    Deactivate {
+        project: Option<String>,
+        /// Preservation mode: wipe | hibernate | park.
+        #[arg(long, value_name = "mode")]
+        mode: Option<String>,
+        /// Grace window in minutes (hibernate only). Submissions
+        /// after this window are refused. Defaults to 15 if omitted
+        /// when mode = hibernate; ignored otherwise.
+        #[arg(long, value_name = "minutes")]
+        grace: Option<u32>,
+        /// Running-execution policy: wait | cancel. Default: wait.
+        #[arg(long = "running-policy", value_name = "policy")]
+        running_policy: Option<String>,
+    },
+    /// Cancel an in-flight `activate` (status=Activating). Wipes
+    /// every signal row registered so far, cancels the
+    /// TriggerSetup color, flips the project to Inactive. 412 if
+    /// the project isn't Activating.
+    #[command(name = "cancel-activate")]
+    CancelActivate {
+        project: Option<String>,
+    },
+    /// Force-cancel running executions while a deactivate-with-wait
+    /// is draining. Idempotent: if the project isn't currently in
+    /// `deactivating`, this is a no-op.
+    #[command(name = "cancel-running")]
+    CancelRunning {
+        project: Option<String>,
+    },
+    /// Atomic deactivate-then-activate against a fresh worker image.
+    /// Used after editing the trigger or fire subgraph: drops live
+    /// signals, rebuilds if needed, re-registers everything against
+    /// the new binary in one shot.
+    Resync,
     /// List every project registered with the dispatcher.
     Ps,
     /// Remove a project at the level you ask for. No flags → the
@@ -152,10 +212,10 @@ enum Cmd {
 
 #[derive(Debug, Subcommand)]
 enum TokenAction {
-    /// Mint a new extension token. Default token shape is the
-    /// friendly `wm_tk_<adj>-<noun>-<NN>` (e.g. `wm_tk_swift-
-    /// falcon-23`); pass `--hard` for a uuid-backed token when
-    /// the dispatcher is exposed beyond localhost.
+    /// Mint a new API token. Tokens grant scoped access to the
+    /// dispatcher's signal enumeration surface. All scope flags
+    /// are optional; an unscoped token sees every signal in the
+    /// tenant.
     Mint {
         /// Optional human label, separate from the token itself.
         /// Shown by `weft token ls`. Defaults to the token's own
@@ -163,21 +223,36 @@ enum TokenAction {
         #[arg(long)]
         name: Option<String>,
         /// Use a high-entropy token (`wm_tk_<32-hex>`) instead of
-        /// the friendly default. Pick this when the dispatcher
-        /// isn't on localhost-only.
+        /// the friendly default.
         #[arg(long)]
         hard: bool,
+        /// Restrict to specific consumer kinds (e.g.
+        /// `--kinds human_in_the_loop`). Repeat to allow multiple.
+        /// Empty = any kind.
+        #[arg(long, value_name = "kind")]
+        kinds: Vec<String>,
+        /// Restrict to specific project ids. Repeat for multiple.
+        /// Empty = any project in the tenant.
+        #[arg(long, value_name = "uuid")]
+        projects: Vec<String>,
+        /// Restrict to signals carrying any of these tags. Repeat
+        /// for multiple. Empty = any tag (including untagged).
+        /// Tag charset: [A-Za-z0-9_-]{1,64}.
+        #[arg(long, value_name = "tag")]
+        tags: Vec<String>,
     },
-    /// List existing extension tokens.
+    /// List existing API tokens.
     Ls,
-    /// Revoke an extension token.
+    /// Revoke an API token.
     Revoke { token: String },
 }
 
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name, hard } => commands::token::TokenAction::Mint { name, hard },
+            TokenAction::Mint { name, hard, kinds, projects, tags } => {
+                commands::token::TokenAction::Mint { name, hard, kinds, projects, tags }
+            }
             TokenAction::Ls => commands::token::TokenAction::Ls,
             TokenAction::Revoke { token } => commands::token::TokenAction::Revoke { token },
         }
@@ -192,10 +267,28 @@ enum InfraAction {
     /// Scale sidecars to 0 replicas. PVC + Service stay so the
     /// next `start` resumes the same instance with its persisted
     /// state (auth, credentials, etc).
-    Stop,
+    Stop {
+        /// Skip the interactive prompt and answer it directly.
+        /// Required in --json mode (the extension already
+        /// confirmed in its own UI). On a TTY without this flag,
+        /// the CLI prompts.
+        #[arg(long, value_name = "true|false")]
+        deactivate_triggers: Option<bool>,
+    },
     /// Delete every k8s resource the sidecars own, PVC included.
     /// Irreversible: the next `start` is a fresh provision.
-    Terminate,
+    Terminate {
+        #[arg(long, value_name = "true|false")]
+        deactivate_triggers: Option<bool>,
+    },
+    /// Atomic stop + sidecar image rebuild + start. Used after
+    /// editing sidecar source: brings infra down, swaps the image
+    /// tags, runs InfraSetup again. Triggers are deactivated as
+    /// part of the stop step; reclick activate after.
+    Upgrade {
+        #[arg(long, value_name = "true|false")]
+        deactivate_triggers: Option<bool>,
+    },
     /// Print the current lifecycle state of each infra node.
     Status,
 }
@@ -240,13 +333,20 @@ enum DaemonAction {
     },
 }
 
-impl From<InfraAction> for commands::infra::InfraAction {
-    fn from(value: InfraAction) -> Self {
-        match value {
-            InfraAction::Start => commands::infra::InfraAction::Start,
-            InfraAction::Stop => commands::infra::InfraAction::Stop,
-            InfraAction::Terminate => commands::infra::InfraAction::Terminate,
-            InfraAction::Status => commands::infra::InfraAction::Status,
+impl InfraAction {
+    fn split(self) -> (commands::infra::InfraAction, commands::infra::DeactivateChoice) {
+        match self {
+            InfraAction::Start => (commands::infra::InfraAction::Start, None),
+            InfraAction::Stop { deactivate_triggers } => {
+                (commands::infra::InfraAction::Stop, deactivate_triggers)
+            }
+            InfraAction::Terminate { deactivate_triggers } => {
+                (commands::infra::InfraAction::Terminate, deactivate_triggers)
+            }
+            InfraAction::Upgrade { deactivate_triggers } => {
+                (commands::infra::InfraAction::Upgrade, deactivate_triggers)
+            }
+            InfraAction::Status => (commands::infra::InfraAction::Status, None),
         }
     }
 }
@@ -267,21 +367,37 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr so stdout stays a clean channel for
+    // machine-readable output (notably `--json`). The extension
+    // reads stdout-only and parses JSON; without this, tracing
+    // warnings prepend themselves and the parse explodes.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
-    let ctx = commands::Ctx { dispatcher: cli.dispatcher };
+    let ctx = commands::Ctx::new(cli.dispatcher, cli.json);
 
     match cli.command {
         Cmd::New { name } => commands::new::run(ctx, name).await,
         Cmd::Build => commands::build::run(ctx).await,
         Cmd::Run { detach } => commands::run::run(ctx, detach).await,
-        Cmd::Follow { target } => commands::follow::run(ctx, target).await,
+        Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,
-        Cmd::Activate { project } => commands::activate::run(ctx, project).await,
-        Cmd::Deactivate { project } => commands::deactivate::run(ctx, project).await,
+        Cmd::Activate { project, reactivate_choice } => {
+            commands::activate::run(ctx, project, reactivate_choice).await
+        }
+        Cmd::Deactivate { project, mode, grace, running_policy } => {
+            commands::deactivate::run(ctx, project, mode, grace, running_policy).await
+        }
+        Cmd::CancelActivate { project } => {
+            commands::cancel_activate::run(ctx, project).await
+        }
+        Cmd::CancelRunning { project } => {
+            commands::cancel_running::run(ctx, project).await
+        }
+        Cmd::Resync => commands::resync::run(ctx).await,
         Cmd::Ps => commands::ps::run(ctx).await,
         Cmd::Rm { project, infra, journal, image, local, all } => {
             commands::rm::run(
@@ -293,7 +409,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Logs { target } => commands::logs::run(ctx, target).await,
         Cmd::Status => commands::status::run(ctx).await,
         Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
-        Cmd::Infra { action } => commands::infra::run(ctx, action.into()).await,
+        Cmd::Infra { action } => {
+            let (verb, deactivate) = action.split();
+            commands::infra::run(ctx, verb, deactivate).await
+        }
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,

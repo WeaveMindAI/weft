@@ -3,9 +3,8 @@
 //!
 //!   - `Phase::TriggerSetup`: read the upstream bridge's
 //!     `endpointUrl`, compute the `/events` SSE URL, register an
-//!     SSE wake signal via `ctx.register_signal`. The listener
-//!     subscribes; the dispatcher receives `message.received`
-//!     events and fires fresh executions.
+//!     SSE signal. The listener subscribes; the dispatcher receives
+//!     `message.received` events and fires fresh executions.
 //!
 //!   - `Phase::Fire`: the event data seeded `__seed__`. Map the
 //!     WhatsApp-specific fields to output ports.
@@ -16,7 +15,7 @@ use serde_json::Value;
 use weft_core::context::Phase;
 use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{WakeSignalKind, WakeSignalSpec};
+use weft_core::signal::Sse;
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
 pub struct WhatsAppReceiveNode;
@@ -60,12 +59,9 @@ async fn register(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
     } else {
         format!("{}/events", base)
     };
-    ctx.register_signal(WakeSignalSpec {
-        kind: WakeSignalKind::Sse {
-            url: events_url,
-            event_name: "message.received".into(),
-        },
-        is_resume: false,
+    ctx.register_signal(Sse {
+        url: events_url,
+        event_name: "message.received".into(),
     })
     .await?;
     Ok(NodeOutput::empty())

@@ -7,7 +7,12 @@ members = [
     "crates/weft-cli",
     "crates/weft-engine",
     "crates/weft-catalog",
+    "crates/weft-journal",
     "crates/weft-listener",
+    "crates/weft-task-store",
+    "crates/weft-broker",
+    "crates/weft-broker-client",
+    "crates/weft-infra",
 ]
 
 [workspace.package]
@@ -46,10 +51,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # utils
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
 regex = "1"
+inventory = "0.3"
+url = "2"
+hmac = "0.12"
+sha2 = "0.10"
 
 # minillmlib: local path during development, crates.io for release
 minillmlib = { path = "../MiniLLMLibRS" }
@@ -60,3 +69,5 @@ weft-compiler = { path = "crates/weft-compiler" }
 weft-stdlib = { path = "crates/weft-stdlib" }
 weft-engine = { path = "crates/weft-engine" }
 weft-catalog = { path = "crates/weft-catalog" }
+weft-journal = { path = "crates/weft-journal" }
+weft-task-store = { path = "crates/weft-task-store" }

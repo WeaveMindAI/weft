@@ -26,7 +26,9 @@ extension-vscode/out/
 extension-vscode/.vscode-test/
 extension-vscode/*.vsix
 
-# Browser extension build artifacts
+# Browser extension build artifacts. The active extension's build
+# dir is gitignored at extension-browser/.gitignore (which selectively
+# tracks the unversioned zip + xpi).
 extension-browser-v1/web-ext-artifacts/*
 # NOTE: v1 archived folders (catalog-v1, crates-v1, dashboard-v1,
 # extension-browser-v1, sidecars-v1) are frozen reference. Their

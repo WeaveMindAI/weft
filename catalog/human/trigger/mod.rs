@@ -1,10 +1,10 @@
 //! HumanTrigger: starts an execution when a human submits a form.
 //! Two phases:
 //!
-//!   - `Phase::TriggerSetup`: build a Form wake signal from the
-//!     node's config and register it.
+//!   - `Phase::TriggerSetup`: build a Form signal from the node's
+//!     config and register it.
 //!
-//!   - `Phase::Fire`: the submission landed on `__seed__` as
+//!   - `Phase::Fire`: the submission lands on `__seed__` as
 //!     `{body: <submission>}`. Map the submitted values to output
 //!     ports per the form field definitions.
 
@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{FormSchema, WakeSignalKind, WakeSignalSpec};
+use weft_core::signal::{Form, FormSchema};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
 use super::form_helpers::{
@@ -52,10 +52,10 @@ impl Node for HumanTriggerNode {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                // Triggers don't have upstream input ports at
-                // setup time; pass an empty object so the helper
-                // doesn't try to project a value into prefilled
-                // / display fields.
+                // Triggers don't have upstream input ports at setup
+                // time; pass an empty object so the helper doesn't
+                // try to project a value into prefilled / display
+                // fields.
                 let empty_input = Value::Object(serde_json::Map::new());
                 let fields = build_form_fields(&raw_fields, specs, &empty_input);
                 let schema = FormSchema {
@@ -63,14 +63,14 @@ impl Node for HumanTriggerNode {
                     description: description.clone(),
                     fields,
                 };
-                ctx.register_signal(WakeSignalSpec {
-                    kind: WakeSignalKind::Form {
-                        form_type: "human-trigger".into(),
-                        schema,
-                        title: if title.is_empty() { None } else { Some(title) },
-                        description,
-                    },
-                    is_resume: false,
+                ctx.register_signal(Form {
+                    form_type: "human-trigger".into(),
+                    schema,
+                    title: if title.is_empty() { None } else { Some(title) },
+                    description,
+                    // Browser extension / human-in-the-loop
+                    // processors enumerate this consumer kind.
+                    consumer_kind: Some("human_in_the_loop".into()),
                 })
                 .await?;
                 Ok(NodeOutput::empty())

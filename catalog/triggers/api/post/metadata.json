@@ -19,15 +19,12 @@
       "description": "Optional route suffix appended under `/w/{token}/`. Leave empty for the bare token URL."
     },
     {
-      "key": "apiKey",
-      "label": "API Key",
-      "field_type": { "kind": "password" },
+      "key": "generateApiKey",
+      "label": "Require API key",
+      "field_type": { "kind": "checkbox" },
       "required": false,
-      "description": "Optional. If set, the incoming request must include this key in the X-API-Key header."
+      "description": "When on, the listener mints an API key at activation time and incoming requests must include it in the X-API-Key header. The plaintext is shown once on the node inspector; click Regenerate to mint a new one."
     }
-  ],
-  "entrySignals": [
-    { "kind": "webhook", "is_resume": false }
   ],
   "requires_infra": false,
   "features": {

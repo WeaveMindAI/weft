@@ -1,8 +1,7 @@
 //! The ops dashboard UI. A single-page HTML shell served from the
 //! dispatcher; fetches live state via the existing JSON endpoints
 //! and renders it in the browser. Deliberately minimal: ops only, no
-//! code editing. Phase B replaces the inlined HTML with a proper
-//! svelte/react build embedded via rust-embed.
+//! code editing.
 
 use axum::{
     extract::{Path, State},

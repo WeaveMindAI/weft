@@ -1,20 +1,20 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { fetchPendingTasks, dismissAction, cancelTask, clearAllTasks, clearTasksForExecution, getTokens, addToken, removeToken, type PendingTask, type ExtensionToken } from '../../lib/api';
+  import { fetchPendingTasks, skipTask, cancelRun, clearAll, getTokens, addToken, removeToken, type PendingTask, type ApiToken } from '../../lib/api';
 
   let allItems = $state<PendingTask[]>([]);
   let loading = $state(true);
   let connected = $state(false);
   let error = $state<string | null>(null);
   let selectedTask = $state<PendingTask | null>(null);
-  let selectedAction = $state<PendingTask | null>(null);
   let showSettings = $state(false);
-  let tokens = $state<ExtensionToken[]>([]);
-  
-  // Separate tasks, triggers, and actions
-  const tasks = $derived(allItems.filter(t => t.taskType === 'Task' || (!t.taskType && t.taskType !== 'Action' && t.taskType !== 'Trigger')));
-  const triggers = $derived(allItems.filter(t => t.taskType === 'Trigger'));
-  const actions = $derived(allItems.filter(t => t.taskType === 'Action'));
+  let tokens = $state<ApiToken[]>([]);
+
+  // Architecture-4: dispatcher returns one flat list; the listener
+  // shapes each entry per kind. The popup renders all of them as
+  // tasks. Future consumer kinds (browser session, etc) would
+  // render differently here based on `kind` / `consumerKind`.
+  const tasks = $derived(allItems);
   
   // New token form
   let newTokenUrl = $state('');
@@ -53,7 +53,6 @@
     loading = true;
     error = null;
     selectedTask = null;
-    selectedAction = null;
 
     try {
       tokens = await getTokens();
@@ -62,9 +61,6 @@
         allItems = [];
         return;
       }
-      // Single round-trip: fetch tasks AND infer connectivity from
-      // it. The previous version did a separate /health probe per
-      // token first which doubled the network cost on every refresh.
       const result = await fetchPendingTasks({ timeoutMs: 10000 });
       allItems = result.tasks;
       connected = result.anyReachable;
@@ -76,74 +72,55 @@
     }
   }
 
-  async function handleCancelTask(task: PendingTask) {
+  /// Skip = "I don't want to answer this one." Resume the lane
+  /// with null; the rest of the run keeps going.
+  async function handleSkipTask(task: PendingTask) {
     try {
-      await cancelTask(task as PendingTask & { _tokenConfig?: ExtensionToken });
+      await skipTask(task as PendingTask & { _tokenConfig?: ApiToken });
       selectedTask = null;
       await refresh();
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to cancel task';
+      error = e instanceof Error ? e.message : 'Failed to skip task';
     }
   }
 
+  /// Cancel = "kill this whole run." Drops every sibling task
+  /// of the same execution. Confirm before doing it because the
+  /// blast radius is bigger than the visible task.
+  async function handleCancelRun(task: PendingTask) {
+    if (!confirm('Cancel the entire run? Every related task will be dropped and the execution will be marked failed.')) {
+      return;
+    }
+    try {
+      await cancelRun(task as PendingTask & { _tokenConfig?: ApiToken });
+      selectedTask = null;
+      await refresh();
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to cancel run';
+    }
+  }
+
+  /// Clear all = cancel every run this token can see. Confirm
+  /// before doing it; the destructiveness scales with N runs.
   async function handleClearAll() {
-    // Bypass confirmation in browser extension context? Popups block window.confirm.
-    // Use a tiny custom state instead for now: one click removes everything.
-    try {
-      await clearAllTasks();
-      await refresh();
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to clear tasks';
-    }
-  }
-
-  /// Extract the execution UUID from a task's callback_id. The TaskRegistry
-  /// stores callback_id in the `executionId` field in one of three shapes:
-  ///   - WaitingForInput: "{execUuid(36)}-{nodeId}-{pulseUuid}-{seq}"
-  ///   - NotifyAction:    "{execUuid(36)}-{nodeId}-action"  (or overridden)
-  ///   - Trigger:         "trigger-{triggerId}"
-  /// Returns null for shapes where no clean execution UUID can be pulled out,
-  /// so the caller hides the "clear run" affordance instead of sending a
-  /// malformed request.
-  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  function extractExecutionUuid(task: PendingTask): string | null {
-    const prefix = task.executionId.slice(0, 36);
-    return UUID_RE.test(prefix) ? prefix : null;
-  }
-
-  async function handleClearForTask(task: PendingTask) {
-    const tokenConfig = (task as PendingTask & { _tokenConfig?: ExtensionToken })._tokenConfig;
-    if (!tokenConfig) {
-      error = 'Task missing token configuration';
-      return;
-    }
-    const execUuid = extractExecutionUuid(task);
-    if (!execUuid) {
-      error = 'This task does not belong to a runnable execution';
+    if (!confirm('Cancel every pending run this token sees? All related tasks will be dropped.')) {
       return;
     }
     try {
-      await clearTasksForExecution(tokenConfig, execUuid);
+      // Clear-all calls the per-token endpoint once per token.
+      // Each call cancels every distinct execution that token
+      // sees, so iterating across configured tokens covers
+      // everything.
+      for (const t of tokens) {
+        try {
+          await clearAll(t);
+        } catch (e) {
+          console.warn('[WeaveMind] clearAll failed for', t.name, e);
+        }
+      }
       await refresh();
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to clear tasks for this run';
-    }
-  }
-
-  async function handleDismissAction(action: PendingTask) {
-    // Dismiss action using dedicated endpoint (just removes from list)
-    try {
-      await dismissAction(action as PendingTask & { _tokenConfig?: ExtensionToken });
-      selectedAction = null;
-      await refresh();
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to dismiss action';
-    }
-  }
-
-  function openActionUrl(action: PendingTask) {
-    if (action.actionUrl) {
-      window.open(action.actionUrl, '_blank');
+      error = e instanceof Error ? e.message : 'Failed to clear all';
     }
   }
 
@@ -155,8 +132,10 @@
 
     try {
       // Accepted formats:
-      //   http://host:port/ext/TOKEN   (full dispatcher URL)
-      //   TOKEN                        (uses http://localhost:9999)
+      //   http://host:port/api-token/TOKEN/signals  (full URL from
+      //                                              `weft token mint`)
+      //   http://host:port/api-token/TOKEN          (variant)
+      //   TOKEN                                     (uses http://localhost:9999)
       let token: string;
       let dispatcherUrl: string;
 
@@ -164,18 +143,18 @@
         const url = new URL(newTokenUrl);
         dispatcherUrl = `${url.protocol}//${url.host}`;
         const pathParts = url.pathname.split('/').filter(Boolean);
-        const extIndex = pathParts.indexOf('ext');
-        if (extIndex >= 0 && pathParts[extIndex + 1]) {
-          token = pathParts[extIndex + 1];
+        const idx = pathParts.indexOf('api-token');
+        if (idx >= 0 && pathParts[idx + 1]) {
+          token = pathParts[idx + 1];
         } else {
-          throw new Error('Invalid URL format. Expected: http://localhost:9999/ext/TOKEN');
+          throw new Error('Invalid URL format. Expected: http://localhost:9999/api-token/TOKEN');
         }
       } else {
         token = newTokenUrl.trim();
         dispatcherUrl = 'http://localhost:9999';
       }
 
-      const response = await fetch(`${dispatcherUrl}/ext/${token}/health`, {
+      const response = await fetch(`${dispatcherUrl}/api-token/${token}/health`, {
         method: 'GET',
         signal: AbortSignal.timeout(5000),
       });
@@ -205,18 +184,6 @@
     await refresh();
   }
 
-  function formatTime(dateStr: string): string {
-    if (!dateStr) return '';
-    const date = new Date(dateStr);
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    
-    if (diff < 60000) return 'Just now';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-    return date.toLocaleDateString();
-  }
-
   // Smart data formatting helpers
   function getDataType(value: unknown): string {
     if (value === null) return 'null';
@@ -237,13 +204,10 @@
   }
 
   /// Open the task in the extension-hosted full-page runner. The
-  /// runner lives at `tasks.html` (declared in the manifest's
-  /// web_accessible_resources by WXT auto-detection) and renders
-  /// the form against the dispatcher directly. The hash carries
-  /// the executionId so the runner knows which task to focus
-  /// among the cross-token list it loads.
+  /// hash carries the signal token so the runner knows which task
+  /// to focus among the cross-token list it loads.
   function openTaskInRunner(task: PendingTask) {
-    const url = `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(task.executionId)}`;
+    const url = `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(task.token)}`;
     browser.tabs.create({ url });
   }
 </script>
@@ -417,7 +381,7 @@
           <button class="btn btn-secondary" onclick={refresh}>Retry</button>
         </div>
       </div>
-    {:else if tasks.length === 0 && triggers.length === 0 && actions.length === 0}
+    {:else if tasks.length === 0}
       <!-- Empty State -->
       <div class="card">
         <div class="card-header">
@@ -432,101 +396,63 @@
             </svg>
           </div>
           <p class="empty-title">No pending items</p>
-          <p class="hint">Tasks and actions from your projects will appear here</p>
+          <p class="hint">Tasks from your projects will appear here</p>
         </div>
       </div>
     {:else}
-      <!-- Tasks Section -->
-      {#if tasks.length > 0}
-        <div class="section-header">
-          <span class="section-title">Tasks</span>
-          <span class="section-count">{tasks.length}</span>
-          <button class="clear-all-btn" onclick={handleClearAll} title="Delete every pending task (use this to flush orphan requests from cancelled runs)">
-            Clear all
-          </button>
-        </div>
-        <div class="tasks-container">
-          {#each tasks as task}
-            <div class="task-card-wrapper">
-              <button class="task-card" onclick={() => openTaskInRunner(task)}>
-                <div class="task-card-header">
-                  <div class="task-dot"></div>
-                  <span class="task-title">{task.title}</span>
-                  <span class="task-time">{formatTime(task.createdAt)}</span>
-                </div>
-                {#if task.description}
-                  <p class="task-preview">{task.description}</p>
-                {/if}
-              </button>
-              {#if extractExecutionUuid(task)}
-                <button class="task-clear-run" onclick={() => handleClearForTask(task)} title="Clear every pending task for this run">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/>
-                  </svg>
-                </button>
-              {/if}
-              <button class="task-cancel" onclick={() => handleCancelTask(task)} title="Cancel task (skip downstream)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M18 6L6 18M6 6l12 12"/>
-                </svg>
-              </button>
-            </div>
-          {/each}
-        </div>
-      {/if}
-      
-      <!-- Triggers Section (persistent forms) -->
-      {#if triggers.length > 0}
-        <div class="section-header">
-          <span class="section-title">Triggers</span>
-          <span class="section-count">{triggers.length}</span>
-        </div>
-        <div class="tasks-container">
-          {#each triggers as trigger}
-            <button class="task-card trigger-card" onclick={() => openTaskInRunner(trigger)}>
+      <div class="section-header">
+        <span class="section-title">Tasks</span>
+        <span class="section-count">{tasks.length}</span>
+        <button
+          class="clear-all-btn"
+          onclick={handleClearAll}
+          title="Cancel every pending run this token sees. Drops every related task; runs are marked failed (still inspectable in the journal)."
+        >
+          Clear all
+        </button>
+      </div>
+      <div class="tasks-container">
+        {#each tasks as task}
+          <div class="task-card-wrapper">
+            <button class="task-card" onclick={() => openTaskInRunner(task)}>
               <div class="task-card-header">
-                <div class="trigger-dot"></div>
-                <span class="task-title">{trigger.title}</span>
+                <div class="task-dot"></div>
+                <span class="task-title">{task.title}</span>
               </div>
-              {#if trigger.description}
-                <p class="task-preview">{trigger.description}</p>
+              {#if task.description}
+                <p class="task-preview">{task.description}</p>
               {/if}
             </button>
-          {/each}
-        </div>
-      {/if}
-
-      <!-- Actions Section (URLs to open) -->
-      {#if actions.length > 0}
-        <div class="section-header">
-          <span class="section-title">Links</span>
-          <span class="section-count">{actions.length}</span>
-        </div>
-        <div class="tasks-container">
-          {#each actions as action}
-            <div class="action-card">
-              <div class="action-card-row">
-                <button class="action-link" onclick={() => { openActionUrl(action); handleDismissAction(action); }}>
-                  <span class="action-dot"></span>
-                  <span class="action-url">{action.actionUrl || 'Open link'}</span>
-                </button>
-                <button class="action-dismiss" onclick={() => handleDismissAction(action)} title="Dismiss">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M18 6L6 18M6 6l12 12"/>
-                  </svg>
-                </button>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
+            <button
+              class="task-skip"
+              onclick={() => handleSkipTask(task)}
+              title="Skip: answer this task with null. The rest of the run continues."
+              aria-label="Skip task"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="5 4 15 12 5 20"/><line x1="19" y1="5" x2="19" y2="19"/>
+              </svg>
+            </button>
+            <button
+              class="task-cancel"
+              onclick={() => handleCancelRun(task)}
+              title="Cancel run: kill this entire execution. Every related task is dropped and the run is marked failed (you can still inspect it in the journal)."
+              aria-label="Cancel run"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/>
+              </svg>
+            </button>
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 </div>
 
 <style>
   /* Browser popup chrome sizing. Scoped via `:global()` so it
-     lands in the popup's per-entry CSS chunk only — putting
+     lands in the popup's per-entry CSS chunk only; putting
      these rules in popup/index.html's inline <style> would let
      vite hoist them into the shared `app-*.css` and clamp the
      full-tab tasks page (which loads the same shared chunk) to
@@ -1040,7 +966,7 @@
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
   }
 
-  .task-clear-run,
+  .task-skip,
   .task-cancel {
     display: flex;
     align-items: center;
@@ -1049,24 +975,22 @@
     background: white;
     border: 1px solid #e4e4e7;
     border-left: none;
+    border-radius: 0;
     cursor: pointer;
     color: #a1a1aa;
     transition: all 0.15s;
     flex-shrink: 0;
   }
 
-  .task-clear-run {
-    border-radius: 0;
-  }
-
+  /* Cancel sits on the right edge: rounded right corner. */
   .task-cancel {
     border-radius: 0 8px 8px 0;
   }
 
-  .task-clear-run:hover {
-    background: #fff7ed;
-    color: #f59e0b;
-    border-color: #fed7aa;
+  .task-skip:hover {
+    background: #eff6ff;
+    color: #2563eb;
+    border-color: #bfdbfe;
   }
 
   .task-cancel:hover {
@@ -1077,78 +1001,20 @@
 
   .clear-all-btn {
     margin-left: auto;
+    padding: 3px 9px;
+    background: white;
+    border: 1px solid #e4e4e7;
+    border-radius: 4px;
+    color: #71717a;
     font-size: 11px;
-    padding: 4px 10px;
-    background: #fff7ed;
-    border: 1px solid #fed7aa;
-    border-radius: 6px;
-    color: #b45309;
     cursor: pointer;
-    font-weight: 500;
     transition: all 0.15s;
   }
 
   .clear-all-btn:hover {
-    background: #fef3c7;
-    border-color: #fcd34d;
-  }
-
-  .action-card {
-    background: white;
-    border: 1px solid #e4e4e7;
-    border-radius: 8px;
-    padding: 10px 12px;
-    text-align: left;
-    width: 100%;
-  }
-
-  .action-card-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .action-link {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: none;
-    border: none;
-    cursor: pointer;
-    text-align: left;
-    padding: 0;
-  }
-
-  .action-link:hover .action-url {
-    color: #18181b;
-    text-decoration: underline;
-  }
-
-  .action-url {
-    font-size: 11px;
-    color: #52525b;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 240px;
-  }
-
-  .action-dismiss {
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 4px;
-    color: #a1a1aa;
-    border-radius: 4px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .action-dismiss:hover {
-    background: #f4f4f5;
-    color: #71717a;
+    background: #fef2f2;
+    color: #ef4444;
+    border-color: #fecaca;
   }
 
   .task-card-header {
@@ -1165,27 +1031,6 @@
     flex-shrink: 0;
   }
 
-  .trigger-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #8b5cf6;
-    flex-shrink: 0;
-  }
-
-  .trigger-card {
-    border-radius: 8px;
-    border-left: 3px solid #8b5cf6;
-  }
-
-  .action-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #22c55e;
-    flex-shrink: 0;
-  }
-
   .task-title {
     font-size: 12px;
     font-weight: 500;
@@ -1194,12 +1039,6 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-
-  .task-time {
-    font-size: 10px;
-    color: #a1a1aa;
-    flex-shrink: 0;
   }
 
   .task-preview {

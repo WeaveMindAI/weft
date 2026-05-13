@@ -15,3 +15,5 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+inventory = { workspace = true }
+cron = "0.12"

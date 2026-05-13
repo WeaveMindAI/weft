@@ -11,10 +11,6 @@
 //! 5. `codegen::emit` produces rust source files that link the graph +
 //!    every referenced node (from stdlib + user `nodes/` + vendor).
 //! 6. `build::invoke_cargo` runs cargo to produce the binary.
-//!
-//! Phase A1 (scaffold) stubs these out. Phase A2 ports real logic from
-//! `crates-v1/weft-core/src/weft_compiler.rs` and
-//! `crates-v1/weft-nodes/src/enrich.rs`.
 
 pub mod project;
 pub mod weft_compiler;
@@ -121,7 +117,6 @@ fn empty_project(project_id: Uuid) -> ProjectDefinition {
         nodes: Vec::new(),
         edges: Vec::new(),
         groups: Vec::new(),
-        status: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

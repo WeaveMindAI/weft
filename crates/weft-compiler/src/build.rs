@@ -202,7 +202,11 @@ fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<
 /// `<weft>/crates/weft-compiler`. Runtime override via
 /// `WEFT_REPO_ROOT` (used by the dispatcher container where
 /// CARGO_MANIFEST_DIR is baked to a path that doesn't exist).
-fn resolve_weft_root() -> CompileResult<PathBuf> {
+///
+/// Public so the CLI's hash + docker-build paths share one
+/// resolution function. They all need the same answer: where on
+/// disk does the user have the weft workspace.
+pub fn resolve_weft_root() -> CompileResult<PathBuf> {
     if let Ok(p) = std::env::var("WEFT_REPO_ROOT") {
         return Ok(PathBuf::from(p));
     }

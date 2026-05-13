@@ -48,11 +48,6 @@
         "category": "Weft"
       },
       {
-        "command": "weft.openLoomView",
-        "title": "Open Runner View",
-        "category": "Weft"
-      },
-      {
         "command": "weft.runProject",
         "title": "Run Project",
         "category": "Weft",
@@ -99,12 +94,6 @@
         "title": "Refresh Executions",
         "category": "Weft",
         "icon": "$(refresh)"
-      },
-      {
-        "command": "weft.toggleTestMode",
-        "title": "Toggle Test Mode",
-        "category": "Weft",
-        "icon": "$(beaker)"
       }
     ],
     "views": {
@@ -116,11 +105,6 @@
         {
           "id": "weft.executions",
           "name": "Executions"
-        },
-        {
-          "id": "weft.inspector",
-          "name": "Inspector",
-          "type": "webview"
         }
       ]
     },

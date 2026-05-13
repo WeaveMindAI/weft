@@ -33,7 +33,6 @@
       "description": "Each field contributes inputs/outputs per its fieldType (see form_field_specs)."
     }
   ],
-  "entrySignals": [],
   "requires_infra": false,
   "features": {
     "hasFormSchema": true

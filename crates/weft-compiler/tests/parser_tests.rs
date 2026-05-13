@@ -1,6 +1,6 @@
 use weft_compiler::weft_compiler::*;
 use weft_core::weft_type::{WeftPrimitive, WeftType};
-use weft_core::{GroupBoundaryRole, LaneMode};
+use weft_core::LaneMode;
 
 #[test]
 fn test_basic_project() {
@@ -520,7 +520,7 @@ outer = Group(
   ) -> (
     output: String
   ) {
-    label: \"Inner\"
+    _label: \"Inner\"
     code: ```
 return {\"output\": \"hello\"}
     ```
@@ -664,7 +664,7 @@ grp = Group(
   ) -> (
     out: Dict[String, String]
   ) {
-    label: \"Metadata\"
+    _label: \"Metadata\"
   }
   pack_node.notes = self.notes
   pack_node.priority = self.priority
@@ -687,7 +687,7 @@ fn test_multiline_json_array_in_config() {
 # Description: Test
 
 review = HumanQuery {
-  label: "Test"
+  _label: "Test"
   fields: [{
     "fieldType":"display",
     "key":"name"
@@ -802,7 +802,7 @@ fn test_group_post_config_output_ports() {
 test = Group {
   # This is a test
 
-  inner = Debug { label: "X" }
+  inner = Debug { _label: "X" }
 } -> (testing: String)
 "#;
     let result = compile(source, uuid::Uuid::new_v4());
@@ -960,7 +960,7 @@ fn test_label_quoted() {
     let source = r#"
 # Project: Label
 node = ExecPython {
-    label: "My Worker Node"
+    _label: "My Worker Node"
     code: "return {}"
 }
 "#;
@@ -974,7 +974,7 @@ fn test_label_unquoted() {
     let source = r#"
 # Project: LabelBare
 node = ExecPython {
-    label: Worker
+    _label: Worker
     code: "return {}"
 }
 "#;
@@ -988,7 +988,7 @@ fn test_label_with_escapes() {
     let source = r#"
 # Project: LabelEsc
 node = ExecPython {
-    label: "Has \"quotes\" inside"
+    _label: "Has \"quotes\" inside"
     code: "return {}"
 }
 "#;
@@ -1001,7 +1001,7 @@ node = ExecPython {
 fn test_label_in_oneliner() {
     let source = r#"
 # Project: LabelOneLiner
-node = ExecPython { label: "Quick", code: "return {}" }
+node = ExecPython { _label: "Quick", code: "return {}" }
 "#;
     let result = compile(source, uuid::Uuid::new_v4()).expect("should compile");
     let node = &result.nodes[0];
@@ -1566,7 +1566,7 @@ processor = Group(raw: String) -> (clean: String) {
 processor.raw = input.value
 
 llm = Llm {
-    label: "Summarizer"
+    _label: "Summarizer"
     temperature: 0.5
     model: "gpt-4"
 }
@@ -1784,7 +1784,7 @@ fn post_config_outputs_one_liner() {
     let src = r#"# Project: Test
 # Description: test
 
-draft = LlmInference -> (response: JsonDict) { label: "Draft", parseJson: true } -> (subject: String, body: String)
+draft = LlmInference -> (response: JsonDict) { _label: "Draft", parseJson: true } -> (subject: String, body: String)
 out = Debug
 out.data = draft.subject
 "#;
@@ -1803,7 +1803,7 @@ fn post_config_outputs_multi_line() {
 # Description: test
 
 draft = LlmInference -> (response: JsonDict) {
-  label: "Draft"
+  _label: "Draft"
   parseJson: true
 } -> (subject: String, body: String)
 out = Debug
@@ -1822,8 +1822,8 @@ fn post_config_outputs_brace_arrow_same_line() {
     let src = r#"# Project: Test
 # Description: test
 
-qualify = LlmInference -> (response: JsonDict) { label: "Qualify Lead", parseJson: true } -> (is_promising: Boolean, reason: String, summary: String)
-draft = LlmInference -> (response: JsonDict) { label: "Draft Email", parseJson: true } -> (subject: String, body: String)
+qualify = LlmInference -> (response: JsonDict) { _label: "Qualify Lead", parseJson: true } -> (is_promising: Boolean, reason: String, summary: String)
+draft = LlmInference -> (response: JsonDict) { _label: "Draft Email", parseJson: true } -> (subject: String, body: String)
 out = Debug
 out.data = draft.subject
 "#;

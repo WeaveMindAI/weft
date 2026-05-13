@@ -1,4 +1,4 @@
-import { fetchPendingTasks, type PendingTask, type ExtensionToken } from '../lib/api';
+import { fetchPendingTasks, type PendingTask, type ApiToken } from '../lib/api';
 
 const POLL_INTERVAL_MS = 30000; // 30 seconds
 
@@ -44,12 +44,8 @@ export default defineBackground(() => {
 
   // Listen for messages from content scripts (toast clicks).
   browser.runtime.onMessage.addListener(
-    (message: { type: string; actionUrl?: string; url?: string }) => {
-      if (message.type === 'OPEN_AND_DISMISS_ACTION' && message.actionUrl) {
-        // Action toast: open the user's URL in a new tab. The
-        // dispatcher auto-expires the action from the task list.
-        browser.tabs.create({ url: message.actionUrl });
-      } else if (message.type === 'OPEN_TASK_RUNNER' && message.url) {
+    (message: { type: string; url?: string }) => {
+      if (message.type === 'OPEN_TASK_RUNNER' && message.url) {
         // Task toast: open the extension-hosted runner. Content
         // scripts can't navigate to chrome-extension:// URLs with
         // `window.open` from a web-origin so the toast delegates
@@ -75,15 +71,16 @@ async function pollForTasks() {
     }
     const tasks = result.tasks;
 
-    // Find tasks the user hasn't been notified about yet
-    const newTasks = tasks.filter(t => !seenTaskIds.has(t.executionId));
+    // Find tasks the user hasn't been notified about yet. Signal
+    // token uniquely identifies a task; we use it as the seen-key
+    // so re-fetches don't re-notify on the same task.
+    const newTasks = tasks.filter(t => !seenTaskIds.has(t.token));
 
     if (newTasks.length > 0) {
       await showNotification(newTasks.length, newTasks[0]);
     }
 
-    // Update seen IDs to current task list only (prune completed tasks automatically)
-    seenTaskIds = new Set(tasks.map(t => t.executionId));
+    seenTaskIds = new Set(tasks.map(t => t.token));
 
     // Update badge
     await updateBadge(tasks.length);
@@ -92,35 +89,26 @@ async function pollForTasks() {
   }
 }
 
-async function showNotification(count: number, task: PendingTask & { _tokenConfig?: ExtensionToken }) {
+async function showNotification(count: number, task: PendingTask & { _tokenConfig?: ApiToken }) {
   try {
-    // Check if notifications are enabled
     const settings = await getSettings();
     if (!settings.notificationsEnabled) {
       console.log('[WeaveMind] Notifications disabled, skipping');
       return;
     }
 
-    // Generate unique notification ID
-    const notificationId = `task-${task.executionId}-${Date.now()}`;
-    
-    // Build the runner URL. The extension-hosted full-page runner
-    // (entrypoints/tasks/*) lives at tasks.html in the bundle. The
-    // hash fragment carries the executionId so clicking the toast
-    // lands on the right task.
-    const taskUrl = `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(task.executionId)}`;
+    const notificationId = `task-${task.token}-${Date.now()}`;
+    // Hash fragment carries the signal token; the extension-hosted
+    // runner reads it to focus the right task.
+    const taskUrl = `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(task.token)}`;
 
-    // Send toast message to all tabs via content script
-    const isAction = task.taskType === 'Action';
     const toastData = {
       id: notificationId,
-      title: isAction ? 'WeaveMind' : 'WeaveMind Task',
-      message: count === 1 
-        ? (isAction ? `${task.title}` : `New task: ${task.title}`)
+      title: 'WeaveMind Task',
+      message: count === 1
+        ? `New task: ${task.title}`
         : `${count} new tasks waiting for your approval`,
-      taskUrl: isAction ? undefined : taskUrl,
-      actionUrl: isAction ? task.actionUrl : undefined,
-      taskType: task.taskType || 'Task',
+      taskUrl,
     };
 
     // Get all tabs and send message to each

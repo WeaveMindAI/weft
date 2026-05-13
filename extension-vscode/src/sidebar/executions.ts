@@ -111,7 +111,7 @@ export class ExecutionNode extends vscode.TreeItem {
       cancelled: '$(circle-slash)',
     }[summary.status.toLowerCase()] ?? '$(circle-outline)';
     const started = new Date(summary.started_at * 1000).toLocaleString();
-    super(`${statusIcon} ${summary.entry_node} — ${started}`, vscode.TreeItemCollapsibleState.None);
+    super(`${statusIcon} ${summary.entry_node} (${started})`, vscode.TreeItemCollapsibleState.None);
     this.id = summary.color;
     this.description = `${summary.status}${pinned ? '' : '  ·  other project'}`;
     this.tooltip = new vscode.MarkdownString(

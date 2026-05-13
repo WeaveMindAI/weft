@@ -15,7 +15,7 @@
 //      newest currently-running or most-recent completed exec.
 //
 // The controller owns the project-level SSE subscription. It has
-// no UI of its own — it tells the webview what to show via
+// no UI of its own; it tells the webview what to show via
 // `kind: followStatus` messages and defers the actual
 // execution-event stream to ExecutionFollower.
 
@@ -36,6 +36,12 @@ export interface FollowStatus {
 
 export type PostFn = (msg: HostMessage) => void;
 
+/// Fired on every project-SSE event that could change the
+/// dispatcher's `available_actions` list (executions starting /
+/// finishing, project status changes). The extension uses this to
+/// debounce-trigger a `weft status --json` refetch.
+export type ActionableEventHandler = (ev: DispatcherEvent) => void;
+
 export class AutoFollowController {
   private mode: FollowMode = 'latest';
   private color: string | undefined;
@@ -51,6 +57,11 @@ export class AutoFollowController {
     private readonly client: DispatcherClient,
     private readonly follower: ExecutionFollower,
     private readonly post: PostFn,
+    /// Notified on events that shift available_actions (start /
+    /// completion / failure). The extension debounces 500ms before
+    /// re-fetching status, so a flurry of node events during a run
+    /// doesn't hammer the dispatcher.
+    private readonly onActionable: ActionableEventHandler = () => {},
   ) {}
 
   /** Called when the extension pins a different project. Resets
@@ -158,6 +169,19 @@ export class AutoFollowController {
   }
 
   private onEvent(ev: DispatcherEvent): void {
+    // Anything that ends or starts an execution can shift the
+    // dispatcher's available_actions list, so route every such
+    // event to the actionable-event handler before the
+    // execution-following logic.
+    if (
+      ev.kind === 'execution_started' ||
+      ev.kind === 'execution_completed' ||
+      ev.kind === 'execution_failed' ||
+      ev.kind === 'execution_cancelled'
+    ) {
+      this.onActionable(ev);
+    }
+
     if (ev.kind !== 'execution_started') return;
     if (this.mode === 'latest') {
       // If we're already following this color (the run command

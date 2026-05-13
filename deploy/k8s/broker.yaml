@@ -1,0 +1,191 @@
+---
+# weft-broker. The trusted proxy that fronts Postgres for tenant
+# pods. Validates each request's projected SA token via TokenReview,
+# resolves it to a (tenant, role), and runs a per-endpoint scope
+# check before delegating to Postgres.
+#
+# RBAC posture: TokenReview only, cluster-wide. The broker has no
+# pod / service / deployment access. It does NOT mutate cluster
+# resources; only kube-apiserver mints SA tokens, the broker just
+# verifies them.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weft-broker-sa
+  namespace: weft-db
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: weft-broker-tokenreview
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: weft-broker-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: weft-broker-sa
+    namespace: weft-db
+roleRef:
+  kind: ClusterRole
+  name: weft-broker-tokenreview
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-broker
+  namespace: weft-db
+  labels:
+    app: weft-broker
+    weft.dev/role: broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weft-broker
+  template:
+    metadata:
+      labels:
+        app: weft-broker
+        weft.dev/role: broker
+    spec:
+      serviceAccountName: weft-broker-sa
+      containers:
+        - name: broker
+          image: weft-broker:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9090
+              name: http
+          env:
+            - name: WEFT_BROKER_PORT
+              value: "9090"
+            - name: WEFT_BROKER_AUDIENCE
+              value: "weft-broker"
+            - name: WEFT_TENANT_NS_PREFIX
+              value: "wm-"
+            - name: WEFT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: weft-postgres-credentials
+                  key: WEFT_DATABASE_URL
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-broker
+  namespace: weft-db
+  labels:
+    app: weft-broker
+spec:
+  selector:
+    app: weft-broker
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+---
+# Broker ingress: tenant namespaces (anything labeled
+# `weft.dev/role=tenant`) may call the broker on :9090. Block
+# everything else, including the dispatcher (which goes direct to
+# Postgres).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weft-broker-ingress
+  namespace: weft-db
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-broker
+  policyTypes:
+    - Ingress
+  ingress:
+    # AND of namespace-label and pod-label: only worker / listener
+    # pods in tenant namespaces. Sidecars are user-defined code and
+    # have no business calling the broker; if a sidecar later needs
+    # DB-fronting, it gets its own role and a separate allow rule.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              weft.dev/role: tenant
+          podSelector:
+            matchExpressions:
+              - key: weft.dev/role
+                operator: In
+                values: [worker, listener]
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# Broker egress: only Postgres (intra-ns), DNS, and kube-apiserver
+# (TokenReview). Cannot reach the dispatcher namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weft-broker-egress
+  namespace: weft-db
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-broker
+  policyTypes:
+    - Egress
+  egress:
+    # Intra-namespace Postgres.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: weft-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # kube-apiserver (TokenReview).
+    #
+    # The apiserver doesn't live in a Pod we can pod-select; the
+    # only reliable selector is its ClusterIP via ipBlock. The
+    # cluster Service CIDR is operator-defined: kind's default is
+    # 10.96.0.0/12 (apiserver lives at 10.96.0.1). For other
+    # distros, replace this CIDR via the `setup.sh` install path
+    # (which substitutes ${WEFT_APISERVER_CIDR} at apply time).
+    #
+    # Refusing to allow internet egress here is the whole point: a
+    # compromised broker (RCE in a handler) cannot reach external
+    # services with the SA token, and only TokenReview is a
+    # legitimate destination.
+    - to:
+        - ipBlock:
+            cidr: 10.96.0.0/12
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443

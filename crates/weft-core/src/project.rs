@@ -1,12 +1,8 @@
 //! Graph-level project types. Describes a weft program as a graph:
 //! nodes (instances of a node type), edges (connections between port
 //! refs). Port and field shapes live on the node TYPE (NodeMetadata),
-//! not on the instance.
-//!
-//! Ported from `crates-v1/weft-core/src/project.rs` and simplified for
-//! v2: no more `NodeFeatures` (entry primitives replace
-//! isTrigger/triggerCategory/requiresRunningInstance), no more ts_rs
-//! bindings (VS Code extension reads metadata.json directly).
+//! not on the instance. `NodeFeatures` is preserved on each node (the
+//! v1 `triggerCategory` field was the only thing dropped).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,14 +10,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::weft_type::WeftType;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub enum ProjectStatus {
-    #[default]
-    Draft,
-    Active,
-    Inactive,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
@@ -38,8 +26,6 @@ pub struct ProjectDefinition {
     /// them from the flat layout.
     #[serde(default)]
     pub groups: Vec<GroupDefinition>,
-    #[serde(default)]
-    pub status: ProjectStatus,
     #[serde(rename = "createdAt", default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(rename = "updatedAt", default = "Utc::now")]
@@ -134,12 +120,6 @@ pub struct NodeDefinition {
     /// need a registry lookup per node.
     #[serde(default)]
     pub features: crate::node::NodeFeatures,
-    /// Entry-use wake signals this node declares (Webhook, Cron,
-    /// Form, Socket). Mirrored from NodeMetadata at enrich time so
-    /// the dispatcher can register signals without re-looking-up the
-    /// catalog at activation time.
-    #[serde(default, rename = "entrySignals", alias = "entry")]
-    pub entry_signals: Vec<crate::primitive::WakeSignalSpec>,
     /// `true` if this node requires a sidecar-backed infra
     /// instance. Mirrored from NodeMetadata so the dispatcher can
     /// drive `weft infra up/down` without a catalog lookup.
@@ -171,8 +151,8 @@ fn default_config() -> Value {
 }
 
 impl NodeDefinition {
-    /// Resolved `is_output` for this node instance. Reads
-    /// `config.is_output` (explicit author override) if set, else
+    /// Resolved `_is_output` for this node instance. Reads
+    /// `config._is_output` (explicit author override) if set, else
     /// falls back to `features.is_output_default` (node-type default).
     ///
     /// Load-bearing: the dispatcher collects every `is_output()` node
@@ -180,10 +160,26 @@ impl NodeDefinition {
     /// 3.0). Flipping this bit changes what the runtime considers a
     /// "production target" of a run.
     pub fn is_output(&self) -> bool {
-        if let Some(v) = self.config.get("is_output").and_then(|v| v.as_bool()) {
+        if let Some(v) = self.config.get("_is_output").and_then(|v| v.as_bool()) {
             return v;
         }
         self.features.is_output_default
+    }
+
+    /// Tags from `_tags` config. Used for token-scoped enumeration
+    /// (a token with `allowed_tags` only sees signals tagged with
+    /// at least one of those tags). Validated at parse time:
+    /// each tag matches `[A-Za-z0-9_-]{1,64}`.
+    pub fn tags(&self) -> Vec<String> {
+        self.config
+            .get("_tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -266,33 +262,6 @@ pub struct Edge {
     /// Used by tooling to remove or rewrite the edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<Span>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectExecution {
-    pub id: Uuid,
-    #[serde(rename = "projectId")]
-    pub project_id: Uuid,
-    pub status: ExecutionStatus,
-    #[serde(rename = "startedAt")]
-    pub started_at: DateTime<Utc>,
-    #[serde(rename = "completedAt")]
-    pub completed_at: Option<DateTime<Utc>>,
-    #[serde(rename = "currentNode")]
-    pub current_node: Option<String>,
-    pub state: Value,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ExecutionStatus {
-    Pending,
-    Running,
-    WaitingForInput,
-    Paused,
-    Completed,
-    Failed,
-    Cancelled,
 }
 
 /// Pre-indexed edge lookups. Build once per compiled project, use

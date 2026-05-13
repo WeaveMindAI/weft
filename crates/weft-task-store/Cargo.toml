@@ -1,0 +1,18 @@
+[package]
+name = "weft-task-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid"] }
+tokio = { workspace = true }
+tokio-util = { version = "0.7" }
+tracing = { workspace = true }
+uuid = { workspace = true }

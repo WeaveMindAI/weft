@@ -1,24 +1,13 @@
-//! The weft execution engine. Linked into each compiled project
-//! binary. Exposes one entry point: [`run`]. The binary's `main`
-//! parses a `WakeSpec` from CLI args, hands it to `run`, and exits
-//! when `run` returns.
-//!
-//! Phase A slice 0: the engine is the former `weft-runner` library
-//! minus CLI concerns, minus the single-entry hack, with the
-//! suspension path expressed in terms of [`WakeSignalSpec`] instead
-//! of the old await_form/await_timer/await_callback trio.
-//!
-//! Later slices (3+) will replace the HTTP dispatcher client with a
-//! WebSocket client and wire real stall+snapshot + await_signal
-//! round-trips.
+//! Weft execution engine, linked into each compiled project binary.
+//! Connects to the broker, folds the journal, drives the pulse loop,
+//! writes journal events through the broker. All control-plane
+//! round-trips (`await_signal`, `register_signal`,
+//! `provision_sidecar`) flow through the dispatcher's task queue
+//! (also via the broker).
 
 pub mod context;
-pub mod dispatcher_link;
-pub mod loop_driver;
+pub(crate) mod loop_driver;
+pub mod run_pod;
 
-pub use context::{
-    ship_node_completed, ship_node_failed, ship_node_resumed, ship_node_skipped,
-    ship_node_started, ship_node_suspended, ship_pulse_mutations, RunnerHandle,
-};
-pub use dispatcher_link::{DispatcherLink, StartPacket};
-pub use loop_driver::{run_loop, run_with_link, LoopOutcome, RootSeed, WakeSpec};
+pub use context::EngineClients;
+pub use run_pod::run_pod;

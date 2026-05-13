@@ -58,7 +58,7 @@ export function getStatusIcon(status: string): string {
 }
 
 /// Override color for status badges so suspended/waiting reads
-/// "frozen / parked" (cyan) — distinct from running (the node's
+/// "frozen / parked" (cyan), distinct from running (the node's
 /// own color) and from completed/failed which carry semantic
 /// glyph coloring elsewhere. Returns `undefined` for statuses
 /// that should keep the node's own color.

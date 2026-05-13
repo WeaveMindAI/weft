@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use weft_core::node::FormFieldSpec;
 use weft_core::node::FormFieldPort;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::FormField;
+use weft_core::signal::FormField;
 
 /// Embedded copy of `form_field_specs.json` shared by HumanQuery
 /// and HumanTrigger. Parsed once on first access. The catalog
@@ -93,7 +93,7 @@ pub fn build_form_fields(
                 None => {
                     tracing::warn!(
                         target: "weft::human",
-                        "unknown fieldType '{field_type}' for field '{key}' — dropping"
+                        "unknown fieldType '{field_type}' for field '{key}'; dropping"
                     );
                     return None;
                 }
@@ -154,7 +154,7 @@ fn render_needs_input(render: &Value) -> bool {
 }
 
 /// Map the form response onto output ports declared by the node's
-/// specs. Driven entirely by `adds_outputs` in the spec — no
+/// specs. Driven entirely by `adds_outputs` in the spec; no
 /// per-field-type knowledge here.
 ///
 /// Conventions a spec author should follow:

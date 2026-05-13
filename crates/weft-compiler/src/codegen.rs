@@ -94,7 +94,6 @@ fn group_by_package<'a>(
     catalog: &'a FsCatalog,
     referenced: &BTreeSet<String>,
 ) -> CompileResult<Vec<PackageEmit<'a>>> {
-    use std::collections::BTreeMap;
     let mut by_key: BTreeMap<std::path::PathBuf, Vec<String>> = BTreeMap::new();
     for node_type in referenced {
         let Some(pkg) = catalog.package_of(node_type) else {
@@ -176,6 +175,11 @@ fn write_cargo_toml(
         &mut merged,
         "weft-core",
         toml::Value::Table(path_table("../weft/crates/weft-core")),
+    );
+    insert_dep(
+        &mut merged,
+        "weft-broker-client",
+        toml::Value::Table(path_table("../weft/crates/weft-broker-client")),
     );
     insert_dep(
         &mut merged,
@@ -551,20 +555,21 @@ fn write_main_rs(src_dir: &Path, packages: &[PackageEmit<'_>]) -> CompileResult<
         pkg_mods.push_str(&format!("mod {};\n", pkg.module_ident));
     }
     let contents = format!(
-        r#"//! Project worker binary. Spawned by the dispatcher per execution.
-//!
-//! Connects to `${{dispatcher}}/ws/executions/{{color}}` over WebSocket,
-//! handshakes, receives the Start packet (wake + optional snapshot +
-//! queued deliveries), drives the pulse loop, reports terminal state
-//! (or stalls with a snapshot) over the same socket.
+        r#"//! Project worker binary. Spawned by the dispatcher as part of
+//! a per-project pool. Claims `target=worker` tasks for its own
+//! `project_id` and runs each as a tokio task in-process. Idle-shuts
+//! itself down after a grace window with no pending work.
 
 use std::sync::Arc;
 
-use anyhow::Context;
 use clap::Parser;
-use tokio::sync::Notify;
 
+use weft_broker_client::{{
+    BrokerInfraClient, BrokerJournalClient, BrokerTaskStoreClient, BrokerWorkerPodClient,
+    TokenSource,
+}};
 use weft_core::NodeCatalog;
+use weft_engine::EngineClients;
 
 mod project;
 mod registry;
@@ -572,15 +577,46 @@ mod registry;
 #[derive(Debug, Parser)]
 #[command(name = "weft-project-worker", version)]
 struct Args {{
-    /// Color for this execution (mandatory in Slice 3+; dispatcher
-    /// always provides it).
-    #[arg(long)]
-    color: String,
+    /// Project id this Pod serves. Worker only claims tasks scoped to
+    /// this project.
+    #[arg(long, env = "WEFT_PROJECT_ID")]
+    project_id: String,
 
-    /// Dispatcher base URL. The worker upgrades `${{dispatcher}}` to
-    /// `ws://` or `wss://` and connects to `/ws/executions/{{color}}`.
-    #[arg(long, env = "WEFT_DISPATCHER_URL")]
-    dispatcher: String,
+    /// Broker base URL. The worker never touches Postgres directly;
+    /// every journal write, task enqueue/claim, worker_pod heartbeat,
+    /// and infra read flows through the broker, which validates the
+    /// projected SA token at WEFT_BROKER_TOKEN_PATH and runs a
+    /// per-tenant scope check.
+    #[arg(long, env = "WEFT_BROKER_URL")]
+    broker_url: String,
+
+    /// Filesystem path to the kubelet-projected SA token. The broker
+    /// validates this token via TokenReview on every call.
+    #[arg(long, env = "WEFT_BROKER_TOKEN_PATH", default_value = "/var/run/weft/sa/token")]
+    broker_token_path: String,
+
+    /// k8s Pod name (injected via downward API). Stamped on every
+    /// journal write; the fencing trigger uses it to detect zombies.
+    #[arg(long, env = "WEFT_POD_NAME")]
+    pod_name: String,
+
+    /// k8s namespace this Pod runs in. Recorded on the worker_pod
+    /// row so the dispatcher's reaper can `kubectl delete` against
+    /// the right namespace.
+    #[arg(long, env = "WEFT_NAMESPACE")]
+    namespace: String,
+
+    /// Identifier of the dispatcher Pod that spawned us. Recorded on
+    /// the worker_pod row for ops traceability.
+    #[arg(long, env = "WEFT_OWNER_DISPATCHER", default_value = "unknown")]
+    owner_dispatcher: String,
+
+    /// Tenant this worker belongs to. Stamped on every task this
+    /// worker enqueues so the dispatcher's listener reaper can tell
+    /// "this tenant has work mid-flight" from "this listener is
+    /// genuinely idle." Without it, the reaper races register flows.
+    #[arg(long, env = "WEFT_TENANT_ID")]
+    tenant_id: String,
 }}
 
 #[tokio::main]
@@ -593,36 +629,34 @@ async fn main() -> anyhow::Result<()> {{
         .init();
 
     let args = Args::parse();
-    let color: uuid::Uuid = args.color.parse().context("color uuid")?;
+
+    let token = TokenSource::new(std::path::PathBuf::from(&args.broker_token_path));
+    let journal = BrokerJournalClient::new(args.broker_url.clone(), token.clone());
+    let tasks = BrokerTaskStoreClient::new(args.broker_url.clone(), token.clone());
+    let worker_pods = BrokerWorkerPodClient::new(args.broker_url.clone(), token.clone());
+    let infra = BrokerInfraClient::new(args.broker_url.clone(), token.clone());
+
+    let clients = EngineClients {{
+        journal,
+        tasks,
+        infra,
+    }};
 
     let project = project::project().clone();
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;
-    let cancellation = Arc::new(Notify::new());
 
-    let outcome = weft_engine::run_with_link(
+    weft_engine::run_pod(
         project,
         catalog,
-        color,
-        &args.dispatcher,
-        cancellation,
+        clients,
+        worker_pods,
+        args.pod_name,
+        args.project_id,
+        args.tenant_id,
     )
     .await?;
 
-    match outcome {{
-        weft_engine::LoopOutcome::Completed {{ outputs }} => {{
-            tracing::info!(target: "weft_project_worker", "completed: {{outputs}}");
-        }}
-        weft_engine::LoopOutcome::Failed {{ error }} => {{
-            tracing::error!(target: "weft_project_worker", "failed: {{error}}");
-        }}
-        weft_engine::LoopOutcome::Stalled => {{
-            tracing::info!(target: "weft_project_worker", "stalled: snapshot shipped");
-        }}
-        weft_engine::LoopOutcome::Stuck => {{
-            tracing::warn!(target: "weft_project_worker", "stuck: pending pulses with no ready nodes");
-        }}
-    }}
-
+    tracing::info!(target: "weft_project_worker", "pod exit");
     Ok(())
 }}
 

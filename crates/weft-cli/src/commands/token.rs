@@ -1,53 +1,61 @@
-//! Extension token management. These are the opaque tokens users
-//! paste into the browser extension to grant it access to the
-//! dispatcher's pending-task queue.
+//! API token management. Tokens grant scoped access to the
+//! dispatcher's signal enumeration surface (`GET /api-token/{tk}/
+//! signals`). Each token carries three independent scope vectors;
+//! empty vector = wildcard for that dimension.
+//!
+//! Tokens are general (not tied to one consumer kind). The browser
+//! extension picks the `human_in_the_loop` scope at install time;
+//! a future Slack bot would pick its own kind. Same dispatcher
+//! surface either way.
 
 use super::Ctx;
 
 pub enum TokenAction {
-    Mint { name: Option<String>, hard: bool },
+    Mint {
+        name: Option<String>,
+        hard: bool,
+        kinds: Vec<String>,
+        projects: Vec<String>,
+        tags: Vec<String>,
+    },
     Ls,
-    Revoke { token: String },
+    Revoke {
+        token: String,
+    },
 }
 
 pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
     let client = ctx.client();
     match action {
-        TokenAction::Mint { name, hard } => {
+        TokenAction::Mint { name, hard, kinds, projects, tags } => {
             let style = if hard { "hard" } else { "friendly" };
             let body = serde_json::json!({
                 "name": name,
                 "metadata": null,
                 "style": style,
+                "allowedKinds": kinds,
+                "allowedProjects": projects,
+                "allowedTags": tags,
             });
-            let resp: serde_json::Value = client.post_json("/ext-tokens", &body).await?;
+            let resp: serde_json::Value = client.post_json("/api-tokens", &body).await?;
             let token = resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
             let final_name = resp.get("name").and_then(|v| v.as_str()).unwrap_or("");
             println!("{token}");
             if !final_name.is_empty() && final_name != token.strip_prefix("wm_tk_").unwrap_or("") {
                 eprintln!("Name: {final_name}");
             }
-            eprintln!("Paste into the browser extension as:");
-            eprintln!("  {}/ext/{token}", client.base());
+            print_scope_summary(&resp);
+            eprintln!("Use this URL to enumerate this token's signals:");
+            eprintln!("  {}/api-token/{token}/signals", client.base());
             Ok(())
         }
         TokenAction::Ls => {
-            let resp: serde_json::Value = client.get_json("/ext-tokens").await?;
+            let resp: serde_json::Value = client.get_json("/api-tokens").await?;
             let arr = resp.as_array().cloned().unwrap_or_default();
             if arr.is_empty() {
                 println!("(no tokens)");
                 return Ok(());
             }
-            // Three-line layout per entry:
-            //   <token>          ← the actual identifier
-            //   name: <label>    ← the human label, when set
-            //     <paste URL>    ← copy-paste target for the
-            //                      browser extension
-            // The token comes first because it's the canonical
-            // identifier; revoke also accepts the name. The
-            // previous layout printed the name as if it were the
-            // token, which broke `revoke` for users who copied
-            // the displayed string.
             let base = client.base();
             let mut first = true;
             for t in arr {
@@ -61,16 +69,42 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 if !name.is_empty() && name != token.strip_prefix("wm_tk_").unwrap_or("") {
                     println!("  name: {name}");
                 }
-                println!("  {base}/ext/{token}");
+                print_scope_summary(&t);
+                println!("  {base}/api-token/{token}/signals");
             }
             Ok(())
         }
         TokenAction::Revoke { token } => {
-            // The dispatcher accepts either the token string or
-            // the human label and returns 404 if nothing matched.
-            client.delete(&format!("/ext-tokens/{token}")).await?;
+            client.delete(&format!("/api-tokens/{token}")).await?;
             println!("revoked: {token}");
             Ok(())
         }
+    }
+}
+
+/// Pretty-print the scope vectors. Empty vector renders as
+/// "(any)" so the user can tell a wildcard from a missing field.
+fn print_scope_summary(t: &serde_json::Value) {
+    let kinds = arr_or_any(t.get("allowedKinds"));
+    let projects = arr_or_any(t.get("allowedProjects"));
+    let tags = arr_or_any(t.get("allowedTags"));
+    eprintln!("  scope:");
+    eprintln!("    kinds:    {kinds}");
+    eprintln!("    projects: {projects}");
+    eprintln!("    tags:     {tags}");
+}
+
+fn arr_or_any(v: Option<&serde_json::Value>) -> String {
+    let arr = v.and_then(|x| x.as_array());
+    match arr {
+        Some(a) if a.is_empty() => "(any)".into(),
+        Some(a) => {
+            let xs: Vec<String> = a
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
+            xs.join(", ")
+        }
+        None => "(any)".into(),
     }
 }

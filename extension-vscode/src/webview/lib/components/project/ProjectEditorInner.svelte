@@ -11,13 +11,13 @@
 	import ActionBar from "./ActionBar.svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "$lib/nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures } from "$lib/types";
-	import { getApiUrl } from "$lib/config";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "$lib/constants/colors";
 	import { autoOrganize, parseWeft, type OpaqueBlock, type WeftParseError, type WeftWarning } from "$lib/ai/weft-parser";
 	import { updateNodeConfig as weftUpdateConfig, updateNodeLabel as weftUpdateLabel, addNode as weftAddNode, addGroup as weftAddGroup, removeNode as weftRemoveNode, removeGroup as weftRemoveGroup, addEdge as weftAddEdge, removeEdge as weftRemoveEdge, updateNodePorts as weftUpdatePorts, updateGroupPorts as weftUpdateGroupPorts, updateProjectMeta as weftUpdateMeta, moveNodeScope as weftMoveNodeScope, moveGroupScope as weftMoveGroupScope, renameGroup as weftRenameGroup, updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutPrefix } from "$lib/ai/weft-editor";
 	import { findSearchMatch } from "$lib/ai/weft-patch";
 	import { extractInfraSubgraph } from "$lib/utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "$lib/utils/trigger-subgraph";
+	import { nodeBodyFeedKind } from "$lib/utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 
@@ -33,48 +33,87 @@
 	let lastPushTime = 0;
 	const DEBOUNCE_MS = 100; // Prevent multiple pushes within 100ms
 
-	let { project, onSave, onRun, onStop, onCancelBuild, executionState, triggerState, onToggleTrigger, onResyncTrigger, infraState, onCheckInfraStatus, onStartInfra, onStopInfra, onTerminateInfra, onForceRetry, validationErrors, autoOrganizeOnMount = false, fitViewAfterOrganize = false, infraLiveData, structuralLock = false }: {
+	let {
+		project,
+		onSave,
+		onRun,
+		onStop,
+		onDismissError,
+		onActivate,
+		onCancelActivate,
+		onDeactivate,
+		onReactivate,
+		onCancelRunning,
+		onResumeActive,
+		onResync,
+		onStartInfra,
+		onStopInfra,
+		onTerminateInfra,
+		onUpgradeInfra,
+		actionBarState,
+		drift,
+		infraNodes,
+		hasInfraInGraph = false,
+		hasTriggersInGraph = false,
+		executionState,
+		validationErrors,
+		autoOrganizeOnMount = false,
+		fitViewAfterOrganize = false,
+		infraFeedByNode,
+		signalFeedByNode,
+		structuralLock = false,
+	}: {
 		project: ProjectDefinition;
-		onSave: (data: { name?: string; description?: string; weftCode?: string; loomCode?: string; layoutCode?: string }) => void;
+		onSave: (data: { name?: string; description?: string; weftCode?: string; layoutCode?: string }) => void;
+		// Action-bar verb callbacks. The webview emits these; the
+		// host translates each into a CLI shell-out.
 		onRun?: () => void;
 		onStop?: () => void;
-		onCancelBuild?: () => void;
+		onDismissError?: () => void;
+		onActivate?: () => void;
+		onCancelActivate?: () => void;
+		onDeactivate?: () => void;
+		onReactivate?: () => void;
+		onCancelRunning?: () => void;
+		onResumeActive?: () => void;
+		onResync?: () => void;
+		onStartInfra?: () => void;
+		onStopInfra?: () => void;
+		onTerminateInfra?: () => void;
+		onUpgradeInfra?: () => void;
+		// Action-bar state machine (host-owned single source of
+		// truth) and drift snapshot. Passed straight through to
+		// the ActionBar component; nothing in this file decides.
+		actionBarState: import('../../../../shared/protocol').ActionBarState;
+		drift: import('../../../../shared/protocol').ActionAvailability | undefined;
+		// Per-node infra status, keyed by node_id. Used by the
+		// graph node decorations (badge under each infra node);
+		// independent of the action bar's infra rollup.
+		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string }>;
+		// Source-derived flags from the parsed project: does this
+		// graph DECLARE infra / trigger nodes. Drives bar-section
+		// visibility (don't show Infra section on a project with
+		// no infra nodes).
+		hasInfraInGraph?: boolean;
+		hasTriggersInGraph?: boolean;
+		// Per-execution state for graph decorations: which edges
+		// are pulsing right now, last-observed node outputs, etc.
+		// Independent of action-bar state.
 		executionState?: {
 			isRunning: boolean;
-			activeEdges: Set<string>;
 			nodeOutputs: Record<string, unknown>;
 			nodeStatuses: Record<string, string>;
 			nodeExecutions: import('$lib/types').NodeExecutionTable;
 		};
-		triggerState?: {
-			hasTriggers: boolean;
-			hasTriggersInFrontend: boolean;
-			hasTriggersInBackend: boolean;
-			isActive: boolean;
-			isLoading: boolean;
-			hasError?: boolean;
-			isStale?: boolean;
-		};
-		onToggleTrigger?: () => void;
-		onResyncTrigger?: () => void;
-		infraState?: {
-			hasInfrastructure: boolean;
-			hasInfraInFrontend: boolean;
-			hasInfraInBackend: boolean;
-			infraDiverged: boolean;
-			status: string;
-			nodes: Array<{ nodeId: string; nodeType: string; instanceId: string; status: string; backend?: string }>;
-			isLoading: boolean;
-		};
-		onCheckInfraStatus?: () => void;
-		onStartInfra?: () => void;
-		onStopInfra?: () => void;
-		onTerminateInfra?: () => void;
-		onForceRetry?: () => void;
 		validationErrors?: Map<string, import('$lib/types').ValidationError[]>;
 		autoOrganizeOnMount?: boolean;
 		fitViewAfterOrganize?: boolean;
-		infraLiveData?: Record<string, import('$lib/types').LiveDataItem[]>;
+		/// Per-node sidecar /live tick state. Read for nodes whose
+		/// `requiresInfra` flag is true; ignored otherwise.
+		infraFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
+		/// Per-node listener /display tick state. Read for nodes whose
+		/// `features.isTrigger` flag is true; ignored otherwise.
+		signalFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
 		structuralLock?: boolean;
 	} = $props();
 
@@ -87,7 +126,6 @@
 	let weftCode = $state(untrack(() => project.weftCode) ?? '');
 	let layoutCode = $state(untrack(() => project.layoutCode) ?? '');
 	let weftOpaqueBlocks = $state<OpaqueBlock[]>([]);
-	let weftParseErrors = $state<WeftParseError[]>([]);
 	let saveStatus = $state<'idle' | 'saved'>('idle');
 	let saveStatusTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -250,14 +288,12 @@
 		return result;
 	}
 
-	function applyParseResult(w: { opaqueBlocks: OpaqueBlock[]; errors: WeftParseError[] }) {
+	function applyParseResult(w: { opaqueBlocks: OpaqueBlock[] }) {
 		weftOpaqueBlocks = w.opaqueBlocks;
-		weftParseErrors = w.errors;
 	}
 
 	function clearWeftParseState() {
 		weftOpaqueBlocks = [];
-		weftParseErrors = [];
 	}
 
 	let weftStreaming = $state(false);
@@ -317,8 +353,6 @@
 				await patchFromProject(w.project);
 				weftOpaqueBlocks = savedOpaqueBlocks;
 				saveProject();
-			} else {
-				weftParseErrors = result.errors;
 			}
 			// Wait for Svelte's reactive cycle to settle before clearing the guard
 			await tick();
@@ -358,8 +392,6 @@
 		animated: false,
 		// NOTE: Do NOT set markerEnd here - it overrides individual edge settings
 	});
-
-	const isEdgeActive = (edgeId: string) => executionState?.activeEdges?.has(edgeId) ?? false;
 
 	// Get the SvelteFlow instance for screenToFlowPosition and fitView
 	const { screenToFlowPosition, fitView, getViewport, setViewport, zoomIn, zoomOut } = useSvelteFlow();
@@ -887,7 +919,7 @@
 					features: n.features,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
-					infraNodeStatus: infraState?.nodes.find(inf => inf.nodeId === n.id)?.status,
+					infraNodeStatus: infraNodes?.find(inf => inf.nodeId === n.id)?.status,
 				},
 				...(hiddenByCollapsedGroup
 					? { style: 'display: none;' }
@@ -914,8 +946,6 @@
 			const sourceNode = projectNodes.find(n => n.id === e.source);
 			const edgeColor = getEdgeColor(e.source, e.sourceHandle);
 
-			const active = isEdgeActive(e.id);
-
 			// Group interface port handles: __inner suffix is set by the parser for self-references
 			// (in.port -> __inner source handle, out.port -> __inner target handle)
 			const sourceHandle = e.sourceHandle;
@@ -928,16 +958,15 @@
 				sourceHandle,
 				targetHandle,
 				type: 'custom',
-				animated: active,
+				animated: false,
 				zIndex: 5,
-				style: `stroke-width: ${active ? 3 : 2}px; stroke: ${edgeColor};`,
+				style: `stroke-width: 2px; stroke: ${edgeColor};`,
 				markerEnd: {
 					type: MarkerType.ArrowClosed,
 					width: 20,
 					height: 20,
 					color: edgeColor,
 				},
-				className: active ? 'edge-active' : '',
 			};
 		});
 	}
@@ -948,7 +977,6 @@
 	$effect(() => {
 		const state = executionState;
 		if (state) {
-			const activeEdges = state.activeEdges;
 			const nodeOutputs = state.nodeOutputs || {};
 			const nodeExecutions = state.nodeExecutions || {};
 
@@ -1046,25 +1074,17 @@
 					};
 				});
 				
-				edges = edges.map(e => ({
-					...e,
-					animated: activeEdges.has(e.id),
-					style: activeEdges.has(e.id) 
-						? e.style?.replace(/stroke-width: \d+px/, 'stroke-width: 3px') 
-						: e.style?.replace(/stroke-width: \d+px/, 'stroke-width: 2px'),
-					class: activeEdges.has(e.id) ? 'edge-active' : '',
-				}));
 			});
 		}
 	});
 
 	// Keep per-node infra status badges in sync with backend state
 	$effect(() => {
-		const infraNodes = infraState?.nodes;
-		if (!infraNodes) return;
+		const list = infraNodes;
+		if (!list) return;
 		untrack(() => {
 			nodes = nodes.map(n => {
-				const backendNode = infraNodes.find(inf => inf.nodeId === n.id);
+				const backendNode = list.find(inf => inf.nodeId === n.id);
 				const newStatus = backendNode?.status;
 				if (n.data.infraNodeStatus !== newStatus) {
 					return { ...n, data: { ...n.data, infraNodeStatus: newStatus } };
@@ -1074,27 +1094,28 @@
 		});
 	});
 
-	// Keep per-node live data in sync (infra live data + node display data)
+	// Per-node body-panel feed. Each node consumes AT MOST ONE feed
+	// based on its role: infra nodes get sidecar /live ticks, trigger
+	// nodes get listener /display ticks, anything else gets nothing.
+	// Roles are mutually exclusive (see lib/utils/node-roles); the
+	// `bodyFeed` field on node.data is what ProjectNode.svelte renders.
 	$effect(() => {
-		const liveMap = infraLiveData;
-		const isActive = triggerState?.isActive ?? false;
-		const pid = project?.id ?? '';
+		const infra = infraFeedByNode;
+		const signal = signalFeedByNode;
 		untrack(() => {
-			const ctx = { projectId: pid, isProjectActive: isActive, apiBaseUrl: getApiUrl() };
 			nodes = nodes.map(n => {
 				const d = n.data as Record<string, unknown>;
-				const infraItems = liveMap?.[n.id];
-				// Compute display data from node template
-				const nodeType = d.nodeType as string;
-				const template = NODE_TYPE_CONFIG[nodeType as NodeType];
-				const displayItems = template?.getDisplayData?.(
-					{ id: n.id, nodeType, label: d.label as string | null, config: (d.config as Record<string, unknown>) ?? {}, position: n.position, inputs: (d.inputs as import('$lib/types').PortDefinition[]) ?? [], outputs: (d.outputs as import('$lib/types').PortDefinition[]) ?? [], features: d.features as NodeFeatures },
-					ctx,
-				);
-				const items = [...(infraItems ?? []), ...(displayItems ?? [])];
-				const prev = d.liveDataItems as import('$lib/types').LiveDataItem[] | undefined;
-				if (items.length === 0 && (!prev || prev.length === 0)) return n;
-				return { ...n, data: { ...n.data, liveDataItems: items.length > 0 ? items : undefined } };
+				const role = nodeBodyFeedKind({
+					nodeType: d.nodeType as string,
+					features: d.features as { isTrigger?: boolean } | undefined,
+				});
+				const feed =
+					role === 'infra' ? infra?.[n.id]
+					: role === 'signal' ? signal?.[n.id]
+					: undefined;
+				const prev = d.bodyFeed as import('../../../../shared/protocol').NodeFeedState | undefined;
+				if (feed === prev) return n;
+				return { ...n, data: { ...n.data, bodyFeed: feed } };
 			});
 		});
 	});
@@ -1109,10 +1130,7 @@
 		if (!show) {
 			untrack(() => {
 				nodes = nodes.map(n => ({ ...n, class: '' }));
-				edges = edges.map(e => {
-					const active = executionState?.activeEdges?.has(e.id) ?? false;
-					return { ...e, class: active ? 'edge-active' : '' };
-				});
+				edges = edges.map(e => ({ ...e, class: '' }));
 			});
 			return;
 		}
@@ -1445,7 +1463,7 @@
 			return;
 		}
 		// Fast path: if the source matches what we already have,
-		// the user-visible structure didn't change — but the
+		// the user-visible structure didn't change, but the
 		// COMPILER may have re-inferred port metadata that isn't
 		// captured in the source text (laneMode for implicit
 		// Gather/Expand, inferred concrete portTypes from edges).
@@ -1467,8 +1485,6 @@
 			if (w.project.name) project.name = w.project.name;
 			if (w.project.description !== undefined) project.description = w.project.description;
 			void patchFromProject(w.project);
-		} else {
-			weftParseErrors = result.errors;
 		}
 	}
 
@@ -1476,7 +1492,7 @@
 	/// to match the freshly-parsed project's port metadata. Used when
 	/// the source text didn't change but the compiler may have
 	/// re-inferred laneMode (implicit Gather/Expand) or concrete
-	/// portTypes. Only touches port arrays — positions, configs,
+	/// portTypes. Only touches port arrays; positions, configs,
 	/// edge IDs are untouched, so xyflow doesn't relayout.
 	function mergeInferredPortMetadata(parsed: ProjectDefinition): void {
 		const byId = new Map(parsed.nodes.map(n => [n.id, n]));
@@ -2886,35 +2902,46 @@
 			</div>
 		{/if}
 
-		<!-- Divergence warnings -->
-		{#if infraState?.infraDiverged}
+		<!-- Drift banner. The Upgrade Infra button on the action bar
+		     is the primary affordance; this banner is a redundant
+		     surfacing for the case where the user might miss the
+		     button. Independent of the user-action overlay (drift is
+		     a backend fact). Visibility tracks the backend's
+		     `available_actions` so banner and button agree on what
+		     the user can do. -->
+		{#if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_upgrade')}
 			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
 				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
 					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-					Infrastructure has changed. Stop and restart to apply.
+					Infrastructure has changed. Click Upgrade to apply.
 				</div>
 			</div>
 		{/if}
 
-		<!-- Floating action bar. In the VS Code build, 'playground'
-		     only hides SaaS-specific controls in CommandPalette and
-		     other surfaces; the action bar itself (Run/Stop/infra/
-		     trigger controls) is always available. -->
+		<!-- Floating action bar. State + drift come from the host's
+		     ActionBarStore (single source of truth). The bar reads
+		     `state.backend` for at-rest facts and `state.overlay`
+		     for the in-flight user-action; `drift` lights
+		     Resync/Upgrade indicators. -->
 		<ActionBar
-			variant="floating"
-			{infraState}
-			{triggerState}
-			{executionState}
-			{onCheckInfraStatus}
+			state={actionBarState}
+			{drift}
+			{onRun}
+			{onStop}
+			{onDismissError}
+			{onActivate}
+			{onCancelActivate}
+			{onDeactivate}
+			{onReactivate}
+			{onCancelRunning}
+			{onResumeActive}
+			{onResync}
 			{onStartInfra}
 			{onStopInfra}
 			{onTerminateInfra}
-			{onForceRetry}
-			{onToggleTrigger}
-			{onResyncTrigger}
-			{onRun}
-			{onStop}
-			{onCancelBuild}
+			{onUpgradeInfra}
+			hasInfra={hasInfraInGraph}
+			hasTriggers={hasTriggersInGraph}
 			onToggleInfraSubgraph={() => { showInfraSubgraph = !showInfraSubgraph; if (showInfraSubgraph) showTriggerSubgraph = false; }}
 			{showInfraSubgraph}
 			onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
@@ -3028,20 +3055,6 @@
 		stroke-linejoin: round;
 	}
 	
-	/* Active edge animation */
-	:global(.svelte-flow .edge-active .svelte-flow__edge-path) {
-		animation: edge-flow 1s linear infinite;
-	}
-	
-	@keyframes edge-flow {
-		from {
-			stroke-dashoffset: 24;
-		}
-		to {
-			stroke-dashoffset: 0;
-		}
-	}
-
 	/* New nodes during patch: rendered for measurement but invisible until ELK positions them */
 	:global(.svelte-flow__node.node-pending-layout) {
 		opacity: 0 !important;

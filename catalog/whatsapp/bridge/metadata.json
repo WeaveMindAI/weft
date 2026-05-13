@@ -15,10 +15,8 @@
     { "name": "jid", "type": "String", "required": false }
   ],
   "fields": [],
-  "entrySignals": [],
   "requires_infra": true,
   "features": {
-    "hasLiveData": true,
     "sidecar": {
       "name": "whatsapp-bridge",
       "port": 8090,

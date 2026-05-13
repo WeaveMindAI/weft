@@ -16,7 +16,6 @@
     { "name": "success", "type": "Boolean", "required": false }
   ],
   "fields": [],
-  "entrySignals": [],
   "requires_infra": false,
   "features": {}
 }

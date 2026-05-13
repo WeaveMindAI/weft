@@ -1,128 +1,148 @@
-//! HTTP router for the listener. Three surfaces:
+//! HTTP router for the listener. Every endpoint is network-trusted:
+//! only Pods in the dispatcher's namespace can reach the listener
+//! port (NetworkPolicy enforces this). No bearer auth in arch-5.
 //!
-//!   User-facing (Webhook + Form fires):
-//!     - `POST /signal/{token}`        fire a signal with a JSON body
-//!     - `POST /signal/{token}/{*path}` fire with extra path segment
-//!     - `GET  /signal/{token}`        read kind-specific metadata (form schema)
-//!
-//!   Dispatcher-internal (requires admin token):
-//!     - `POST /register`    add a signal
-//!     - `POST /unregister`  remove a signal
-//!     - `GET  /signals`     list all active signals (debug)
-//!
-//!   Health (unauthed):
-//!     - `GET /health`
+//!   POST /register     add a signal to the registry
+//!   POST /unregister   remove a signal
+//!   POST /process      run kind-specific logic for one fire,
+//!                      return a `ProcessOutcome` (value + target)
+//!                      for the dispatcher to journal on
+//!   POST /render       render the consumer-facing payload for one
+//!                      token. Pure over the spec; called once at
+//!                      register time and the result cached on the
+//!                      signal row.
+//!   GET  /signals      debug: list registry entries
+//!   GET  /health       liveness probe
+
+use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::State,
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::kinds;
-use crate::protocol::{RegisterRequest, RegisterResponse, UnregisterRequest};
+use crate::protocol::{
+    ActionRequest, ActionResponse, DisplayRequest, DisplayResponse, ProcessOutcome,
+    ProcessRequest, RegisterRequest, RegisterResponse, UnregisterRequest,
+};
 use crate::ListenerState;
 
 pub fn router(state: ListenerState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/signal/{token}", get(get_signal).post(fire_signal))
-        .route("/signal/{token}/{*path}", post(fire_signal_with_path))
         .route("/register", post(register))
         .route("/unregister", post(unregister))
+        .route("/process", post(process))
+        .route("/render", post(render))
+        .route("/display", post(display))
+        .route("/action", post(action))
         .route("/signals", get(list_signals))
+        .route("/rehydrate", post(rehydrate_handler))
         .with_state(state)
+}
+
+/// Reconcile the in-memory registry with the durable signal table.
+/// Idempotent: existing entries are left alone, missing ones are
+/// inserted. Called by the dispatcher's activate flow after
+/// TriggerSetup completes, so resume signals (which TriggerSetup
+/// can't replay) come back from the DB before the gate flips to
+/// Active.
+async fn rehydrate_handler(
+    State(state): State<ListenerState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let broker_url = Arc::new(state.config.broker_url.clone());
+    crate::registry::rehydrate(
+        state.tasks.clone(),
+        broker_url,
+        state.token_source.clone(),
+        &state.config.tenant_id,
+        state.registry.clone(),
+        state.config.clone(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn fire_signal(
-    State(state): State<ListenerState>,
-    Path(token): Path<String>,
-    body: Option<Json<Value>>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    fire_inner(state, token, body.map(|Json(v)| v).unwrap_or(Value::Null)).await
-}
-
-async fn fire_signal_with_path(
-    State(state): State<ListenerState>,
-    Path((token, _path)): Path<(String, String)>,
-    body: Option<Json<Value>>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    fire_inner(state, token, body.map(|Json(v)| v).unwrap_or(Value::Null)).await
-}
-
-async fn fire_inner(
-    state: ListenerState,
-    token: String,
-    body: Value,
-) -> Result<StatusCode, (StatusCode, String)> {
-    if state.registry.get(&token).is_none() {
-        return Err((StatusCode::NOT_FOUND, "unknown token".into()));
-    }
-    state.relay.fire(token, body).await;
-    Ok(StatusCode::ACCEPTED)
-}
-
-async fn get_signal(
-    State(state): State<ListenerState>,
-    Path(token): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let signal = state
-        .registry
-        .get(&token)
-        .ok_or((StatusCode::NOT_FOUND, "unknown token".into()))?;
-    // Minimal metadata exposure. Form schema lives inside the
-    // signal spec's kind, so we return the whole kind. Kinds that
-    // don't want to expose anything are still covered because the
-    // WakeSignalKind enum controls what's visible.
-    Ok(Json(
-        serde_json::to_value(&signal.spec.kind)
-            .unwrap_or(Value::Null),
-    ))
-}
-
 async fn register(
     State(state): State<ListenerState>,
-    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
-    let user_url = kinds::register_spec(
+    let (routing, kind_state) = kinds::register_in_registry(
         req.token,
         req.spec,
         req.node_id,
+        req.is_resume,
+        req.color,
+        kinds::RoutingSource::Mint {
+            secret_cache: state.secret_cache.clone(),
+        },
         state.registry.clone(),
-        state.relay.clone(),
+        state.fire_sink.clone(),
         state.config.clone(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok(Json(RegisterResponse { user_url }))
+    Ok(Json(RegisterResponse { routing, kind_state }))
+}
+
+async fn display(
+    State(state): State<ListenerState>,
+    Json(req): Json<DisplayRequest>,
+) -> Result<Json<DisplayResponse>, (StatusCode, String)> {
+    let sig = state
+        .registry
+        .get(&req.token)
+        .ok_or((StatusCode::NOT_FOUND, format!("unknown token: {}", req.token)))?;
+    let display = kinds::compute_display(&req.token, &sig, &state.secret_cache);
+    Ok(Json(DisplayResponse { display }))
+}
+
+async fn action(
+    State(state): State<ListenerState>,
+    Json(req): Json<ActionRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let (result, routing) = kinds::handle_action(
+        &req.token,
+        &req.kind,
+        req.payload,
+        &state.registry,
+        &state.secret_cache,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(ActionResponse { result, routing }))
 }
 
 async fn unregister(
     State(state): State<ListenerState>,
-    headers: HeaderMap,
     Json(req): Json<UnregisterRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
-    // Dropping the registered signal aborts its task via TaskGuard.
-    if state.registry.remove(&req.token).is_some() {
-        state.relay.maybe_notify_empty().await;
-    }
+    state.registry.remove(&req.token);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn process(
+    State(state): State<ListenerState>,
+    Json(req): Json<ProcessRequest>,
+) -> Result<Json<ProcessOutcome>, (StatusCode, String)> {
+    let outcome = kinds::process(&req.token, req.payload, state.registry.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(outcome))
 }
 
 async fn list_signals(
     State(state): State<ListenerState>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
     let rows: Vec<Value> = state
         .registry
         .list()
@@ -138,14 +158,21 @@ async fn list_signals(
     Ok(Json(Value::Array(rows)))
 }
 
-fn require_admin(state: &ListenerState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    let got = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if got != state.config.admin_token {
-        return Err((StatusCode::UNAUTHORIZED, "bad admin token".into()));
-    }
-    Ok(())
+#[derive(Debug, Deserialize)]
+struct RenderRequest {
+    token: String,
 }
+
+/// Render the consumer payload for one signal. Pure function over
+/// the registered spec; the dispatcher caches the result on the
+/// signal row at register time. Park-mode projects can therefore
+/// serve consumer enumeration with the listener pod reaped.
+async fn render(
+    State(state): State<ListenerState>,
+    Json(req): Json<RenderRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let rendered = kinds::render(&req.token, state.registry.clone())
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(rendered.unwrap_or(Value::Null)))
+}
+

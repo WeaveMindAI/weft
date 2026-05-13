@@ -4,12 +4,12 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Notify;
 
+use crate::cancellation::CancellationFlag;
 use crate::error::{WeftError, WeftResult};
 use crate::lane::Lane;
 use crate::node::SidecarSpec;
-use crate::primitive::{CostReport, WakeSignalSpec};
+use crate::primitive::{CostReport, SignalSpec};
 use crate::Color;
 
 /// Which lifecycle phase this invocation belongs to. v2 mirrors v1's
@@ -25,19 +25,28 @@ use crate::Color;
 ///   should register.
 /// - `Fire`: the normal fire-time execution. Trigger nodes receive
 ///   the payload, their outputs flow downstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     InfraSetup,
     TriggerSetup,
+    /// Default for old-schema rows that didn't carry a phase.
+    #[default]
     Fire,
 }
 
-impl Default for Phase {
-    fn default() -> Self {
-        Self::Fire
+impl Phase {
+    /// Stable wire/storage tag. Matches the serde rename so the
+    /// JSON form and the DB form agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InfraSetup => "infra_setup",
+            Self::TriggerSetup => "trigger_setup",
+            Self::Fire => "fire",
+        }
     }
 }
+
 
 /// The per-execution context handed to `Node::execute`. Exposes the
 /// language's primitive surface (`await_signal` for mid-execution
@@ -89,32 +98,89 @@ impl ExecutionContext {
         Self { execution_id, project_id, node_id, node_type, node_label, color, lane, config, input, phase, handle }
     }
 
-    // ----- Suspension primitive --------------------------------------
+    // ----- Wait-and-resume primitive ---------------------------------
 
-    /// Suspend this lane until the given wake signal fires. The engine
-    /// forwards the spec to the dispatcher (which registers a webhook,
-    /// schedules a timer, etc.), and parks on a oneshot. When the
-    /// dispatcher delivers the fire value, this returns.
+    /// Stop executing this lane until the given wake signal fires.
     ///
-    /// `spec.is_resume` must be `true` here; passing `false` is a
-    /// contract violation (that's an entry-signal, not a wait).
-    pub async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value> {
-        self.handle.await_signal(spec).await
+    /// Use when the node needs an answer mid-flow that comes from
+    /// outside (a HumanQuery form, a timer, a webhook callback). The
+    /// node's execute body parks here and the engine releases the
+    /// worker; when the fire arrives, a fresh worker spawns, folds
+    /// the journal, and this call returns the fire's payload.
+    ///
+    /// This is the resume path; pair with `register_signal`
+    /// (entry-trigger, persistent) for the other case. Lifecycle
+    /// metadata (resume vs entry) lives on the dispatcher's
+    /// register request, not on the spec.
+    ///
+    /// Returns the value the fire carried.
+    pub async fn await_signal<K: crate::signal::Signal>(&self, kind: K) -> WeftResult<Value> {
+        self.handle
+            .await_signal(crate::signal::to_spec(kind))
+            .await
     }
 
-    // ----- Entry-signal registration (TriggerSetup phase) ------------
+    // ----- Entry-trigger registration --------------------------------
 
-    /// Declare that when this node is live, the listener should watch
-    /// for the given wake signal. Called by trigger nodes during
-    /// `Phase::TriggerSetup`. Fire-and-forget: the dispatcher records
-    /// the spec and registers it with the per-project listener after
-    /// the sub-execution completes. Returns the user-facing URL (if
-    /// the signal kind has one).
+    /// Set up a persistent wake signal that fires fresh executions.
     ///
-    /// `spec.is_resume` must be `false` (entry signals are persistent,
-    /// not single-use lane-bound).
-    pub async fn register_signal(&self, spec: WakeSignalSpec) -> WeftResult<Option<String>> {
-        self.handle.register_signal(spec).await
+    /// Use when the node is a trigger declaring "while I'm active,
+    /// the listener should watch for X" (Webhook, HumanTrigger form,
+    /// cron, SSE subscription). Returns synchronously with the
+    /// user-facing URL (if the kind mints one) and the worker keeps
+    /// executing. Each subsequent fire spawns a brand new execution
+    /// of the project; this signal is NOT bound to the current
+    /// execution's lane. Called from `Phase::TriggerSetup`.
+    ///
+    /// This is the entry path; pair with `await_signal` for mid-flow
+    /// waits.
+    ///
+    /// Every public URL is derived from the signal's mount_path on
+    /// the dispatcher; nodes don't need the URL handed back. Returns
+    /// `()` once the dispatcher has acknowledged the registration.
+    pub async fn register_signal<K: crate::signal::Signal>(
+        &self,
+        kind: K,
+    ) -> WeftResult<()> {
+        self.handle
+            .register_signal(crate::signal::to_spec(kind))
+            .await
+    }
+
+    // ----- Memoized step ---------------------------------------------
+
+    /// Run `work` once and journal its output, OR return the past
+    /// journaled output on replay. Use this to wrap any
+    /// non-deterministic / side-effecting work between awaits so
+    /// the value stays consistent across replays.
+    ///
+    /// Example:
+    /// ```ignore
+    /// let approval_token = ctx.run("mint_token", || async {
+    ///     Ok(serde_json::json!(uuid::Uuid::new_v4().to_string()))
+    /// }).await?;
+    /// let answer = ctx.await_signal(spec).await?;
+    /// let api_resp = ctx.run("call_api", || async {
+    ///     Ok(call_external_api(&answer).await?)
+    /// }).await?;
+    /// ```
+    ///
+    /// The closure runs at most once across all replays of this
+    /// (node, lane). On every subsequent replay the journaled
+    /// output is returned directly without invoking the closure.
+    /// `name` is author-supplied for log traceability; the
+    /// runtime keys on call_index ordering, not on the name.
+    pub async fn run<F, Fut>(&self, name: &str, work: F) -> WeftResult<Value>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = WeftResult<Value>>,
+    {
+        if let Some(value) = self.handle.run_step(name).await? {
+            return Ok(value);
+        }
+        let value = work().await?;
+        self.handle.run_record(name, &value).await?;
+        Ok(value)
     }
 
     // ----- Infra primitive ----------------------------------------
@@ -125,9 +191,8 @@ impl ExecutionContext {
     /// an error otherwise.
     ///
     /// Node code uses this to call its sidecar (POST /action,
-    /// GET /outputs, subscribe /live). The dispatcher resolves
-    /// the URL from its InfraRegistry so node code never touches
-    /// k8s.
+    /// GET /outputs, subscribe /live). The dispatcher resolves the
+    /// URL from the `infra_pod` table so node code never touches k8s.
     pub async fn sidecar_endpoint(&self) -> WeftResult<String> {
         self.handle.sidecar_endpoint().await
     }
@@ -149,29 +214,49 @@ impl ExecutionContext {
         self.handle.provision_sidecar(spec).await
     }
 
-    // ----- Fire-and-forget primitives --------------------------------
+    // ----- Side-effect primitives ------------------------------------
 
-    /// Report a cost attributable to this execution. Journaled by the
-    /// runtime, aggregated by the dispatcher.
-    pub fn report_cost(&self, report: CostReport) {
-        self.handle.report_cost(report);
+    /// Report a cost attributable to this execution. Durable: the
+    /// underlying broker INSERT is the commit point, so the worker
+    /// pod can die immediately after `.await` returns and the
+    /// dispatcher will still journal the cost on its own timeline.
+    /// Returns Err if the broker can't accept the record (e.g.
+    /// negative amount rejected, broker unreachable); callers
+    /// decide how to handle a cost they couldn't book.
+    pub async fn report_cost(&self, report: CostReport) -> WeftResult<()> {
+        self.handle.report_cost(report).await
     }
 
-    /// Emit a log line from this node. Journaled for dashboard display.
-    pub fn log(&self, level: LogLevel, message: impl Into<String>) {
-        self.handle.log(level, message.into());
+    /// Emit a log line from this node. Same durability shape as
+    /// `report_cost`: the broker INSERT is the commit point.
+    pub async fn log(&self, level: LogLevel, message: impl Into<String>) -> WeftResult<()> {
+        self.handle.log(level, message.into()).await
     }
 
     // ----- Read helpers ----------------------------------------------
 
     /// Check whether the enclosing execution has been cancelled.
+    /// Cheap synchronous read; safe to poll in tight loops.
     pub fn is_cancelled(&self) -> bool {
-        self.handle.is_cancelled()
+        self.handle.cancellation().is_cancelled()
     }
 
-    /// Notify that resolves when the execution is cancelled. Nodes
-    /// holding long operations should race their work against this.
-    pub fn cancellation(&self) -> Arc<Notify> {
+    /// Cancellation flag for the enclosing execution. Long-running
+    /// nodes should `tokio::select!` on `flag.cancelled()` against
+    /// their work future, e.g.:
+    ///
+    /// ```ignore
+    /// let flag = ctx.cancellation();
+    /// tokio::select! {
+    ///     out = my_long_request() => out,
+    ///     _ = flag.cancelled() => return Err(...),
+    /// }
+    /// ```
+    ///
+    /// The flag is persistent: once set, every future check (sync
+    /// or async) sees it. No race between `cancel()` and a future
+    /// `cancelled().await`.
+    pub fn cancellation(&self) -> Arc<CancellationFlag> {
         self.handle.cancellation()
     }
 }
@@ -258,14 +343,25 @@ impl InputBag {
 /// delegates to an implementation.
 #[async_trait::async_trait]
 pub trait ContextHandle: Send + Sync {
-    async fn await_signal(&self, spec: WakeSignalSpec) -> WeftResult<Value>;
-    async fn register_signal(&self, spec: WakeSignalSpec) -> WeftResult<Option<String>>;
+    async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value>;
+    async fn register_signal(&self, spec: SignalSpec) -> WeftResult<()>;
     async fn sidecar_endpoint(&self) -> WeftResult<String>;
     async fn provision_sidecar(&self, spec: SidecarSpec) -> WeftResult<SidecarHandle>;
-    fn report_cost(&self, report: CostReport);
-    fn log(&self, level: LogLevel, message: String);
-    fn is_cancelled(&self) -> bool;
-    fn cancellation(&self) -> Arc<Notify>;
+    /// Replay-side of `ctx.run`. Returns `Some(value)` if a past
+    /// invocation of this body already executed the step at the
+    /// current call_index and journaled its output; the wrapper
+    /// returns this value without invoking the closure. Returns
+    /// `None` when the sequence-pop yielded no entry (fresh call).
+    /// `name` is author-supplied for traceability; the runtime
+    /// keys on call_index, not name.
+    async fn run_step(&self, name: &str) -> WeftResult<Option<Value>>;
+    /// Persist-side of `ctx.run`. Called only on the fresh path
+    /// (no journaled output for the current call_index). Writes a
+    /// `RunOutput` event so future replays will short-circuit.
+    async fn run_record(&self, name: &str, value: &Value) -> WeftResult<()>;
+    async fn report_cost(&self, report: CostReport) -> WeftResult<()>;
+    async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
+    fn cancellation(&self) -> Arc<CancellationFlag>;
 }
 
 /// Result of `provision_sidecar`: the handle identifies the

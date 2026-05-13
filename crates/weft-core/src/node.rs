@@ -79,16 +79,9 @@ pub struct NodeMetadata {
     /// Configurable fields (shown in the node inspector UI).
     #[serde(default)]
     pub fields: Vec<FieldDef>,
-    /// Entry-use wake signals declared by this node. Empty = normal
-    /// node (no trigger role). Only the tag (signal kind +
-    /// is_resume) is stored in metadata; values come from the
-    /// node's config, resolved by `WakeSignalKind::resolve_from_config`
-    /// during enrich. Node authors do no value plumbing here.
-    #[serde(default, rename = "entrySignals", alias = "entry")]
-    pub entry_signals: Vec<crate::primitive::WakeSignalTag>,
     /// Whether this node requires wiring to a sidecar-backed infra
-    /// node. Computed from `entry` containing `Event`, but allowed as
-    /// an explicit flag for nodes that use infra without entry.
+    /// node. Explicit flag in metadata.json; mirrored to
+    /// `NodeDefinition.requires_infra` at enrich time.
     #[serde(default)]
     pub requires_infra: bool,
     /// Node-level semantic constraints. Small, extensible.
@@ -253,24 +246,10 @@ pub struct NodeFeatures {
     /// events rather than running as part of an execution).
     #[serde(default, rename = "isTrigger")]
     pub is_trigger: bool,
-    /// If `is_trigger`, which category the trigger falls into.
-    /// Matches v1's TriggerCategory: Webhook / Polling / Schedule /
-    /// Socket / Local / Manual. Serialized as a plain string so the
-    /// webview doesn't need a round-trip type.
-    #[serde(default, rename = "triggerCategory", skip_serializing_if = "Option::is_none")]
-    pub trigger_category: Option<String>,
     /// Webview hint: render the node's latest output as a JSON
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview")]
     pub show_debug_preview: bool,
-    /// Webview hint: the node opts into the inline live-data
-    /// strip (in/out chips) under its body. Nodes that don't opt
-    /// in fall back to the modal inspector for inputs/outputs.
-    /// Used by WhatsAppBridge (QR + connection status) where
-    /// live telemetry from the sidecar is core UX. Regular
-    /// action nodes (Send/Receive/Debug) leave this off.
-    #[serde(default, rename = "hasLiveData")]
-    pub has_live_data: bool,
     /// Default value of the node's `is_output` config flag. Nodes that
     /// are semantically "produce this thing" (Debug, Output) default
     /// to true. Any project can override by setting `is_output` in the
@@ -454,6 +433,12 @@ pub struct NodeOutput {
 /// dispatcher reads it during `weft infra up` and applies the
 /// manifests through its `InfraBackend`. Node code is never
 /// invoked during provisioning.
+///
+/// Node authors write the manifests verbatim. The dispatcher only
+/// injects the routing/cleanup labels
+/// (`weft.dev/{role,project,node,instance}`) and substitutes the
+/// `__INSTANCE_ID__`, `__NAMESPACE__`, `__SIDECAR_IMAGE__`
+/// placeholders. See `docs/authoring-nodes.md` for the contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarSpec {
     /// Short name used to construct the image tag
@@ -465,10 +450,10 @@ pub struct SidecarSpec {
     /// (e.g. `/action`). Defaults to empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_path: Option<String>,
-    /// Raw k8s manifests to apply. Placeholders like
-    /// `__INSTANCE_ID__` and `__NAMESPACE__` are substituted by
-    /// the infra backend before apply.
-    #[serde(default)]
+    /// Raw k8s manifests to apply. Required; at least one manifest
+    /// must be provided. Placeholders like `__INSTANCE_ID__` and
+    /// `__NAMESPACE__` are substituted by the infra backend before
+    /// apply.
     pub manifests: Vec<Value>,
 }
 

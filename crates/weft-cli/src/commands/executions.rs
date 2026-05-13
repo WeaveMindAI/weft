@@ -75,7 +75,7 @@ pub async fn clean(
 ) -> anyhow::Result<()> {
     if images || build_cache {
         if images {
-            clean_worker_images(all).await?;
+            clean_worker_images(&ctx, all).await?;
         }
         if build_cache {
             clean_build_cache().await?;
@@ -123,7 +123,7 @@ pub async fn clean(
 /// Reclaim dangling worker images. Without `--all`, scoped to the
 /// cwd project (whose id we read from `weft.toml`). With `--all`,
 /// nukes every dangling image labelled `weft.dev/project=...`.
-async fn clean_worker_images(all: bool) -> anyhow::Result<()> {
+async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     use tokio::process::Command;
     let mut args: Vec<String> = vec![
         "image".into(),
@@ -139,11 +139,9 @@ async fn clean_worker_images(all: bool) -> anyhow::Result<()> {
     } else {
         // cwd project. If we can't discover one, bail with a hint
         // instead of silently nuking everything.
-        let cwd = std::env::current_dir()?;
-        let project = weft_compiler::project::Project::discover(&cwd).map_err(|e| {
+        let project = ctx.project().map_err(|e| {
             anyhow::anyhow!(
-                "no Weft project discovered from {} ({e}); pass --all to clean every project's images",
-                cwd.display()
+                "{e}; pass --all to clean every project's images"
             )
         })?;
         args.push(format!("label=weft.dev/project={}", project.id()));

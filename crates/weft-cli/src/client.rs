@@ -56,18 +56,18 @@ impl DispatcherClient {
         Ok(())
     }
 
-    /// POST with no body, parse the JSON response.
-    pub async fn post_json_empty(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+    /// POST with a JSON body, discard the response. For endpoints
+    /// that return 204 No Content (idempotent state mutations).
+    pub async fn post_with_body(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<()> {
         let url = format!("{}{}", self.base, path);
-        let resp = self.http.post(&url).send().await.with_context(|| format!("POST {url}"))?;
-        resp.error_for_status()?.json().await.context("parse response")
+        let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
+        resp.error_for_status()?;
+        Ok(())
     }
+
 }
 
-pub fn resolve_dispatcher_url(override_url: Option<&str>) -> String {
-    if let Some(u) = override_url {
-        return u.to_string();
-    }
-    // Phase A2: read from weft.toml if present. Scaffold defaults.
-    "http://localhost:9999".to_string()
-}

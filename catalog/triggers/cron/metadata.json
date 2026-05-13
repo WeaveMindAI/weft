@@ -21,9 +21,6 @@
       "description": "Standard cron expression. Default fires every 5 minutes."
     }
   ],
-  "entrySignals": [
-    { "kind": "timer", "is_resume": false }
-  ],
   "requires_infra": false,
   "features": {
     "isTrigger": true,

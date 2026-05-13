@@ -1,6 +1,6 @@
 import type { NodeInstance, Edge } from '$lib/types';
-import { NODE_TYPE_CONFIG } from '$lib/nodes';
 import { extractSubgraph, type SubgraphResult } from './subgraph';
+import { nodeIsTrigger } from './node-roles';
 
 /**
  * Extract the trigger setup subgraph from a project.
@@ -17,8 +17,6 @@ export function extractTriggerSubgraph(
 	edges: Edge[],
 ): SubgraphResult {
 	return extractSubgraph(nodes, edges, {
-		seedFilter: (n) =>
-			!!n.features?.isTrigger
-			|| !!NODE_TYPE_CONFIG[n.nodeType]?.features?.isTrigger,
+		seedFilter: (n) => nodeIsTrigger(n),
 	});
 }

@@ -642,13 +642,16 @@ fn check_port_coverage(
             let known_outputs: std::collections::HashSet<&str> =
                 node.outputs.iter().map(|p| p.name.as_str()).collect();
             // Metadata-declared fields are also valid config keys;
-            // their values either drive node behavior or resolve into
-            // a wake-signal spec (see WakeSignalKind::resolve_from_config).
+            // their values drive node behavior at runtime.
             let Some(meta) = catalog.lookup(&node.node_type) else { continue };
             let known_fields: std::collections::HashSet<&str> =
                 meta.fields.iter().map(|f| f.key.as_str()).collect();
             for key in obj.keys() {
-                if key == "parentId" || key == "fields" {
+                // Reserved per-instance keys (`_label`, `_is_output`,
+                // `_tags`) are validated by the parser and never need
+                // to match a declared port. `parentId` / `fields` are
+                // layout-side keys co-resident in the same config blob.
+                if key.starts_with('_') || key == "parentId" || key == "fields" {
                     continue;
                 }
                 if known_inputs.contains(key.as_str())
@@ -670,29 +673,31 @@ fn check_port_coverage(
             }
         }
 
-        // form-field-conflict: form fields materialize as ports. If a
-        // form field's key clashes with an already-declared port, the
-        // generated port would collide. Catch at validate.
+        // form-field-conflict: form fields materialize as ports. If
+        // a form field's key clashes with an already-declared port,
+        // the generated port would collide.
+        //
+        // Form-derived ports already live in `node.inputs` /
+        // `node.outputs` after enrich. Duplicate-detection runs PER
+        // SIDE: a single field can't materialize twice in `inputs`
+        // (or twice in `outputs`), but a node legitimately can have
+        // an input AND an output sharing a name (e.g. a passthrough
+        // `value`/`value`). Crossing the chain would false-positive
+        // every passthrough that happens to declare a form schema.
         if node.features.has_form_schema {
-            if let Some(fields) = node.config.get("fields").and_then(|v| v.as_array()) {
-                let declared: std::collections::HashSet<&str> = node
-                    .inputs
-                    .iter()
-                    .chain(node.outputs.iter())
-                    .map(|p| p.name.as_str())
-                    .collect();
-                for f in fields {
-                    let Some(key) = f.get("key").and_then(|v| v.as_str()) else { continue };
-                    // Skip self-fields (the form schema port itself).
-                    if declared.iter().filter(|n| **n == key).count() > 1 {
+            for ports in [&node.inputs, &node.outputs] {
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for port in ports.iter() {
+                    if !seen.insert(port.name.as_str()) {
                         push(
                             d,
                             line,
                             Severity::Error,
                             "form-field-conflict",
                             format!(
-                                "form field key '{}' collides with an existing port on '{}'",
-                                key, node.id
+                                "form field key '{}' duplicates a port of the same direction on '{}'",
+                                port.name, node.id
                             ),
                         );
                     }

@@ -9,7 +9,9 @@
   } from './lib/ai/weft-parser';
   import { registerCatalog, type CatalogEntry } from './lib/nodes';
   import { translateProject } from './host-bridge';
-  import type { ProjectDefinition as V1Project, LiveDataItem, NodeExecution } from './lib/types';
+  import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
+  import type { ProjectDefinition as V1Project, NodeExecution } from './lib/types';
+  import type { ActionBarState, ActionAvailability, NodeFeedState } from '../shared/protocol';
 
   let project: V1Project | null = $state(null);
   let error: string | null = $state(null);
@@ -19,45 +21,37 @@
   let editorRef: any = $state();
 
   // Live execution state fed by the host's exec follower.
-  // activeEdges is a Set of graph edge IDs currently pulsing.
-  // nodeStatuses/nodeOutputs snapshot the last-observed values.
+  // nodeStatuses/nodeOutputs snapshot the last-observed values per
+  // node; nodeExecutions tracks the rolling history per node.
   let executionState = $state<{
     isRunning: boolean;
-    activeEdges: Set<string>;
     nodeStatuses: Record<string, string>;
     nodeOutputs: Record<string, unknown>;
     nodeExecutions: Record<string, NodeExecution[]>;
   }>({
     isRunning: false,
-    activeEdges: new Set(),
     nodeStatuses: {},
     nodeOutputs: {},
     nodeExecutions: {},
   });
 
-  // Per-node live data items (the node body renders these inline when
-  // features.showDebugPreview / features.hasLiveData is set).
-  let liveDataByNode = $state<Record<string, LiveDataItem[]>>({});
+  // Per-node body-panel feeds. Each node ID maps to AT MOST ONE
+  // feed depending on type:
+  //   - infra nodes (requires_infra=true)  → infraFeedByNode
+  //   - trigger nodes (features.isTrigger) → signalFeedByNode
+  //   - debug nodes  (features.showDebugPreview) → executionState.nodeOutputs
+  //   - everything else → no body-panel; modal inspector only.
+  // Each feed entry is `NodeFeedState`: ok with items, or error with a
+  // message. NEVER a fallback to execution data on the wrong feed.
+  let infraFeedByNode = $state<Record<string, NodeFeedState>>({});
+  let signalFeedByNode = $state<Record<string, NodeFeedState>>({});
 
-  // Cluster-side infra lifecycle state. Combined from:
-  //   - the parse result (does the project declare any infra node?
-  //     → hasInfraInFrontend), and
-  //   - the host's /infra/status poll (what's the cluster saying
-  //     now? → hasInfraInBackend + status + nodes).
-  // The ActionBar hides entirely unless hasInfrastructure is true,
-  // so we need the frontend-derived signal so a freshly-authored
-  // project with infra nodes but nothing provisioned yet still
-  // shows the Start button.
-  let hasInfraInFrontend = $state(false);
-  let hasInfraInBackend = $state(false);
-  let hasTriggersInFrontend = $state(false);
-  let infraBackendStatus = $state<'none' | 'running' | 'stopped' | 'mixed'>('none');
-  let infraTransitional = $state<'starting' | 'stopping' | 'terminating' | null>(null);
-  let infraBackendNodes = $state<Array<{ nodeId: string; nodeType: string; instanceId: string; status: string }>>([]);
-  let infraIsLoading = $state(true);
-  let triggerProjectStatus = $state<'registered' | 'active' | 'inactive' | 'unknown'>('unknown');
-  let triggerTransitional = $state<'activating' | 'deactivating' | null>(null);
-  let triggerFirstResponseReceived = $state(false);
+  // Source-derived flags: does the project DECLARE infra / trigger
+  // nodes. Driven by parse results, not by backend state. Used to
+  // gate visibility of bar sections (don't show the Infra section
+  // for a project with no infra nodes in source).
+  let hasInfraInGraph = $state(false);
+  let hasTriggersInGraph = $state(false);
 
   // Auto-follow state. The host-side controller owns the actual
   // decisions; we just render the badge and forward clicks.
@@ -65,43 +59,47 @@
   let followColor = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
   let sourceOpen = $state(false);
-  let buildVerb = $state<'run' | 'activate' | 'infraStart' | undefined>(undefined);
 
-  // Per-node gate for the inline live-data strip. Only nodes
-  // whose type declares `features.hasLiveData` opt into having
-  // in/out pulses rendered under the node body. Without this
-  // gate every node that executed would show an input/output
-  // strip, which is noise: users should use the modal inspector
-  // (click the icon) to see input/output for arbitrary nodes.
-  // WhatsAppBridge is the canonical yes (QR code + status);
-  // WhatsAppReceive, WhatsAppSend, Debug, etc. are no.
-  let hasLiveDataByNode = $state<Record<string, boolean>>({});
-
-  // Effective status the ActionBar reads: transitional wins over
-  // the polled backend state so the button shows "Starting..."
-  // immediately when the user clicks, not 3 seconds later.
-  let infraState = $derived({
-    hasInfrastructure: hasInfraInFrontend || hasInfraInBackend,
-    hasInfraInFrontend,
-    hasInfraInBackend,
-    status: (infraTransitional ?? infraBackendStatus) as string,
-    nodes: infraBackendNodes,
-    isLoading: infraIsLoading,
+  // Action-bar state: single source of truth for what the bar
+  // renders. The host's ActionBarStore pushes every transition;
+  // the webview is a pure renderer that reads from this store.
+  // `backend` always present, `overlay` carries the user-action
+  // layer, `error` sticky banner.
+  let actionBarState = $state<ActionBarState>({
+    backend: {
+      available: [],
+      status: 'unknown',
+      mode: 'unknown',
+      infraRollup: 'none',
+      runningCount: 0,
+    },
+    overlay: { kind: 'idle' },
   });
 
-  let triggerState = $derived({
-    hasTriggers: hasTriggersInFrontend,
-    isActive: triggerProjectStatus === 'active' && triggerTransitional !== 'deactivating',
-    // Only show "Checking..." while a transition the user just
-    // asked for is in flight, or on the very first poll before
-    // any response lands. The ActionBar greys the Activate button
-    // out via its own `infraBlocking` check when infra exists but
-    // isn't running, so we don't have to re-implement that here.
-    isLoading:
-      triggerTransitional !== null || (!triggerFirstResponseReceived && hasTriggersInFrontend),
-  });
+  // Latest /status snapshot. Drives the action bar's drift
+  // indicators (Resync/Upgrade lights) AND the graph's per-node
+  // infra badges. Stays current across cli_running so the lights
+  // don't blink mid-verb.
+  let statusSnapshot = $state<ActionAvailability | undefined>(undefined);
 
   onMount(() => {
+    // Bubble-up listener for per-node action buttons (e.g. the
+    // Regenerate-API-key button on a trigger node). ProjectNode
+    // dispatches a `weft-signal-action` CustomEvent; we forward
+    // to the host which calls /projects/{id}/signals/{node_id}/action.
+    const onSignalAction = (e: Event) => {
+      const ce = e as CustomEvent<{ nodeId: string; actionKind: string; payload?: unknown; confirm?: string }>;
+      const detail = ce.detail;
+      if (!detail || typeof detail.nodeId !== 'string' || typeof detail.actionKind !== 'string') return;
+      send({
+        kind: 'signalAction',
+        nodeId: detail.nodeId,
+        actionKind: detail.actionKind,
+        payload: detail.payload,
+        confirm: detail.confirm,
+      });
+    };
+    window.addEventListener('weft-signal-action', onSignalAction as EventListener);
     const unsub = onMessage((msg) => {
       if (msg.kind === 'catalogAll') {
         registerCatalog(msg.catalog as unknown as Record<string, CatalogEntry>);
@@ -122,25 +120,18 @@
           editorRef.applyExternalSource?.(msg.source, msg.layoutCode);
         }
         // Recompute "source has infra / triggers" flags on every
-        // parse so the ActionBar follows the user's edits. These
-        // drive ActionBar visibility without waiting for the poll.
-        const catalog = msg.response.catalog;
-        hasInfraInFrontend = msg.response.project.nodes.some((n) => {
-          const entry = catalog[n.nodeType] as { requires_infra?: boolean } | undefined;
-          return (n as unknown as { requiresInfra?: boolean }).requiresInfra ?? entry?.requires_infra ?? false;
-        });
-        hasTriggersInFrontend = msg.response.project.nodes.some((n) => {
-          const entry = catalog[n.nodeType] as { features?: { isTrigger?: boolean } } | undefined;
-          return (n.features?.isTrigger ?? entry?.features?.isTrigger) ?? false;
-        });
-        // Build the per-node gate so the liveData handler can
-        // drop pulses for nodes that didn't opt in.
-        hasLiveDataByNode = Object.fromEntries(
-          msg.response.project.nodes.map((n) => {
-            const entry = catalog[n.nodeType] as { features?: { hasLiveData?: boolean } } | undefined;
-            const on = (n.features?.hasLiveData ?? entry?.features?.hasLiveData) ?? false;
-            return [n.id, on];
+        // parse so the ActionBar follows the user's edits. Source-
+        // derived (independent of backend state) so a freshly
+        // authored project with infra nodes shows the Start button
+        // even before anything is provisioned.
+        hasInfraInGraph = msg.response.project.nodes.some((n) =>
+          nodeRequiresInfra({
+            nodeType: n.nodeType,
+            requiresInfra: (n as unknown as { requiresInfra?: boolean }).requiresInfra,
           }),
+        );
+        hasTriggersInGraph = msg.response.project.nodes.some((n) =>
+          nodeIsTrigger({ nodeType: n.nodeType, features: n.features }),
         );
         error = null;
         return;
@@ -152,12 +143,10 @@
       if (msg.kind === 'execReset') {
         executionState = {
           isRunning: true,
-          activeEdges: new Set(),
           nodeStatuses: {},
           nodeOutputs: {},
           nodeExecutions: {},
         };
-        liveDataByNode = {};
         return;
       }
       if (msg.kind === 'execTerminal') {
@@ -196,7 +185,7 @@
         // retried/completed/failed/skipped) on the same record;
         // we mutate the existing row, not append. Failure +
         // retry will close the live attempt into prior_attempts
-        // and reset the live fields — until that wires up, a
+        // and reset the live fields; until that wires up, a
         // fresh dispatch after a terminal row goes into the same
         // row's history (one pulse per (node, lane)).
         const now = Date.now();
@@ -249,42 +238,16 @@
           ...executionState.nodeExecutions,
           [e.nodeId]: nextRows,
         };
-        return;
-      }
-      if (msg.kind === 'edgeActive') {
-        const next = new Set(executionState.activeEdges);
-        if (msg.event.active) next.add(msg.event.edgeId);
-        else next.delete(msg.event.edgeId);
-        executionState.activeEdges = next;
-        return;
-      }
-      if (msg.kind === 'infraStatus') {
-        const snap = msg.snapshot;
-        hasInfraInBackend = snap.nodes.length > 0;
-        infraBackendStatus = snap.rollup;
-        infraBackendNodes = snap.nodes.map((n) => ({
-          nodeId: n.nodeId,
-          nodeType: '',
-          instanceId: n.nodeId,
-          status: n.status,
-        }));
-        infraIsLoading = false;
-        // Clear the optimistic transitional state once the backend
-        // poll reports ANY settled rollup. We match by expected
-        // end state where possible ('starting' expects 'running',
-        // 'stopping' expects 'stopped'/'none', 'terminating'
-        // expects 'none'), but we also bail out if the user
-        // interacted and the backend rollup is plainly different
-        // from what we'd see mid-transition, to avoid getting
-        // stuck forever if the transition overshoots or the
-        // click-side optimistic state is stale.
-        const expected: Record<string, Array<'running' | 'stopped' | 'mixed' | 'none'>> = {
-          starting: ['running', 'mixed'],
-          stopping: ['stopped', 'none'],
-          terminating: ['none'],
-        };
-        if (infraTransitional && expected[infraTransitional]?.includes(snap.rollup)) {
-          infraTransitional = null;
+        // Debug preview (`features.showDebugPreview`) reads its
+        // last output from `executionState.nodeOutputs[id]`. Update
+        // it on completion. Earlier this rode the liveData channel;
+        // now it taps the exec event directly so the body-panel
+        // feeds (infra / signal display) cannot interfere.
+        if (state === 'completed' && e.output !== undefined) {
+          executionState.nodeOutputs = {
+            ...executionState.nodeOutputs,
+            [e.nodeId]: e.output,
+          };
         }
         return;
       }
@@ -298,82 +261,41 @@
         sourceOpen = msg.open;
         return;
       }
-      if (msg.kind === 'buildState') {
-        buildVerb = msg.active ? msg.verb : undefined;
+      if (msg.kind === 'actionBarState') {
+        actionBarState = msg.state;
         return;
       }
-      if (msg.kind === 'actionFailed') {
-        // Something went wrong on the dispatcher side. Drop any
-        // optimistic transitional flag so the ActionBar stops
-        // showing "Activating..." / "Starting..." forever. The
-        // toast has already surfaced the concrete error to the
-        // user via the host-side showErrorMessage.
-        if (
-          msg.action === 'infraStart' ||
-          msg.action === 'infraStop' ||
-          msg.action === 'infraTerminate'
-        ) {
-          infraTransitional = null;
-        } else {
-          triggerTransitional = null;
-        }
+      if (msg.kind === 'statusSnapshot') {
+        statusSnapshot = msg.snapshot;
         return;
       }
-      if (msg.kind === 'triggerStatus') {
-        const prevStatus = triggerProjectStatus;
-        triggerProjectStatus = msg.snapshot.projectStatus;
-        triggerFirstResponseReceived = true;
-        // Clear the optimistic transitional flag on any settled
-        // state that matches the user's intent, or when the
-        // status visibly changed (even if not to the exact end
-        // state we expected). Last-resort timeout handled by
-        // actionFailed when the POST errors out.
-        if (triggerTransitional === 'activating') {
-          if (triggerProjectStatus === 'active' || prevStatus !== triggerProjectStatus) {
-            triggerTransitional = null;
-          }
-        } else if (triggerTransitional === 'deactivating') {
-          if (triggerProjectStatus !== 'active' || prevStatus !== triggerProjectStatus) {
-            triggerTransitional = null;
-          }
-        }
+      if (msg.kind === 'infraLive') {
+        // Sidecar /live tick for one infra node. Always overwrite
+        // the previous tick: pollers are independent, errors are
+        // user-visible, no fallback.
+        const { nodeId, ...feed } = msg;
+        infraFeedByNode = { ...infraFeedByNode, [nodeId]: feed };
         return;
       }
-      if (msg.kind === 'liveData') {
-        // Only surface the inline live strip on nodes that opted in
-        // via `features.hasLiveData`. Everything else flows through
-        // the modal inspector (click the node's icon) and the
-        // NodeExecution rows we maintain separately.
-        if (hasLiveDataByNode[msg.nodeId]) {
-          liveDataByNode = {
-            ...liveDataByNode,
-            [msg.nodeId]: msg.items,
-          };
-        }
-        // Still fold outputs into nodeOutputs so the Debug node's
-        // inline preview (showDebugPreview) has something to read,
-        // regardless of hasLiveData. Debug doesn't opt into
-        // hasLiveData but DOES read the last output chip.
-        for (const item of msg.items) {
-          if (typeof item.label === 'string' && item.label.startsWith('out.')) {
-            executionState.nodeOutputs = {
-              ...executionState.nodeOutputs,
-              [msg.nodeId]: item.data,
-            };
-          }
-        }
+      if (msg.kind === 'signalDisplay') {
+        // Listener /display tick for one trigger node. Overwrite
+        // semantics same as infraLive.
+        const { nodeId, ...feed } = msg;
+        signalFeedByNode = { ...signalFeedByNode, [nodeId]: feed };
         return;
       }
     });
     send({ kind: 'ready' });
-    return unsub;
+    return () => {
+      unsub();
+      window.removeEventListener('weft-signal-action', onSignalAction as EventListener);
+    };
   });
 
   function onSave(data: {
     name?: string;
     description?: string;
     weftCode?: string;
-    loomCode?: string;
     layoutCode?: string;
   }) {
     if (data.weftCode !== undefined && data.weftCode !== weftCode) {
@@ -386,50 +308,49 @@
     }
   }
 
+  // Verb dispatchers. Each flushes pending edit saves (so the
+  // build sees the user's freshest source) when the verb spawns
+  // a worker, and forwards the message to the host. The host's
+  // CLI runner emits progress events that drive every UI
+  // transition; the webview never sets transitional flags itself.
   function onRun() {
-    // Don't flip isRunning here. The host posts buildState=true
-    // first (drives the "Building..." button), and the actual
-    // run-started signal arrives via the dispatcher's
-    // ExecutionStarted SSE event, which sets isRunning through
-    // the execEvent handler. Setting isRunning=true here would
-    // leave the UI showing "Stop" if the build is cancelled
-    // (since cancellation never reaches the run-started path).
-    //
-    // Flush any pending debounced saves first. The graph editor
-    // debounces saveWeft for ~1s after every keystroke; without
-    // this flush, clicking Run while a save is still queued
-    // builds against the stale on-disk source.
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'runProject' });
   }
-
-  function onStop() {
-    send({ kind: 'stopProject' });
+  // Stop is generic now: the host inspects the bar's current
+  // state and either kills the spawned CLI process group
+  // (cli_running) or POSTs /executions/{color}/cancel
+  // (execution_running). One verb, state-aware behavior.
+  function onStop() { send({ kind: 'stopAction' }); }
+  function onDismissError() { send({ kind: 'dismissError' }); }
+  function onActivate() {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'activateProject' });
   }
-
+  function onDeactivate() { send({ kind: 'deactivateProject' }); }
+  function onCancelActivate() { send({ kind: 'cancelActivate' }); }
+  function onReactivate() {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'reactivateProject' });
+  }
+  function onCancelRunning() { send({ kind: 'cancelRunning' }); }
+  function onResumeActive() {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'resumeActive' });
+  }
+  function onResync() {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'resyncProject' });
+  }
   function onStartInfra() {
     editorRef?.flushAllPendingSaves?.();
-    infraTransitional = 'starting';
     send({ kind: 'infraStart' });
   }
-  function onStopInfra() {
-    infraTransitional = 'stopping';
-    send({ kind: 'infraStop' });
-  }
-  function onTerminateInfra() {
-    infraTransitional = 'terminating';
-    send({ kind: 'infraTerminate' });
-  }
-
-  function onToggleTrigger() {
-    if (triggerProjectStatus === 'active') {
-      triggerTransitional = 'deactivating';
-      send({ kind: 'deactivateProject' });
-    } else {
-      editorRef?.flushAllPendingSaves?.();
-      triggerTransitional = 'activating';
-      send({ kind: 'activateProject' });
-    }
+  function onStopInfra() { send({ kind: 'infraStop' }); }
+  function onTerminateInfra() { send({ kind: 'infraTerminate' }); }
+  function onUpgradeInfra() {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'infraUpgrade' });
   }
 </script>
 
@@ -452,15 +373,26 @@
       {onSave}
       {onRun}
       {onStop}
-      onCancelBuild={() => send({ kind: 'cancelBuild' })}
-      executionState={{ ...executionState, buildVerb }}
-      {infraState}
-      {triggerState}
-      {onToggleTrigger}
+      {onDismissError}
+      {onActivate}
+      {onCancelActivate}
+      {onDeactivate}
+      {onReactivate}
+      {onCancelRunning}
+      {onResumeActive}
+      {onResync}
       {onStartInfra}
       {onStopInfra}
       {onTerminateInfra}
-      infraLiveData={liveDataByNode}
+      {onUpgradeInfra}
+      {actionBarState}
+      drift={statusSnapshot}
+      infraNodes={statusSnapshot?.infraNodes}
+      {hasInfraInGraph}
+      {hasTriggersInGraph}
+      {executionState}
+      {infraFeedByNode}
+      {signalFeedByNode}
     />
   {:else}
     <div class="p-4 text-muted-foreground">loading graph...</div>

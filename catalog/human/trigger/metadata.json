@@ -30,9 +30,6 @@
       "description": "Each field contributes an output port per its fieldType (see form_field_specs)."
     }
   ],
-  "entrySignals": [
-    { "kind": "form", "is_resume": false }
-  ],
   "requires_infra": false,
   "features": {
     "isTrigger": true,

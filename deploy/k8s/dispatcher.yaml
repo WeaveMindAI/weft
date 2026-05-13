@@ -14,22 +14,31 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: weft-dispatcher
+# Scoped to exactly what dispatcher's `kubectl apply` / `kubectl
+# delete` paths touch: tenant pods (workers, sidecars), the
+# listener Deployment+Service, tenant namespace bundles
+# (Namespace + ServiceAccount + NetworkPolicy). No ConfigMap, Job,
+# PVC, Ingress, or read-only diagnostics. Sweeper uses `get` on
+# pods to list terminal-phase ones; that's it.
 rules:
   - apiGroups: [""]
-    resources: [pods, pods/log, services, configmaps, persistentvolumeclaims, events, namespaces]
-    verbs: [get, list, watch, create, update, patch, delete]
+    resources: [namespaces]
+    verbs: [get, list, create]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [get, list, create, update, patch, delete]
   - apiGroups: [apps]
-    resources: [deployments, replicasets]
-    verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [apps]
-    resources: [deployments/scale]
-    verbs: [get, update, patch]
-  - apiGroups: [batch]
-    resources: [jobs]
-    verbs: [get, list, watch, create, update, patch, delete]
+    resources: [deployments]
+    verbs: [get, list, create, update, patch, delete]
   - apiGroups: [networking.k8s.io]
-    resources: [ingresses]
-    verbs: [get, list, watch, create, update, patch, delete]
+    resources: [networkpolicies]
+    verbs: [get, list, create, update, patch, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -44,14 +53,10 @@ roleRef:
   name: weft-dispatcher
   apiGroup: rbac.authorization.k8s.io
 ---
-# StatefulSet for the dispatcher.
-# Note: the `weft-internal-secret` Secret is created imperatively
-# by `weft daemon start` (NOT in this manifest). Re-applying this
-# file does not touch the Secret, so the fresh random value
-# survives manifest re-applies. Stable Pod IDs
-# (`weft-dispatcher-0`, `-1`, ...) so the lease tables in Postgres
-# can record `owner_pod_id` and any Pod can route forwards via
-# headless Service DNS.
+# StatefulSet for the dispatcher. Stable Pod IDs
+# (`weft-dispatcher-0`, `-1`, ...) so each Pod can claim worker /
+# task / tenant_listener leases in Postgres with a stable
+# `owner_pod_id`.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -59,6 +64,7 @@ metadata:
   namespace: weft-system
   labels:
     app: weft-dispatcher
+    weft.dev/role: dispatcher
 spec:
   serviceName: weft-dispatcher-headless
   replicas: 1
@@ -70,6 +76,7 @@ spec:
     metadata:
       labels:
         app: weft-dispatcher
+        weft.dev/role: dispatcher
     spec:
       serviceAccountName: weft-dispatcher
       terminationGracePeriodSeconds: 60
@@ -91,17 +98,30 @@ spec:
               value: weft-system
             - name: WEFT_TENANT_NS_PREFIX
               value: wm-
-            - name: WEFT_DISPATCHER_CALLBACK_URL
-              value: http://weft-dispatcher.weft-system.svc.cluster.local:9999
-            - name: WEFT_INTERNAL_URL_TEMPLATE
-              value: http://{pod}.weft-dispatcher-headless.weft-system.svc.cluster.local:9999
             - name: WEFT_LISTENER_IMAGE
               value: weft-listener:local
             - name: WEFT_DATABASE_URL
-              value: postgres://weft:weft-local-dev@weft-postgres.weft-system.svc.cluster.local:5432/weft
-          envFrom:
-            - secretRef:
-                name: weft-internal-secret
+              valueFrom:
+                secretKeyRef:
+                  name: weft-postgres-credentials
+                  key: WEFT_DATABASE_URL
+            # Cluster CIDR knobs: required in-cluster so the
+            # dispatcher can render NetworkPolicies that allow
+            # internet egress while denying intra-cluster Pod traffic.
+            # The default values match Kind's defaults; production
+            # operators MUST override.
+            - name: WEFT_CLUSTER_POD_CIDR
+              value: "10.244.0.0/16"
+            - name: WEFT_CLUSTER_SERVICE_CIDR
+              value: "10.96.0.0/12"
+            - name: WEFT_BROKER_URL
+              value: "http://weft-broker.weft-db.svc.cluster.local:9090"
+            # Public ingress URL surfaced to users in webhook /
+            # activation URLs. Override per-deploy; localhost is the
+            # right default for local dev with `kubectl port-forward`
+            # but production should set the real ingress host.
+            - name: WEFT_DISPATCHER_PUBLIC_BASE_URL
+              value: "http://dispatcher.weft.local"
           readinessProbe:
             httpGet:
               path: /health

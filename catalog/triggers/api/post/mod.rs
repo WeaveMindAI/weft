@@ -1,9 +1,8 @@
 //! ApiPost: webhook trigger. Two phases:
 //!
-//!   - `Phase::TriggerSetup`: build a `WakeSignalKind::Webhook` spec
-//!     from the node's config (path + optional apiKey) and hand it
-//!     to the dispatcher via `ctx.register_signal`. The listener
-//!     mints the URL.
+//!   - `Phase::TriggerSetup`: build a `Webhook` signal from the
+//!     node's config (path + optional apiKey toggle) and register
+//!     it. The dispatcher mounts the public URL.
 //!
 //!   - `Phase::Fire`: the dispatcher seeded the posted JSON on the
 //!     `__seed__` port wrapped as `{body: <json>}`. Forward every
@@ -15,7 +14,7 @@ use serde_json::Value;
 
 use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{WakeSignalKind, WakeSignalSpec, WebhookAuth};
+use weft_core::signal::{Webhook, WebhookAuth};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
 pub struct ApiPostNode;
@@ -42,18 +41,18 @@ impl Node for ApiPostNode {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let auth = if ctx.config.values.contains_key("apiKey") {
-                    WebhookAuth::OptionalApiKey {
-                        field: "apiKey".into(),
-                    }
+                let auth = if ctx
+                    .config
+                    .values
+                    .get("generateApiKey")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    WebhookAuth::OptionalApiKey
                 } else {
                     WebhookAuth::None
                 };
-                let spec = WakeSignalSpec {
-                    kind: WakeSignalKind::Webhook { path, auth },
-                    is_resume: false,
-                };
-                ctx.register_signal(spec).await?;
+                ctx.register_signal(Webhook { path, auth }).await?;
                 Ok(NodeOutput::empty())
             }
             Phase::Fire => {

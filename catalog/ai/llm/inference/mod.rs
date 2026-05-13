@@ -113,7 +113,7 @@ impl Node for LlmInferenceNode {
             let effort = effective
                 .get("reasoningEffort")
                 .and_then(|v| v.as_str())
-                .unwrap_or("medium")
+                .unwrap_or("none")
                 .to_string();
             cp = cp.with_reasoning(ReasoningConfig {
                 effort: Some(effort),

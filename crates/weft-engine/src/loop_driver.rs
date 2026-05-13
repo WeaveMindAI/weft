@@ -1,26 +1,37 @@
-//! The pulse loop. Given a project, a wake spec, and a dispatcher
-//! link, drive the scheduler until completion, failure, or stall.
+//! The pulse loop. Drives the scheduler for a single execution
+//! color until completion, failure, or stall.
 //!
-//! Key shape (Phase A Slice 3):
-//! - Ready nodes are dispatched as tokio tasks into a `JoinSet`.
-//! - Each task runs the node's async `execute` and reports back
-//!   through an mpsc channel whose items the main loop applies to
+//! Shape:
+//! - Boot: fold the journal for this color to recover pulses,
+//!   executions, and pending deliveries. If the journal is empty
+//!   we wait briefly for the producer to write `ExecutionStarted`
+//!   + `PulseSeeded`, then re-fold.
+//! - Dispatch: ready nodes go into a `JoinSet` as tokio tasks.
+//!   Each task runs the node's async `execute` and reports back
+//!   through an mpsc channel; the main loop applies results to
 //!   `pulses` and `executions` (single-writer invariant).
-//! - When a node calls `ctx.await_signal(...)`, its task parks on a
-//!   oneshot inside the `DispatcherLink` until the dispatcher sends
-//!   the matching `Deliver`. Other lanes keep running.
-//! - Stall = no ready nodes, no in-flight tasks, at least one
-//!   NodeExecution in WaitingForInput. The loop serializes an
-//!   `ExecutionSnapshot`, sends `Stalled` over the link, awaits the
-//!   `StalledAck`, and exits. A later worker invocation picks up the
-//!   snapshot and resumes.
-//! - Completion = no ready nodes, no in-flight tasks, no waiting.
+//! - Suspend: a node calling `ctx.await_signal(...)` returns
+//!   `WeftError::Suspended { token }` from the spawned task; the
+//!   loop's `apply_results` records the token in `waiting`. The
+//!   fold at boot seeds any already-resolved suspensions in
+//!   `awaited_sequences`; bodies pop entries in call_index order.
+//!   When nothing is making progress and at least one lane is
+//!   waiting, the loop returns `Stalled`.
+//! - Stall / Stuck: when drive() runs out of work but pulses or
+//!   waiting suspensions remain, `run_one_execution` re-fetches
+//!   the journal and re-folds. New SuspensionResolved rows that
+//!   landed during drive() get picked up; the loop drives again.
+//!   Only after the journal has stabilized does the worker
+//!   actually exit (Stalled = waiting on more fires; Stuck =
+//!   graph-shape bug).
+//! - Completion: no ready nodes, no in-flight tasks, nothing
+//!   waiting. Journal a terminal event and return.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use weft_core::context::{ConfigBag, InputBag};
@@ -29,36 +40,25 @@ use weft_core::exec::{
     preprocess_input, NodeExecution, NodeExecutionStatus, NodeExecutionTable,
 };
 use weft_core::node::NodeOutput;
-use weft_core::primitive::{ExecutionSnapshot, WakeMessage};
+use weft_core::primitive::ExecutionSnapshot;
 use weft_core::project::EdgeIndex;
-use weft_core::pulse::{Pulse, PulseTable};
+use weft_core::pulse::PulseTable;
+use weft_core::cancellation::CancellationFlag;
 use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
+
+use weft_journal::JournalClient;
 
 use crate::context::{
     ship_node_completed, ship_node_failed, ship_node_resumed, ship_node_skipped,
-    ship_node_started, ship_node_suspended, RunnerHandle,
+    ship_node_started, ship_node_suspended, EngineClients, RunnerHandle,
 };
-use crate::dispatcher_link::{DispatcherLink, StartPacket};
 
-// Re-exported for backwards compat; the wake spec is now carried by
-// the Start packet but callers may still want to construct wakes
-// manually for detached tests.
-pub use weft_core::primitive::RootSeed;
-
-#[derive(Debug, Clone)]
-pub enum WakeSpec {
-    Fresh {
-        entry_node: Option<String>,
-        entry_value: Value,
-    },
-    Resume {
-        entry_node: String,
-        entry_value: Value,
-    },
-    FreshMulti {
-        seeds: Vec<RootSeed>,
-    },
-}
+/// Maximum re-fetch attempts when drive() returns Stalled/Stuck.
+/// Each iteration re-reads the journal and reapplies the snapshot,
+/// so this bounds the worst-case loop on a misconfigured graph.
+/// In practice 0 or 1 is enough: 0 when the snapshot was already
+/// complete, 1 when fires landed during drive's run.
+const REFETCH_MAX_ITERS: u32 = 8;
 
 /// Outcome the loop reports back to the binary wrapper.
 #[derive(Debug, Clone)]
@@ -66,307 +66,215 @@ pub enum LoopOutcome {
     Completed { outputs: Value },
     Failed { error: String },
     /// Worker stalled: at least one lane is waiting for a signal.
-    /// Snapshot has been shipped over the link; worker should exit.
+    /// Worker should exit; the next fire's `register_signal` task
+    /// will resume by re-folding the journal.
     Stalled,
     /// Scheduler ran to quiescence but pulses remain pending and
     /// nothing is waiting. Treat as a graph-shape bug.
     Stuck,
 }
 
-/// Entry point used by in-process tests (no dispatcher link).
-/// Seeds pulses per the given `wake` and drives the loop to
-/// completion. Nodes calling `await_signal` will error because the
-/// link is absent; keep tests to graphs that don't suspend.
-pub async fn run_loop(
+/// Run one execution to a terminal state or a stall. Each call folds
+/// the journal once on entry and re-folds after Stalled/Stuck up to
+/// `REFETCH_MAX_ITERS` to absorb deliveries that landed during
+/// drive(). `pod_name` stamps every journal write so the fencing
+/// trigger can reject writes from a Pod whose row is no longer alive.
+pub async fn run_one_execution(
     project: ProjectDefinition,
     catalog: Arc<dyn NodeCatalog>,
     color: Color,
-    wake: WakeSpec,
-    dispatcher_url: Option<&str>,
-    cancellation: Arc<Notify>,
+    clients: EngineClients,
+    pod_name: String,
+    tenant_id: String,
+    cancellation: Arc<CancellationFlag>,
 ) -> anyhow::Result<LoopOutcome> {
-    let _ = dispatcher_url;
     let edge_idx = EdgeIndex::build(&project);
     let mut pulses: PulseTable = Default::default();
     let mut executions: NodeExecutionTable = Default::default();
+    // Per-(node, lane) ordered list of past `await_signal` calls.
+    // Pre-loaded from the journal fold; consumed by the body's
+    // `await_signal` calls in call_index order. Replaces the
+    // single-token `expected_tokens` HashMap from the
+    // single-await-per-body world.
+    let mut awaited_sequences: HashMap<
+        (String, weft_core::lane::Lane),
+        Vec<weft_core::primitive::AwaitedEntry>,
+    > = HashMap::new();
 
-    seed_from_wake_spec(&wake, color, &project, &edge_idx, &mut pulses)?;
-
-    let exec_id = uuid::Uuid::new_v4().to_string();
-    drive(
-        &project,
-        &edge_idx,
-        catalog.as_ref(),
-        &exec_id,
-        color,
-        None,
-        &cancellation,
-        &mut pulses,
-        &mut executions,
-        HashMap::new(),
-        weft_core::context::Phase::Fire,
-    )
-    .await
-}
-
-/// Entry point used by the compiled project binary. Connects to the
-/// dispatcher, handshakes, restores state from the Start packet,
-/// drives the loop, ships the terminal status over the link.
-pub async fn run_with_link(
-    project: ProjectDefinition,
-    catalog: Arc<dyn NodeCatalog>,
-    color: Color,
-    dispatcher_url: &str,
-    cancellation: Arc<Notify>,
-) -> anyhow::Result<LoopOutcome> {
-    let (link, start) = DispatcherLink::connect(dispatcher_url, color).await?;
-    // Hook the link's Cancel handler up to our cancellation Notify
-    // so a `DispatcherToWorker::Cancel` actually wakes the loop's
-    // `cancellation.notified()` await. Without this, Cancel
-    // messages arrive at the link but are silently dropped.
-    link.set_cancellation(cancellation.clone()).await;
-    let edge_idx = EdgeIndex::build(&project);
-    let mut pulses: PulseTable = Default::default();
-    let mut executions: NodeExecutionTable = Default::default();
-    let mut expected_tokens: HashMap<(String, weft_core::lane::Lane), String> = HashMap::new();
-
-    let StartPacket { wake, snapshot, worker_instance_id: _ } = start;
-
-    // The dispatcher's fold is the single source of truth for this
-    // color's state. When `snapshot` is present we seed the link
-    // with every pending delivery (fires not yet consumed) and
-    // restore pulses + executions. When absent (unusual: event log
-    // empty), we seed from the wake message.
-    let had_snapshot = snapshot.is_some();
-    // Phase for this worker lifetime. Fresh runs carry it on the
-    // wake; Resume continues the original phase (Fire, since no
-    // snapshotted run was ever launched in InfraSetup or
-    // TriggerSetup).
-    let phase = match &wake {
-        WakeMessage::Fresh { phase, .. } => *phase,
-        WakeMessage::Resume => weft_core::context::Phase::Fire,
-    };
-    if let Some(snap) = snapshot {
-        for (token, value) in snap.pending_deliveries.clone() {
-            link.seed_delivery(token, value).await;
+    // Fold the journal: this is the source of truth. If the log is
+    // non-empty (resume case), apply it to seed pulses, executions,
+    // and pending deliveries. If empty, the producer just journaled
+    // ExecutionStarted + PulseSeeded; wait briefly for the rows.
+    let journal = clients.journal.clone();
+    let mut events = fetch_events(journal.as_ref(), color).await?;
+    if events.is_empty() {
+        // Wait up to 6s (30 * 200ms) for the producer to commit. The
+        // sleep yields to cancellation: a cancel landing mid-wait
+        // breaks us out instead of forcing the worker to sit idle.
+        for _ in 0..30 {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                _ = cancellation.cancelled() => {
+                    return Ok(LoopOutcome::Failed { error: "cancelled".into() });
+                }
+            }
+            let evs = fetch_events(journal.as_ref(), color).await?;
+            if !evs.is_empty() {
+                events = evs;
+                break;
+            }
         }
-        apply_snapshot(snap, &mut pulses, &mut executions, &mut expected_tokens);
     }
-    if !had_snapshot {
-        seed_from_wake_message(&wake, color, &project, &edge_idx, &mut pulses, &expected_tokens)?;
+    // The dispatcher's contract is "ExecutionStarted is journaled
+    // before the worker boots." If we sat through the full wait
+    // and the journal is STILL empty, that contract is broken: bail
+    // loudly instead of silently proceeding with phase=Fire (which
+    // would bypass phase_scope for what might have been a
+    // TriggerSetup execution).
+    if events.is_empty() {
+        anyhow::bail!(
+            "worker booted for color {color} but no ExecutionStarted \
+             arrived within 6s; the dispatcher contract is broken"
+        );
     }
+    // Phase derives from the ExecutionStarted event we now have. No
+    // unwrap_or fallback: if events is non-empty but contains no
+    // ExecutionStarted, the journal is malformed and we fail loud.
+    let phase = events
+        .iter()
+        .find_map(|e| match e {
+            weft_journal::ExecEvent::ExecutionStarted { phase, .. } => Some(*phase),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!(
+            "color {color} has journal events but no ExecutionStarted; \
+             journal is malformed"
+        ))?;
+    let snap = weft_journal::fold_to_snapshot(color, &events);
+    apply_snapshot(snap, &mut pulses, &mut executions, &mut awaited_sequences);
 
     let exec_id = uuid::Uuid::new_v4().to_string();
-    let mut expected_tokens = expected_tokens;
+    // Drive in a re-fetch loop. drive() folds the journal once at
+    // boot and works off that snapshot; SuspensionResolved rows that
+    // arrive while drive() is running are invisible to it. When
+    // drive() returns Stalled/Stuck, refetch the journal: if new
+    // deliveries arrived, fold the new state on top and re-drive.
+    // Cap the loop so a misbehaving fold can't spin forever.
+    let mut event_count_before = events.len();
+    let mut outcome;
+    let mut iters_left = REFETCH_MAX_ITERS;
     loop {
-        let outcome = drive(
+        outcome = drive(
             &project,
             &edge_idx,
             catalog.as_ref(),
             &exec_id,
             color,
-            Some(&link),
+            &clients,
+            &pod_name,
+            &tenant_id,
             &cancellation,
             &mut pulses,
             &mut executions,
-            std::mem::take(&mut expected_tokens),
+            std::mem::take(&mut awaited_sequences),
             phase,
         )
         .await?;
+        if !matches!(outcome, LoopOutcome::Stalled | LoopOutcome::Stuck) {
+            break;
+        }
+        if iters_left == 0 {
+            break;
+        }
+        iters_left -= 1;
+        let fresh = fetch_events(journal.as_ref(), color).await?;
+        if fresh.len() <= event_count_before {
+            break;
+        }
+        event_count_before = fresh.len();
+        let snap = weft_journal::fold_to_snapshot(color, &fresh);
+        apply_snapshot(snap, &mut pulses, &mut executions, &mut awaited_sequences);
+        tracing::info!(
+            target: "weft_engine::resume",
+            color = %color,
+            "re-fetched journal after stall/stuck; re-driving"
+        );
+    }
 
-        match &outcome {
-            LoopOutcome::Completed { outputs } => {
-                link.completed(outputs.clone()).await;
-                return Ok(outcome);
+    match &outcome {
+        LoopOutcome::Completed { outputs } => {
+            journal_terminal(journal.as_ref(), color, &pod_name, true, outputs.clone(), String::new()).await;
+        }
+        LoopOutcome::Failed { error } => {
+            // Cancellation: walk the in-memory snapshot and journal
+            // a NodeCancelled per non-terminal node so the UI's
+            // per-node tally flips to cancelled (not stuck-running).
+            // This used to live in the dispatcher's cancel_color
+            // path; it's the worker's job now since we only know
+            // which nodes are non-terminal AT the moment we exit.
+            if error == "cancelled" {
+                journal_node_cancellations(journal.as_ref(), color, &pod_name).await;
             }
-            LoopOutcome::Failed { error } => {
-                link.failed(error.clone()).await;
-                return Ok(outcome);
-            }
-            LoopOutcome::Stuck => {
-                link.failed("execution stuck".into()).await;
-                return Ok(outcome);
-            }
-            LoopOutcome::Stalled => {
-                // Worker is parked. Wait for the dispatcher to
-                // either send us a fresh Deliver (a fire landed
-                // during the grace window) or tell us to exit.
-                // `wait_after_stall` returns true if a delivery
-                // re-seeded the link and we should drive() again,
-                // false if the dispatcher is letting the worker
-                // exit cleanly.
-                if !link.wait_after_stall().await {
-                    return Ok(outcome);
-                }
-                // A Deliver landed. The previous suspended task's
-                // future has already exited (it returned Suspended);
-                // its exec is in WaitingForInput state and its pulse
-                // is Absorbed. To re-dispatch we have to un-absorb
-                // the pulse for the lane whose token the dispatcher
-                // just delivered. Without this drive() finds no
-                // ready work and stalls again immediately, looping
-                // forever (each iteration journals another Stalled).
-                wake_resuming_lanes_from_stall(&link, &mut pulses, &executions, &mut expected_tokens).await;
-            }
+            journal_terminal(journal.as_ref(), color, &pod_name, false, serde_json::Value::Null, error.clone()).await;
+        }
+        LoopOutcome::Stuck => {
+            journal_terminal(journal.as_ref(), color, &pod_name, false, serde_json::Value::Null, "execution stuck".into()).await;
+        }
+        LoopOutcome::Stalled => {
+            // Worker exits cleanly without writing a terminal event.
+            // Resume happens on the next fire: dispatcher writes a
+            // SuspensionResolved row + enqueues a fresh `resume`
+            // task (the prior task is `complete` so dedup lets a
+            // new one through), and a worker spawns to fold the
+            // updated journal. Nothing extra to journal here.
         }
     }
-}
-
-fn seed_from_wake_spec(
-    wake: &WakeSpec,
-    color: Color,
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-) -> anyhow::Result<()> {
-    match wake {
-        WakeSpec::Fresh { entry_node: Some(entry), entry_value } => {
-            let entry_node_def = project
-                .nodes
-                .iter()
-                .find(|n| &n.id == entry)
-                .ok_or_else(|| anyhow::anyhow!("entry node '{entry}' not found"))?;
-            let entry_port = entry_node_def
-                .inputs
-                .first()
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "__seed__".into());
-            pulses
-                .entry(entry.clone())
-                .or_default()
-                .push(Pulse::new(color, Vec::new(), entry.clone(), entry_port, entry_value.clone()));
-        }
-        WakeSpec::Fresh { entry_node: None, .. } => {}
-        WakeSpec::Resume { entry_node, entry_value } => {
-            seed_resume(entry_node, entry_value, color, project, edge_idx, pulses)?;
-        }
-        WakeSpec::FreshMulti { seeds } => {
-            for seed in seeds {
-                pulses.entry(seed.node_id.clone()).or_default().push(Pulse::new(
-                    color,
-                    Vec::new(),
-                    seed.node_id.clone(),
-                    "__seed__".to_string(),
-                    seed.value.clone(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn seed_from_wake_message(
-    wake: &WakeMessage,
-    color: Color,
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-    _expected_tokens: &HashMap<(String, weft_core::lane::Lane), String>,
-) -> anyhow::Result<()> {
-    let _ = (project, edge_idx);
-    match wake {
-        WakeMessage::Fresh { seeds, phase: _ } => {
-            for seed in seeds {
-                // Use the dispatcher-minted `seed.pulse_id` so the
-                // worker's pulse table and the dispatcher's
-                // journal-folded pulse table mint with identical
-                // UUIDs. NodeStarted's `pulses_absorbed` then
-                // matches on either side by exact UUID.
-                let id = seed
-                    .pulse_id
-                    .parse()
-                    .unwrap_or_else(|_| uuid::Uuid::new_v4());
-                let pulse = Pulse {
-                    id,
-                    color,
-                    lane: Vec::new(),
-                    target_node: seed.node_id.clone(),
-                    target_port: "__seed__".to_string(),
-                    value: seed.value.clone(),
-                    status: weft_core::pulse::PulseStatus::Pending,
-                    gathered: false,
-                };
-                pulses.entry(seed.node_id.clone()).or_default().push(pulse);
-            }
-        }
-        WakeMessage::Resume => {
-            // Nothing to seed: the snapshot already populated pulses.
-        }
-    }
-    Ok(())
-}
-
-fn seed_resume(
-    entry_node: &str,
-    entry_value: &Value,
-    color: Color,
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-) -> anyhow::Result<()> {
-    let entry_node_def = project
-        .nodes
-        .iter()
-        .find(|n| n.id == entry_node)
-        .ok_or_else(|| anyhow::anyhow!("entry node '{entry_node}' not found"))?;
-    for port in &entry_node_def.outputs {
-        let outgoing = edge_idx.get_outgoing(project, entry_node);
-        for edge in outgoing.iter().filter(|e| e.source_handle.as_deref() == Some(&port.name)) {
-            let target_port = edge.target_handle.as_deref().unwrap_or("default");
-            pulses.entry(edge.target.clone()).or_default().push(Pulse::new(
-                color,
-                Vec::new(),
-                edge.target.clone(),
-                target_port.to_string(),
-                entry_value.clone(),
-            ));
-        }
-    }
-    Ok(())
+    Ok(outcome)
 }
 
 fn apply_snapshot(
     snap: ExecutionSnapshot,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
-    expected_tokens: &mut HashMap<(String, weft_core::lane::Lane), String>,
+    awaited_sequences: &mut HashMap<
+        (String, weft_core::lane::Lane),
+        Vec<weft_core::primitive::AwaitedEntry>,
+    >,
 ) {
     *pulses = snap.pulses;
     *executions = snap.executions;
-    for (token, info) in &snap.suspensions {
-        expected_tokens.insert(
-            (info.node_id.clone(), info.lane.clone()),
-            token.clone(),
-        );
-    }
+    *awaited_sequences = snap.awaited_sequences;
 
-    // A WaitingForInput exec resumes ONLY if its token has a
-    // pending delivery. Without this scoping, every fresh worker
-    // spawn would re-dispatch every still-suspended sibling, hit
-    // `await_signal`, find no delivery for its own token, and
-    // return Suspended again — churning the journal with N
-    // spurious NodeStarteds per resume.
+    // A WaitingForInput exec re-dispatches ONLY if at least one of
+    // its sequence's entries has been resolved by a fire AND the
+    // exec is still non-terminal. Without this scoping, every fresh
+    // worker spawn would re-dispatch every still-suspended sibling,
+    // re-run the body, hit the first await, find no delivery yet,
+    // re-suspend, churning the journal with spurious
+    // NodeStarted/Suspended cycles per fresh worker.
     //
     // The mechanics: un-absorb the pulses for resuming lanes only.
     // Their execs stay in WaitingForInput; the dispatch loop will
     // detect (non-terminal exec exists + pulse Pending again) and
     // ship `NodeResumed` instead of `NodeStarted` (same record,
     // state Suspended → Running).
-    let resume_locations: std::collections::HashSet<(String, weft_core::lane::Lane)> = snap
-        .suspensions
-        .iter()
-        .filter(|(token, _)| snap.pending_deliveries.contains_key(*token))
-        .map(|(_, info)| (info.node_id.clone(), info.lane.clone()))
-        .collect();
+    let resume_locations: std::collections::HashSet<(String, weft_core::lane::Lane)> =
+        awaited_sequences
+            .iter()
+            .filter(|(_, seq)| {
+                seq.iter().any(|e| matches!(
+                    &e.kind,
+                    weft_core::primitive::AwaitedEntryKind::Await { resolved: Some(_), .. }
+                ))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
 
     // Crashed-worker recovery: any Running exec (no terminal event
     // arrived because the worker died mid-flight) gets its pulses
     // un-absorbed too so we re-dispatch it. We keep the exec
-    // record; the dispatch path will detect "non-terminal exec
-    // exists" and ship NodeResumed (state Running → Running, a
-    // no-op transition that's still a useful audit signal). Future
-    // refinement: ship NodeRetried for crashed-Running executions
-    // since they're effectively a fresh attempt.
+    // record; the dispatch path detects "non-terminal exec exists"
+    // and ships NodeResumed.
     let crashed_running: std::collections::HashSet<(String, weft_core::lane::Lane)> =
         executions
             .values()
@@ -407,80 +315,29 @@ fn apply_snapshot(
     }
 }
 
-/// After a stall is broken by a `Deliver`, find the (node, lane)
-/// pair whose token just got delivered, un-absorb its pulse, and
-/// repopulate `expected_tokens` so the next `drive()` sees the
-/// resume-correct state. Mirrors the resume-scoping branch of
-/// `apply_snapshot`, but operates on the in-memory state of a
-/// still-alive worker (no fresh fold).
-async fn wake_resuming_lanes_from_stall(
-    link: &DispatcherLink,
-    pulses: &mut PulseTable,
-    executions: &NodeExecutionTable,
-    expected_tokens: &mut HashMap<(String, weft_core::lane::Lane), String>,
-) {
-    let ready_tokens: std::collections::HashSet<String> =
-        link.ready_delivery_tokens().await.into_iter().collect();
-    if ready_tokens.is_empty() {
-        return;
-    }
-    // For every WaitingForInput exec whose callback_id matches a
-    // newly-Ready token: un-absorb pulses for that (node, lane) up
-    // to the count the original dispatch absorbed.
-    let mut un_absorb_counts: HashMap<(String, weft_core::lane::Lane), usize> = HashMap::new();
-    for execs in executions.values() {
-        for e in execs {
-            if e.status != NodeExecutionStatus::WaitingForInput {
-                continue;
-            }
-            let Some(tok) = e.callback_id.as_deref() else { continue };
-            if !ready_tokens.contains(tok) {
-                continue;
-            }
-            *un_absorb_counts
-                .entry((e.node_id.clone(), e.lane.clone()))
-                .or_default() += e.pulses_absorbed.len().max(1);
-            // Make sure expected_tokens has the mapping so the
-            // re-dispatched task picks up the seeded delivery via
-            // `await_signal`'s expected-token branch.
-            expected_tokens.insert(
-                (e.node_id.clone(), e.lane.clone()),
-                tok.to_string(),
-            );
-        }
-    }
-    for ((node_id, lane), count) in un_absorb_counts {
-        if let Some(bucket) = pulses.get_mut(&node_id) {
-            let mut remaining = count;
-            for p in bucket.iter_mut() {
-                if remaining == 0 {
-                    break;
-                }
-                if p.status == weft_core::pulse::PulseStatus::Absorbed && p.lane == lane {
-                    p.status = weft_core::pulse::PulseStatus::Pending;
-                    remaining -= 1;
-                }
-            }
-        }
-    }
-}
-
 // ---------- Main drive loop ----------
 
-/// Internal loop body shared by `run_loop` and `run_with_link`.
+/// Internal loop body called once per execution by `run_one_execution`.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     catalog: &dyn NodeCatalog,
     exec_id: &str,
-    _color: Color,
-    link: Option<&DispatcherLink>,
-    cancellation: &Arc<Notify>,
+    color: Color,
+    clients: &EngineClients,
+    pod_name: &str,
+    tenant_id: &str,
+    cancellation: &Arc<CancellationFlag>,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
-    mut expected_tokens: HashMap<(String, weft_core::lane::Lane), String>,
+    mut awaited_sequences: HashMap<
+        (String, weft_core::lane::Lane),
+        Vec<weft_core::primitive::AwaitedEntry>,
+    >,
     phase: weft_core::context::Phase,
 ) -> anyhow::Result<LoopOutcome> {
+    let journal = clients.journal.as_ref();
     let (result_tx, mut result_rx) = mpsc::unbounded_channel::<NodeTaskResult>();
     let mut in_flight: JoinSet<()> = JoinSet::new();
     // Nodes that called `await_signal` and returned `Suspended`.
@@ -510,42 +367,37 @@ async fn drive(
     }
 
     loop {
-        // Pause dispatching when the link is not Live. In-flight
-        // node futures keep running; their results and any cost /
-        // log events queue up in the outbound mpsc and flush when
-        // the supervisor reconnects. A `Dead` link means the
-        // supervisor gave up on reconnect; bail out with a failure.
-        if let Some(link) = link {
-            let mut status = link.status();
-            loop {
-                let current = *status.borrow_and_update();
-                match current {
-                    crate::dispatcher_link::LinkStatus::Live => break,
-                    crate::dispatcher_link::LinkStatus::Dead => {
-                        tracing::error!(
-                            target: "weft_engine",
-                            "dispatcher link is dead (reconnect failed); aborting execution"
-                        );
-                        return Ok(LoopOutcome::Failed {
-                            error: "dispatcher link dead".into(),
-                        });
-                    }
-                    crate::dispatcher_link::LinkStatus::Connecting
-                    | crate::dispatcher_link::LinkStatus::Disconnected => {
-                        if status.changed().await.is_err() {
-                            return Ok(LoopOutcome::Failed {
-                                error: "dispatcher link closed".into(),
-                            });
-                        }
-                    }
-                }
-            }
+        // Cancellation checkpoint. Checked at the TOP of every
+        // iteration regardless of whether the previous iteration
+        // made progress. The flag is persistent (AtomicBool), so
+        // there's no race between cancel() landing and the next
+        // check.
+        //
+        // Before returning Failed("cancelled"), `shutdown().await`
+        // the in-flight JoinSet: simply dropping the JoinSet aborts
+        // its tasks at their next yield point, but a task that's
+        // mid-journal-write may finish writing (e.g. NodeCompleted)
+        // AFTER the cancel path wrote NodeCancelled for the same
+        // (node, lane). The fold is last-write-wins, so the final
+        // state would flip to Completed and downstream nodes would
+        // receive a fake output. Awaiting shutdown drives every
+        // task to its abort point deterministically before we
+        // declare the execution cancelled.
+        if cancellation.is_cancelled() {
+            tracing::info!(
+                target: "weft_engine::loop_driver",
+                color = %color,
+                in_flight = in_flight.len(),
+                "cancellation observed at loop top; draining in-flight tasks"
+            );
+            in_flight.shutdown().await;
+            return Ok(LoopOutcome::Failed { error: "cancelled".into() });
         }
 
         let mut mutations = Vec::new();
         preprocess_input(project, pulses, &mut mutations);
         if !mutations.is_empty() {
-            crate::context::ship_pulse_mutations(link, std::mem::take(&mut mutations)).await;
+            crate::context::ship_pulse_mutations(journal, pod_name,std::mem::take(&mut mutations)).await;
         }
         let ready = find_ready_nodes(project, pulses, edge_idx);
 
@@ -583,7 +435,21 @@ async fn drive(
                 .get(&node_id)
                 .and_then(|v| v.iter().rposition(|e| e.lane == group.lane && !e.status.is_terminal()));
             let is_resume = existing.is_some();
-            let resume_token = expected_tokens.get(&(node_id.clone(), group.lane.clone())).cloned();
+            // For NodeResumed event reporting: the token + resolved
+            // value of the most-recently-resolved await in the
+            // sequence (the fire that triggered this dispatch).
+            // None = crashed-Running recovery, no fresh delivery.
+            let resume_token_value: Option<(String, serde_json::Value)> = awaited_sequences
+                .get(&(node_id.clone(), group.lane.clone()))
+                .and_then(|seq| {
+                    seq.iter().rev().find_map(|e| match &e.kind {
+                        weft_core::primitive::AwaitedEntryKind::Await {
+                            token,
+                            resolved: Some(value),
+                        } => Some((token.clone(), value.clone())),
+                        _ => None,
+                    })
+                });
 
             if is_resume {
                 if let Some(idx) = existing {
@@ -622,19 +488,19 @@ async fn drive(
 
             if group.should_skip {
                 mark_skipped(executions, &node_id, group.color, &group.lane);
-                ship_node_skipped(link, &node_id, &group.lane).await;
+                ship_node_skipped(journal, pod_name,color, &node_id, &group.lane).await;
                 let mut muts = Vec::new();
                 emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
-                crate::context::ship_pulse_mutations(link, muts).await;
+                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
                 continue;
             }
 
             if let Some(err) = &group.error {
                 mark_failed(executions, &node_id, group.color, &group.lane, err);
-                ship_node_failed(link, &node_id, &group.lane, err).await;
+                ship_node_failed(journal, pod_name,color, &node_id, &group.lane, err).await;
                 let mut muts = Vec::new();
                 emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
-                crate::context::ship_pulse_mutations(link, muts).await;
+                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
                 continue;
             }
 
@@ -643,10 +509,10 @@ async fn drive(
                 None => {
                     let err = format!("unknown node type: {}", node_def.node_type);
                     mark_failed(executions, &node_id, group.color, &group.lane, &err);
-                    ship_node_failed(link, &node_id, &group.lane, &err).await;
+                    ship_node_failed(journal, pod_name,color, &node_id, &group.lane, &err).await;
                     let mut muts = Vec::new();
                     emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
-                    crate::context::ship_pulse_mutations(link, muts).await;
+                    crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
                     continue;
                 }
             };
@@ -655,26 +521,15 @@ async fn drive(
             // checks so we don't emit Started/Resumed for a path
             // that bails to skipped/failed.
             if is_resume {
-                if let Some(token) = &resume_token {
-                    let value = link
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("link required for resume"))
-                        .ok();
-                    let value_for_event = match value {
-                        Some(l) => l.peek_seeded_delivery(token).await.unwrap_or(serde_json::Value::Null),
-                        None => serde_json::Value::Null,
-                    };
-                    ship_node_resumed(link, &node_id, &group.lane, token, &value_for_event).await;
-                } else {
-                    // Resume detected (non-terminal exec) but no
-                    // token: this is the crashed-Running recovery
-                    // path. Treat as resume-from-crash; ship
-                    // NodeResumed with empty token+value so the
-                    // dispatcher fold knows it's a continuation.
-                    ship_node_resumed(link, &node_id, &group.lane, "", &serde_json::Value::Null).await;
+                if let Some((token, value)) = &resume_token_value {
+                    ship_node_resumed(journal, pod_name,color, &node_id, &group.lane, token, value).await;
                 }
+                // Resume detected without a token = crashed-Running
+                // recovery. The exec record is already Running; no
+                // lifecycle event needed (the journal fold already
+                // sees this lane as in-flight).
             } else {
-                ship_node_started(link, &node_id, &group.lane, &group.input, &group.pulse_ids).await;
+                ship_node_started(journal, pod_name,color, &node_id, &group.lane, &group.input, &group.pulse_ids).await;
             }
 
             let config = ConfigBag {
@@ -684,9 +539,15 @@ async fn drive(
                 values: group.input.as_object().cloned().unwrap_or_default().into_iter().collect(),
             };
 
-            // Give this invocation an expected_token if we have one
-            // carrying over from a snapshot.
-            let token = expected_tokens.remove(&(node_id.clone(), group.lane.clone()));
+            // Hand the per-(node, lane) await sequence to the
+            // handle. The body's `await_signal` calls pop entries
+            // in call_index order: resolved entries replay
+            // instantly, the pending tail re-suspends, and an
+            // exhausted sequence (or fresh node) registers a new
+            // await with the next call_index.
+            let sequence = awaited_sequences
+                .remove(&(node_id.clone(), group.lane.clone()))
+                .unwrap_or_default();
 
             let handle = Arc::new(
                 RunnerHandle::new(
@@ -695,10 +556,12 @@ async fn drive(
                     group.color,
                     node_id.clone(),
                     group.lane.clone(),
-                    link.cloned(),
+                    clients.clone(),
+                    pod_name.to_string(),
+                    tenant_id.to_string(),
                     cancellation.clone(),
                 )
-                .with_expected_token(token),
+                .with_awaited_sequence(sequence),
             ) as Arc<dyn weft_core::context::ContextHandle>;
 
             let ctx = ExecutionContext::new(
@@ -756,7 +619,8 @@ async fn drive(
             edge_idx,
             pulses,
             executions,
-            link,
+            journal,
+            pod_name,
             &mut waiting,
             phase_scope.as_ref(),
         )
@@ -768,7 +632,7 @@ async fn drive(
 
         // No progress from draining. Check: is anything still in flight?
         if in_flight.is_empty() {
-            return terminate(pulses, executions, link, &waiting).await;
+            return terminate(pulses, executions, &waiting).await;
         }
 
         // At least one in-flight task. Block on either the next
@@ -779,7 +643,12 @@ async fn drive(
         // apply_results on the next iter drains the message.
         tokio::select! {
             _ = in_flight.join_next() => {}
-            _ = cancellation.notified() => {
+            _ = cancellation.cancelled() => {
+                tracing::info!(
+                    target: "weft_engine::loop_driver",
+                    color = %color,
+                    "cancellation observed at idle wait; exiting Failed(cancelled)"
+                );
                 return Ok(LoopOutcome::Failed { error: "cancelled".into() });
             }
         }
@@ -792,13 +661,15 @@ async fn drive(
 /// nothing active to run and this map is non-empty, it stalls the
 /// worker so the dispatcher can kill the process and respawn on
 /// fire.
+#[allow(clippy::too_many_arguments)]
 async fn apply_results(
     rx: &mut mpsc::UnboundedReceiver<NodeTaskResult>,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
-    link: Option<&DispatcherLink>,
+    journal: &dyn JournalClient,
+    pod_name: &str,
     waiting: &mut HashMap<String, (String, weft_core::lane::Lane)>,
     phase_scope: Option<&std::collections::HashSet<String>>,
 ) -> bool {
@@ -813,7 +684,7 @@ async fn apply_results(
                 // mutations. The dispatcher's fold tolerates either
                 // order across nodes; within one node the emitted
                 // pulses logically follow completion.
-                ship_node_completed(link, &result.node_id, &result.lane, &output_value).await;
+                ship_node_completed(journal, pod_name,result.color, &result.node_id, &result.lane, &output_value).await;
                 let mut muts = Vec::new();
                 postprocess_output(
                     &result.node_id,
@@ -826,14 +697,14 @@ async fn apply_results(
                     executions,
                     &mut muts,
                 );
-                crate::context::ship_pulse_mutations(link, muts).await;
+                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
                 if let Some(scope) = phase_scope.as_ref() {
                     drop_out_of_scope_pulses(pulses, scope);
                 }
             }
             NodeTaskOutcome::Failed(err) => {
                 mark_failed(executions, &result.node_id, result.color, &result.lane, &err);
-                ship_node_failed(link, &result.node_id, &result.lane, &err).await;
+                ship_node_failed(journal, pod_name,result.color, &result.node_id, &result.lane, &err).await;
                 let mut muts = Vec::new();
                 emit_null_downstream(
                     &result.node_id,
@@ -845,7 +716,7 @@ async fn apply_results(
                     executions,
                     &mut muts,
                 );
-                crate::context::ship_pulse_mutations(link, muts).await;
+                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
             }
             NodeTaskOutcome::Waiting(token) => {
                 mark_waiting(
@@ -855,7 +726,7 @@ async fn apply_results(
                     &result.lane,
                     &token,
                 );
-                ship_node_suspended(link, &result.node_id, &result.lane, &token).await;
+                ship_node_suspended(journal, pod_name,result.color, &result.node_id, &result.lane, &token).await;
                 waiting.insert(token, (result.node_id, result.lane));
             }
         }
@@ -881,13 +752,12 @@ fn mark_waiting(
 async fn terminate(
     pulses: &PulseTable,
     executions: &mut NodeExecutionTable,
-    link: Option<&DispatcherLink>,
     waiting: &HashMap<String, (String, weft_core::lane::Lane)>,
 ) -> anyhow::Result<LoopOutcome> {
     // `waiting` only tracks suspensions that fired in *this* drive
     // call. After a stall→resume, suspensions from the previous
     // drive() are persisted in `executions` (status =
-    // WaitingForInput) but the local map starts empty — so we'd
+    // WaitingForInput) but the local map starts empty, so we'd
     // mis-classify a partially-resumed workflow as Stuck. Source of
     // truth is the executions table.
     let has_waiting = waiting_count(executions) > 0;
@@ -903,16 +773,13 @@ async fn terminate(
         }),
         None => {
             if has_waiting {
-                if let Some(link) = link {
-                    tracing::info!(
-                        target: "weft_engine",
-                        local_waiting,
-                        persisted_waiting = waiting_count(executions),
-                        "nothing active; all remaining work is waiting on signals: stalling"
-                    );
-                    link.stall().await;
-                    return Ok(LoopOutcome::Stalled);
-                }
+                tracing::info!(
+                    target: "weft_engine",
+                    local_waiting,
+                    persisted_waiting = waiting_count(executions),
+                    "nothing active; all remaining work is waiting on signals: stalling"
+                );
+                return Ok(LoopOutcome::Stalled);
             }
             tracing::warn!(
                 target: "weft_engine",
@@ -953,7 +820,7 @@ enum NodeTaskOutcome {
     Waiting(String),
 }
 
-// ---------- Mutation helpers (unchanged from Slice 2) ----------
+// ---------- Mutation helpers ----------
 
 fn final_outputs(executions: &NodeExecutionTable) -> Value {
     let mut obj = serde_json::Map::new();
@@ -1070,7 +937,7 @@ fn compute_trigger_setup_scope(
     let triggers: Vec<String> = project
         .nodes
         .iter()
-        .filter(|n| n.features.is_trigger || !n.entry_signals.is_empty())
+        .filter(|n| n.features.is_trigger)
         .map(|n| n.id.clone())
         .collect();
     let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1086,4 +953,140 @@ fn compute_trigger_setup_scope(
         }
     }
     scope
+}
+
+
+async fn fetch_events(
+    journal: &dyn JournalClient,
+    color: Color,
+) -> anyhow::Result<Vec<weft_journal::ExecEvent>> {
+    journal.events_for_color(color).await
+}
+
+/// Walk the journal, find every (node, lane) that's currently
+/// non-terminal, and journal a NodeCancelled for each so the UI
+/// flips them out of "running". Called when the loop driver exits
+/// with `Failed { error: "cancelled" }`.
+///
+/// Important: the source of truth is the freshly-folded journal,
+/// NOT the worker's in-memory `executions` table. The dispatcher's
+/// cancel path may have already written some NodeCancelled events
+/// (those records will be terminal in the fold and skipped). The
+/// worker may have spawned more nodes between when the dispatcher
+/// folded and when the worker observed the cancellation flag;
+/// those records are still non-terminal, and only the worker can
+/// catch them. Per-node idempotency falls out of "if it's already
+/// terminal in the journal, skip it."
+async fn journal_node_cancellations(
+    journal: &dyn JournalClient,
+    color: Color,
+    pod_name: &str,
+) {
+    let events = match fetch_events(journal, color).await {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(
+                target: "weft_engine",
+                error = %err,
+                "journal_node_cancellations: failed to fetch events for catch-up fold"
+            );
+            return;
+        }
+    };
+    let snapshot = weft_journal::fold_to_snapshot(color, &events);
+    let now = now_unix();
+    let reason = "Cancelled by user".to_string();
+    for (node_id, execs) in snapshot.executions.iter() {
+        for e in execs {
+            if e.status.is_terminal() {
+                continue;
+            }
+            let event = weft_journal::ExecEvent::NodeCancelled {
+                color,
+                node_id: node_id.clone(),
+                lane: e.lane.clone(),
+                reason: reason.clone(),
+                at_unix: now,
+            };
+            if let Err(err) = journal.record_event(&event, Some(pod_name)).await {
+                tracing::warn!(
+                    target: "weft_engine",
+                    error = %err,
+                    node = %node_id,
+                    "failed to journal NodeCancelled"
+                );
+            }
+        }
+    }
+}
+
+async fn journal_terminal(
+    journal: &dyn JournalClient,
+    color: Color,
+    pod_name: &str,
+    completed: bool,
+    outputs: serde_json::Value,
+    error: String,
+) {
+    // Idempotent: if a terminal event already exists for this color
+    // (e.g. the dispatcher's cancel path wrote ExecutionCancelled
+    // before the worker's loop driver observed cancellation), skip
+    // the write. Avoids the bridge double-publishing.
+    if journal.has_terminal_event(color).await.unwrap_or(false) {
+        return;
+    }
+    let event = if completed {
+        weft_journal::ExecEvent::ExecutionCompleted {
+            color,
+            outputs,
+            at_unix: now_unix(),
+        }
+    } else if error == "cancelled" {
+        // The loop driver returns Failed { error: "cancelled" } when
+        // the cancellation flag fires. Translate that to the proper
+        // ExecutionCancelled terminal so the UI renders the cancel
+        // affordance instead of a generic failure.
+        weft_journal::ExecEvent::ExecutionCancelled {
+            color,
+            reason: "Cancelled by user".to_string(),
+            at_unix: now_unix(),
+        }
+    } else {
+        weft_journal::ExecEvent::ExecutionFailed {
+            color,
+            error,
+            at_unix: now_unix(),
+        }
+    };
+    // Terminal events MUST land in the journal: the SSE bridge keys
+    // off them, and a missing terminal leaves the UI showing a hung
+    // execution forever with no operator recourse. Retry with bounded
+    // backoff on transient errors; on persistent failure, panic so
+    // k8s restarts the pod (the new pod will run the worker again
+    // and re-emit the terminal once the journal is back up).
+    let mut delay_ms = 100u64;
+    let mut attempt = 0u32;
+    const MAX_ATTEMPTS: u32 = 5;
+    loop {
+        match journal.record_event(&event, Some(pod_name)).await {
+            Ok(()) => return,
+            Err(e) => {
+                attempt += 1;
+                if attempt >= MAX_ATTEMPTS {
+                    panic!(
+                        "failed to journal terminal event after {MAX_ATTEMPTS} attempts: {e}; \
+                         panicking so the pod restarts and the next run can re-emit"
+                    );
+                }
+                tracing::warn!(
+                    target: "weft_engine",
+                    error = %e,
+                    attempt,
+                    "retrying terminal-event journal write"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                delay_ms = (delay_ms * 2).min(5000);
+            }
+        }
+    }
 }

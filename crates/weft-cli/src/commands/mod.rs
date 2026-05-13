@@ -9,6 +9,9 @@ pub mod follow;
 pub mod stop;
 pub mod activate;
 pub mod deactivate;
+pub mod cancel_activate;
+pub mod cancel_running;
+pub mod resync;
 pub mod ps;
 pub mod rm;
 pub mod logs;
@@ -21,34 +24,124 @@ pub mod status;
 pub mod token;
 pub mod listener;
 
+use std::sync::Arc;
+
+use weft_compiler::project::Project;
+
+/// Per-invocation CLI context. Built once in `main.rs`:
+///   - `dispatcher_url` is resolved from the `--dispatcher` flag, the
+///     cwd-discovered `weft.toml`, then the localhost default. ONE
+///     resolution at startup; verbs read the result, never re-resolve.
+///   - `project` holds the cwd-discovered Project (lazy-loaded once).
+///     Verbs that need project metadata (id, name) call
+///     `Ctx::project()`. Verbs that only talk to the dispatcher
+///     (`ps`, `describe-nodes`, `daemon`) don't touch it.
+#[derive(Clone)]
 pub struct Ctx {
-    pub dispatcher: Option<String>,
+    dispatcher_url: String,
+    json: bool,
+    project: Arc<std::sync::OnceLock<anyhow::Result<Project>>>,
 }
 
 impl Ctx {
+    /// Build a Ctx from CLI flags. Resolves the dispatcher URL once;
+    /// project discovery is deferred so verbs that don't need a
+    /// project (ps, describe-nodes) never pay for it.
+    pub fn new(dispatcher_override: Option<String>, json: bool) -> Self {
+        let dispatcher_url = match dispatcher_override {
+            Some(u) => u,
+            None => Project::discover(
+                &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            )
+            .map(|p| p.dispatcher_url())
+            .unwrap_or_else(|_| "http://localhost:9999".to_string()),
+        };
+        Self {
+            dispatcher_url,
+            json,
+            project: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    pub fn json(&self) -> bool {
+        self.json
+    }
+
+    pub fn dispatcher_url(&self) -> &str {
+        &self.dispatcher_url
+    }
+
     pub fn client(&self) -> crate::client::DispatcherClient {
-        crate::client::DispatcherClient::new(
-            crate::client::resolve_dispatcher_url(self.dispatcher.as_deref())
-        )
+        crate::client::DispatcherClient::new(self.dispatcher_url.clone())
+    }
+
+    /// The cwd-discovered project, lazy-loaded and cached. Returns
+    /// the same Result every call (a single discover, success or
+    /// failure). Verbs that REQUIRE a project return the error;
+    /// verbs that don't ignore it.
+    pub fn project(&self) -> anyhow::Result<&Project> {
+        self.project
+            .get_or_init(|| {
+                let cwd = std::env::current_dir()?;
+                Project::discover(&cwd).map_err(|e| anyhow::anyhow!("discover project: {e}"))
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Build a fresh Progress emitter for a verb. Threading the
+    /// emitter through helper functions (rather than reaching for
+    /// `Ctx`) keeps the verb scope explicit at every call site.
+    pub fn progress(&self, verb: crate::progress::ActionVerb) -> crate::progress::Progress {
+        crate::progress::Progress::new(verb, self.json)
+    }
+
+    /// Run a verb body with one shared Progress emitter. The body
+    /// receives `&Progress` so it can fire phase events. On error,
+    /// `progress.error(...)` is called automatically (so verbs
+    /// don't have to repeat the trap), then the error propagates.
+    pub async fn with_progress<F, Fut>(
+        &self,
+        verb: crate::progress::ActionVerb,
+        body: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(crate::progress::Progress) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let progress = self.progress(verb);
+        match body(progress.clone()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                progress.error(&format!("{e}"));
+                Err(e)
+            }
+        }
     }
 }
 
-/// Resolve a project id from either an explicit CLI argument
-/// (UUID or short name) or by walking up from cwd to find a
-/// `weft.toml`. Returns the UUID string the dispatcher uses.
-///
-/// Only used by commands that want a "talk about THIS project"
-/// default. Commands that are process-wide (ps, describe-nodes)
-/// don't need it.
-pub fn resolve_project_id(explicit: Option<String>) -> anyhow::Result<String> {
+/// Resolve a project id: explicit CLI argument wins; otherwise read
+/// it from the cwd-discovered project on `Ctx`. Pass-through for
+/// name-vs-uuid: the dispatcher's endpoints accept uuids, so name
+/// lookups would need a `/projects/by-name` round-trip; today we
+/// pass the raw arg through and the dispatcher rejects non-uuids.
+pub fn resolve_project_id(ctx: &Ctx, explicit: Option<String>) -> anyhow::Result<String> {
     if let Some(raw) = explicit {
-        // Accept either a UUID or treat as-is (for name-based
-        // lookups the dispatcher can resolve). Dispatcher's
-        // endpoints today only accept UUIDs; pass through.
         return Ok(raw);
     }
-    let cwd = std::env::current_dir()?;
-    let project = weft_compiler::project::Project::discover(&cwd)
-        .map_err(|e| anyhow::anyhow!("no project under cwd: {e}"))?;
-    Ok(project.id().to_string())
+    Ok(ctx.project()?.id().to_string())
+}
+
+/// Build (client, id, name) for verbs that talk about THIS project.
+/// All three come from the Ctx-cached Project; the client uses the
+/// already-resolved dispatcher URL.
+pub fn resolve_project(
+    ctx: &Ctx,
+) -> anyhow::Result<(crate::client::DispatcherClient, String, String)> {
+    let project = ctx.project()?;
+    Ok((
+        ctx.client(),
+        project.id().to_string(),
+        project.manifest.package.name.clone(),
+    ))
 }

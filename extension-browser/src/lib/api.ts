@@ -1,46 +1,62 @@
-// Extension token authentication.
+// API client for the WeaveMind dispatcher's general signal surface.
 //
-// v2: the extension talks directly to the weft dispatcher's /ext/*
-// surface. No dashboard proxy. For local dev, `dispatcherUrl`
-// defaults to http://localhost:9999 (the weft start daemon).
+// Architecture-4: the dispatcher exposes ONE generic enumeration
+// route per api_token (`GET /api-token/{tk}/signals`) and ONE
+// generic per-signal route (`POST /signal/{signal_token}`,
+// `DELETE /signal/{signal_token}`). Per-kind rendering happens
+// inside the listener. The browser extension is the consumer that
+// renders Form-kind signals; future consumers (Slack bot, etc)
+// would render their kinds the same way against the same routes.
 //
-// Related:
-// - crates/weft-dispatcher/src/api/extension.rs
-
-const DEFAULT_DISPATCHER_URL = 'http://localhost:9999';
-
-export type TaskType = 'Task' | 'Action' | 'Trigger';
+// Each token in storage is scoped server-side (kinds + projects +
+// tags). The extension just uses the token; scope checks happen on
+// the dispatcher.
 
 export interface PendingTask {
-  executionId: string;
+  /// Per-signal token. Identifies the signal end-to-end:
+  /// fire = `POST /signal/{token}`, cancel = `DELETE /signal/{token}`.
+  /// Replaces the v1 `executionId` field (the dispatcher's `color`
+  /// is no longer surfaced to consumers; signal token alone is
+  /// sufficient routing).
+  token: string;
   nodeId: string;
+  /// Wake-signal kind tag (e.g. `form`, `webhook`, `timer`).
+  /// Useful for the extension to skip kinds it can't render.
+  kind: string;
+  /// Free-form consumer label (e.g. `human_in_the_loop`). Set by
+  /// the registering node; the extension's allowed_kinds must
+  /// include it for the dispatcher to surface this signal.
+  consumerKind?: string;
+  /// Display text. Listener picks a sensible default if the node
+  /// didn't set a title.
   title: string;
   description?: string;
-  createdAt: string;
-  taskType?: TaskType;
-  actionUrl?: string;
+  /// Form schema, present for Form-kind signals.
   formSchema?: unknown;
-  metadata?: Record<string, unknown>;
 }
 
-export interface ExtensionToken {
+export interface ApiToken {
+  /// The api_token string (e.g. `wm_tk_swift-falcon-23`).
   token: string;
+  /// User-facing name shown in the popup.
   name: string;
-  dispatcherUrl: string; // Base URL for the cloud API
+  /// Base URL of the dispatcher this token belongs to. Allows the
+  /// extension to point at multiple dispatchers (e.g. local + cloud)
+  /// from one browser.
+  dispatcherUrl: string;
 }
 
-export async function getTokens(): Promise<ExtensionToken[]> {
-  const result = await browser.storage.local.get('extensionTokens');
-  return (result.extensionTokens as ExtensionToken[]) || [];
+export async function getTokens(): Promise<ApiToken[]> {
+  const result = await browser.storage.local.get('apiTokens');
+  return (result.apiTokens as ApiToken[]) || [];
 }
 
-export async function setTokens(tokens: ExtensionToken[]): Promise<void> {
-  await browser.storage.local.set({ extensionTokens: tokens });
+export async function setTokens(tokens: ApiToken[]): Promise<void> {
+  await browser.storage.local.set({ apiTokens: tokens });
 }
 
-export async function addToken(token: ExtensionToken): Promise<void> {
+export async function addToken(token: ApiToken): Promise<void> {
   const tokens = await getTokens();
-  // Avoid duplicates
   if (!tokens.find(t => t.token === token.token)) {
     tokens.push(token);
     await setTokens(tokens);
@@ -53,24 +69,16 @@ export async function removeToken(tokenId: string): Promise<void> {
 }
 
 export interface FetchTasksResult {
-  /// Tasks pulled across every token, in arbitrary order.
   tasks: PendingTask[];
-  /// True iff at least one token's `/tasks` fetch returned 2xx.
-  /// Callers use this to flip a "connected" indicator without a
-  /// second `/health` round-trip.
+  /// True iff at least one configured token successfully reached
+  /// its dispatcher. Drives the popup's "connected" indicator.
   anyReachable: boolean;
-  /// Per-token success/failure counts so callers can render
-  /// granular status.
   tokenCount: number;
   successCount: number;
 }
 
-/// Fetch pending tasks from every configured token IN PARALLEL.
-/// Sequential awaits in a for-loop multiplied total latency by N
-/// (one round-trip per token); `Promise.allSettled` lets each
-/// token round-trip in its own task and we collect once everything
-/// settles. Failures don't poison the others — a single token
-/// returning 500 still surfaces the others' tasks.
+/// Fetch pending tasks from every configured api_token IN PARALLEL.
+/// One round-trip per token; failures are isolated.
 export async function fetchPendingTasks(
   { timeoutMs }: { timeoutMs?: number } = {},
 ): Promise<FetchTasksResult> {
@@ -79,20 +87,16 @@ export async function fetchPendingTasks(
     return { tasks: [], anyReachable: false, tokenCount: 0, successCount: 0 };
   }
 
-  const fetchOne = async (tokenConfig: ExtensionToken): Promise<PendingTask[]> => {
-    const url = `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/tasks`;
-    const fetchOptions: RequestInit = { method: 'GET' };
-    if (timeoutMs) fetchOptions.signal = AbortSignal.timeout(timeoutMs);
-    const response = await fetch(url, fetchOptions);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    const data = await response.json();
-    // Dispatcher returns a flat array; v1's dashboard proxy
-    // wrapped it in { tasks: [...] }. Accept either shape.
-    const tasks = (Array.isArray(data) ? data : (data.tasks ?? [])) as PendingTask[];
+  const fetchOne = async (tokenConfig: ApiToken): Promise<PendingTask[]> => {
+    const url = `${tokenConfig.dispatcherUrl}/api-token/${tokenConfig.token}/signals`;
+    const opts: RequestInit = { method: 'GET' };
+    if (timeoutMs) opts.signal = AbortSignal.timeout(timeoutMs);
+    const resp = await fetch(url, opts);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const tasks = (Array.isArray(data) ? data : []) as PendingTask[];
     for (const task of tasks) {
-      (task as PendingTask & { _tokenConfig: ExtensionToken })._tokenConfig = tokenConfig;
+      (task as PendingTask & { _tokenConfig: ApiToken })._tokenConfig = tokenConfig;
     }
     return tasks;
   };
@@ -119,156 +123,93 @@ export async function fetchPendingTasks(
   };
 }
 
-/// Dismiss an action (just removes from list, no project interaction)
-export async function dismissAction(
-  action: PendingTask & { _tokenConfig?: ExtensionToken }
-): Promise<void> {
-  const tokenConfig = action._tokenConfig;
-  
-  if (!tokenConfig) {
-    throw new Error('Action missing token configuration');
-  }
-  
-  // Use the full executionId (includes -action suffix) for dismissal
-  const actionId = encodeURIComponent(action.executionId);
-  
-  // Use dashboard proxy: /ext/{token}/actions/{actionId}/dismiss
-  const url = `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/actions/${actionId}/dismiss`;
-  
-  console.log('[WeaveMind] Dismissing action:', { url, actionId: action.executionId });
-  
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-  });
-  
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP ${response.status}: ${text}`);
-  }
-  
-  console.log('[WeaveMind] Action dismissed successfully');
-}
-
-/// Cancel a task (skip downstream execution, remove from list)
-export async function cancelTask(
-  task: PendingTask & { _tokenConfig?: ExtensionToken }
-): Promise<void> {
-  const tokenConfig = task._tokenConfig;
-  
-  if (!tokenConfig) {
-    throw new Error('Task missing token configuration');
-  }
-  
-  const executionId = encodeURIComponent(task.executionId);
-  const url = `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/tasks/${executionId}/cancel`;
-  
-  console.log('[WeaveMind] Cancelling task:', { url, executionId: task.executionId });
-  
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-  });
-  
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP ${response.status}: ${text}`);
-  }
-  
-  console.log('[WeaveMind] Task cancelled successfully');
-}
-
-/// Submit a trigger form (fires the trigger with form data)
-export async function submitTrigger(
-  trigger: PendingTask & { _tokenConfig?: ExtensionToken },
+/// Submit a form payload (HumanQuery completion / human trigger
+/// fire). The signal token alone is sufficient routing; no extra
+/// auth header is needed because possessing the signal token is the
+/// authorization. (Cancel/dismiss requires the api_token because
+/// they're destructive across the whole signal pool.)
+export async function submitTask(
+  task: PendingTask & { _tokenConfig?: ApiToken },
   input: Record<string, unknown>,
 ): Promise<void> {
-  const tokenConfig = trigger._tokenConfig;
-
-  if (!tokenConfig) {
-    throw new Error('Trigger missing token configuration');
-  }
-
-  const triggerTaskId = encodeURIComponent(trigger.executionId);
-  const url = `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/triggers/${triggerTaskId}/submit`;
-
-  console.log('[WeaveMind] Submitting trigger:', { url, triggerTaskId: trigger.executionId });
-
-  const response = await fetch(url, {
+  const tokenConfig = task._tokenConfig;
+  if (!tokenConfig) throw new Error('Task missing token configuration');
+  const url = `${tokenConfig.dispatcherUrl}/signal/${task.token}`;
+  const resp = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    // Send the form payload directly. The dispatcher journals it
-    // as the suspension's resolved value; the worker's
-    // HumanTrigger node maps it to output ports per its
-    // form_field_specs.
     body: JSON.stringify(input),
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP ${response.status}: ${text}`);
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${text}`);
   }
-
-  console.log('[WeaveMind] Trigger submitted successfully');
 }
 
-/// Delete every pending task owned by this token (orphans from cancelled runs, etc).
-/// Returns the total number of tasks removed across all tokens.
-export async function clearAllTasks(): Promise<number> {
-  const tokens = await getTokens();
-  let totalRemoved = 0;
-  for (const tokenConfig of tokens) {
-    const url = `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/cleanup/all`;
-    try {
-      const response = await fetch(url, { method: 'POST' });
-      if (!response.ok) {
-        console.warn(`[WeaveMind] cleanup/all failed for ${tokenConfig.name}: ${response.status}`);
-        continue;
-      }
-      const body = await response.json() as { removed?: number };
-      totalRemoved += body.removed ?? 0;
-    } catch (e) {
-      console.error(`[WeaveMind] cleanup/all error for ${tokenConfig.name}:`, e);
-    }
+/// Skip ONE task: resume its lane with null. Sibling lanes of
+/// the same execution keep going. Most upstream code patterns
+/// auto-skip on null inputs (downstream null-propagation), so
+/// this is the "I don't want to answer this one, do whatever"
+/// action. Auth: signal token alone (knowing it = permission).
+export async function skipTask(
+  task: PendingTask & { _tokenConfig?: ApiToken },
+): Promise<void> {
+  const tokenConfig = task._tokenConfig;
+  if (!tokenConfig) throw new Error('Task missing token configuration');
+  const url = `${tokenConfig.dispatcherUrl}/signal/${task.token}/skip`;
+  const resp = await fetch(url, { method: 'POST' });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${text}`);
   }
-  return totalRemoved;
 }
 
-/// Delete every pending task whose callback_id is scoped to a specific execution.
-/// Use this when one run got stuck with dozens of orphan form requests.
-export async function clearTasksForExecution(
-  tokenConfig: ExtensionToken,
-  executionId: string,
-): Promise<number> {
-  const url = `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/cleanup/execution/${encodeURIComponent(executionId)}`;
-  const response = await fetch(url, { method: 'POST' });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP ${response.status}: ${text}`);
-  }
-  const body = await response.json() as { removed?: number };
-  return body.removed ?? 0;
-}
-
-/// Check if any token is reachable. Parallel, returns on first
-/// success. Callers that ALSO do a tasks fetch should NOT call
-/// this — infer connectivity from the tasks fetch result and save
-/// the round-trip.
-export async function checkConnection(): Promise<boolean> {
-  const tokens = await getTokens();
-  if (tokens.length === 0) return false;
-  const probes = tokens.map(async (tokenConfig) => {
-    const response = await fetch(
-      `${tokenConfig.dispatcherUrl}/ext/${tokenConfig.token}/health`,
-      { method: 'GET', signal: AbortSignal.timeout(5000) },
-    );
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return true;
+/// Cancel the WHOLE RUN this task belongs to. Every sibling task
+/// of the same execution dies (5 parallel HumanQueries → all 5
+/// dropped). Worker stops, NodeCancelled + ExecutionFailed
+/// journaled. The user can still inspect the run in the journal
+/// afterward to debug why they cancelled.
+///
+/// Auth: api_token via Authorization header. Token must be ≥
+/// project-scoped (no kind / tag restrictions). Tag-scoped tokens
+/// are rejected; they can only skip their visible signals.
+export async function cancelRun(
+  task: PendingTask & { _tokenConfig?: ApiToken },
+): Promise<void> {
+  const tokenConfig = task._tokenConfig;
+  if (!tokenConfig) throw new Error('Task missing token configuration');
+  const url = `${tokenConfig.dispatcherUrl}/signal/${task.token}`;
+  const resp = await fetch(url, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${tokenConfig.token}` },
   });
-  try {
-    await Promise.any(probes);
-    return true;
-  } catch {
-    return false;
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${text}`);
   }
 }
+
+/// Clear all visible tasks for one api_token. Cancels every
+/// distinct execution this token sees (one cancel per color, not
+/// per task). Same scope rule as cancelRun: token must be
+/// ≥ project-scoped.
+export async function clearAll(token: ApiToken): Promise<{
+  colorsCancelled: number;
+  entrySignalsDropped: number;
+}> {
+  const url = `${token.dispatcherUrl}/api-token/${token.token}/signals`;
+  const resp = await fetch(url, { method: 'DELETE' });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${text}`);
+  }
+  const body = (await resp.json()) as {
+    colors_cancelled?: number;
+    entry_signals_dropped?: number;
+  };
+  return {
+    colorsCancelled: body.colors_cancelled ?? 0,
+    entrySignalsDropped: body.entry_signals_dropped ?? 0,
+  };
+}
+

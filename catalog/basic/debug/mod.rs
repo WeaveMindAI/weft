@@ -27,12 +27,12 @@ impl Node for DebugNode {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
-        // No output port — Debug is a terminal node. The graph view
+        // No output port: Debug is a terminal node. The graph view
         // reads the input value off the SSE event stream (weft follow
         // / replay) and renders it inline via features.showDebugPreview.
         let data = ctx.input.raw("data").cloned().unwrap_or(Value::Null);
         let label = ctx.node_label.as_deref().unwrap_or(&ctx.node_id);
-        ctx.log(LogLevel::Info, format!("[{}] {}", label, data));
+        ctx.log(LogLevel::Info, format!("[{}] {}", label, data)).await?;
         Ok(NodeOutput::empty())
     }
 }

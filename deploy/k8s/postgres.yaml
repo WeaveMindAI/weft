@@ -1,17 +1,14 @@
 ---
-# Postgres backing store for the dispatcher StatefulSet. Holds the
-# event log, suspension/entry/ext token tables, the per-color slot
-# lease, and the per-tenant listener handle. Cross-Pod EventBus
-# fanout uses the same Postgres via LISTEN/NOTIFY.
-#
-# Local dev runs a single Pod with a 5Gi PVC. Cloud / enterprise
-# self-host swap this for a managed Postgres (Cloud SQL, RDS) by
-# pointing WEFT_DATABASE_URL elsewhere; this manifest stays optional.
+# Postgres backing store. Lives in `weft-db`, fronted by `weft-broker`
+# for tenant pods (workers, listeners, sidecars). The dispatcher and
+# the broker reach Postgres directly (god mode + intra-namespace).
+# Tenant pods cannot reach this Service: NetworkPolicy in `weft-db`
+# denies their ingress.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: weft-postgres-data
-  namespace: weft-system
+  namespace: weft-db
   labels:
     app: weft-postgres
 spec:
@@ -20,24 +17,66 @@ spec:
     requests:
       storage: 5Gi
 ---
+# LOCAL-DEV ONLY. The password below is committed to the repo for
+# kind/setup.sh boostrap. Production / cloud deployments MUST NOT
+# apply this manifest; they create the same-named Secret out-of-band
+# (sealed-secrets, external-secrets, or a manual `kubectl create
+# secret`) before applying the rest of the bundle. The Deployment
+# below references this Secret by name and is identical between
+# local and cloud.
+#
+# Why `data` (base64) instead of `stringData`: kubectl rewrites
+# `stringData` into `data` server-side, but the client-side
+# last-applied-configuration annotation keeps the original
+# stringData form. The three-way merge then reports "configured"
+# on every apply because the local manifest's stringData doesn't
+# match the cluster's data field. That false-positive cascades
+# through setup.sh's idempotency: it thinks manifests changed,
+# rolls the dispatcher pod, re-loads images, every run. Using
+# `data` directly round-trips identically.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: weft-postgres-credentials
+  namespace: weft-db
+  labels:
+    weft.dev/scope: local-dev-only
+type: Opaque
+data:
+  POSTGRES_USER: d2VmdA==
+  POSTGRES_PASSWORD: d2VmdC1sb2NhbC1kZXY=
+  POSTGRES_DB: d2VmdA==
+  # postgres://weft:weft-local-dev@weft-postgres.weft-db.svc.cluster.local:5432/weft
+  # The dispatcher and broker reference this via secretKeyRef so the
+  # password never appears in `kubectl describe pod` env output. Prod
+  # swaps this Secret only; the deployment env wiring stays the same.
+  WEFT_DATABASE_URL: cG9zdGdyZXM6Ly93ZWZ0OndlZnQtbG9jYWwtZGV2QHdlZnQtcG9zdGdyZXMud2VmdC1kYi5zdmMuY2x1c3Rlci5sb2NhbDo1NDMyL3dlZnQ=
+---
+# Mirror of the credentials Secret into the weft-system namespace so
+# the dispatcher (which runs there) can `secretKeyRef` against a
+# local copy. Kubernetes Secrets are namespace-scoped; this is the
+# canonical way to share. Prod operators must rotate BOTH copies in
+# lockstep; cloud deployments should drive this via a real secret
+# manager rather than a static replica.
 apiVersion: v1
 kind: Secret
 metadata:
   name: weft-postgres-credentials
   namespace: weft-system
+  labels:
+    weft.dev/scope: local-dev-only
 type: Opaque
-stringData:
-  POSTGRES_USER: weft
-  POSTGRES_PASSWORD: weft-local-dev
-  POSTGRES_DB: weft
+data:
+  WEFT_DATABASE_URL: cG9zdGdyZXM6Ly93ZWZ0OndlZnQtbG9jYWwtZGV2QHdlZnQtcG9zdGdyZXMud2VmdC1kYi5zdmMuY2x1c3Rlci5sb2NhbDo1NDMyL3dlZnQ=
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: weft-postgres
-  namespace: weft-system
+  namespace: weft-db
   labels:
     app: weft-postgres
+    weft.dev/role: postgres
 spec:
   replicas: 1
   strategy:
@@ -49,6 +88,7 @@ spec:
     metadata:
       labels:
         app: weft-postgres
+        weft.dev/role: postgres
     spec:
       containers:
         - name: postgres
@@ -84,7 +124,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: weft-postgres
-  namespace: weft-system
+  namespace: weft-db
   labels:
     app: weft-postgres
 spec:
@@ -94,3 +134,77 @@ spec:
     - name: postgres
       port: 5432
       targetPort: 5432
+---
+# Default-deny on weft-db. Anything reaching Postgres or the broker
+# must be matched by an explicit allow rule below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weft-db-default-deny
+  namespace: weft-db
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Postgres ingress: only the broker (intra-namespace) and the
+# dispatcher (in `weft-system`) may speak to it. Tenant pods are
+# blocked at this seam.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weft-db-postgres-allow
+  namespace: weft-db
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    # Intra-namespace: the broker.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: weft-broker
+      ports:
+        - protocol: TCP
+          port: 5432
+    # weft-system: only the dispatcher Pod, not anything else that
+    # might land in that namespace later. namespaceSelector AND
+    # podSelector in the SAME `from` element ANDs them.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: weft-system
+          podSelector:
+            matchLabels:
+              app: weft-dispatcher
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# Postgres egress: only DNS. It never initiates outbound traffic to
+# anything else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weft-db-postgres-egress
+  namespace: weft-db
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-postgres
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

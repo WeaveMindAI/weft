@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use axum::{extract::{Path, Query, State}, Json};
+use axum::{extract::{Query, State}, Json};
 use serde::{Deserialize, Serialize};
 use weft_catalog::stdlib_catalog as stdlib_fs_catalog;
 use weft_compiler::describe::describe_project;
@@ -99,13 +99,3 @@ pub async fn nodes(
     Json(NodesResponse { catalog, warnings })
 }
 
-/// Per-project catalog alias. Kept for tooling that already calls
-/// this; behaves like `/describe/nodes?project_root=...` once we
-/// thread project → path lookup through DispatcherState. For now
-/// it mirrors the stdlib-only response.
-pub async fn project_catalog(
-    State(_state): State<DispatcherState>,
-    Path(_id): Path<String>,
-) -> Json<NodesResponse> {
-    Json(NodesResponse { catalog: stdlib_map(), warnings: Vec::new() })
-}

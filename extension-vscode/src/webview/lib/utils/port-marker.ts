@@ -139,7 +139,7 @@ export function portMarkerStyle(
 	const baseClass = '!w-3 !h-3';
 	// xyflow's default Handle CSS sets `border-radius: 100%`. For
 	// circle markers we keep that via `!rounded-full`. For
-	// triangle markers we explicitly clear it to `0` — otherwise
+	// triangle markers we explicitly clear it to `0`; otherwise
 	// the round border-radius clips the SVG's left/right tips,
 	// making the triangle look like a rounded leaf instead of a
 	// crisp arrow.

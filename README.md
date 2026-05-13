@@ -3,6 +3,8 @@
 > **Building in public, two months in.** Weft is young. The language, the type system, and the durable executor are the stable parts. The node catalog is small and intentionally opinionated (a few dozen nodes across LLM, code, communication, flow, storage, and triggers). The long-term vision is to let projects define their own nodes fluently in the language itself, but that is still ahead. If you are evaluating it for production, treat it as a foundation to build on, not a finished product. Breaking changes are expected while the shape is still settling; they will be announced, and migration notes will come with them.
 >
 > **Note on the docs.** This README, `DESIGN.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, and most of the prose around the project were written fast to get the open source release out the door. They may sound a bit AI-generated in places. If you have the time and taste to rewrite any of them more cleanly, please do. A PR that improves the writing is as welcome as one that fixes a bug.
+>
+> **Architecture note.** Most of this README still describes the v1 architecture (Restate orchestrator, separate dashboard, `dev.sh` workflow). The v2 architecture (kubernetes-native, single-binary dispatcher, VS Code extension as the UI) is in flight. See `docs/v2-control-plane-unification.md` for the current shape. A README rewrite is on the punch list.
 
 **A programming language for AI systems.**
 

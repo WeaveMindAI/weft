@@ -8,7 +8,7 @@
 //! | (none)      | deactivate + unregister on dispatcher                  |
 //! | `--infra`   | also terminate sidecars (deletes PVCs, auth gone)      |
 //! | `--journal` | also drop this project's execution + log rows          |
-//! | `--image`   | also remove `weft-worker-<id>:latest` from docker+kind |
+//! | `--image`   | also remove every `weft-worker-<id>:*` tag from docker+kind |
 //! | `--local`   | also wipe `.weft/target/` under the cwd project        |
 //! | `--all`     | implies the four levels above                          |
 //!
@@ -21,6 +21,7 @@ use tokio::process::Command;
 
 use super::{resolve_project_id, Ctx};
 use crate::commands::daemon::{cluster_config, ClusterBackend};
+use crate::progress::{ActionVerb, Progress};
 
 pub struct RmArgs {
     pub project: Option<String>,
@@ -47,95 +48,171 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         local = true;
     }
 
-    let project_id = resolve_project_id(project)?;
-    let client = ctx.client();
+    let ctx_inner = ctx.clone();
+    ctx.with_progress(ActionVerb::Rm, |progress| async move {
+        let ctx = ctx_inner;
+        let project_id = resolve_project_id(&ctx, project)?;
+        let client = ctx.client();
 
-    // Level 1: always. Deactivate (ignore errors; may already be
-    // inactive) then delete the dispatcher registration.
-    let _ = client
-        .post_empty(&format!("/projects/{project_id}/deactivate"))
-        .await;
+        // Level 1: always. Deactivate first (so signals leave the
+        // listener cleanly), then unregister. Both must succeed: if
+        // either fails the project is left in an inconsistent state
+        // (deactivate half-done OR registration alive while signals
+        // wiped). Bubble loudly so the user sees what to fix.
+        progress.dispatcher_call_start(&format!("/projects/{project_id}/deactivate"));
+        client
+            .post_empty(&format!("/projects/{project_id}/deactivate"))
+            .await
+            .context("deactivate")?;
+        progress.dispatcher_call_done(serde_json::json!({ "step": "deactivate" }));
 
-    if infra {
-        // Terminate first: the dispatcher uses the
-        // registration to find sidecars, so we must hit this
-        // before the DELETE.
-        let _ = client
-            .post_empty(&format!("/projects/{project_id}/infra/terminate"))
-            .await;
-        println!("infra: terminated");
-    }
-
-    client
-        .delete(&format!("/projects/{project_id}"))
-        .await
-        .context("dispatcher unregister")?;
-    println!("registration: removed");
-
-    if journal {
-        // Phase B: add a per-project DELETE endpoint for journal
-        // rows. For now we walk the execution list and delete
-        // colors individually.
-        let execs: serde_json::Value =
-            client.get_json("/executions").await.unwrap_or_default();
-        if let Some(arr) = execs.as_array() {
-            let mut dropped = 0u32;
-            for e in arr {
-                let pid = e.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-                if pid != project_id {
-                    continue;
-                }
-                let Some(color) = e.get("color").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let _ = client.delete(&format!("/executions/{color}")).await;
-                dropped += 1;
-            }
-            println!("journal: {dropped} execution(s) dropped");
+        if infra {
+            progress.dispatcher_call_start(&format!(
+                "/projects/{project_id}/infra/terminate"
+            ));
+            client
+                .post_empty(&format!("/projects/{project_id}/infra/terminate"))
+                .await
+                .context("infra terminate")?;
+            progress.dispatcher_call_done(serde_json::json!({ "step": "infra_terminate" }));
         }
-    }
 
-    if image {
-        remove_worker_image(&project_id).await;
-    }
+        progress.dispatcher_call_start(&format!("/projects/{project_id}"));
+        client
+            .delete(&format!("/projects/{project_id}"))
+            .await
+            .context("dispatcher unregister")?;
+        progress.dispatcher_call_done(serde_json::json!({ "step": "unregister" }));
 
-    if local {
-        wipe_local_artifacts().await;
-    }
+        if journal {
+            drop_journal_rows(&progress, &client, &project_id).await?;
+        }
+        if image {
+            remove_worker_image(&progress, &project_id).await?;
+        }
+        if local {
+            wipe_local_artifacts(&ctx, &progress)?;
+        }
+        progress.complete(&format!("rm completed for {project_id}"));
+        Ok(())
+    })
+    .await
+}
 
+async fn drop_journal_rows(
+    progress: &Progress,
+    client: &crate::client::DispatcherClient,
+    project_id: &str,
+) -> Result<()> {
+    // Walk the execution list and delete colors individually (the
+    // dispatcher has no bulk DELETE for a project's journal rows).
+    let execs: serde_json::Value = client
+        .get_json("/executions")
+        .await
+        .context("list executions")?;
+    let Some(arr) = execs.as_array() else {
+        anyhow::bail!("/executions returned non-array: {execs}");
+    };
+    let mut dropped = 0u32;
+    for e in arr {
+        let pid = e.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+        if pid != project_id {
+            continue;
+        }
+        let Some(color) = e.get("color").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        client
+            .delete(&format!("/executions/{color}"))
+            .await
+            .with_context(|| format!("delete execution {color}"))?;
+        dropped += 1;
+    }
+    progress.dispatcher_call_done(serde_json::json!({
+        "step": "journal_drop",
+        "dropped": dropped,
+    }));
     Ok(())
 }
 
-async fn remove_worker_image(project_id: &str) {
-    let tag = format!("weft-worker-{project_id}:latest");
-    let _ = Command::new("docker")
-        .args(["image", "rm", "-f", &tag])
-        .status()
-        .await;
+async fn remove_worker_image(progress: &Progress, project_id: &str) -> Result<()> {
+    // Worker tags are `weft-worker-<id>:<short-hash>`; the hash
+    // changes every rebuild. List every tag for the project and rmi
+    // each one.
+    let repo = format!("weft-worker-{project_id}");
+    let listing = Command::new("docker")
+        .args(["images", "--format", "{{.Repository}}:{{.Tag}}", &repo])
+        .output()
+        .await
+        .context("docker images")?;
+    if !listing.status.success() {
+        anyhow::bail!(
+            "docker images failed: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        );
+    }
+    let tags: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.starts_with(&format!("{repo}:")))
+        .collect();
+    if tags.is_empty() {
+        progress.dispatcher_call_done(serde_json::json!({
+            "step": "image_remove",
+            "removed": 0,
+        }));
+        return Ok(());
+    }
+    for tag in &tags {
+        let st = Command::new("docker")
+            .args(["image", "rm", "-f", tag])
+            .status()
+            .await
+            .with_context(|| format!("docker image rm {tag}"))?;
+        if !st.success() {
+            anyhow::bail!("docker image rm {tag} exited {st}");
+        }
+    }
     let cfg = cluster_config();
     if cfg.backend == ClusterBackend::Kind {
-        // `kind` doesn't expose a native "remove loaded image";
-        // exec into the node and use crictl. Best-effort.
         let node = format!("{}-control-plane", cfg.cluster_name);
-        let _ = Command::new("docker")
-            .args(["exec", &node, "crictl", "rmi", &tag])
-            .status()
-            .await;
+        for tag in &tags {
+            // crictl rmi is best-effort: if the kind cluster isn't
+            // running OR doesn't have this image cached, that's
+            // fine. The tag is gone from the docker host already,
+            // which is what matters for the next rebuild.
+            let _ = Command::new("docker")
+                .args(["exec", &node, "crictl", "rmi", tag])
+                .status()
+                .await;
+        }
     }
-    println!("image: {tag} removed");
+    progress.dispatcher_call_done(serde_json::json!({
+        "step": "image_remove",
+        "removed": tags.len(),
+    }));
+    Ok(())
 }
 
-async fn wipe_local_artifacts() {
-    let cwd = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let Ok(project) = weft_compiler::project::Project::discover(&cwd) else {
-        return;
-    };
+fn wipe_local_artifacts(ctx: &Ctx, progress: &Progress) -> Result<()> {
+    // Use the ctx-cached project. If the cwd isn't a weft project,
+    // surface that loudly: --local was requested but there's nothing
+    // local to wipe.
+    let project = ctx.project().context("--local requested, but no project in cwd")?;
     let target = project.state_dir().join("target");
     if target.exists() {
-        let _ = std::fs::remove_dir_all(&target);
-        println!("local: wiped {}", target.display());
+        std::fs::remove_dir_all(&target)
+            .with_context(|| format!("remove {}", target.display()))?;
+        progress.dispatcher_call_done(serde_json::json!({
+            "step": "local_wipe",
+            "path": target.display().to_string(),
+        }));
+    } else {
+        progress.dispatcher_call_done(serde_json::json!({
+            "step": "local_wipe",
+            "path": target.display().to_string(),
+            "skipped": "missing",
+        }));
     }
+    Ok(())
 }

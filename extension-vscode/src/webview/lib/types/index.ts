@@ -399,41 +399,6 @@ export interface FieldDefinition {
 
 export type NodeCategory = "Triggers" | "AI" | "Data" | "Flow" | "Utility" | "Debug" | "Infrastructure";
 
-/**
- * General trigger categories - fundamental ways a project can be triggered.
- * - Webhook: HTTP endpoint that receives POST requests (Discord, GitHub, Slack, custom, etc.)
- * - Polling: Periodically checks an external source for changes (RSS, API polling, etc.)
- * - Schedule: Time-based triggers using cron expressions
- * - Socket: Persistent connections (WebSocket, SSE, etc.)
- * - Local: Triggers that only work locally (file watcher, system events, etc.)
- * - Manual: Triggered manually by user action
- */
-export type TriggerCategory = "Webhook" | "Polling" | "Schedule" | "Socket" | "Local" | "Manual";
-
-export type Capability = "DurableKV";
-
-export interface ReadinessCheck {
-	TcpSocket?: { port: number };
-	HttpGet?: { port: number; path: string };
-}
-
-export interface ActionEndpoint {
-	port: number;
-	path: string;
-}
-
-export interface KubeManifest {
-	manifest: Record<string, unknown>;
-}
-
-export interface InfrastructureSpec {
-	manifests: KubeManifest[];
-	readinessCheck: ReadinessCheck;
-	actionEndpoint: ActionEndpoint;
-}
-
-export type RunLocationConstraint = "local" | "cloud" | "any";
-
 /** Status of a single node execution. */
 export type NodeExecutionStatus = 'running' | 'completed' | 'failed' | 'waiting_for_input' | 'skipped' | 'cancelled';
 
@@ -463,33 +428,24 @@ export interface NodeExecution {
 /** Node executions keyed by node ID. */
 export type NodeExecutionTable = Record<string, NodeExecution[]>;
 
-/** A typed data item returned by the sidecar's /live endpoint for dashboard rendering. */
-export interface LiveDataItem {
-	type: 'text' | 'image' | 'progress';
-	label: string;
-	/** For text: the string to display. For image: a data URI. For progress: a number 0-1. */
-	data: string | number;
-}
+/** A typed data item shown on a node's body-panel feed. The
+ *  authoritative definition lives in `shared/protocol.ts`; this
+ *  re-export keeps webview imports under the `$lib/types` alias.
+ *  Adding a new kind: extend the union in protocol.ts AND add a
+ *  branch in ProjectNode.svelte's render block.
+ */
+export type { LiveDataItem } from '../../../shared/protocol';
 
 export interface NodeFeatures {
 	isTrigger?: boolean;
-	triggerCategory?: TriggerCategory;
 	runLocationConstraint?: RunLocationConstraint;
 	canAddInputPorts?: boolean;
 	canAddOutputPorts?: boolean;
 	hidden?: boolean;
 	showRunLocationSelector?: boolean;
 	showDebugPreview?: boolean;
-	/** Node is an infrastructure node (long-running, provides actions to other nodes) */
-	isInfrastructure?: boolean;
 	/** Node has a dynamic form schema. Ports are derived from config.fields via the node's formFieldSpecs. */
 	hasFormSchema?: boolean;
-	/** Infrastructure deployment specification (only for infrastructure nodes).
-	 * Defines the K8s manifests, readiness check, and action endpoint.
-	 * The node itself controls how it gets deployed. */
-	infrastructureSpec?: InfrastructureSpec;
-	/** Sidecar exposes a /live endpoint with typed data items for real-time dashboard display. */
-	hasLiveData?: boolean;
 	/** Groups of ports where at least one must be non-null for the node to execute.
 	 * If all ports in a group are null/missing, the node is skipped.
 	 * e.g. [['text', 'media']] = at least one of text/media must be non-null. */
@@ -532,14 +488,10 @@ export interface NodeTemplate {
 	icon: import('svelte').Component;
 	color: string;
 	category: NodeCategory;
-	tags: string[];
 	fields: FieldDefinition[];
 	defaultInputs: PortDefinition[];
 	defaultOutputs: PortDefinition[];
 	features?: NodeFeatures;
-	/** Whether this node is always included in the AI builder's context.
-	 *  Non-base nodes are only available via the node shopping assistant. */
-	isBase?: boolean;
 	validate?: NodeValidateFunction;
 	setupGuide?: string[];
 	formFieldSpecs?: import('$lib/utils/form-field-specs').FormFieldSpec[];
@@ -550,16 +502,6 @@ export interface NodeTemplate {
 		inputs?: Record<string, PortType>;
 		outputs?: Record<string, PortType>;
 	};
-	/** Return display items to show on the node (e.g. webhook URL after activation).
-	 *  Called by the editor when project state changes. */
-	getDisplayData?: (node: NodeInstance, context: DisplayDataContext) => LiveDataItem[];
-}
-
-/** Context passed to NodeTemplate.getDisplayData */
-export interface DisplayDataContext {
-	projectId: string;
-	isProjectActive: boolean;
-	apiBaseUrl: string;
 }
 
 // =============================================================================
@@ -603,242 +545,6 @@ export interface NodeInstance {
 }
 
 // =============================================================================
-// Setup Manifest Types (Builder/Runner mode)
-// =============================================================================
-
-/**
- * Audience a manifest element is shown to.
- * - 'admin': only the project owner sees it in the builder/admin runner view.
- * - 'visitor': only people who visit the published deploy page see it.
- * - 'both': everyone sees it (default for regular inputs/outputs).
- *
- * Sensitive field types (password, api_key) are forced to 'admin' by the
- * renderer regardless of what the DSL declares. Infra lifecycle controls
- * and trigger controls are also admin-only and not configurable from the DSL.
- */
-export type Visibility = 'admin' | 'visitor' | 'both';
-
-/** Render mode for the runner view. */
-export type RunnerMode = 'admin' | 'visitor';
-
-/**
- * Optional presentation variant for a field/output/live item.
- * The renderer picks a reasonable default based on the field/port type;
- * `as` lets the DSL override it. Unknown values fall back to the default.
- */
-export type ItemVariant =
-	// Text inputs
-	| 'text' | 'textarea' | 'password' | 'email' | 'url'
-	// Numeric
-	| 'number' | 'slider'
-	// Boolean
-	| 'toggle' | 'checkbox'
-	// Pickers (single-select)
-	| 'radio' | 'select' | 'cards'
-	// Pickers (multi-select)
-	| 'multiselect' | 'tags' | 'multicards'
-	// Specialized
-	| 'date' | 'time' | 'datetime' | 'color' | 'file'
-	// Output-only
-	| 'markdown' | 'code' | 'json' | 'image' | 'gallery' | 'audio'
-	| 'video' | 'download' | 'progress' | 'chart' | 'log';
-
-/**
- * A single field exposed to the runner for configuration.
- * References a specific field on a specific node instance.
- */
-export interface SetupItem {
-	id: string;
-	nodeId: string;
-	fieldKey: string;
-	label?: string;        // overrides the node field's default label
-	description?: string;  // supplements the node's setupGuide
-	visibility?: Visibility;
-	as?: ItemVariant;
-	/** Inline options for select/radio/cards/multiselect variants. Supplements
-	 *  or overrides any options declared on the node field itself. Accepts
-	 *  comma-separated values (`"a,b,c"`) or a JSON-encoded array. */
-	options?: string[];
-	// Sizing overrides (raw CSS or named presets). Used by height-sensitive
-	// variants like textarea, markdown output, image/video, chart.
-	height?: string;
-	minHeight?: string;
-	maxHeight?: string;
-	width?: string;
-	// Visual container: by default fields and outputs are chromeless (just
-	// label + input) so they inherit the parent's box. Set to 'card' to force
-	// a rounded bordered container, 'subtle' for a hairline separator only.
-	chrome?: 'none' | 'subtle' | 'card';
-}
-
-/**
- * A single output port exposed to the runner for result display.
- * The runner sees the live value of this port after/during execution.
- */
-export interface OutputItem {
-	id: string;
-	nodeId: string;
-	portName: string;    // the output port name (e.g. "response", "data")
-	label?: string;      // display label override
-	description?: string;
-	visibility?: Visibility;
-	as?: ItemVariant;
-	height?: string;
-	minHeight?: string;
-	maxHeight?: string;
-	width?: string;
-	chrome?: 'none' | 'subtle' | 'card';
-	/** Placeholder text shown when the output is empty (before first run). */
-	placeholder?: string;
-}
-
-/**
- * A live data display from an infrastructure node, shown in the runner view.
- * References a node whose sidecar exposes a /live endpoint with LiveDataItem[].
- */
-export interface LiveItem {
-	id: string;
-	nodeId: string;
-	label?: string;      // display label override
-	description?: string;
-	visibility?: Visibility;
-	as?: ItemVariant;
-	height?: string;
-	minHeight?: string;
-	maxHeight?: string;
-	width?: string;
-	chrome?: 'none' | 'subtle' | 'card';
-}
-
-/**
- * A logical group of setup items shown as a section in the runner view.
- * A phase can also contain nested bricks (columns, card, etc.) via `children`,
- * so you can build rich section layouts that mix fields with decoration.
- */
-export interface SetupPhase {
-	id: string;
-	title: string;
-	description?: string;
-	items: SetupItem[];
-	liveItems?: LiveItem[];
-	visibility?: Visibility;
-	/** Additional blocks rendered inside this phase after items/liveItems.
-	 *  Used for layout bricks (columns, card) that wrap more content. */
-	children?: Block[];
-}
-
-/**
- * Visual theme for the runner page.
- * All fields optional; renderer falls back to sensible defaults.
- *
- * The `skin` field selects a bundle of presets (fonts, surfaces, default
- * card chrome, spacing). Individual properties override whatever the skin
- * sets, so you can pick "studio" and then tweak only the primary color.
- */
-export interface RunnerTheme {
-	primary?: string;       // hex or tailwind color token
-	accent?: string;
-	background?: string;
-	font?: 'inter' | 'serif' | 'mono' | 'display' | string;
-	mode?: 'light' | 'dark' | 'auto';
-	radius?: 'none' | 'sm' | 'md' | 'lg' | 'xl' | '2xl' | '3xl' | 'full';
-	layout?: 'narrow' | 'centered' | 'wide' | 'ultrawide' | 'full';
-	/** Aesthetic preset. See skins.ts for the full list. */
-	skin?: 'default' | 'editorial' | 'studio' | 'brutalist' | 'terminal' | 'playful' | string;
-	/** Page-wide background treatment. Overrides skin's default surface. */
-	surface?: 'plain' | 'subtle' | 'gradient' | 'glass' | 'dark' | 'mesh';
-	/** Vertical spacing multiplier for the main block stack. */
-	density?: 'compact' | 'comfortable' | 'spacious';
-	/** Explicit content width override (raw CSS) takes priority over layout preset. */
-	contentWidth?: string;
-	/** Page padding preset. */
-	padding?: 'sm' | 'md' | 'lg' | 'xl' | '2xl';
-}
-
-/**
- * A decorative or structural brick in the runner page.
- * Bricks are non-interactive presentation elements (or simple CTAs) that
- * don't bind to a Weft node. The `kind` discriminates the shape of `props`.
- */
-export interface Brick {
-	id: string;
-	kind: BrickKind;
-	visibility?: Visibility;
-	props: Record<string, unknown>;
-	children?: Block[];
-}
-
-export type BrickKind =
-	| 'hero'
-	| 'navbar'
-	| 'navlink'
-	| 'logo'
-	| 'banner'
-	| 'text'
-	| 'heading'
-	| 'divider'
-	| 'image'
-	| 'video'
-	| 'embed'
-	| 'quote'
-	| 'stat'
-	| 'stats'
-	| 'feature'
-	| 'feature-grid'
-	| 'faq'
-	| 'qa'
-	| 'testimonial'
-	| 'badge'
-	| 'spacer'
-	| 'section'
-	| 'columns'
-	| 'card'
-	| 'tabs'
-	| 'tab'
-	| 'cta'
-	| 'footer';
-
-/**
- * An ordered entry in the manifest's top-level block list.
- * Everything the page renders lives here, in order, so the LLM and the
- * renderer agree on layout without a second tree.
- */
-export type Block =
-	| { kind: 'phase'; phase: SetupPhase }
-	| { kind: 'brick'; brick: Brick }
-	| { kind: 'output'; output: OutputItem }
-	| { kind: 'live'; live: LiveItem };
-
-/**
- * Parsed view of a project's loom setup. Derived from `loomCode` by
- * `hydrateProject` on every store read, consumed by the runner view
- * to render the setup page. This is NEVER a write target: all edits
- * go through the raw `loomCode` text and re-parse. The serializer
- * that used to round-trip this shape back to text was deleted
- * because it corrupted multi-line text blocks and comments.
- *
- * `blocks`, when present, is the source-order block list the runner
- * walks when rendering (hero, section, cta, phase, output, etc.).
- * The current parser always populates it, so consumers produced by
- * `parseLoom` can rely on it being non-null. The field is marked
- * optional for legacy callers that construct a manifest without a
- * block list (programmatic tests, fallback synthesis).
- *
- * `phases`, `outputs`, and `liveItems` are flat convenience indexes
- * the parser also populates alongside `blocks` so filters,
- * validation, and visitor-access computation don't have to walk the
- * block tree. They may contain the same items referenced from
- * `blocks`; treat them as read-only projections.
- */
-export interface SetupManifest {
-	phases: SetupPhase[];
-	outputs: OutputItem[];
-	liveItems?: LiveItem[];
-	theme?: RunnerTheme;
-	blocks?: Block[];
-}
-
-// =============================================================================
 // Project Types
 // =============================================================================
 
@@ -856,79 +562,12 @@ export interface ProjectDefinition {
 	description: string | null;
 	// Stored (source of truth)
 	weftCode?: string | null;
-	loomCode?: string | null;
 	layoutCode?: string | null;
 	// Derived in-memory from weftCode (not stored)
 	nodes: NodeInstance[];
 	edges: Edge[];
-	// Derived in-memory from loomCode (not stored)
-	setupManifest?: SetupManifest;
-	// Weft editor state (persisted alongside weftCode)
-	weftOpaqueBlocks?: unknown[];
-	weftItemOrder?: string[];
-	weftItemGaps?: number[];
 	createdAt: string;
 	updatedAt: string;
-	/** True when this project row is a deployment snapshot (created via
-	 *  Publish). Deployment projects are hidden from the builder list and
-	 *  their code is read-only in the builder view, but the admin runner
-	 *  path can still tweak field values. */
-	isDeployment?: boolean;
-	/** For deployments: the builder project this one was cloned from.
-	 *  Null for builder rows. */
-	originProjectId?: string | null;
-}
-
-export interface NodeInputs {
-	[portName: string]: unknown;
-}
-
-export interface NodeOutputs {
-	[portName: string]: unknown;
-}
-
-export interface MessagePayload {
-	data: Record<string, unknown>;
-	sourceNodeId: string | null;
-	timestamp: string;
-}
-
-// =============================================================================
-// Execution Types
-// =============================================================================
-
-export type ExecutionStatus =
-	| "pending"
-	| "running"
-	| "waiting_for_input"
-	| "paused"
-	| "completed"
-	| "failed"
-	| "cancelled";
-
-export interface ProjectExecution {
-	id: string;
-	projectId: string;
-	status: ExecutionStatus;
-	startedAt: string;
-	completedAt: string | null;
-	currentNode: string | null;
-	state: Record<string, unknown>;
-	error: string | null;
-}
-
-export interface TriggerConfig {
-	id: string;
-	triggerId: string;
-	triggerCategory: TriggerCategory;
-	nodeType: string;
-	projectId: string;
-	triggerNodeId: string;
-	config: Record<string, unknown>;
-	credentials?: Record<string, unknown>;
-	enabled: boolean;
-	runLocation: "cloud" | "local";
-	createdAt: string;
 }
 
 // =============================================================================
