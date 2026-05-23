@@ -1,15 +1,20 @@
-//! Render and apply the per-tenant namespace bundle: namespace
-//! itself, three role-scoped ServiceAccounts, default-deny + per-role
-//! NetworkPolicies. Idempotent: `kubectl apply` reconciles whatever
-//! state the cluster already has.
+//! Per-tenant k8s namespace bundle.
 //!
-//! Called from the project-register path the first time the
-//! dispatcher sees a new tenant; the static `user-namespace.yaml`
-//! local-dev manifest pre-creates the same bundle for `wm-local` so
-//! a fresh install works without booting the dispatcher first.
+//! Houses tenant-scoped services that are shared across the
+//! tenant's projects:
+//!   - the listener pod (`weft-listener-sa`)
+//!   - the infra-supervisor pod (`weft-infra-supervisor-sa`)
+//!
+//! Workers + infra pods live in PROJECT namespaces, not here.
+//! The per-project bundle (`project_namespace.rs`) creates those
+//! namespaces, their SAs, NetworkPolicies, and RoleBindings to the
+//! cluster-scoped supervisor / listener ClusterRoles.
+//!
+//! Idempotent: `kubectl apply` reconciles whatever state the cluster
+//! already has.
 
 use anyhow::Result;
-use tokio::process::Command;
+use weft_platform_traits::KubeClient;
 
 pub struct ClusterCidrs<'a> {
     pub pod_cidr: &'a str,
@@ -18,17 +23,109 @@ pub struct ClusterCidrs<'a> {
 }
 
 pub async fn ensure_tenant_namespace(
+    pool: &sqlx::PgPool,
+    kube: &dyn KubeClient,
     namespace: &str,
     tenant: &str,
     cidrs: ClusterCidrs<'_>,
 ) -> Result<()> {
-    let manifest = render_tenant_namespace(namespace, tenant, cidrs);
-    apply(&manifest).await
+    let manifest = render_tenant_namespace(
+        namespace,
+        &crate::project_namespace::SafeLabel::new(tenant, 63),
+        cidrs,
+    );
+    kube.apply_yaml(&manifest).await?;
+    // Register the namespace → tenant mapping in the same step
+    // as the kubectl apply. The broker's TokenReview path uses
+    // this registry as the SoT (no string parsing). Writing it
+    // here means every namespace the dispatcher creates has a
+    // row by the time any pod inside it can authenticate.
+    crate::namespace_registry::register(pool, namespace, tenant).await
+}
+
+/// Render + apply the per-tenant supervisor Deployment. Idempotent
+/// via `kubectl apply` on a deterministic name; safe to call on
+/// every project register.
+pub async fn ensure_supervisor_deployment(
+    kube: &dyn KubeClient,
+    namespace: &str,
+    tenant: &str,
+    supervisor_image: &str,
+) -> Result<()> {
+    let manifest = render_supervisor_deployment(
+        namespace,
+        &crate::project_namespace::SafeLabel::new(tenant, 63),
+        supervisor_image,
+    );
+    kube.apply_yaml(&manifest).await
+}
+
+pub fn render_supervisor_deployment(
+    namespace: &str,
+    // SafeLabel: the type forces sanitization before this id reaches
+    // the manifest (closes the cloud free-form-tenant injection seam).
+    tenant: &crate::project_namespace::SafeLabel,
+    supervisor_image: &str,
+) -> String {
+    format!(
+        r#"---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-infra-supervisor
+  namespace: {namespace}
+  labels:
+    weft.dev/role: infra-supervisor
+    weft.dev/tenant: "{tenant}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      weft.dev/role: infra-supervisor
+      weft.dev/tenant: "{tenant}"
+  template:
+    metadata:
+      labels:
+        weft.dev/role: infra-supervisor
+        weft.dev/tenant: "{tenant}"
+    spec:
+      serviceAccountName: weft-infra-supervisor-sa
+      containers:
+        - name: supervisor
+          image: {supervisor_image}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: WEFT_TENANT_ID
+              value: "{tenant}"
+            - name: WEFT_BROKER_URL
+              value: "http://weft-broker.weft-db.svc.cluster.local:9090"
+            - name: WEFT_BROKER_TOKEN_PATH
+              value: "/var/run/weft/sa/token"
+            - name: WEFT_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: weft-sa-token
+              mountPath: /var/run/weft/sa
+              readOnly: true
+      volumes:
+        - name: weft-sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: weft-broker
+                  expirationSeconds: 3600
+                  path: token
+"#,
+    )
 }
 
 pub fn render_tenant_namespace(
     namespace: &str,
-    tenant: &str,
+    // SafeLabel: forces sanitization before interpolation (see
+    // `render_supervisor_deployment`).
+    tenant: &crate::project_namespace::SafeLabel,
     cidrs: ClusterCidrs<'_>,
 ) -> String {
     let pod_cidr = cidrs.pod_cidr;
@@ -54,13 +151,7 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: weft-worker-sa
-  namespace: {namespace}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: weft-sidecar-sa
+  name: weft-infra-supervisor-sa
   namespace: {namespace}
 ---
 apiVersion: networking.k8s.io/v1
@@ -87,7 +178,7 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Only the dispatcher in weft-system. AND'd inside one `from:`.
+    # Dispatcher (weft-system, /register, /process).
     - from:
         - namespaceSelector:
             matchLabels:
@@ -99,7 +190,7 @@ spec:
         - protocol: TCP
           port: 8080
   egress:
-    # Broker for journal / signal / task ops.
+    # Broker (cross-ns to weft-db).
     - to:
         - namespaceSelector:
             matchLabels:
@@ -110,6 +201,7 @@ spec:
       ports:
         - protocol: TCP
           port: 9090
+    # DNS.
     - to:
         - namespaceSelector:
             matchLabels:
@@ -119,6 +211,15 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # ANY namespace belonging to this tenant (project namespaces are
+    # labeled `weft.dev/tenant=<tenant>`). The listener subscribes to
+    # SSE endpoints exposed by infra pods in the tenant's project
+    # namespaces.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              weft.dev/tenant: "{tenant}"
+    # Internet (for kinds whose URL is external, e.g. third-party SSE).
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -129,119 +230,161 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: worker-policy
+  name: supervisor-policy
   namespace: {namespace}
 spec:
   podSelector:
     matchLabels:
-      weft.dev/role: worker
-  policyTypes:
-    - Ingress
-    - Egress
-  egress:
-    # Broker only.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: weft-db
-          podSelector:
-            matchLabels:
-              weft.dev/role: broker
-      ports:
-        - protocol: TCP
-          port: 9090
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    # Sidecars in this same tenant namespace.
-    - to:
-        - podSelector:
-            matchLabels:
-              weft.dev/role: sidecar
-    - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - {pod_cidr}
-              - {service_cidr}
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: sidecar-policy
-  namespace: {namespace}
-spec:
-  podSelector:
-    matchLabels:
-      weft.dev/role: sidecar
+      weft.dev/role: infra-supervisor
   policyTypes:
     - Ingress
     - Egress
   ingress:
-    # Tenant workers (in this same namespace).
-    - from:
-        - podSelector:
-            matchLabels:
-              weft.dev/role: worker
-    # ONLY the dispatcher pod from weft-system: namespace + pod
-    # selector AND'd inside one `from:` entry (two list items inside
-    # one rule are AND'd; two top-level rules are OR'd). Without the
-    # AND, every pod in weft-system reaches the sidecar, including
-    # the broker (which is a credentialed attacker target if pwned
-    # and has no business calling tenant sidecars).
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: weft-system
-          podSelector:
-            matchLabels:
-              weft.dev/role: dispatcher
-    # Ingress controller for public webhooks / browser session
-    # streams. Restricted to the actual ingress pods, not "any pod
-    # in the ingress namespace" (which often includes admission
-    # controllers etc).
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {ingress_ns}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: ingress-nginx
+    # The supervisor doesn't serve HTTP: no ingress allowed.
   egress:
-    # Internet, but not other Pods or Services in this cluster: a
-    # compromised sidecar must not be able to reach other tenant
-    # namespaces or the broker via cluster-internal addresses.
+    # Broker.
     - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - {pod_cidr}
-              - {service_cidr}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: weft-db
+          podSelector:
+            matchLabels:
+              weft.dev/role: broker
+      ports:
+        - protocol: TCP
+          port: 9090
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # k8s API server (kubernetes.default.svc, in `default` namespace).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: default
+      ports:
+        - protocol: TCP
+          port: 443
+    # ANY namespace belonging to this tenant. The supervisor's
+    # kube-rs watches + infra-pod HTTP probes need cross-ns egress
+    # into the tenant's project namespaces.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              weft.dev/tenant: "{tenant}"
+  # Ingress namespace not needed; the supervisor doesn't talk to
+  # ingress controllers.
+---
+# Cross-ns egress controls happen via NetworkPolicy above. The
+# ingress controller's namespace label `{ingress_ns}` is referenced
+# from project namespace `infra-policy` (for `Expose::TenantPublic`
+# endpoints), not from this tenant namespace.
 "#,
     )
 }
 
-async fn apply(manifest: &str) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(manifest.as_bytes()).await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cidrs() -> ClusterCidrs<'static> {
+        ClusterCidrs {
+            pod_cidr: "10.244.0.0/16",
+            service_cidr: "10.96.0.0/12",
+            ingress_namespace: "ingress-nginx",
+        }
     }
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("kubectl apply (tenant namespace) failed: {stderr}");
+
+    fn sl(s: &str) -> crate::project_namespace::SafeLabel {
+        crate::project_namespace::SafeLabel::new(s, 63)
     }
-    Ok(())
+
+    #[test]
+    fn renders_namespace_and_service_accounts() {
+        let yaml = render_tenant_namespace("wm-tenant-alice", &sl("alice"), cidrs());
+        assert!(yaml.contains("kind: Namespace"));
+        assert!(yaml.contains("name: wm-tenant-alice"));
+        // Tenant namespace holds listener + supervisor SAs ONLY.
+        // Worker / infra SAs are in project namespaces.
+        assert!(yaml.contains("name: weft-listener-sa"));
+        assert!(yaml.contains("name: weft-infra-supervisor-sa"));
+        assert!(!yaml.contains("name: weft-worker-sa"));
+        assert!(!yaml.contains("name: weft-infra-sa"));
+    }
+
+    #[test]
+    fn renders_supervisor_and_listener_policies() {
+        let yaml = render_tenant_namespace("wm-tenant-alice", &sl("alice"), cidrs());
+        assert!(yaml.contains("name: listener-policy"));
+        assert!(yaml.contains("name: supervisor-policy"));
+    }
+
+    #[test]
+    fn supervisor_policy_egress_into_tenant_projects() {
+        let yaml = render_tenant_namespace("wm-tenant-alice", &sl("alice"), cidrs());
+        // The supervisor's egress allows tenant-scoped cross-ns reach
+        // via namespaceSelector on `weft.dev/tenant=<tenant>`.
+        assert!(yaml.contains("weft.dev/tenant: \"alice\""));
+    }
+
+    #[test]
+    fn listener_policy_egress_into_tenant_projects() {
+        let yaml = render_tenant_namespace("wm-tenant-alice", &sl("alice"), cidrs());
+        // Same label-selector trick for the listener (SSE
+        // subscriptions to project-namespace infra pods).
+        let listener_section = yaml
+            .split("name: listener-policy")
+            .nth(1)
+            .expect("listener-policy section");
+        assert!(listener_section.contains("weft.dev/tenant: \"alice\""));
+    }
+
+    #[test]
+    fn tenant_label_stamped_on_namespace() {
+        let yaml = render_tenant_namespace("wm-tenant-alice", &sl("alice"), cidrs());
+        // The namespace itself carries the tenant label so external
+        // selectors (project-namespace policies) can match it.
+        assert!(yaml.contains("weft.dev/role: tenant"));
+        assert!(yaml.contains("weft.dev/tenant: \"alice\""));
+    }
+
+    #[test]
+    fn supervisor_render_includes_namespace_and_image() {
+        let yaml = render_supervisor_deployment(
+            "wm-alice",
+            &sl("alice"),
+            "weft-infra-supervisor:local",
+        );
+        assert!(yaml.contains("namespace: wm-alice"));
+        assert!(yaml.contains("image: weft-infra-supervisor:local"));
+        assert!(yaml.contains("weft-infra-supervisor-sa"));
+    }
+
+    #[test]
+    fn supervisor_render_carries_tenant_label() {
+        let yaml = render_supervisor_deployment("wm-alice", &sl("alice"), "img:1");
+        assert!(yaml.contains("weft.dev/role: infra-supervisor"));
+        assert!(yaml.contains("weft.dev/tenant: \"alice\""));
+    }
+
+    #[test]
+    fn supervisor_render_injects_tenant_env() {
+        let yaml = render_supervisor_deployment("wm-alice", &sl("alice"), "img:1");
+        assert!(yaml.contains("name: WEFT_TENANT_ID"));
+        assert!(yaml.contains("value: \"alice\""));
+        assert!(yaml.contains("name: WEFT_BROKER_URL"));
+    }
+
+    #[test]
+    fn supervisor_render_mounts_projected_sa_token() {
+        let yaml = render_supervisor_deployment("wm-alice", &sl("alice"), "img:1");
+        assert!(yaml.contains("audience: weft-broker"));
+        assert!(yaml.contains("mountPath: /var/run/weft/sa"));
+    }
 }

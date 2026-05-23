@@ -3214,6 +3214,7 @@ dependencies = [
  "clap",
  "eventsource-client",
  "futures",
+ "ipnet",
  "reqwest",
  "serde",
  "serde_json",
@@ -3256,6 +3257,7 @@ dependencies = [
  "inventory",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3291,12 +3293,14 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "weft-broker-client",
  "weft-catalog",
  "weft-compiler",
  "weft-core",
  "weft-dispatcher",
  "weft-journal",
  "weft-listener",
+ "weft-platform-traits",
  "weft-task-store",
 ]
 
@@ -3306,6 +3310,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3316,6 +3321,7 @@ dependencies = [
  "weft-core",
  "weft-infra",
  "weft-journal",
+ "weft-platform-traits",
  "weft-task-store",
 ]
 
@@ -3325,7 +3331,30 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "serde_json",
  "sqlx",
+]
+
+[[package]]
+name = "weft-infra-supervisor"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "weft-broker-client",
+ "weft-core",
+ "weft-infra-supervisor",
+ "weft-platform-traits",
 ]
 
 [[package]]
@@ -3368,6 +3397,18 @@ dependencies = [
  "weft-broker-client",
  "weft-core",
  "weft-task-store",
+]
+
+[[package]]
+name = "weft-platform-traits"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

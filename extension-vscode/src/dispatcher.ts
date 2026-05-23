@@ -59,19 +59,40 @@ function subscribeSse(
 }
 
 /// Thrown by `DispatcherClient` for any non-2xx response. Carries
-/// the status code so callers can match (e.g. show a kind-specific
-/// hint on 404) without parsing strings.
+/// the status code (so callers can match, e.g. a 404 hint) AND the
+/// response body, which is where the dispatcher puts its actual
+/// reason (e.g. "project is already activating; wait or weft
+/// deactivate"). The message surfaces the body when present so the
+/// user sees the reason, not just "POST /path: 409".
 export class HttpError extends Error {
   constructor(
     public readonly method: string,
     public readonly path: string,
     public readonly status: number,
+    public readonly body?: string,
   ) {
-    super(`${method} ${path}: ${status}`);
+    const reason = body && body.trim() ? body.trim() : `${status}`;
+    super(`${method} ${path}: ${reason}`);
     this.name = 'HttpError';
   }
 }
 
+/// Read an errored response's body (best-effort) and build an
+/// HttpError. One place so every verb surfaces the dispatcher's
+/// reason identically.
+async function httpError(method: string, path: string, res: Response): Promise<HttpError> {
+  const body = await res.text().catch(() => '');
+  return new HttpError(method, path, res.status, body);
+}
+
+// TODO(weft): the generic get<T>/post<T> surface lets callers
+// declare inline shapes that drift from the Rust wire structs
+// without `tsc` catching it (a renamed field on the backend keeps
+// compiling because `<{status?: string}>` is partial by design).
+// The structural answer is generated TypeScript types from the
+// Rust protocol structs (ts-rs / typeshare) wired into setup.sh.
+// Tracked separately from this slice; each new endpoint should
+// still go through this client for the moment.
 export class DispatcherClient {
   constructor(private baseUrl: string) {}
 
@@ -81,7 +102,7 @@ export class DispatcherClient {
 
   async get<T>(path: string): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`);
-    if (!res.ok) throw new HttpError('GET', path, res.status);
+    if (!res.ok) throw await httpError('GET', path, res);
     return (await res.json()) as T;
   }
 
@@ -91,14 +112,14 @@ export class DispatcherClient {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new HttpError('POST', path, res.status);
+    if (!res.ok) throw await httpError('POST', path, res);
     const text = await res.text();
     return (text ? JSON.parse(text) : ({} as unknown)) as T;
   }
 
   async del(path: string): Promise<void> {
     const res = await fetch(`${this.baseUrl}${path}`, { method: 'DELETE' });
-    if (!res.ok && res.status !== 204) throw new HttpError('DELETE', path, res.status);
+    if (!res.ok && res.status !== 204) throw await httpError('DELETE', path, res);
   }
 
   subscribe(path: string, onEvent: (ev: { data: string }) => void): SseSubscription {

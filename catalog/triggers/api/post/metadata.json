@@ -29,7 +29,6 @@
   "requires_infra": false,
   "features": {
     "isTrigger": true,
-    "triggerCategory": "Webhook",
     "canAddOutputPorts": true
   },
   "validate": [

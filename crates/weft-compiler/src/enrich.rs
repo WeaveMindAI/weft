@@ -264,7 +264,7 @@ pub fn enrich_with_policy(
         node.outputs = outputs;
         node.features = meta.features.clone();
         node.requires_infra = meta.requires_infra;
-        node.sidecar = meta.features.sidecar.clone();
+        node.images = meta.images.clone();
     }
 
     if !errors.is_empty() {

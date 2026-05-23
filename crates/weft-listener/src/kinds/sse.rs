@@ -61,11 +61,12 @@ impl KindHandler for SseHandler {
         _sig: &RegisteredSignal,
         payload: Value,
     ) -> ProcessOutcome {
+        // An SSE event (raised internally by spawn_loop via
+        // `sink.fire`, delivered through the FireSignal broker task)
+        // routes to the entry trigger.
         ProcessOutcome {
             value: payload,
-            target: ProcessTarget::Drop {
-                reason: Some("sse is internal-fire only".into()),
-            },
+            target: ProcessTarget::Entry,
         }
     }
 
@@ -83,18 +84,29 @@ struct SseMessage {
     data: String,
 }
 
-/// Parse one SSE message block (the text between two `\n\n`
+/// Find the first SSE block boundary in `buf` as `(offset, len)`:
+/// the byte offset where the delimiter starts and its length. Per the
+/// WHATWG event-stream spec a block ends on ANY of `\r\n\r\n`, `\n\n`,
+/// or `\r\r` (a CRLF-emitting server never produces `\n\n`, so a
+/// `\n\n`-only scan would buffer forever and never dispatch). Earliest
+/// match wins; `\r\n\r\n` is checked first so it isn't mis-split as
+/// `\r\r` + leftover. Pure byte search: safe regardless of UTF-8
+/// framing since all delimiters are ASCII.
+fn find_block_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    let crlf2 = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4));
+    let lf2 = buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let cr2 = buf.windows(2).position(|w| w == b"\r\r").map(|p| (p, 2));
+    // Earliest boundary wins. The three delimiters can't start at the
+    // same offset (the byte after the first `\r`/`\n` differs), so
+    // earliest-offset alone is unambiguous; no length tie-break needed.
+    [crlf2, lf2, cr2].into_iter().flatten().min_by_key(|(pos, _)| *pos)
+}
+
+/// Parse one SSE message block (the text between two block
 /// boundaries) into a typed message. Returns None if the block
 /// carried no `data:` line (per spec, those blocks are dispatched
 /// as events with no data, but for our purposes there's nothing to
 /// fire on, so we skip).
-/// Find the byte offset of the first `\n\n` in `buf`, or `None`.
-/// Pure byte search: works regardless of UTF-8 framing because the
-/// SSE delimiter is two ASCII newlines.
-fn find_block_boundary(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
-}
-
 fn parse_message(block: &str) -> Option<SseMessage> {
     let mut event = String::from("message");
     let mut data = String::new();
@@ -156,7 +168,6 @@ fn spawn_loop(
             {
                 Ok(r) if r.status().is_success() => {
                     info!(target: "weft_listener::sse", %url, %token, "SSE connected");
-                    backoff = 1;
                     r
                 }
                 Ok(r) => {
@@ -173,6 +184,7 @@ fn spawn_loop(
                 }
             };
 
+            let connected_at = std::time::Instant::now();
             let mut stream = resp.bytes_stream();
             // Byte-level buffer so a multi-byte UTF-8 sequence
             // straddling a chunk boundary is reassembled before
@@ -193,9 +205,10 @@ fn spawn_loop(
                     }
                 };
                 buffer.extend_from_slice(&chunk);
-                while let Some(pos) = find_block_boundary(&buffer) {
-                    let block_bytes: Vec<u8> = buffer.drain(..pos + 2).collect();
-                    // `block_bytes` ends with `\n\n`; strip before decode.
+                while let Some((pos, delim_len)) = find_block_boundary(&buffer) {
+                    let block_bytes: Vec<u8> = buffer.drain(..pos + delim_len).collect();
+                    // `block_bytes` ends with the delimiter; strip it
+                    // (`pos` bytes precede it) before decode.
                     let block = match std::str::from_utf8(&block_bytes[..pos]) {
                         Ok(s) => s,
                         Err(e) => {
@@ -231,7 +244,17 @@ fn spawn_loop(
                 }
             }
 
-            sleep(Duration::from_secs(1)).await;
+            // The stream dropped (ended or errored). Reconnect on the
+            // same backoff ladder as connect failures, so a flapping
+            // endpoint (accepts then immediately resets) doesn't get
+            // hammered at a fixed 1/s. Only treat the connection as
+            // healthy (reset the ladder) if it stayed up long enough
+            // to deliver, not just complete a TCP handshake.
+            if connected_at.elapsed() >= Duration::from_secs(30) {
+                backoff = 1;
+            }
+            sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(60);
         }
     })
 }
@@ -275,5 +298,24 @@ mod tests {
         // Per spec a block with no `data:` is dispatched as an empty
         // event; we have nothing to fire so we skip.
         assert!(parse_message("event: ping").is_none());
+    }
+
+    #[test]
+    fn block_boundary_matches_all_spec_delimiters() {
+        // LF (the common case), CRLF (the bug: a CRLF server used to
+        // never fire because only `\n\n` was scanned), and bare CR.
+        assert_eq!(find_block_boundary(b"data: a\n\nrest"), Some((7, 2)));
+        assert_eq!(find_block_boundary(b"data: a\r\n\r\nrest"), Some((7, 4)));
+        assert_eq!(find_block_boundary(b"data: a\r\rrest"), Some((7, 2)));
+        // No complete boundary yet: keep buffering.
+        assert_eq!(find_block_boundary(b"data: a\n"), None);
+        assert_eq!(find_block_boundary(b"data: a\r\n"), None);
+    }
+
+    #[test]
+    fn block_boundary_prefers_crlf_over_truncating_to_cr() {
+        // A `\r\n\r\n` at offset 0 must report len 4, not be mis-split
+        // as `\r\r`-like; the drain offset depends on this.
+        assert_eq!(find_block_boundary(b"\r\n\r\nx"), Some((0, 4)));
     }
 }

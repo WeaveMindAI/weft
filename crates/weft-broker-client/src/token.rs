@@ -21,7 +21,7 @@ impl TokenSource {
 
     /// Default path for in-cluster pods; the dispatcher mounts the
     /// projected SA token at this location for listener / worker /
-    /// sidecar pods.
+    /// infra pods.
     pub fn default_path() -> PathBuf {
         PathBuf::from("/var/run/weft/sa/token")
     }

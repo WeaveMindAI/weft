@@ -1,31 +1,27 @@
 //! Output postprocessing. After a node returns from `execute`, the
 //! runtime calls this to emit pulses on each outgoing edge, applying
-//! Expand/Gather lane transformations and runtime type checks.
-
-use std::collections::{HashMap, HashSet};
+//! the Expand lane split. No type checking here: type enforcement is
+//! the consumer's input boundary's job (`ready::check_input`). (Gather
+//! is an input-side transform; see `preprocess` + `ready::build_input`.)
 
 use serde_json::{Map, Value};
 
-use crate::exec::execution::{NodeExecutionStatus, NodeExecutionTable};
 use crate::exec::mutations::PulseMutation;
-use crate::exec::typecheck::runtime_type_check;
 use crate::lane::{Lane, LaneFrame};
-use crate::project::{Edge, EdgeIndex, LaneMode, NodeDefinition, ProjectDefinition};
+use crate::project::{Edge, EdgeIndex, LaneMode, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
-use crate::weft_type::WeftType;
 use crate::Color;
 
-/// Outcome of `postprocess_output`. `gather_fired` lets the caller
-/// re-run readiness; mutations land in the caller-provided vec so
-/// the runtime can ship them to the dispatcher for journaling.
-#[derive(Debug, Default)]
-pub struct PostprocessResult {
-    pub gather_fired: bool,
-}
 
-/// Process a node's output. Emits pulses downstream and appends one
-/// `PulseMutation::Emitted` per produced pulse to `mutations`, so
-/// the runtime can ship a faithful journal record.
+/// Process a node's output: emit pulses on each outgoing edge,
+/// applying the Expand lane split, and append one
+/// `PulseMutation::Emitted` per produced pulse so the runtime can ship
+/// a faithful journal record.
+///
+/// No type checking here. Type enforcement lives at exactly one
+/// boundary, the CONSUMER's input (`ready::check_input`): a node emits
+/// its output as produced, and a bad-typed value is caught when it
+/// reaches whatever node consumes it.
 pub fn postprocess_output(
     node_id: &str,
     output: &Value,
@@ -34,66 +30,21 @@ pub fn postprocess_output(
     project: &ProjectDefinition,
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
-    node_executions: &mut NodeExecutionTable,
     mutations: &mut Vec<PulseMutation>,
-) -> PostprocessResult {
-    let mut result = PostprocessResult::default();
+) {
     let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
         tracing::error!(target: "weft::exec::postprocess", node = node_id, "node not found in project");
-        return result;
+        return;
     };
 
     let output_obj = output.as_object();
     let outgoing = edge_idx.get_outgoing(project, node_id);
 
-    // Per-port runtime type check on Single ports. Mismatches coerce
-    // to null and mark the execution failed.
-    let mut failed_ports: HashSet<String> = HashSet::new();
     for port in &node.outputs {
-        if port.lane_mode != LaneMode::Single {
-            continue;
-        }
-        let connected = outgoing.iter().any(|e| e.source_handle.as_deref() == Some(&port.name));
-        if !connected {
-            continue;
-        }
         let value = output_obj
             .and_then(|o| o.get(&port.name))
             .cloned()
             .unwrap_or(Value::Null);
-        if value.is_null() || port.port_type.is_unresolved() {
-            continue;
-        }
-        if !runtime_type_check(&port.port_type, &value) {
-            let err = format!(
-                "output '{}' expected {}, got {}",
-                port.name,
-                port.port_type,
-                WeftType::infer(&value)
-            );
-            tracing::error!(target: "weft::exec::postprocess", node = node_id, "{err}");
-            if let Some(execs) = node_executions.get_mut(node_id) {
-                if let Some(exec) = execs.iter_mut().rev().find(|e| e.color == color && &e.lane == lane) {
-                    exec.status = NodeExecutionStatus::Failed;
-                    exec.error = Some(err);
-                }
-            }
-            failed_ports.insert(port.name.clone());
-        }
-    }
-
-    // Collect gather-port values to process together at the end.
-    let mut gather_values: HashMap<String, Value> = HashMap::new();
-
-    for port in &node.outputs {
-        let value = if failed_ports.contains(&port.name) {
-            Value::Null
-        } else {
-            output_obj
-                .and_then(|o| o.get(&port.name))
-                .cloned()
-                .unwrap_or(Value::Null)
-        };
         match port.lane_mode {
             LaneMode::Single => emit_single(
                 node_id,
@@ -115,42 +66,13 @@ pub fn postprocess_output(
                 pulses,
                 mutations,
             ),
-            LaneMode::Gather => {
-                gather_values.insert(port.name.clone(), value);
-            }
+            // Gather is an INPUT-port lane mode only (the language never
+            // assigns it to an output port). The collection happens on
+            // the receiving node's input side in `preprocess::apply_gather`,
+            // not here, so there is nothing to do at emit time.
+            LaneMode::Gather => {}
         }
     }
-
-    if !gather_values.is_empty() {
-        if lane.is_empty() {
-            for (port_name, value) in &gather_values {
-                emit_single(
-                    node_id,
-                    &outgoing,
-                    port_name,
-                    value,
-                    color,
-                    lane,
-                    pulses,
-                    mutations,
-                );
-            }
-        } else {
-            result.gather_fired = try_gather(
-                node_id,
-                node,
-                color,
-                lane,
-                &gather_values,
-                &outgoing,
-                pulses,
-                node_executions,
-                mutations,
-            );
-        }
-    }
-
-    result
 }
 
 /// Emit a Single output port value on every outgoing edge from that
@@ -244,25 +166,15 @@ fn emit_expand(
             let mut child_lane = lane.clone();
             child_lane.push(LaneFrame { count: n, index: i as u32 });
 
-            let checked = if item.is_null() || port.port_type.is_unresolved() {
-                item.clone()
-            } else if !runtime_type_check(&port.port_type, item) {
-                tracing::error!(
-                    target: "weft::exec::postprocess",
-                    node = node_id, port = %port.name, lane = ?child_lane,
-                    "expand item type mismatch; coercing to null"
-                );
-                Value::Null
-            } else {
-                item.clone()
-            };
-
+            // Pure split: emit each element untouched. Type enforcement
+            // is the consumer's input boundary's job (`ready::check_input`),
+            // not the producer's.
             let pulse = Pulse::new(
                 color,
                 child_lane.clone(),
                 edge.target.clone(),
                 target_handle.to_string(),
-                checked.clone(),
+                item.clone(),
             );
             let pulse_id = pulse.id;
             pulses.entry(edge.target.clone()).or_default().push(pulse);
@@ -274,86 +186,10 @@ fn emit_expand(
                 target_port: target_handle.to_string(),
                 color,
                 lane: child_lane,
-                value: checked,
+                value: item.clone(),
             });
         }
     }
-}
-
-/// Gather port: when all sibling lanes at the top level have
-/// completed, collect their output port values into a list and emit
-/// at the parent lane.
-fn try_gather(
-    node_id: &str,
-    node: &NodeDefinition,
-    color: Color,
-    lane: &Lane,
-    gather_values: &HashMap<String, Value>,
-    outgoing: &[&Edge],
-    pulses: &mut PulseTable,
-    node_executions: &NodeExecutionTable,
-    mutations: &mut Vec<PulseMutation>,
-) -> bool {
-    let top = lane.last().unwrap();
-    let expected = top.count;
-    let parent_lane: Lane = lane[..lane.len() - 1].to_vec();
-
-    // Check siblings: all sibling executions for this node at
-    // matching parent-lane + count have reached a terminal state.
-    let siblings: Vec<_> = node_executions
-        .get(node_id)
-        .map(|execs| {
-            execs
-                .iter()
-                .filter(|e| {
-                    e.color == color
-                        && e.lane.len() == lane.len()
-                        && e.lane[..e.lane.len() - 1] == parent_lane[..]
-                        && e.lane.last().map(|f| f.count) == Some(expected)
-                        && e.status.is_terminal()
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if (siblings.len() as u32) < expected {
-        return false;
-    }
-
-    for (port_name, _) in gather_values {
-        let mut ordered: Vec<(u32, Value)> = siblings
-            .iter()
-            .map(|e| {
-                let idx = e.lane.last().unwrap().index;
-                let value = if matches!(e.status, NodeExecutionStatus::Failed | NodeExecutionStatus::Skipped) {
-                    Value::Null
-                } else {
-                    e.output
-                        .as_ref()
-                        .and_then(|o| o.get(port_name))
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                };
-                (idx, value)
-            })
-            .collect();
-        ordered.sort_by_key(|(i, _)| *i);
-        let gathered = Value::Array(ordered.into_iter().map(|(_, v)| v).collect());
-
-        if let Some(port_def) = node.outputs.iter().find(|p| &p.name == port_name) {
-            if !port_def.port_type.is_unresolved() && !runtime_type_check(&port_def.port_type, &gathered) {
-                tracing::error!(
-                    target: "weft::exec::postprocess",
-                    node = node_id, port = port_name.as_str(),
-                    "gather type mismatch"
-                );
-            }
-        }
-
-        emit_single(node_id, outgoing, port_name, &gathered, color, &parent_lane, pulses, mutations);
-    }
-
-    true
 }
 
 /// Emit null on every output port at the given lane. Used when a
@@ -366,11 +202,10 @@ pub fn emit_null_downstream(
     project: &ProjectDefinition,
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
-    node_executions: &mut NodeExecutionTable,
     mutations: &mut Vec<PulseMutation>,
-) -> PostprocessResult {
+) {
     let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
-        return PostprocessResult::default();
+        return;
     };
     let mut null_output = Map::new();
     for port in &node.outputs {
@@ -384,7 +219,7 @@ pub fn emit_null_downstream(
         project,
         pulses,
         edge_idx,
-        node_executions,
         mutations,
-    )
+    );
 }
+

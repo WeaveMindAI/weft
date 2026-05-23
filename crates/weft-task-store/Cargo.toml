@@ -16,3 +16,9 @@ tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables tokio's paused virtual clock (start_paused +
+# advance) so the idle-exit picker test runs deterministically
+# without real sleeps.
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

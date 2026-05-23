@@ -1,15 +1,25 @@
 //! Engine-side `ContextHandle`. Lifecycle events go straight to
 //! the journal via the broker. Control-plane round-trips
-//! (`await_signal`, `register_signal`, `provision_sidecar`) go
-//! through the dispatcher's task queue (also via the broker): the
-//! worker enqueues a task row and waits for completion. Resume
-//! values are seeded into the per-(node, lane) await sequence by
-//! the loop driver at boot from the journal fold; the body's
-//! `await_signal` calls pop entries in call_index order.
+//! (`await_signal`, `register_signal`) go through the dispatcher's
+//! task queue (also via the broker): the worker enqueues a task row
+//! and waits for completion. Resume values are seeded into the
+//! per-(node, lane) await sequence by the loop driver at boot from
+//! the journal fold; the body's `await_signal` calls pop entries in
+//! call_index order.
+//!
+//! Infra-provision (the engine-side counterpart to user code's
+//! `Node::provision` returning an `InfraSpec`) is driven by the loop
+//! driver, NOT by methods on `RunnerHandle`. The loop driver calls
+//! `node.provision`, compiles + hashes the returned spec locally,
+//! reads prior applied state via the broker, makes a local
+//! skip/fresh/replace decision, and (when not Skip) enqueues an
+//! `Apply` lifecycle command via `apply_via_supervisor`. The tenant's
+//! supervisor pod handles the kubectl work. Once apply completes,
+//! the loop driver runs `node.execute` with `Phase::InfraSetup`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -19,11 +29,24 @@ use weft_core::context::{ContextHandle, LogLevel};
 use weft_core::error::{WeftError, WeftResult};
 use weft_core::primitive::{CostReport, SignalSpec};
 use weft_core::Color;
+
+use crate::now_unix;
 use weft_infra::InfraReader;
 use weft_journal::{ExecEvent, JournalClient};
 
 use weft_task_store::tasks as task_store;
 use weft_task_store::{TaskKind, TaskStoreClient};
+
+/// Serialize a lane into the canonical string used in task dedup keys.
+/// One definition so the side-effect-task and register-signal-task
+/// dedup keys can't drift, and so a serialization failure is surfaced
+/// (a swallowed `unwrap_or_default()` would collapse distinct lanes to
+/// the same empty key and silently drop a task). Lane serialization
+/// shouldn't fail in practice, which is exactly why a failure must be
+/// loud rather than masked.
+fn lane_dedup_key(lane: &weft_core::lane::Lane) -> Result<String, serde_json::Error> {
+    serde_json::to_string(lane)
+}
 
 /// Bundle of broker-backed clients the engine threads everywhere.
 /// Each handle clones cheaply (every field is `Arc<dyn _>`).
@@ -32,6 +55,61 @@ pub struct EngineClients {
     pub journal: Arc<dyn JournalClient>,
     pub tasks: Arc<dyn TaskStoreClient>,
     pub infra: Arc<dyn InfraReader>,
+    /// Broker client for infra applied-state reads + apply enqueue.
+    /// Used by the loop driver during `Phase::InfraSetup` to make the
+    /// skip/fresh/replace decision locally, then ship the spec to the
+    /// supervisor via the `infra_lifecycle_command` table.
+    pub infra_state: Arc<dyn InfraStateClient>,
+    /// Clock the engine uses for every time-related decision
+    /// (deadlines, polling intervals). Production passes the
+    /// real clock; layer-3 tests pass `FakeClock` so deadlines
+    /// can be exercised without burning real wall-clock seconds.
+    pub clock: Arc<dyn weft_platform_traits::Clock>,
+}
+
+/// Trait surface over `BrokerInfraStateClient` so tests can inject a
+/// no-op (or recording) implementation. Production has one impl: the
+/// broker-backed HTTP client.
+///
+/// The trait has two operations: `enqueue_apply` (ship a fresh spec
+/// to the supervisor) and `wait_apply` (poll the resulting command
+/// row to terminal). The supervisor owns every other concern
+/// end-to-end: read prior `infra_node`, compile + hash, decide
+/// skip / fresh / replace, run kubectl, update the row. The worker
+/// just hands off the spec and waits.
+#[async_trait]
+pub trait InfraStateClient: Send + Sync {
+    async fn enqueue_apply(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        spec_json: serde_json::Value,
+    ) -> anyhow::Result<i64>;
+
+    async fn wait_apply(
+        &self,
+        project_id: &str,
+        command_id: i64,
+    ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse>;
+}
+
+#[async_trait]
+impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
+    async fn enqueue_apply(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        spec_json: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        self.enqueue_apply(project_id, node_id, spec_json).await
+    }
+    async fn wait_apply(
+        &self,
+        project_id: &str,
+        command_id: i64,
+    ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
+        self.wait_apply(project_id, command_id).await
+    }
 }
 
 /// Round-trip timeout for control-plane tasks. Generous because
@@ -57,12 +135,6 @@ async fn record_from_pod(journal: &dyn JournalClient, event: ExecEvent, pod_name
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 pub struct RunnerHandle {
     execution_id: String,
@@ -71,7 +143,7 @@ pub struct RunnerHandle {
     node_id: String,
     node_lane: weft_core::lane::Lane,
     /// Broker-backed clients: journal writes, task enqueue, and
-    /// infra reads (sidecar endpoint lookup) all flow through here.
+    /// infra reads (infra endpoint lookup) all flow through here.
     clients: EngineClients,
     /// k8s Pod name stamped on every journal write so the fencing
     /// trigger can reject writes from a Pod that has been drained or
@@ -172,11 +244,12 @@ impl RunnerHandle {
         let payload_json = serde_json::to_value(&payload).map_err(|e| {
             WeftError::Config(format!("{dedup_prefix} payload: {e}"))
         })?;
+        let lane = lane_dedup_key(&self.node_lane)
+            .map_err(|e| WeftError::Config(format!("{dedup_prefix} lane key: {e}")))?;
         let dedup_key = format!(
             "{dedup_prefix}:{color}:{node}:{lane}:{idx}",
             color = self.color,
             node = self.node_id,
-            lane = serde_json::to_string(&self.node_lane).unwrap_or_default(),
             idx = self.next_side_effect_index(),
         );
         self.clients
@@ -554,7 +627,7 @@ impl ContextHandle for RunnerHandle {
     /// the body's call sequence drifted from the journal: error
     /// loudly. If the sequence is exhausted, return None to signal
     /// "fresh path" so the wrapper invokes the closure.
-    async fn run_step(&self, name: &str) -> WeftResult<Option<Value>> {
+    async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
         let next_entry = {
             let mut seq = self
@@ -575,7 +648,7 @@ impl ContextHandle for RunnerHandle {
                 }
                 match entry.kind {
                     weft_core::primitive::AwaitedEntryKind::Run { value, .. } => {
-                        Ok(Some(value))
+                        Ok((call_index, Some(value)))
                     }
                     weft_core::primitive::AwaitedEntryKind::Await { .. } => {
                         Err(WeftError::NodeExecution(format!(
@@ -587,20 +660,14 @@ impl ContextHandle for RunnerHandle {
                     }
                 }
             }
-            None => Ok(None),
+            None => Ok((call_index, None)),
         }
     }
 
-    async fn run_record(&self, name: &str, value: &Value) -> WeftResult<()> {
-        // call_index already incremented by run_step. The fresh
-        // path means run_step returned None, so the index that
-        // applies to THIS run output is one less than the current
-        // counter. Subtract atomically (no other call could have
-        // observed the counter between run_step and run_record
-        // because the body is a single async future polled in
-        // sequence; the Mutex on awaited_sequence guards races
-        // against any cross-thread polling).
-        let call_index = self.next_call_index.load(Ordering::SeqCst).saturating_sub(1);
+    async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()> {
+        // call_index is the value run_step returned, passed in so
+        // run_step and run_record agree on the index explicitly
+        // rather than via a shared counter both sides read.
         record_from_pod(
             self.clients.journal.as_ref(),
             ExecEvent::RunOutput {
@@ -618,17 +685,55 @@ impl ContextHandle for RunnerHandle {
         Ok(())
     }
 
-    async fn sidecar_endpoint(&self) -> WeftResult<String> {
+    async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
         let endpoint = self
             .clients
             .infra
-            .sidecar_endpoint(&self.project_id, &self.node_id)
+            .endpoint_url(&self.project_id, &self.node_id, name)
             .await
-            .map_err(|e| WeftError::Config(format!("infra_pod lookup: {e}")))?;
+            .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
         endpoint.ok_or_else(|| {
             WeftError::Config(format!(
-                "sidecar for node '{}' is not provisioned or has no endpoint URL; run `weft infra start` first",
-                self.node_id
+                "endpoint '{}' for node '{}' is not available; either the infra isn't running \
+                 or the endpoint name is not declared. Check `weft infra status` and the node's \
+                 InfraSpec.endpoints list.",
+                name, self.node_id
+            ))
+        })
+    }
+
+    async fn endpoint_call(
+        &self,
+        base: &str,
+        method: weft_core::EndpointMethod,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> WeftResult<serde_json::Value> {
+        let url = format!("{}{}", base.trim_end_matches('/'), path);
+        let client = reqwest::Client::new();
+        let req = match method {
+            weft_core::EndpointMethod::Get => client.get(&url),
+            weft_core::EndpointMethod::Post => {
+                let mut r = client.post(&url);
+                if let Some(b) = &body {
+                    r = r.json(b);
+                }
+                r
+            }
+        };
+        let resp = req.send().await.map_err(|e| {
+            WeftError::Runtime(anyhow::anyhow!("endpoint_call {url}: {e}"))
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WeftError::Runtime(anyhow::anyhow!(
+                "endpoint_call {url} returned {status}: {body}"
+            )));
+        }
+        resp.json::<serde_json::Value>().await.map_err(|e| {
+            WeftError::Runtime(anyhow::anyhow!(
+                "endpoint_call {url} response not JSON: {e}"
             ))
         })
     }
@@ -675,30 +780,6 @@ impl ContextHandle for RunnerHandle {
             "register_signal: dispatcher ack"
         );
         Ok(())
-    }
-
-    async fn provision_sidecar(
-        &self,
-        spec: weft_core::node::SidecarSpec,
-    ) -> WeftResult<weft_core::context::SidecarHandle> {
-        let reply = enqueue_provision_sidecar_task(
-            self.clients.tasks.as_ref(),
-            &self.project_id,
-            &self.node_id,
-            &spec,
-            &self.tenant_id,
-        )
-        .await
-        .map_err(|e| WeftError::Config(format!("provision_sidecar: {e}")))?;
-        let endpoint_url = reply.endpoint_url.ok_or_else(|| {
-            WeftError::Config(
-                "provision_sidecar: dispatcher returned no endpoint URL".into(),
-            )
-        })?;
-        Ok(weft_core::context::SidecarHandle {
-            instance_id: reply.instance_id,
-            endpoint_url,
-        })
     }
 
     async fn report_cost(&self, report: CostReport) -> WeftResult<()> {
@@ -762,12 +843,6 @@ struct RegisterSignalReply {
     token: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ProvisionSidecarReply {
-    instance_id: String,
-    endpoint_url: Option<String>,
-}
-
 async fn enqueue_register_signal_task(
     tasks: &dyn TaskStoreClient,
     color: Color,
@@ -787,7 +862,7 @@ async fn enqueue_register_signal_task(
     // executor uses for SuspensionRegistered: that one omits
     // `is_resume` because only resume registrations journal a
     // SuspensionRegistered event.
-    let lane_key = serde_json::to_string(lane)?;
+    let lane_key = lane_dedup_key(lane)?;
     let dedup_key = format!(
         "{}/{}/{}/{}/{}",
         color, node_id, lane_key, is_resume, call_index,
@@ -844,6 +919,8 @@ mod replay_tests {
             journal: Arc::new(NoopJournal),
             tasks: Arc::new(NoopTaskStore),
             infra: Arc::new(NoopInfra),
+            infra_state: Arc::new(NoopInfraState),
+            clock: Arc::new(weft_platform_traits::clock::SystemClock),
         };
         RunnerHandle::new(
             "exec-1".into(),
@@ -930,12 +1007,37 @@ mod replay_tests {
     struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
-        async fn sidecar_endpoint(
+        async fn endpoint_url(
             &self,
             _project_id: &str,
             _node_id: &str,
+            _endpoint_name: &str,
         ) -> anyhow::Result<Option<String>> {
             Ok(None)
+        }
+    }
+
+    struct NoopInfraState;
+    #[async_trait]
+    impl InfraStateClient for NoopInfraState {
+        async fn enqueue_apply(
+            &self,
+            _project_id: &str,
+            _node_id: &str,
+            _spec_json: serde_json::Value,
+        ) -> anyhow::Result<i64> {
+            Ok(0)
+        }
+        async fn wait_apply(
+            &self,
+            _project_id: &str,
+            _command_id: i64,
+        ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
+            Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
+                completed: true,
+                outcome: Some(weft_broker_client::protocol::LifecycleOutcome::Succeeded),
+                outcome_message: None,
+            })
         }
     }
 
@@ -951,10 +1053,11 @@ mod replay_tests {
             },
         }];
         let handle = handle_with_sequence(seq);
-        let got = handle
+        let (idx, got) = handle
             .run_step("decide")
             .await
             .expect("run_step ok");
+        assert_eq!(idx, 0);
         assert_eq!(got, Some(serde_json::json!("go-left")));
     }
 
@@ -963,7 +1066,8 @@ mod replay_tests {
     #[tokio::test]
     async fn run_step_fresh_returns_none() {
         let handle = handle_with_sequence(Vec::new());
-        let got = handle.run_step("decide").await.expect("run_step ok");
+        let (idx, got) = handle.run_step("decide").await.expect("run_step ok");
+        assert_eq!(idx, 0);
         assert!(got.is_none(), "no journaled output yet");
     }
 
@@ -1018,14 +1122,16 @@ mod replay_tests {
         let handle = handle_with_sequence(seq);
         assert_eq!(
             handle.run_step("first").await.expect("first"),
-            Some(serde_json::json!("v0"))
+            (0, Some(serde_json::json!("v0")))
         );
         assert_eq!(
             handle.run_step("second").await.expect("second"),
-            Some(serde_json::json!("v1"))
+            (1, Some(serde_json::json!("v1")))
         );
         // Third call: sequence exhausted, returns None.
-        assert!(handle.run_step("third").await.expect("third").is_none());
+        let (idx, val) = handle.run_step("third").await.expect("third");
+        assert_eq!(idx, 2);
+        assert!(val.is_none());
     }
 
     /// Mixed sequence: Await then Run. Verifies the counter and
@@ -1072,53 +1178,79 @@ mod replay_tests {
             .expect("run replay ok");
         assert_eq!(
             processed,
-            Some(serde_json::json!({"shape": "pre-baked"}))
+            (1, Some(serde_json::json!({"shape": "pre-baked"})))
         );
     }
 }
 
-async fn enqueue_provision_sidecar_task(
-    tasks: &dyn TaskStoreClient,
+/// After `node.provision()` returns, the loop driver calls this to
+/// ship the spec to the supervisor and wait for it to settle.
+///
+/// The worker doesn't compile, doesn't hash, doesn't decide
+/// skip/fresh/replace. The supervisor owns all of those: it reads
+/// the prior `infra_node` row, compiles the new spec with the real
+/// image-tag map + instance id (fresh-mint or reused), hashes,
+/// makes the decision, and executes. The worker just polls the
+/// command row for terminal state.
+///
+/// This is a single round-trip from the engine's perspective:
+/// "supervisor, please apply this spec; tell me when you're done."
+/// Skip detection happens supervisor-side and is invisible to the
+/// caller (success is success either way).
+pub async fn apply_via_supervisor(
+    infra_state: &dyn InfraStateClient,
+    clock: &dyn weft_platform_traits::Clock,
     project_id: &str,
     node_id: &str,
-    spec: &weft_core::node::SidecarSpec,
-    tenant_id: &str,
-) -> anyhow::Result<ProvisionSidecarReply> {
-    let dedup_key = format!("{project_id}/{node_id}");
-    let payload = serde_json::json!({
-        "project_id": project_id,
-        "node_id": node_id,
-        "spec": spec,
-    });
-    let id = tasks
-        .enqueue_dedup(task_store::NewTask {
-            kind: TaskKind::ProvisionSidecar,
-            target: task_store::TaskTarget::Dispatcher,
-            project_id: Some(project_id.to_string()),
-            dedup_key: Some(dedup_key),
-            color: None,
-            tenant_id: Some(tenant_id.to_string()),
-            target_pod_name: None,
-            payload,
-        })
-        .await?
-        .id();
-    let outcome = tasks
-        .wait_for_terminal(id, TASK_WAIT_TIMEOUT, TASK_POLL_INTERVAL)
+    spec: &weft_core::infra::InfraSpec,
+) -> anyhow::Result<()> {
+    let spec_json = serde_json::to_value(spec)?;
+    let cmd_id = infra_state
+        .enqueue_apply(project_id, node_id, spec_json)
         .await?;
-    match outcome.status {
-        task_store::TaskStatus::Complete => {
-            let result = outcome
-                .result
-                .ok_or_else(|| anyhow::anyhow!("provision_sidecar returned no result"))?;
-            Ok(serde_json::from_value(result)?)
+    let deadline = clock.now() + TASK_WAIT_TIMEOUT;
+    loop {
+        let resp = infra_state.wait_apply(project_id, cmd_id).await?;
+        if resp.completed {
+            use weft_broker_client::protocol::LifecycleOutcome;
+            match resp.outcome {
+                Some(LifecycleOutcome::Succeeded) => return Ok(()),
+                Some(LifecycleOutcome::Cancelled) => {
+                    // The command was abandoned (e.g. the node was
+                    // removed by `remove_node` mid-flight). Not a
+                    // failure: surface as "no longer applicable"
+                    // and let the engine treat it as completed.
+                    let reason = resp.outcome_message.as_deref().unwrap_or("cancelled");
+                    tracing::info!(
+                        target: "weft_engine::context",
+                        project_id,
+                        node_id,
+                        reason,
+                        "supervisor apply cancelled; no longer applicable"
+                    );
+                    return Ok(());
+                }
+                Some(LifecycleOutcome::Failed) => {
+                    let err = resp
+                        .outcome_message
+                        .unwrap_or_else(|| "supervisor reported no error detail".into());
+                    anyhow::bail!("supervisor apply failed: {err}");
+                }
+                None => {
+                    // completed=true with outcome=None means schema
+                    // drift the broker should have caught; fail loud.
+                    anyhow::bail!(
+                        "supervisor apply completed but returned no outcome"
+                    );
+                }
+            }
         }
-        task_store::TaskStatus::Failed => {
+        if clock.now() >= deadline {
             anyhow::bail!(
-                "{}",
-                outcome.error.unwrap_or_else(|| "provision_sidecar failed".into())
-            )
+                "supervisor did not complete apply command {cmd_id} within {}s",
+                TASK_WAIT_TIMEOUT.as_secs()
+            );
         }
-        other => anyhow::bail!("provision_sidecar status: {other:?}"),
+        clock.sleep(TASK_POLL_INTERVAL).await;
     }
 }

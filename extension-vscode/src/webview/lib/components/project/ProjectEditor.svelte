@@ -33,6 +33,8 @@
 		onStartInfra,
 		onStopInfra,
 		onTerminateInfra,
+		onInfraNodeStop,
+		onInfraNodeTerminate,
 		onUpgradeInfra,
 		actionBarState,
 		drift,
@@ -62,10 +64,15 @@
 		onStartInfra?: () => void;
 		onStopInfra?: () => void;
 		onTerminateInfra?: () => void;
+		/// Per-node lifecycle, used by the graph's right-click menu
+		/// on a single infra node. The parent dispatches the HTTP
+		/// call through the extension host's CLI verb path.
+		onInfraNodeStop?: (nodeId: string) => void;
+		onInfraNodeTerminate?: (nodeId: string) => void;
 		onUpgradeInfra?: () => void;
 		actionBarState: import('../../../../shared/protocol').ActionBarState;
 		drift: import('../../../../shared/protocol').ActionAvailability | undefined;
-		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string }>;
+		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string; failureStage?: string; failureMessage?: string }>;
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
 		executionState?: {
@@ -77,7 +84,7 @@
 		validationErrors?: Map<string, ValidationError[]>;
 		autoOrganizeOnMount?: boolean;
 		fitViewAfterOrganize?: boolean;
-		/// Per-node sidecar /live tick state. Only consumed for nodes
+		/// Per-node infra /live tick state. Only consumed for nodes
 		/// with `requiresInfra: true`.
 		infraFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
 		/// Per-node listener /display tick state. Only consumed for
@@ -105,6 +112,8 @@
 		{onStartInfra}
 		{onStopInfra}
 		{onTerminateInfra}
+		{onInfraNodeStop}
+		{onInfraNodeTerminate}
 		{onUpgradeInfra}
 		{actionBarState}
 		{drift}

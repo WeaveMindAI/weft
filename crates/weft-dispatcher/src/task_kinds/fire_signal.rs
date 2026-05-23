@@ -4,9 +4,8 @@
 //! dispatcher Pod claims it and runs the same `dispatch_listener_outcome`
 //! path a stateless fire goes through.
 //!
-//! Replaces the legacy `POST /signal/internal-resume` HTTP push from
-//! listener to dispatcher: tenant pods never speak HTTP to the
-//! dispatcher in arch-5; coordination is the task table, gated by the
+//! Tenant pods never speak HTTP to the dispatcher: listener →
+//! dispatcher coordination goes through the task table, gated by the
 //! broker's per-tenant scope check.
 
 use anyhow::Result;

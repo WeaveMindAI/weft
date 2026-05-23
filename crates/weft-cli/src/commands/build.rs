@@ -145,9 +145,9 @@ async fn docker_build(
 }
 
 /// Single docker build entrypoint used by both worker images and
-/// sidecar images. The `label` arg lets callers stamp the
+/// infra images. The `label` arg lets callers stamp the
 /// `weft.dev/project=<id>` filter so `prune_dangling_for_project`
-/// can find their leftovers later. Sidecar callers can pass `None`
+/// can find their leftovers later. Other callers can pass `None`
 /// or a different domain label.
 pub async fn docker_build_image(
     tag: &str,

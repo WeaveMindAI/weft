@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::exec::mutations::{ExpandedChild, PulseMutation};
-use crate::exec::typecheck::runtime_type_check;
 use crate::lane::{Lane, LaneFrame};
 use crate::project::{LaneMode, NodeDefinition, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
@@ -44,7 +43,7 @@ pub fn preprocess_input(
     }
 
     for w in work {
-        apply(w, project, pulses, mutations);
+        apply(w, pulses, mutations);
     }
     true
 }
@@ -159,19 +158,17 @@ fn collect_gather_work(node: &NodeDefinition, pulses: &PulseTable, out: &mut Vec
 
 fn apply(
     work: Work,
-    project: &ProjectDefinition,
     pulses: &mut PulseTable,
     mutations: &mut Vec<PulseMutation>,
 ) {
     match work {
-        Work::Expand(w) => apply_expand(w, project, pulses, mutations),
-        Work::Gather(w) => apply_gather(w, project, pulses, mutations),
+        Work::Expand(w) => apply_expand(w, pulses, mutations),
+        Work::Gather(w) => apply_gather(w, pulses, mutations),
     }
 }
 
 fn apply_expand(
     w: ExpandWork,
-    project: &ProjectDefinition,
     pulses: &mut PulseTable,
     mutations: &mut Vec<PulseMutation>,
 ) {
@@ -181,36 +178,23 @@ fn apply_expand(
         }
     }
 
-    let port_type = project
-        .nodes
-        .iter()
-        .find(|n| n.id == w.node_id)
-        .and_then(|n| n.inputs.iter().find(|p| p.name == w.port))
-        .map(|p| &p.port_type);
-
+    // Pure transform: split the list into per-element child lanes. No
+    // type checking here. Type enforcement lives at exactly one place
+    // (the consuming node's input boundary, `ready::check_input`):
+    // each element pulse carries the element value and is checked
+    // against the (post-transform) element port type when its lane
+    // fires.
     let bucket = pulses.entry(w.node_id.clone()).or_default();
     let mut children = Vec::with_capacity(w.leaves.len());
     for (lane_suffix, item) in &w.leaves {
         let mut child_lane = w.base_lane.clone();
         child_lane.extend_from_slice(lane_suffix);
 
-        let checked = match port_type {
-            Some(pt) if !item.is_null() && !pt.is_unresolved() && !runtime_type_check(pt, item) => {
-                tracing::error!(
-                    target: "weft::exec::preprocess",
-                    node = %w.node_id, port = %w.port, lane = ?child_lane,
-                    "expand type mismatch; coercing to null"
-                );
-                Value::Null
-            }
-            _ => item.clone(),
-        };
-
-        let pulse = Pulse::new(w.color, child_lane, w.node_id.clone(), w.port.clone(), checked.clone());
+        let pulse = Pulse::new(w.color, child_lane, w.node_id.clone(), w.port.clone(), item.clone());
         children.push(ExpandedChild {
             pulse_id: pulse.id,
             lane_suffix: lane_suffix.clone(),
-            value: checked,
+            value: item.clone(),
         });
         bucket.push(pulse);
     }
@@ -227,7 +211,6 @@ fn apply_expand(
 
 fn apply_gather(
     w: GatherWork,
-    project: &ProjectDefinition,
     pulses: &mut PulseTable,
     mutations: &mut Vec<PulseMutation>,
 ) {
@@ -240,23 +223,11 @@ fn apply_gather(
     }
     let gathered = Value::Array(w.gathered);
 
-    // Lane warning path kept but we always emit the gathered value: a
-    // downstream validation error is more actionable than a silent null.
-    let port_def = project
-        .nodes
-        .iter()
-        .find(|n| n.id == w.node_id)
-        .and_then(|n| n.inputs.iter().find(|p| p.name == w.port));
-    if let Some(port) = port_def {
-        if !port.port_type.is_unresolved() && !runtime_type_check(&port.port_type, &gathered) {
-            tracing::error!(
-                target: "weft::exec::preprocess",
-                node = %w.node_id, port = %w.port,
-                "gather type mismatch; downstream check will reject"
-            );
-        }
-    }
-
+    // Pure transform: emit the assembled list untouched. Type
+    // enforcement is the consumer's input boundary's job
+    // (`ready::check_input` checks this `List[T]` value as a whole
+    // against the gather port type, failing a required port if it
+    // doesn't match).
     let bucket = pulses.entry(w.node_id.clone()).or_default();
     let mut pulse = Pulse::new(w.color, w.parent_lane.clone(), w.node_id.clone(), w.port.clone(), gathered.clone());
     pulse.gathered = true;
@@ -289,7 +260,12 @@ fn expand_recursive(data: &Value, depth: u32) -> Vec<(Lane, Value)> {
         return vec![(vec![LaneFrame { count: 1, index: 0 }], data.clone())];
     };
     if arr.is_empty() {
-        return vec![(vec![LaneFrame { count: 1, index: 0 }], Value::Null)];
+        // Empty list → zero children, NOT one phantom null. This
+        // matches the postprocess emit side (`emit_expand` yields no
+        // pulses for an empty array); fabricating a `[null]` lane
+        // here would inflate the fan-out count to 1 and feed a
+        // downstream Gather a phantom null.
+        return Vec::new();
     }
 
     let count = arr.len() as u32;

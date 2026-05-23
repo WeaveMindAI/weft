@@ -121,15 +121,16 @@
 	// 0: exact label match, 1: label starts with query, 2: label word starts with query,
 	// 3: label contains query, 4: tag match, 5: description match, -1: no match.
 	function scoreNode(config: { label: string; description: string; tags: string[] }, query: string): number {
-		const label = config.label.toLowerCase();
+		const label = (config.label ?? "").toLowerCase();
 		if (label === query) return 0;
 		if (label.startsWith(query)) return 1;
 		// Check if any word in the label starts with the query
 		const words = label.split(/\s+/);
 		if (words.some(w => w.startsWith(query))) return 2;
 		if (label.includes(query)) return 3;
-		if (config.tags.some(t => t.toLowerCase().includes(query))) return 4;
-		if (config.description.toLowerCase().includes(query)) return 5;
+		const tags = config.tags ?? [];
+		if (tags.some(t => t.toLowerCase().includes(query))) return 4;
+		if ((config.description ?? "").toLowerCase().includes(query)) return 5;
 		return -1;
 	}
 

@@ -55,15 +55,88 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/worker_pod/mark_done",
             post(handlers::worker_pod_mark_done),
         )
+        .route(
+            "/v1/worker_pod/mark_done_if_idle",
+            post(handlers::worker_pod_mark_done_if_idle),
+        )
         // Infra reads
         .route(
-            "/v1/infra/sidecar_endpoint",
-            post(handlers::infra_sidecar_endpoint),
+            "/v1/infra/endpoint_url",
+            post(handlers::infra_endpoint_url),
         )
         // Signals (listener-only rehydrate read)
         .route(
             "/v1/signal/list_for_tenant",
             post(handlers::signal_list_for_tenant),
+        )
+        // Supervisor surface (tenant-scoped; InfraSupervisor role only).
+        .route(
+            "/v1/supervisor/projects_for_tenant",
+            post(handlers::supervisor_projects_for_tenant),
+        )
+        .route(
+            "/v1/supervisor/infra_nodes",
+            post(handlers::supervisor_infra_nodes),
+        )
+        .route(
+            "/v1/supervisor/health_protocols",
+            post(handlers::supervisor_health_protocols),
+        )
+        .route(
+            "/v1/supervisor/claim_command",
+            post(handlers::supervisor_claim_command),
+        )
+        .route(
+            "/v1/supervisor/event_record",
+            post(handlers::supervisor_event_record),
+        )
+        .route(
+            "/v1/supervisor/set_status",
+            post(handlers::supervisor_set_status),
+        )
+        .route(
+            "/v1/supervisor/remove_node",
+            post(handlers::supervisor_remove_node),
+        )
+        .route(
+            "/v1/supervisor/command_complete",
+            post(handlers::supervisor_command_complete),
+        )
+        .route(
+            "/v1/supervisor/running_count",
+            post(handlers::supervisor_running_count),
+        )
+        .route(
+            "/v1/supervisor/infra_command_in_flight",
+            post(handlers::supervisor_infra_command_in_flight),
+        )
+        .route(
+            "/v1/supervisor/trigger_deps",
+            post(handlers::supervisor_trigger_deps),
+        )
+        .route(
+            "/v1/supervisor/set_applied",
+            post(handlers::supervisor_set_applied),
+        )
+        .route(
+            "/v1/supervisor/set_provisioning",
+            post(handlers::supervisor_set_provisioning),
+        )
+        .route(
+            "/v1/supervisor/enqueue_lifecycle",
+            post(handlers::supervisor_enqueue_lifecycle),
+        )
+        .route(
+            "/v1/supervisor/project_image_tags",
+            post(handlers::supervisor_project_image_tags),
+        )
+        .route(
+            "/v1/infra/enqueue_apply",
+            post(handlers::infra_enqueue_apply),
+        )
+        .route(
+            "/v1/infra/wait_apply",
+            post(handlers::infra_wait_apply),
         )
         .with_state(state)
 }

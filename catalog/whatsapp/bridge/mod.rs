@@ -1,20 +1,26 @@
 //! WhatsAppBridge: infra node.
 //!
-//! - `Phase::InfraSetup`: the node calls `ctx.provision_sidecar`
-//!   with its own SidecarSpec. The dispatcher applies k8s
-//!   manifests and returns the handle. The node emits
-//!   `endpointUrl` so downstream nodes that need it during the
-//!   same setup sub-execution can wire through edges.
-//! - `Phase::Fire` / `Phase::TriggerSetup`: the node queries the
-//!   sidecar's `/outputs` endpoint and forwards the fields to
-//!   its output ports.
+//! - `Phase::InfraSetup`: `Node::provision` returns an `InfraSpec`
+//!   declaring a Deployment + Service + PVC for the Baileys bridge.
+//!   The dispatcher's apply task compiles + applies the manifests
+//!   and writes the `infra_node` row. Then `execute` runs in
+//!   InfraSetup phase to forward the bridge's `/outputs` to the
+//!   node's pulse output ports.
+//! - `Phase::TriggerSetup` / `Phase::Fire`: `execute` queries
+//!   `endpoint_url("api")` and forwards `/outputs` as before. Provision
+//!   is skipped (infra is already up).
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use weft_core::context::Phase;
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::infra::{
+    AccessMode, Container, ContainerPort, Endpoint, EnvEntry, Expose, Image, InfraSpec, Lifecycle,
+    Mount, Probe, Protocol, Resources, TerminateBehavior, Unit, UnitKind, UpgradeBehavior, Volume,
+    VolumeKind,
+};
+use weft_core::node::{NodeInput, NodeMetadata, NodeOutput};
+use weft_core::{ExecutionContext, InfraProvisionContext, Node, WeftResult};
 
 pub struct WhatsAppBridgeNode;
 
@@ -30,69 +36,108 @@ impl Node for WhatsAppBridgeNode {
         serde_json::from_str(METADATA_JSON).expect("WhatsAppBridge metadata.json must be valid")
     }
 
+    async fn provision(
+        &self,
+        _ctx: InfraProvisionContext,
+        _input: NodeInput,
+    ) -> WeftResult<InfraSpec> {
+        // No programmatic inputs today; the bridge is parameterless.
+        // Future: a `device_label` input could be threaded into env.
+        Ok(InfraSpec {
+            units: vec![Unit {
+                name: "bridge".into(),
+                kind: UnitKind::Deployment,
+                // WhatsApp's session can't tolerate two pod replicas
+                // simultaneously, so use Recreate for upgrades. The
+                // strategy is per-Unit; this node has only one Unit,
+                // so all upgrades use it.
+                on_upgrade: UpgradeBehavior::Recreate,
+                containers: vec![{
+                    // Bridge port. One source of truth : the env
+                    // var, the ContainerPort, and the readiness
+                    // probe all derive from this constant.
+                    const BRIDGE_PORT: u16 = 8090;
+                    Container::new("whatsapp", Image::Local { name: "bridge".into() })
+                        .with_env(vec![
+                            EnvEntry::Literal {
+                                name: "PORT".into(),
+                                value: BRIDGE_PORT.to_string(),
+                            },
+                            EnvEntry::Literal {
+                                name: "AUTH_DIR".into(),
+                                value: "/data/auth".into(),
+                            },
+                        ])
+                        .with_ports(vec![ContainerPort {
+                            name: "http".into(),
+                            port: BRIDGE_PORT,
+                            protocol: Protocol::Tcp,
+                        }])
+                        .with_resources(Resources {
+                            cpu_request: Some("100m".into()),
+                            memory_request: Some("128Mi".into()),
+                            cpu_limit: Some("500m".into()),
+                            memory_limit: Some("512Mi".into()),
+                            ..Default::default()
+                        })
+                        .with_mounts(vec![Mount {
+                            volume: "auth".into(),
+                            path: "/data/auth".into(),
+                            ..Default::default()
+                        }])
+                        .with_readiness(
+                            Probe::http("/health", BRIDGE_PORT).with_initial_delay(5),
+                        )
+                }],
+                ..Default::default()
+            }],
+            volumes: vec![Volume {
+                name: "auth".into(),
+                kind: VolumeKind::Persistent {
+                    size: "100Mi".into(),
+                    storage_class: None,
+                    access_modes: vec![AccessMode::ReadWriteOnce],
+                },
+            }],
+            endpoints: vec![Endpoint {
+                name: "api".into(),
+                unit: "bridge".into(),
+                container: "whatsapp".into(),
+                port: "http".into(),
+                expose: Expose::ClusterInternal,
+            }],
+            lifecycle: Lifecycle {
+                on_terminate: TerminateBehavior {
+                    preserve_pvcs: Vec::new(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
         match ctx.phase {
-            Phase::InfraSetup => provision(&ctx).await,
-            Phase::Fire | Phase::TriggerSetup => query_outputs(&ctx).await,
+            Phase::InfraSetup | Phase::TriggerSetup | Phase::Fire => query_outputs(&ctx).await,
         }
     }
 }
 
-/// InfraSetup: ask the dispatcher to apply this node's sidecar
-/// manifests. The spec comes from the node's own metadata, which
-/// the runtime receives as part of the `NodeMetadata` read at
-/// startup. Emit the endpoint URL + instance id as outputs so
-/// the setup subgraph can thread them to anything that needs them.
-async fn provision(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
-    let meta: NodeMetadata = serde_json::from_str(METADATA_JSON)
-        .expect("WhatsAppBridge metadata.json must be valid");
-    let spec = meta.features.sidecar.ok_or_else(|| {
-        weft_core::error::WeftError::Config(
-            "WhatsAppBridge metadata missing sidecar spec".into(),
-        )
-    })?;
-
-    let handle = ctx.provision_sidecar(spec).await?;
-
-    Ok(NodeOutput::empty()
-        .set("endpointUrl", Value::String(handle.endpoint_url.clone()))
-        .set("instanceId", Value::String(handle.instance_id.clone())))
-}
-
-/// Fire / TriggerSetup: ask the dispatcher for this node's
-/// sidecar endpoint, call its `/outputs` helper, forward every
-/// top-level field to a matching output port. Also emits
-/// `endpointUrl` so downstream triggers can pick it up.
 async fn query_outputs(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
-    let endpoint = ctx.sidecar_endpoint().await?;
-    let outputs_url = endpoint
-        .replace("/action", "/outputs")
-        .trim_end_matches('/')
-        .to_string();
-    let final_url = if outputs_url.ends_with("/outputs") {
-        outputs_url
-    } else {
-        format!("{outputs_url}/outputs")
-    };
-    let resp = reqwest::Client::new()
-        .get(&final_url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| weft_core::error::WeftError::NodeExecution(format!("GET {final_url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(weft_core::error::WeftError::NodeExecution(format!(
-            "sidecar /outputs returned {}",
-            resp.status()
-        )));
-    }
-    let sidecar_outputs: Value = resp
-        .json()
-        .await
-        .map_err(|e| weft_core::error::WeftError::NodeExecution(format!("parse /outputs: {e}")))?;
-
-    let mut output = NodeOutput::empty().set("endpointUrl", Value::String(endpoint.clone()));
-    if let Value::Object(map) = sidecar_outputs {
+    // One broker round-trip resolves the endpoint; the handle
+    // caches the URL so `.url()` and `.call(...)` don't repeat
+    // the lookup. Output ports: `endpointUrl` (the bare URL, so
+    // downstream nodes like WhatsAppSend can target the bridge
+    // from outside the declared-endpoint graph) plus the bridge's
+    // `/outputs` keys (status, phoneNumber, jid, pushName), each
+    // a declared port in metadata.json. The `/outputs` key set
+    // and the declared output ports must stay in sync.
+    let api = ctx.endpoint("api").await?;
+    let bridge_outputs = api
+        .call(weft_core::EndpointMethod::Get, "/outputs", None)
+        .await?;
+    let mut output = NodeOutput::empty().set("endpointUrl", Value::String(api.url().to_string()));
+    if let Value::Object(map) = bridge_outputs {
         for (k, v) in map {
             output = output.set(k, v);
         }

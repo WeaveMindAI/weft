@@ -4,10 +4,10 @@
 //!     node's config (path + optional apiKey toggle) and register
 //!     it. The dispatcher mounts the public URL.
 //!
-//!   - `Phase::Fire`: the dispatcher seeded the posted JSON on the
-//!     `__seed__` port wrapped as `{body: <json>}`. Forward every
-//!     body field to the output port with the same name; add
-//!     `receivedAt` if no input provided one.
+//!   - `Phase::Fire`: the dispatcher seeds the raw posted JSON on
+//!     the `__seed__` port. Forward every top-level field to the
+//!     output port with the same name; add `receivedAt` if the
+//!     payload didn't carry one.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -56,13 +56,14 @@ impl Node for ApiPostNode {
                 Ok(NodeOutput::empty())
             }
             Phase::Fire => {
-                let payload = ctx
+                // `fire_public_entry` seeds the raw POST body into
+                // `__seed__`; fan its top-level keys onto output ports.
+                let body = ctx
                     .input
                     .values
                     .get("__seed__")
                     .cloned()
                     .unwrap_or(Value::Null);
-                let body = payload.get("body").cloned().unwrap_or(payload);
                 let mut output = NodeOutput::empty();
                 if let Value::Object(obj) = body {
                     for (k, v) in obj {

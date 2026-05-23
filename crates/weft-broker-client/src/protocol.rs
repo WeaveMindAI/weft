@@ -9,18 +9,291 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use weft_journal::ExecEvent;
-use weft_task_store::tasks::{ClaimFilter, NewTask, Task, TaskOutcome, TaskStatus, TaskTarget};
-use weft_task_store::TaskKind;
+use weft_task_store::tasks::{ClaimFilter, NewTask, Task, TaskOutcome, TaskStatus};
+
+// =================================================================
+// Wire-enum helper
+// =================================================================
+//
+// Every enum that crosses a process boundary as a TEXT column or a
+// JSON string field uses this macro. Single source of truth for
+// the variant <-> string mapping: the serde `rename_all` attribute.
+// No more dual `as_str/parse` tables that drift apart.
+//
+// Generates:
+// - the enum itself with `#[derive(...Serialize, Deserialize)]` and
+//   `#[serde(rename_all = "snake_case")]`
+// - `as_str(self) -> &'static str` using the same casing rule
+// - `parse(s: &str) -> Option<Self>` driven by the same serde derive
+//   (via `serde::Deserialize::deserialize(StrDeserializer::new(s))`)
+// - `pub const VARIANTS: &[Self]` for iteration (e.g. the
+//   auto-generated round-trip tests walk it)
+//
+// Add or rename a variant in ONE place; everything follows.
+macro_rules! wire_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident = $str:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, Hash,
+            ::serde::Serialize, ::serde::Deserialize,
+        )]
+        #[serde(rename_all = "snake_case")]
+        $vis enum $name {
+            $(
+                $(#[$variant_meta])*
+                #[serde(rename = $str)]
+                $variant,
+            )+
+        }
+
+        impl $name {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $str, )+
+                }
+            }
+            pub fn parse(s: &str) -> ::core::option::Option<Self> {
+                match s {
+                    $( $str => ::core::option::Option::Some(Self::$variant), )+
+                    _ => ::core::option::Option::None,
+                }
+            }
+            pub const VARIANTS: &'static [Self] = &[ $( Self::$variant ),+ ];
+        }
+
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+/// Generate one round-trip `#[test]` per `wire_enum!`. Each test
+/// walks `T::VARIANTS` and asserts `parse(as_str) == Some(v)`, the
+/// serde wire form equals `"<as_str>"`, and decode round-trips.
+/// New variants are covered automatically (driven off `VARIANTS`);
+/// adding a new wire enum means adding one line to the invocation
+/// at the bottom of this file.
+#[cfg(test)]
+macro_rules! wire_enum_roundtrip_tests {
+    ( $( $name:ident ),+ $(,)? ) => {
+        $(
+            #[allow(non_snake_case)]
+            #[test]
+            fn $name() {
+                for v in $name::VARIANTS {
+                    assert_eq!($name::parse(v.as_str()), Some(*v), "parse(as_str) {v:?}");
+                    let json = serde_json::to_string(v).expect("serialize");
+                    assert_eq!(json, format!("\"{}\"", v.as_str()), "wire form {v:?}");
+                    let back: $name = serde_json::from_str(&json).expect("deserialize");
+                    assert_eq!(back, *v, "round-trip {v:?}");
+                }
+            }
+        )+
+    };
+}
+
+// =================================================================
+// Typed wire enums
+// =================================================================
+
+wire_enum! {
+    /// Lifecycle verb stored in `infra_lifecycle_command.verb`.
+    /// `Apply` / `Stop` / `Terminate` are claimed by the per-tenant
+    /// supervisor pod; `Deactivate` / `Reactivate` are claimed by the
+    /// dispatcher's `lifecycle_claimer` loop. The split is enforced
+    /// in the claim queries' `verb IN (...)` predicates (and the
+    /// matching partial-index `WHERE` clauses, which can't be
+    /// parameterized), in `weft-broker/handlers.rs` and
+    /// `weft-dispatcher/lifecycle_claimer.rs`.
+    pub enum InfraLifecycleVerb {
+        Apply = "apply",
+        Stop = "stop",
+        Terminate = "terminate",
+        Deactivate = "deactivate",
+        Reactivate = "reactivate",
+    }
+}
+
+wire_enum! {
+    /// What to do with in-flight Fire-phase executions of the targeted
+    /// project when a lifecycle verb (stop/terminate/deactivate) fires.
+    pub enum RunningPolicy {
+        /// Cancel running execs immediately, then run the lifecycle op.
+        Cancel = "cancel",
+        /// Wait until running_count reaches 0, then run the lifecycle
+        /// op. New fires are gated per the project's lifecycle axes
+        /// (set by the trigger-deactivate step).
+        Wait = "wait",
+    }
+}
+
+impl Default for RunningPolicy {
+    fn default() -> Self {
+        Self::Wait
+    }
+}
+
+wire_enum! {
+    /// How a `deactivate` command should treat the project's signal
+    /// table on entry.
+    pub enum DeactivationMode {
+        /// Drop every signal (entries + suspensions) and forget the
+        /// project ever ran. Only legal with `RunningPolicy::Cancel`.
+        Wipe = "wipe",
+        /// Keep DB signal rows; unregister from listener; arm a deadline
+        /// after which the project auto-wipes. Suspended fires are kept
+        /// alive on the gate (visible=false, accepting=true on entry
+        /// signals only) for `grace_minutes`.
+        Hibernate = "hibernate",
+        /// Keep DB signal rows; unregister from listener. No deadline,
+        /// no eventual wipe. Reactivate fully restores.
+        Park = "park",
+    }
+}
+
+wire_enum! {
+    /// Lifecycle-state of an infra node row, written into `infra_node.status`.
+    pub enum InfraNodeStatus {
+        /// Mid-apply: the apply task started but hasn't successfully
+        /// written `Running` yet.
+        Provisioning = "provisioning",
+        /// Infra node is up, supervisor sees at least one Pod Ready.
+        Running = "running",
+        /// Deployment scaled to 0 (user clicked Stop). PVCs preserved.
+        Stopped = "stopped",
+        /// Supervisor declared the node below its readiness threshold.
+        Flaky = "flaky",
+        /// The most recent apply (or post-apply execute) failed.
+        /// `failure_stage` carries the structured reason.
+        Failed = "failed",
+        /// Transient: supervisor mid-stop.
+        Stopping = "stopping",
+        /// Transient: supervisor mid-terminate. Row is removed on success.
+        Terminating = "terminating",
+    }
+}
+
+impl InfraNodeStatus {
+    /// Coarse precedence for rolling N per-unit statuses up to one
+    /// node-level status. Higher wins. Transient/bad states dominate
+    /// healthy ones so the node never looks "running" while a unit is
+    /// mid-terminate or failed. Must match the dispatcher's
+    /// `infra_rollup` precedence so the two agree.
+    pub fn rollup_rank(self) -> u8 {
+        match self {
+            Self::Terminating => 7,
+            Self::Stopping => 6,
+            Self::Provisioning => 5,
+            Self::Failed => 4,
+            Self::Flaky => 3,
+            Self::Running => 2,
+            Self::Stopped => 1,
+        }
+    }
+
+    /// Roll a set of per-unit statuses up to one node-level status by
+    /// `rollup_rank` (worst-of-units). Empty -> `Stopped` (no units
+    /// up is the degenerate "nothing running" case).
+    pub fn rollup<'a>(units: impl IntoIterator<Item = &'a InfraNodeStatus>) -> InfraNodeStatus {
+        units
+            .into_iter()
+            .copied()
+            .max_by_key(|s| s.rollup_rank())
+            .unwrap_or(InfraNodeStatus::Stopped)
+    }
+}
+
+/// Per-unit runtime state carried in `infra_node.units_json`. The map
+/// key is the unit name. This is the per-unit truth: the node-level
+/// `infra_node.status` is a `InfraNodeStatus::rollup` over these. Also
+/// the authoritative roster of a node's EXPECTED units (a unit at 0
+/// replicas or a Service-only unit shows no workload, so the supervisor
+/// can't learn the roster from observed labels alone). Stamped at apply
+/// from the spec's units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRuntime {
+    pub status: InfraNodeStatus,
+    /// Resolved at apply from `Unit.on_stop`.
+    pub stop_behavior: weft_core::StopBehavior,
+    /// Resolved at apply: `Unit.health.flaky_after_seconds` or the
+    /// supervisor's global default.
+    pub flaky_after_seconds: u32,
+    /// Resolved at apply: `Unit.health.recovery_after_seconds` or the
+    /// supervisor's global default.
+    pub recovery_after_seconds: u32,
+}
+
+wire_enum! {
+    /// Lifecycle status of a project row, written into
+    /// `project.status`. Both the dispatcher (writer) and the
+    /// supervisor (reader, via the broker) consume this enum.
+    pub enum ProjectStatus {
+        /// Fresh row, never activated.
+        Registered = "registered",
+        /// Transient: user clicked activate; trigger setup in flight.
+        Activating = "activating",
+        /// Live; worker pool spawns on demand and fires execute.
+        Active = "active",
+        /// Transient: user clicked deactivate with runningPolicy=wait;
+        /// running executions are draining.
+        Deactivating = "deactivating",
+        /// Idle; gate refuses / parks fires per the lifecycle axes.
+        Inactive = "inactive",
+    }
+}
+
+impl InfraNodeStatus {
+    /// Statuses where the node is expected to have running replicas
+    /// the health loop should observe. Used by the supervisor's
+    /// health tick: a node mid-apply or mid-stop has no SLO; only
+    /// `Running` / `Flaky` does.
+    pub fn expects_running_replicas(self) -> bool {
+        matches!(self, Self::Running | Self::Flaky)
+    }
+
+    /// Statuses where re-apply can reuse the existing instance_id
+    /// (PVCs may already be bound, services may already exist).
+    /// `Terminating` cannot: we're tearing it down, not reapplying.
+    /// Every other status either has live state to reattach to
+    /// (Running/Flaky/Stopped/Stopping) or is mid-failure that
+    /// sweep+re-apply handles idempotently (Provisioning/Failed).
+    pub fn permits_instance_id_reuse(self) -> bool {
+        !matches!(self, Self::Terminating)
+    }
+}
+
+wire_enum! {
+    /// `infra_node.failure_stage` discriminator. Set whenever
+    /// `status = Failed`.
+    pub enum FailureStage {
+        Provision = "provision",
+        Apply = "apply",
+        Execute = "execute",
+        /// Set when a supervisor-driven stop/terminate aborted.
+        ApplyLifecycle = "apply_lifecycle",
+    }
+}
 
 // ---------- Journal ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecordRequest {
     pub event: ExecEvent,
-    /// Worker pod name for fencing trigger; None for listener writes
-    /// (which arch-5 doesn't currently emit, but the field is here
-    /// for symmetry with the trait).
-    pub pod_name: Option<String>,
+    /// Worker pod name, used by the journal's fencing trigger. Always
+    /// present: only workers write through this request (every caller
+    /// passes its own pod), and the dispatcher's own in-process writes
+    /// bypass this struct entirely.
+    pub pod_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,51 +323,7 @@ pub struct JournalHasTerminalResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskEnqueueDedupRequest {
-    pub spec: NewTaskWire,
-}
-
-/// Mirror of `NewTask` for the wire. `TaskKind` and `TaskTarget`
-/// derive `Serialize` / `Deserialize` directly (snake_case) so a new
-/// variant on the producer side becomes a deserialization error on
-/// the broker side instead of a silent string-table miss.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewTaskWire {
-    pub kind: TaskKind,
-    pub target: TaskTarget,
-    pub project_id: Option<String>,
-    pub dedup_key: Option<String>,
-    pub color: Option<String>,
-    pub tenant_id: Option<String>,
-    pub target_pod_name: Option<String>,
-    pub payload: Value,
-}
-
-impl NewTaskWire {
-    pub fn from_new_task(spec: &NewTask) -> Self {
-        Self {
-            kind: spec.kind,
-            target: spec.target,
-            project_id: spec.project_id.clone(),
-            dedup_key: spec.dedup_key.clone(),
-            color: spec.color.clone(),
-            tenant_id: spec.tenant_id.clone(),
-            target_pod_name: spec.target_pod_name.clone(),
-            payload: spec.payload.clone(),
-        }
-    }
-
-    pub fn into_new_task(self) -> NewTask {
-        NewTask {
-            kind: self.kind,
-            target: self.target,
-            project_id: self.project_id,
-            dedup_key: self.dedup_key,
-            color: self.color,
-            tenant_id: self.tenant_id,
-            target_pod_name: self.target_pod_name,
-            payload: self.payload,
-        }
-    }
+    pub spec: NewTask,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,73 +376,12 @@ impl TaskWaitTerminalRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskClaimOneRequest {
     pub pod_id: String,
-    pub filter: ClaimFilterWire,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ClaimFilterWire {
-    Dispatcher,
-    Worker { project_id: String },
-}
-
-impl ClaimFilterWire {
-    pub fn from_filter(f: &ClaimFilter) -> Self {
-        match f {
-            ClaimFilter::Dispatcher => Self::Dispatcher,
-            ClaimFilter::Worker { project_id } => Self::Worker {
-                project_id: project_id.clone(),
-            },
-        }
-    }
-    pub fn into_filter(self) -> ClaimFilter {
-        match self {
-            Self::Dispatcher => ClaimFilter::Dispatcher,
-            Self::Worker { project_id } => ClaimFilter::Worker { project_id },
-        }
-    }
+    pub filter: ClaimFilter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskClaimOneResponse {
-    pub task: Option<TaskWire>,
-}
-
-/// Wire shape of `Task` (status as the canonical string).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskWire {
-    pub id: Uuid,
-    pub kind: String,
-    pub status: TaskStatus,
-    pub project_id: Option<String>,
-    pub color: Option<String>,
-    pub tenant_id: Option<String>,
-    pub payload: Value,
-}
-
-impl TaskWire {
-    pub fn from_task(t: Task) -> Self {
-        Self {
-            id: t.id,
-            kind: t.kind,
-            status: t.status,
-            project_id: t.project_id,
-            color: t.color,
-            tenant_id: t.tenant_id,
-            payload: t.payload,
-        }
-    }
-    pub fn into_task(self) -> Task {
-        Task {
-            id: self.id,
-            kind: self.kind,
-            status: self.status,
-            project_id: self.project_id,
-            color: self.color,
-            tenant_id: self.tenant_id,
-            payload: self.payload,
-        }
-    }
+    pub task: Option<Task>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,17 +450,679 @@ pub struct WorkerPodMarkDoneRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerPodMarkDoneResponse {}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerPodMarkDoneIfIdleRequest {
+    pub pod_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerPodMarkDoneIfIdleResponse {
+    /// True if this pod won the guarded `alive -> done` flip and
+    /// should now exit. False means work was pending/in-flight, so
+    /// the pod stays alive.
+    pub exited: bool,
+}
+
 // ---------- Infra ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InfraSidecarEndpointRequest {
+pub struct InfraEndpointUrlRequest {
+    pub project_id: String,
+    pub node_id: String,
+    pub endpoint_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraEndpointUrlResponse {
+    pub endpoint_url: Option<String>,
+}
+
+// ---------- Supervisor surface (tenant-scoped) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorProjectsForTenantRequest {
+    pub tenant_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorProject {
+    pub project_id: String,
+    pub project_namespace: String,
+    /// Current `project.status`. The supervisor's health protocol
+    /// engine consumes this so a `HealthCondition::ProjectStatusEq`
+    /// can fire based on lifecycle (e.g. "auto-recover only when
+    /// the project is currently parked"). No `serde(default)`:
+    /// broker and supervisor deploy together, a missing field is
+    /// schema drift and should fail loud on deserialize.
+    pub status: ProjectStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorProjectsForTenantResponse {
+    pub projects: Vec<SupervisorProject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorInfraNodesRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorInfraNode {
+    pub node_id: String,
+    pub instance_id: String,
+    pub status: InfraNodeStatus,
+    pub applied_spec_hash: Option<String>,
+    pub endpoints: std::collections::BTreeMap<String, String>,
+    /// PVC names to preserve on terminate (see
+    /// `SupervisorSetAppliedRequest::preserve_pvcs`). No
+    /// `serde(default)`: pre-prod, supervisor + broker deploy
+    /// together; a missing field is schema drift, not version
+    /// skew.
+    pub preserve_pvcs: Vec<String>,
+    /// Per-unit runtime: status + resolved health windows +
+    /// stop_behavior, keyed by unit name. The authoritative unit
+    /// roster + per-unit truth the health/stop loops operate on.
+    pub units: std::collections::BTreeMap<String, UnitRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorInfraNodesResponse {
+    pub nodes: Vec<SupervisorInfraNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorHealthProtocolsRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorHealthProtocolsResponse {
+    pub protocols: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorClaimCommandRequest {
+    pub tenant_id: String,
+    pub claimer_pod: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorClaimCommandResponse {
+    pub command: Option<SupervisorCommandRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorCommandRow {
+    pub id: i64,
+    pub project_id: String,
+    pub node_id: Option<String>,
+    pub verb: InfraLifecycleVerb,
+    /// Whether the supervisor should wait for the project's
+    /// running-execution count to reach 0 before performing the
+    /// lifecycle op. `Some` for Stop / Terminate (populated by
+    /// `issue_lifecycle`); `None` for Apply (irrelevant) and for
+    /// dispatcher-owned verbs that don't reach the supervisor's
+    /// claim path.
+    #[serde(default)]
+    pub running_policy: Option<RunningPolicy>,
+    /// Set for `verb = apply`: `InfraSpec` serialized as JSON. The
+    /// supervisor reads the prior `infra_node` row itself to decide
+    /// skip / fresh / replace; the worker doesn't pass a mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_json: Option<serde_json::Value>,
+    /// Stop only: force scale-to-zero EVERY unit, ignoring each unit's
+    /// `on_stop` (so NoOp units come down too). The user's explicit
+    /// "take it all down so I can update it" override.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorEventRecordRequest {
+    pub project_id: String,
+    pub node_id: Option<String>,
+    pub kind: InfraEventKind,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorEventRecordResponse {
+    pub id: i64,
+}
+
+// =================================================================
+// Typed infra_event surface
+// =================================================================
+//
+// The wire format for `infra_event` is `(kind: TEXT, payload: JSONB)`.
+// The supervisor writes rows; the dispatcher's `infra_event_bridge`
+// reads them and converts each row into a typed `DispatcherEvent`
+// for SSE consumers. The bridge needs a stable contract on:
+//   1. which kind strings exist;
+//   2. what JSON shape each kind's payload carries.
+//
+// `InfraEvent` collapses (kind, payload) into one tagged enum.
+// Writers construct `InfraEvent::Flaky { desired, ready }` and
+// call `.into_record()` to get `(kind, payload)` for the wire
+// request. Readers call `InfraEvent::from_kind_and_payload(kind,
+// payload)` to recover the typed shape. A rename or schema drift
+// on either side becomes a compile error at the construction site.
+
+wire_enum! {
+    /// Tagged kind for `infra_event` rows. Matches the `kind` TEXT
+    /// column verbatim via `as_str()`.
+    pub enum InfraEventKind {
+        Flaky = "flaky",
+        Recovered = "recovered",
+        Failed = "failed",
+        Stopped = "stopped",
+        Terminated = "terminated",
+        Started = "started",
+        Notify = "notify",
+        ProtocolConfigError = "protocol_config_error",
+    }
+}
+
+/// Typed per-kind payload. Construction-site is the supervisor;
+/// destruction-site is the dispatcher's bridge. The `kind` string
+/// stored in the DB row drives which arm is selected.
+///
+/// **No `Serialize` / `Deserialize` on the outer enum**: the wire
+/// format is `(kind: TEXT, payload: JSONB)` in two columns, NOT a
+/// tagged JSON blob. Callers go through `into_record()` /
+/// `from_kind_and_payload()` exclusively; deriving serde here would
+/// create a different shape and let a future caller silently emit
+/// the wrong bytes via `to_value(&infra_event)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InfraEvent {
+    Flaky(FlakyPayload),
+    Recovered,
+    Failed(FailedPayload),
+    Stopped,
+    Terminated,
+    Started(StartedPayload),
+    Notify(NotifyPayload),
+    ProtocolConfigError(ProtocolConfigErrorPayload),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartedPayload {
+    pub instance_id: String,
+    pub mode: StartMode,
+}
+
+wire_enum! {
+    /// How an apply settled. Drives the action-bar distinction
+    /// between "first apply" / "re-applied with new spec" / "already
+    /// running, no-op".
+    pub enum StartMode {
+        Fresh = "fresh",
+        Replace = "replace",
+        Skip = "skip",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlakyPayload {
+    /// k8s desired replicas (non-negative; widened to i64 only because
+    /// the `kubectl get` JSON parser produces i64).
+    pub desired: i64,
+    pub ready: i64,
+    /// Optional human-readable reason; the bridge surfaces it on
+    /// the action-bar banner. Defaults to a `desired=N ready=M`
+    /// summary if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedPayload {
+    pub stage: FailureStage,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyPayload {
+    pub protocol: String,
+    pub channel: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolConfigErrorPayload {
+    /// The serde error message from the failed `health_protocols_json`
+    /// deserialize, verbatim.
+    pub error: String,
+}
+
+impl InfraEvent {
+    /// Wire-shape pair for a `supervisor_event_record` call.
+    /// The kind string is the canonical column value; the payload
+    /// is the typed body serialized to JSON.
+    ///
+    /// Serialization is infallible for every payload variant here
+    /// (plain structs over `String`, `i64`, typed enums). If a
+    /// future variant adds a non-Serialize-friendly field, the
+    /// `expect` below is the loud-failure surface we want.
+    pub fn into_record(self) -> (InfraEventKind, Value) {
+        let kind = match &self {
+            Self::Flaky(_) => InfraEventKind::Flaky,
+            Self::Recovered => InfraEventKind::Recovered,
+            Self::Failed(_) => InfraEventKind::Failed,
+            Self::Stopped => InfraEventKind::Stopped,
+            Self::Terminated => InfraEventKind::Terminated,
+            Self::Started(_) => InfraEventKind::Started,
+            Self::Notify(_) => InfraEventKind::Notify,
+            Self::ProtocolConfigError(_) => InfraEventKind::ProtocolConfigError,
+        };
+        let payload = match self {
+            Self::Flaky(p) => serde_json::to_value(p).expect("FlakyPayload serializes"),
+            Self::Failed(p) => serde_json::to_value(p).expect("FailedPayload serializes"),
+            Self::Started(p) => serde_json::to_value(p).expect("StartedPayload serializes"),
+            Self::Notify(p) => serde_json::to_value(p).expect("NotifyPayload serializes"),
+            Self::ProtocolConfigError(p) => {
+                serde_json::to_value(p).expect("ProtocolConfigErrorPayload serializes")
+            }
+            Self::Recovered | Self::Stopped | Self::Terminated => Value::Null,
+        };
+        (kind, payload)
+    }
+
+    /// Reader: validate that `payload` matches `kind`'s shape.
+    /// Returns `Err` if the payload doesn't deserialize as expected
+    /// (e.g. a Flaky event missing `desired` / `ready`). Callers
+    /// (the bridge) treat this as a writer bug.
+    pub fn from_kind_and_payload(
+        kind: InfraEventKind,
+        payload: &Value,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(match kind {
+            InfraEventKind::Flaky => Self::Flaky(serde_json::from_value(payload.clone())?),
+            InfraEventKind::Recovered => Self::Recovered,
+            InfraEventKind::Failed => Self::Failed(serde_json::from_value(payload.clone())?),
+            InfraEventKind::Stopped => Self::Stopped,
+            InfraEventKind::Terminated => Self::Terminated,
+            InfraEventKind::Started => Self::Started(serde_json::from_value(payload.clone())?),
+            InfraEventKind::Notify => Self::Notify(serde_json::from_value(payload.clone())?),
+            InfraEventKind::ProtocolConfigError => {
+                Self::ProtocolConfigError(serde_json::from_value(payload.clone())?)
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetStatusRequest {
+    /// `infra_lifecycle_command.id` the supervisor is executing,
+    /// if this write is part of a lifecycle command (Stop /
+    /// Terminate / Apply transitions). The broker checks the
+    /// command is still claimed by the caller's pod before
+    /// applying the write; a stale (lease-expired, reclaimed
+    /// by a sibling pod) supervisor can't stamp statuses for a
+    /// row another pod owns.
+    ///
+    /// `None` for autonomous writes from the health loop
+    /// (`Flaky` / `Running` reconciliation) where there is no
+    /// command in flight. Tenant scope still applies.
+    pub command_id: Option<i64>,
+    pub project_id: String,
+    pub node_id: String,
+    /// The unit whose status this write sets. `Some(unit)` updates that
+    /// unit's entry in `units_json` and recomputes the node-level
+    /// rollup; the autonomous health loop always targets a unit.
+    /// `None` writes the node-level status directly AND every unit (a
+    /// lifecycle-driven node-wide transition: Stopping/Terminating/
+    /// Failed during a command applies to the whole node uniformly).
+    pub unit: Option<String>,
+    pub status: InfraNodeStatus,
+    /// Required iff `status == Failed`; ignored otherwise (the broker
+    /// could enforce, but today it stores as-given).
+    pub failure_stage: Option<FailureStage>,
+    pub failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetStatusResponse {}
+
+/// Atomic post-apply state write: status, instance_id, applied spec
+/// hash, endpoints map. Supervisor calls this on successful apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetAppliedRequest {
+    /// `infra_lifecycle_command.id` the supervisor is executing.
+    /// The broker rejects the UPSERT if the command is no longer
+    /// claimed by the caller's pod; prevents a stale supervisor
+    /// from resurrecting a row that `remove_node` deleted, or
+    /// stamping over a sibling pod's still-running apply.
+    pub command_id: i64,
+    pub project_id: String,
+    pub node_id: String,
+    pub instance_id: String,
+    pub applied_spec_hash: String,
+    pub endpoints: std::collections::BTreeMap<String, String>,
+    pub namespace: String,
+    /// PVC names to preserve on a future terminate. From
+    /// `InfraSpec.lifecycle.on_terminate.preserve_pvcs`. Persisted
+    /// on the `infra_node` row so the supervisor can honor it on
+    /// terminate (terminate has no access to the spec). No
+    /// `serde(default)`: pre-prod, broker + supervisor deploy
+    /// together; a missing field is schema drift.
+    pub preserve_pvcs: Vec<String>,
+    /// Per-unit runtime, resolved from the spec's units at apply.
+    /// Status is set to `Running` for every unit here (apply success
+    /// = all units up). The health loop then maintains per-unit
+    /// status from this baseline.
+    pub units: std::collections::BTreeMap<String, UnitRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetAppliedResponse {}
+
+/// Supervisor-callable: write or update the `infra_node` row at
+/// `Provisioning` status BEFORE the kubectl apply begins. Locks
+/// in the (instance_id, namespace, preserve_pvcs) tuple so that a
+/// partial-apply failure leaves a visible row pointing at the
+/// labelled-but-incomplete resources. The user's Terminate then
+/// works (delete_by_label keyed on the recorded instance_id +
+/// preserve_pvcs). On apply success, `set_applied` flips
+/// Provisioning -> Running and fills endpoints + applied_spec_hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetProvisioningRequest {
+    pub command_id: i64,
+    pub project_id: String,
+    pub node_id: String,
+    pub instance_id: String,
+    pub namespace: String,
+    /// Carried forward to `set_applied`; needed at Terminate time
+    /// even when the apply never reaches success.
+    pub preserve_pvcs: Vec<String>,
+    /// Per-unit runtime resolved from the spec's units. Status is
+    /// `Provisioning` for every unit at this point. Locked in before
+    /// kubectl so a partial-apply failure leaves the roster visible.
+    pub units: std::collections::BTreeMap<String, UnitRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetProvisioningResponse {}
+
+/// Supervisor-callable: enqueue a `deactivate` / `reactivate`
+/// lifecycle command for the dispatcher to claim. The supervisor
+/// can't touch the signal table directly (it has no Postgres write
+/// authority for those rows), so it asks the dispatcher via this
+/// command queue.
+///
+/// `verb` is constrained to the dispatcher-claimable set at the
+/// type level via the typed `LifecycleSpec`: only `Deactivate(...)`
+/// and `Reactivate` are constructible. There's no way to enqueue
+/// `Apply` / `Stop` / `Terminate` through this endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorEnqueueLifecycleRequest {
+    pub project_id: String,
+    pub spec: LifecycleSpec,
+}
+
+/// Typed (verb, payload) pair for a dispatcher-claimable lifecycle
+/// command. Both variants live in `protocol.rs` so the supervisor
+/// can't accidentally enqueue a verb the dispatcher doesn't handle,
+/// and the dispatcher's claim path can't drift the payload shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum LifecycleSpec {
+    Deactivate(DeactivateSpec),
+    Reactivate,
+}
+
+impl LifecycleSpec {
+    /// Project the typed spec onto the (verb, running_policy,
+    /// spec_json) columns the `infra_lifecycle_command` schema
+    /// stores. `running_policy` is `None` for dispatcher-owned
+    /// verbs: Deactivate carries it inside `spec_json` (single
+    /// source of truth); Reactivate has no running-fires concept.
+    /// Supervisor-owned verbs (Stop / Terminate) populate the
+    /// column directly through `issue_lifecycle`; Apply ignores it.
+    pub fn into_row_columns(self) -> (InfraLifecycleVerb, Option<RunningPolicy>, Option<Value>) {
+        match self {
+            Self::Deactivate(spec) => {
+                let payload = serde_json::to_value(spec).expect("DeactivateSpec serializes");
+                (InfraLifecycleVerb::Deactivate, None, Some(payload))
+            }
+            Self::Reactivate => (InfraLifecycleVerb::Reactivate, None, None),
+        }
+    }
+
+    /// Inverse of `into_row_columns`: rebuild the typed spec from
+    /// the row's columns. Used by the dispatcher's claim path so
+    /// encode and decode share one source of truth.
+    ///
+    /// Returns `Err` on:
+    /// - a verb that isn't dispatcher-claimable (`Apply`/`Stop`/
+    ///   `Terminate` shouldn't land here);
+    /// - `Deactivate` with NULL or malformed `spec_json`;
+    /// - `Reactivate` with non-NULL `spec_json` (would be a writer
+    ///   bug).
+    pub fn from_row_columns(
+        verb: InfraLifecycleVerb,
+        spec_json: Option<Value>,
+    ) -> Result<Self, FromRowColumnsError> {
+        match verb {
+            InfraLifecycleVerb::Deactivate => {
+                let json = spec_json.ok_or(FromRowColumnsError::DeactivateMissingSpec)?;
+                let spec: DeactivateSpec = serde_json::from_value(json)
+                    .map_err(FromRowColumnsError::DeactivateMalformed)?;
+                Ok(Self::Deactivate(spec))
+            }
+            InfraLifecycleVerb::Reactivate => {
+                if spec_json.is_some() {
+                    return Err(FromRowColumnsError::ReactivateUnexpectedSpec);
+                }
+                Ok(Self::Reactivate)
+            }
+            other => Err(FromRowColumnsError::NotDispatcherClaimable(other)),
+        }
+    }
+}
+
+/// Error variants from `LifecycleSpec::from_row_columns`. Surfaces
+/// with enough structure that callers (today: the dispatcher's
+/// `lifecycle_claimer`) can log a specific message and either
+/// complete-with-error or hard-bail.
+#[derive(Debug, thiserror::Error)]
+pub enum FromRowColumnsError {
+    #[error("deactivate command missing spec_json")]
+    DeactivateMissingSpec,
+    #[error("deactivate spec_json malformed: {0}")]
+    DeactivateMalformed(#[source] serde_json::Error),
+    #[error("reactivate command unexpectedly carries spec_json")]
+    ReactivateUnexpectedSpec,
+    #[error("verb '{0}' is not dispatcher-claimable; supervisor's filter must match")]
+    NotDispatcherClaimable(InfraLifecycleVerb),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorEnqueueLifecycleResponse {
+    pub command_id: i64,
+}
+
+/// Worker-callable: enqueue an Apply lifecycle command for the
+/// tenant's supervisor. The engine uses this after `node.provision()`
+/// returns a fresh InfraSpec. The supervisor reads the prior
+/// `infra_node` row, compiles the new spec, hashes, and decides
+/// skip / fresh / replace internally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraEnqueueApplyRequest {
+    pub project_id: String,
+    pub node_id: String,
+    pub spec_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraEnqueueApplyResponse {
+    pub command_id: i64,
+}
+
+/// Worker-callable: wait for a previously-issued apply command to
+/// reach terminal state. Worker polls this until completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraWaitApplyRequest {
+    pub project_id: String,
+    pub command_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraWaitApplyResponse {
+    pub completed: bool,
+    /// Typed outcome once `completed=true`. None while pending.
+    pub outcome: Option<LifecycleOutcome>,
+    /// Human-readable message attached to a terminal outcome.
+    /// None on success or while pending; on Failed it carries the
+    /// error message; on Cancelled it carries the reason. The
+    /// `outcome` discriminant says which.
+    pub outcome_message: Option<String>,
+}
+
+/// Payload for a `verb=deactivate` lifecycle command. Stored on
+/// the `infra_lifecycle_command.spec_json` column by the supervisor
+/// when a HealthProtocol fires, and deserialized by the dispatcher's
+/// `lifecycle_claimer` when it claims the row.
+///
+/// Also used as the HTTP request body for the dispatcher's
+/// `/deactivate` endpoint and as the embedded `triggerDeactivation`
+/// field on Sync / Stop / Terminate. One typed shape, no per-endpoint
+/// duplicates.
+///
+/// Accepts both camelCase (`graceMinutes`, `runningPolicy`) and
+/// snake_case (`grace_minutes`, `running_policy`): the HTTP client
+/// (extension webview, JS) sends camelCase; the supervisor's
+/// machine-to-machine writes use snake_case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeactivateSpec {
+    pub mode: DeactivationMode,
+    /// Hibernate window in minutes. Only meaningful when
+    /// `mode = Hibernate`; ignored otherwise. Default 15 keeps the
+    /// wire shape forgiving for clients deactivating with
+    /// Park/Wipe (no grace concept).
+    #[serde(
+        default = "default_grace_minutes",
+        rename = "graceMinutes",
+        alias = "grace_minutes"
+    )]
+    pub grace_minutes: u32,
+    #[serde(rename = "runningPolicy", alias = "running_policy")]
+    pub running_policy: RunningPolicy,
+}
+
+fn default_grace_minutes() -> u32 {
+    15
+}
+
+impl DeactivateSpec {
+    /// Verify the (mode, policy) combination is coherent. The
+    /// only illegal combo is `Wipe + Wait`: wipe drops every
+    /// suspended fire, so waiting for them to drain first is
+    /// contradictory. Lives next to the wire type so every caller
+    /// (broker handler, dispatcher's /deactivate, supervisor's
+    /// enqueue path) shares one validator.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.mode == DeactivationMode::Wipe && self.running_policy == RunningPolicy::Wait {
+            return Err(
+                "wipe requires runningPolicy=cancel; waiting before wiping is contradictory",
+            );
+        }
+        Ok(())
+    }
+}
+
+wire_enum! {
+    /// Terminal state of an `infra_lifecycle_command`. Single source
+    /// of truth for the `outcome` TEXT column. Adding a new variant
+    /// requires touching this enum and every match site (compile
+    /// errors flag the drift).
+    pub enum LifecycleOutcome {
+        /// The claimer completed the verb cleanly. `error` is None.
+        Succeeded = "succeeded",
+        /// The claimer hit a real error. `error` carries the
+        /// message; callers treat this as a failure.
+        Failed = "failed",
+        /// The command was abandoned before the claimer ran it
+        /// (e.g. the targeted node was removed mid-flight). NOT a
+        /// failure; callers treat as "no longer applicable".
+        Cancelled = "cancelled",
+    }
+}
+
+/// Supervisor reads the project's per-(node, image_name) hash map
+/// so it can resolve `Image::Local` references at apply time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorProjectImageTagsRequest {
     pub project_id: String,
     pub node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InfraSidecarEndpointResponse {
-    pub endpoint_url: Option<String>,
+pub struct SupervisorProjectImageTagsResponse {
+    pub tags: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorRemoveNodeRequest {
+    pub project_id: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorRemoveNodeResponse {
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorCommandCompleteRequest {
+    pub command_id: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorCommandCompleteResponse {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorTriggerDepsRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorTriggerDep {
+    pub infra_node_id: String,
+    pub trigger_node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorTriggerDepsResponse {
+    pub deps: Vec<SupervisorTriggerDep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorRunningCountRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorRunningCountResponse {
+    /// Count of non-suspended in-flight execution colors for this
+    /// project. Drives the supervisor's `running_policy=wait`
+    /// readiness check before scaling / deleting.
+    pub running_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorInfraCommandInFlightRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorInfraCommandInFlightResponse {
+    /// True if the project has an uncompleted `infra_lifecycle_command`
+    /// (a user infra action: apply / stop / terminate is in flight).
+    /// The health loop stands down for the whole project while this is
+    /// true so it never fights a user action over a node's status.
+    pub in_flight: bool,
 }
 
 // ---------- Signals ----------
@@ -307,6 +1137,67 @@ pub struct SignalListForTenantResponse {
     pub rows: Vec<SignalRowWire>,
 }
 
+wire_enum! {
+    /// The user-facing surface a signal exposes. `PublicEntry`
+    /// pairs with a `mount_path`; `TaskCallback` and `Internal`
+    /// don't. The listener routes incoming fires by this kind.
+    pub enum SignalSurfaceKind {
+        PublicEntry = "public_entry",
+        TaskCallback = "task_callback",
+        Internal = "internal",
+    }
+}
+
+wire_enum! {
+    /// Authentication scheme attached to a signal. `None` means
+    /// any caller with the URL can fire; `ApiKey` requires a
+    /// matching key in the request (config in `auth_config`).
+    pub enum SignalAuthKind {
+        None = "none",
+        ApiKey = "api_key",
+    }
+}
+
+impl SignalRowWire {
+    /// Reassemble the typed `SignalRouting` from this wire row's
+    /// flat columns. The wire stores `surface_kind` as a tag and
+    /// keeps the `PublicEntry` path in `mount_path`; the typed
+    /// `SignalSurface::PublicEntry { path }` packs them together.
+    /// One adapter, one source of truth for the projection.
+    ///
+    /// Returns Err if the row violates a documented invariant
+    /// (`PublicEntry` with `mount_path = NULL`). The signal schema
+    /// has a partial unique index on `mount_path WHERE NOT NULL`,
+    /// so reaching this branch means the writer drifted from the
+    /// schema. Fail loud rather than silently mounting at `""`.
+    pub fn to_routing(&self) -> Result<weft_core::primitive::SignalRouting, &'static str> {
+        use weft_core::primitive::{SignalAuth, SignalRouting, SignalSurface};
+        let surface = match self.surface_kind {
+            SignalSurfaceKind::PublicEntry => {
+                let raw = self
+                    .mount_path
+                    .as_deref()
+                    .ok_or("SignalRowWire: PublicEntry with NULL mount_path")?;
+                // Stored mount_path has a leading `/`; the surface
+                // field doesn't carry it.
+                let path = raw.strip_prefix('/').unwrap_or(raw).to_string();
+                SignalSurface::PublicEntry { path }
+            }
+            SignalSurfaceKind::TaskCallback => SignalSurface::TaskCallback,
+            SignalSurfaceKind::Internal => SignalSurface::Internal,
+        };
+        let auth = match self.auth_kind {
+            SignalAuthKind::None => SignalAuth::None,
+            SignalAuthKind::ApiKey => SignalAuth::ApiKey,
+        };
+        Ok(SignalRouting {
+            surface,
+            auth,
+            auth_config: self.auth_config.clone().unwrap_or(Value::Null),
+        })
+    }
+}
+
 /// Wire shape for a row of the signal table that the listener
 /// rehydrates from. Mirrors the columns the listener reads today.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,15 +1207,505 @@ pub struct SignalRowWire {
     pub spec_json: String,
     pub is_resume: bool,
     pub color: Option<String>,
-    pub surface_kind: String,
+    pub surface_kind: SignalSurfaceKind,
     pub mount_path: Option<String>,
-    pub auth_kind: String,
+    pub auth_kind: SignalAuthKind,
     pub auth_config: Option<Value>,
     /// Opaque per-kind state. `{}` for kinds that don't persist
     /// anything. Timer uses it to recover the absolute
-    /// `next_fire_at_unix` across listener restarts; other stateful
+    /// `next_fire_at_unix_ms` across listener restarts; other stateful
     /// kinds use the same channel for whatever state they need to
-    /// survive a restart.
-    #[serde(default)]
+    /// survive a restart. The `signal.kind_state` column is
+    /// `JSONB NOT NULL DEFAULT '{}'::jsonb`, so the broker always
+    /// emits a value; missing on the wire is schema drift.
     pub kind_state: Value,
 }
+
+#[cfg(test)]
+mod wire_enum_roundtrips {
+    use super::*;
+    // One generated round-trip test per wire enum. Adding a new
+    // wire_enum! means adding its name here; missing one is a
+    // visible omission in this single list.
+    wire_enum_roundtrip_tests!(
+        InfraLifecycleVerb,
+        RunningPolicy,
+        DeactivationMode,
+        InfraNodeStatus,
+        ProjectStatus,
+        FailureStage,
+        InfraEventKind,
+        StartMode,
+        LifecycleOutcome,
+        SignalSurfaceKind,
+        SignalAuthKind,
+    );
+}
+
+#[cfg(test)]
+mod supervisor_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn projects_for_tenant_round_trip() {
+        let req = SupervisorProjectsForTenantRequest {
+            tenant_id: "alice".into(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["tenant_id"], "alice");
+        let resp: SupervisorProjectsForTenantResponse = serde_json::from_value(json!({
+            "projects": [
+                {
+                    "project_id": "p1",
+                    "project_namespace": "wm-project-alice-p1",
+                    "status": "active",
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resp.projects.len(), 1);
+        assert_eq!(resp.projects[0].project_id, "p1");
+        assert_eq!(resp.projects[0].project_namespace, "wm-project-alice-p1");
+        assert_eq!(resp.projects[0].status, ProjectStatus::Active);
+    }
+
+    /// `SupervisorProject::status` has NO `serde(default)`, so a
+    /// missing field must fail deserialize. Pin the property so a
+    /// future re-add of the default would break CI.
+    #[test]
+    fn projects_for_tenant_missing_status_fails() {
+        let res: Result<SupervisorProjectsForTenantResponse, _> = serde_json::from_value(json!({
+            "projects": [
+                { "project_id": "p1", "project_namespace": "wm-project-alice-p1" }
+            ]
+        }));
+        assert!(
+            res.is_err(),
+            "missing status should fail deserialize; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn infra_node_response_round_trip() {
+        let json = json!({
+            "nodes": [
+                {
+                    "node_id": "tgi",
+                    "instance_id": "wn-abc-tgi-12",
+                    "status": "running",
+                    "applied_spec_hash": "deadbeef",
+                    "endpoints": { "api": "http://x.svc:8080" },
+                    "preserve_pvcs": ["model-cache"],
+                    "units": { "main": {
+                        "status": "running",
+                        "stop_behavior": { "kind": "scale_to_zero" },
+                        "flaky_after_seconds": 30,
+                        "recovery_after_seconds": 30
+                    }}
+                }
+            ]
+        });
+        let resp: SupervisorInfraNodesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.nodes[0].endpoints.get("api").unwrap(), "http://x.svc:8080");
+        assert_eq!(resp.nodes[0].units.get("main").unwrap().status, InfraNodeStatus::Running);
+        assert_eq!(resp.nodes[0].applied_spec_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(resp.nodes[0].preserve_pvcs, vec!["model-cache".to_string()]);
+    }
+
+    /// `SupervisorInfraNode::preserve_pvcs` has NO `serde(default)`:
+    /// pre-prod, broker + supervisor deploy together, missing field
+    /// is schema drift. Pin the property so a future re-add of the
+    /// default breaks CI.
+    #[test]
+    fn infra_node_missing_preserve_pvcs_fails() {
+        let json = json!({
+            "nodes": [
+                {
+                    "node_id": "tgi",
+                    "instance_id": "wn-abc-tgi-12",
+                    "status": "running",
+                    "applied_spec_hash": "deadbeef",
+                    "endpoints": {}
+                }
+            ]
+        });
+        let res: Result<SupervisorInfraNodesResponse, _> = serde_json::from_value(json);
+        assert!(res.is_err(), "missing preserve_pvcs must fail deserialize");
+    }
+
+    #[test]
+    fn set_applied_request_round_trip() {
+        let req = SupervisorSetAppliedRequest {
+            command_id: 7,
+            project_id: "p".into(),
+            node_id: "tgi".into(),
+            instance_id: "wn-abc-tgi-12".into(),
+            applied_spec_hash: "deadbeef".into(),
+            endpoints: [("api".to_string(), "http://x".to_string())].into(),
+            namespace: "wm-x".into(),
+            preserve_pvcs: vec!["data".into()],
+            units: std::collections::BTreeMap::new(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        let back: SupervisorSetAppliedRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.command_id, 7);
+        assert_eq!(back.preserve_pvcs, vec!["data".to_string()]);
+        assert_eq!(back.instance_id, "wn-abc-tgi-12");
+    }
+
+    #[test]
+    fn set_applied_missing_preserve_pvcs_fails() {
+        // Write path mirrors the read path: no serde(default) on
+        // preserve_pvcs, so a missing field is loud schema drift.
+        let v = json!({
+            "command_id": 7, "project_id": "p", "node_id": "tgi",
+            "instance_id": "i", "applied_spec_hash": "h",
+            "endpoints": {}, "namespace": "ns", "units": {}
+        });
+        let res: Result<SupervisorSetAppliedRequest, _> = serde_json::from_value(v);
+        assert!(res.is_err(), "missing preserve_pvcs must fail deserialize");
+    }
+
+    #[test]
+    fn set_provisioning_request_round_trip() {
+        let req = SupervisorSetProvisioningRequest {
+            command_id: 9,
+            project_id: "p".into(),
+            node_id: "tgi".into(),
+            instance_id: "wn-abc-tgi-12".into(),
+            namespace: "wm-x".into(),
+            preserve_pvcs: vec!["data".into()],
+            units: std::collections::BTreeMap::new(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        let back: SupervisorSetProvisioningRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.command_id, 9);
+        assert_eq!(back.preserve_pvcs, vec!["data".to_string()]);
+    }
+
+    #[test]
+    fn set_provisioning_missing_preserve_pvcs_fails() {
+        let v = json!({
+            "command_id": 9, "project_id": "p", "node_id": "tgi",
+            "instance_id": "i", "namespace": "ns"
+        });
+        let res: Result<SupervisorSetProvisioningRequest, _> = serde_json::from_value(v);
+        assert!(res.is_err(), "missing preserve_pvcs must fail deserialize");
+    }
+
+    #[test]
+    fn command_row_running_policy_default() {
+        // A row that omits `running_policy` deserializes to None
+        // (dispatcher verbs + Apply leave the column NULL).
+        let v = json!({
+            "id": 1,
+            "project_id": "p",
+            "verb": "stop"
+        });
+        let row: SupervisorCommandRow = serde_json::from_value(v).unwrap();
+        assert_eq!(row.running_policy, None);
+        assert_eq!(row.verb, InfraLifecycleVerb::Stop);
+        assert_eq!(row.node_id, None);
+    }
+
+    #[test]
+    fn deactivate_spec_round_trip() {
+        let s = DeactivateSpec {
+            mode: DeactivationMode::Hibernate,
+            grace_minutes: 5,
+            running_policy: RunningPolicy::Wait,
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let back: DeactivateSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn lifecycle_spec_round_trip_deactivate_and_reactivate() {
+        let d = LifecycleSpec::Deactivate(DeactivateSpec {
+            mode: DeactivationMode::Park,
+            grace_minutes: 0,
+            running_policy: RunningPolicy::Cancel,
+        });
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["verb"], "deactivate");
+        let back: LifecycleSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(d, back);
+
+        let r = LifecycleSpec::Reactivate;
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["verb"], "reactivate");
+        let back: LifecycleSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn infra_event_record_then_decode_round_trips_every_variant() {
+        // Construct one of each kind, encode via into_record(),
+        // decode via from_kind_and_payload(), assert equal. Drift
+        // on either side (writer renames a field, reader forgets
+        // an arm) trips this test.
+        let cases = vec![
+            InfraEvent::Flaky(FlakyPayload {
+                desired: 3,
+                ready: 1,
+                reason: Some("crashloop".into()),
+            }),
+            InfraEvent::Recovered,
+            InfraEvent::Failed(FailedPayload {
+                stage: FailureStage::Apply,
+                message: "kubectl rejected".into(),
+            }),
+            InfraEvent::Stopped,
+            InfraEvent::Terminated,
+            InfraEvent::Started(StartedPayload {
+                instance_id: "inst1".into(),
+                mode: StartMode::Fresh,
+            }),
+            InfraEvent::Notify(NotifyPayload {
+                protocol: "p".into(),
+                channel: "ops".into(),
+            }),
+            InfraEvent::ProtocolConfigError(ProtocolConfigErrorPayload {
+                error: "bad json".into(),
+            }),
+        ];
+        for ev in cases {
+            let (kind, payload) = ev.clone().into_record();
+            let back = InfraEvent::from_kind_and_payload(kind, &payload)
+                .expect("decode after into_record");
+            assert_eq!(ev, back, "round-trip mismatch for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn command_row_per_node_serializes() {
+        let row = SupervisorCommandRow {
+            id: 42,
+            project_id: "p".into(),
+            node_id: Some("n".into()),
+            verb: InfraLifecycleVerb::Terminate,
+            running_policy: Some(RunningPolicy::Cancel),
+            spec_json: None,
+            force: false,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["node_id"], "n");
+        assert_eq!(v["verb"], "terminate");
+        assert_eq!(v["running_policy"], "cancel");
+    }
+
+    /// `LifecycleSpec::into_row_columns` no longer populates the
+    /// running_policy column for dispatcher verbs (it's NULL in
+    /// the DB; Deactivate carries policy inside spec_json). Pin
+    /// the property so a future re-add of the column-as-SoT
+    /// for these verbs breaks CI.
+    #[test]
+    fn into_row_columns_returns_none_policy_for_dispatcher_verbs() {
+        let (verb, policy, spec_json) = LifecycleSpec::Deactivate(DeactivateSpec {
+            mode: DeactivationMode::Hibernate,
+            grace_minutes: 5,
+            running_policy: RunningPolicy::Wait,
+        })
+        .into_row_columns();
+        assert_eq!(verb, InfraLifecycleVerb::Deactivate);
+        assert_eq!(policy, None);
+        assert!(spec_json.is_some());
+
+        let (verb, policy, spec_json) = LifecycleSpec::Reactivate.into_row_columns();
+        assert_eq!(verb, InfraLifecycleVerb::Reactivate);
+        assert_eq!(policy, None);
+        assert_eq!(spec_json, None);
+    }
+
+    #[test]
+    fn set_status_request_optional_fields_skip_when_none() {
+        let r = SupervisorSetStatusRequest {
+            command_id: None,
+            project_id: "p".into(),
+            node_id: "n".into(),
+            unit: None,
+            status: InfraNodeStatus::Running,
+            failure_stage: None,
+            failure_message: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        let back: SupervisorSetStatusRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.status, InfraNodeStatus::Running);
+        assert_eq!(back.command_id, None);
+    }
+
+    #[test]
+    fn set_status_request_with_command_id_round_trip() {
+        let r = SupervisorSetStatusRequest {
+            command_id: Some(42),
+            project_id: "p".into(),
+            node_id: "n".into(),
+            unit: None,
+            status: InfraNodeStatus::Stopping,
+            failure_stage: None,
+            failure_message: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        let back: SupervisorSetStatusRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.command_id, Some(42));
+        assert_eq!(back.status, InfraNodeStatus::Stopping);
+    }
+
+    #[test]
+    fn event_record_request_round_trip() {
+        let r = SupervisorEventRecordRequest {
+            project_id: "p".into(),
+            node_id: Some("n".into()),
+            kind: InfraEventKind::Flaky,
+            payload: json!({ "desired": 3, "ready": 1 }),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        let back: SupervisorEventRecordRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.kind, InfraEventKind::Flaky);
+        assert_eq!(back.payload["desired"], 3);
+    }
+
+    #[test]
+    fn running_count_response_round_trip() {
+        let v = json!({ "running_count": 3 });
+        let r: SupervisorRunningCountResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(r.running_count, 3);
+    }
+
+    #[test]
+    fn endpoint_url_response_handles_null() {
+        let v = json!({ "endpoint_url": null });
+        let r: InfraEndpointUrlResponse = serde_json::from_value(v).unwrap();
+        assert!(r.endpoint_url.is_none());
+    }
+
+    #[test]
+    fn endpoint_url_request_carries_endpoint_name() {
+        let v = json!({
+            "project_id": "p",
+            "node_id": "n",
+            "endpoint_name": "api"
+        });
+        let r: InfraEndpointUrlRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(r.endpoint_name, "api");
+    }
+
+    fn make_row(
+        surface_kind: SignalSurfaceKind,
+        mount_path: Option<&str>,
+        auth_kind: SignalAuthKind,
+        auth_config: Option<Value>,
+    ) -> SignalRowWire {
+        SignalRowWire {
+            token: "t".into(),
+            node_id: "n".into(),
+            spec_json: "{}".into(),
+            is_resume: false,
+            color: None,
+            surface_kind,
+            mount_path: mount_path.map(|s| s.to_string()),
+            auth_kind,
+            auth_config,
+            kind_state: Value::Null,
+        }
+    }
+
+    #[test]
+    fn to_routing_public_entry_strips_leading_slash() {
+        use weft_core::primitive::{SignalAuth, SignalSurface};
+        let r = make_row(
+            SignalSurfaceKind::PublicEntry,
+            Some("/hooks/x"),
+            SignalAuthKind::None,
+            None,
+        )
+        .to_routing()
+        .unwrap();
+        match r.surface {
+            SignalSurface::PublicEntry { path } => assert_eq!(path, "hooks/x"),
+            _ => panic!("expected PublicEntry"),
+        }
+        assert!(matches!(r.auth, SignalAuth::None));
+    }
+
+    #[test]
+    fn to_routing_public_entry_root_path() {
+        use weft_core::primitive::SignalSurface;
+        let r = make_row(
+            SignalSurfaceKind::PublicEntry,
+            Some("/"),
+            SignalAuthKind::None,
+            None,
+        )
+        .to_routing()
+        .unwrap();
+        match r.surface {
+            SignalSurface::PublicEntry { path } => assert_eq!(path, ""),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn to_routing_public_entry_null_mount_path_errors() {
+        // Schema invariant: PublicEntry rows have NOT NULL mount_path.
+        // A NULL-mount_path PublicEntry would silently mount at "";
+        // the projection refuses to do that and surfaces the drift.
+        let err = make_row(
+            SignalSurfaceKind::PublicEntry,
+            None,
+            SignalAuthKind::None,
+            None,
+        )
+        .to_routing()
+        .unwrap_err();
+        assert!(err.contains("NULL mount_path"));
+    }
+
+    #[test]
+    fn to_routing_task_callback() {
+        use weft_core::primitive::SignalSurface;
+        let r = make_row(
+            SignalSurfaceKind::TaskCallback,
+            None,
+            SignalAuthKind::None,
+            None,
+        )
+        .to_routing()
+        .unwrap();
+        assert!(matches!(r.surface, SignalSurface::TaskCallback));
+    }
+
+    #[test]
+    fn to_routing_internal() {
+        use weft_core::primitive::SignalSurface;
+        let r = make_row(
+            SignalSurfaceKind::Internal,
+            None,
+            SignalAuthKind::None,
+            None,
+        )
+        .to_routing()
+        .unwrap();
+        assert!(matches!(r.surface, SignalSurface::Internal));
+    }
+
+    #[test]
+    fn to_routing_api_key_passes_config_through() {
+        use weft_core::primitive::SignalAuth;
+        let cfg = json!({"header_name": "x-api-key", "value_hash": "abc"});
+        let r = make_row(
+            SignalSurfaceKind::PublicEntry,
+            Some("/x"),
+            SignalAuthKind::ApiKey,
+            Some(cfg.clone()),
+        )
+        .to_routing()
+        .unwrap();
+        assert!(matches!(r.auth, SignalAuth::ApiKey));
+        assert_eq!(r.auth_config, cfg);
+    }
+}
+

@@ -11,45 +11,25 @@ use anyhow::Result;
 use tokio::process::Command;
 
 
-/// Ensure `weft-dispatcher:local` exists in the local docker image
-/// cache. Rebuild only when the build inputs changed (or the image
-/// is missing, or `rebuild == true && inputs changed`). Returns
-/// `true` if a rebuild actually happened, `false` if the cache hit.
-pub async fn ensure_dispatcher_image(tag: &str, rebuild: bool) -> Result<bool> {
+/// Build (if stale) a system image from `deploy/docker/<dockerfile_name>`.
+/// All four system images (dispatcher / listener / broker /
+/// infra-supervisor) share the same build inputs (workspace
+/// manifests + every crate + the catalog); the only per-image
+/// difference is which Dockerfile drives the build. Adding a
+/// build input is a one-line change here, not four. Returns `true`
+/// if a rebuild actually happened, `false` on a cache hit.
+pub async fn ensure_system_image(
+    tag: &str,
+    dockerfile_name: &str,
+    rebuild: bool,
+) -> Result<bool> {
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-    let dockerfile = root.join("deploy/docker/dispatcher.Dockerfile");
+    let dockerfile = root.join("deploy/docker").join(dockerfile_name);
     let inputs = vec![
         root.join("Cargo.toml"),
         root.join("Cargo.lock"),
-        dockerfile.clone(),
-        root.join("crates"),
-        root.join("catalog"),
-    ];
-    ensure_image(tag, &dockerfile, &root, &inputs, rebuild).await
-}
-
-pub async fn ensure_listener_image(tag: &str, rebuild: bool) -> Result<bool> {
-    let root = weft_compiler::build::resolve_weft_root()
-        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-    let dockerfile = root.join("deploy/docker/listener.Dockerfile");
-    let inputs = vec![
-        root.join("Cargo.toml"),
-        root.join("Cargo.lock"),
-        dockerfile.clone(),
-        root.join("crates"),
-        root.join("catalog"),
-    ];
-    ensure_image(tag, &dockerfile, &root, &inputs, rebuild).await
-}
-
-pub async fn ensure_broker_image(tag: &str, rebuild: bool) -> Result<bool> {
-    let root = weft_compiler::build::resolve_weft_root()
-        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-    let dockerfile = root.join("deploy/docker/broker.Dockerfile");
-    let inputs = vec![
-        root.join("Cargo.toml"),
-        root.join("Cargo.lock"),
+        root.join("rust-toolchain.toml"),
         dockerfile.clone(),
         root.join("crates"),
         root.join("catalog"),

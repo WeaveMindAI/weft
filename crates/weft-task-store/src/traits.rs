@@ -59,6 +59,12 @@ pub trait WorkerPodClient: Send + Sync {
     async fn heartbeat(&self, pod_name: &str) -> Result<bool>;
 
     async fn mark_done(&self, pod_name: &str) -> Result<()>;
+
+    /// Guarded idle self-exit: flip `alive -> done` IFF no
+    /// pending/claimed worker task for the pod's own project (read
+    /// from its row, not a parameter). Returns true if this pod won
+    /// the flip. See `worker_pod::mark_done_if_idle`.
+    async fn mark_done_if_idle(&self, pod_name: &str) -> Result<bool>;
 }
 
 // ---------- Postgres impls ----------
@@ -131,5 +137,9 @@ impl WorkerPodClient for PostgresWorkerPodClient {
 
     async fn mark_done(&self, pod_name: &str) -> Result<()> {
         crate::worker_pod::mark_done(&self.pool, pod_name).await
+    }
+
+    async fn mark_done_if_idle(&self, pod_name: &str) -> Result<bool> {
+        crate::worker_pod::mark_done_if_idle(&self.pool, pod_name).await
     }
 }

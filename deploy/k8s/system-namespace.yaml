@@ -51,7 +51,7 @@ spec:
 ---
 # Dispatcher egress: god mode. The dispatcher is the control plane:
 # it reaches every tenant listener (admin POSTs to /register, /process,
-# etc), every tenant sidecar (endpoint resolution, health), every
+# etc), every tenant infra pod (endpoint resolution, health), every
 # external webhook target nodes spec, plus the kube-apiserver via
 # kubectl. Any rule that tries to enumerate "what the dispatcher
 # talks to" goes stale the moment a node author adds a new outbound

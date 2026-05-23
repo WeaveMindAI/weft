@@ -71,17 +71,8 @@ enum Cmd {
     /// executions and flips the project straight to inactive.
     Deactivate {
         project: Option<String>,
-        /// Preservation mode: wipe | hibernate | park.
-        #[arg(long, value_name = "mode")]
-        mode: Option<String>,
-        /// Grace window in minutes (hibernate only). Submissions
-        /// after this window are refused. Defaults to 15 if omitted
-        /// when mode = hibernate; ignored otherwise.
-        #[arg(long, value_name = "minutes")]
-        grace: Option<u32>,
-        /// Running-execution policy: wait | cancel. Default: wait.
-        #[arg(long = "running-policy", value_name = "policy")]
-        running_policy: Option<String>,
+        #[command(flatten)]
+        opts: TriggerDeactivationOpts,
     },
     /// Cancel an in-flight `activate` (status=Activating). Wipes
     /// every signal row registered so far, cancels the
@@ -108,7 +99,7 @@ enum Cmd {
     /// Remove a project at the level you ask for. No flags → the
     /// cwd project is deactivated + unregistered on the
     /// dispatcher. Add flags to escalate: `--infra` terminates
-    /// sidecars, `--journal` drops execution history,
+    /// infra pods, `--journal` drops execution history,
     /// `--image` removes the worker image from docker + kind,
     /// `--local` wipes `.weft/target/` on the host, `--all`
     /// implies every flag. An explicit project id overrides the
@@ -126,6 +117,11 @@ enum Cmd {
         local: bool,
         #[arg(long)]
         all: bool,
+        /// Skip the supervisor terminate-wait window. Use when the
+        /// supervisor pod is wedged or the cluster is unreachable
+        /// and the user wants the project gone NOW.
+        #[arg(long)]
+        force: bool,
     },
     /// Tail logs. No arg → latest execution of the cwd project.
     /// UUID arg → that specific execution.
@@ -259,38 +255,83 @@ impl From<TokenAction> for commands::token::TokenAction {
     }
 }
 
+/// Shared trigger-deactivation flags, used by every verb that takes
+/// triggers down (the standalone `weft deactivate` and every infra
+/// verb that deactivates as a side effect: stop, terminate, upgrade).
+///
+/// Missing flags prompt the user on a TTY; in `--json` mode missing
+/// required flags become errors so the extension always passes them.
+#[derive(Debug, clap::Args, Default, Clone)]
+struct TriggerDeactivationOpts {
+    /// Preservation mode for active triggers: wipe | hibernate | park.
+    #[arg(long, value_name = "wipe|hibernate|park")]
+    mode: Option<String>,
+    /// Hibernate grace window in minutes (only meaningful with
+    /// --mode hibernate). Default 15.
+    #[arg(long, value_name = "minutes")]
+    grace: Option<u32>,
+    /// What to do with in-flight executions: wait | cancel.
+    #[arg(long = "running-policy", value_name = "wait|cancel")]
+    running_policy: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum InfraAction {
-    /// Provision the project's sidecars (first time) or scale them
-    /// back to 1 (after stop). Errors if infra is already running.
+    /// Run the InfraSetup subworkflow: per-node either skip-apply
+    /// (hash match) or fresh apply. Use when starting infra from
+    /// scratch.
     Start,
-    /// Scale sidecars to 0 replicas. PVC + Service stay so the
-    /// next `start` resumes the same instance with its persisted
-    /// state (auth, credentials, etc).
-    Stop {
-        /// Skip the interactive prompt and answer it directly.
-        /// Required in --json mode (the extension already
-        /// confirmed in its own UI). On a TTY without this flag,
-        /// the CLI prompts.
-        #[arg(long, value_name = "true|false")]
-        deactivate_triggers: Option<bool>,
-    },
-    /// Delete every k8s resource the sidecars own, PVC included.
-    /// Irreversible: the next `start` is a fresh provision.
-    Terminate {
-        #[arg(long, value_name = "true|false")]
-        deactivate_triggers: Option<bool>,
-    },
-    /// Atomic stop + sidecar image rebuild + start. Used after
-    /// editing sidecar source: brings infra down, swaps the image
-    /// tags, runs InfraSetup again. Triggers are deactivated as
-    /// part of the stop step; reclick activate after.
+    /// Same endpoint as start; labeled differently to acknowledge a
+    /// prior partial-state. Cheap when most nodes are already
+    /// healthy (hash match short-circuits).
+    Restart,
+    /// Re-apply against current images / sources. When the project is
+    /// Active, triggers deactivate (same picker as `weft deactivate`)
+    /// for the duration; after the apply settles, re-activate per
+    /// --auto-reactivate.
     Upgrade {
+        #[command(flatten)]
+        opts: TriggerDeactivationOpts,
+        /// Re-activate the project after the upgrade settles.
+        /// Defaults to true on a TTY (prompts when omitted). In
+        /// `--json` mode the flag is required when project is Active.
         #[arg(long, value_name = "true|false")]
-        deactivate_triggers: Option<bool>,
+        auto_reactivate: Option<bool>,
+    },
+    /// Scale infra workloads to 0 (PVCs preserved). When the project
+    /// is Active, triggers deactivate via the standard picker.
+    Stop {
+        #[command(flatten)]
+        opts: TriggerDeactivationOpts,
+    },
+    /// Delete every infra resource (PVCs included unless preserved by
+    /// the node's InfraSpec). When the project is Active, triggers
+    /// deactivate via the standard picker.
+    Terminate {
+        #[command(flatten)]
+        opts: TriggerDeactivationOpts,
     },
     /// Print the current lifecycle state of each infra node.
     Status,
+    /// Per-node stop. Targets one infra node by id, leaves the rest
+    /// of the project's infra untouched. Used from the graph's per-
+    /// node menu (the trash icon's siblings).
+    NodeStop {
+        #[arg(value_name = "node_id")]
+        node_id: String,
+        /// Force scale-to-zero every unit, ignoring each unit's
+        /// `on_stop`. Takes down units that would normally stay up
+        /// (NoOp) so you can update them on the next start. You accept
+        /// the downtime (and any slow re-warmup) by passing this.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Per-node terminate. Same scope as `node-stop` but deletes
+    /// resources instead of scaling to 0.
+    NodeTerminate {
+        #[arg(value_name = "node_id")]
+        node_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -334,19 +375,38 @@ enum DaemonAction {
 }
 
 impl InfraAction {
-    fn split(self) -> (commands::infra::InfraAction, commands::infra::DeactivateChoice) {
+    fn split(self) -> (commands::infra::InfraAction, commands::infra::InfraOpts) {
+        let opts_from = |t: TriggerDeactivationOpts, auto: Option<bool>| commands::infra::InfraOpts {
+            mode: t.mode,
+            grace: t.grace,
+            running_policy: t.running_policy,
+            auto_reactivate: auto,
+        };
         match self {
-            InfraAction::Start => (commands::infra::InfraAction::Start, None),
-            InfraAction::Stop { deactivate_triggers } => {
-                (commands::infra::InfraAction::Stop, deactivate_triggers)
+            InfraAction::Start => (commands::infra::InfraAction::Start, Default::default()),
+            InfraAction::Restart => (commands::infra::InfraAction::Restart, Default::default()),
+            InfraAction::Stop { opts } => {
+                (commands::infra::InfraAction::Stop, opts_from(opts, None))
             }
-            InfraAction::Terminate { deactivate_triggers } => {
-                (commands::infra::InfraAction::Terminate, deactivate_triggers)
+            InfraAction::Terminate { opts } => {
+                (commands::infra::InfraAction::Terminate, opts_from(opts, None))
             }
-            InfraAction::Upgrade { deactivate_triggers } => {
-                (commands::infra::InfraAction::Upgrade, deactivate_triggers)
-            }
-            InfraAction::Status => (commands::infra::InfraAction::Status, None),
+            InfraAction::Upgrade {
+                opts,
+                auto_reactivate,
+            } => (
+                commands::infra::InfraAction::Upgrade,
+                opts_from(opts, auto_reactivate),
+            ),
+            InfraAction::Status => (commands::infra::InfraAction::Status, Default::default()),
+            InfraAction::NodeStop { node_id, force } => (
+                commands::infra::InfraAction::NodeStop { node_id, force },
+                Default::default(),
+            ),
+            InfraAction::NodeTerminate { node_id } => (
+                commands::infra::InfraAction::NodeTerminate { node_id },
+                Default::default(),
+            ),
         }
     }
 }
@@ -388,8 +448,15 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Activate { project, reactivate_choice } => {
             commands::activate::run(ctx, project, reactivate_choice).await
         }
-        Cmd::Deactivate { project, mode, grace, running_policy } => {
-            commands::deactivate::run(ctx, project, mode, grace, running_policy).await
+        Cmd::Deactivate { project, opts } => {
+            commands::deactivate::run(
+                ctx,
+                project,
+                opts.mode,
+                opts.grace,
+                opts.running_policy,
+            )
+            .await
         }
         Cmd::CancelActivate { project } => {
             commands::cancel_activate::run(ctx, project).await
@@ -399,10 +466,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Resync => commands::resync::run(ctx).await,
         Cmd::Ps => commands::ps::run(ctx).await,
-        Cmd::Rm { project, infra, journal, image, local, all } => {
+        Cmd::Rm { project, infra, journal, image, local, all, force } => {
             commands::rm::run(
                 ctx,
-                commands::rm::RmArgs { project, infra, journal, image, local, all },
+                commands::rm::RmArgs { project, infra, journal, image, local, all, force },
             )
             .await
         }
@@ -410,8 +477,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status => commands::status::run(ctx).await,
         Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
         Cmd::Infra { action } => {
-            let (verb, deactivate) = action.split();
-            commands::infra::run(ctx, verb, deactivate).await
+            let (verb, opts) = action.split();
+            commands::infra::run(ctx, verb, opts).await
         }
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,

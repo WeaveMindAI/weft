@@ -129,13 +129,9 @@ pub async fn rehydrate(
         }
         let spec: SignalSpec = serde_json::from_str(&row.spec_json)
             .map_err(|e| anyhow::anyhow!("malformed spec_json for signal {}: {e}", row.token))?;
-        let routing = reconstruct_routing(
-            &row.surface_kind,
-            row.mount_path,
-            &row.auth_kind,
-            row.auth_config,
-        )
-        .map_err(|e| anyhow::anyhow!("reconstruct routing for {}: {e}", row.token))?;
+        let routing = row.to_routing().map_err(|e| {
+            anyhow::anyhow!("to_routing for signal {}: {e}", row.token)
+        })?;
         crate::kinds::register_in_registry(
             row.token,
             spec,
@@ -153,94 +149,4 @@ pub async fn rehydrate(
         .await?;
     }
     Ok(())
-}
-
-fn reconstruct_routing(
-    surface_kind: &str,
-    mount_path: Option<String>,
-    auth_kind: &str,
-    auth_config: Option<serde_json::Value>,
-) -> anyhow::Result<weft_core::primitive::SignalRouting> {
-    use weft_core::primitive::{SignalAuth, SignalRouting, SignalSurface};
-    let surface = match surface_kind {
-        "public_entry" => {
-            let path = mount_path.unwrap_or_default();
-            // Stored mount_path has a leading `/`; the surface field
-            // doesn't carry it.
-            let path = path.strip_prefix('/').unwrap_or(&path).to_string();
-            SignalSurface::PublicEntry { path }
-        }
-        "task_callback" => SignalSurface::TaskCallback,
-        "internal" => SignalSurface::Internal,
-        other => anyhow::bail!("unknown surface_kind: {other}"),
-    };
-    let auth = match auth_kind {
-        "none" => SignalAuth::None,
-        "api_key" => SignalAuth::ApiKey,
-        other => anyhow::bail!("unknown auth_kind: {other}"),
-    };
-    Ok(SignalRouting {
-        surface,
-        auth,
-        auth_config: auth_config.unwrap_or(serde_json::Value::Null),
-    })
-}
-
-#[cfg(test)]
-mod reconstruct_routing_tests {
-    use super::reconstruct_routing;
-    use weft_core::primitive::{SignalAuth, SignalSurface};
-
-    #[test]
-    fn public_entry_strips_leading_slash() {
-        let r = reconstruct_routing("public_entry", Some("/hooks/x".into()), "none", None).unwrap();
-        match r.surface {
-            SignalSurface::PublicEntry { path } => assert_eq!(path, "hooks/x"),
-            _ => panic!("expected PublicEntry"),
-        }
-        assert!(matches!(r.auth, SignalAuth::None));
-    }
-
-    #[test]
-    fn public_entry_root_path() {
-        let r = reconstruct_routing("public_entry", Some("/".into()), "none", None).unwrap();
-        match r.surface {
-            SignalSurface::PublicEntry { path } => assert_eq!(path, ""),
-            _ => panic!(),
-        }
-    }
-
-    #[test]
-    fn task_callback_no_path() {
-        let r = reconstruct_routing("task_callback", None, "none", None).unwrap();
-        assert!(matches!(r.surface, SignalSurface::TaskCallback));
-    }
-
-    #[test]
-    fn internal_surface() {
-        let r = reconstruct_routing("internal", None, "none", None).unwrap();
-        assert!(matches!(r.surface, SignalSurface::Internal));
-    }
-
-    #[test]
-    fn api_key_auth_passes_config_through() {
-        let cfg = serde_json::json!({"header_name": "x-api-key", "value_hash": "abc"});
-        let r =
-            reconstruct_routing("public_entry", Some("/x".into()), "api_key", Some(cfg.clone()))
-                .unwrap();
-        assert!(matches!(r.auth, SignalAuth::ApiKey));
-        assert_eq!(r.auth_config, cfg);
-    }
-
-    #[test]
-    fn unknown_surface_kind_errors() {
-        let err = reconstruct_routing("websocket", None, "none", None).unwrap_err();
-        assert!(err.to_string().contains("unknown surface_kind"));
-    }
-
-    #[test]
-    fn unknown_auth_kind_errors() {
-        let err = reconstruct_routing("internal", None, "oauth2", None).unwrap_err();
-        assert!(err.to_string().contains("unknown auth_kind"));
-    }
 }

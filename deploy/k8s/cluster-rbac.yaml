@@ -1,0 +1,63 @@
+---
+# Cluster-scoped ClusterRoles for the per-tenant infra-supervisor
+# and listener pods. The dispatcher creates RoleBindings in each
+# project namespace at register time, binding these ClusterRoles to
+# the tenant-namespace SAs `weft-infra-supervisor-sa` and
+# `weft-listener-sa`.
+#
+# This approach keeps the supervisor / listener blast radius
+# exactly "this tenant's project namespaces" (Roles are bound
+# per-namespace; the ClusterRole gives the verb surface, the
+# RoleBinding scopes it).
+#
+# The supervisor owns `kubectl apply` for every resource the
+# weft-core compiler can emit (Deployment, StatefulSet, Service,
+# PVC, ConfigMap, Secret, Ingress, NetworkPolicy, HPA, Job,
+# DaemonSet, Pod). `create + patch + update` covers both fresh
+# applies (POST) and Replace's re-apply-after-sweep (PUT/PATCH).
+# `delete` covers Stop / Terminate sweeps.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: weft-infra-supervisor-clusterrole
+rules:
+  # Pods: only listed/watched/deleted (delete-by-label sweep). The
+  # supervisor never patches a Pod directly; it scales the
+  # parent Deployment / StatefulSet instead.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, delete]
+  # Services + Configs + PVCs: created by `kubectl apply`, swept on
+  # terminate. Patch is the SSA path kubectl apply uses on existing
+  # objects.
+  - apiGroups: [""]
+    resources: [services, configmaps, secrets, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Workloads: same as configs PLUS `scale` for the Deployment /
+  # StatefulSet replica count moves on Stop / Replace.
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments/scale, statefulsets/scale]
+    verbs: [update, patch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: weft-listener-clusterrole
+rules:
+  # Listener needs to resolve Service URLs for cross-namespace SSE
+  # subscriptions against infra pods.
+  - apiGroups: [""]
+    resources: [services, endpoints]
+    verbs: [get, list, watch]

@@ -165,7 +165,7 @@ impl Journal for MockJournal {
                     Some(NodeExecEvent {
                         color: *c,
                         node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
+                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                         kind: NodeExecKind::Started,
                         input: Some(input.clone()),
                         output: None,
@@ -182,7 +182,7 @@ impl Journal for MockJournal {
                     Some(NodeExecEvent {
                         color: *c,
                         node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
+                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                         kind: NodeExecKind::Suspended,
                         input: None,
                         output: None,
@@ -199,7 +199,7 @@ impl Journal for MockJournal {
                     Some(NodeExecEvent {
                         color: *c,
                         node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
+                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                         kind: NodeExecKind::Resumed,
                         input: None,
                         output: None,
@@ -216,7 +216,7 @@ impl Journal for MockJournal {
                     Some(NodeExecEvent {
                         color: *c,
                         node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
+                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                         kind: NodeExecKind::Cancelled,
                         input: None,
                         output: None,
@@ -233,7 +233,7 @@ impl Journal for MockJournal {
                     Some(NodeExecEvent {
                         color: *c,
                         node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
+                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                         kind: NodeExecKind::Completed,
                         input: None,
                         output: Some(output.clone()),
@@ -250,7 +250,7 @@ impl Journal for MockJournal {
                     Some(NodeExecEvent {
                         color: *c,
                         node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
+                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                         kind: NodeExecKind::Failed,
                         input: None,
                         output: None,
@@ -267,7 +267,7 @@ impl Journal for MockJournal {
                     Some(NodeExecEvent {
                         color: *c,
                         node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).unwrap_or_default(),
+                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                         kind: NodeExecKind::Skipped,
                         input: None,
                         output: None,

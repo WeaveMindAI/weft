@@ -33,7 +33,6 @@
   "requires_infra": false,
   "features": {
     "isTrigger": true,
-    "triggerCategory": "Manual",
     "hasFormSchema": true
   },
   "validate": [

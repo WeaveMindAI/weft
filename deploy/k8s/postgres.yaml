@@ -1,6 +1,6 @@
 ---
 # Postgres backing store. Lives in `weft-db`, fronted by `weft-broker`
-# for tenant pods (workers, listeners, sidecars). The dispatcher and
+# for tenant pods (workers, listeners, infra pods). The dispatcher and
 # the broker reach Postgres directly (god mode + intra-namespace).
 # Tenant pods cannot reach this Service: NetworkPolicy in `weft-db`
 # denies their ingress.

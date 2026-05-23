@@ -1,7 +1,7 @@
 {
   "type": "WhatsAppReceive",
   "label": "WhatsApp Receive",
-  "description": "Fires an execution when a WhatsApp message arrives at the project's WhatsApp sidecar. Wire this node's `endpointUrl` input from a WhatsAppBridge node; the listener subscribes to the bridge's SSE events stream and fires on every `message.received` event.",
+  "description": "Fires an execution when a WhatsApp message arrives at the project's WhatsApp bridge. Wire this node's `endpointUrl` input from a WhatsAppBridge node; the listener subscribes to the bridge's SSE events stream and fires on every `message.received` event.",
   "category": "Triggers",
   "tags": ["whatsapp", "trigger", "sse"],
   "icon": "MessageCircle",
@@ -14,15 +14,13 @@
     { "name": "from", "type": "String", "required": false },
     { "name": "pushName", "type": "String", "required": false },
     { "name": "messageId", "type": "String", "required": false },
-    { "name": "timestamp", "type": "String", "required": false },
+    { "name": "timestamp", "type": "Number", "required": false },
     { "name": "isGroup", "type": "Boolean", "required": false },
-    { "name": "chatId", "type": "String", "required": false },
-    { "name": "messageType", "type": "String", "required": false }
+    { "name": "chatId", "type": "String", "required": false }
   ],
   "fields": [],
   "requires_infra": false,
   "features": {
-    "isTrigger": true,
-    "triggerCategory": "Webhook"
+    "isTrigger": true
   }
 }

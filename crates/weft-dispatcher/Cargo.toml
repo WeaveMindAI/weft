@@ -16,6 +16,8 @@ weft-catalog = { workspace = true }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
 weft-listener = { path = "../weft-listener" }
+weft-broker-client = { path = "../weft-broker-client" }
+weft-platform-traits = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -38,13 +40,14 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { workspace = true }
 dashmap = "6"
 cron = "0.12"
-sha2 = "0.10"
+sha2 = { workspace = true }
 url = { workspace = true }
 
 [features]
 test-helpers = []
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-dispatcher = { path = ".", features = ["test-helpers"] }
+weft-platform-traits = { workspace = true, features = ["test-helpers"] }

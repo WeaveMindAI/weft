@@ -149,21 +149,61 @@ weft follow <project-id>
 4. Complete the task from the extension. The dispatcher resumes
    the suspended execution with the form submission.
 
-## Infra nodes (kind cluster)
+## Infra: long-running services your workflow can use
 
-Infra nodes (Slack bridge, Postgres sidecar, WhatsApp, etc) run
-inside a local `kind` kubernetes cluster. The dispatcher provisions
-it lazily on first `weft infra up`. Prereqs:
+Most Weft nodes are short-lived: they run, produce a value, and exit.
+But some capabilities need a process that's *always there*: a WhatsApp
+bridge holding a phone session, a local LLM server, a database, a
+headless browser. Weft calls these **infra nodes**, and the whole point
+is that you declare them like any other node and Weft runs them for you.
+
+**Why it's nice.** You don't write Kubernetes YAML, manage Docker
+Compose, or babysit a daemon. You drop a "WhatsApp Bridge" node onto
+the graph, hit Start, and Weft provisions a real pod, wires up its
+network, persists its state on a disk, and hands the rest of your
+workflow a URL to talk to it. Locally that runs in a `kind` cluster on
+your machine; in the cloud it's the same code against real Kubernetes:
+**one model, no separate "local vs prod" setup.** Weft itself is the
+infrastructure layer.
+
+**How it works, in one breath.** An infra node describes what it wants
+(a container, a port, a disk) as a typed spec. When you Start, Weft
+compiles that to Kubernetes objects, applies them, waits for the pod to
+be ready, and records a stable in-cluster URL. Downstream nodes get
+that URL and make HTTP calls. Weft watches the pod's health and shows
+its status right on the node in the graph.
+
+**The lifecycle you'll actually use:**
+
+- **Start**: bring the infra up (or bring back any piece that was down).
+- **Stop**: scale it to zero. Its disk and address are kept, so a later
+  Start is fast. A node can mark a piece *NoOp* meaning "leave me
+  running on stop" for things that are expensive to recreate.
+- **Upgrade**: stop then start, to roll a new version of your node's
+  image or spec. (A NoOp piece stays frozen until you explicitly take
+  it down with `weft infra <node> stop --force`, the graph shows a hint
+  when that's the case.)
+- **Terminate**: delete everything, including the disk.
+
+**Prerequisites (local).** Infra runs in a `kind` cluster the
+dispatcher provisions lazily. Install once per machine:
 
 ```bash
-# Once per machine:
 #   https://kind.sigs.k8s.io/docs/user/quick-start/
 #   https://kubernetes.io/docs/tasks/tools/
 ```
 
-Phase A ships the KindInfraBackend scaffolding; full sidecar
-wiring (event streaming, credential injection) lands as specific
-infra-backed nodes are ported.
+```bash
+weft infra start         # provision the project's infra, wait for ready
+weft infra status        # per-node status + endpoint URLs
+weft infra stop          # scale to zero (keeps disks)
+weft infra upgrade       # roll a new image/spec (stop + start)
+weft infra terminate     # delete it all
+```
+
+To author your own infra node, see `docs/authoring-nodes.md` (the
+"Infra nodes" section): the typed `InfraSpec`, how to expose endpoints,
+and the `/live` / `/outputs` HTTP contracts.
 
 ## CLI cheat sheet
 
@@ -188,7 +228,12 @@ weft describe-nodes        Print the per-project catalog as JSON.
 weft executions            List past executions.
 weft events <color>        Print one execution's node events.
 weft clean [<color>]       Purge journal data (defaults: keep 30 days).
-weft infra up/down         Provision/tear down infra pods (kind).
+weft infra start/stop      Provision / scale-to-zero the project's infra.
+weft infra upgrade         Roll a new image/spec (stop + start).
+weft infra terminate       Delete the project's infra (and its disks).
+weft infra status          Per-node infra status + endpoint URLs.
+weft infra node-stop <id> [--force]   Stop one infra node (--force overrides on_stop).
+weft infra node-terminate <id>        Terminate one infra node (delete its resources).
 weft add <git-url>         Install an external node package (phase B).
 ```
 

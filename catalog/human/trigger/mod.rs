@@ -4,9 +4,10 @@
 //!   - `Phase::TriggerSetup`: build a Form signal from the node's
 //!     config and register it.
 //!
-//!   - `Phase::Fire`: the submission lands on `__seed__` as
-//!     `{body: <submission>}`. Map the submitted values to output
-//!     ports per the form field definitions.
+//!   - `Phase::Fire`: the submission lands on `__seed__` as the
+//!     raw form payload (a flat JSON object keyed by field key).
+//!     Map the submitted values to output ports per the form field
+//!     definitions.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -77,17 +78,14 @@ impl Node for HumanTriggerNode {
             }
             Phase::Fire => {
                 // The submission lands on `__seed__` as the raw
-                // form payload (a JSON object keyed by field key).
-                // Older webhook-shaped payloads wrapped it under
-                // `body`; we still unwrap that for compatibility
-                // with non-extension senders.
-                let payload = ctx
+                // form payload (a JSON object keyed by field key):
+                // `fire_public_entry` seeds the POST body verbatim.
+                let submission = ctx
                     .input
                     .values
                     .get("__seed__")
                     .cloned()
                     .unwrap_or(Value::Null);
-                let submission = payload.get("body").cloned().unwrap_or(payload);
                 let raw_fields = parse_form_fields(&ctx.config.values);
                 Ok(map_response_to_ports(&submission, &raw_fields, specs))
             }

@@ -1,8 +1,7 @@
 //! Graph-level project types. Describes a weft program as a graph:
 //! nodes (instances of a node type), edges (connections between port
 //! refs). Port and field shapes live on the node TYPE (NodeMetadata),
-//! not on the instance. `NodeFeatures` is preserved on each node (the
-//! v1 `triggerCategory` field was the only thing dropped).
+//! not on the instance. `NodeFeatures` is preserved on each node.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -120,15 +119,17 @@ pub struct NodeDefinition {
     /// need a registry lookup per node.
     #[serde(default)]
     pub features: crate::node::NodeFeatures,
-    /// `true` if this node requires a sidecar-backed infra
-    /// instance. Mirrored from NodeMetadata so the dispatcher can
-    /// drive `weft infra up/down` without a catalog lookup.
+    /// `true` if this node implements `Node::provision` and the
+    /// dispatcher must run InfraSetup before activate. Mirrored from
+    /// NodeMetadata.requires_infra at enrich time.
     #[serde(default, rename = "requiresInfra")]
     pub requires_infra: bool,
-    /// Sidecar declaration for `requires_infra: true` nodes.
-    /// Mirrored from NodeMetadata.sidecar at enrich time.
-    #[serde(default, rename = "sidecar", skip_serializing_if = "Option::is_none")]
-    pub sidecar: Option<crate::node::SidecarSpec>,
+    /// Image source dirs the CLI builds for this node. Mirrored from
+    /// NodeMetadata.images at enrich time. The CLI walks this to know
+    /// which Dockerfiles to build before sending imageHashes to
+    /// the dispatcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,4 +294,56 @@ impl EdgeIndex {
             .map(|indices| indices.iter().map(|&i| &project.edges[i]).collect())
             .unwrap_or_default()
     }
+}
+
+/// For every `requires_infra` node, find every trigger whose
+/// upstream-closure includes it. Returns `(infra_node_id,
+/// trigger_node_id)` pairs sorted by `(infra, trigger)`.
+///
+/// Used by:
+///   - dispatcher's per-node stop/terminate safety check (refuse if a
+///     trigger depends on the targeted infra node);
+///   - broker's `supervisor_trigger_deps` endpoint so the supervisor
+///     can make the same decision when reacting to flaky/recovered
+///     events.
+///
+/// Pure walk over `ProjectDefinition`; no I/O. The same function
+/// hosted by `weft-core` is the only copy : neither side maintains
+/// a mirror.
+pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
+    let edge_idx = EdgeIndex::build(project);
+    let triggers: Vec<&str> = project
+        .nodes
+        .iter()
+        .filter(|n| n.features.is_trigger)
+        .map(|n| n.id.as_str())
+        .collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for infra in project.nodes.iter().filter(|n| n.requires_infra) {
+        for trigger in &triggers {
+            let mut visited: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut frontier: Vec<String> = vec![(*trigger).to_string()];
+            let mut reached = false;
+            while let Some(id) = frontier.pop() {
+                if !visited.insert(id.clone()) {
+                    continue;
+                }
+                if id == infra.id {
+                    reached = true;
+                    break;
+                }
+                for e in edge_idx.get_incoming(project, &id) {
+                    if !visited.contains(&e.source) {
+                        frontier.push(e.source.clone());
+                    }
+                }
+            }
+            if reached {
+                out.push((infra.id.clone(), (*trigger).to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
 }

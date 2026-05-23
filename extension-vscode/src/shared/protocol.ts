@@ -48,6 +48,10 @@ export interface NodeDefinition {
     isTrigger?: boolean;
     showDebugPreview?: boolean;
     isOutputDefault?: boolean;
+    /// Names the endpoint serving the node's `/live` HTTP route the
+    /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
+    /// so the panel doesn't show a broken eye.
+    liveEndpoint?: string;
   };
   requiresInfra?: boolean;
   entry: unknown[];
@@ -177,6 +181,7 @@ export interface CatalogEntry {
     hasFormSchema?: boolean;
     isTrigger?: boolean;
     showDebugPreview?: boolean;
+    liveEndpoint?: string;
     hidden?: boolean;
   };
   /** Form-field vocabulary for nodes whose `features.hasFormSchema`
@@ -269,7 +274,7 @@ export interface NodeExecEvent {
 }
 
 /// One item rendered in a node's body panel. Two distinct feeds
-/// produce items: infra `/live` (sidecar telemetry) and signal
+/// produce items: infra `/live` (infra-pod telemetry) and signal
 /// `/display` (trigger URL + auth metadata). The two feeds flow
 /// through SEPARATE message channels (`infraLive`, `signalDisplay`)
 /// keyed by node id; they never cross. Adding a new presentation
@@ -357,13 +362,29 @@ export interface ActionAvailability {
   /// deactivating-state UI: shows "draining N executions...".
   runningCount: number;
   /// Infra rollup.
-  infraRollup: 'none' | 'stopped' | 'partial' | 'running';
+  infraRollup:
+    | 'none'
+    | 'stopped'
+    | 'partial'
+    | 'running'
+    | 'failed'
+    | 'flaky'
+    | 'stopping'
+    | 'terminating'
+    | 'provisioning';
   /// Per-node infra status. Used by graph decorations (badges
   /// under each infra node), independent of the rollup.
   infraNodes: Array<{
     nodeId: string;
     nodeType: string;
+    /// Possible values:
+    ///   "provisioning" | "running" | "stopped" | "flaky" | "failed"
+    ///   | "stopping"   | "terminating"
     status: string;
+    /// Set when status=failed: which stage of the apply pipeline
+    /// failed (`provision` | `apply` | `execute` | `apply_lifecycle`).
+    failureStage?: string;
+    failureMessage?: string;
   }>;
   /// Counts of preserved state, for the reactivate-time dialog.
   preservation: {
@@ -374,7 +395,12 @@ export interface ActionAvailability {
   };
 }
 
-/// Every action-bar verb. Matches the CLI's ActionVerb enum (snake_case).
+/// Every action-bar verb. Mirrors the dispatcher's
+/// `compute_available_actions` output union AND the CLI's
+/// `ActionVerb` enum (snake_case). Some verbs come from the
+/// dispatcher's `/status` (reactivate, resume_active) and some
+/// from the CLI's progress stream (build, rm); the bar consumes
+/// both, so the type is the superset.
 export type ActionVerb =
   | 'run'
   | 'activate'
@@ -384,10 +410,15 @@ export type ActionVerb =
   | 'cancel_running'
   | 'resume_active'
   | 'resync'
+  | 'build'
+  | 'rm'
   | 'infra_start'
+  | 'infra_restart'
   | 'infra_stop'
   | 'infra_terminate'
-  | 'infra_upgrade';
+  | 'infra_upgrade'
+  | 'infra_node_stop'
+  | 'infra_node_terminate';
 
 /// CLI progress phase. Matches the CLI's Phase enum. Closed set so
 /// the reducer's match is exhaustive at the type level.
@@ -464,7 +495,16 @@ export type BackendSnapshot = {
   /// "deactivating" | "registered". Rendered as a chip and used
   /// by the trigger slot to pick the Reactivate / Activate variant.
   mode: string;
-  infraRollup: 'none' | 'stopped' | 'partial' | 'running';
+  infraRollup:
+    | 'none'
+    | 'stopped'
+    | 'partial'
+    | 'running'
+    | 'failed'
+    | 'flaky'
+    | 'stopping'
+    | 'terminating'
+    | 'provisioning';
   /// Drain progress when status='deactivating'.
   runningCount: number;
   /// Hibernate-grace deadline, when present.
@@ -483,7 +523,7 @@ export type HostMessage =
   | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled' }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   | { kind: 'execEvent'; event: NodeExecEvent }
-  /// Sidecar `/live` poll result for one infra node. Routed to
+  /// Infra `/live` poll result for one infra node. Routed to
   /// the node's body panel iff the node has `requiresInfra: true`.
   | ({ kind: 'infraLive'; nodeId: string } & NodeFeedState)
   /// Listener `/display` poll result for one trigger node. Routed
@@ -525,8 +565,13 @@ export type WebviewMessage =
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string }
   | { kind: 'runProject' }
   | { kind: 'infraStart' }
+  | { kind: 'infraRestart' }
   | { kind: 'infraStop' }
   | { kind: 'infraTerminate' }
+  /// Per-node Stop (graph menu, partial-state recovery).
+  | { kind: 'infraNodeStop'; nodeId: string }
+  /// Per-node Terminate (graph menu, partial-state recovery).
+  | { kind: 'infraNodeTerminate'; nodeId: string }
   | { kind: 'activateProject' }
   | { kind: 'deactivateProject' }
   /// User clicked Reactivate (project is Inactive WITH preserved
@@ -557,7 +602,7 @@ export type WebviewMessage =
   /// User clicked Resync. Atomic deactivate + reactivate against
   /// the current source.
   | { kind: 'resyncProject' }
-  /// User clicked Upgrade Infra. Atomic infra stop + sidecar
+  /// User clicked Upgrade Infra. atomic infra stop + image
   /// rebuild + start.
   | { kind: 'infraUpgrade' }
   /// User clicked the Refresh Status button on the graph header.

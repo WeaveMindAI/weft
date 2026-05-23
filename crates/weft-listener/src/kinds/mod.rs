@@ -19,10 +19,12 @@
 //! delegate. They never know about specific kinds.
 //!
 //! Conventions enforced by the dispatch helpers below:
-//!   - Stateful kinds (Timer, SSE) decline external fires by
-//!     returning `ProcessTarget::Drop`. Their fires enqueue a
-//!     `FireSignal` task via the broker, which the dispatcher's
-//!     picker routes through the standard `/process` flow.
+//!   - Stateful kinds (Timer, SSE) raise their own fires internally
+//!     (a tick / an SSE event) and enqueue a `FireSignal` task via the
+//!     broker; the dispatcher picker runs it back through `/process`,
+//!     where the kind's `process_entry` routes it to
+//!     `ProcessTarget::Entry`. (An unknown token still returns Drop;
+//!     that's the genuine "no signal here" case.)
 //!   - Resume signals (`is_resume = true`) always route to
 //!     `ProcessTarget::Resume`; the kind's `process` impl is only
 //!     consulted for entry-mode (`is_resume = false`).
@@ -72,7 +74,7 @@ pub trait KindHandler: Send + Sync {
     /// Compute the initial opaque state to persist on the signal row
     /// at register time. Default: empty object. Kinds that need to
     /// survive a listener restart return values keyed by their own
-    /// schema (Timer: `{"next_fire_at_unix": <abs unix>}` for After,
+    /// schema (Timer: `{"next_fire_at_unix_ms": <abs unix>}` for After,
     /// `{}` for Cron/At since those are wall-clock-absolute).
     ///
     /// **Persistence policy**: `signal_insert`'s UPSERT runs

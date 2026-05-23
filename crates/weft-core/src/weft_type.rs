@@ -209,41 +209,6 @@ impl WeftType {
         }
     }
 
-    /// Remove Null from a type. `String | Null` becomes `String`.
-    /// A bare `Null` becomes `Null` (cannot strip further).
-    /// Non-union types without Null are returned unchanged.
-    /// Note: only strips from flat unions (direct children). Unions are
-    /// always flattened by `WeftType::union()`, so nested unions do not
-    /// occur in practice. If that invariant ever changes, this method
-    /// should be made recursive to match `contains_null()`.
-    pub fn without_null(&self) -> WeftType {
-        match self {
-            WeftType::Union(types) => {
-                let filtered: Vec<WeftType> = types.iter()
-                    .filter(|t| !matches!(t, WeftType::Primitive(WeftPrimitive::Null)))
-                    .cloned()
-                    .collect();
-                if filtered.is_empty() {
-                    self.clone()
-                } else if filtered.len() == 1 {
-                    filtered.into_iter().next().unwrap()
-                } else {
-                    WeftType::Union(filtered)
-                }
-            }
-            _ => self.clone(),
-        }
-    }
-
-    /// For an expand port: extract the element type from List[T] → T.
-    /// Returns None if the type is not a List (expand requires List input).
-    pub fn expand_element_type(&self) -> Option<WeftType> {
-        match self {
-            WeftType::List(inner) => Some(*inner.clone()),
-            WeftType::TypeVar(_) => Some(self.clone()),
-            _ => None,
-        }
-    }
 
     // ── Compatibility ───────────────────────────────────────────────────
 

@@ -23,7 +23,6 @@
   ],
   "requires_infra": false,
   "features": {
-    "isTrigger": true,
-    "triggerCategory": "Schedule"
+    "isTrigger": true
   }
 }

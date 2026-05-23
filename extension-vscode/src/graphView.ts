@@ -1,7 +1,7 @@
 // Extension-host side of the graph view. Owns a single WebviewPanel
 // that tracks the currently-active .weft document, parses via the
 // dispatcher on every text change (debounced), and streams saves
-// back into the document / .layout.json sidecar.
+// back into the document / .layout.json companion.
 //
 // The webview does all the text surgery in-process via v1's
 // weft-editor.ts. When the user edits something, the webview sends
@@ -78,7 +78,7 @@ export class GraphViewController {
   // never both, so a node never has both timers.
   private signalDisplayTimers: Map<string, NodeJS.Timeout> = new Map();
   // Interval between polls for infra /live. 3s matches v1; the
-  // sidecar's /live is cheap (returns current state snapshot), so
+  // /live is cheap (returns current state snapshot), so
   // this is fine.
   private readonly liveIntervalMs = 3000;
   // Action bar state, drift, and per-node infra status come from
@@ -284,21 +284,24 @@ export class GraphViewController {
    *  Also drives the ActionBar's infra + trigger status pollers
    *  based on which node families the project contains.
    */
-  private syncInfraLivePollers(response: { project: ProjectDefinition; catalog: Record<string, { requires_infra?: boolean; features?: { isTrigger?: boolean } }> }): void {
+  private syncInfraLivePollers(response: { project: ProjectDefinition; catalog: Record<string, { requires_infra?: boolean; features?: { isTrigger?: boolean; liveEndpoint?: string } }> }): void {
     const projectId = response.project.id;
     if (!projectId) {
       this.stopAllLivePollers();
       return;
     }
+    // Only poll /live for infra nodes whose catalog metadata names a
+    // `features.liveEndpoint`. TCP-only infra (Postgres, Redis) leaves
+    // it unset and would otherwise return 502 on every tick.
     const infraNodeIds = new Set(
       response.project.nodes
         .filter((n) => {
-          // The catalog entry's NodeMetadata still uses snake_case
-          // (`requires_infra`), so we check both. NodeDefinition's
-          // own field is `requiresInfra` (camelCase) per its wire
-          // schema.
           const entry = response.catalog[n.nodeType];
-          return n.requiresInfra ?? entry?.requires_infra ?? false;
+          const isInfra = n.requiresInfra ?? entry?.requires_infra ?? false;
+          if (!isInfra) return false;
+          const liveEndpoint = entry?.features?.liveEndpoint
+            ?? n.features?.liveEndpoint;
+          return liveEndpoint != null;
         })
         .map((n) => n.id),
     );
@@ -480,8 +483,17 @@ export class GraphViewController {
     }
   }
 
-  private async runDeactivate(): Promise<void> {
-    // Step 1: preservation mode (wipe vs hibernate vs park).
+  /// Shared trigger-deactivation picker. Used by the standalone
+  /// Deactivate button AND by every infra verb that takes triggers
+  /// down as a side effect (Stop / Terminate / Upgrade). One UX
+  /// surface, one set of choices.
+  ///
+  /// Returns CLI flags (`--mode <m> --running-policy <p> [--grace <g>]`)
+  /// ready to splice into a dispatchVerb call, or `null` when the
+  /// user cancelled any step.
+  private async promptTriggerDeactivation(
+    verbHint: string,
+  ): Promise<string[] | null> {
     const modes: Array<{
       label: string;
       detail: string;
@@ -507,18 +519,15 @@ export class GraphViewController {
       },
     ];
     const modeChoice = await vscode.window.showQuickPick(modes, {
-      placeHolder: 'Choose preservation mode',
+      placeHolder: `${verbHint}: choose trigger-preservation mode`,
       ignoreFocusOut: true,
     });
-    if (!modeChoice) return;
+    if (!modeChoice) return null;
 
-    // Step 2: running-execution policy. Skipped for wipe (which
-    // forces cancel because waiting before wiping is contradictory).
-    // For preservation modes, wait is the safe default (in-flight
-    // runs finish naturally; new fires already park). Cancel is
-    // the panic button.
     let runningPolicy: 'wait' | 'cancel';
     if (modeChoice.mode === 'wipe') {
+      // Wipe forces cancel because waiting before wiping is
+      // contradictory (you've asked to drop everything anyway).
       runningPolicy = 'cancel';
     } else {
       const runningPolicies: Array<{
@@ -539,21 +548,18 @@ export class GraphViewController {
           value: 'cancel',
         },
       ];
-      const runningChoice = await vscode.window.showQuickPick(runningPolicies, {
-        placeHolder: 'How should running executions be handled?',
-        ignoreFocusOut: true,
-      });
-      if (!runningChoice) return;
+      const runningChoice = await vscode.window.showQuickPick(
+        runningPolicies,
+        {
+          placeHolder: `${verbHint}: how should running executions be handled?`,
+          ignoreFocusOut: true,
+        },
+      );
+      if (!runningChoice) return null;
       runningPolicy = runningChoice.value;
     }
 
-    // Step 3: hibernate-specific grace window.
-    const args = [
-      '--mode',
-      modeChoice.mode,
-      '--running-policy',
-      runningPolicy,
-    ];
+    const args = ['--mode', modeChoice.mode, '--running-policy', runningPolicy];
     if (modeChoice.mode === 'hibernate') {
       const grace = await vscode.window.showInputBox({
         prompt:
@@ -568,9 +574,115 @@ export class GraphViewController {
           return null;
         },
       });
-      if (grace === undefined) return;
+      if (grace === undefined) return null;
       args.push('--grace', String(Number(grace.trim())));
     }
+    return args;
+  }
+
+  /// Read the project's current lifecycle.status. Failed reads
+  /// default to "not active" so the worst case is we skip the
+  /// deactivation prompt and let the dispatcher 412 if it disagrees.
+  private async projectIsActive(): Promise<boolean> {
+    const projectId = this.watchedProjectId;
+    if (!projectId) return false;
+    try {
+      const status = await this.client.get<{ status?: string }>(
+        `/projects/${projectId}/status`,
+      );
+      return status.status === 'active';
+    } catch {
+      return false;
+    }
+  }
+
+  /// Project-level infra Stop / Terminate. Surfaces the shared
+  /// deactivation picker when the project is Active; otherwise just
+  /// dispatches the bare verb.
+  private async confirmAndDispatchInfraVerb(
+    verb: 'stop' | 'terminate',
+  ): Promise<void> {
+    const active = await this.projectIsActive();
+    let deactivationArgs: string[] = [];
+    if (active) {
+      const picked = await this.promptTriggerDeactivation(`infra ${verb}`);
+      if (!picked) return;
+      deactivationArgs = picked;
+    }
+    void this.dispatchVerb('infra', [verb, ...deactivationArgs]);
+  }
+
+  /// Project-level infra Upgrade. Same trigger-deactivation flow as
+  /// Stop / Terminate when the project is Active, plus a follow-up
+  /// "auto-reactivate after the upgrade?" Yes/No.
+  private async confirmAndDispatchInfraUpgrade(): Promise<void> {
+    const active = await this.projectIsActive();
+    if (!active) {
+      void this.dispatchVerb('infra', ['upgrade']);
+      return;
+    }
+    const deactivationArgs = await this.promptTriggerDeactivation('infra upgrade');
+    if (!deactivationArgs) return;
+    const reactivate = await vscode.window.showQuickPick(
+      [
+        {
+          label: 'Re-activate after upgrade',
+          detail: 'Re-register triggers as soon as the apply settles. Recommended.',
+          value: true,
+        },
+        {
+          label: 'Leave inactive',
+          detail: 'Triggers stay parked after the upgrade. Click Activate manually later.',
+          value: false,
+        },
+      ],
+      {
+        placeHolder: 'infra upgrade: re-activate after the upgrade?',
+        ignoreFocusOut: true,
+      },
+    );
+    if (!reactivate) return;
+    void this.dispatchVerb('infra', [
+      'upgrade',
+      ...deactivationArgs,
+      '--auto-reactivate',
+      String(reactivate.value),
+    ]);
+  }
+
+  /// Per-node infra verb (stop / terminate) for partial-state
+  /// recovery from the graph context menu. Confirms via QuickPick
+  /// then dispatches the CLI verb, which gives the action bar the
+  /// usual cli_running overlay + spinner.
+  private async confirmAndDispatchPerNodeVerb(
+    nodeId: string,
+    verb: 'stop' | 'terminate',
+  ): Promise<void> {
+    const confirm = await vscode.window.showQuickPick(
+      [
+        {
+          label: verb === 'stop' ? 'Stop this node' : 'Terminate this node',
+          detail:
+            verb === 'stop'
+              ? 'Scale ALL its units to 0 (PVCs preserved), even units that would normally stay up on stop (NoOp). Reversible via Start.'
+              : 'Delete all resources, including PVCs unless preserved by the spec.',
+          value: true,
+        },
+        { label: 'Cancel', detail: 'Abort the action.', value: false },
+      ],
+      { placeHolder: `Confirm per-node ${verb}`, ignoreFocusOut: true },
+    );
+    if (!confirm || !confirm.value) return;
+    // Per-node stop from the graph forces: the user explicitly picked
+    // one node to take down, so NoOp units come down too (otherwise a
+    // right-click stop on a NoOp-only node would silently do nothing).
+    const args = verb === 'stop' ? ['node-stop', nodeId, '--force'] : ['node-terminate', nodeId];
+    void this.dispatchVerb('infra', args);
+  }
+
+  private async runDeactivate(): Promise<void> {
+    const args = await this.promptTriggerDeactivation('deactivate');
+    if (!args) return;
     void this.dispatchVerb('deactivate', args);
   }
 
@@ -661,11 +773,24 @@ export class GraphViewController {
       case 'infraStart':
         void this.dispatchVerb('infra', ['start']);
         break;
+      case 'infraRestart':
+        void this.dispatchVerb('infra', ['restart']);
+        break;
       case 'infraStop':
-        void this.dispatchVerb('infra', ['stop']);
+        void this.confirmAndDispatchInfraVerb('stop');
         break;
       case 'infraTerminate':
-        void this.dispatchVerb('infra', ['terminate']);
+        void this.confirmAndDispatchInfraVerb('terminate');
+        break;
+      case 'infraNodeStop':
+        // Route through the CLI like every other verb so the action
+        // bar's `cli_running` overlay fires (gives us the spinner +
+        // label). The CLI proxies to the dispatcher's per-node
+        // endpoint.
+        void this.confirmAndDispatchPerNodeVerb(msg.nodeId, 'stop');
+        break;
+      case 'infraNodeTerminate':
+        void this.confirmAndDispatchPerNodeVerb(msg.nodeId, 'terminate');
         break;
       case 'activateProject':
         void this.dispatchVerb('activate', []);
@@ -698,7 +823,7 @@ export class GraphViewController {
         void this.dispatchVerb('resync', []);
         break;
       case 'infraUpgrade':
-        void this.dispatchVerb('infra', ['upgrade']);
+        void this.confirmAndDispatchInfraUpgrade();
         break;
       case 'refreshStatus':
         void this.refreshActionAvailability();

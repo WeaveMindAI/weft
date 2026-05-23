@@ -54,6 +54,23 @@ pub enum DispatcherEvent {
     ProjectRegistered { project_id: String, name: String },
     ProjectActivated { project_id: String },
     ProjectDeactivated { project_id: String },
+    /// Infra node transitioned between status values. Catch-all for
+    /// supervisor-driven state changes the extension renders as a
+    /// per-node badge.
+    InfraStatusChanged { project_id: String, node_id: String, status: String },
+    /// Supervisor declared an infra node flaky; the extension shows
+    /// the orange banner with `reason`.
+    InfraFlaky { project_id: String, node_id: String, reason: String },
+    /// Inverse of InfraFlaky.
+    InfraRecovered { project_id: String, node_id: String },
+    /// Supervisor finished terminating an infra node; the
+    /// `infra_node` row has been deleted.
+    InfraTerminated { project_id: String, node_id: String },
+    /// Supervisor couldn't parse the project's
+    /// `health_protocols_json`. The user's config is broken; the
+    /// supervisor fell back to defaults. Surfaced as a banner in
+    /// the action bar so the user sees their config didn't take.
+    InfraConfigError { project_id: String, error: String },
 }
 
 impl DispatcherEvent {
@@ -74,7 +91,12 @@ impl DispatcherEvent {
             | Self::TriggerUrlChanged { project_id, .. }
             | Self::ProjectRegistered { project_id, .. }
             | Self::ProjectActivated { project_id }
-            | Self::ProjectDeactivated { project_id } => project_id,
+            | Self::ProjectDeactivated { project_id }
+            | Self::InfraStatusChanged { project_id, .. }
+            | Self::InfraFlaky { project_id, .. }
+            | Self::InfraRecovered { project_id, .. }
+            | Self::InfraTerminated { project_id, .. }
+            | Self::InfraConfigError { project_id, .. } => project_id,
         }
     }
 
@@ -95,7 +117,12 @@ impl DispatcherEvent {
             Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }
-            | Self::ProjectDeactivated { .. } => None,
+            | Self::ProjectDeactivated { .. }
+            | Self::InfraStatusChanged { .. }
+            | Self::InfraFlaky { .. }
+            | Self::InfraRecovered { .. }
+            | Self::InfraTerminated { .. }
+            | Self::InfraConfigError { .. } => None,
         }
     }
 }
@@ -211,6 +238,9 @@ impl EventBus {
     async fn publish_local_inner(&self, event: &DispatcherEvent) {
         let inner = self.inner.read().await;
         if let Some(tx) = inner.get(event.project_id()) {
+            // broadcast::Sender::send errors only when there are
+            // no live receivers; that's a normal idle state (no
+            // SSE clients subscribed), not a failure to discard.
             let _ = tx.send(event.clone());
         }
     }

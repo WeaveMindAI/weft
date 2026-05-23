@@ -32,11 +32,13 @@
 			features?: import('$lib/types').NodeFeatures;
 			onUpdate?: (updates: NodeDataUpdates) => void;
 			infraNodeStatus?: string;
+			infraFailureStage?: string;
+			infraFailureMessage?: string;
 			debugData?: unknown;
 			executions?: import('$lib/types').NodeExecution[];
 			executionCount?: number;
 			/// Body-panel feed for this node, set ONLY for infra
-			/// (sidecar /live) and trigger (listener /display) nodes.
+			/// (infra /live) and trigger (listener /display) nodes.
 			/// Other nodes get undefined and render no body panel
 			/// here. Distinct from `debugData` which is the JSON
 			/// preview chip Debug-style nodes show under the body
@@ -615,13 +617,24 @@
 			<span class="text-base leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
 			<span class="text-[11px] font-semibold tracking-wide uppercase" style="color: {typeConfig.color};">{typeConfig.label}</span>
 			{#if data.infraNodeStatus}
-				<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none
+				<span
+					class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none
 					{data.infraNodeStatus === 'running' ? 'bg-green-100 text-green-700' : ''}
-					{data.infraNodeStatus === 'stopped' ? 'bg-amber-100 text-amber-700' : ''}
-				">
+					{data.infraNodeStatus === 'flaky' ? 'bg-amber-100 text-amber-700' : ''}
+					{data.infraNodeStatus === 'failed' ? 'bg-rose-100 text-rose-700' : ''}
+					{data.infraNodeStatus === 'stopped' ? 'bg-zinc-100 text-zinc-600' : ''}
+					{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-100 text-sky-700' : ''}
+					"
+					title={data.infraFailureMessage
+						? `${data.infraFailureStage ? data.infraFailureStage + ': ' : ''}${data.infraFailureMessage}`
+						: undefined}
+				>
 					<span class="w-1.5 h-1.5 rounded-full
 						{data.infraNodeStatus === 'running' ? 'bg-green-500' : ''}
-						{data.infraNodeStatus === 'stopped' ? 'bg-amber-500' : ''}
+						{data.infraNodeStatus === 'flaky' ? 'bg-amber-500' : ''}
+						{data.infraNodeStatus === 'failed' ? 'bg-rose-500' : ''}
+						{data.infraNodeStatus === 'stopped' ? 'bg-zinc-400' : ''}
+						{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-500 animate-pulse' : ''}
 					"></span>
 					{data.infraNodeStatus}
 				</span>

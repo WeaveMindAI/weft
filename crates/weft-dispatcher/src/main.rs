@@ -10,12 +10,12 @@ use tracing::info;
 
 use weft_dispatcher::{
     api::router,
-    backend::{InfraBackend, K8sWorkerBackend, KindInfraBackend, WorkerBackend},
+    backend::{K8sWorkerBackend, WorkerBackend},
     journal::postgres::PostgresJournal,
     listener::{
         K8sListenerBackend, ListenerBackend, ListenerPool, SubprocessListenerBackend,
     },
-    tenant::{self, NamespaceMapper, TenantId, TenantRouter},
+    tenant::{self, NamespaceMapper, TenantRouter},
     DispatcherState,
 };
 
@@ -56,22 +56,34 @@ async fn main() -> anyhow::Result<()> {
     weft_dispatcher::lease::migrate(journal.pool())
         .await
         .context("apply lease migrations")?;
+    weft_dispatcher::namespace_registry::migrate(journal.pool())
+        .await
+        .context("apply namespace_registry migrations")?;
     weft_task_store::migrate(journal.pool())
         .await
         .context("apply task-store migrations")?;
-    weft_dispatcher::infra::migrate(journal.pool())
+    weft_dispatcher::infra_node::migrate(journal.pool())
         .await
-        .context("apply infra_pod migrations")?;
+        .context("apply infra_node migrations")?;
+    weft_dispatcher::infra_event::migrate(journal.pool())
+        .await
+        .context("apply infra_event migrations")?;
+    weft_dispatcher::infra_lifecycle_command::migrate(journal.pool())
+        .await
+        .context("apply infra_lifecycle_command migrations")?;
     weft_dispatcher::journal_bridge::migrate(journal.pool())
         .await
         .context("apply journal_bridge cursor migrations")?;
+    weft_dispatcher::infra_event_bridge::migrate(journal.pool())
+        .await
+        .context("apply infra_event_bridge cursor migrations")?;
     let projects: weft_dispatcher::ProjectStore = std::sync::Arc::new(
         weft_dispatcher::PostgresProjectStore::new(journal.pool().clone())
             .await
             .context("init project store")?,
     );
 
-    // Broker URL: every tenant pod (listener / worker / sidecar)
+    // Broker URL: every tenant pod (listener / worker / infra)
     // talks to the broker instead of touching Postgres. Required
     // in-cluster; subprocess dev wires it through env.
     let in_cluster_for_broker = std::env::var("KUBERNETES_SERVICE_HOST").is_ok();
@@ -88,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
             "http://localhost:9090".to_string()
         }
     };
+
+    let kube = weft_platform_traits::kube::in_cluster()
+        .await
+        .context("init kubectl client (dispatcher needs `kubectl` in PATH)")?;
 
     let listener_backend: Arc<dyn ListenerBackend> =
         match std::env::var("WEFT_LISTENER_BACKEND").as_deref() {
@@ -106,12 +122,16 @@ async fn main() -> anyhow::Result<()> {
             _ => {
                 let image = std::env::var("WEFT_LISTENER_IMAGE")
                     .unwrap_or_else(|_| "weft-listener:local".into());
-                Arc::new(K8sListenerBackend::new(image, broker_url.clone()))
+                Arc::new(K8sListenerBackend::new(image, broker_url.clone(), kube.clone()))
             }
         };
 
     let worker_backend: Arc<dyn WorkerBackend> =
-        Arc::new(K8sWorkerBackend::new(broker_url.clone()));
+        Arc::new(K8sWorkerBackend::new(
+            broker_url.clone(),
+            kube.clone(),
+            Arc::new(weft_platform_traits::clock::SystemClock),
+        ));
 
     // Cluster CIDR knobs. Required in-cluster so the dispatcher can
     // render NetworkPolicies that allow internet egress while denying
@@ -164,46 +184,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cluster_ingress_namespace = std::env::var("WEFT_CLUSTER_INGRESS_NAMESPACE")
         .unwrap_or_else(|_| "ingress-nginx".to_string());
+    let supervisor_image = std::env::var("WEFT_SUPERVISOR_IMAGE")
+        .unwrap_or_else(|_| "weft-infra-supervisor:local".to_string());
 
-    let infra_backend = Arc::new(KindInfraBackend::new());
-
-    // Rehydrate sidecars from each tenant namespace. Without this a
-    // dispatcher restart orphans every sidecar. Pulled from the
-    // `project` table (DISTINCT tenant_id) rather than hardcoded so
-    // cloud's per-user tenants get covered automatically.
-    let boot_namespaces =
-        active_tenant_namespaces(journal.pool(), namespace_mapper.as_ref()).await?;
-    match infra_backend.rehydrate(&boot_namespaces).await {
-        Ok(adopted) => {
-            for a in adopted {
-                let status = if a.running {
-                    weft_dispatcher::infra::InfraStatus::Running
-                } else {
-                    weft_dispatcher::infra::InfraStatus::Stopped
-                };
-                if let Err(e) = weft_dispatcher::infra::upsert_with_status(
-                    journal.pool(),
-                    &a.project_id,
-                    &a.node_id,
-                    &a.handle,
-                    status,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "weft_dispatcher",
-                        error = %e,
-                        project = %a.project_id,
-                        node = %a.node_id,
-                        "infra rehydrate row insert failed"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            info!("infra rehydrate failed (cluster access?): {e}");
-        }
-    }
+    // Infra rehydrate on restart: the supervisor pod owns runtime
+    // tracking, so the dispatcher doesn't need to scan k8s. Each
+    // tenant's supervisor will list pods on its own startup and
+    // reconcile `infra_node` rows accordingly.
 
     let pod_id = weft_dispatcher::state::PodId::from_env();
     info!("dispatcher pod identity: {}", pod_id);
@@ -254,7 +241,6 @@ async fn main() -> anyhow::Result<()> {
         journal: Arc::new(journal),
         pg_pool,
         workers: worker_backend,
-        infra: infra_backend,
         projects,
         events: event_bus,
         listener_backend,
@@ -265,6 +251,8 @@ async fn main() -> anyhow::Result<()> {
         cluster_pod_cidr,
         cluster_service_cidr,
         cluster_ingress_namespace,
+        supervisor_image,
+        kube,
     };
 
     let renewer_state = state.clone();
@@ -280,10 +268,24 @@ async fn main() -> anyhow::Result<()> {
         weft_dispatcher::journal_bridge::run(bridge_state).await;
     });
 
+    // Infra-event bridge: same pattern for `infra_event` rows
+    // written by per-tenant supervisor pods (flaky / recovered /
+    // failed / etc.).
+    let infra_bridge_state = state.clone();
+    tokio::spawn(async move {
+        weft_dispatcher::infra_event_bridge::run(infra_bridge_state).await;
+    });
+
     // Reapers: sweep stale worker_pod rows and retain-old terminal
     // task rows. Every dispatcher Pod runs them; FOR UPDATE SKIP
     // LOCKED + idempotent ops keep them safe under concurrency.
     weft_dispatcher::reaper::spawn_all(state.clone());
+
+    // Dispatcher-owned lifecycle commands (deactivate / reactivate).
+    // Claimed via SKIP LOCKED so multiple dispatcher Pods coexist;
+    // one Pod takes a given row, runs the deactivate or activate,
+    // stamps complete.
+    weft_dispatcher::lifecycle_claimer::spawn(state.clone());
 
     // Task picker loop. Each dispatcher Pod runs one and competes
     // for tasks via SKIP LOCKED.
@@ -296,10 +298,6 @@ async fn main() -> anyhow::Result<()> {
         .register(
             TaskKind::RegisterSignal,
             Arc::new(weft_dispatcher::task_kinds::RegisterSignalExecutor),
-        )
-        .register(
-            TaskKind::ProvisionSidecar,
-            Arc::new(weft_dispatcher::task_kinds::ProvisionSidecarExecutor),
         )
         .register(
             TaskKind::RouteEntry,
@@ -338,17 +336,9 @@ async fn main() -> anyhow::Result<()> {
     // concurrent dispatchers converge on one spawn per project.
     weft_dispatcher::cold_start::spawn(state.clone());
 
-    // Periodic worker-pod sweeper. Worker pods run with
-    // `restartPolicy: OnFailure`: k8s restarts the container on
-    // crash, but a clean exit (worker drains and exits 0) leaves
-    // the Pod in Succeeded phase forever. They consume only an
-    // etcd record, but the user's `kubectl get pods` clutters
-    // fast. Active workers stay in Running phase; sweeper skips them.
-    let sweeper_pool = state.pg_pool.clone();
-    let sweeper_mapper = state.namespace_mapper.clone();
-    tokio::spawn(async move {
-        worker_pod_sweeper(sweeper_pool, sweeper_mapper).await;
-    });
+    // Worker-pod GC (terminal-object cleanup) is a reaper sweep
+    // (`reaper::spawn`), driven off the `worker_pod` table (see
+    // `sweep_terminal_worker_pods`). No separate kubectl-get sweep.
 
     let app = router(state);
     let addr = format!("0.0.0.0:{}", http_port);
@@ -358,99 +348,6 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(graceful_shutdown())
         .await?;
     Ok(())
-}
-
-/// Resolve the set of currently-active tenant namespaces from the
-/// `project` table. Used at boot for sidecar rehydrate and at every
-/// sweep tick so newly-registered tenants get covered without a
-/// dispatcher restart.
-async fn active_tenant_namespaces(
-    pool: &sqlx::PgPool,
-    namespace_mapper: &dyn NamespaceMapper,
-) -> anyhow::Result<Vec<String>> {
-    use sqlx::Row;
-    let rows = sqlx::query("SELECT DISTINCT tenant_id FROM project")
-        .fetch_all(pool)
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let tenant_id: String = row.try_get("tenant_id")?;
-        out.push(namespace_mapper.namespace_for(&TenantId(tenant_id)));
-    }
-    Ok(out)
-}
-
-/// Periodic sweeper that deletes worker pods in terminal phase
-/// (Succeeded/Failed) older than the grace window. Workers run
-/// with `restartPolicy: OnFailure`, so a clean exit leaves the
-/// Pod in Succeeded phase indefinitely (eats etcd space, clutters
-/// `kubectl get`). Active workers stay in Running phase, so this
-/// sweeper never touches them.
-///
-/// Interval: every 5 minutes.
-/// Threshold: pod must have been terminal for >10 minutes. Keeps
-/// just-finished pods inspectable for `kubectl logs` for a bit.
-async fn worker_pod_sweeper(
-    pool: sqlx::PgPool,
-    namespace_mapper: Arc<dyn NamespaceMapper>,
-) {
-    use tokio::process::Command;
-    let interval = std::time::Duration::from_secs(300);
-    let min_age_secs: i64 = 600;
-    loop {
-        tokio::time::sleep(interval).await;
-        let namespaces = match active_tenant_namespaces(&pool, namespace_mapper.as_ref()).await {
-            Ok(ns) => ns,
-            Err(e) => {
-                tracing::warn!(
-                    target: "weft_dispatcher::sweeper",
-                    error = %e,
-                    "skipping sweep tick: active_tenant_namespaces failed"
-                );
-                continue;
-            }
-        };
-        for ns in &namespaces {
-            let out = Command::new("kubectl")
-                .args([
-                    "-n", ns,
-                    "get", "pods",
-                    "-l", "weft.dev/role=worker",
-                    "--field-selector=status.phase=Succeeded",
-                    "-o",
-                    "jsonpath={range .items[*]}{.metadata.name}\t{.status.containerStatuses[0].state.terminated.finishedAt}\n{end}",
-                ])
-                .output()
-                .await;
-            let stdout = match out {
-                Ok(o) if o.status.success() => o.stdout,
-                _ => continue,
-            };
-            let now = chrono::Utc::now();
-            let text = String::from_utf8_lossy(&stdout);
-            for line in text.lines() {
-                let mut it = line.splitn(2, '\t');
-                let Some(name) = it.next() else { continue };
-                let Some(ts) = it.next() else { continue };
-                if name.is_empty() || ts.is_empty() {
-                    continue;
-                }
-                let Ok(finished_at) = ts.parse::<chrono::DateTime<chrono::Utc>>() else {
-                    continue;
-                };
-                if (now - finished_at).num_seconds() < min_age_secs {
-                    continue;
-                }
-                let _ = Command::new("kubectl")
-                    .args([
-                        "-n", ns, "delete", "pod", name,
-                        "--ignore-not-found", "--wait=false",
-                    ])
-                    .output()
-                    .await;
-            }
-        }
-    }
 }
 
 /// Background loop that renews every lease this Pod owns. If a

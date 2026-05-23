@@ -6,7 +6,7 @@
 //! | flag        | action                                                 |
 //! |-------------|--------------------------------------------------------|
 //! | (none)      | deactivate + unregister on dispatcher                  |
-//! | `--infra`   | also terminate sidecars (deletes PVCs, auth gone)      |
+//! | `--infra`   | also terminate infra pods (deletes PVCs, auth gone)      |
 //! | `--journal` | also drop this project's execution + log rows          |
 //! | `--image`   | also remove every `weft-worker-<id>:*` tag from docker+kind |
 //! | `--local`   | also wipe `.weft/target/` under the cwd project        |
@@ -30,6 +30,8 @@ pub struct RmArgs {
     pub image: bool,
     pub local: bool,
     pub all: bool,
+    /// `weft rm --force`: skip the supervisor terminate-wait window.
+    pub force: bool,
 }
 
 pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
@@ -40,6 +42,7 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         mut image,
         mut local,
         all,
+        force,
     } = args;
     if all {
         infra = true;
@@ -77,9 +80,18 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
             progress.dispatcher_call_done(serde_json::json!({ "step": "infra_terminate" }));
         }
 
-        progress.dispatcher_call_start(&format!("/projects/{project_id}"));
+        // `--force` flips on the dispatcher's skip-the-wait switch.
+        // Without it, the dispatcher waits up to 120s for the
+        // supervisor to confirm the terminate command landed before
+        // deleting the project namespace (cf docs §13.10).
+        let unregister_path = if force {
+            format!("/projects/{project_id}?force=true")
+        } else {
+            format!("/projects/{project_id}")
+        };
+        progress.dispatcher_call_start(&unregister_path);
         client
-            .delete(&format!("/projects/{project_id}"))
+            .delete(&unregister_path)
             .await
             .context("dispatcher unregister")?;
         progress.dispatcher_call_done(serde_json::json!({ "step": "unregister" }));

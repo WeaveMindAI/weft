@@ -1,6 +1,11 @@
 //! `weft deactivate [project]`. Without arg: discover cwd project.
 //! No build required; deactivate just drops trigger URLs (or
 //! preserves them, per --mode).
+//!
+//! Also home to [`prompt_trigger_deactivation`]: the shared helper
+//! used by every CLI verb that takes triggers down as a side effect
+//! (`weft infra stop / terminate / upgrade`). One UX surface for
+//! trigger deactivation means improvements propagate everywhere.
 
 use super::Ctx;
 use crate::progress::ActionVerb;
@@ -10,6 +15,94 @@ use crate::progress::ActionVerb;
 /// keeping a single number isolated to one place per side avoids
 /// drift if either side wants to bump it later.
 const DEFAULT_GRACE_MINUTES: u32 = 15;
+
+/// Resolve the trigger-deactivation choice (mode + grace + running
+/// policy) from explicit flags, falling back to interactive prompts
+/// on a human terminal. In `--json` mode, missing values are an
+/// error: the caller (the extension) must pass them explicitly.
+///
+/// Returns a JSON object matching the wire
+/// `DeactivateSpec` shape (`mode`, `runningPolicy`, optional
+/// `graceMinutes`), ready to embed under `triggerDeactivation`
+/// in the request body or to POST verbatim to `/deactivate`.
+///
+/// `verb_label` is used in the JSON-mode error message so the user
+/// sees which verb is failing (e.g. "infra stop requires --mode").
+pub fn prompt_trigger_deactivation(
+    json: bool,
+    verb_label: &str,
+    mode: Option<&str>,
+    grace: Option<u32>,
+    running_policy: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    // Mode resolution priority: explicit --mode flag > interactive
+    // prompt (human terminal only) > error (json mode).
+    let mode = match mode {
+        Some(m) => m.to_string(),
+        None if json => anyhow::bail!(
+            "{verb_label}: project is active, --mode required \
+             (one of: wipe, hibernate, park)"
+        ),
+        None => prompt_mode()?,
+    };
+    if !["wipe", "hibernate", "park"].contains(&mode.as_str()) {
+        anyhow::bail!("invalid mode '{mode}'; must be one of: wipe, hibernate, park");
+    }
+
+    // Grace window: only meaningful for hibernate. Prompt if the
+    // user picked hibernate interactively without --grace; otherwise
+    // fall back to default. Non-hibernate mode ignores grace entirely.
+    let grace_minutes = match (mode.as_str(), grace) {
+        ("hibernate", Some(g)) => Some(g),
+        ("hibernate", None) if json => Some(DEFAULT_GRACE_MINUTES),
+        ("hibernate", None) => Some(prompt_grace()?),
+        _ => None,
+    };
+
+    // Running-policy: wait by default for preservation modes; wipe
+    // forces cancel because waiting before wiping is contradictory.
+    let running_policy = match running_policy {
+        Some(p) if p == "wait" || p == "cancel" => p.to_string(),
+        Some(other) => anyhow::bail!(
+            "invalid running-policy '{other}'; must be wait|cancel"
+        ),
+        None if mode == "wipe" => "cancel".to_string(),
+        None => "wait".to_string(),
+    };
+    if mode == "wipe" && running_policy == "wait" {
+        anyhow::bail!(
+            "wipe requires running-policy=cancel; waiting before wiping is contradictory"
+        );
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("mode".into(), serde_json::json!(mode));
+    obj.insert("runningPolicy".into(), serde_json::json!(running_policy));
+    if let Some(g) = grace_minutes {
+        obj.insert("graceMinutes".into(), serde_json::json!(g));
+    }
+    Ok(serde_json::Value::Object(obj))
+}
+
+/// Read the project's current lifecycle.status from the dispatcher.
+/// Returns `Ok(true)` when status == "active". Propagates errors
+/// so callers don't silently skip trigger-deactivation prompts on
+/// a network blip and then eat a 412 from the dispatcher.
+pub async fn project_is_active(
+    client: &crate::client::DispatcherClient,
+    project_id: &str,
+) -> anyhow::Result<bool> {
+    // Surfaces real errors (network blip, dispatcher down) so the
+    // caller doesn't silently skip the trigger-deactivation prompt
+    // and then eat a 412 from the dispatcher with no context.
+    let status: serde_json::Value = client
+        .get_json(&format!("/projects/{project_id}/status"))
+        .await?;
+    Ok(status
+        .get("status")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s == "active"))
+}
 
 pub async fn run(
     ctx: Ctx,
@@ -38,76 +131,61 @@ async fn run_inner(
         None => super::resolve_project(ctx)?,
     };
 
-    // Mode resolution priority: explicit --mode flag > interactive
-    // prompt (human terminal only) > default wipe (when --json or
-    // stdin isn't a terminal). The extension always passes --mode
-    // since it can't answer stdin prompts.
-    let mode = match mode {
-        Some(m) => m,
-        None if ctx.json() => "wipe".to_string(),
-        None => prompt_mode()?,
+    // Standalone deactivate has its own --json behavior: when no
+    // --mode is given in json mode, default to wipe (preserves
+    // backwards-compat with the extension's existing dispatch
+    // path, which always passes --mode anyway). prompt_trigger_deactivation
+    // would error in json mode without --mode; absorb that here by
+    // pre-filling.
+    let resolved_mode = match mode.as_deref() {
+        Some(m) => Some(m.to_string()),
+        None if ctx.json() => Some("wipe".to_string()),
+        None => None,
     };
-    if !["wipe", "hibernate", "park"].contains(&mode.as_str()) {
-        anyhow::bail!(
-            "invalid mode '{mode}'; must be one of: wipe, hibernate, park"
-        );
-    }
-
-    // Grace window: only meaningful for hibernate. Prompt if the
-    // user picked hibernate interactively without --grace; otherwise
-    // fall back to default.
-    let grace_minutes = match (mode.as_str(), grace) {
-        ("hibernate", Some(g)) => Some(g),
-        ("hibernate", None) if ctx.json() => Some(DEFAULT_GRACE_MINUTES),
-        ("hibernate", None) => Some(prompt_grace()?),
-        _ => None,
-    };
-
-    // Running-policy: wait by default for preservation modes;
-    // wipe forces cancel because waiting before wiping is
-    // contradictory (you've asked to drop everything anyway).
-    let running_policy = match running_policy.as_deref() {
-        Some(p) if p == "wait" || p == "cancel" => p.to_string(),
-        Some(other) => anyhow::bail!(
-            "invalid --running-policy '{other}'; must be wait|cancel"
-        ),
-        None if mode == "wipe" => "cancel".to_string(),
-        None => "wait".to_string(),
-    };
-    if mode == "wipe" && running_policy == "wait" {
-        anyhow::bail!(
-            "wipe requires --running-policy cancel; waiting before wiping is contradictory"
-        );
-    }
+    let deactivation = prompt_trigger_deactivation(
+        ctx.json(),
+        "deactivate",
+        resolved_mode.as_deref(),
+        grace,
+        running_policy.as_deref(),
+    )?;
 
     let path = format!("/projects/{id}/deactivate");
-    let mut body = serde_json::Map::new();
-    body.insert("preservationMode".into(), serde_json::json!(mode));
-    body.insert("runningPolicy".into(), serde_json::json!(running_policy));
-    if let Some(g) = grace_minutes {
-        body.insert("graceMinutes".into(), serde_json::json!(g));
-    }
-    let body = serde_json::Value::Object(body);
+    // The dispatcher's `/deactivate` endpoint takes the canonical
+    // `DeactivateSpec` shape, same field names as the embedded
+    // `triggerDeactivation` body (`mode`, `runningPolicy`,
+    // `graceMinutes`). We send `deactivation` verbatim.
+    let mode_str = deactivation
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("wipe")
+        .to_string();
+    let running_policy_str = deactivation
+        .get("runningPolicy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cancel")
+        .to_string();
+    let grace_minutes = deactivation
+        .get("graceMinutes")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
     progress.dispatcher_call_start(&path);
-    // Dispatcher returns 204 No Content on success: idempotent
-    // state mutation, no body to deserialize. post_json would
-    // EOF-error on the empty body; post_with_body discards it.
-    client.post_with_body(&path, &body).await?;
+    client.post_with_body(&path, &deactivation).await?;
     let mut done = serde_json::Map::new();
-    done.insert("mode".into(), serde_json::json!(mode));
-    done.insert("runningPolicy".into(), serde_json::json!(running_policy));
+    done.insert("mode".into(), serde_json::json!(mode_str));
+    done.insert("runningPolicy".into(), serde_json::json!(running_policy_str));
     if let Some(g) = grace_minutes {
         done.insert("graceMinutes".into(), serde_json::json!(g));
     }
     progress.dispatcher_call_done(serde_json::Value::Object(done));
     if !ctx.json() {
         let suffix = match grace_minutes {
-            Some(g) => format!("[mode: {mode}, running: {running_policy}, grace: {g}min]"),
-            None => format!("[mode: {mode}, running: {running_policy}]"),
+            Some(g) => format!("[mode: {mode_str}, running: {running_policy_str}, grace: {g}min]"),
+            None => format!("[mode: {mode_str}, running: {running_policy_str}]"),
         };
         println!("deactivated {name} ({id}) {suffix}");
     }
-    progress.complete(&format!("deactivated {name} ({mode}/{running_policy})"));
+    progress.complete(&format!("deactivated {name} ({mode_str}/{running_policy_str})"));
     Ok(())
 }
 

@@ -47,16 +47,22 @@ pub fn router(state: DispatcherState) -> Router {
         // already wrote to the row stays in place).
         .route("/projects/{id}/cancel-running", post(project::cancel_running))
         .route("/projects/{id}/resync", post(project::resync))
-        .route("/projects/{id}/infra/start", post(infra::start))
+        // Unified subworkflow endpoint for Start / Restart / Upgrade.
+        // All three CLI verbs POST here; the dispatcher uses the
+        // resolved-spec-hash to decide skip-vs-apply per node.
+        .route("/projects/{id}/infra/sync", post(infra::sync))
         .route("/projects/{id}/infra/stop", post(infra::stop))
         .route("/projects/{id}/infra/terminate", post(infra::terminate))
-        .route("/projects/{id}/infra/upgrade", post(infra::upgrade))
+        // Per-node verbs for partial-state recovery.
+        .route("/projects/{id}/infra/nodes/{node_id}/stop", post(infra::stop_node))
+        .route("/projects/{id}/infra/nodes/{node_id}/terminate", post(infra::terminate_node))
         .route(
             "/signal/{token}",
             post(signal::fire_signal).delete(signal::cancel_signal),
         )
         .route("/signal/{token}/skip", post(signal::skip_signal))
         .route("/projects/{id}/infra/status", get(infra::status))
+        .route("/projects/{id}/infra/commands/{cmd_id}", get(infra::command_status))
         .route("/projects/{id}/infra/nodes/{node_id}/live", get(infra::live))
         .route("/executions/{color}/cancel", post(execution::cancel))
         .route("/executions/{color}/logs", get(execution::list_logs))

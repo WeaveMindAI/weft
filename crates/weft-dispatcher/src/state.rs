@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::backend::{InfraBackend, WorkerBackend};
+use crate::backend::WorkerBackend;
 use crate::events::EventBus;
 use crate::journal::Journal;
 use crate::listener::{ListenerBackend, ListenerPool};
@@ -47,7 +47,6 @@ pub struct DispatcherState {
     /// extending the Journal trait into a kitchen sink.
     pub pg_pool: sqlx::PgPool,
     pub workers: Arc<dyn WorkerBackend>,
-    pub infra: Arc<dyn InfraBackend>,
     pub projects: ProjectStore,
     pub events: EventBus,
     /// Spawns per-tenant listener instances.
@@ -73,8 +72,18 @@ pub struct DispatcherState {
     pub cluster_service_cidr: String,
     /// Kubernetes namespace name of the cluster's ingress controller
     /// (ingress-nginx by default; Traefik / Contour / etc. use
-    /// different namespaces). Threaded into rendered sidecar policies
-    /// so public-facing sidecars accept ingress from the right
+    /// different namespaces). Threaded into rendered infra-pod policies
+    /// so public-facing infra pods accept ingress from the right
     /// controller.
     pub cluster_ingress_namespace: String,
+    /// Docker tag of the per-tenant infra-supervisor pod image. The
+    /// dispatcher renders + applies a Deployment with this image to
+    /// each tenant namespace at first project register.
+    pub supervisor_image: String,
+    /// kube client used by the reaper (supervisor scale-down). The
+    /// listener and worker backends hold their own clones of the
+    /// same `Arc<dyn KubeClient>` (constructed once in main). The
+    /// trait lives in `weft-platform-traits`, shared with the
+    /// supervisor crate.
+    pub kube: Arc<dyn weft_platform_traits::KubeClient>,
 }

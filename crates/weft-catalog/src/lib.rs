@@ -618,4 +618,49 @@ mod package_tests {
         assert_eq!(pkg.node_types.len(), 2);
         assert_eq!(pkg.shared_rs.len(), 1, "should have form_helpers.rs");
     }
+
+    /// WhatsApp triad: bridge is the infra (requires_infra + locally
+    /// built image), receive is a trigger (no infra), send is a
+    /// normal Fire-phase node (no infra). All three must load from
+    /// the catalog so the package compiles into a project binary.
+    #[test]
+    fn whatsapp_triad_loaded() {
+        let cat = stdlib_catalog().unwrap();
+        let bridge = cat.entry("WhatsAppBridge").expect("WhatsAppBridge missing");
+        assert!(bridge.metadata.requires_infra, "bridge must be infra");
+        assert_eq!(
+            bridge.metadata.images,
+            vec!["images/bridge".to_string()],
+            "bridge declares its locally-built infra image",
+        );
+        assert_eq!(
+            bridge.metadata.features.live_endpoint.as_deref(),
+            Some("api"),
+            "bridge opts into /live by naming the endpoint that serves it",
+        );
+
+        let recv = cat.entry("WhatsAppReceive").expect("WhatsAppReceive missing");
+        assert!(!recv.metadata.requires_infra, "receive must NOT require infra");
+        assert!(recv.metadata.features.is_trigger, "receive is a trigger");
+
+        let send = cat.entry("WhatsAppSend").expect("WhatsAppSend missing");
+        assert!(!send.metadata.requires_infra, "send must NOT require infra");
+        assert!(!send.metadata.features.is_trigger, "send is a normal node");
+
+        // The three must live under the same package so the codegen
+        // bundles them together. (`package_of` returns the package
+        // descriptor for any node_type in it.)
+        let pkg = cat.package_of("WhatsAppBridge").expect("bridge package");
+        assert_eq!(
+            pkg.name, "whatsapp",
+            "WhatsApp triad must share a package",
+        );
+        assert!(
+            pkg.node_types.iter().any(|t| t == "WhatsAppBridge")
+                && pkg.node_types.iter().any(|t| t == "WhatsAppReceive")
+                && pkg.node_types.iter().any(|t| t == "WhatsAppSend"),
+            "package must contain all three node types, got {:?}",
+            pkg.node_types,
+        );
+    }
 }

@@ -154,10 +154,7 @@ async fn journal_cancel_terminals(state: &DispatcherState, color: Color) -> anyh
         return Ok(());
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::lease::now_unix() as u64;
 
     // Per-node cancellation MUST land before ExecutionCancelled.
     // Otherwise a partial run that journaled the terminal event
@@ -199,7 +196,15 @@ async fn journal_cancel_terminals(state: &DispatcherState, color: Color) -> anyh
     Ok(())
 }
 
-async fn has_terminal_event(pool: &sqlx::PgPool, color: Color) -> anyhow::Result<bool> {
+/// The terminal outcome recorded for a color, if any. The journal is
+/// the authoritative source: `Completed`/`Failed`/`Cancelled` are the
+/// three terminal `exec_event` kinds. `None` means the execution is
+/// still in flight. Used both for cancel-dedup and as the source of
+/// truth when the in-RAM event bus drops events (broadcast `Lagged`).
+pub(crate) async fn terminal_outcome(
+    pool: &sqlx::PgPool,
+    color: Color,
+) -> anyhow::Result<Option<TerminalOutcome>> {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT kind FROM exec_event \
          WHERE color = $1 \
@@ -209,7 +214,22 @@ async fn has_terminal_event(pool: &sqlx::PgPool, color: Color) -> anyhow::Result
     .bind(color.to_string())
     .fetch_optional(pool)
     .await?;
-    Ok(row.is_some())
+    Ok(row.map(|(kind,)| match kind.as_str() {
+        "execution_completed" => TerminalOutcome::Completed,
+        "execution_cancelled" => TerminalOutcome::Cancelled,
+        _ => TerminalOutcome::Failed,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+async fn has_terminal_event(pool: &sqlx::PgPool, color: Color) -> anyhow::Result<bool> {
+    Ok(terminal_outcome(pool, color).await?.is_some())
 }
 
 pub async fn get(
@@ -278,13 +298,17 @@ pub async fn replay(
     Path(color_str): Path<String>,
 ) -> Result<Json<Vec<DispatcherEvent>>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // `execution_project` errors propagate as 500. `Ok(None)` (no
+    // such execution) is also fatal here: replaying events for a
+    // color we can't attribute to a project would emit them on the
+    // empty-string project bucket, which no SSE subscriber listens
+    // to. Surface as 404.
     let project_id = state
         .journal
         .execution_project(color)
         .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
     let raw_events = state
         .journal
         .events_for(color)
@@ -300,12 +324,18 @@ pub async fn replay(
     // of "running" mode. A still-running exec (no terminal yet)
     // returns only node events; the live SSE will deliver the
     // terminal event when it happens.
-    if let Some(summary) = state
+    // Propagate DB errors instead of silently degrading. Without
+    // this, a transient list_executions failure would skip terminal-
+    // status synthesis and leave the UI showing "Running" forever
+    // for an execution that already terminated.
+    let summary = state
         .journal
         .list_executions(500)
         .await
-        .ok()
-        .and_then(|list| list.into_iter().find(|s| s.color == color))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .find(|s| s.color == color);
+    if let Some(summary) = summary
     {
         match summary.status.to_ascii_lowercase().as_str() {
             "completed" => out.push(DispatcherEvent::ExecutionCompleted {
@@ -347,18 +377,23 @@ fn node_event_to_dispatcher(
             input: e.input.unwrap_or(serde_json::Value::Null),
             project_id,
         },
+        // Per the journal schema, Suspended/Resumed carry a token,
+        // Cancelled carries a reason, Failed carries an error. A
+        // NULL column on any of these is a schema-drift bug; surface
+        // a visible sentinel so the UI doesn't render a blank
+        // diagnostic and the broken row is obvious in logs.
         NodeExecKind::Suspended => DispatcherEvent::NodeSuspended {
             color: e.color,
             node: e.node_id,
             lane: e.lane,
-            token: e.token.unwrap_or_default(),
+            token: e.token.unwrap_or_else(|| "<missing token column>".into()),
             project_id,
         },
         NodeExecKind::Resumed => DispatcherEvent::NodeResumed {
             color: e.color,
             node: e.node_id,
             lane: e.lane,
-            token: e.token.unwrap_or_default(),
+            token: e.token.unwrap_or_else(|| "<missing token column>".into()),
             value: e.value.unwrap_or(serde_json::Value::Null),
             project_id,
         },
@@ -366,7 +401,7 @@ fn node_event_to_dispatcher(
             color: e.color,
             node: e.node_id,
             lane: e.lane,
-            reason: e.reason.unwrap_or_default(),
+            reason: e.reason.unwrap_or_else(|| "<missing reason column>".into()),
             project_id,
         },
         NodeExecKind::Completed => DispatcherEvent::NodeCompleted {
@@ -380,7 +415,7 @@ fn node_event_to_dispatcher(
             color: e.color,
             node: e.node_id,
             lane: e.lane,
-            error: e.error.unwrap_or_default(),
+            error: e.error.unwrap_or_else(|| "<missing error column>".into()),
             project_id,
         },
         NodeExecKind::Skipped => DispatcherEvent::NodeSkipped {

@@ -58,18 +58,30 @@ pub async fn listener_inspect(
         let admin_url: String = row
             .try_get("admin_url")
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
+        // Drift-detection endpoint: the whole point is to surface
+        // mismatches between journal and listener registry. A
+        // silenced DB error or silent JSON decode failure here
+        // would defeat that. Propagate / report the failure shape.
         let journal_count = state
             .journal
             .signal_count_for_tenant(&tenant_id)
             .await
-            .unwrap_or(0);
-        let listener_registry: Option<Value> = match http
+            .map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_count_for_tenant: {e}"))
+            })?;
+        let listener_registry: Value = match http
             .get(format!("{}/signals", admin_url.trim_end_matches('/')))
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
-            _ => None,
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "decode_error": e.to_string() }),
+            },
+            Ok(r) => serde_json::json!({
+                "http_error": r.status().as_u16(),
+            }),
+            Err(e) => serde_json::json!({ "network_error": e.to_string() }),
         };
         out.push(serde_json::json!({
             "tenant_id": tenant_id,
@@ -173,7 +185,7 @@ async fn apply_lifecycle_gate(
     // but the gate is the cheapest place to evaluate the deadline
     // and avoids a write per fire.
     if let Some(deadline) = routing.fires_deadline_unix {
-        if (unix_now() as i64) > deadline {
+        if (crate::lease::now_unix()) > deadline {
             return Err((
                 StatusCode::GONE,
                 "Project is not accepting requests. Please contact the project administrator.".into(),
@@ -200,7 +212,7 @@ async fn apply_lifecycle_gate(
         let entry = ParkedFire {
             id: uuid::Uuid::new_v4().to_string(),
             payload,
-            received_at_unix: unix_now() as i64,
+            received_at_unix: crate::lease::now_unix(),
         };
         let entry_json = serde_json::to_value(&entry).map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("park serialize: {e}"))
@@ -240,12 +252,7 @@ async fn apply_lifecycle_gate(
     ))
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// `crate::lease::now_unix` is the canonical wall-clock reader.
 
 /// Fire-time projection: just the three lifecycle fields the gate
 /// actually reads (status + accepting + deadline) plus the project
@@ -299,10 +306,13 @@ pub(crate) async fn lookup_signal_routing(
     let accepting: bool = row
         .try_get("accepting_fires")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let deadline: Option<i64> = row.try_get("fires_deadline_unix").ok();
+    let deadline: Option<i64> = row
+        .try_get("fires_deadline_unix")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     Ok(FireGateInfo {
         project_id,
-        status: crate::project_store::project_status_from_str(&status_str),
+        status: crate::project_store::project_status_from_str(&status_str)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode status: {e}")))?,
         accepting_fires: accepting,
         fires_deadline_unix: deadline,
         surface_kind,
@@ -375,10 +385,7 @@ pub(crate) async fn dispatch_listener_outcome(
                         // DELETE and enqueue would leave the
                         // suspension token gone and the worker
                         // waiting forever.
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
+                        let now = crate::lease::now_unix() as u64;
                         state
                             .journal
                             .record_event_dedup(
@@ -787,8 +794,19 @@ impl TokenScope {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
+            // Color parse fails loud: a corrupt `color` would silently
+            // reclassify a resume signal as an entry signal, and
+            // `clear_all_signals` would then DELETE it instead of
+            // cancelling its execution. (consumer_payload stays
+            // best-effort: it's display-only enumeration data.)
             let color_str: Option<String> = r.try_get("color")?;
-            let color = color_str.and_then(|s| s.parse::<weft_core::Color>().ok());
+            let color = match color_str {
+                Some(s) => Some(
+                    s.parse::<weft_core::Color>()
+                        .map_err(|e| anyhow::anyhow!("corrupt signal.color '{s}': {e}"))?,
+                ),
+                None => None,
+            };
             let payload_str: Option<String> = r.try_get("consumer_payload")?;
             let consumer_payload =
                 payload_str.and_then(|s| serde_json::from_str(&s).ok());
@@ -866,7 +884,9 @@ pub async fn fire_public_entry(
     let accepting: bool = row
         .try_get("accepting_fires")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let deadline: Option<i64> = row.try_get("fires_deadline_unix").ok();
+    let deadline: Option<i64> = row
+        .try_get("fires_deadline_unix")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     let auth_kind: String = row
         .try_get("auth_kind")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
@@ -880,7 +900,8 @@ pub async fn fire_public_entry(
 
     let routing = FireGateInfo {
         project_id,
-        status: crate::project_store::project_status_from_str(&status_str),
+        status: crate::project_store::project_status_from_str(&status_str)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode status: {e}")))?,
         accepting_fires: accepting,
         fires_deadline_unix: deadline,
         // Catch-all is matched on mount_path; only public_entry rows

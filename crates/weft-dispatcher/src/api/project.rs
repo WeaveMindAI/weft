@@ -24,13 +24,24 @@ pub struct ProjectSummary {
     pub status: String,
 }
 
-pub async fn list(State(state): State<DispatcherState>) -> Json<Vec<ProjectSummary>> {
-    let items = state.projects.list().await;
-    Json(items.into_iter().map(|p| ProjectSummary {
-        id: p.id.to_string(),
-        name: p.name,
-        status: p.status.as_str().to_string(),
-    }).collect())
+pub async fn list(
+    State(state): State<DispatcherState>,
+) -> Result<Json<Vec<ProjectSummary>>, (StatusCode, String)> {
+    let items = state
+        .projects
+        .list()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list projects: {e}")))?;
+    Ok(Json(
+        items
+            .into_iter()
+            .map(|p| ProjectSummary {
+                id: p.id.to_string(),
+                name: p.name,
+                status: p.status.as_str().to_string(),
+            })
+            .collect(),
+    ))
 }
 
 /// Payload accepted by `POST /projects`. The client (CLI, VS Code
@@ -45,10 +56,6 @@ pub struct RegisterRequest {
     pub id: uuid::Uuid,
     pub name: String,
     pub source: String,
-    /// Absolute path to the project root. Unused today; reserved
-    /// for multi-file imports once the compiler resolves them.
-    #[serde(default)]
-    pub root: Option<String>,
     /// Source hash of the worker image. CLI computes from project
     /// source + workspace; dispatcher persists on the project row
     /// (used as worker docker tag suffix AND as the resync drift
@@ -67,6 +74,16 @@ pub struct RegisterRequest {
 pub struct RegisterError {
     pub error: String,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+fn register_internal_error(msg: String) -> (StatusCode, Json<RegisterError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(RegisterError {
+            error: msg,
+            diagnostics: Vec::new(),
+        }),
+    )
 }
 
 /// Compile the supplied source and register the resulting project.
@@ -125,10 +142,20 @@ pub async fn register(
         ));
     }
 
-    let tenant = state.tenant_router.tenant_for_project(&project.id.to_string());
-    let namespace = state.namespace_mapper.namespace_for(&tenant);
-    if let Err(e) = crate::tenant_namespace::ensure_tenant_namespace(
-        &namespace,
+    let project_id_str = project.id.to_string();
+    let tenant = state.tenant_router.tenant_for_project(&project_id_str);
+    let tenant_namespace = state.namespace_mapper.namespace_for(&tenant);
+    // The tenant namespace is a hard prerequisite, not best-effort:
+    // it holds `weft-listener-sa` / `weft-infra-supervisor-sa` (which
+    // the project-namespace RoleBindings below reference as subjects)
+    // plus the broker's TokenReview registry row. If it fails to land,
+    // fail register loudly rather than create a project namespace with
+    // RoleBindings pointing at non-existent SAs and a tenant with no
+    // registry row. Same policy as the project-namespace ensure below.
+    crate::tenant_namespace::ensure_tenant_namespace(
+        &state.pg_pool,
+        &*state.kube,
+        &tenant_namespace,
         tenant.as_str(),
         crate::tenant_namespace::ClusterCidrs {
             pod_cidr: &state.cluster_pod_cidr,
@@ -137,21 +164,49 @@ pub async fn register(
         },
     )
     .await
-    {
-        // Best-effort; tolerate failures during local dev where
-        // kubectl isn't available. The static `wm-local` manifest
-        // covers the local case.
-        tracing::warn!(
-            target: "weft_dispatcher::register",
-            tenant = %tenant,
-            namespace = %namespace,
-            error = %e,
-            "ensure_tenant_namespace failed; continuing"
-        );
-    }
+    .map_err(|e| register_internal_error(format!("ensure_tenant_namespace ({tenant_namespace}): {e}")))?;
+    // Note: we no longer spawn the per-tenant supervisor Deployment
+    // at register time. The supervisor is lazy: it gets applied the
+    // first time the project's sync handler needs to enqueue an
+    // Apply command. Projects that never use infra never spawn one.
+    // The supervisor reaper kills idle supervisor Deployments when
+    // a tenant has no live infra_node rows and no in-flight commands.
+    // Per-project namespace bundle: namespace + worker/infra SAs +
+    // NetworkPolicies + RoleBindings to the supervisor/listener
+    // ClusterRoles.
+    let project_namespace =
+        crate::project_namespace::name_for(tenant.as_str(), &project_id_str);
+    let project_namespace_args = crate::project_namespace::ProjectNamespaceArgs {
+        project_id: &project_id_str,
+        tenant_id: tenant.as_str(),
+        namespace: &project_namespace,
+        pod_cidr: &state.cluster_pod_cidr,
+        service_cidr: &state.cluster_service_cidr,
+        ingress_namespace: &state.cluster_ingress_namespace,
+        tenant_namespace: &tenant_namespace,
+    };
+    // Namespace MUST land before we write the project row: every
+    // downstream step (worker spawn, infra apply, listener attach)
+    // assumes the namespace + its RBAC bundle exist. If kubectl
+    // refuses, fail register loudly rather than insert a row that
+    // points at a namespace nothing else can create.
+    crate::project_namespace::ensure(&state.pg_pool, &*state.kube, &project_namespace_args)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RegisterError {
+                    error: format!(
+                        "ensure_project_namespace {}: {e}",
+                        project_namespace
+                    ),
+                    diagnostics: Vec::new(),
+                }),
+            )
+        })?;
     let summary = state
         .projects
-        .register(project, tenant.as_str())
+        .register(project, tenant.as_str(), &project_namespace)
         .await
         .map_err(|e| {
             (
@@ -166,13 +221,15 @@ pub async fn register(
         state
             .projects
             .set_running_source_hash(summary.id, hash)
-            .await;
+            .await
+            .map_err(|e| register_internal_error(format!("set_running_source_hash: {e}")))?;
     }
     if let Some(hash) = req.infra_hash.as_deref() {
         state
             .projects
             .set_running_infra_hash(summary.id, hash)
-            .await;
+            .await
+            .map_err(|e| register_internal_error(format!("set_running_infra_hash: {e}")))?;
     }
     state
         .events
@@ -193,7 +250,12 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<ProjectSummary>, StatusCode> {
     let id = id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let summary = state.projects.get(id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let summary = state
+        .projects
+        .get(id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(ProjectSummary {
         id: summary.id.to_string(),
         name: summary.name,
@@ -201,9 +263,20 @@ pub async fn get(
     }))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct RemoveQuery {
+    /// `weft rm --force` sets this. When true, the dispatcher skips
+    /// the supervisor terminate-wait window and proceeds straight to
+    /// namespace deletion. Use when the supervisor is wedged and the
+    /// user wants the project gone NOW.
+    #[serde(default)]
+    pub force: bool,
+}
+
 pub async fn remove(
     State(state): State<DispatcherState>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<RemoveQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let id = id
         .parse::<uuid::Uuid>()
@@ -215,7 +288,21 @@ pub async fn remove(
     // remain in the listener leaves dangling registrations that
     // outlive their owning project.
     deactivate_project(&state, id).await?;
-    if state.projects.remove(id).await {
+    // Tear down infra: issues a supervisor terminate command, waits
+    // up to 120s for completion (unless --force), then drops all
+    // infra_* rows and deletes the project namespace. MUST succeed:
+    // if any of the DB cascade writes fail, the project row stays
+    // (so a retry replays cleanly). Step 2 (supervisor wait) and
+    // step 4 (namespace delete) inside `delete_project` are still
+    // log-and-continue for the cluster-unreachable case; only DB
+    // writes are fail-loud.
+    crate::api::infra::delete_project(&state, id, query.force).await?;
+    let removed = state
+        .projects
+        .remove(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("remove: {e}")))?;
+    if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, "project not found".into()))
@@ -257,7 +344,36 @@ pub async fn run(
         .projects
         .project(id)
         .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project definition missing".into()))?;
+    let project_id = id.to_string();
+
+    // Pre-flight: every `requires_infra` node must be Running. The
+    // node body's `ctx.endpoint(...)` deep in execute() would
+    // fail with a confusing "endpoint not available" otherwise.
+    // Match the activate / reactivate pre-flight semantics so the
+    // user sees the same actionable error from any entry point.
+    let mut missing: Vec<String> = Vec::new();
+    for node in project.nodes.iter().filter(|n| n.requires_infra) {
+        let row = crate::infra_node::get(&state.pg_pool, &project_id, &node.id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
+        let running = row
+            .map(|r| r.status == crate::infra_node::InfraNodeStatus::Running)
+            .unwrap_or(false);
+        if !running {
+            missing.push(node.id.clone());
+        }
+    }
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            format!(
+                "infra not running for: {}. Run `weft infra start` first.",
+                missing.join(", ")
+            ),
+        ));
+    }
 
     // Pick targets: explicit override -> upstream of that one node.
     // Otherwise every `is_output` node in the project.
@@ -294,8 +410,8 @@ pub async fn run(
 
     // Event-sourced log: execution started + one PulseSeeded event
     // per root. Replay rebuilds the initial pulse table from these.
-    let now = unix_now();
-    let _ = state
+    let now = crate::lease::now_unix() as u64;
+    state
         .journal
         .record_event(&weft_journal::ExecEvent::ExecutionStarted {
             color,
@@ -304,7 +420,8 @@ pub async fn run(
             phase: weft_core::context::Phase::Fire,
             at_unix: now,
         })
-        .await;
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     // Mint a pulse_id per seed. Both the journaled `PulseSeeded`
     // event and the `RootSeed` shipped to the worker carry the
     // same UUID, so a fresh worker's fold reconstructs the seed
@@ -318,7 +435,7 @@ pub async fn run(
         })
         .collect();
     for seed in &core_seeds {
-        let _ = state
+        state
             .journal
             .record_event(&weft_journal::ExecEvent::PulseSeeded {
                 color,
@@ -329,7 +446,8 @@ pub async fn run(
                 value: seed.value.clone(),
                 at_unix: now,
             })
-            .await;
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     }
     // The journal already has ExecutionStarted + PulseSeeded above.
     // Enqueue an `execute` task targeted at the worker pool; the
@@ -382,6 +500,46 @@ fn compute_root_seeds(
         .collect()
 }
 
+/// For each `requires_infra` node in the project, list the
+/// `is_trigger` nodes that have it in their upstream closure.
+///
+/// Re-export from weft-core. The function lives there because both
+/// the dispatcher (per-node safety check) and the broker
+/// (supervisor_trigger_deps) need it; one definition, no clones.
+pub use weft_core::project::compute_trigger_deps;
+
+/// Mirror of [`compute_trigger_setup_seeds`] for `Phase::InfraSetup`.
+///
+/// Seeds are the roots of the upstream closure of every
+/// `requires_infra` node : NOT the infra nodes themselves. Without
+/// this, "text → compute_url → provision_infra" graphs would skip the
+/// text/compute_url path, and the infra node's `provision()` body
+/// wouldn't see those upstream values as input.
+///
+/// Returns an empty vec if the project has no infra nodes (the
+/// caller short-circuits : no InfraSetup execution needed).
+pub fn compute_infra_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
+    let edge_idx = EdgeIndex::build(project);
+    let infra: Vec<String> = project
+        .nodes
+        .iter()
+        .filter(|n| n.requires_infra)
+        .map(|n| n.id.clone())
+        .collect();
+    if infra.is_empty() {
+        return Vec::new();
+    }
+    let in_subgraph = upstream_closure(project, &edge_idx, &infra);
+    roots_of(project, &edge_idx, &in_subgraph)
+        .into_iter()
+        .map(|id| RootSeed {
+            node_id: id,
+            pulse_id: uuid::Uuid::new_v4().to_string(),
+            value: Value::Null,
+        })
+        .collect()
+}
+
 /// Seeds for a TriggerSetup-phase sub-execution.
 ///
 /// Target set = every trigger node. Walk upstream (no terminators);
@@ -419,31 +577,27 @@ pub fn compute_trigger_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed>
         .collect()
 }
 
-/// Spawn a worker to run the InfraSetup sub-execution for the
-/// given nodes and wait for it to complete. Each node's
-/// `execute()` runs with `Phase::InfraSetup` and calls
-/// `ctx.provision_sidecar(spec)` to get its sidecar applied.
-/// Mirrors `run_trigger_setup` but seeds the infra subgraph.
+/// Spawn a worker to run the InfraSetup sub-execution for every
+/// `requires_infra` node in the project and wait for it to complete.
+/// Seeds the upstream-closure roots so programmatic-infra patterns
+/// (text → compute → infra) flow values into the infra body.
 pub async fn run_infra_setup(
     state: &DispatcherState,
     project_id_uuid: uuid::Uuid,
-    node_ids: Vec<String>,
 ) -> Result<(), (StatusCode, String)> {
-    if node_ids.is_empty() {
+    let project = state
+        .projects
+        .project(project_id_uuid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    let seeds = compute_infra_setup_seeds(&project);
+    if seeds.is_empty() {
         return Ok(());
     }
     let project_id = project_id_uuid.to_string();
     let color = uuid::Uuid::new_v4();
-    let now = unix_now();
-
-    let seeds: Vec<RootSeed> = node_ids
-        .into_iter()
-        .map(|node_id| RootSeed {
-            node_id,
-            pulse_id: uuid::Uuid::new_v4().to_string(),
-            value: Value::Null,
-        })
-        .collect();
+    let now = crate::lease::now_unix() as u64;
 
     state
         .journal
@@ -457,7 +611,7 @@ pub async fn run_infra_setup(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     for seed in &seeds {
-        let _ = state
+        state
             .journal
             .record_event(&weft_journal::ExecEvent::PulseSeeded {
                 color,
@@ -468,7 +622,8 @@ pub async fn run_infra_setup(
                 value: seed.value.clone(),
                 at_unix: now,
             })
-            .await;
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     }
 
     let mut events = state.events.subscribe_project(&project_id).await;
@@ -502,7 +657,31 @@ pub async fn run_infra_setup(
                         ));
                     }
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // The bus dropped a batch that may have held this
+                        // color's terminal event. The journal is
+                        // authoritative: re-query it rather than wait
+                        // blind (which would spuriously time out even
+                        // though infra setup already finished).
+                        match crate::api::execution::terminal_outcome(&state.pg_pool, color).await {
+                            Ok(Some(crate::api::execution::TerminalOutcome::Completed)) => {
+                                return Ok(())
+                            }
+                            Ok(Some(_)) => {
+                                return Err((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "infra setup failed".into(),
+                                ))
+                            }
+                            Ok(None) => {} // still in flight; keep waiting
+                            Err(e) => {
+                                return Err((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("infra setup terminal lookup: {e}"),
+                                ))
+                            }
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -780,6 +959,10 @@ pub struct ProjectInfraEntry {
     pub node_type: String,
     pub status: String,
     pub endpoint_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "failureStage")]
+    pub failure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "failureMessage")]
+    pub failure_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -821,68 +1004,115 @@ pub async fn status(
         .projects
         .get(id)
         .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     let project = state
         .projects
         .project(id)
         .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project definition missing".into()))?;
     let project_id = id.to_string();
     let tenant = state.tenant_router.tenant_for_project(&project_id);
-    let listener_running = state.listeners.is_alive(&tenant, &state.pg_pool).await;
-
-    let infra_entries = crate::infra::list_for_project(&state.pg_pool, &project_id)
+    let listener_running = state
+        .listeners
+        .is_alive(&tenant, &state.pg_pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_pod: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener is_alive: {e}")))?;
+
+    let infra_rows = crate::infra_node::list_for_project(&state.pg_pool, &project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
     let mut infra = Vec::new();
-    for (node_id, entry) in &infra_entries {
-        // Skip rows whose node_id no longer exists in the project
-        // source (post-resync drift). An empty node_type would mask
-        // the divergence; filtering surfaces the cleanup work to the
-        // operator via the row count alone.
+    for row in &infra_rows {
         let Some(node_type) = project
             .nodes
             .iter()
-            .find(|n| n.id == *node_id)
+            .find(|n| n.id == row.node_id)
             .map(|n| n.node_type.clone())
         else {
             tracing::warn!(
                 target: "weft_dispatcher::status",
-                project_id, node_id,
-                "infra_pod row references node not in project source; skipping"
+                project_id, node_id = %row.node_id,
+                "infra_node row references node not in project source; skipping"
             );
             continue;
         };
         infra.push(ProjectInfraEntry {
-            node_id: node_id.clone(),
+            node_id: row.node_id.clone(),
             node_type,
-            status: format!("{:?}", entry.status).to_lowercase(),
-            endpoint_url: entry.handle.endpoint_url.clone(),
+            status: row.status.as_str().to_string(),
+            // Coarse UI hint: first endpoint by name (BTreeMap = stable).
+            endpoint_url: row.endpoints.values().next().cloned(),
+            failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
+            failure_message: row.failure_message.clone(),
         });
     }
 
     // Aggregate state across infra nodes:
-    // - none:    project has 0 requires_infra nodes (or 0 rows).
-    // - running: every requires_infra node has a Running row.
-    // - stopped: every requires_infra node has a Stopped row.
-    // - partial: mixed (some Running, some not).
+    //   - none:    project has 0 requires_infra nodes.
+    //   - running: every requires_infra node has a Running row.
+    //   - stopped: every requires_infra node is Stopped (or absent).
+    //   - partial: mixed (some Running, some not, no failures).
+    //   - failed:  at least one row has status=Failed.
+    //   - flaky:   at least one row has status=Flaky and the rest are Running.
     let infra_node_count = project.nodes.iter().filter(|n| n.requires_infra).count();
     let has_infra = infra_node_count > 0;
     let infra_rollup = if !has_infra {
         "none".to_string()
     } else {
+        use crate::infra_node::InfraNodeStatus;
         let mut running = 0usize;
         let mut stopped = 0usize;
+        let mut absent = 0usize; // never provisioned OR terminated
+        let mut failed = 0usize;
+        let mut flaky = 0usize;
+        let mut stopping = 0usize;
+        let mut terminating = 0usize;
+        let mut provisioning = 0usize;
         for n in project.nodes.iter().filter(|n| n.requires_infra) {
-            match infra_entries.iter().find(|(id, _)| id == &n.id) {
-                Some((_, e)) if e.status == crate::infra::InfraStatus::Running => running += 1,
-                Some(_) => stopped += 1,
-                None => stopped += 1,
+            match infra_rows.iter().find(|r| r.node_id == n.id) {
+                Some(r) => match r.status {
+                    InfraNodeStatus::Running => running += 1,
+                    InfraNodeStatus::Failed => failed += 1,
+                    InfraNodeStatus::Flaky => flaky += 1,
+                    InfraNodeStatus::Stopping => stopping += 1,
+                    InfraNodeStatus::Terminating => terminating += 1,
+                    InfraNodeStatus::Provisioning => provisioning += 1,
+                    InfraNodeStatus::Stopped => stopped += 1,
+                },
+                // No `infra_node` row means the node was either
+                // never provisioned OR was terminated (terminate
+                // removes the row). Either way the project namespace
+                // holds nothing for this node; Terminate as an
+                // action is meaningless. Treat as `none`.
+                None => absent += 1,
             }
         }
-        if running == infra_node_count {
+        // Transient states take precedence: if anything is mid-flip
+        // we report that so the action bar shows a spinner and no
+        // user-actionable verbs. `terminating` beats `stopping`
+        // (terminate is the more aggressive verb).
+        if terminating > 0 {
+            "terminating".to_string()
+        } else if stopping > 0 {
+            "stopping".to_string()
+        } else if provisioning > 0 {
+            "provisioning".to_string()
+        } else if failed > 0 {
+            "failed".to_string()
+        } else if flaky > 0 && running + flaky == infra_node_count {
+            "flaky".to_string()
+        } else if running == infra_node_count {
             "running".to_string()
-        } else if stopped == infra_node_count {
+        } else if absent == infra_node_count {
+            // All nodes have no row → terminated (or fresh).
+            "none".to_string()
+        } else if stopped + absent == infra_node_count {
+            // Some stopped + some never-provisioned. Pragmatic
+            // bucket as `stopped` because the user can re-start
+            // and Terminate still makes sense for the actually-
+            // stopped subset.
             "stopped".to_string()
         } else {
             "partial".to_string()
@@ -907,12 +1137,23 @@ pub async fn status(
         last_status: last.map(|l| l.status.clone()),
     };
 
-    let drift = compute_drift(
-        &query,
-        state.projects.running_source_hash(id).await.as_deref(),
-        state.projects.running_infra_hash(id).await.as_deref(),
-    );
-    let lifecycle = state.projects.lifecycle(id).await;
+    let source_hash = state
+        .projects
+        .running_source_hash(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_source_hash: {e}")))?;
+    let infra_hash = state
+        .projects
+        .running_infra_hash(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_infra_hash: {e}")))?;
+    let drift = compute_drift(&query, source_hash.as_deref(), infra_hash.as_deref());
+    let lifecycle = state
+        .projects
+        .lifecycle(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lifecycle: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     let preservation = preservation_counts(&state, &project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("preservation_counts: {e}")))?;
@@ -1043,7 +1284,7 @@ fn compute_available_actions(
     // `run` is available in every state EXCEPT Activating (the
     // worker is dedicated to TriggerSetup and a manual run would
     // race the lifecycle CAS) AND when the project has infra nodes
-    // whose sidecars aren't running (the run would fail at sidecar
+    // whose infra isn't running (the run would fail at infra
     // /outputs anyway; surface as "not available" rather than let
     // it through with a confusing error).
     if lifecycle.status != ProjectStatus::Activating
@@ -1070,8 +1311,7 @@ fn compute_available_actions(
             // Mid-deactivate: the user can either give up on the
             // wait (cancel_running, drain finishes immediately) or
             // change their mind (resume_active rolls back into
-            // Active). Activate also stays in the verb list as an
-            // alias for resume_active so existing UIs keep working.
+            // Active).
             if running_count > 0 {
                 out.push("cancel_running".to_string());
             }
@@ -1092,22 +1332,56 @@ fn compute_available_actions(
         }
     }
 
-    // Infra controls share the worker pool indirectly (some infra
-    // ops re-run TriggerSetup on success). Hide them during
-    // Activating so the user can't kick off conflicting infra
-    // changes mid-activate.
+    // Infra controls. Hide during Activating so the user can't
+    // race the trigger-setup subworkflow. Rollup states:
+    //   running:     stop, terminate, (upgrade if drift)
+    //   stopped:     start, terminate
+    //   none:        start                       (no infra applied yet)
+    //   partial /
+    //   failed /
+    //   flaky:       start, stop, terminate, (upgrade if drift)
+    //   stopping /
+    //   terminating: (no actions; the supervisor is in flight)
+    //
+    // `partial` (per-unit lifecycle: some units up, some down) is a
+    // valid steady state, not a transient. From it the user can push
+    // in any direction: Start brings the down units up, Stop takes the
+    // up units down (respecting NoOp), Terminate kills everything. It
+    // is NOT the all-or-nothing "stopped" set plus a restart; it's the
+    // union of start and stop because both are meaningful at once.
     if has_infra && lifecycle.status != ProjectStatus::Activating {
-        if infra_running {
-            out.push("infra_stop".to_string());
-            out.push("infra_terminate".to_string());
-            if drift.infra_drift {
-                out.push("infra_upgrade".to_string());
+        match infra_rollup {
+            "running" => {
+                out.push("infra_stop".to_string());
+                out.push("infra_terminate".to_string());
+                if drift.infra_drift {
+                    out.push("infra_upgrade".to_string());
+                }
             }
-        } else {
-            out.push("infra_start".to_string());
-            if infra_rollup == "stopped" || infra_rollup == "partial" {
+            "stopped" => {
+                // The user can either bring the nodes back up (Start
+                // scales replicas back, PVC intact) OR escalate to
+                // Terminate to delete the PVC and start fresh.
+                out.push("infra_start".to_string());
                 out.push("infra_terminate".to_string());
             }
+            "none" => {
+                out.push("infra_start".to_string());
+            }
+            "partial" | "failed" | "flaky" => {
+                out.push("infra_start".to_string());
+                out.push("infra_stop".to_string());
+                out.push("infra_terminate".to_string());
+                if drift.infra_drift {
+                    out.push("infra_upgrade".to_string());
+                }
+            }
+            "stopping" | "terminating" => {
+                // Supervisor is processing a lifecycle command. No
+                // user-actionable verbs; the action bar renders a
+                // spinner from the rollup alone.
+            }
+            _ => {}
         }
     }
 
@@ -1160,30 +1434,216 @@ pub async fn activate(
         Some(Json(b)) => (b.source_hash, b.infra_hash, b.reactivate_choice),
         None => (None, None, None),
     };
+    activate_inner(&state, id, source_hash, infra_hash, reactivate_choice).await
+}
+
+/// How `activate_inner` must roll back a failed Activating-window.
+/// The deciding factor is whether `run_trigger_setup` STARTED: before
+/// it, no signal state was touched by the activate (prior suspended /
+/// entry signals are untouched), so rollback is just "un-stick the
+/// status". Once trigger-setup starts, signals may be half-registered
+/// and must be wiped.
+enum ActivateRollback {
+    /// CAS Activating→Inactive only. Keep existing signals (a failure
+    /// before trigger-setup never touched them; wiping would nuke the
+    /// project's prior suspended/parked work on a transient error).
+    UnstickOnly,
+    /// Full cleanup: cancel the TS color, sweep orphan TS colors, drop
+    /// all signal rows, CAS Activating→Inactive. Used once trigger-
+    /// setup started (signals are in flux).
+    WipeSignals { ts_color: Option<weft_core::Color> },
+}
+
+struct ActivateWindowError {
+    status: StatusCode,
+    msg: String,
+    rollback: ActivateRollback,
+}
+
+/// The Activating-window of `activate_inner`: every step that runs
+/// while the project status is `Activating`, ending with the CAS to
+/// `Active`. Factored out so `activate_inner` has ONE rollback site
+/// for the whole window (a failure anywhere here must un-stick the
+/// project from Activating; the caller does that once on Err).
+///
+/// The error carries the rollback MODE (`ActivateRollback`): failures
+/// before `run_trigger_setup` un-stick only (keep signals), failures
+/// from trigger-setup onward wipe (signals are in flux).
+///
+/// The keep-alive lease is acquired and held for the whole window,
+/// then dropped here on success (the listener thereafter stays alive
+/// on signal-row presence). On failure it drops when this fn returns.
+#[allow(clippy::too_many_arguments)]
+async fn activate_trigger_setup_window(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    project_id: &str,
+    tenant: &crate::tenant::TenantId,
+    namespace: &str,
+    choice: &str,
+    project: &ProjectDefinition,
+) -> Result<(), ActivateWindowError> {
+    // Failures up to (not including) run_trigger_setup haven't touched
+    // signal state, so they only need the status un-stuck.
+    let unstick = |(status, msg): (StatusCode, String)| ActivateWindowError {
+        status,
+        msg,
+        rollback: ActivateRollback::UnstickOnly,
+    };
+
+    let keep_alive = crate::listener::ActivateKeepAlive::acquire(&state.pg_pool, tenant)
+        .await
+        .map_err(|e| unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("keep-alive: {e}"))))?;
+
+    // Apply the reactivate choice's destructive effect now that we
+    // hold the exclusive Activating transition (validated by caller).
+    apply_reactivate_choice(state, project_id, choice).await.map_err(unstick)?;
+
+    // Sweep any prior TriggerSetup colors that leaked from a failed
+    // previous activate. Safe because we won `try_begin_activating`:
+    // no sibling activate is in flight, so every non-terminal
+    // trigger_setup color here is an orphan from a dead prior
+    // activate, never a concurrent one.
+    sweep_orphan_trigger_setup_colors(state, project_id)
+        .await
+        .map_err(|e| {
+            unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("sweep orphan ts colors: {e}")))
+        })?;
+
+    // Run TriggerSetup. From here on signals are in flux, so a failure
+    // wipes (carrying the TS color so the rollback cancels it). Its
+    // register_signal tasks UPSERT entry rows on (project_id,
+    // node_id), so existing rows from before a deactivate get
+    // spec/mount/auth refreshed in place; the token survives, so
+    // parked_fires still attached drain cleanly later.
+    let seeds = compute_trigger_setup_seeds(project);
+    if !seeds.is_empty() {
+        run_trigger_setup(state, id, seeds).await.map_err(|(status, msg, ts_color)| {
+            ActivateWindowError { status, msg, rollback: ActivateRollback::WipeSignals { ts_color } }
+        })?;
+    }
+
+    // From here trigger-setup succeeded but signals are registered, so
+    // any failure still wipes (ts_color is None: setup's own color is
+    // already terminal, the rollback sweeps remaining orphans).
+    let wipe = |(status, msg): (StatusCode, String)| ActivateWindowError {
+        status,
+        msg,
+        rollback: ActivateRollback::WipeSignals { ts_color: None },
+    };
+
+    // Drop orphan entry rows: nodes that previously had triggers but
+    // no longer do (user edited source while deactivated).
+    drop_orphan_entry_rows(state, project_id, project)
+        .await
+        .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("drop_orphan_entry_rows: {e}"))))?;
+
+    // Reconcile the listener's in-RAM registry with the durable
+    // signal table (resume signals belong to suspended executions
+    // whose workers are gone). /rehydrate is idempotent.
+    state
+        .listeners
+        .with_listener(
+            tenant,
+            namespace,
+            state.listener_backend.as_ref(),
+            &state.pg_pool,
+            state.pod_id.as_str(),
+            |handle| async move { crate::listener::rehydrate(&handle).await },
+        )
+        .await
+        .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("listener rehydrate: {e}"))))?;
+
+    // Flip Activating → Active. CAS guards against a concurrent
+    // cancel_activate that flipped us to Inactive: in that case the
+    // cancel already wiped our signals, so we surrender with no
+    // further rollback (UnstickOnly: status is already Inactive, the
+    // inner CAS no-ops).
+    let cas_ok = state
+        .projects
+        .cas_lifecycle(
+            id,
+            crate::project_store::ProjectStatus::Activating,
+            &crate::project_store::ProjectLifecycle::active(),
+        )
+        .await
+        .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("cas_lifecycle: {e}"))))?;
+    if !cas_ok {
+        return Err(ActivateWindowError {
+            status: StatusCode::CONFLICT,
+            msg: "activate raced with cancel_activate; project is now Inactive".into(),
+            rollback: ActivateRollback::UnstickOnly,
+        });
+    }
+
+    // Window done: project is Active. Release the lease; the listener
+    // now stays alive on signal-row presence alone.
+    drop(keep_alive);
+    Ok(())
+}
+
+/// In-process callable for `activate`. Used by `/infra/sync`'s
+/// auto-reactivate path. Same body as the axum handler minus the
+/// extractor plumbing.
+pub async fn activate_inner(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    source_hash: Option<String>,
+    infra_hash: Option<String>,
+    reactivate_choice: Option<String>,
+) -> Result<Json<ActivateResponse>, (StatusCode, String)> {
     if let Some(hash) = source_hash.as_deref() {
-        state.projects.set_running_source_hash(id, hash).await;
+        state
+            .projects
+            .set_running_source_hash(id, hash)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_source_hash: {e}")))?;
     }
     if let Some(hash) = infra_hash.as_deref() {
-        state.projects.set_running_infra_hash(id, hash).await;
+        state
+            .projects
+            .set_running_infra_hash(id, hash)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_infra_hash: {e}")))?;
     }
 
     let project = state
         .projects
         .project(id)
         .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
     let project_id = id.to_string();
 
-    // Pre-flight: every requires_infra node must be provisioned
-    // AND in the Running state. A stopped sidecar is just as bad
-    // as a missing one from the trigger-setup subgraph's point of
-    // view (the worker will try to query /outputs and fail).
+    // Activate is the trigger-setup verb. A project without any
+    // trigger nodes has nothing to register, so flipping its status
+    // to Active is meaningless and creates an absorbing state: the
+    // next sync would see was_active=true and re-call activate
+    // forever. Refuse loudly so the CLI / extension knows the
+    // verb doesn't apply.
+    let has_triggers = project.nodes.iter().any(|n| n.features.is_trigger);
+    if !has_triggers {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "project has no trigger nodes; nothing to activate. \
+             Use `weft run` to fire an execution directly."
+                .into(),
+        ));
+    }
+
+    // Pre-flight: every requires_infra node must be Running. A
+    // Stopped / Failed / Flaky node is just as bad as a missing one
+    // from TriggerSetup's POV (the worker will try `endpoint_url`
+    // and the broker will return None).
     let mut missing: Vec<String> = Vec::new();
     for node in project.nodes.iter().filter(|n| n.requires_infra) {
-        let live = crate::infra::handle_if_running(&state.pg_pool, &project_id, &node.id)
+        let row = crate::infra_node::get(&state.pg_pool, &project_id, &node.id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_pod: {e}")))?;
-        if live.is_none() {
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
+        let running = row
+            .map(|r| r.status == crate::infra_node::InfraNodeStatus::Running)
+            .unwrap_or(false);
+        if !running {
             missing.push(node.id.clone());
         }
     }
@@ -1197,154 +1657,106 @@ pub async fn activate(
         ));
     }
 
-    // Reactivate-choice pre-flight. The default
-    // (execute_parked_keep_suspended) is a no-op here: the drain
-    // pass at the end of activate already replays every queued fire
-    // through dispatch_listener_outcome.
-    let choice = reactivate_choice.as_deref().unwrap_or("execute_parked_keep_suspended");
-    match choice {
-        "execute_parked_keep_suspended" => {}
-        "keep_suspended_only" => {
-            sqlx::query(
-                "UPDATE signal SET parked_fires = '[]'::jsonb \
-                 WHERE project_id = $1 AND jsonb_array_length(parked_fires) > 0",
-            )
-            .bind(&project_id)
-            .execute(&state.pg_pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clear parked: {e}")))?;
-        }
-        "wipe_all" => {
-            wipe_project_signals(&state, &project_id).await?;
-        }
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown reactivate_choice '{other}'; must be one of: \
-                     execute_parked_keep_suspended, keep_suspended_only, wipe_all"
-                ),
-            ));
-        }
-    }
-
-    // Hold a per-tenant keep-alive lease (SHARED OP-lock) for the
-    // entire activate window. This fences the listener reaper out
-    // for every step: TriggerSetup spawn, register_signal task
-    // execution, drain pass. Without this lease the reaper can
-    // observe a freshly-spawned listener with zero signals + zero
-    // in-flight tasks (the activate-spawned worker may not have
-    // reached its first ctx.register_signal yet) and kill it,
-    // leaving the next register POST on a dead Service.
-    let tenant = state.tenant_router.tenant_for_project(&project_id);
-    let namespace = state.namespace_mapper.namespace_for(&tenant);
-    let keep_alive =
-        crate::listener::ActivateKeepAlive::acquire(&state.pg_pool, &tenant)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("keep-alive: {e}")))?;
-
-    // Sweep any prior TriggerSetup colors that leaked from a
-    // failed previous activate (rollback's cancel_color may have
-    // failed; the per-tenant keep_alive lock guarantees no
-    // concurrent in-flight TriggerSetup in this tenant, so any
-    // non-terminal trigger_setup color we see here is orphaned).
-    sweep_orphan_trigger_setup_colors(&state, &project_id)
-        .await
-        .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("sweep orphan ts colors: {e}"))
-        })?;
-
-    // Flip status=Activating up-front. The gate parks fires while
-    // we set up triggers (the listener may not yet have every
-    // signal registered, so relaying could 404 / race). The drain
-    // at the end replays every parked payload through the
-    // post-CAS Active gate.
-    //
-    // Use full set_lifecycle (not CAS): we accept any prior status
-    // (Inactive / Registered / Active for re-activate from active).
-    state
-        .projects
-        .set_lifecycle(id, &crate::project_store::ProjectLifecycle::activating())
-        .await;
-
-    // Run TriggerSetup. Its register_signal tasks UPSERT entry
-    // rows on (project_id, node_id), so existing rows from before
-    // a deactivate get spec_json/mount_path/auth refreshed in
-    // place; the token survives, so any parked_fires still
-    // attached to it drain cleanly in the loop below.
-    let seeds = compute_trigger_setup_seeds(&project);
-    if !seeds.is_empty() {
-        match run_trigger_setup(&state, id, seeds).await {
-            Ok(()) => {}
-            Err((status, msg, ts_color)) => {
-                // Atomic rollback: same body as cancel-activate.
-                // If cleanup itself fails the original failure
-                // still dominates the response; we log loudly.
-                if let Err((rb_status, rb_msg)) =
-                    wipe_activating_state(&state, id, &project_id, ts_color).await
-                {
-                    tracing::error!(
-                        target: "weft_dispatcher::activate",
-                        project_id = %id,
-                        rb_status = %rb_status,
-                        rb_error = %rb_msg,
-                        "activate rollback: wipe_activating_state failed; manual cleanup needed"
-                    );
-                }
-                keep_alive.release().await;
-                return Err((status, msg));
-            }
-        }
-    }
-
-    // Drop orphan entry rows: nodes that previously had triggers
-    // but no longer do (user edited the project source while
-    // deactivated). TriggerSetup just upserted every still-existing
-    // entry; anything left over is dead.
-    drop_orphan_entry_rows(&state, &project_id, &project)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drop_orphan_entry_rows: {e}")))?;
-
-    // Reconcile the listener's in-RAM registry with the durable
-    // signal table. TriggerSetup just re-registered entry triggers
-    // via its worker, but resume signals belong to suspended
-    // executions whose workers are long gone (nothing replays
-    // `ctx.await_signal`). Without this step, post-park resume
-    // fires would 404 at the listener. The listener's /rehydrate is
-    // idempotent: entries already in its registry stay untouched,
-    // so this is safe to call even when the listener was never
-    // reaped.
-    state
-        .listeners
-        .with_listener(
-            &tenant,
-            &namespace,
-            state.listener_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-            |handle| async move { crate::listener::rehydrate(&handle).await },
+    // A source-hash change must kill the stale-image worker before
+    // the activate's TriggerSetup exec runs, otherwise it's
+    // dispatched against a worker that doesn't know about the new
+    // trigger nodes. Idempotent (kill-by-source-hash + respawn), so
+    // it's safe before the single-flight CAS: two concurrent
+    // activates both calling it is harmless, and keeping it before
+    // the CAS means its failure leaves the project in its original
+    // status rather than stranded in Activating. MUST propagate.
+    replace_stale_worker_if_needed(state, &project_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("replace_stale_worker_if_needed: {e}"),
         )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener rehydrate: {e}")))?;
+    })?;
 
-    // Flip Activating → Active. CAS guards against a concurrent
-    // cancel_activate that flipped us to Inactive between the
-    // TriggerSetup completion and this point: in that case we
-    // surrender: the cancel already wiped our signals, so
-    // proceeding with the drain would replay payloads against a
-    // half-torn-down state.
-    let active = crate::project_store::ProjectLifecycle::active();
-    let cas_ok = state
-        .projects
-        .cas_lifecycle(id, crate::project_store::ProjectStatus::Activating, &active)
-        .await;
-    if !cas_ok {
-        keep_alive.release().await;
+    // Validate (don't yet apply) the reactivate choice. Validation is
+    // a pure rejection and belongs in the read-only pre-flight; the
+    // choice's DESTRUCTIVE effect (clearing parked / wiping signals)
+    // is applied AFTER the single-flight CAS below, so a losing
+    // concurrent activate that 409s never wipes the winner's state.
+    let choice = reactivate_choice.as_deref().unwrap_or("execute_parked_keep_suspended");
+    if !matches!(choice, "execute_parked_keep_suspended" | "keep_suspended_only" | "wipe_all") {
         return Err((
-            StatusCode::CONFLICT,
-            "activate raced with cancel_activate; project is now Inactive".into(),
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown reactivate_choice '{choice}'; must be one of: \
+                 execute_parked_keep_suspended, keep_suspended_only, wipe_all"
+            ),
         ));
     }
+
+    // Single-flight gate: atomically claim the Activating transition.
+    // Activating is the one mutual-exclusion state in the lifecycle;
+    // while a project is activating (registering trigger signals),
+    // no second activation may start. `try_begin_activating` flips
+    // the full activating() lifecycle IFF the project isn't already
+    // Activating, and reports whether THIS call won. A losing caller
+    // (a concurrent activate from another dispatcher Pod, a double-
+    // click, CLI + extension racing) bails here with 409 BEFORE
+    // touching the keep-alive sentinel or the orphan sweep. This is
+    // what makes the sweep below correct: having won the exclusive
+    // transition, any non-terminal trigger_setup color we then see
+    // is genuinely an orphan from a dead prior activate, never a
+    // sibling activate's in-flight color.
+    let won = state
+        .projects
+        .try_begin_activating(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("try_begin_activating: {e}")))?;
+    if !won {
+        return Err((
+            StatusCode::CONFLICT,
+            "project is already activating; wait for it to finish or `weft deactivate` to cancel"
+                .into(),
+        ));
+    }
+
+    // Tenant/namespace for the trigger-setup window (which holds the
+    // keep-alive lease internally) and the post-activate URL publish.
+    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let namespace = state.namespace_mapper.namespace_for(&tenant);
+
+    // Everything from here to the Active CAS happens while the
+    // project is Activating. ANY failure in this window must
+    // un-stick the project (a stranded Activating locks out all
+    // future activates) and release the keep-alive lease. Rather
+    // than hand-roll a rollback at each `?` (the footgun that
+    // stranded the project before), the whole window is ONE fallible
+    // block with ONE rollback site below. A future step added here
+    // can't forget the un-stick.
+    let setup = activate_trigger_setup_window(
+        &state, id, &project_id, &tenant, &namespace, choice, &project,
+    )
+    .await;
+    if let Err(ActivateWindowError { status, msg, rollback }) = setup {
+        // Single rollback site for the whole window. The mode says
+        // how much to undo: a pre-trigger-setup failure only un-sticks
+        // the status (signals were never touched, so wiping would
+        // destroy the project's prior suspended/parked work); a
+        // trigger-setup-or-later failure wipes (signals are in flux).
+        // Both are idempotent and safe if a concurrent cancel/success
+        // already moved us out of Activating (the inner CAS no-ops).
+        let rb = match rollback {
+            ActivateRollback::UnstickOnly => unstick_activating(&state, id).await.map(|_| ()),
+            ActivateRollback::WipeSignals { ts_color } => {
+                wipe_activating_state(&state, id, &project_id, ts_color).await
+            }
+        };
+        if let Err((rb_status, rb_msg)) = rb {
+            tracing::error!(
+                target: "weft_dispatcher::activate",
+                project_id = %id, rb_status = %rb_status, rb_error = %rb_msg,
+                "activate rollback failed; project may be stuck Activating, manual cleanup needed"
+            );
+        }
+        return Err((status, msg));
+    }
+    // Past here the project is Active (the window's final step CASed
+    // it). A failure now is a 500 but the project is correctly
+    // Active, NOT stranded, so no rollback.
 
     // Drain every queued fire that survived the inactive window.
     // Single loop, kind-agnostic: dispatch_listener_outcome routes
@@ -1354,12 +1766,6 @@ pub async fn activate(
     drain_parked_fires(&state, &project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drain_parked_fires: {e}")))?;
-
-    // Activate window done. Release the keep-alive lease; the
-    // listener now stays alive purely on signal-row presence (the
-    // reaper's only kill condition is "zero signals AND no in-flight
-    // operation").
-    keep_alive.release().await;
 
     let urls = collect_listener_urls(&state, &project_id).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("collect_listener_urls: {e}"))
@@ -1388,23 +1794,27 @@ pub async fn activate(
 /// obsolete) so the drain doesn't need to know what kind it's
 /// draining.
 ///
-/// Per row:
-///   1. Atomically claim: UPDATE drain_claimed_at = now WHERE
-///      drain_claimed_at IS NULL. If 0 rows updated, another pass
-///      raced us and won; skip.
+/// Per row (see `drain_one_token`):
+///   1. Atomically claim: UPDATE drain_claimed_at = now,
+///      drain_claimed_by = <fresh nonce> WHERE drain_claimed_at IS
+///      NULL. If 0 rows updated, another pass raced us and won; skip.
 ///   2. Pop-then-dispatch loop: read head (`parked_fires -> 0`),
-///      dispatch, then pop it (`parked_fires - 0`). One element
+///      dispatch, then pop it (`parked_fires - 0::int`) FENCED on our
+///      claim nonce (`WHERE drain_claimed_by = <ours>`). One element
 ///      commits at a time, so a mid-loop failure leaves the unsent
-///      remainder intact in FIFO order for the next activate to
-///      retry. Appends from concurrent fires land at the tail; index
-///      0 stays stable across the pop-then-dispatch window, so the
-///      read-then-pop is race-free without a separate per-element
-///      claim.
-///   3. Release the row claim regardless of outcome.
+///      remainder intact in FIFO order for the next activate. Appends
+///      from concurrent fires land at the tail, so index 0 is stable
+///      across the dispatch window. If a stale-claim sweep handed the
+///      row to a sibling pod mid-drain, our fenced pop matches 0 rows
+///      and we abort: the element we just dispatched dedups at the
+///      task table (`ParkedFire.id` -> `enqueue_dedup`), and the new
+///      owner re-drives from the same head.
+///   3. Release the row claim FENCED on our nonce (so we never clear a
+///      sibling's claim that took over), regardless of outcome.
 ///
-/// A pod crash between steps 1 and 3 leaves drain_claimed_at set;
-/// the next activate's pre-pass releases stale claims older than
-/// the threshold so the row becomes drainable again.
+/// A pod crash between steps 1 and 3 leaves the claim set; the next
+/// activate's pre-pass releases stale claims older than the threshold
+/// so the row becomes drainable again.
 async fn drain_parked_fires(
     state: &DispatcherState,
     project_id: &str,
@@ -1424,7 +1834,7 @@ async fn drain_parked_fires(
     // we can dispatch) cannot livelock the activate handler; an
     // operator-visible failure beats an infinite loop.
     const MAX_DRAIN_PASSES: u32 = 3;
-    let now = unix_now() as i64;
+    let now = crate::lease::now_unix();
     sqlx::query(
         "UPDATE signal SET drain_claimed_at_unix = NULL \
          WHERE project_id = $1 \
@@ -1492,13 +1902,19 @@ async fn drain_one_token(
 ) -> anyhow::Result<()> {
     use sqlx::Row;
 
-    // Atomic claim. If another pass beat us, bail.
+    // Atomic claim with a per-claim owner nonce. If another pass beat
+    // us, bail. The nonce fences every subsequent pop + the release:
+    // if a stale-claim sweep on a sibling pod takes the row over
+    // mid-drain, our fenced pop matches 0 rows and we abort, rather
+    // than popping an element the new owner already dispatched.
+    let owner = uuid::Uuid::new_v4().to_string();
     let claim = sqlx::query(
-        "UPDATE signal SET drain_claimed_at_unix = $2 \
+        "UPDATE signal SET drain_claimed_at_unix = $2, drain_claimed_by = $3 \
          WHERE token = $1 AND drain_claimed_at_unix IS NULL",
     )
     .bind(token)
-    .bind(unix_now() as i64)
+    .bind(crate::lease::now_unix())
+    .bind(&owner)
     .execute(&state.pg_pool)
     .await?;
     if claim.rows_affected() == 0 {
@@ -1552,17 +1968,25 @@ async fn drain_one_token(
         .await
         {
             Ok(_) => {
-                // Pop the head. `- 0::int` is the unambiguous form
-                // of `jsonb_array - integer_index`; plain `- 0`
-                // would be ambiguous with `jsonb_object - text_key`
-                // under some inference paths.
-                sqlx::query(
+                // Pop the head, FENCED on our claim nonce. `- 0::int`
+                // is the unambiguous form of `jsonb_array - integer_index`
+                // (plain `- 0` is ambiguous with `jsonb_object - text_key`
+                // under some inference paths). If `drain_claimed_by` is
+                // no longer ours, a sibling took over after a stale-claim
+                // sweep: 0 rows affected -> abort without popping (the
+                // element we just dispatched dedups at the task table via
+                // ParkedFire.id, and the new owner re-drives from head).
+                let popped = sqlx::query(
                     "UPDATE signal SET parked_fires = parked_fires - 0::int \
-                     WHERE token = $1",
+                     WHERE token = $1 AND drain_claimed_by = $2",
                 )
                 .bind(token)
+                .bind(&owner)
                 .execute(&state.pg_pool)
                 .await?;
+                if popped.rows_affected() == 0 {
+                    break Ok(());
+                }
             }
             Err((status, msg)) => {
                 // Leave the unsent remainder in place (FIFO order
@@ -1578,12 +2002,15 @@ async fn drain_one_token(
         }
     };
 
-    // Release the claim regardless of outcome.
+    // Release the claim regardless of outcome, FENCED on our nonce: if
+    // a sibling already took the row over via a stale-claim sweep, we
+    // must not clear ITS claim. A no-op release (0 rows) is fine.
     sqlx::query(
-        "UPDATE signal SET drain_claimed_at_unix = NULL \
-         WHERE token = $1",
+        "UPDATE signal SET drain_claimed_at_unix = NULL, drain_claimed_by = NULL \
+         WHERE token = $1 AND drain_claimed_by = $2",
     )
     .bind(token)
+    .bind(&owner)
     .execute(&state.pg_pool)
     .await?;
 
@@ -1666,10 +2093,70 @@ async fn drop_orphan_entry_rows(
     Ok(())
 }
 
-/// Cancel-activate / TriggerSetup-failure cleanup. Runs the
-/// canonical wipe (cancel TS color + drop all signal rows) and
-/// then CAS Activating → Inactive (wiped). Idempotent: a partial
-/// run leaves the next call with less work.
+/// Apply an activate `reactivate_choice`'s destructive effect on the
+/// project's parked/suspended signal state. Run AFTER the
+/// single-flight CAS so a losing concurrent activate can't wipe the
+/// winner's state. `choice` must already be validated.
+///   - `execute_parked_keep_suspended`: no-op (the drain at the end
+///     of activate replays every parked fire).
+///   - `keep_suspended_only`: clear parked fires, keep suspensions.
+///   - `wipe_all`: drop every signal row.
+async fn apply_reactivate_choice(
+    state: &DispatcherState,
+    project_id: &str,
+    choice: &str,
+) -> Result<(), (StatusCode, String)> {
+    match choice {
+        "execute_parked_keep_suspended" => Ok(()),
+        "keep_suspended_only" => {
+            sqlx::query(
+                "UPDATE signal SET parked_fires = '[]'::jsonb \
+                 WHERE project_id = $1 AND jsonb_array_length(parked_fires) > 0",
+            )
+            .bind(project_id)
+            .execute(&state.pg_pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clear parked: {e}")))?;
+            Ok(())
+        }
+        "wipe_all" => wipe_project_signals(state, project_id).await,
+        _ => unreachable!("reactivate_choice validated by caller"),
+    }
+}
+
+/// Un-stick a project from Activating: CAS Activating → Inactive
+/// (wiped lifecycle). Returns whether THIS call won the transition.
+/// A loss means a concurrent activate-success (→Active) or another
+/// cancel already moved us out of Activating, in which case the
+/// caller must NOT proceed to wipe signals (it would nuke a
+/// freshly-active project's triggers, or double-wipe a cancel's).
+///
+/// This is the minimal rollback: it touches NO signal state, so it's
+/// the correct undo for a failure BEFORE trigger-setup ran (the
+/// project returns to Inactive with its prior suspended/parked
+/// signals intact; the next activate retries cleanly).
+async fn unstick_activating(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    state
+        .projects
+        .cas_lifecycle(
+            id,
+            crate::project_store::ProjectStatus::Activating,
+            &crate::project_store::ProjectLifecycle::wiped(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cas_lifecycle: {e}")))
+}
+
+/// Cancel-activate / TriggerSetup-failure cleanup: un-stick the
+/// status (via `unstick_activating`) AND wipe signal state (cancel TS
+/// color + sweep orphan TS colors + drop all signal rows). Used once
+/// trigger-setup has started, so signals are in flux and must go.
+/// Idempotent: a partial run leaves the next call with less work, and
+/// if the un-stick CAS loses (a concurrent activate-success/cancel
+/// already left Activating) it returns early WITHOUT wiping.
 ///
 /// `ts_color` is the TriggerSetup color the in-flight activate
 /// spawned (Some when called from the rollback path inside
@@ -1682,23 +2169,9 @@ async fn wipe_activating_state(
     project_id: &str,
     ts_color: Option<weft_core::Color>,
 ) -> Result<(), (StatusCode, String)> {
-    // CAS Activating → Inactive FIRST. This races a concurrent
-    // activate-success that's about to CAS Activating → Active:
-    // exactly one of the two CASes lands. If we lose, activate
-    // already finished cleanly and we must NOT wipe signals
-    // (we'd nuke a freshly-active project's triggers). If we win,
-    // status is Inactive and no future activate-CAS can touch it
-    // until the user re-activates.
-    let won = state
-        .projects
-        .cas_lifecycle(
-            id,
-            crate::project_store::ProjectStatus::Activating,
-            &crate::project_store::ProjectLifecycle::wiped(),
-        )
-        .await;
-    if !won {
-        // Activate raced us and won. Nothing to clean up.
+    // Un-stick FIRST. If we lose the CAS, activate already finished
+    // cleanly (or a sibling cancel did the wipe); do not touch signals.
+    if !unstick_activating(state, id).await? {
         return Ok(());
     }
     if let Some(c) = ts_color {
@@ -1760,62 +2233,61 @@ async fn wipe_project_signals(
 ///               last one terminates. The user can re-deactivate
 ///               with runningPolicy=cancel to give up on the wait,
 ///               or activate to roll back into Active.
-#[derive(Debug, Default, Deserialize)]
-pub struct DeactivateRequest {
-    #[serde(default, rename = "preservationMode", alias = "preservation_mode")]
-    pub preservation_mode: Option<String>,
-    /// Grace window in minutes; only meaningful when
-    /// preservationMode = "hibernate". Defaults to 15.
-    #[serde(default, rename = "graceMinutes", alias = "grace_minutes")]
-    pub grace_minutes: Option<u32>,
-    /// `cancel` | `wait`. Default: `wait`.
-    #[serde(default, rename = "runningPolicy", alias = "running_policy")]
-    pub running_policy: Option<String>,
-}
+// `DeactivationMode` is the wire contract for the `mode` field on a
+// `DeactivateSpec`. It lives in `weft-broker-client::protocol` so
+// the supervisor + dispatcher share one source of truth. Re-export
+// here so this module stays the canonical home for deactivation glue.
+pub use weft_broker_client::protocol::DeactivationMode;
 
-const DEFAULT_HIBERNATE_GRACE_MINUTES: u32 = 15;
+/// Run the trigger-deactivation side effects embedded in Sync /
+/// Stop / Terminate. Single place for the validate + execute
+/// pair; previously duplicated as `TriggerDeactivation::execute`
+/// in `api/infra.rs`, but the spec shape is the same as the wire
+/// `DeactivateSpec`, so the executor lives next to the rest of
+/// the deactivation machinery. The validation rule itself lives
+/// on `DeactivateSpec::validate` (broker, dispatcher, supervisor
+/// share one validator); this site adds the `triggerDeactivation:`
+/// prefix so clients see which field tripped the check.
+pub async fn execute_trigger_deactivation(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    spec: &weft_broker_client::protocol::DeactivateSpec,
+) -> Result<(), (StatusCode, String)> {
+    spec.validate()
+        .map_err(|m| (StatusCode::BAD_REQUEST, format!("triggerDeactivation: {m}")))?;
+    let existed = deactivate_project_with_mode(
+        state,
+        id,
+        spec.mode,
+        spec.grace_minutes,
+        spec.running_policy,
+    )
+    .await?;
+    if !existed {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "triggerDeactivation: project disappeared mid-deactivate".into(),
+        ));
+    }
+    Ok(())
+}
 
 pub async fn deactivate(
     State(state): State<DispatcherState>,
     Path(id_str): Path<String>,
-    body: Option<Json<DeactivateRequest>>,
+    Json(spec): Json<weft_broker_client::protocol::DeactivateSpec>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let id = id_str
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
-    let body = body.map(|Json(b)| b).unwrap_or_default();
-    let mode = body.preservation_mode.as_deref().unwrap_or("wipe");
-    if !["wipe", "hibernate", "park"].contains(&mode) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("invalid preservationMode '{mode}'; must be wipe|hibernate|park"),
-        ));
-    }
-    let running_policy = body.running_policy.as_deref().unwrap_or("wait");
-    if !["wait", "cancel"].contains(&running_policy) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("invalid runningPolicy '{running_policy}'; must be wait|cancel"),
-        ));
-    }
-    // wipe + wait is meaningless: wipe means "drop everything
-    // including suspended". Waiting for executions to drain before
-    // dropping them contradicts the intent. Force-pair them.
-    if mode == "wipe" && running_policy == "wait" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "wipe requires runningPolicy=cancel; waiting before wiping is contradictory".into(),
-        ));
-    }
-    let grace_minutes = body
-        .grace_minutes
-        .unwrap_or(DEFAULT_HIBERNATE_GRACE_MINUTES);
+    spec.validate()
+        .map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
     let existed = deactivate_project_with_mode(
         &state,
         id,
-        mode,
-        grace_minutes,
-        running_policy,
+        spec.mode,
+        spec.grace_minutes,
+        spec.running_policy,
     )
     .await?;
     if !existed {
@@ -1841,6 +2313,7 @@ pub async fn resync(
         .projects
         .project(id)
         .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
     let project_id = id.to_string();
 
@@ -1853,10 +2326,13 @@ pub async fn resync(
     //    a clear error. The user starts infra and clicks Activate.
     let mut missing: Vec<String> = Vec::new();
     for node in project.nodes.iter().filter(|n| n.requires_infra) {
-        let live = crate::infra::handle_if_running(&state.pg_pool, &project_id, &node.id)
+        let row = crate::infra_node::get(&state.pg_pool, &project_id, &node.id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_pod: {e}")))?;
-        if live.is_none() {
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
+        let running = row
+            .map(|r| r.status == crate::infra_node::InfraNodeStatus::Running)
+            .unwrap_or(false);
+        if !running {
             missing.push(node.id.clone());
         }
     }
@@ -1878,18 +2354,173 @@ pub async fn resync(
 
 /// Shared deactivation logic. Used both by the explicit
 /// `/deactivate` endpoint and auto-called from `infra stop` /
-/// `infra terminate` / project removal: a stopped sidecar leaves
+/// `infra terminate` / project removal: a stopped infra leaves
 /// the project's triggers pointing at a dead endpoint, so we
 /// always wipe in those flows. Returns true if the project existed.
 ///
 /// Always wipes (preservationMode=wipe, runningPolicy=cancel).
 /// User-initiated deactivates use the parameterized variant via
 /// the API handler.
+/// Replace the project's alive worker pod when its baked-in
+/// source_hash no longer matches the project's current
+/// `running_source_hash`. The worker binary embeds the project
+/// definition at compile time (codegen bakes `project.json` into the
+/// binary), so a worker spawned before the user added a node will
+/// never see that node.
+///
+/// Order matters here. If we killed the old pod first and then waited
+/// for cold_start to spawn a replacement, the next enqueued worker
+/// task (the InfraSetup `execute`) could race the doomed pod's
+/// in-flight task picker: the pod is marked dead in the DB but still
+/// alive in k8s during its terminationGracePeriod, and the picker
+/// happily claims tasks until its own heartbeat detects the dead row.
+/// Any journal write then trips the fencing trigger and the task
+/// fails. We avoid the race by spawning the replacement FIRST, then
+/// killing the stale pod once the new one is alive.
+///
+/// Idempotent: a no-op when hashes match or no pod is alive. Safe to
+/// call from every path that updates `running_source_hash`.
+pub async fn replace_stale_worker_if_needed(
+    state: &DispatcherState,
+    project_id: &str,
+) -> anyhow::Result<()> {
+    let project_uuid: uuid::Uuid = match project_id.parse() {
+        Ok(u) => u,
+        Err(_) => return Ok(()),
+    };
+    // No fallback: a DB error here must propagate or the stale-pod
+    // check would treat the failure as "no expected hash" and
+    // either kill a healthy pod (false positive) or skip a stale
+    // pod (false negative). `Ok(None)` is fine ("never set"); the
+    // hash comparison treats it as empty.
+    // No live worker: nothing to compare against. Skip without
+    // consulting the source hash: a None hash with no live worker
+    // is a legitimate "project just registered, no sync run yet"
+    // state (sync writes the hash before any task that would
+    // spawn). With a live worker, we need a hash to decide whether
+    // to kill it; fail loud if it's missing.
+    let Some((stale_pod_name, stale_namespace, have_hash)) =
+        weft_task_store::worker_pod::alive_pod_for_project_full(&state.pg_pool, project_id)
+            .await?
+    else {
+        return Ok(());
+    };
+    let want_hash = state
+        .projects
+        .running_source_hash(project_uuid)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "replace_stale_worker: project {project_id} has a live worker but no \
+                 running_source_hash; sync ordering invariant broken"
+            )
+        })?;
+    if have_hash == want_hash {
+        return Ok(());
+    }
+    tracing::info!(
+        target: "weft_dispatcher::api::project",
+        project_id,
+        stale_pod = %stale_pod_name,
+        have_hash = %have_hash,
+        want_hash = %want_hash,
+        "replacing stale-image worker pod after source_hash change"
+    );
+
+    // Step 1: kill the stale pod ourselves. The `spawn_pod` task
+    // executor is intentionally narrow: "spawn a pod when none is
+    // alive". It will not kill a mismatched pod for us. The kill
+    // belongs to the caller (this function) that decided the stale
+    // pod must go. mark_dead first so the fencing trigger blocks
+    // any late journal write from the doomed worker; kubectl delete
+    // second so the pod is actually removed.
+    weft_task_store::worker_pod::mark_dead(&state.pg_pool, &stale_pod_name).await?;
+    state
+        .workers
+        .kill_pod(stale_pod_name.clone(), stale_namespace)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "kill_pod {stale_pod_name} failed (stale worker would survive spawn): {e}"
+            )
+        })?;
+
+    // Step 2: enqueue a SpawnPod task for a fresh worker. Dedup key
+    // matches cold_start's so a concurrent sweep collapses on us.
+    let tenant = state.tenant_router.tenant_for_project(project_id);
+    let namespace = state
+        .projects
+        .project_namespace(project_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project_namespace({project_id}) returned None; cannot spawn worker"
+            )
+        })?;
+    let dedup = format!("{project_id}:spawn");
+    let payload = serde_json::json!({
+        "project_id": project_id,
+        "tenant": tenant.as_str(),
+        "namespace": namespace,
+        "owner_dispatcher": state.pod_id.as_str(),
+    });
+    weft_task_store::tasks::enqueue_dedup(
+        &state.pg_pool,
+        weft_task_store::tasks::NewTask {
+            kind: weft_task_store::TaskKind::SpawnPod,
+            target: weft_task_store::tasks::TaskTarget::Dispatcher,
+            project_id: Some(project_id.to_string()),
+            dedup_key: Some(dedup),
+            color: None,
+            tenant_id: Some(tenant.to_string()),
+            target_pod_name: None,
+            payload,
+        },
+    )
+    .await?;
+
+    // Step 3: wait for the new pod to register itself alive. Bounded
+    // so a wedged image build doesn't block the sync indefinitely.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if let Some((p, _, h)) = weft_task_store::worker_pod::alive_pod_for_project_full(
+            &state.pg_pool,
+            project_id,
+        )
+        .await?
+        {
+            if p != stale_pod_name && h == want_hash {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if !ready {
+        tracing::warn!(
+            target: "weft_dispatcher::api::project",
+            project_id,
+            stale_pod = %stale_pod_name,
+            "replacement worker did not come up within 60s; \
+             cold_start will retry as soon as a worker task lands"
+        );
+    }
+    Ok(())
+}
+
 pub async fn deactivate_project(
     state: &DispatcherState,
     id: uuid::Uuid,
 ) -> Result<bool, (StatusCode, String)> {
-    deactivate_project_with_mode(state, id, "wipe", 0, "cancel").await
+    deactivate_project_with_mode(
+        state,
+        id,
+        DeactivationMode::Wipe,
+        0,
+        crate::infra_lifecycle_command::RunningPolicy::Cancel,
+    )
+    .await
 }
 
 /// Mode-aware deactivation.
@@ -1906,20 +2537,21 @@ pub async fn deactivate_project(
 ///   - `wait`:   leave running executions to drain. Status is set
 ///               to Deactivating; the journal-bridge CASes it to
 ///               Inactive once `running_count = 0`: see
-///               `journal_bridge::terminal_cleanup`. Wipe with
-///               `wait` does NOT cancel suspended executions (they
-///               only get cancelled when status finally flips to
-///               Inactive, but with wipe-target the row is gone by
-///               then; in practice wipe + wait still cancels
-///               suspended at the moment the drain completes
-///               because nothing keeps them alive). Hibernate /
-///               park + wait leave suspended alone forever.
+///               `journal_bridge::terminal_cleanup`. Hibernate /
+///               park + wait leave suspended executions alone.
+///
+/// `wait` is only ever paired with hibernate / park. Wipe is always
+/// paired with cancel (the only producers are the supervisor's
+/// WipeTriggers action and the internal `deactivate_project`, both
+/// hardcoding cancel), and `DeactivateSpec::validate` rejects
+/// wipe+wait at every boundary, so that combination never reaches
+/// here.
 pub async fn deactivate_project_with_mode(
     state: &DispatcherState,
     id: uuid::Uuid,
-    mode: &str,
+    mode: DeactivationMode,
     grace_minutes: u32,
-    running_policy: &str,
+    running_policy: crate::infra_lifecycle_command::RunningPolicy,
 ) -> Result<bool, (StatusCode, String)> {
     use crate::project_store::{ProjectLifecycle, ProjectStatus};
 
@@ -1930,13 +2562,12 @@ pub async fn deactivate_project_with_mode(
     // `deactivating_to(target)` so status=Deactivating but the
     // gate axes are already the target's.
     let target = match mode {
-        "wipe" => ProjectLifecycle::wiped(),
-        "hibernate" => {
-            let deadline = unix_now() as i64 + (grace_minutes as i64) * 60;
+        DeactivationMode::Wipe => ProjectLifecycle::wiped(),
+        DeactivationMode::Hibernate => {
+            let deadline = crate::lease::now_unix() + (grace_minutes as i64) * 60;
             ProjectLifecycle::hibernating(deadline)
         }
-        "park" => ProjectLifecycle::parked(),
-        _ => unreachable!("validated upstream"),
+        DeactivationMode::Park => ProjectLifecycle::parked(),
     };
 
     // For wipe (always paired with cancel), do the cancel + drop
@@ -1944,7 +2575,7 @@ pub async fn deactivate_project_with_mode(
     // flip the lifecycle to wiped. The reaper would otherwise
     // observe accepting=false and start killing the listener
     // mid-cleanup.
-    if mode == "wipe" {
+    if mode == DeactivationMode::Wipe {
         wipe_project_signals(state, &project_id).await?;
     } else {
         // hibernate / park: KEEP the DB signal rows (the parking
@@ -1980,9 +2611,10 @@ pub async fn deactivate_project_with_mode(
     // and let the drain-watcher flip status to Inactive once the
     // running set empties. Wipe never reaches the wait branch:
     // upstream rejects (mode=wipe, running_policy=wait).
-    let lifecycle_to_set = if running_policy == "wait" {
+    use crate::infra_lifecycle_command::RunningPolicy;
+    let lifecycle_to_set = if running_policy == RunningPolicy::Wait {
         ProjectLifecycle::deactivating_to(target)
-    } else if mode != "wipe" {
+    } else if mode != DeactivationMode::Wipe {
         cancel_running_non_suspended(state, &project_id).await?;
         target
     } else {
@@ -1993,7 +2625,8 @@ pub async fn deactivate_project_with_mode(
     let existed = state
         .projects
         .set_lifecycle(id, &lifecycle_to_set)
-        .await;
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_lifecycle: {e}")))?;
     if existed {
         state
             .events
@@ -2007,14 +2640,27 @@ pub async fn deactivate_project_with_mode(
         let running_now = running_count(state, &project_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}")))?;
-        if running_policy == "wait"
+        if running_policy == RunningPolicy::Wait
             && lifecycle_to_set.status == ProjectStatus::Deactivating
             && running_now == 0
         {
-            let _ = state
+            // Fast-path CAS: if this returns false (raced something
+            // else) or errors, the bridge's drain-watcher will
+            // perform the same transition on its next tick.
+            // Either way no caller action; log on error.
+            if let Err(e) = state
                 .projects
                 .cas_status(id, ProjectStatus::Deactivating, ProjectStatus::Inactive)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    target: "weft_dispatcher::api::project",
+                    project_id = %project_id,
+                    error = %e,
+                    "fast-path cas_status(deactivating -> inactive) failed; \
+                     drain-watcher will retry"
+                );
+            }
         }
     }
     Ok(existed)
@@ -2054,7 +2700,12 @@ pub async fn cancel_activate(
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     let project_id = id_str;
-    let lifecycle = state.projects.lifecycle(id).await;
+    let lifecycle = state
+        .projects
+        .lifecycle(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lifecycle: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     if lifecycle.status != ProjectStatus::Activating {
         return Err((
             StatusCode::PRECONDITION_FAILED,
@@ -2148,7 +2799,7 @@ async fn run_trigger_setup(
 ) -> Result<(), (StatusCode, String, Option<weft_core::Color>)> {
     let project_id = project_id_uuid.to_string();
     let color = uuid::Uuid::new_v4();
-    let now = unix_now();
+    let now = crate::lease::now_unix() as u64;
 
     state
         .journal
@@ -2162,7 +2813,7 @@ async fn run_trigger_setup(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}"), Some(color)))?;
     for seed in &seeds {
-        let _ = state
+        state
             .journal
             .record_event(&weft_journal::ExecEvent::PulseSeeded {
                 color,
@@ -2173,7 +2824,8 @@ async fn run_trigger_setup(
                 value: seed.value.clone(),
                 at_unix: now,
             })
-            .await;
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}"), Some(color)))?;
     }
 
     // Subscribe BEFORE enqueueing so the worker can't beat us to
@@ -2222,7 +2874,37 @@ async fn run_trigger_setup(
                 ));
             }
             Ok(_) => continue,
-            Err(_) => {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Dropped batch may have held this color's terminal.
+                // The journal is authoritative: re-query rather than
+                // fail the trigger-setup on a transient lag.
+                match crate::api::execution::terminal_outcome(&state.pg_pool, color).await {
+                    Ok(Some(crate::api::execution::TerminalOutcome::Completed)) => return Ok(()),
+                    Ok(Some(crate::api::execution::TerminalOutcome::Failed)) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "trigger setup failed".into(),
+                            Some(color),
+                        ))
+                    }
+                    Ok(Some(crate::api::execution::TerminalOutcome::Cancelled)) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "trigger setup cancelled".into(),
+                            Some(color),
+                        ))
+                    }
+                    Ok(None) => continue, // still in flight; keep waiting
+                    Err(e) => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("trigger setup terminal lookup: {e}"),
+                            Some(color),
+                        ))
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "trigger setup event stream closed".into(),
@@ -2257,12 +2939,7 @@ async fn collect_listener_urls(
 }
 
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// `crate::lease::now_unix` is the canonical wall-clock reader.
 
 #[cfg(test)]
 mod trigger_seed_tests {
@@ -2422,5 +3099,204 @@ mod trigger_seed_tests {
         );
         let seeds = compute_trigger_seeds(&p, "a", &Value::Null);
         assert!(seeds.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod infra_seed_and_dep_tests {
+    use super::*;
+
+    /// (id, is_trigger, requires_infra)
+    fn project(nodes: &[(&str, bool, bool)], edges: &[(&str, &str)]) -> ProjectDefinition {
+        let n_json: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|(id, is_trigger, requires_infra)| {
+                serde_json::json!({
+                    "id": id,
+                    "nodeType": "T",
+                    "label": null,
+                    "config": {},
+                    "position": { "x": 0, "y": 0 },
+                    "features": { "isTrigger": is_trigger },
+                    "requiresInfra": requires_infra,
+                })
+            })
+            .collect();
+        let e_json: Vec<serde_json::Value> = edges
+            .iter()
+            .map(|(s, t)| {
+                serde_json::json!({
+                    "id": format!("e_{}_{}", s, t),
+                    "source": s,
+                    "sourcePort": "out",
+                    "target": t,
+                    "targetPort": "in",
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "name": "t",
+            "description": null,
+            "nodes": n_json,
+            "edges": e_json,
+            "groups": []
+        });
+        serde_json::from_value(body).expect("valid test project")
+    }
+
+    fn seed_ids(seeds: &[RootSeed]) -> Vec<String> {
+        let mut v: Vec<String> = seeds.iter().map(|s| s.node_id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn infra_seeds_are_upstream_roots_not_infra_nodes() {
+        // text → compute → infra
+        let p = project(
+            &[("text", false, false), ("compute", false, false), ("infra", false, true)],
+            &[("text", "compute"), ("compute", "infra")],
+        );
+        let seeds = compute_infra_setup_seeds(&p);
+        // The seed is the upstream root (text), NOT the infra node.
+        assert_eq!(seed_ids(&seeds), vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn infra_seeds_skip_unreachable_branches() {
+        // unrelated standalone node + a real text → infra chain.
+        let p = project(
+            &[
+                ("standalone", false, false),
+                ("text", false, false),
+                ("infra", false, true),
+            ],
+            &[("text", "infra")],
+        );
+        let seeds = compute_infra_setup_seeds(&p);
+        assert_eq!(seed_ids(&seeds), vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn infra_node_with_no_upstream_seeds_itself() {
+        // A parameterless infra node (no upstream edges) IS its own
+        // root : has to seed something to fire.
+        let p = project(&[("infra", false, true)], &[]);
+        let seeds = compute_infra_setup_seeds(&p);
+        assert_eq!(seed_ids(&seeds), vec!["infra".to_string()]);
+    }
+
+    #[test]
+    fn infra_seeds_empty_when_no_infra_nodes() {
+        let p = project(&[("a", false, false), ("b", false, false)], &[("a", "b")]);
+        assert!(compute_infra_setup_seeds(&p).is_empty());
+    }
+
+    #[test]
+    fn infra_seeds_handle_multiple_infra_nodes_with_shared_root() {
+        // text → infraA ; text → infraB
+        let p = project(
+            &[("text", false, false), ("infraA", false, true), ("infraB", false, true)],
+            &[("text", "infraA"), ("text", "infraB")],
+        );
+        let seeds = compute_infra_setup_seeds(&p);
+        // text is the only root reaching both.
+        assert_eq!(seed_ids(&seeds), vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn trigger_deps_direct_chain() {
+        // infra → trigger
+        let p = project(
+            &[("infra", false, true), ("trigger", true, false)],
+            &[("infra", "trigger")],
+        );
+        let deps = compute_trigger_deps(&p);
+        assert_eq!(deps, vec![("infra".to_string(), "trigger".to_string())]);
+    }
+
+    #[test]
+    fn trigger_deps_indirect_chain() {
+        // infra → middle → trigger
+        let p = project(
+            &[
+                ("infra", false, true),
+                ("middle", false, false),
+                ("trigger", true, false),
+            ],
+            &[("infra", "middle"), ("middle", "trigger")],
+        );
+        let deps = compute_trigger_deps(&p);
+        assert_eq!(deps, vec![("infra".to_string(), "trigger".to_string())]);
+    }
+
+    #[test]
+    fn trigger_deps_skip_unrelated_triggers() {
+        // infraA → triggerA ; infraB and triggerB are not connected.
+        let p = project(
+            &[
+                ("infraA", false, true),
+                ("infraB", false, true),
+                ("triggerA", true, false),
+                ("triggerB", true, false),
+            ],
+            &[("infraA", "triggerA")],
+        );
+        let deps = compute_trigger_deps(&p);
+        assert_eq!(deps, vec![("infraA".to_string(), "triggerA".to_string())]);
+    }
+
+    #[test]
+    fn trigger_deps_one_infra_two_triggers() {
+        // infra → t1 ; infra → t2
+        let p = project(
+            &[("infra", false, true), ("t1", true, false), ("t2", true, false)],
+            &[("infra", "t1"), ("infra", "t2")],
+        );
+        let deps = compute_trigger_deps(&p);
+        // Sorted by (infra, trigger).
+        assert_eq!(
+            deps,
+            vec![
+                ("infra".to_string(), "t1".to_string()),
+                ("infra".to_string(), "t2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trigger_deps_empty_when_no_triggers() {
+        let p = project(
+            &[("infra", false, true), ("downstream", false, false)],
+            &[("infra", "downstream")],
+        );
+        assert!(compute_trigger_deps(&p).is_empty());
+    }
+
+    #[test]
+    fn trigger_deps_empty_when_no_infra() {
+        let p = project(
+            &[("trigger", true, false), ("upstream", false, false)],
+            &[("upstream", "trigger")],
+        );
+        assert!(compute_trigger_deps(&p).is_empty());
+    }
+
+    #[test]
+    fn trigger_deps_skip_when_trigger_does_not_reach_infra() {
+        // text → trigger (no infra in the path)
+        let p = project(
+            &[
+                ("text", false, false),
+                ("trigger", true, false),
+                ("infra", false, true),
+            ],
+            &[("text", "trigger"), ("infra", "text")],
+        );
+        // text → trigger; infra → text; so trigger's upstream
+        // includes both text AND infra. Deps should include infra.
+        let deps = compute_trigger_deps(&p);
+        assert_eq!(deps, vec![("infra".to_string(), "trigger".to_string())]);
     }
 }

@@ -58,7 +58,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
         let project_def = state
             .projects
             .project(project_uuid)
-            .await
+            .await?
             .ok_or_else(|| anyhow::anyhow!("project {} not registered", signal.project_id))?;
 
         let seeds = crate::api::project::compute_trigger_seeds(
@@ -78,10 +78,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
         // events. Each event carries a dedup key so the journal's
         // partial UNIQUE collapses duplicates atomically.
         let color = Uuid::new_v5(&COLOR_NAMESPACE, task.id.as_bytes());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = crate::lease::now_unix() as u64;
         let task_id = task.id;
         state
             .journal

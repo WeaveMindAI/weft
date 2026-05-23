@@ -1,5 +1,5 @@
 //! `weft-broker` binary. The trusted proxy that fronts Postgres for
-//! every user-namespace pod (worker, listener, sidecar). Validates
+//! every user-namespace pod (worker, listener, infra). Validates
 //! the caller's projected ServiceAccount token via TokenReview,
 //! resolves it to a (tenant, role), and runs each authenticated
 //! request through a per-endpoint scope check before touching the DB.
@@ -29,16 +29,10 @@ async fn main() -> anyhow::Result<()> {
     // different audience claim.
     let audience = std::env::var("WEFT_BROKER_AUDIENCE")
         .unwrap_or_else(|_| "weft-broker".into());
-    // Namespace prefix mapping: tenant `t` lives in `wm-t` by
-    // default, mirroring `dispatcher::tenant::PrefixNamespaceMapper`.
-    // Cloud override via env keeps the broker in lockstep with the
-    // dispatcher's namespace shape.
-    let namespace_prefix = std::env::var("WEFT_TENANT_NS_PREFIX")
-        .unwrap_or_else(|_| "wm-".into());
 
     let state = weft_broker::BrokerState::new(
         &database_url,
-        weft_broker::AuthConfig { audience, namespace_prefix },
+        weft_broker::AuthConfig { audience },
     )
     .await?;
 

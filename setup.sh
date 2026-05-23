@@ -48,7 +48,7 @@
 #                 projects + history come back instantly.
 #   --purge       TRUE clean slate. Deletes the kind cluster, every
 #                 weft-built docker image (dispatcher, listener,
-#                 every weft-worker-*), every weavemind sidecar
+#                 every weft-worker-*), every weavemind infra
 #                 image, the BuildKit cache, the workspace target/
 #                 cargo cache, ~/.local/share/weft (image-hash
 #                 stamps, port-forward state, etc), and every
@@ -505,12 +505,12 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       fi
       ok "removed every weft-worker-* image"
 
-      sidecar_ids="$(
-        docker images 'ghcr.io/weavemindai/sidecar-*' -q 2>/dev/null | sort -u
+      infra_image_ids="$(
+        docker images 'ghcr.io/weavemindai/infra-*' -q 2>/dev/null | sort -u
       )"
-      if [[ -n "${sidecar_ids}" ]]; then
-        echo "${sidecar_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
-        ok "removed sidecar images"
+      if [[ -n "${infra_image_ids}" ]]; then
+        echo "${infra_image_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
+        ok "removed infra images"
       fi
 
       # Shared base images, gated.

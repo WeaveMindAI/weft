@@ -2,6 +2,7 @@ pub mod cancellation;
 pub mod context;
 pub mod error;
 pub mod exec;
+pub mod infra;
 pub mod lane;
 pub mod node;
 pub mod primitive;
@@ -17,8 +18,16 @@ pub mod weft_type;
 pub use inventory;
 
 pub use cancellation::CancellationFlag;
-pub use context::{ExecutionContext, Phase};
+pub use context::{ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, Phase};
 pub use error::{WeftError, WeftResult};
+pub use infra::{
+    Access, AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
+    Container, ContainerPort, ContainerSecurityContext, EgressRule, Endpoint, EnvEntry, Expose,
+    HttpHeader, Image, IngressRule, InfraProvisionContext, InfraSpec, Lifecycle,
+    Mount, PodOptions, PodSecurityContext, PreStopHook, Probe, ProbeKind, Protocol,
+    ProvisionContextError, Resources, ScalingPolicy, StopBehavior, TerminateBehavior, Toleration,
+    Unit, UnitHealth, UnitKind, UpgradeBehavior, Volume, VolumeKind,
+};
 pub use lane::{Lane, LaneFrame};
 pub use node::{
     Condition, FieldDef, FormFieldPort, FormFieldSpec, MetadataCatalog, Node, NodeCatalog,

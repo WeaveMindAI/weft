@@ -44,9 +44,12 @@ pub enum ActionVerb {
     Resync,
     Build,
     InfraStart,
+    InfraRestart,
     InfraStop,
     InfraTerminate,
     InfraUpgrade,
+    InfraNodeStop,
+    InfraNodeTerminate,
     /// Multi-level project cleanup (deactivate + unregister + optional
     /// infra/journal/image/local wipes).
     Rm,
@@ -57,7 +60,7 @@ pub enum ActionVerb {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Worker / sidecar image build started.
+    /// Worker / infra image build started.
     BuildStart,
     /// Build skipped because the hash matched an existing image.
     BuildSkip,
@@ -73,8 +76,8 @@ pub enum Phase {
     /// (e.g. `{ "color": "..." }` for run, `{ "signal_count": N }`
     /// for activate).
     DispatcherCallDone,
-    /// Sidecar provision started (one event covers all sidecars in
-    /// the verb; node ids in detail).
+    /// Infra provision started (one event covers every infra node
+    /// in the verb; node ids in detail).
     InfraProvisionStart,
     InfraProvisionDone,
     /// Trigger registration started (signals about to be wired up).
@@ -124,7 +127,7 @@ impl Progress {
             // them in order even when stdout buffering is enabled
             // (line-buffered terminals behave differently from
             // pipe-buffered subprocesses).
-            println!("{}", serde_json::to_string(&ev).unwrap_or_default());
+            println!("{}", serde_json::to_string(&ev).expect("Event serializes"));
             use std::io::Write;
             let _ = std::io::stdout().flush();
         } else {
@@ -220,8 +223,8 @@ impl Progress {
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .expect("system clock past UNIX_EPOCH")
+        .as_secs()
 }
 
 /// Render a human-mode status line. Returns None for phases that
@@ -244,7 +247,7 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
                 .unwrap_or("?")
         ),
         Phase::ImagePushStart => "loading image".to_string(),
-        Phase::InfraProvisionStart => "provisioning sidecars".to_string(),
+        Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
         Phase::Complete => return ev
             .detail

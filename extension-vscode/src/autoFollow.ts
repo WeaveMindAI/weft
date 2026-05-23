@@ -169,15 +169,28 @@ export class AutoFollowController {
   }
 
   private onEvent(ev: DispatcherEvent): void {
-    // Anything that ends or starts an execution can shift the
-    // dispatcher's available_actions list, so route every such
-    // event to the actionable-event handler before the
-    // execution-following logic.
+    // Anything that shifts the dispatcher's `available_actions` list
+    // routes to the actionable-event handler so the action bar
+    // refetches `weft status --json` and re-renders. Includes:
+    //   - execution lifecycle (run / cancel / complete change run state)
+    //   - infra lifecycle (status flips, transients, flaky/recovered);
+    //     this is what makes Stop / Terminate's `stopping` /
+    //     `terminating` transients visible in the UI. Without it the
+    //     bar only re-reads on user action.
     if (
       ev.kind === 'execution_started' ||
       ev.kind === 'execution_completed' ||
       ev.kind === 'execution_failed' ||
-      ev.kind === 'execution_cancelled'
+      ev.kind === 'execution_cancelled' ||
+      ev.kind === 'infra_status_changed' ||
+      ev.kind === 'infra_flaky' ||
+      ev.kind === 'infra_recovered' ||
+      ev.kind === 'infra_terminated' ||
+      ev.kind === 'project_registered' ||
+      ev.kind === 'project_activated' ||
+      ev.kind === 'project_deactivated' ||
+      ev.kind === 'infra_config_error' ||
+      ev.kind === 'trigger_url_changed'
     ) {
       this.onActionable(ev);
     }

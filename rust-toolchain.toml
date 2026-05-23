@@ -1,0 +1,14 @@
+# SINGLE SOURCE OF TRUTH for the Rust toolchain across the entire
+# system: local builds, the daemon's cargo builds, the worker image
+# build, AND the four component images (dispatcher / broker / listener /
+# infra-supervisor) all read this file via rustup. Bump this one line
+# to move a whole Weft release to a new toolchain; nothing else names a
+# version.
+#
+# To move a release onto a pinned nightly (e.g. to adopt a language
+# feature once it's usable), change `channel` to `nightly-YYYY-MM-DD`.
+# Every build path follows automatically because they all install
+# rustup with `--default-toolchain none` and let this file select.
+[toolchain]
+channel = "1.94.0"
+profile = "minimal"

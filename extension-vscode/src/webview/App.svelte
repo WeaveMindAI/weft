@@ -348,6 +348,12 @@
   }
   function onStopInfra() { send({ kind: 'infraStop' }); }
   function onTerminateInfra() { send({ kind: 'infraTerminate' }); }
+  function onInfraNodeStop(nodeId: string) {
+    send({ kind: 'infraNodeStop', nodeId });
+  }
+  function onInfraNodeTerminate(nodeId: string) {
+    send({ kind: 'infraNodeTerminate', nodeId });
+  }
   function onUpgradeInfra() {
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'infraUpgrade' });
@@ -384,6 +390,8 @@
       {onStartInfra}
       {onStopInfra}
       {onTerminateInfra}
+      {onInfraNodeStop}
+      {onInfraNodeTerminate}
       {onUpgradeInfra}
       {actionBarState}
       drift={statusSnapshot}

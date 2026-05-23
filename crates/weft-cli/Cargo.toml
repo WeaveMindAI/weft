@@ -24,5 +24,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tempfile = "3"
-sha2 = "0.10"
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+ipnet = { workspace = true }

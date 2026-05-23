@@ -223,6 +223,15 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		icon: resolveIcon(entry.icon),
 		color: entry.color ?? '#71717a',
 		category: entry.category as NodeCategory,
+		// Empty-array default keeps the command palette's
+		// `tags.some(...)` call safe for nodes that declare no tags.
+		tags: entry.tags ?? [],
+		// Mirror the catalog metadata's `requires_infra` flag onto
+		// the template. The webview's infra-subgraph extractor +
+		// node-role helpers read this to decide which nodes are
+		// infra-backed. Without it the subgraph "eye" finds no
+		// seeds and shows an empty subgraph.
+		requiresInfra: entry.requires_infra ?? false,
 		fields: (entry.fields ?? []).map(flattenField),
 		defaultInputs: entry.inputs ?? [],
 		defaultOutputs: entry.outputs ?? [],
@@ -297,6 +306,7 @@ function registerBuiltins(): void {
 			color: '#71717a',
 			category: 'Flow' as NodeCategory,
 			tags: ['group', 'container', 'scope'],
+			requiresInfra: false,
 			fields: [],
 			defaultInputs: [],
 			defaultOutputs: [],

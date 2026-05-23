@@ -115,10 +115,23 @@
 	const pendingMessage = $derived(overlay.kind === 'pending' ? overlay.message : undefined);
 	const isExecRunning = $derived(overlay.kind === 'execution_running');
 
-	// Generic CLI phase label. Verb-agnostic so new verbs that hit
-	// the same phases get sensible text without forking.
-	function cliPhaseLabel(phase: CliPhase | undefined): string {
+	/// Label for the CLI-running spinner.
+	///
+	/// Mirrors the trigger flow: the spinner's intent comes from the
+	/// VERB the user clicked (Stop / Terminate / Start / Activate
+	/// / Restart), not from the phase. Phases are progress within a
+	/// verb, used here only when they carry information that swaps
+	/// the wording mid-flight (e.g. "Building..." → "Loading...").
+	///
+	/// `verb` is always set whenever `phase` is set (both come from
+	/// the same `cli_running` overlay).
+	function cliPhaseLabel(
+		phase: CliPhase | undefined,
+		verb: ActionVerb | undefined,
+	): string {
 		if (phase === undefined) return '';
+		// Phase-specific overrides for stages that have their own
+		// dedicated user-facing wording.
 		switch (phase) {
 			case 'build_start': return 'Building...';
 			case 'build_skip': return 'Cached, loading...';
@@ -126,13 +139,37 @@
 			case 'image_push_start':
 			case 'image_push_done': return 'Loading image...';
 			case 'infra_provision_start':
-			case 'infra_provision_done': return 'Provisioning sidecars...';
+			case 'infra_provision_done': return 'Provisioning infra...';
 			case 'trigger_register_start':
 			case 'trigger_register_done': return 'Registering triggers...';
-			case 'dispatcher_call_start':
-			case 'dispatcher_call_done': return 'Calling dispatcher...';
-			default: return 'Working...';
 		}
+		// Default: derive from the verb. Covers the dispatcher-call
+		// phases and any future phase that doesn't have its own
+		// override above.
+		switch (verb) {
+			case 'infra_start': return 'Starting infra...';
+			case 'infra_restart': return 'Restarting infra...';
+			case 'infra_stop': return 'Stopping infra...';
+			case 'infra_terminate': return 'Terminating infra...';
+			case 'infra_upgrade': return 'Upgrading infra...';
+			case 'infra_node_stop': return 'Stopping node...';
+			case 'infra_node_terminate': return 'Terminating node...';
+			case 'activate':
+			case 'reactivate':
+			case 'resume_active': return 'Activating triggers...';
+			case 'cancel_activate': return 'Cancelling activate...';
+			case 'deactivate': return 'Deactivating triggers...';
+			case 'cancel_running': return 'Cancelling running...';
+			case 'resync': return 'Resyncing...';
+			case 'run': return 'Running...';
+			case 'build': return 'Building...';
+			case 'rm': return 'Removing...';
+		}
+		// `verb` is `never` here if every variant of `ActionVerb`
+		// is covered; adding a new verb to the union forces a
+		// compile error until this switch is updated.
+		const _exhaustive: never = verb;
+		return _exhaustive;
 	}
 
 	// ─── Slot-state derivations ──────────────────────────────────
@@ -184,8 +221,11 @@
 			rollup: backend.infraRollup,
 			canStart: !anyOverlayBlocks && nodeCount > 0 && isVerbAvailable('infra_start'),
 			canStop: !anyOverlayBlocks && isVerbAvailable('infra_stop'),
-			canTerminate: !anyOverlayBlocks && isVerbAvailable('infra_terminate')
-				&& (backend.infraRollup === 'running' || backend.infraRollup === 'stopped'),
+			// Trust the dispatcher's available_actions verbatim (it's
+			// the state machine). No redundant rollup re-gate: the old
+			// `rollup === running|stopped` check wrongly hid Terminate
+			// in `partial` (per-unit mixed state).
+			canTerminate: !anyOverlayBlocks && isVerbAvailable('infra_terminate'),
 			canUpgrade: !anyOverlayBlocks && infraDrift && isVerbAvailable('infra_upgrade'),
 			showDrift: infraDrift,
 		};
@@ -228,9 +268,20 @@
 			return { kind: 'absent' };
 		}
 		const anyOverlayBlocks = overlay.kind === 'cli_running' || overlay.kind === 'pending';
+		// Source-derived gate: if the graph has infra nodes, Run is
+		// only legal once every infra node is Running. This is
+		// defense-in-depth on top of the dispatcher's own
+		// `available_actions` check: the dispatcher gate fails when
+		// the project is unregistered (status fetch errors out), so
+		// we re-derive from the parsed graph + last-known rollup.
+		const infraReady = !hasInfra || backend.infraRollup === 'running';
 		return {
 			kind: 'run',
-			enabled: !anyOverlayBlocks && nodeCount > 0 && isVerbAvailable('run'),
+			enabled:
+				!anyOverlayBlocks
+				&& nodeCount > 0
+				&& infraReady
+				&& isVerbAvailable('run'),
 		};
 	});
 
@@ -286,8 +337,9 @@
 	});
 
 	function isInfraVerb(v: ActionVerb): boolean {
-		return v === 'infra_start' || v === 'infra_stop'
-			|| v === 'infra_terminate' || v === 'infra_upgrade';
+		return v === 'infra_start' || v === 'infra_restart' || v === 'infra_stop'
+			|| v === 'infra_terminate' || v === 'infra_upgrade'
+			|| v === 'infra_node_stop' || v === 'infra_node_terminate';
 	}
 	function isMiddleVerb(v: ActionVerb): boolean {
 		return v === 'run';
@@ -415,9 +467,22 @@
 	{#if slot.kind === 'absent'}
 		<!-- never rendered: outer guard skips the section -->
 	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase), true)}
+		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb), true)}
 	{:else}
-		{#if slot.rollup === 'running'}
+		{#if slot.rollup === 'stopping' || slot.rollup === 'terminating' || slot.rollup === 'provisioning'}
+			<!-- Supervisor-driven transients: the dispatcher emits NO
+			     infra verbs for these (it expects the bar to render a
+			     spinner from the rollup alone). No user-actionable
+			     button; not a CLI verb, so no Stop affordance. -->
+			{@render workingButton(
+				slot.rollup === 'stopping'
+					? 'Stopping infra...'
+					: slot.rollup === 'terminating'
+						? 'Terminating infra...'
+						: 'Provisioning infra...',
+				false,
+			)}
+		{:else if slot.rollup === 'running'}
 			<button class="{btn} {btnDisabled} bg-zinc-100 text-zinc-700 border border-zinc-200 hover:bg-zinc-200" onclick={onStopInfra} disabled={!slot.canStop}>
 				<Square class="w-3.5 h-3.5" />
 				<span class={labelCss}>Stop Infra</span>
@@ -431,19 +496,19 @@
 				<button
 					class="{btn} bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100"
 					onclick={onUpgradeInfra}
-					title="Source changed since infra started; rebuild sidecars"
+					title="Source changed since infra started; rebuild infra images"
 				>
 					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
 					<span class={labelCss}>Upgrade Infra</span>
 				</button>
 			{/if}
-		{:else if slot.rollup === 'stopped'}
-			<button class="{btn} {btnDisabled} bg-blue-50 text-blue-600 border border-blue-200 hover:bg-blue-100" onclick={onStartInfra} disabled={!slot.canStart}>
-				<Database class="w-3.5 h-3.5" />
-				<span class={labelCss}>Restart Infra</span>
-			</button>
 		{:else}
-			<!-- 'none' or 'partial': both present "Start Infra" as the next step. -->
+			<!-- Non-transient, non-running ('none', 'stopped',
+			     'partial', 'failed', 'flaky') all present "Start
+			     Infra" as the next step. The dispatcher's
+			     available_actions decides whether the button is
+			     enabled; the rollup decides the rendering siblings
+			     (trash button visibility, drift dot). -->
 			<button
 				class="{btn} {btnDisabled} bg-blue-50 text-blue-600 border border-blue-200 hover:bg-blue-100"
 				onclick={onStartInfra}
@@ -469,7 +534,7 @@
 	{#if slot.kind === 'absent'}
 		<!-- never rendered: outer guard skips the section -->
 	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase), true)}
+		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb), true)}
 	{:else if slot.kind === 'pending'}
 		{@render workingButton(slot.message, false)}
 	{:else if slot.kind === 'stop_execution'}
@@ -496,7 +561,7 @@
 	{#if slot.kind === 'absent'}
 		<!-- never rendered: outer guard skips the section -->
 	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase), true)}
+		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb), true)}
 	{:else if slot.kind === 'active'}
 		<button
 			class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700"

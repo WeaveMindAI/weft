@@ -446,6 +446,9 @@ export interface NodeFeatures {
 	showDebugPreview?: boolean;
 	/** Node has a dynamic form schema. Ports are derived from config.fields via the node's formFieldSpecs. */
 	hasFormSchema?: boolean;
+	/** Names the endpoint serving the node's `/live` HTTP route the
+	 * body panel polls. Unset for TCP-only infra (Postgres, Redis). */
+	liveEndpoint?: string;
 	/** Groups of ports where at least one must be non-null for the node to execute.
 	 * If all ports in a group are null/missing, the node is skipped.
 	 * e.g. [['text', 'media']] = at least one of text/media must be non-null. */
@@ -488,6 +491,17 @@ export interface NodeTemplate {
 	icon: import('svelte').Component;
 	color: string;
 	category: NodeCategory;
+	/** Free-form search tags from the node's metadata.json. The
+	 *  command palette's scoreNode() reads this for tag-match
+	 *  ranking. Always present (empty array when the node declares
+	 *  none) so consumers don't have to optional-chain. */
+	tags: string[];
+	/// Mirrors the node's `metadata.requires_infra` flag. The infra
+	/// subgraph extractor + node-role helpers key off this to decide
+	/// whether to seed from this node. Always present in templates
+	/// built from the dispatcher's /describe/nodes payload; defaults
+	/// to false when the catalog entry doesn't declare it.
+	requiresInfra: boolean;
 	fields: FieldDefinition[];
 	defaultInputs: PortDefinition[];
 	defaultOutputs: PortDefinition[];

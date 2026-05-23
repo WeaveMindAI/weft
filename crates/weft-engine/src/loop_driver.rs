@@ -52,6 +52,7 @@ use crate::context::{
     ship_node_completed, ship_node_failed, ship_node_resumed, ship_node_skipped,
     ship_node_started, ship_node_suspended, EngineClients, RunnerHandle,
 };
+use crate::now_unix;
 
 /// Maximum re-fetch attempts when drive() returns Stalled/Stuck.
 /// Each iteration re-reads the journal and reapplies the snapshot,
@@ -86,6 +87,10 @@ pub async fn run_one_execution(
     clients: EngineClients,
     pod_name: String,
     tenant_id: String,
+    // namespace: project namespace this worker pod runs in. Used to
+    // build the InfraProvisionContext passed to infra nodes during
+    // InfraSetup.
+    namespace: String,
     cancellation: Arc<CancellationFlag>,
 ) -> anyhow::Result<LoopOutcome> {
     let edge_idx = EdgeIndex::build(&project);
@@ -111,9 +116,10 @@ pub async fn run_one_execution(
         // Wait up to 6s (30 * 200ms) for the producer to commit. The
         // sleep yields to cancellation: a cancel landing mid-wait
         // breaks us out instead of forcing the worker to sit idle.
+        // Driven by `clients.clock` so layer-3 tests can fast-forward.
         for _ in 0..30 {
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                _ = clients.clock.sleep(std::time::Duration::from_millis(200)) => {}
                 _ = cancellation.cancelled() => {
                     return Ok(LoopOutcome::Failed { error: "cancelled".into() });
                 }
@@ -173,6 +179,7 @@ pub async fn run_one_execution(
             &clients,
             &pod_name,
             &tenant_id,
+            &namespace,
             &cancellation,
             &mut pulses,
             &mut executions,
@@ -202,23 +209,19 @@ pub async fn run_one_execution(
     }
 
     match &outcome {
-        LoopOutcome::Completed { outputs } => {
-            journal_terminal(journal.as_ref(), color, &pod_name, true, outputs.clone(), String::new()).await;
+        // Cancellation: walk the in-memory snapshot and journal a
+        // NodeCancelled per non-terminal node so the UI's per-node
+        // tally flips to cancelled (not stuck-running). Only the
+        // worker knows which nodes are non-terminal AT the moment
+        // we exit, so this can't live in the dispatcher's cancel
+        // path. The terminal write happens after, via the shared
+        // `journal_terminal` path below.
+        LoopOutcome::Failed { error } if error == "cancelled" => {
+            journal_node_cancellations(journal.as_ref(), color, &pod_name).await;
+            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
         }
-        LoopOutcome::Failed { error } => {
-            // Cancellation: walk the in-memory snapshot and journal
-            // a NodeCancelled per non-terminal node so the UI's
-            // per-node tally flips to cancelled (not stuck-running).
-            // This used to live in the dispatcher's cancel_color
-            // path; it's the worker's job now since we only know
-            // which nodes are non-terminal AT the moment we exit.
-            if error == "cancelled" {
-                journal_node_cancellations(journal.as_ref(), color, &pod_name).await;
-            }
-            journal_terminal(journal.as_ref(), color, &pod_name, false, serde_json::Value::Null, error.clone()).await;
-        }
-        LoopOutcome::Stuck => {
-            journal_terminal(journal.as_ref(), color, &pod_name, false, serde_json::Value::Null, "execution stuck".into()).await;
+        LoopOutcome::Completed { .. } | LoopOutcome::Failed { .. } | LoopOutcome::Stuck => {
+            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
         }
         LoopOutcome::Stalled => {
             // Worker exits cleanly without writing a terminal event.
@@ -275,6 +278,17 @@ fn apply_snapshot(
     // un-absorbed too so we re-dispatch it. We keep the exec
     // record; the dispatch path detects "non-terminal exec exists"
     // and ships NodeResumed.
+    // A `Running` lane with no terminal in the journal is assumed to
+    // belong to a worker that DIED mid-node; we un-absorb its pulses
+    // and re-run the node. This is only safe because at most ONE
+    // worker exists per color at a time: the dispatcher's spawn path
+    // dedups (enqueue-dedup key + the partial unique index on
+    // worker_pod + a NOT-EXISTS-live-pod check in cold_start), so a
+    // fresh worker can't re-fold and re-run a node body while the
+    // prior worker is still alive and about to ship its own
+    // NodeCompleted. If that one-worker-per-color invariant ever
+    // broke, this re-run would double-execute the node (double LLM
+    // spend / double side-effects).
     let crashed_running: std::collections::HashSet<(String, weft_core::lane::Lane)> =
         executions
             .values()
@@ -328,6 +342,9 @@ async fn drive(
     clients: &EngineClients,
     pod_name: &str,
     tenant_id: &str,
+    // namespace: project namespace this worker is running in. Used
+    // to populate InfraProvisionContext when dispatching infra nodes.
+    namespace: &str,
     cancellation: &Arc<CancellationFlag>,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
@@ -349,18 +366,23 @@ async fn drive(
 
     // Phase-scoped subgraph. In TriggerSetup we only want the
     // triggers (features.is_trigger) and their upstream closure to
-    // execute; any node outside that set must be auto-skipped when
-    // a pulse lands on it, otherwise downstream nodes of the
-    // triggers (e.g. the WhatsAppSend reply in an echo bot) block
-    // forever waiting for inputs that TriggerSetup never produces.
+    // execute; in InfraSetup we only want infra nodes
+    // (requires_infra) and their upstream closure. Any node outside
+    // the set is auto-skipped when a pulse lands on it, otherwise
+    // downstream nodes block forever waiting for inputs that the
+    // setup phase never produces.
     //
-    // Empty set means "no scoping" (Fire / InfraSetup phases).
+    // None (no scoping) is used for Phase::Fire (normal execution
+    // graph reaches everything via pulses).
     let phase_scope: Option<std::collections::HashSet<String>> =
         match phase {
             weft_core::context::Phase::TriggerSetup => {
                 Some(compute_trigger_setup_scope(project, edge_idx))
             }
-            _ => None,
+            weft_core::context::Phase::InfraSetup => {
+                Some(compute_infra_setup_scope(project, edge_idx))
+            }
+            weft_core::context::Phase::Fire => None,
         };
     if let Some(scope) = phase_scope.as_ref() {
         drop_out_of_scope_pulses(pulses, scope);
@@ -400,11 +422,27 @@ async fn drive(
             crate::context::ship_pulse_mutations(journal, pod_name,std::mem::take(&mut mutations)).await;
         }
         let ready = find_ready_nodes(project, pulses, edge_idx);
+        if !ready.is_empty() {
+            let ids: Vec<&str> = ready.iter().map(|(id, _)| id.as_str()).collect();
+            tracing::info!(
+                target: "weft_engine::loop_driver",
+                color = %color,
+                ready_ids = ?ids,
+                "ready batch"
+            );
+        }
 
         // Dispatch every ready group that isn't already Running for
         // this (node_id, color, lane). Each dispatch either short-
         // circuits (skip/failure) or spawns a task.
         for (node_id, mut group) in ready {
+            tracing::info!(
+                target: "weft_engine::loop_driver",
+                node = %node_id,
+                color = %group.color,
+                lane = ?group.lane,
+                "dispatching ready group"
+            );
             let Some(node_def) = project.nodes.iter().find(|n| n.id == node_id) else {
                 continue;
             };
@@ -455,12 +493,10 @@ async fn drive(
                 if let Some(idx) = existing {
                     if let Some(record) = executions.get_mut(&node_id).and_then(|v| v.get_mut(idx)) {
                         record.status = NodeExecutionStatus::Running;
-                        // Refresh input only when the new dispatch
-                        // carries a different input (rare; we keep
-                        // the original input on a pure resume).
-                        if record.input.is_none() {
-                            record.input = Some(group.input.clone());
-                        }
+                        // Keep the original input: the fold always
+                        // recorded it (`NodeStarted.input` is non-null),
+                        // and a resume replays from the journal sequence
+                        // rather than re-deriving inputs.
                     }
                 }
             } else {
@@ -487,20 +523,22 @@ async fn drive(
             }
 
             if group.should_skip {
-                mark_skipped(executions, &node_id, group.color, &group.lane);
-                ship_node_skipped(journal, pod_name,color, &node_id, &group.lane).await;
-                let mut muts = Vec::new();
-                emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
-                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
+                handle_node_skip(
+                    &node_id, group.color, &group.lane,
+                    project, edge_idx, pulses, executions, journal, pod_name,
+                    phase_scope.as_ref(),
+                )
+                .await;
                 continue;
             }
 
             if let Some(err) = &group.error {
-                mark_failed(executions, &node_id, group.color, &group.lane, err);
-                ship_node_failed(journal, pod_name,color, &node_id, &group.lane, err).await;
-                let mut muts = Vec::new();
-                emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
-                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
+                handle_node_failure(
+                    &node_id, group.color, &group.lane, err,
+                    project, edge_idx, pulses, executions, journal, pod_name,
+                    phase_scope.as_ref(),
+                )
+                .await;
                 continue;
             }
 
@@ -508,11 +546,12 @@ async fn drive(
                 Some(n) => n,
                 None => {
                     let err = format!("unknown node type: {}", node_def.node_type);
-                    mark_failed(executions, &node_id, group.color, &group.lane, &err);
-                    ship_node_failed(journal, pod_name,color, &node_id, &group.lane, &err).await;
-                    let mut muts = Vec::new();
-                    emit_null_downstream(&node_id, group.color, &group.lane, project, pulses, edge_idx, executions, &mut muts);
-                    crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
+                    handle_node_failure(
+                        &node_id, group.color, &group.lane, &err,
+                        project, edge_idx, pulses, executions, journal, pod_name,
+                        phase_scope.as_ref(),
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -582,16 +621,114 @@ async fn drive(
             // already shipped earlier in this loop body, before
             // the spawn. Don't ship a second one here.
 
-            // Spawn the node's execute as a task. It writes its
-            // result back over `result_tx`; the main loop applies
-            // the effect on `pulses`/`executions`.
+            // Spawn the node's body as a task. For infra nodes in
+            // `Phase::InfraSetup` the body runs in two stages:
+            //   1. `node_impl.provision(infra_ctx, input)` returns an
+            //      InfraSpec. Failure here = node fails with stage
+            //      "provision"; downstream cascade-skips.
+            //   2. Engine compiles spec locally, asks broker for prior
+            //      applied state, picks skip / fresh / replace, and
+            //      (when not skip) enqueues an Apply lifecycle command
+            //      via the broker. The tenant's supervisor pod claims
+            //      the command and runs kubectl. Failure here = node
+            //      fails with stage "apply".
+            //   3. `node_impl.execute(ctx)` runs as usual, with
+            //      `ctx.endpoint_url(name)` now resolving against the
+            //      freshly-applied infra_node row. Failure here = node
+            //      fails with stage "execute"; the infra stays up
+            //      (provisioned-but-execute-failed sub-state).
+            //
+            // For non-InfraSetup phases AND non-infra nodes, this
+            // is just `execute`. The task writes its result back via
+            // `result_tx`; the main loop applies the effect on
+            // `pulses`/`executions`.
             let tx = result_tx.clone();
             let node_id_task = node_id.clone();
             let color_task = group.color;
             let lane_task = group.lane.clone();
             // node_impl is &'static dyn Node (see NodeCatalog::lookup
             // contract). No allocation or unsafe needed.
+            let is_infra_setup_provision =
+                matches!(phase, weft_core::context::Phase::InfraSetup) && node_def.requires_infra;
+            let provision_project_id = project.id.to_string();
+            let provision_node_id = node_id.clone();
+            let provision_tenant_id = tenant_id.to_string();
+            let provision_namespace = namespace.to_string();
+            let provision_clients = clients.clone();
+            // Input bag for provision (mirrors the execute input).
+            let provision_input = weft_core::node::NodeInput {
+                values: group
+                    .input
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            };
             in_flight.spawn(async move {
+                if is_infra_setup_provision {
+                    // 1. Call the node's provision body.
+                    let infra_ctx = weft_core::infra::InfraProvisionContext::new(
+                        provision_project_id.clone(),
+                        provision_node_id.clone(),
+                        provision_namespace.clone(),
+                        provision_tenant_id.clone(),
+                    );
+                    let spec = match node_impl.provision(infra_ctx, provision_input).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.send(NodeTaskResult {
+                                node_id: node_id_task,
+                                color: color_task,
+                                lane: lane_task,
+                                outcome: NodeTaskOutcome::Failed(format!("provision: {e}")),
+                            });
+                            return;
+                        }
+                    };
+
+                    // 2. Enqueue an Apply lifecycle command and wait.
+                    //
+                    // The worker does NOT compile or hash the spec.
+                    // Compile requires the per-(project, node) image
+                    // tag map; only the supervisor has the role +
+                    // RBAC to read it. More importantly, the
+                    // supervisor mints the real `instance_id` at
+                    // apply time, so any worker-side hash would be
+                    // computed against a placeholder and would never
+                    // match the supervisor's hash anyway.
+                    //
+                    // Single source of compile + hash: the
+                    // supervisor reads the prior `infra_node` row,
+                    // compiles the new spec with the real instance
+                    // id + image tags, hashes, decides skip / fresh
+                    // / replace, and executes. The worker just polls
+                    // the command row for terminal state.
+                    //
+                    // After this returns Ok the supervisor has
+                    // written `infra_node` to Running (or short-
+                    // circuited on Skip), so the subsequent execute
+                    // can call `ctx.endpoint_url` and get a live URL.
+                    if let Err(e) = crate::context::apply_via_supervisor(
+                        provision_clients.infra_state.as_ref(),
+                        provision_clients.clock.as_ref(),
+                        &provision_project_id,
+                        &provision_node_id,
+                        &spec,
+                    )
+                    .await
+                    {
+                        let _ = tx.send(NodeTaskResult {
+                            node_id: node_id_task,
+                            color: color_task,
+                            lane: lane_task,
+                            outcome: NodeTaskOutcome::Failed(format!("apply: {e}")),
+                        });
+                        return;
+                    }
+                    // 3. Fall through to execute.
+                }
+
                 let result = node_impl.execute(ctx).await;
                 let outcome = match result {
                     Ok(output) => NodeTaskOutcome::Completed(output),
@@ -655,6 +792,88 @@ async fn drive(
     }
 }
 
+/// Tear down a terminated node lane's downstream: null every
+/// connected output pulse, ship those mutations, then prune
+/// out-of-scope pulses. The SHARED tail of every node-down path
+/// (failure, skip): the mark + lifecycle-event differ, this is what's
+/// identical. The prune is here, not at the call sites, so a new
+/// node-down path can't forget it (during a setup phase
+/// `emit_null_downstream` can emit onto out-of-scope nodes, which
+/// would otherwise be dispatched, auto-skipped, and churn the loop).
+#[allow(clippy::too_many_arguments)]
+async fn null_downstream_and_prune(
+    node_id: &str,
+    color: weft_core::Color,
+    lane: &weft_core::lane::Lane,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    pulses: &mut PulseTable,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    phase_scope: Option<&std::collections::HashSet<String>>,
+) {
+    let mut muts = Vec::new();
+    emit_null_downstream(node_id, color, lane, project, pulses, edge_idx, &mut muts);
+    crate::context::ship_pulse_mutations(journal, pod_name, muts).await;
+    if let Some(scope) = phase_scope {
+        drop_out_of_scope_pulses(pulses, scope);
+    }
+}
+
+/// Fail a node lane: mark Failed, ship `NodeFailed`, null+prune
+/// downstream. The SINGLE failure path: a genuine `execute` error, a
+/// dispatch-time error, an unknown node type, and an output
+/// type-check failure all route here, so "X-failed node = failed
+/// node" is structurally true (not a hand-copied near-dup that can
+/// drift). A failed node never propagates its real output values:
+/// status (Failed) and data (null) always agree.
+#[allow(clippy::too_many_arguments)]
+async fn handle_node_failure(
+    node_id: &str,
+    color: weft_core::Color,
+    lane: &weft_core::lane::Lane,
+    err: &str,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    pulses: &mut PulseTable,
+    executions: &mut NodeExecutionTable,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    phase_scope: Option<&std::collections::HashSet<String>>,
+) {
+    mark_failed(executions, node_id, color, lane, err);
+    ship_node_failed(journal, pod_name, color, node_id, lane, err).await;
+    null_downstream_and_prune(
+        node_id, color, lane, project, edge_idx, pulses, journal, pod_name, phase_scope,
+    )
+    .await;
+}
+
+/// Skip a node lane (a scope/condition decided it shouldn't run):
+/// mark Skipped, ship `NodeSkipped`, null+prune downstream. Same
+/// downstream teardown as a failure (the prune in particular), just a
+/// different lifecycle event.
+#[allow(clippy::too_many_arguments)]
+async fn handle_node_skip(
+    node_id: &str,
+    color: weft_core::Color,
+    lane: &weft_core::lane::Lane,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    pulses: &mut PulseTable,
+    executions: &mut NodeExecutionTable,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    phase_scope: Option<&std::collections::HashSet<String>>,
+) {
+    mark_skipped(executions, node_id, color, lane);
+    ship_node_skipped(journal, pod_name, color, node_id, lane).await;
+    null_downstream_and_prune(
+        node_id, color, lane, project, edge_idx, pulses, journal, pod_name, phase_scope,
+    )
+    .await;
+}
+
 /// Drain pending task results and apply them to the state tables.
 /// Returns true if any result was drained. `waiting` accumulates
 /// tokens of nodes that returned `Suspended`: when the loop finds
@@ -678,13 +897,14 @@ async fn apply_results(
         any = true;
         match result.outcome {
             NodeTaskOutcome::Completed(output) => {
-                mark_completed(executions, &result.node_id, result.color, &result.lane, &output);
+                // No output-side type check: type enforcement lives at
+                // exactly one boundary, the CONSUMER's input
+                // (`ready::check_input`). A node ships its output as
+                // produced; a bad-typed value surfaces at whatever node
+                // consumes it (with the source named in the error).
                 let output_value = output_to_value(&output);
-                // NodeCompleted FIRST, then ship pulse-table
-                // mutations. The dispatcher's fold tolerates either
-                // order across nodes; within one node the emitted
-                // pulses logically follow completion.
-                ship_node_completed(journal, pod_name,result.color, &result.node_id, &result.lane, &output_value).await;
+                mark_completed(executions, &result.node_id, result.color, &result.lane, &output);
+                ship_node_completed(journal, pod_name, result.color, &result.node_id, &result.lane, &output_value).await;
                 let mut muts = Vec::new();
                 postprocess_output(
                     &result.node_id,
@@ -694,29 +914,20 @@ async fn apply_results(
                     project,
                     pulses,
                     edge_idx,
-                    executions,
                     &mut muts,
                 );
-                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
+                crate::context::ship_pulse_mutations(journal, pod_name, muts).await;
                 if let Some(scope) = phase_scope.as_ref() {
                     drop_out_of_scope_pulses(pulses, scope);
                 }
             }
             NodeTaskOutcome::Failed(err) => {
-                mark_failed(executions, &result.node_id, result.color, &result.lane, &err);
-                ship_node_failed(journal, pod_name,result.color, &result.node_id, &result.lane, &err).await;
-                let mut muts = Vec::new();
-                emit_null_downstream(
-                    &result.node_id,
-                    result.color,
-                    &result.lane,
-                    project,
-                    pulses,
-                    edge_idx,
-                    executions,
-                    &mut muts,
-                );
-                crate::context::ship_pulse_mutations(journal, pod_name,muts).await;
+                handle_node_failure(
+                    &result.node_id, result.color, &result.lane, &err,
+                    project, edge_idx, pulses, executions, journal, pod_name,
+                    phase_scope,
+                )
+                .await;
             }
             NodeTaskOutcome::Waiting(token) => {
                 mark_waiting(
@@ -849,13 +1060,6 @@ fn first_failure(executions: &NodeExecutionTable) -> Option<String> {
     None
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn output_to_value(output: &NodeOutput) -> Value {
     Value::Object(output.outputs.clone().into_iter().collect())
 }
@@ -940,8 +1144,34 @@ fn compute_trigger_setup_scope(
         .filter(|n| n.features.is_trigger)
         .map(|n| n.id.clone())
         .collect();
+    upstream_closure(project, edge_idx, triggers)
+}
+
+/// Compute the node-id set that a `Phase::InfraSetup` run should
+/// execute: every `requires_infra` node plus its upstream closure.
+/// This is what unblocks "programmatic infra" (a text-field node
+/// feeding into an infra node): the upstream nodes execute first so
+/// their values are available as `provision`-time inputs.
+fn compute_infra_setup_scope(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+) -> std::collections::HashSet<String> {
+    let infra: Vec<String> = project
+        .nodes
+        .iter()
+        .filter(|n| n.requires_infra)
+        .map(|n| n.id.clone())
+        .collect();
+    upstream_closure(project, edge_idx, infra)
+}
+
+fn upstream_closure(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    seeds: Vec<String>,
+) -> std::collections::HashSet<String> {
     let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut frontier: Vec<String> = triggers;
+    let mut frontier: Vec<String> = seeds;
     while let Some(id) = frontier.pop() {
         if !scope.insert(id.clone()) {
             continue;
@@ -961,6 +1191,144 @@ async fn fetch_events(
     color: Color,
 ) -> anyhow::Result<Vec<weft_journal::ExecEvent>> {
     journal.events_for_color(color).await
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use weft_core::project::{Edge, NodeDefinition, Position, ProjectDefinition};
+
+    fn mk_node(id: &str, is_trigger: bool, requires_infra: bool) -> NodeDefinition {
+        let mut features = weft_core::node::NodeFeatures::default();
+        features.is_trigger = is_trigger;
+        NodeDefinition {
+            id: id.to_string(),
+            node_type: "Test".to_string(),
+            label: None,
+            config: serde_json::Value::Null,
+            position: Position { x: 0.0, y: 0.0 },
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            features,
+            scope: Vec::new(),
+            group_boundary: None,
+            requires_infra,
+            images: Vec::new(),
+            span: None,
+            header_span: None,
+            config_spans: Default::default(),
+        }
+    }
+
+    fn mk_edge(src: &str, dst: &str) -> Edge {
+        Edge {
+            id: format!("e-{src}-{dst}"),
+            source: src.to_string(),
+            target: dst.to_string(),
+            source_handle: None,
+            target_handle: None,
+            span: None,
+        }
+    }
+
+    fn mk_project(nodes: Vec<NodeDefinition>, edges: Vec<Edge>) -> ProjectDefinition {
+        let v = serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "name": "t",
+            "description": null,
+            "nodes": nodes,
+            "edges": edges,
+            "groups": []
+        });
+        serde_json::from_value(v).expect("test project definition")
+    }
+
+    #[test]
+    fn infra_setup_scope_includes_infra_and_upstream() {
+        // text -> compute -> infra
+        let project = mk_project(
+            vec![
+                mk_node("text", false, false),
+                mk_node("compute", false, false),
+                mk_node("infra", false, true),
+            ],
+            vec![mk_edge("text", "compute"), mk_edge("compute", "infra")],
+        );
+        let idx = EdgeIndex::build(&project);
+        let scope = compute_infra_setup_scope(&project, &idx);
+        assert!(scope.contains("infra"));
+        assert!(scope.contains("compute"));
+        assert!(scope.contains("text"));
+    }
+
+    #[test]
+    fn infra_setup_scope_excludes_downstream_of_infra() {
+        // infra -> trigger -> reply (a fire-time-only path)
+        let project = mk_project(
+            vec![
+                mk_node("infra", false, true),
+                mk_node("trigger", true, false),
+                mk_node("reply", false, false),
+            ],
+            vec![mk_edge("infra", "trigger"), mk_edge("trigger", "reply")],
+        );
+        let idx = EdgeIndex::build(&project);
+        let scope = compute_infra_setup_scope(&project, &idx);
+        assert!(scope.contains("infra"));
+        // The trigger node is downstream of infra; not part of the
+        // InfraSetup scope.
+        assert!(!scope.contains("trigger"));
+        assert!(!scope.contains("reply"));
+    }
+
+    #[test]
+    fn infra_setup_scope_handles_multiple_infra_nodes() {
+        // text -> infraA ; cfg -> infraB
+        let project = mk_project(
+            vec![
+                mk_node("text", false, false),
+                mk_node("cfg", false, false),
+                mk_node("infraA", false, true),
+                mk_node("infraB", false, true),
+            ],
+            vec![mk_edge("text", "infraA"), mk_edge("cfg", "infraB")],
+        );
+        let idx = EdgeIndex::build(&project);
+        let scope = compute_infra_setup_scope(&project, &idx);
+        assert!(scope.contains("text"));
+        assert!(scope.contains("cfg"));
+        assert!(scope.contains("infraA"));
+        assert!(scope.contains("infraB"));
+    }
+
+    #[test]
+    fn trigger_setup_scope_unchanged() {
+        // text -> trigger ; trigger -> reply (downstream not in scope)
+        let project = mk_project(
+            vec![
+                mk_node("text", false, false),
+                mk_node("trigger", true, false),
+                mk_node("reply", false, false),
+            ],
+            vec![mk_edge("text", "trigger"), mk_edge("trigger", "reply")],
+        );
+        let idx = EdgeIndex::build(&project);
+        let scope = compute_trigger_setup_scope(&project, &idx);
+        assert!(scope.contains("trigger"));
+        assert!(scope.contains("text"));
+        assert!(!scope.contains("reply"));
+    }
+
+    #[test]
+    fn empty_infra_set_yields_empty_scope() {
+        let project = mk_project(
+            vec![mk_node("a", false, false), mk_node("b", false, false)],
+            vec![mk_edge("a", "b")],
+        );
+        let idx = EdgeIndex::build(&project);
+        let scope = compute_infra_setup_scope(&project, &idx);
+        assert!(scope.is_empty());
+    }
 }
 
 /// Walk the journal, find every (node, lane) that's currently
@@ -1020,42 +1388,71 @@ async fn journal_node_cancellations(
     }
 }
 
+/// Journal the terminal event for this execution's color. Pure
+/// translation from `LoopOutcome` to the matching `ExecEvent`
+/// variant: `Completed`/`Failed`/`Stuck` map; `Stalled` is a
+/// caller-side no-op so this function isn't called for it.
 async fn journal_terminal(
     journal: &dyn JournalClient,
+    clock: &dyn weft_platform_traits::Clock,
     color: Color,
     pod_name: &str,
-    completed: bool,
-    outputs: serde_json::Value,
-    error: String,
+    outcome: &LoopOutcome,
 ) {
     // Idempotent: if a terminal event already exists for this color
     // (e.g. the dispatcher's cancel path wrote ExecutionCancelled
     // before the worker's loop driver observed cancellation), skip
-    // the write. Avoids the bridge double-publishing.
-    if journal.has_terminal_event(color).await.unwrap_or(false) {
-        return;
-    }
-    let event = if completed {
-        weft_journal::ExecEvent::ExecutionCompleted {
-            color,
-            outputs,
-            at_unix: now_unix(),
+    // the write. Avoids the bridge double-publishing. There is NO
+    // DB uniqueness guard on terminal events (the write uses
+    // record_event, not record_event_dedup), so this check is the
+    // only dedup. On a transient read error, skip the write rather
+    // than risk a double-publish: a missed terminal is re-folded by
+    // the bridge from the journal, a duplicate confuses SSE
+    // consumers.
+    match journal.has_terminal_event(color).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "weft_engine::loop_driver",
+                color = %color,
+                error = %e,
+                "has_terminal_event failed; skipping terminal write to avoid double-publish"
+            );
+            return;
         }
-    } else if error == "cancelled" {
+    }
+    let at_unix = now_unix();
+    let event = match outcome {
+        LoopOutcome::Completed { outputs } => weft_journal::ExecEvent::ExecutionCompleted {
+            color,
+            outputs: outputs.clone(),
+            at_unix,
+        },
         // The loop driver returns Failed { error: "cancelled" } when
         // the cancellation flag fires. Translate that to the proper
         // ExecutionCancelled terminal so the UI renders the cancel
         // affordance instead of a generic failure.
-        weft_journal::ExecEvent::ExecutionCancelled {
-            color,
-            reason: "Cancelled by user".to_string(),
-            at_unix: now_unix(),
+        LoopOutcome::Failed { error } if error == "cancelled" => {
+            weft_journal::ExecEvent::ExecutionCancelled {
+                color,
+                reason: "Cancelled by user".to_string(),
+                at_unix,
+            }
         }
-    } else {
-        weft_journal::ExecEvent::ExecutionFailed {
+        LoopOutcome::Failed { error } => weft_journal::ExecEvent::ExecutionFailed {
             color,
-            error,
-            at_unix: now_unix(),
+            error: error.clone(),
+            at_unix,
+        },
+        LoopOutcome::Stuck => weft_journal::ExecEvent::ExecutionFailed {
+            color,
+            error: "execution stuck".to_string(),
+            at_unix,
+        },
+        LoopOutcome::Stalled => {
+            debug_assert!(false, "journal_terminal must not be called for Stalled");
+            return;
         }
     };
     // Terminal events MUST land in the journal: the SSE bridge keys
@@ -1084,7 +1481,7 @@ async fn journal_terminal(
                     attempt,
                     "retrying terminal-event journal write"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                clock.sleep(std::time::Duration::from_millis(delay_ms)).await;
                 delay_ms = (delay_ms * 2).min(5000);
             }
         }

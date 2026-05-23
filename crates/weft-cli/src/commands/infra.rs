@@ -1,22 +1,13 @@
-//! `weft infra start | stop | terminate | upgrade | status`. Five
-//! lifecycle verbs:
+//! `weft infra start | restart | upgrade | stop | terminate | status`.
 //!
-//!   - **start**: provision the sidecars if missing, or scale them
-//!     back to 1 if they were stopped. Refuses if already running.
-//!   - **stop**: scale the Deployments to 0. Keeps PVCs / Services
-//!     so a later `start` resumes the same instance. Refuses if
-//!     already stopped.
-//!   - **terminate**: delete every k8s resource the sidecars own,
-//!     PVCs included. Irreversible. Idempotent (safe to re-run).
-//!   - **upgrade**: atomic stop + sidecar image swap + start.
-//!   - **status**: print the current lifecycle state of every
-//!     infra node for the cwd project.
+//! Start / Restart / Upgrade map to the same dispatcher endpoint
+//! (`/projects/{id}/infra/sync`); the label is purely UX. The
+//! dispatcher decides per-node skip-vs-apply via the resolved
+//! spec hash.
 //!
-//! `start` / `upgrade` auto-build any sidecar images they need
-//! first. The shared progress emitter feeds the VS Code action
-//! bar; in --json mode the CLI never reads from stdin (the
-//! extension passes --deactivate-triggers explicitly when it needs
-//! to confirm a destructive verb).
+//! Stop / Terminate are direct: they enqueue an
+//! `infra_lifecycle_command` row that the tenant's supervisor pod
+//! claims and executes.
 
 use std::collections::BTreeMap;
 
@@ -28,38 +19,53 @@ use crate::images;
 use crate::progress::{ActionVerb, Progress};
 use weft_catalog::stdlib_catalog;
 
+#[derive(Clone)]
 pub enum InfraAction {
     Start,
+    Restart,
+    Upgrade,
     Stop,
     Terminate,
-    Upgrade,
     Status,
+    NodeStop { node_id: String, force: bool },
+    NodeTerminate { node_id: String },
 }
 
-/// Whether the verb call should ask the dispatcher to drop
-/// triggers as part of the operation. None = prompt the user
-/// (terminal mode); Some(_) = use this verbatim (extension mode).
-pub type DeactivateChoice = Option<bool>;
+/// Trigger-deactivation + post-sync auto-reactivate choices for the
+/// infra verbs that take triggers down (Stop, Terminate, Upgrade).
+/// Mirrors the shared `prompt_trigger_deactivation` argument shape;
+/// `auto_reactivate` is the post-Upgrade reactivate decision.
+///
+/// All fields are optional at the CLI surface; missing fields prompt
+/// the user on a TTY or error in `--json` mode (per the shared
+/// helper's contract). Inactive projects ignore everything except
+/// `auto_reactivate`, which is also ignored because there's nothing
+/// to reactivate.
+#[derive(Default, Clone)]
+pub struct InfraOpts {
+    pub mode: Option<String>,
+    pub grace: Option<u32>,
+    pub running_policy: Option<String>,
+    pub auto_reactivate: Option<bool>,
+}
 
-pub async fn run(
-    ctx: Ctx,
-    action: InfraAction,
-    deactivate_triggers: DeactivateChoice,
-) -> Result<()> {
-    // Status is read-only with no progress events; route directly.
+pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     if matches!(action, InfraAction::Status) {
         return infra_status(&ctx).await;
     }
-    let verb = match action {
+    let verb = match &action {
         InfraAction::Start => ActionVerb::InfraStart,
+        InfraAction::Restart => ActionVerb::InfraRestart,
+        InfraAction::Upgrade => ActionVerb::InfraUpgrade,
         InfraAction::Stop => ActionVerb::InfraStop,
         InfraAction::Terminate => ActionVerb::InfraTerminate,
-        InfraAction::Upgrade => ActionVerb::InfraUpgrade,
+        InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
+        InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
         InfraAction::Status => unreachable!(),
     };
     let ctx_inner = ctx.clone();
     ctx.with_progress(verb, |progress| async move {
-        run_inner(&ctx_inner, &progress, action, deactivate_triggers).await
+        run_inner(&ctx_inner, &progress, action, opts).await
     })
     .await
 }
@@ -68,112 +74,272 @@ async fn run_inner(
     ctx: &Ctx,
     progress: &Progress,
     action: InfraAction,
-    deactivate_choice: DeactivateChoice,
+    opts: InfraOpts,
 ) -> Result<()> {
+    // Run the action's work. The command bodies emit phase progress
+    // (dispatcher_call_start/done, provision phases) but NOT a terminal
+    // `complete`: we emit exactly one `complete` here, after the whole
+    // action settles. This is what keeps the action-bar overlay held
+    // for the FULL verb, including multi-phase Upgrade (stop + start);
+    // a per-phase `complete` would clear the overlay mid-upgrade and
+    // let the bar flicker through intermediate interactive states.
+    let summary = match &action {
+        InfraAction::Start => "infra started",
+        InfraAction::Restart => "infra restarted",
+        InfraAction::Upgrade => "infra upgraded",
+        InfraAction::Stop => "infra stopped",
+        InfraAction::Terminate => "infra terminated",
+        InfraAction::NodeStop { .. } => "infra node stopped",
+        InfraAction::NodeTerminate { .. } => "infra node terminated",
+        InfraAction::Status => unreachable!(),
+    };
     match action {
-        InfraAction::Start => infra_start(ctx, progress).await,
-        InfraAction::Upgrade => infra_upgrade(ctx, progress, deactivate_choice).await,
-        InfraAction::Stop => infra_stop(ctx, progress, deactivate_choice).await,
-        InfraAction::Terminate => infra_terminate(ctx, progress, deactivate_choice).await,
-        InfraAction::Status => unreachable!("status routed directly"),
+        // Plain Start: just bring DOWN units up (apply skips up units).
+        InfraAction::Start => infra_sync(ctx, progress, action, opts).await?,
+        // Restart / Upgrade = stop then start. The apply path leaves
+        // up units frozen, so to cycle a running unit onto a new spec
+        // we stop first (respecting each unit's on_stop: NoOp units stay
+        // up, ScaleToZero go down) then start (recreates the down ones).
+        // `infra_stop` blocks until the stop settles, so the start sees
+        // the post-stop state.
+        InfraAction::Restart | InfraAction::Upgrade => {
+            infra_stop(ctx, progress, opts.clone()).await?;
+            infra_sync(ctx, progress, InfraAction::Start, opts).await?;
+        }
+        InfraAction::Stop => infra_stop(ctx, progress, opts).await?,
+        InfraAction::Terminate => infra_terminate(ctx, progress, opts).await?,
+        InfraAction::NodeStop { node_id, force } => {
+            infra_node_verb(ctx, progress, &node_id, "stop", force).await?
+        }
+        InfraAction::NodeTerminate { node_id } => {
+            infra_node_verb(ctx, progress, &node_id, "terminate", false).await?
+        }
+        InfraAction::Status => unreachable!(),
     }
+    progress.complete(summary);
+    Ok(())
 }
 
-async fn infra_start(ctx: &Ctx, progress: &Progress) -> Result<()> {
+async fn infra_node_verb(
+    ctx: &Ctx,
+    progress: &Progress,
+    node_id: &str,
+    verb: &str,
+    force: bool,
+) -> Result<()> {
+    let (client, project_id, name) = super::resolve_project(ctx)?;
+    let path = format!("/projects/{project_id}/infra/nodes/{node_id}/{verb}");
+    let body = serde_json::json!({ "force": force });
+    progress.dispatcher_call_start(&path);
+    // 202 Accepted with { command_id }.
+    let issued: serde_json::Value = client.post_json(&path, &body).await?;
+    progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id, "node_id": node_id }));
+    let command_id = issued
+        .get("command_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("infra node {verb}: response missing command_id"))?;
+    // Wait on the command, not a per-node status: a NoOp unit staying
+    // up means the node never reaches "stopped", so the command
+    // outcome is the honest done signal (and a force-stop completing
+    // is what we actually want to wait for).
+    wait_for_command(&client, &project_id, command_id, verb).await?;
+    if !ctx.json() {
+        let final_resp: serde_json::Value = client
+            .get_json(&format!("/projects/{project_id}/infra/status"))
+            .await?;
+        print_status(&name, &project_id, &final_resp);
+    }
+    // Terminal event emitted once by `run_inner` (see infra_sync note).
+    Ok(())
+}
+
+async fn infra_sync(
+    ctx: &Ctx,
+    progress: &Progress,
+    action: InfraAction,
+    opts: InfraOpts,
+) -> Result<()> {
     let handle = super::ensure::ensure_registered(ctx, progress).await?;
-    let sidecar_hashes = ensure_sidecar_images(progress, &handle.project, &handle.id).await?;
-    let path = format!("/projects/{}/infra/start", handle.id);
-    let body = serde_json::json!({
-        "sourceHash": handle.source_hash,
-        "infraHash": handle.infra_hash,
-        "sidecarHashes": sidecar_hashes,
-    });
-    let node_ids: Vec<String> = sidecar_hashes.keys().cloned().collect();
+    let image_tags = build_infra_images(progress, &handle.project, &handle.id).await?;
+    let verb_label = action_verb_label(&action);
+
+    // Only Upgrade against an Active project actually needs the
+    // trigger-deactivation choice. Start / Restart fire when infra
+    // is down (project necessarily Inactive); Upgrade when infra is
+    // running (project usually Active).
+    let active = super::deactivate::project_is_active(&handle.client, &handle.id).await?;
+    let trigger_deactivation = if active {
+        Some(super::deactivate::prompt_trigger_deactivation(
+            ctx.json(),
+            &format!("infra {verb_label}"),
+            opts.mode.as_deref(),
+            opts.grace,
+            opts.running_policy.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    // Auto-reactivate decision. Only meaningful when active (Upgrade
+    // path); ignored otherwise. Default: true. Prompted on TTY when
+    // active and not specified; errors in --json mode without the
+    // flag so the extension always passes it explicitly.
+    let auto_reactivate = if active {
+        match opts.auto_reactivate {
+            Some(b) => b,
+            None if ctx.json() => anyhow::bail!(
+                "infra {verb_label}: project is active, --auto-reactivate <true|false> required"
+            ),
+            None => prompt_auto_reactivate()?,
+        }
+    } else {
+        true
+    };
+
+    let mut body = serde_json::Map::new();
+    body.insert("sourceHash".into(), serde_json::json!(handle.source_hash));
+    body.insert("infraHash".into(), serde_json::json!(handle.infra_hash));
+    body.insert("imageHashes".into(), serde_json::to_value(&image_tags)?);
+    body.insert("autoReactivate".into(), serde_json::json!(auto_reactivate));
+    if let Some(td) = trigger_deactivation {
+        body.insert("triggerDeactivation".into(), td);
+    }
+    let path = format!("/projects/{}/infra/sync", handle.id);
+    let body = serde_json::Value::Object(body);
+    let node_ids: Vec<String> = image_tags.keys().cloned().collect();
     progress.infra_provision_start(&node_ids);
     progress.dispatcher_call_start(&path);
     let resp: serde_json::Value = handle.client.post_json(&path, &body).await?;
-    progress.dispatcher_call_done(serde_json::json!({
-        "project_id": handle.id,
-        "sidecars_provisioned": node_ids.len(),
-    }));
+    progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
     progress.infra_provision_done();
     if !ctx.json() {
         print_status(&handle.name, &handle.id, &resp);
     }
-    progress.complete(&format!("infra started for {}", handle.name));
+    // No `progress.complete` here: the terminal event is emitted ONCE
+    // by `run_inner` after the whole action. Upgrade chains stop+sync,
+    // and a `complete` from a sub-phase would clear the action-bar
+    // overlay mid-upgrade (the bar would flicker through intermediate
+    // interactive states). This stays a phase, not a terminus.
     Ok(())
 }
 
-async fn infra_upgrade(
-    ctx: &Ctx,
-    progress: &Progress,
-    deactivate_choice: DeactivateChoice,
-) -> Result<()> {
-    let handle = super::ensure::ensure_registered(ctx, progress).await?;
-    let sidecar_hashes = ensure_sidecar_images(progress, &handle.project, &handle.id).await?;
-    let deactivate =
-        resolve_deactivate(&handle.client, &handle.id, "upgrade", deactivate_choice, ctx.json()).await?;
-    let path = format!("/projects/{}/infra/upgrade", handle.id);
-    let body = serde_json::json!({
-        "sourceHash": handle.source_hash,
-        "infraHash": handle.infra_hash,
-        "sidecarHashes": sidecar_hashes,
-        "deactivateTriggers": deactivate,
-    });
-    let node_ids: Vec<String> = sidecar_hashes.keys().cloned().collect();
-    progress.infra_provision_start(&node_ids);
-    progress.dispatcher_call_start(&path);
-    let resp: serde_json::Value = handle.client.post_json(&path, &body).await?;
-    progress.dispatcher_call_done(serde_json::json!({
-        "project_id": handle.id,
-        "sidecars_provisioned": node_ids.len(),
-    }));
-    progress.infra_provision_done();
-    if !ctx.json() {
-        print_status(&handle.name, &handle.id, &resp);
+fn prompt_auto_reactivate() -> Result<bool> {
+    println!(
+        "After the upgrade, re-activate the project? \
+         [Y/n] (yes = re-register triggers; no = leave inactive, click Activate later)"
+    );
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(true);
     }
-    progress.complete(&format!("infra upgraded for {}", handle.name));
-    Ok(())
-}
-
-async fn infra_stop(
-    ctx: &Ctx,
-    progress: &Progress,
-    deactivate_choice: DeactivateChoice,
-) -> Result<()> {
-    let (client, id, name) = super::resolve_project(ctx)?;
-    let deactivate =
-        resolve_deactivate(&client, &id, "stop", deactivate_choice, ctx.json()).await?;
-    let path = format!("/projects/{id}/infra/stop");
-    let body = serde_json::json!({ "deactivateTriggers": deactivate });
-    progress.dispatcher_call_start(&path);
-    let resp: serde_json::Value = client.post_json(&path, &body).await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
-    if !ctx.json() {
-        print_status(&name, &id, &resp);
+    match trimmed.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        other => anyhow::bail!("aborted: expected yes/no/y/n, got '{other}'"),
     }
-    progress.complete(&format!("infra stopped for {name}"));
-    Ok(())
 }
 
-async fn infra_terminate(
+fn action_verb_label(a: &InfraAction) -> &'static str {
+    match a {
+        InfraAction::Start => "start",
+        InfraAction::Restart => "restart",
+        InfraAction::Upgrade => "upgrade",
+        InfraAction::Stop => "stop",
+        InfraAction::Terminate => "terminate",
+        InfraAction::Status => "status",
+        InfraAction::NodeStop { .. } => "node-stop",
+        InfraAction::NodeTerminate { .. } => "node-terminate",
+    }
+}
+
+
+async fn infra_stop(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Result<()> {
+    infra_destroy(ctx, progress, opts, "stop").await
+}
+
+async fn infra_terminate(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Result<()> {
+    infra_destroy(ctx, progress, opts, "terminate").await
+}
+
+/// Stop / Terminate share this body. Prompts for trigger
+/// deactivation only when the project is active; sends an empty
+/// body otherwise. Waits on the COMMAND's completion (not the rollup):
+/// a stop where a NoOp unit stays up never drives the rollup to
+/// "stopped", so the command outcome is the only honest done signal.
+async fn infra_destroy(
     ctx: &Ctx,
     progress: &Progress,
-    deactivate_choice: DeactivateChoice,
+    opts: InfraOpts,
+    verb: &str,
 ) -> Result<()> {
     let (client, id, name) = super::resolve_project(ctx)?;
-    let deactivate =
-        resolve_deactivate(&client, &id, "terminate", deactivate_choice, ctx.json()).await?;
-    let path = format!("/projects/{id}/infra/terminate");
-    let body = serde_json::json!({ "deactivateTriggers": deactivate });
-    progress.dispatcher_call_start(&path);
-    let resp: serde_json::Value = client.post_json(&path, &body).await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
-    if !ctx.json() {
-        print_status(&name, &id, &resp);
+    let active = super::deactivate::project_is_active(&client, &id).await?;
+    let trigger_deactivation = if active {
+        Some(super::deactivate::prompt_trigger_deactivation(
+            ctx.json(),
+            &format!("infra {verb}"),
+            opts.mode.as_deref(),
+            opts.grace,
+            opts.running_policy.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    let path = format!("/projects/{id}/infra/{verb}");
+    let mut body = serde_json::Map::new();
+    if let Some(td) = trigger_deactivation {
+        body.insert("triggerDeactivation".into(), td);
     }
-    progress.complete(&format!("infra terminated for {name}"));
+    let body = serde_json::Value::Object(body);
+    progress.dispatcher_call_start(&path);
+    // 202 Accepted with { command_id }.
+    let issued: serde_json::Value = client.post_json(&path, &body).await?;
+    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
+    let command_id = issued
+        .get("command_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("infra {verb}: response missing command_id"))?;
+    wait_for_command(&client, &id, command_id, verb).await?;
+    if !ctx.json() {
+        let final_resp: serde_json::Value = client
+            .get_json(&format!("/projects/{id}/infra/status"))
+            .await?;
+        print_status(&name, &id, &final_resp);
+    }
+    // Terminal event emitted once by `run_inner` (see infra_sync note).
     Ok(())
+}
+
+/// Poll the command-status endpoint until the supervisor marks the
+/// command complete. Fails loud on a `failed` outcome; `cancelled`
+/// (e.g. the node was already gone) is treated as success ("no longer
+/// applicable"). 300s deadline.
+async fn wait_for_command(
+    client: &crate::client::DispatcherClient,
+    project_id: &str,
+    command_id: i64,
+    verb: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let resp: serde_json::Value = client
+            .get_json(&format!("/projects/{project_id}/infra/commands/{command_id}"))
+            .await?;
+        if resp.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let outcome = resp.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+            if outcome == "failed" {
+                let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                anyhow::bail!("infra {verb} failed: {msg}");
+            }
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("infra {verb} did not complete within 300s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 async fn infra_status(ctx: &Ctx) -> Result<()> {
@@ -185,52 +351,6 @@ async fn infra_status(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Pick the deactivate-triggers flag: extension always passes one
-/// in (post-confirmation in its own UI), terminal users get the
-/// stdin prompt. The dispatcher refuses destructive verbs against
-/// an active project unless this flag is true.
-async fn resolve_deactivate(
-    client: &crate::client::DispatcherClient,
-    project_id: &str,
-    verb: &str,
-    explicit: DeactivateChoice,
-    json: bool,
-) -> Result<bool> {
-    if let Some(b) = explicit {
-        return Ok(b);
-    }
-    if json {
-        // No prompt available; the extension should have passed
-        // --deactivate-triggers explicitly. Fail loud rather than
-        // silently picking a default.
-        anyhow::bail!(
-            "--json mode requires --deactivate-triggers <true|false> (cannot prompt)"
-        );
-    }
-    let status: serde_json::Value = client
-        .get_json(&format!("/projects/{project_id}/status"))
-        .await?;
-    let active = status
-        .get("status")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s == "active");
-    if !active {
-        return Ok(false);
-    }
-    println!(
-        "Project has active triggers. Running `{verb}` will deactivate them; \
-         you'll need to reactivate manually after."
-    );
-    println!("Continue? [y/N]");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let confirmed =
-        line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes");
-    if !confirmed {
-        anyhow::bail!("aborted: triggers are active and user did not confirm");
-    }
-    Ok(true)
-}
 
 fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
     let nodes = resp
@@ -254,24 +374,20 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
     }
 }
 
-/// Build + kind-load every sidecar image the project's infra nodes
-/// reference. Hash-tagged: skip the docker build entirely when the
-/// hash-tagged image is already in the local cache. Each image's
-/// build/push emits its own pair of progress events so the action
-/// bar can show "building sidecar X" granularity. Returns a map of
-/// (infra_node_id -> sidecar_hash) for the dispatcher.
-async fn ensure_sidecar_images(
+/// Build the `(node_id -> { image_name -> hash_tag })` map for every
+/// `requires_infra` node in the project. Reads `metadata.images`
+/// (the list of buildable image dirs); for each image, hashes the
+/// dir, builds the docker image if missing, kind-loads in local
+/// dev. Returns the nested map shipped in the `/infra/sync` body.
+async fn build_infra_images(
     progress: &Progress,
     project: &weft_compiler::project::Project,
     project_id: &str,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
     let definition = crate::hash::load_enriched_project(project)?;
     let catalog = stdlib_catalog().map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
 
-    let mut hashes_by_node: BTreeMap<String, String> = BTreeMap::new();
-    // Cache build/load decisions per (sidecar_name, hash) so we
-    // don't re-process the same image across multiple infra nodes
-    // that share a sidecar.
+    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut seen_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for node in definition.nodes.iter().filter(|n| n.requires_infra) {
@@ -281,53 +397,65 @@ async fn ensure_sidecar_images(
                 node.id, node.node_type
             );
         };
-        let Some(sidecar_spec) = entry.metadata.features.sidecar.as_ref() else {
-            anyhow::bail!(
-                "node '{}' (type '{}') is requires_infra but its catalog metadata has no sidecar spec",
-                node.id, node.node_type
-            );
-        };
-        let sidecar_name = sidecar_spec.name.clone();
-        let sidecar_dir = entry.source_dir.join("sidecar");
-        let dockerfile = sidecar_dir.join("Dockerfile");
-        if !dockerfile.is_file() {
-            anyhow::bail!(
-                "node type '{}' declares sidecar '{sidecar_name}' but no Dockerfile at {}",
-                node.node_type,
-                dockerfile.display()
-            );
-        }
+        let mut node_tags: BTreeMap<String, String> = BTreeMap::new();
+        for image_path in &entry.metadata.images {
+            let image_dir = entry.source_dir.join(image_path);
+            // The image's local name (Image::Local.name on the
+            // InfraSpec) is the path's basename. So
+            // `images/bridge` → name `bridge`.
+            let image_name = std::path::Path::new(image_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "node type '{}' declared invalid image path '{image_path}'",
+                        node.node_type
+                    )
+                })?
+                .to_string();
+            let dockerfile = image_dir.join("Dockerfile");
+            if !dockerfile.is_file() {
+                anyhow::bail!(
+                    "node type '{}' declares image '{image_name}' but no Dockerfile at {}",
+                    node.node_type,
+                    dockerfile.display()
+                );
+            }
 
-        let full_hash = crate::hash::compute_sidecar_hash(&node.node_type, &sidecar_dir)?;
-        let short = crate::commands::build::short_hash(&full_hash);
-        let tag = format!("weft-sidecar-{sidecar_name}:{short}");
-        hashes_by_node.insert(node.id.clone(), short.clone());
+            let full_hash = crate::hash::compute_image_hash(&node.node_type, &image_dir)?;
+            let short = crate::commands::build::short_hash(&full_hash);
+            let tag = format!("weft-infra-{image_name}:{short}");
+            node_tags.insert(image_name.clone(), tag.clone());
 
-        if !seen_tags.insert(tag.clone()) {
-            continue;
-        }
+            if !seen_tags.insert(tag.clone()) {
+                continue;
+            }
 
-        let exists = images::image_present(&tag).await.unwrap_or(false);
-        if exists {
-            progress.build_skip(&tag, "hash_match");
-        } else {
-            progress.build_start(&tag);
-            let label = format!("weft.dev/project={project_id}");
-            crate::commands::build::docker_build_image(
-                &tag,
-                &dockerfile,
-                &sidecar_dir,
-                Some(&label),
-            )
-            .await?;
-            progress.build_done(&tag);
+            let exists = images::image_present(&tag).await.unwrap_or(false);
+            if exists {
+                progress.build_skip(&tag, "hash_match");
+            } else {
+                progress.build_start(&tag);
+                let label = format!("weft.dev/project={project_id}");
+                crate::commands::build::docker_build_image(
+                    &tag,
+                    &dockerfile,
+                    &image_dir,
+                    Some(&label),
+                )
+                .await?;
+                progress.build_done(&tag);
+            }
+            let cfg = cluster_config();
+            if cfg.backend == ClusterBackend::Kind {
+                progress.image_push_start(&tag);
+                images::kind_load(&cfg.cluster_name, &tag).await?;
+                progress.image_push_done(&tag);
+            }
         }
-        let cfg = cluster_config();
-        if cfg.backend == ClusterBackend::Kind {
-            progress.image_push_start(&tag);
-            images::kind_load(&cfg.cluster_name, &tag).await?;
-            progress.image_push_done(&tag);
+        if !node_tags.is_empty() {
+            out.insert(node.id.clone(), node_tags);
         }
     }
-    Ok(hashes_by_node)
+    Ok(out)
 }

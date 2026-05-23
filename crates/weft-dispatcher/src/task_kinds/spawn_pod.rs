@@ -32,9 +32,41 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: SpawnPodPayload = serde_json::from_value(task.payload.clone())?;
 
-        // Idempotency: if a live Pod already exists for this project,
-        // skip spawn entirely.
-        if weft_task_store::worker_pod::has_live_for_project(&state.pg_pool, &payload.project_id).await? {
+        // Resolve source_hash at spawn time (not enqueue time) so the
+        // most recent hash is used even when the build finished after
+        // the task was queued.
+        let project_uuid: uuid::Uuid = payload.project_id.parse().map_err(|e| {
+            anyhow::anyhow!("spawn_pod: bad project_id {}: {e}", payload.project_id)
+        })?;
+        // `None` here means "no source hash recorded for this
+        // project yet" (sync hasn't landed). spawn_pod is enqueued
+        // by sync AFTER it writes the hash; a None means the
+        // ordering invariant is broken. Fail loud instead of
+        // silently using `""` (which would tag the pod with empty
+        // image hash and pass any hash-equality check trivially).
+        let want_hash = state
+            .projects
+            .running_source_hash(project_uuid)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "spawn_pod: no running_source_hash for project {project_uuid}; \
+                     sync ordering invariant broken"
+                )
+            })?;
+
+        // Idempotency: if a live pod already exists, nothing to do.
+        // Stale-image handling is the sync handler's job
+        // (`replace_stale_worker_if_needed` kills + waits for fresh
+        // spawn BEFORE enqueueing any task), so by the time
+        // spawn_pod runs the alive pod (if any) is already on the
+        // right hash.
+        if weft_task_store::worker_pod::has_live_for_project(
+            &state.pg_pool,
+            &payload.project_id,
+        )
+        .await?
+        {
             return Ok(serde_json::json!({"skipped": "pod_already_alive"}));
         }
 
@@ -52,23 +84,16 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
             &payload.project_id,
             &payload.namespace,
             &payload.owner_dispatcher,
+            &want_hash,
         )
         .await?;
-
-        // Resolve source_hash at spawn time (not enqueue time) so the
-        // most recent hash is used even when the build finished after
-        // the task was queued.
-        let project_uuid: uuid::Uuid = payload.project_id.parse().map_err(|e| {
-            anyhow::anyhow!("spawn_pod: bad project_id {}: {e}", payload.project_id)
-        })?;
-        let source_hash = state.projects.running_source_hash(project_uuid).await;
 
         let spec = SpawnPodSpec {
             project_id: payload.project_id.clone(),
             tenant: payload.tenant,
             namespace: payload.namespace.clone(),
             owner_dispatcher: payload.owner_dispatcher.clone(),
-            source_hash,
+            source_hash: Some(want_hash),
         };
         let handle = state.workers.spawn_pod(&pod_name, spec).await?;
         Ok(serde_json::to_value(SpawnPodResult {

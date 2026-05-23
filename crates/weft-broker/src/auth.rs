@@ -21,24 +21,32 @@ use crate::state::BrokerState;
 pub struct AuthConfig {
     /// Audience claim every projected SA token must carry.
     pub audience: String,
-    /// Tenant namespace prefix (e.g. `wm-`). Reverse-mapped from the
-    /// caller's namespace to derive the tenant id.
-    pub namespace_prefix: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Listener,
     Worker,
-    Sidecar,
+    /// Per-tenant infra-supervisor pod. Owns health probing,
+    /// HealthProtocol evaluation, and lifecycle execution
+    /// (stop/terminate kubectl ops) for its tenant's projects.
+    InfraSupervisor,
 }
+
+// NOTE: there is deliberately no `Infra` role. Pods the supervisor
+// brings up from an `InfraSpec` (`weft-infra-sa`) never talk to the
+// broker: their endpoint URLs are resolved by the WORKER via
+// `ctx.endpoint()` (the broker's `/infra/endpoint_url`, Worker|Listener
+// only), and their lifecycle is the supervisor's job. So `weft-infra-sa`
+// has no SA-name mapping here; an infra pod that somehow presented a
+// token would fail role resolution (403), which is correct.
 
 impl Role {
     fn from_sa_name(sa: &str) -> Option<Self> {
         match sa {
             "weft-listener-sa" => Some(Self::Listener),
             "weft-worker-sa" => Some(Self::Worker),
-            "weft-sidecar-sa" => Some(Self::Sidecar),
+            "weft-infra-supervisor-sa" => Some(Self::InfraSupervisor),
             _ => None,
         }
     }
@@ -166,17 +174,29 @@ pub async fn extract_identity(
         StatusCode::FORBIDDEN,
         format!("unknown service account '{}'", outcome.sa_name),
     ))?;
-    let tenant_id = outcome
-        .namespace
-        .strip_prefix(&state.auth.namespace_prefix)
-        .ok_or((
-            StatusCode::FORBIDDEN,
-            format!(
-                "namespace '{}' has no '{}' prefix",
-                outcome.namespace, state.auth.namespace_prefix
-            ),
-        ))?
-        .to_string();
+    // Authoritative lookup: the dispatcher writes a row to
+    // `weft_namespace_tenant` whenever it creates a namespace,
+    // so the broker doesn't have to parse the namespace string
+    // (which would be unsafe if a tenant could create their own
+    // namespaces). A missing row = unrecognized namespace = 403.
+    let tenant_id: Option<String> = sqlx::query_scalar(
+        "SELECT tenant_id FROM weft_namespace_tenant WHERE namespace = $1",
+    )
+    .bind(&outcome.namespace)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::warn!(target: "weft_broker::auth", error = %e, "namespace lookup failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("namespace lookup: {e}"))
+    })?;
+    let tenant_id = tenant_id.ok_or((
+        StatusCode::FORBIDDEN,
+        format!(
+            "namespace '{}' is not registered to any tenant; \
+             only namespaces the dispatcher created can authenticate",
+            outcome.namespace
+        ),
+    ))?;
 
     let identity = CallerIdentity {
         tenant_id,
@@ -215,3 +235,4 @@ where
         Ok(AuthedCaller(identity))
     }
 }
+

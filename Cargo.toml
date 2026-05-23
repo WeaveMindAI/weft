@@ -13,6 +13,8 @@ members = [
     "crates/weft-broker",
     "crates/weft-broker-client",
     "crates/weft-infra",
+    "crates/weft-infra-supervisor",
+    "crates/weft-platform-traits",
 ]
 
 [workspace.package]
@@ -59,6 +61,9 @@ inventory = "0.3"
 url = "2"
 hmac = "0.12"
 sha2 = "0.10"
+tempfile = "3"
+parking_lot = "0.12"
+ipnet = "2"
 
 # minillmlib: local path during development, crates.io for release
 minillmlib = { path = "../MiniLLMLibRS" }
@@ -71,3 +76,4 @@ weft-engine = { path = "crates/weft-engine" }
 weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
+weft-platform-traits = { path = "crates/weft-platform-traits" }

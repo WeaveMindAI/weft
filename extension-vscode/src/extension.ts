@@ -248,9 +248,12 @@ export function activate(context: vscode.ExtensionContext) {
       const sub = args[0] ?? '';
       switch (sub) {
         case 'start': return 'infra_start';
+        case 'restart': return 'infra_restart';
         case 'stop': return 'infra_stop';
         case 'terminate': return 'infra_terminate';
         case 'upgrade': return 'infra_upgrade';
+        case 'node-stop': return 'infra_node_stop';
+        case 'node-terminate': return 'infra_node_terminate';
         default:
           throw new Error(`verbTagFor: unknown infra subverb '${sub}'`);
       }
@@ -468,18 +471,39 @@ export function activate(context: vscode.ExtensionContext) {
         parked: Number(json?.preservation?.parked ?? 0),
         suspended: Number(json?.preservation?.suspended ?? 0),
       };
-      const infraArr: Array<{ node_id?: string; node_type?: string; status?: string }> =
-        Array.isArray(json?.infra) ? json.infra : [];
-      let rollup: 'none' | 'stopped' | 'partial' | 'running' = 'none';
-      if (infraArr.length > 0) {
-        const allRunning = infraArr.every((n) => n.status === 'running');
-        const allStopped = infraArr.every((n) => n.status === 'stopped');
-        rollup = allRunning ? 'running' : allStopped ? 'stopped' : 'partial';
-      }
+      const infraArr: Array<{
+        node_id?: string;
+        node_type?: string;
+        status?: string;
+        failureStage?: string;
+        failureMessage?: string;
+      }> = Array.isArray(json?.infra) ? json.infra : [];
+      // Trust the dispatcher's authoritative rollup over re-deriving
+      // from individual node statuses. The dispatcher knows about
+      // `failed` / `flaky` rollups that a naive `allRunning` /
+      // `allStopped` re-derivation would collapse into `partial`.
+      const validRollups = [
+        'none',
+        'stopped',
+        'partial',
+        'running',
+        'failed',
+        'flaky',
+        'stopping',
+        'terminating',
+        'provisioning',
+      ] as const;
+      type RollupLiteral = typeof validRollups[number];
+      const rawRollup = String(json?.infra_rollup ?? 'none');
+      const rollup: RollupLiteral = (validRollups as readonly string[]).includes(rawRollup)
+        ? (rawRollup as RollupLiteral)
+        : 'none';
       const infraNodes = infraArr.map((n) => ({
         nodeId: n.node_id ?? '',
         nodeType: n.node_type ?? '',
         status: n.status ?? 'unknown',
+        ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
+        ...(n.failureMessage !== undefined ? { failureMessage: n.failureMessage } : {}),
       }));
       const execs = json?.executions ?? {};
       const lastStatus: string | undefined = execs.last_status;

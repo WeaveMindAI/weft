@@ -56,7 +56,6 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
-use sqlx::pool::PoolConnection;
 use sqlx::Postgres;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -134,7 +133,18 @@ impl ListenerBackend for SubprocessListenerBackend {
     async fn stop(&self, tenant: &TenantId, _namespace: &str) -> Result<()> {
         if let Some((_, child)) = self.children.remove(tenant.as_str()) {
             let mut c = child.lock().await;
-            let _ = c.kill().await;
+            // `kill` failing means the child is already dead or the
+            // OS refused; either way the subprocess is no longer
+            // ours to manage. Log so a stuck process doesn't go
+            // silent.
+            if let Err(e) = c.kill().await {
+                tracing::warn!(
+                    target: "weft_dispatcher::listener",
+                    tenant = tenant.as_str(),
+                    error = %e,
+                    "child kill failed (likely already exited)"
+                );
+            }
         }
         Ok(())
     }
@@ -146,11 +156,20 @@ impl ListenerBackend for SubprocessListenerBackend {
 pub struct K8sListenerBackend {
     listener_image: String,
     broker_url: String,
+    kube: Arc<dyn weft_platform_traits::KubeClient>,
 }
 
 impl K8sListenerBackend {
-    pub fn new(listener_image: String, broker_url: String) -> Self {
-        Self { listener_image, broker_url }
+    pub fn new(
+        listener_image: String,
+        broker_url: String,
+        kube: Arc<dyn weft_platform_traits::KubeClient>,
+    ) -> Self {
+        Self {
+            listener_image,
+            broker_url,
+            kube,
+        }
     }
 }
 
@@ -167,33 +186,39 @@ impl ListenerBackend for K8sListenerBackend {
             tenant.as_str(),
             &self.broker_url,
         );
-        kubectl_apply_manifest(&manifest).await?;
-        kubectl_rollout_status(namespace, &deploy_name).await?;
+        self.kube.apply_yaml(&manifest).await?;
+        self.kube
+            .wait_rollout_status(namespace, &deploy_name, 120)
+            .await?;
         wait_for_health(&admin_url).await?;
         Ok(ListenerHandle { admin_url })
     }
 
     async fn stop(&self, tenant: &TenantId, namespace: &str) -> Result<()> {
         let deploy_name = deploy_name_for_tenant(tenant.as_str());
-        // Service first: bounded `--wait=true`. Then Deployment with
+        // Service first (instant delete), then Deployment with
         // foreground cascade so ReplicaSet + Pods finish terminating
         // before we return; eliminates the "old Pod still holds the
         // Service Endpoint" race when a fresh spawn lands milliseconds
-        // later.
-        let _ = Command::new("kubectl")
-            .args([
-                "-n", namespace, "delete", "service", &deploy_name,
-                "--ignore-not-found", "--wait=true",
-            ])
-            .status()
-            .await;
-        let _ = Command::new("kubectl")
-            .args([
-                "-n", namespace, "delete", "deployment", &deploy_name,
-                "--ignore-not-found", "--wait=true", "--cascade=foreground",
-            ])
-            .status()
-            .await;
+        // later. Routes through the shared `KubeClient` trait so the
+        // reaper's `backend.stop failed during reap` branch can
+        // actually observe failures (and tests can fake them).
+        self.kube
+            .delete_named(
+                namespace,
+                "service",
+                &deploy_name,
+                weft_platform_traits::DeleteOpts::wait(),
+            )
+            .await?;
+        self.kube
+            .delete_named(
+                namespace,
+                "deployment",
+                &deploy_name,
+                weft_platform_traits::DeleteOpts::wait_cascade(),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -300,41 +325,6 @@ spec:
     )
 }
 
-async fn kubectl_apply_manifest(manifest: &str) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawn kubectl apply")?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(manifest.as_bytes()).await?;
-    }
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("kubectl apply failed: {stderr}");
-    }
-    Ok(())
-}
-
-async fn kubectl_rollout_status(namespace: &str, deployment: &str) -> Result<()> {
-    let status = Command::new("kubectl")
-        .args([
-            "-n", namespace,
-            "rollout", "status", &format!("deployment/{deployment}"),
-            "--timeout=120s",
-        ])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("{deployment} did not reach Ready within 120s");
-    }
-    Ok(())
-}
-
 fn pick_free_port() -> Result<u16> {
     let s = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
     let port = s.local_addr()?.port();
@@ -358,6 +348,28 @@ async fn wait_for_health(admin_url: &str) -> Result<()> {
 // Listener admin client (HTTP helpers)
 // =============================================================
 
+/// Bail with `<route> returned <status>: <body>` if the response
+/// wasn't 2xx; otherwise pass it through. The body decode in the
+/// error path surfaces decode failures via
+/// `unwrap_or_else(|e| format!("<body read failed: {e}>"))` so a
+/// truncated TLS / network reset mid-response shows up in the
+/// error message instead of an empty body.
+async fn bail_unless_ok(resp: reqwest::Response, route: &str) -> Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    // Body read is secondary detail; the primary error (status +
+    // route) is already named. Surface a body-read failure as
+    // part of the error message so a truncated TLS / network reset
+    // mid-response is legible instead of looking like an empty body.
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("<body read failed: {e}>"));
+    anyhow::bail!("listener {route} returned {status}: {body}")
+}
+
 pub async fn register_signal(
     handle: &ListenerHandle,
     token: &str,
@@ -379,11 +391,7 @@ pub async fn register_signal(
         }))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("listener /register returned {}: {}", status, body);
-    }
+    let resp = bail_unless_ok(resp, "/register").await?;
     let body: weft_listener::protocol::RegisterResponse = resp.json().await?;
     Ok((body.routing, body.kind_state))
 }
@@ -396,13 +404,7 @@ pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Valu
         .json(&serde_json::json!({ "token": token }))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "listener /display returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
+    let resp = bail_unless_ok(resp, "/display").await?;
     let body: weft_listener::protocol::DisplayResponse = resp.json().await?;
     Ok(body.display)
 }
@@ -424,13 +426,7 @@ pub async fn action_signal(
         }))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "listener /action returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
+    let resp = bail_unless_ok(resp, "/action").await?;
     let body: weft_listener::protocol::ActionResponse = resp.json().await?;
     Ok(body)
 }
@@ -447,13 +443,7 @@ pub async fn process_signal(
         .json(&serde_json::json!({ "token": token, "payload": payload }))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "listener /process returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
+    let resp = bail_unless_ok(resp, "/process").await?;
     Ok(resp.json::<weft_listener::protocol::ProcessOutcome>().await?)
 }
 
@@ -465,13 +455,7 @@ pub async fn render_signal(handle: &ListenerHandle, token: &str) -> Result<Value
         .json(&serde_json::json!({ "token": token }))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "listener /render returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
+    let resp = bail_unless_ok(resp, "/render").await?;
     Ok(resp.json::<Value>().await?)
 }
 
@@ -484,24 +468,19 @@ pub async fn rehydrate(handle: &ListenerHandle) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("{}/rehydrate", handle.admin_url.trim_end_matches('/'));
     let resp = client.post(&url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "listener /rehydrate returned {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        );
-    }
+    bail_unless_ok(resp, "/rehydrate").await?;
     Ok(())
 }
 
 pub async fn unregister_signal(handle: &ListenerHandle, token: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("{}/unregister", handle.admin_url.trim_end_matches('/'));
-    let _ = client
+    let resp = client
         .post(&url)
         .json(&serde_json::json!({ "token": token }))
         .send()
-        .await;
+        .await?;
+    bail_unless_ok(resp, "/unregister").await?;
     Ok(())
 }
 
@@ -541,27 +520,16 @@ const TRANSITION_WAIT_MAX_SECS: u64 = 180;
 // Advisory lock keys
 // =============================================================
 
-/// Hash domain separator for the per-tenant operation lock. SHARED
-/// during `with_listener`, EXCLUSIVE during the reaper sweep.
-const OP_LOCK_DOMAIN: &str = "tenant_listener_op";
-/// Hash domain separator for the per-tenant transactional state-row
-/// mutex. Held only across row reads/writes; never spans kubectl I/O.
-const ROW_LOCK_DOMAIN: &str = "tenant_listener_row";
-
+/// Domain constants for these locks live in `crate::lease`.
+/// `LISTENER_OP_DOMAIN`: SHARED during `with_listener`, EXCLUSIVE
+/// during the reaper sweep. `LISTENER_ROW_DOMAIN`: held only
+/// across row reads/writes; never spans kubectl I/O.
 fn op_lock_key(tenant_id: &str) -> i64 {
-    hash_advisory_key(OP_LOCK_DOMAIN, tenant_id)
+    crate::lease::advisory_key(crate::lease::LISTENER_OP_DOMAIN, tenant_id)
 }
 
 fn row_lock_key(tenant_id: &str) -> i64 {
-    hash_advisory_key(ROW_LOCK_DOMAIN, tenant_id)
-}
-
-fn hash_advisory_key(domain: &str, tenant_id: &str) -> i64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    domain.hash(&mut h);
-    tenant_id.hash(&mut h);
-    h.finish() as i64
+    crate::lease::advisory_key(crate::lease::LISTENER_ROW_DOMAIN, tenant_id)
 }
 
 /// Begin a transaction and immediately take the per-tenant advisory
@@ -600,12 +568,15 @@ impl ListenerPool {
     }
 
     /// Run `work(handle)` against the tenant's listener. Spawns the
-    /// listener if it isn't running. Holds an OP-lock in SHARED mode
-    /// for the duration of `work`, fencing the reaper out.
+    /// listener if it isn't running. `ensure_listener_alive` arms the
+    /// `op_in_flight_until_unix` sentinel atomically with the row
+    /// write (INSERT or Alive renew), so the reaper sees this op
+    /// while `work` runs.
     ///
-    /// Crash safety: if the dispatcher Pod dies while `work` is
-    /// running, PG releases the SHARED lock automatically when the
-    /// connection drops. The reaper can then proceed.
+    /// Crash safety: the sentinel is a TTL hint, not a held lock.
+    /// If the dispatcher pod dies, the sentinel expires
+    /// (`SENTINEL_TTL_SECS`) and the reaper proceeds.
+    /// No connection state to clean up.
     pub async fn with_listener<R, F, Fut>(
         &self,
         tenant: &TenantId,
@@ -619,14 +590,17 @@ impl ListenerPool {
         F: FnOnce(ListenerHandle) -> Fut,
         Fut: std::future::Future<Output = Result<R>>,
     {
-        let guard = ListenerOpGuard::acquire(pg_pool, tenant.as_str()).await?;
-        let work_result = async {
-            let handle = ensure_listener_alive(tenant, namespace, backend, pg_pool, pod_id).await?;
-            work(handle).await
-        }
-        .await;
-        guard.release().await;
-        work_result
+        // `ensure_listener_alive` arms the op-sentinel as part of
+        // its row write (INSERT or UPDATE), so by the time it
+        // returns Use, the reaper sees the sentinel and backs
+        // off. The sentinel is a TTL hint, not a lock: we don't
+        // clear on exit (a sibling op may have re-armed it
+        // between our work and a clear, and clearing would
+        // expose its listener to reap). The sentinel expires
+        // naturally `SENTINEL_TTL_SECS` after the
+        // last arm.
+        let handle = ensure_listener_alive(tenant, namespace, backend, pg_pool, pod_id).await?;
+        work(handle).await
     }
 
     /// Best-effort listener call with no spawn. Returns `Ok(None)`
@@ -645,7 +619,12 @@ impl ListenerPool {
         F: FnOnce(ListenerHandle) -> Fut,
         Fut: std::future::Future<Output = Result<R>>,
     {
-        let guard = ListenerOpGuard::acquire(pg_pool, tenant.as_str()).await?;
+        // Pre-arm the sentinel ONLY if a row already exists (this
+        // path doesn't spawn). `arm_op_sentinel` returns
+        // `Ok(None)` if there's no row to update; benign here.
+        // Real DB errors still propagate. No clear at exit: see
+        // `with_listener` comment on the TTL hint shape.
+        arm_op_sentinel(pg_pool, tenant.as_str()).await?;
         let work_result = async {
             match read_alive_row(tenant, pg_pool).await? {
                 Some(handle) => Ok(Some(work(handle).await?)),
@@ -653,15 +632,14 @@ impl ListenerPool {
             }
         }
         .await;
-        guard.release().await;
         work_result
     }
 
     /// True iff the tenant currently has an Alive listener row.
     /// Used by status endpoints to render "listener: running" vs
     /// "listener: stopped". Does not take the OP lock.
-    pub async fn is_alive(&self, tenant: &TenantId, pg_pool: &PgPool) -> bool {
-        read_alive_row(tenant, pg_pool).await.ok().flatten().is_some()
+    pub async fn is_alive(&self, tenant: &TenantId, pg_pool: &PgPool) -> Result<bool> {
+        Ok(read_alive_row(tenant, pg_pool).await?.is_some())
     }
 
     /// Best-effort bulk unregister: group `signals` by tenant, then
@@ -683,15 +661,32 @@ impl ListenerPool {
                 .push(sig.token.clone());
         }
         for (tenant_id, tokens) in by_tenant {
-            let tenant = TenantId(tenant_id);
-            let _ = self
+            let tenant = TenantId(tenant_id.clone());
+            let tokens_for_log = tokens.clone();
+            if let Err(e) = self
                 .with_listener_if_alive(&tenant, pg_pool, |handle| async move {
                     for token in &tokens {
-                        let _ = unregister_signal(&handle, token).await;
+                        if let Err(e) = unregister_signal(&handle, token).await {
+                            tracing::warn!(
+                                target: "weft_dispatcher::listener",
+                                token,
+                                error = %e,
+                                "unregister_signal failed (sweep); listener pod may carry stale state"
+                            );
+                        }
                     }
                     Ok::<_, anyhow::Error>(())
                 })
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    target: "weft_dispatcher::listener",
+                    tenant = %tenant_id,
+                    tokens = ?tokens_for_log,
+                    error = %e,
+                    "with_listener_if_alive failed during sweep; tokens remain registered"
+                );
+            }
         }
     }
 
@@ -718,38 +713,29 @@ impl ListenerPool {
         pg_pool: &PgPool,
         pod_id: &str,
     ) -> Result<bool> {
-        let Some(guard) = ListenerReapGuard::try_acquire(pg_pool, tenant.as_str()).await? else {
-            // EXCLUSIVE wasn't free; some operation is in flight.
-            return Ok(false);
-        };
-        let outcome = run_reap(tenant, namespace, backend, pg_pool, pod_id, &guard).await;
-        guard.release().await;
-        outcome
+        // Decide under the per-tenant xact-scoped advisory lock.
+        // If an op holds the lock or the sentinel is live, back off.
+        match try_reap_decision(pg_pool, tenant.as_str()).await? {
+            ReapDecision::Busy => return Ok(false),
+            ReapDecision::Idle => {}
+        }
+        run_reap(tenant, namespace, backend, pg_pool, pod_id).await
     }
 }
 
-/// Body of `try_reap_if_idle` factored out so the EXCLUSIVE guard's
-/// release is centralized at the caller. `_guard` argument is only
-/// here to make the borrow lifetime explicit.
+/// Reap body. `try_reap_decision` already established (under one
+/// xact + advisory lock) that this tenant has no live signals and
+/// no live op sentinel. The lock has since released, but the row
+/// delete below is the synchronization barrier: any op landing
+/// after this point sees a missing row in `decide_under_lock` and
+/// re-spawns fresh.
 async fn run_reap(
     tenant: &TenantId,
     namespace: &str,
     backend: &dyn ListenerBackend,
     pg_pool: &PgPool,
     pod_id: &str,
-    _guard: &ListenerReapGuard,
 ) -> Result<bool> {
-    // EXCLUSIVE held. Re-check semantic need: any signal rows for
-    // this tenant => still needed.
-    let signal_count: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM signal WHERE tenant_id = $1")
-            .bind(tenant.as_str())
-            .fetch_one(pg_pool)
-            .await?;
-    if signal_count.0 > 0 {
-        return Ok(false);
-    }
-
     // Claim Stopping under the row-state lock.
     let claimed = claim_stopping(tenant, pg_pool, pod_id).await?;
     if !claimed {
@@ -757,127 +743,145 @@ async fn run_reap(
         return Ok(true);
     }
 
-    // Slow kubectl delete with the EXCLUSIVE OP-lock still held
-    // (operations can't slip in mid-kill).
-    let _ = backend.stop(tenant, namespace).await;
+    // Slow kubectl delete. `backend.stop` failures are logged but
+    // don't block the row delete: leaving a tenant entry pointing
+    // at a half-stopped pod is worse than leaving an orphaned pod
+    // that the next supervisor sweep catches.
+    if let Err(e) = backend.stop(tenant, namespace).await {
+        tracing::warn!(
+            target: "weft_dispatcher::listener",
+            tenant = tenant.as_str(),
+            namespace,
+            error = %e,
+            "backend.stop failed during reap; will proceed to delete_row"
+        );
+    }
     delete_row(tenant, pg_pool).await?;
     Ok(true)
 }
 
 // =============================================================
-// Per-operation SHARED lock guard
+// Per-operation sentinel + xact lock
 // =============================================================
+//
+// Ops (`with_listener`, `with_listener_if_alive`) and the reaper
+// coordinate via the same per-tenant xact-scoped advisory key
+// (`lease::LISTENER_OP_DOMAIN`). Ops arm a sentinel under the lock,
+// then run their work (possibly slow, involving broker HTTP).
+// The reaper takes the same lock NON-BLOCKING; if it can't, an
+// op's arm is still in flight. If it can, it then reads the
+// sentinel: a live `op_in_flight_until_unix` means an op is
+// running (or recently was). The reaper backs off until the
+// sentinel expires AND the lock is free.
+//
+// xact-scoped means no session-leak back into the pool: the lock
+// auto-releases on COMMIT/ROLLBACK. No fire-and-forget Drop
+// unlocks anywhere.
 
-/// Holds a SHARED advisory lock on the tenant's OP key on a
-/// dedicated PG connection. Lifetime semantics:
+/// Refresh the op-in-flight sentinel for `tenant_id` under a
+/// short xact-scoped advisory lock. Returns `Some(deadline)` if
+/// the row exists (sentinel armed), `None` if no row exists
+/// (caller should not assume the sentinel was armed). Most ops
+/// arm via `ensure_listener_alive` (which writes the row +
+/// sentinel atomically); this helper is for explicit refresh
+/// during long ops (e.g. ActivateKeepAlive heartbeat).
+async fn arm_op_sentinel(pg_pool: &PgPool, tenant_id: &str) -> Result<Option<i64>> {
+    let key = op_lock_key(tenant_id);
+    let until = crate::lease::now_unix() + crate::lease::SENTINEL_TTL_SECS;
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *tx)
+        .await?;
+    let res = sqlx::query(
+        "UPDATE tenant_listener SET op_in_flight_until_unix = $1 WHERE tenant_id = $2",
+    )
+    .bind(until)
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if res.rows_affected() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(until))
+    }
+}
+
+// No explicit clear: the sentinel is a TTL-based hint, not a
+// lock. Clearing on op-exit would clobber a sibling op that
+// arrived between our arm and our clear (its sentinel would
+// vanish, the reaper would see idle, and kill the listener
+// mid-sibling-op). The TTL is short enough (SENTINEL_TTL_SECS
+// = 30s) that natural expiry is fast; the reaper checks the
+// deadline against NOW() rather than presence of a value.
+
+/// Outcome of the reaper's "can I reap this tenant?" check under
+/// the xact-scoped lock.
+enum ReapDecision {
+    /// Sentinel is in the future, or an op holds the lock; back
+    /// off and retry on the next sweep.
+    Busy,
+    /// No ops in flight; safe to delete the tenant_listener row
+    /// and scale down the listener pod.
+    Idle,
+}
+
+/// Decide whether a tenant's listener is idle enough to reap.
+/// Three checks, all under one xact-scoped advisory lock so a
+/// new op can't slip in between them:
 ///
-/// - `acquire`: checkout a connection, take the SHARED lock on it.
-/// - `release` (async): explicit unlock + return the connection to
-///   the pool clean. Always called by `with_listener` /
-///   `with_listener_if_alive` on the happy path.
-/// - `Drop`: synchronous fallback. Spawns a fire-and-forget task to
-///   run the unlock, so a panic / early-return doesn't leak the
-///   lock on the pooled connection (sqlx's PgPool does NOT issue
-///   `DISCARD ALL` between checkouts by default, so the lock would
-///   otherwise survive the connection's reuse).
-#[must_use = "call `release().await` to free the advisory lock; \
-              Drop spawns a fire-and-forget unlock that may not \
-              run if the runtime is tearing down, leaking the lock \
-              onto the pooled connection"]
-struct ListenerOpGuard {
-    conn: Option<PoolConnection<Postgres>>,
-    key: i64,
-}
-
-impl ListenerOpGuard {
-    async fn acquire(pg_pool: &PgPool, tenant_id: &str) -> Result<Self> {
-        let mut conn = pg_pool.acquire().await?;
-        let key = op_lock_key(tenant_id);
-        sqlx::query("SELECT pg_advisory_lock_shared($1)")
-            .bind(key)
-            .execute(&mut *conn)
-            .await?;
-        Ok(Self { conn: Some(conn), key })
+///   1. `pg_try_advisory_xact_lock` on the tenant key. If held by
+///      a mid-tx op, return `Busy`.
+///   2. `signal` rows for the tenant. If any exist, return `Busy`:
+///      registered triggers are the primary "this tenant needs a
+///      listener" signal.
+///   3. `tenant_listener.op_in_flight_until_unix > NOW()`. If the
+///      sentinel is live, return `Busy`: an op is in flight that
+///      isn't holding the lock right now but will be back.
+///
+/// Returning `Idle` decides on a snapshot under this lock; an op
+/// that lands AFTER this tx commits but BEFORE `claim_stopping`
+/// acquires the row-lock would otherwise slip in. The second
+/// barrier is in `claim_stopping`: it re-reads
+/// `op_in_flight_until_unix` under its own row-lock'd tx and
+/// bails if an op armed the sentinel in the gap. Two-phase commit
+/// without long-held locks across kubectl.
+async fn try_reap_decision(pg_pool: &PgPool, tenant_id: &str) -> Result<ReapDecision> {
+    let key = op_lock_key(tenant_id);
+    let mut tx = pg_pool.begin().await?;
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !got {
+        tx.commit().await?;
+        return Ok(ReapDecision::Busy);
     }
-
-    async fn release(mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            let _ = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
-                .bind(self.key)
-                .execute(&mut *conn)
-                .await;
-        }
+    let signal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM signal WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if signal_count > 0 {
+        tx.commit().await?;
+        return Ok(ReapDecision::Busy);
     }
-}
-
-impl Drop for ListenerOpGuard {
-    fn drop(&mut self) {
-        // If `release` was called (Some(conn) drained on the way),
-        // there's nothing to do here. Otherwise spawn a fire-and-
-        // forget unlock so the SHARED lock doesn't survive on a
-        // pooled connection that may be re-used for unrelated work.
-        if let Some(mut conn) = self.conn.take() {
-            let key = self.key;
-            tokio::spawn(async move {
-                let _ = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
-                    .bind(key)
-                    .execute(&mut *conn)
-                    .await;
-            });
-        }
+    let sentinel: Option<i64> = sqlx::query_scalar(
+        "SELECT op_in_flight_until_unix FROM tenant_listener WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    let now = crate::lease::now_unix();
+    let live_sentinel = sentinel.map_or(false, |u| u > now);
+    tx.commit().await?;
+    if live_sentinel {
+        return Ok(ReapDecision::Busy);
     }
-}
-
-/// Holds an EXCLUSIVE advisory lock on the tenant's OP key. Used by
-/// the reaper to fence out concurrent `with_listener` calls. Same
-/// connection-leak protection as `ListenerOpGuard`.
-#[must_use = "call `release().await` to free the advisory lock; \
-              Drop spawns a fire-and-forget unlock that may not \
-              run if the runtime is tearing down, leaking the lock \
-              onto the pooled connection"]
-struct ListenerReapGuard {
-    conn: Option<PoolConnection<Postgres>>,
-    key: i64,
-}
-
-impl ListenerReapGuard {
-    /// Try to grab the EXCLUSIVE lock without blocking. Returns None
-    /// if any operation is currently holding SHARED on the same key.
-    async fn try_acquire(pg_pool: &PgPool, tenant_id: &str) -> Result<Option<Self>> {
-        let mut conn = pg_pool.acquire().await?;
-        let key = op_lock_key(tenant_id);
-        let acquired: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-            .bind(key)
-            .fetch_one(&mut *conn)
-            .await?;
-        if !acquired.0 {
-            return Ok(None);
-        }
-        Ok(Some(Self { conn: Some(conn), key }))
-    }
-
-    async fn release(mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(self.key)
-                .execute(&mut *conn)
-                .await;
-        }
-    }
-}
-
-impl Drop for ListenerReapGuard {
-    fn drop(&mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            let key = self.key;
-            tokio::spawn(async move {
-                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                    .bind(key)
-                    .execute(&mut *conn)
-                    .await;
-            });
-        }
-    }
+    Ok(ReapDecision::Idle)
 }
 
 // =============================================================
@@ -921,15 +925,41 @@ async fn ensure_listener_alive(
                         commit_alive(tenant, namespace, pg_pool, pod_id, &handle).await?;
                         return Ok(handle);
                     }
-                    Err(e) => {
-                        let _ = backend.stop(tenant, namespace).await;
-                        let _ = delete_row(tenant, pg_pool).await;
-                        return Err(e);
+                    Err(spawn_err) => {
+                        // Cleanup on spawn failure. Both calls log
+                        // on failure but the original spawn error is
+                        // what we surface to the caller.
+                        if let Err(e) = backend.stop(tenant, namespace).await {
+                            tracing::warn!(
+                                target: "weft_dispatcher::listener",
+                                tenant = tenant.as_str(),
+                                namespace,
+                                error = %e,
+                                "backend.stop failed during spawn rollback"
+                            );
+                        }
+                        if let Err(e) = delete_row(tenant, pg_pool).await {
+                            tracing::warn!(
+                                target: "weft_dispatcher::listener",
+                                tenant = tenant.as_str(),
+                                error = %e,
+                                "delete_row failed during spawn rollback"
+                            );
+                        }
+                        return Err(spawn_err);
                     }
                 }
             }
             EnsureDecision::CleanupAbandoned { abandoned_namespace } => {
-                let _ = backend.stop(tenant, &abandoned_namespace).await;
+                if let Err(e) = backend.stop(tenant, &abandoned_namespace).await {
+                    tracing::warn!(
+                        target: "weft_dispatcher::listener",
+                        tenant = tenant.as_str(),
+                        namespace = abandoned_namespace.as_str(),
+                        error = %e,
+                        "backend.stop failed for abandoned listener; will retry on next ensure"
+                    );
+                }
                 delete_row(tenant, pg_pool).await?;
                 continue;
             }
@@ -962,18 +992,24 @@ async fn decide_under_lock(
 
     let Some((admin_url, row_namespace, leased_until, state_str)) = row else {
         // No row: claim Spawn. `admin_url` gets filled in by
-        // `commit_alive` once the listener Pod is up.
+        // `commit_alive` once the listener Pod is up. Arm the
+        // op-sentinel from the moment of row birth so the reaper
+        // can't snipe the row between this INSERT and the
+        // caller's later work.
+        let op_until = crate::lease::now_unix()
+            + crate::lease::SENTINEL_TTL_SECS;
         sqlx::query(
             "INSERT INTO tenant_listener \
              (tenant_id, owner_pod_id, leased_until_unix, namespace, \
-              admin_url, state) \
-             VALUES ($1, $2, $3, $4, '', $5)",
+              admin_url, state, op_in_flight_until_unix) \
+             VALUES ($1, $2, $3, $4, '', $5, $6)",
         )
         .bind(tenant.as_str())
         .bind(pod_id)
         .bind(crate::lease::now_unix() + crate::lease::LEASE_DURATION_SECS)
         .bind(namespace)
         .bind(ListenerState::Starting.as_str())
+        .bind(op_until)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1011,17 +1047,23 @@ async fn decide_under_lock(
 
     match state {
         ListenerState::Alive => {
-            // Renew the lease on every successful Use, with our pod
-            // as owner. This way ANY dispatcher pod that touches the
-            // listener keeps it alive, not just the original spawner.
+            // Renew the lease AND arm the op-sentinel on every
+            // successful Use. The lease keeps any sibling dispatcher
+            // pod from concluding the owner died; the sentinel keeps
+            // the reaper from killing the listener pod while our
+            // caller is mid-work.
+            let op_until = crate::lease::now_unix()
+                + crate::lease::SENTINEL_TTL_SECS;
             sqlx::query(
                 "UPDATE tenant_listener \
-                 SET owner_pod_id = $2, leased_until_unix = $3 \
+                 SET owner_pod_id = $2, leased_until_unix = $3, \
+                     op_in_flight_until_unix = $4 \
                  WHERE tenant_id = $1",
             )
             .bind(tenant.as_str())
             .bind(pod_id)
             .bind(crate::lease::now_unix() + crate::lease::LEASE_DURATION_SECS)
+            .bind(op_until)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -1078,13 +1120,18 @@ async fn claim_stopping(
     pod_id: &str,
 ) -> Result<bool> {
     let mut tx = begin_with_lock(pg_pool, row_lock_key(tenant.as_str())).await?;
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT state FROM tenant_listener WHERE tenant_id = $1",
+    // Read state AND the sentinel under the row-lock'd tx. If
+    // an op armed the sentinel between `try_reap_decision`'s
+    // commit and this acquisition, we see it here and bail. The
+    // reap stays correct without holding any cross-step lock.
+    let row: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT state, op_in_flight_until_unix \
+         FROM tenant_listener WHERE tenant_id = $1",
     )
     .bind(tenant.as_str())
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((state_str,)) = row else {
+    let Some((state_str, sentinel)) = row else {
         tx.commit().await?;
         return Ok(false);
     };
@@ -1093,6 +1140,15 @@ async fn claim_stopping(
         anyhow::bail!("unknown tenant_listener.state '{state_str}'");
     };
     if state != ListenerState::Alive {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let now = crate::lease::now_unix();
+    if sentinel.map_or(false, |u| u > now) {
+        // An op armed the sentinel between the reaper's
+        // try_reap_decision commit and this claim. Back off:
+        // the op is mid-flight, will finish, and the next sweep
+        // sees the row again.
         tx.commit().await?;
         return Ok(false);
     }
@@ -1142,33 +1198,49 @@ async fn read_alive_row(tenant: &TenantId, pg_pool: &PgPool) -> Result<Option<Li
 // Activate-handler keep-alive lease
 // =============================================================
 
-/// Hold a SHARED OP-lock on the tenant for the duration of an
-/// activate / TriggerSetup window. This keeps the listener from
-/// being reaped between the moment the activate handler spawns its
-/// trigger-setup worker and the moment that worker writes its first
-/// signal row.
+/// Keep the listener alive for an activate / TriggerSetup window
+/// that may span many seconds (spawning trigger-setup worker,
+/// waiting for first ctx.register_signal). Arms the per-tenant
+/// op-sentinel up-front and re-arms it on a background heartbeat
+/// until the guard is dropped.
 ///
 /// Without this, the reaper can find a window where:
-/// - status=Active is set
-/// - no signal rows exist yet (first register_signal hasn't completed)
-/// - no in-flight register_signal task exists yet (worker hasn't
-///   reached its first ctx.register_signal call)
+/// - status=Active is set,
+/// - no signal rows exist yet (first register_signal hasn't completed),
+/// - no in-flight register_signal task exists yet,
 /// and reap the freshly-spawned listener.
-#[must_use = "call `release().await` to free the keep-alive lease; \
-              Drop falls back to a fire-and-forget unlock that may \
-              not run on shutdown, leaking the lock onto the \
-              pooled connection"]
-pub struct ActivateKeepAlive {
-    inner: ListenerOpGuard,
-}
+///
+/// The heartbeat task is owned by the inner `TtlHeartbeat`; Drop
+/// aborts it. After Drop the sentinel expires by TTL: the row's
+/// `op_in_flight_until_unix` becomes stale `SENTINEL_TTL_SECS`
+/// after the last heartbeat, allowing the reaper to proceed.
+#[must_use = "the keep-alive's TtlHeartbeat aborts on Drop; \
+              hold the binding for the duration of the activate window"]
+pub struct ActivateKeepAlive(#[allow(dead_code)] crate::lease::TtlHeartbeat);
 
 impl ActivateKeepAlive {
     pub async fn acquire(pg_pool: &PgPool, tenant: &TenantId) -> Result<Self> {
-        let guard = ListenerOpGuard::acquire(pg_pool, tenant.as_str()).await?;
-        Ok(Self { inner: guard })
-    }
-
-    pub async fn release(self) {
-        self.inner.release().await;
+        // First arm is best-effort: the listener row may not yet
+        // exist (this is called from activate BEFORE TriggerSetup
+        // spawns the listener). `arm_op_sentinel` returns
+        // Ok(None) in that case; later, register_signal's spawn
+        // path arms the sentinel atomically with the INSERT.
+        // The heartbeat keeps refreshing.
+        arm_op_sentinel(pg_pool, tenant.as_str()).await?;
+        let pool = pg_pool.clone();
+        let t = tenant.clone();
+        let hb = crate::lease::TtlHeartbeat::spawn(
+            "ActivateKeepAlive",
+            crate::lease::heartbeat_interval(),
+            move || {
+                let pool = pool.clone();
+                let t = t.clone();
+                async move {
+                    arm_op_sentinel(&pool, t.as_str()).await?;
+                    Ok(())
+                }
+            },
+        );
+        Ok(Self(hb))
     }
 }

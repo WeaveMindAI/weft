@@ -202,7 +202,7 @@ pub struct SignalRegistration {
     pub auth_config: Option<Value>,
     /// Opaque per-kind state persisted at register time and read
     /// back at rehydrate time. Empty (`{}`) for most kinds. Timer
-    /// uses it to remember absolute `next_fire_at_unix` for
+    /// uses it to remember absolute `next_fire_at_unix_ms` for
     /// After-style schedules so a listener restart doesn't reset
     /// the clock. The dispatcher treats this field as opaque
     /// JSON; only the kind's handler interprets it.

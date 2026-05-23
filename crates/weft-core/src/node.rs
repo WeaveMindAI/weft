@@ -3,11 +3,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::context::ExecutionContext;
-use crate::error::WeftResult;
+use crate::error::{WeftError, WeftResult};
+use crate::infra::{InfraProvisionContext, InfraSpec};
 use crate::weft_type::WeftType;
 
 /// The core trait every node implements. Stdlib nodes in `catalog/`
 /// and user-defined nodes under `myproject/nodes/` both implement this.
+///
+/// Infra nodes (those with `metadata.requires_infra == true`)
+/// additionally implement `provision`, which returns an [`InfraSpec`]
+/// the dispatcher applies BEFORE calling `execute(phase=InfraSetup)`.
+/// Non-infra nodes leave `provision` as the default Err impl; the
+/// dispatcher never calls it for them.
 #[async_trait]
 pub trait Node: Send + Sync {
     /// Stable identifier for this node type. Must be unique across the
@@ -18,10 +25,69 @@ pub trait Node: Send + Sync {
     /// loaded from a co-located `metadata.json` via `include_str!`.
     fn metadata(&self) -> NodeMetadata;
 
+    /// Build the desired infrastructure for this node. Called by the
+    /// engine in `Phase::InfraSetup` BEFORE `execute`. Pure-ish: same
+    /// inputs as `execute`, returns the desired k8s state as a typed
+    /// value. Side effects beyond constructing the spec (registry
+    /// lookups, etc) are allowed because provision is async.
+    ///
+    /// Pulse outputs are NOT emitted from `provision`; they come
+    /// from the subsequent `execute` call in the same node task.
+    /// This keeps the trait surface honest about which method owns
+    /// each concern: provision = infra shape, execute = pulses.
+    ///
+    /// The default impl returns Err. It is only ever invoked by the
+    /// dispatcher when `metadata().requires_infra == true`; nodes
+    /// that opt in MUST override.
+    async fn provision(
+        &self,
+        _ctx: InfraProvisionContext,
+        _input: NodeInput,
+    ) -> WeftResult<InfraSpec> {
+        Err(WeftError::Config(format!(
+            "node '{}' declared requires_infra=true but did not implement Node::provision",
+            self.node_type()
+        )))
+    }
+
     /// Run this node. `ctx` provides language primitives
-    /// (`await_signal`, `report_cost`, `log`). Input values are
-    /// pre-resolved on ctx.
+    /// (`await_signal`, `report_cost`, `log`, `endpoint`). Input
+    /// values are pre-resolved on ctx.
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput>;
+}
+
+/// Input bag handed to `provision` (mirrors what `execute` reads from
+/// `ExecutionContext::input`). Same wire format; separate type so the
+/// trait signature doesn't drag an ExecutionContext through the
+/// pre-apply call site.
+#[derive(Debug, Clone, Default)]
+pub struct NodeInput {
+    pub values: std::collections::HashMap<String, Value>,
+}
+
+impl NodeInput {
+    pub fn get<T: serde::de::DeserializeOwned>(&self, port: &str) -> WeftResult<T> {
+        let v = self
+            .values
+            .get(port)
+            .ok_or_else(|| WeftError::Input(format!("missing input on port: {port}")))?;
+        serde_json::from_value(v.clone())
+            .map_err(|e| WeftError::Input(format!("port {port}: {e}")))
+    }
+
+    pub fn get_optional<T: serde::de::DeserializeOwned>(&self, port: &str) -> WeftResult<Option<T>> {
+        match self.values.get(port) {
+            None => Ok(None),
+            Some(v) if v.is_null() => Ok(None),
+            Some(v) => serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|e| WeftError::Input(format!("port {port}: {e}"))),
+        }
+    }
+
+    pub fn raw(&self, port: &str) -> Option<&Value> {
+        self.values.get(port)
+    }
 }
 
 /// Validation diagnostic. Emitted by the generic validate pass and
@@ -79,11 +145,24 @@ pub struct NodeMetadata {
     /// Configurable fields (shown in the node inspector UI).
     #[serde(default)]
     pub fields: Vec<FieldDef>,
-    /// Whether this node requires wiring to a sidecar-backed infra
-    /// node. Explicit flag in metadata.json; mirrored to
+    /// Whether this node implements `Node::provision` and needs
+    /// dispatcher-driven infrastructure (k8s pods, services, etc).
+    /// Explicit flag in metadata.json; mirrored to
     /// `NodeDefinition.requires_infra` at enrich time.
     #[serde(default)]
     pub requires_infra: bool,
+    /// Local image source directories the CLI must build for this
+    /// node. Each entry is the relative path (from the package root)
+    /// of a directory containing a `Dockerfile`. The directory's
+    /// basename becomes the name used in `Image::Local { name }` from
+    /// the node's `provision()` body. Example: `["images/bridge"]`
+    /// makes `Image::Local { name: "bridge" }` resolvable via the
+    /// InfraProvisionContext.
+    ///
+    /// Empty for non-infra nodes and for infra nodes that only use
+    /// upstream images.
+    #[serde(default)]
+    pub images: Vec<String>,
     /// Node-level semantic constraints. Small, extensible.
     #[serde(default)]
     pub features: NodeFeatures,
@@ -257,11 +336,16 @@ pub struct NodeFeatures {
     /// subgraph to execute (see docs/v2-design.md section 3.0).
     #[serde(default, rename = "isOutputDefault")]
     pub is_output_default: bool,
-    /// Sidecar spec for `requires_infra: true` nodes. Declares the
-    /// image/port/manifests the dispatcher applies during
-    /// `weft infra up`. None for non-infra nodes.
-    #[serde(default, rename = "sidecar", skip_serializing_if = "Option::is_none")]
-    pub sidecar: Option<SidecarSpec>,
+    /// Which declared `Endpoint` (by name) the dispatcher proxies
+    /// `/live` to. `Some("api")` means the node exposes a `/live`
+    /// HTTP surface (runtime status for the graph body panel) at that
+    /// endpoint; the dispatcher proxies `/projects/.../infra/nodes/{}/live`
+    /// to `<that endpoint's URL>/live`. `None` means no `/live` (the
+    /// proxy 404s). One field, no separate `has_live` flag: declaring
+    /// the endpoint IS opting in, and opting in REQUIRES naming the
+    /// endpoint, so the two can't drift out of sync.
+    #[serde(default, rename = "liveEndpoint", skip_serializing_if = "Option::is_none")]
+    pub live_endpoint: Option<String>,
     /// Hidden from node picker and describe-nodes output. Used for
     /// compiler-internal node types (Passthrough) that are real
     /// executing nodes but must not appear in user-facing tooling.
@@ -427,34 +511,6 @@ pub struct NodeOutput {
     /// One value per declared output port. Missing ports are treated
     /// as "no pulse emitted" (not "null pulse emitted").
     pub outputs: std::collections::HashMap<String, Value>,
-}
-
-/// Sidecar declaration on an infra node. Declarative; the
-/// dispatcher reads it during `weft infra up` and applies the
-/// manifests through its `InfraBackend`. Node code is never
-/// invoked during provisioning.
-///
-/// Node authors write the manifests verbatim. The dispatcher only
-/// injects the routing/cleanup labels
-/// (`weft.dev/{role,project,node,instance}`) and substitutes the
-/// `__INSTANCE_ID__`, `__NAMESPACE__`, `__SIDECAR_IMAGE__`
-/// placeholders. See `docs/authoring-nodes.md` for the contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SidecarSpec {
-    /// Short name used to construct the image tag
-    /// (e.g. `whatsapp-bridge` → `ghcr.io/weavemindai/sidecar-whatsapp-bridge:latest`).
-    pub name: String,
-    /// Port the sidecar listens on.
-    pub port: u16,
-    /// Optional path suffix for the action endpoint
-    /// (e.g. `/action`). Defaults to empty.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action_path: Option<String>,
-    /// Raw k8s manifests to apply. Required; at least one manifest
-    /// must be provided. Placeholders like `__INSTANCE_ID__` and
-    /// `__NAMESPACE__` are substituted by the infra backend before
-    /// apply.
-    pub manifests: Vec<Value>,
 }
 
 impl NodeOutput {

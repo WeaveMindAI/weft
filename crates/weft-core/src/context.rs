@@ -8,13 +8,12 @@ use serde_json::Value;
 use crate::cancellation::CancellationFlag;
 use crate::error::{WeftError, WeftResult};
 use crate::lane::Lane;
-use crate::node::SidecarSpec;
 use crate::primitive::{CostReport, SignalSpec};
 use crate::Color;
 
 /// Which lifecycle phase this invocation belongs to. v2 mirrors v1's
 /// three-runtime model: infra setup provisions long-lived resources
-/// (sidecars), trigger setup wires up listeners (opens subscriptions,
+/// (infra pods), trigger setup wires up listeners (opens subscriptions,
 /// registers URLs), and fire runs the regular execution subgraph.
 /// Nodes branch on this to do the right thing per phase.
 ///
@@ -25,13 +24,11 @@ use crate::Color;
 ///   should register.
 /// - `Fire`: the normal fire-time execution. Trigger nodes receive
 ///   the payload, their outputs flow downstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     InfraSetup,
     TriggerSetup,
-    /// Default for old-schema rows that didn't carry a phase.
-    #[default]
     Fire,
 }
 
@@ -175,43 +172,42 @@ impl ExecutionContext {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = WeftResult<Value>>,
     {
-        if let Some(value) = self.handle.run_step(name).await? {
+        // run_step returns the call_index it advanced PAST, so the
+        // record path doesn't have to read a shared counter and
+        // subtract one. The call_index travels with the value
+        // explicitly instead of via an in-RAM invariant between
+        // two trait calls.
+        let (call_index, maybe_value) = self.handle.run_step(name).await?;
+        if let Some(value) = maybe_value {
             return Ok(value);
         }
         let value = work().await?;
-        self.handle.run_record(name, &value).await?;
+        self.handle.run_record(name, call_index, &value).await?;
         Ok(value)
     }
 
     // ----- Infra primitive ----------------------------------------
 
-    /// Retrieve the cluster-local endpoint URL of this node's
-    /// sidecar. Only valid for nodes declared `requires_infra:
-    /// true` and only after `weft infra start` has run. Returns
-    /// an error otherwise.
+    /// Resolve one of this node's declared endpoints to a handle.
+    /// `name` matches an `Endpoint.name` from the InfraSpec the node
+    /// returned during `provision`. One broker round-trip; the
+    /// returned handle caches the URL and exposes `.url()` (sync)
+    /// and `.call(...)` (HTTP) without further lookups.
     ///
-    /// Node code uses this to call its sidecar (POST /action,
-    /// GET /outputs, subscribe /live). The dispatcher resolves the
-    /// URL from the `infra_pod` table so node code never touches k8s.
-    pub async fn sidecar_endpoint(&self) -> WeftResult<String> {
-        self.handle.sidecar_endpoint().await
-    }
-
-    /// Provision this node's sidecar. Called by infra nodes
-    /// during `Phase::InfraSetup`. Mirrors v1's `infra_provision`
-    /// helper: the node hands its SidecarSpec to the dispatcher,
-    /// the dispatcher applies k8s manifests via its
-    /// `InfraBackend` and returns the allocated endpoint URL.
+    /// Valid in:
+    ///   - `Phase::InfraSetup` AFTER provision + apply have succeeded;
+    ///   - `Phase::TriggerSetup` and `Phase::Fire` when the project's
+    ///     infra is Running.
     ///
-    /// Readiness polling stays on the caller: the node decides
-    /// what "ready" means (HTTP /health, a custom ping, nothing
-    /// at all). Keeping it here would force a one-size-fits-all
-    /// protocol.
-    pub async fn provision_sidecar(
-        &self,
-        spec: SidecarSpec,
-    ) -> WeftResult<SidecarHandle> {
-        self.handle.provision_sidecar(spec).await
+    /// Returns an error if the endpoint doesn't exist or the infra
+    /// isn't applied. The dispatcher resolves the URL from the
+    /// `infra_node` row so node code never touches k8s.
+    pub async fn endpoint(&self, name: &str) -> WeftResult<EndpointHandle> {
+        let url = self.handle.endpoint_url(name).await?;
+        Ok(EndpointHandle {
+            handle: self.handle.clone(),
+            url,
+        })
     }
 
     // ----- Side-effect primitives ------------------------------------
@@ -338,6 +334,59 @@ impl InputBag {
     }
 }
 
+/// HTTP method for [`EndpointHandle::call`]. GET / POST cover the
+/// catalog node patterns today. Add PUT / DELETE / PATCH when a
+/// real need surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointMethod {
+    Get,
+    Post,
+}
+
+/// Resolved handle for one of a node's declared endpoints.
+/// Obtained via `ctx.endpoint(name)`: one broker round-trip
+/// resolves the URL, the handle caches it. After that:
+///
+///   - `.url()` is a sync getter for the bare cluster-internal URL
+///     (e.g. to forward as a NodeOutput port value);
+///   - `.call(method, path, body)` issues an HTTP request to the
+///     cached URL + `path` and returns the JSON response.
+///
+/// One handle, one round-trip. No duplicate `endpoint_url`+`endpoint_call`
+/// pattern.
+#[derive(Clone)]
+pub struct EndpointHandle {
+    handle: Arc<dyn ContextHandle>,
+    url: String,
+}
+
+impl EndpointHandle {
+    /// Cluster-internal URL of this endpoint. No broker call; the
+    /// URL was resolved by `ctx.endpoint(name)`.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// HTTP call to this endpoint. `path` MUST start with `/`.
+    /// `body` is serialized as JSON for POST (None = no body).
+    /// Returns the JSON response. Non-2xx, network errors, and
+    /// non-JSON bodies all surface as `WeftError`. The cached URL
+    /// is what gets used; no second broker round-trip.
+    pub async fn call(
+        &self,
+        method: EndpointMethod,
+        path: &str,
+        body: Option<Value>,
+    ) -> WeftResult<Value> {
+        if !path.starts_with('/') {
+            return Err(WeftError::Config(format!(
+                "EndpointHandle::call path must start with '/': got '{path}'"
+            )));
+        }
+        self.handle.endpoint_call(&self.url, method, path, body).await
+    }
+}
+
 /// The runtime-facing handle. The engine crate implements this; the
 /// `Node` trait's execute receives an `ExecutionContext` that
 /// delegates to an implementation.
@@ -345,31 +394,41 @@ impl InputBag {
 pub trait ContextHandle: Send + Sync {
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value>;
     async fn register_signal(&self, spec: SignalSpec) -> WeftResult<()>;
-    async fn sidecar_endpoint(&self) -> WeftResult<String>;
-    async fn provision_sidecar(&self, spec: SidecarSpec) -> WeftResult<SidecarHandle>;
-    /// Replay-side of `ctx.run`. Returns `Some(value)` if a past
-    /// invocation of this body already executed the step at the
-    /// current call_index and journaled its output; the wrapper
-    /// returns this value without invoking the closure. Returns
-    /// `None` when the sequence-pop yielded no entry (fresh call).
-    /// `name` is author-supplied for traceability; the runtime
-    /// keys on call_index, not name.
-    async fn run_step(&self, name: &str) -> WeftResult<Option<Value>>;
+    /// Resolve the cluster-internal URL for a declared endpoint of
+    /// the current node. Used internally by
+    /// [`ExecutionContext::endpoint`] to build an `EndpointHandle`;
+    /// nodes shouldn't call this directly.
+    async fn endpoint_url(&self, name: &str) -> WeftResult<String>;
+    /// HTTP call against a pre-resolved endpoint URL. Used
+    /// internally by [`EndpointHandle::call`]; nodes shouldn't
+    /// call this directly. Takes the URL the handle cached at
+    /// `ctx.endpoint(name).await?` time so this call costs one
+    /// HTTP round-trip (the request), not two (resolve + request).
+    async fn endpoint_call(
+        &self,
+        url: &str,
+        method: EndpointMethod,
+        path: &str,
+        body: Option<Value>,
+    ) -> WeftResult<Value>;
+    /// Replay-side of `ctx.run`. Advances the call_index counter
+    /// and returns:
+    ///   - `(call_index, Some(value))` if a past invocation already
+    ///     executed at this index and journaled `value`; the
+    ///     wrapper returns `value` without invoking the closure;
+    ///   - `(call_index, None)` on the fresh path; the wrapper
+    ///     runs the closure and passes this same `call_index` back
+    ///     to `run_record`.
+    /// `call_index` is returned explicitly and threaded into
+    /// `run_record` so the two calls agree on the index by passing
+    /// it, not by each side independently reading a shared counter.
+    async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)>;
     /// Persist-side of `ctx.run`. Called only on the fresh path
-    /// (no journaled output for the current call_index). Writes a
-    /// `RunOutput` event so future replays will short-circuit.
-    async fn run_record(&self, name: &str, value: &Value) -> WeftResult<()>;
+    /// (no journaled output for the current call_index). `call_index`
+    /// is the value `run_step` returned; passing it explicitly
+    /// removes the read-counter-and-subtract-one coupling.
+    async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()>;
     async fn report_cost(&self, report: CostReport) -> WeftResult<()>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
-}
-
-/// Result of `provision_sidecar`: the handle identifies the
-/// provisioned sidecar in the infra registry, the endpoint URL
-/// is where the node should send its `/action` / `/outputs`
-/// requests at fire time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SidecarHandle {
-    pub instance_id: String,
-    pub endpoint_url: String,
 }

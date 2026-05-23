@@ -2,7 +2,7 @@
 //! cluster lifecycle and the dispatcher deployment inside it.
 //!
 //! Local dev and cloud deploy share this shape: dispatcher runs as
-//! a Pod, listener as a Pod, worker as a Pod, sidecars as Pods. The
+//! a Pod, listener as a Pod, worker as a Pod, infra as Pods. The
 //! only difference is that `start` locally uses `kind` to host the
 //! cluster and `kind load docker-image` to fill the image cache
 //! without a registry push. In cloud the same manifests get applied
@@ -24,7 +24,7 @@ use crate::images;
 ///
 /// Two namespace concepts: `system_namespace` (where the
 /// dispatcher Pod, its Service, PVC and Ingress live) and
-/// `default_user_namespace` (where workers, listeners, sidecars
+/// `default_user_namespace` (where workers, listeners, infra
 /// for tenant `local` run). Cloud adds more user namespaces, one
 /// per tenant; OSS sticks to a single one.
 pub struct ClusterConfig {
@@ -36,7 +36,16 @@ pub struct ClusterConfig {
     pub dispatcher_image: String,
     pub listener_image: String,
     pub broker_image: String,
+    pub supervisor_image: String,
     pub dispatcher_port: u16,
+    /// Cluster Service CIDR. The apiserver's ClusterIP lives in this
+    /// range; the broker NetworkPolicy allows TokenReview egress to
+    /// it, and the dispatcher gets it as env. kind's default is
+    /// `10.96.0.0/12`; a non-kind operator sets WEFT_CLUSTER_SERVICE_CIDR.
+    pub service_cidr: String,
+    /// Cluster Pod CIDR. Passed to the dispatcher for NetworkPolicy
+    /// rendering. kind's default is `10.244.0.0/16`.
+    pub pod_cidr: String,
     /// `kind` for local dev (uses `kind create` + `kind load`);
     /// `k8s` for targeting an external cluster (skips kind
     /// bootstrap, images come from whatever registry the
@@ -76,10 +85,21 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "weft-listener:local".into());
         let broker_image = std::env::var("WEFT_BROKER_IMAGE")
             .unwrap_or_else(|_| "weft-broker:local".into());
+        let supervisor_image = std::env::var("WEFT_SUPERVISOR_IMAGE")
+            .unwrap_or_else(|_| "weft-infra-supervisor:local".into());
         let dispatcher_port = std::env::var("WEFT_DISPATCHER_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(9999);
+        // Raw here; validated where they're consumed (the manifest
+        // apply, `apply_static_manifests`), not at config load: a
+        // malformed CIDR should fail the apply loudly, not break
+        // unrelated commands (stop / logs / rm) that read this config
+        // but never touch the CIDRs.
+        let service_cidr = std::env::var("WEFT_CLUSTER_SERVICE_CIDR")
+            .unwrap_or_else(|_| "10.96.0.0/12".into());
+        let pod_cidr = std::env::var("WEFT_CLUSTER_POD_CIDR")
+            .unwrap_or_else(|_| "10.244.0.0/16".into());
         let backend = match std::env::var("WEFT_CLUSTER_BACKEND")
             .as_deref()
             .ok()
@@ -96,8 +116,88 @@ impl ClusterConfig {
             dispatcher_image,
             listener_image,
             broker_image,
+            supervisor_image,
             dispatcher_port,
+            service_cidr,
+            pod_cidr,
             backend,
+        }
+    }
+}
+
+/// Validate a CIDR string. Always rejects unparseable values; when
+/// `strict` (the security-critical Service CIDR), also rejects ranges
+/// broad enough to admit public addresses, since that CIDR scopes the
+/// broker's apiserver-egress NetworkPolicy.
+fn check_cidr(raw: &str, strict: bool) -> std::result::Result<(), String> {
+    let net: ipnet::IpNet = raw.parse().map_err(|e| format!("not a valid CIDR: {e}"))?;
+    if strict {
+        // The apiserver ClusterIP lives in a private Service CIDR.
+        // Refuse anything that isn't an RFC1918 / private range, or
+        // whose prefix is so short it admits public space (e.g.
+        // `0.0.0.0/0`, `10.0.0.0/4`). A cluster Service CIDR is always
+        // a tight private block (kind: 10.96.0.0/12); a broad one here
+        // would let the broker egress to the public internet.
+        let too_broad = match net {
+            ipnet::IpNet::V4(n) => n.prefix_len() < 8 || !is_private_v4(n.network()),
+            ipnet::IpNet::V6(n) => n.prefix_len() < 8 || !n.network().is_unique_local(),
+        };
+        if too_broad {
+            return Err(
+                "too broad / not a private range; the broker's apiserver-egress \
+                 NetworkPolicy is scoped to this CIDR and a broad value would open the \
+                 broker's egress to public addresses. Use the cluster's actual (private) \
+                 Service CIDR."
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// RFC1918 + CGNAT private IPv4 ranges (10/8, 172.16/12, 192.168/16,
+/// 100.64/10). A cluster Service CIDR is always one of these.
+fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private() || matches!(ip.octets(), [100, b, ..] if (64..=127).contains(&b))
+}
+
+/// Validate both cluster CIDRs and return the `${VAR}` substitution
+/// pairs for `kubectl_apply_*` (CIDRs + the derived apiserver
+/// ClusterIP that scopes the broker's egress NetworkPolicy). The ONLY
+/// way to get the substitution vars, so a manifest carrying a
+/// placeholder can never be applied without the CIDRs having passed
+/// validation first. Validated at the apply boundary, not at config
+/// load, so commands that don't apply manifests (stop / logs / rm)
+/// aren't gated on the CIDR env being well-formed.
+fn validated_cidr_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, String)>> {
+    check_cidr(&cfg.service_cidr, true)
+        .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
+    check_cidr(&cfg.pod_cidr, false)
+        .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_POD_CIDR='{}': {e}", cfg.pod_cidr))?;
+    let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
+        .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
+    Ok(vec![
+        ("WEFT_CLUSTER_SERVICE_CIDR", cfg.service_cidr.clone()),
+        ("WEFT_CLUSTER_POD_CIDR", cfg.pod_cidr.clone()),
+        ("WEFT_APISERVER_CLUSTERIP", apiserver_ip),
+    ])
+}
+
+/// The Kubernetes apiserver's ClusterIP: by convention the FIRST
+/// usable address of the Service CIDR (kind: 10.96.0.1 for
+/// 10.96.0.0/12). The broker's egress NetworkPolicy is scoped to this
+/// single /32 so a compromised broker can reach only the apiserver
+/// (TokenReview), not every ClusterIP Service in the cluster.
+fn apiserver_clusterip(service_cidr: &str) -> std::result::Result<String, String> {
+    let net: ipnet::IpNet = service_cidr.parse().map_err(|e| format!("not a valid CIDR: {e}"))?;
+    match net {
+        ipnet::IpNet::V4(n) => {
+            let base = u32::from(n.network());
+            Ok(std::net::Ipv4Addr::from(base + 1).to_string())
+        }
+        ipnet::IpNet::V6(n) => {
+            let base = u128::from(n.network());
+            Ok(std::net::Ipv6Addr::from(base + 1).to_string())
         }
     }
 }
@@ -130,10 +230,14 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     require_binary("kubectl").await?;
     require_binary("docker").await?;
 
-    let dispatcher_built =
-        images::ensure_dispatcher_image(&cfg.dispatcher_image, rebuild).await?;
-    let listener_built = images::ensure_listener_image(&cfg.listener_image, rebuild).await?;
-    let broker_built = images::ensure_broker_image(&cfg.broker_image, rebuild).await?;
+    let dispatcher_built = images::ensure_system_image(
+        &cfg.dispatcher_image, "dispatcher.Dockerfile", rebuild).await?;
+    let listener_built = images::ensure_system_image(
+        &cfg.listener_image, "listener.Dockerfile", rebuild).await?;
+    let broker_built = images::ensure_system_image(
+        &cfg.broker_image, "broker.Dockerfile", rebuild).await?;
+    let supervisor_built = images::ensure_system_image(
+        &cfg.supervisor_image, "infra-supervisor.Dockerfile", rebuild).await?;
 
     // Re-apply k8s manifests on every restart. NetworkPolicy /
     // ClusterRole / SA-label tweaks land via the manifest files in
@@ -143,11 +247,12 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // kube-apiserver layer (resourceVersion match).
     let manifests_changed = apply_static_manifests(cfg).await?;
 
-    if dispatcher_built || listener_built || broker_built || manifests_changed {
+    if dispatcher_built || listener_built || broker_built || supervisor_built || manifests_changed {
         if cfg.backend == ClusterBackend::Kind {
             images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
             images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
             images::kind_load(&cfg.cluster_name, &cfg.broker_image).await?;
+            images::kind_load(&cfg.cluster_name, &cfg.supervisor_image).await?;
         }
         // Roll the dispatcher pod so it picks up the new image OR
         // the new manifest (e.g. an updated env var or resource
@@ -190,6 +295,9 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
             .status()
             .await;
         }
+        if supervisor_built {
+            roll_supervisor_deployments().await?;
+        }
         println!("daemon refreshed; new image / manifests rolled out");
     } else {
         println!("daemon already running with the latest images and manifests; nothing to do");
@@ -205,6 +313,15 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     let repo_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let manifests = repo_root.join("deploy/k8s");
+    // broker + dispatcher carry ${WEFT_CLUSTER_*_CIDR} placeholders
+    // (see start()) substituted from `cidr_vars`; the others have no
+    // placeholders so the same applier is a no-op substitution for
+    // them. `cluster-rbac.yaml`: ClusterRoles for the per-tenant
+    // supervisor + listener pods, bound into project namespaces by
+    // RoleBindings the dispatcher creates at register time.
+    // Cluster-scoped; in the rolling-apply list so RBAC drift (e.g.
+    // the supervisor's surface growing) stays in sync.
+    let cidr_vars = validated_cidr_vars(cfg)?;
     let mut any_changed = false;
     for name in [
         "system-namespace.yaml",
@@ -213,11 +330,13 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
         "broker.yaml",
         "dispatcher.yaml",
         "ingress.yaml",
+        "cluster-rbac.yaml",
     ] {
-        let changed = kubectl_apply_file_changed(&manifests.join(name)).await?;
-        any_changed = any_changed || changed;
+        // Every manifest goes through the same applier with the CIDR
+        // vars; substitution is a no-op for the manifests without
+        // placeholders (broker + dispatcher are the only ones today).
+        any_changed |= kubectl_apply_changed(&manifests.join(name), &cidr_vars).await?;
     }
-    let _ = cfg;
     Ok(any_changed)
 }
 
@@ -244,13 +363,15 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
         ensure_ingress_controller().await?;
     }
 
-    images::ensure_dispatcher_image(&cfg.dispatcher_image, rebuild).await?;
-    images::ensure_listener_image(&cfg.listener_image, rebuild).await?;
-    images::ensure_broker_image(&cfg.broker_image, rebuild).await?;
+    images::ensure_system_image(&cfg.dispatcher_image, "dispatcher.Dockerfile", rebuild).await?;
+    images::ensure_system_image(&cfg.listener_image, "listener.Dockerfile", rebuild).await?;
+    images::ensure_system_image(&cfg.broker_image, "broker.Dockerfile", rebuild).await?;
+    images::ensure_system_image(&cfg.supervisor_image, "infra-supervisor.Dockerfile", rebuild).await?;
     if cfg.backend == ClusterBackend::Kind {
         images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
         images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
         images::kind_load(&cfg.cluster_name, &cfg.broker_image).await?;
+        images::kind_load(&cfg.cluster_name, &cfg.supervisor_image).await?;
     }
 
     let repo_root = weft_compiler::build::resolve_weft_root()
@@ -259,14 +380,24 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     kubectl_apply_file(&manifests.join("system-namespace.yaml")).await?;
     kubectl_apply_file(&manifests.join("db-namespace.yaml")).await?;
     // No static `wm-local` namespace: the dispatcher renders the
-    // per-tenant bundle (Namespace + SAs + NetworkPolicies) on first
-    // project register via `tenant_namespace::ensure_tenant_namespace`.
+    // per-tenant bundle (Namespace + SAs + NetworkPolicies + the
+    // supervisor pod) on first project register.
     kubectl_apply_file(&manifests.join("postgres.yaml")).await?;
     wait_for_deployment_ready_in_ns("weft-postgres", &cfg.db_namespace).await?;
-    kubectl_apply_file(&manifests.join("broker.yaml")).await?;
+    // broker + dispatcher carry cluster-specific CIDRs (the broker's
+    // TokenReview-egress NetworkPolicy and the dispatcher's env);
+    // substitute them so a non-kind operator sets the CIDRs once via
+    // WEFT_CLUSTER_SERVICE_CIDR / WEFT_CLUSTER_POD_CIDR instead of
+    // hand-editing manifests.
+    let cidr_vars = validated_cidr_vars(cfg)?;
+    kubectl_apply_templated(&manifests.join("broker.yaml"), &cidr_vars).await?;
     wait_for_deployment_ready_in_ns("weft-broker", &cfg.db_namespace).await?;
-    kubectl_apply_file(&manifests.join("dispatcher.yaml")).await?;
+    kubectl_apply_templated(&manifests.join("dispatcher.yaml"), &cidr_vars).await?;
     kubectl_apply_file(&manifests.join("ingress.yaml")).await?;
+    // Cluster-scoped RBAC: ClusterRoles the supervisor + listener
+    // RoleBindings (created per project namespace by the dispatcher)
+    // reference. Applied once during daemon boot.
+    kubectl_apply_file(&manifests.join("cluster-rbac.yaml")).await?;
 
     wait_for_statefulset_ready("weft-dispatcher").await?;
     start_port_forward().await?;
@@ -534,6 +665,59 @@ async fn roll_listener_deployments(cfg: &ClusterConfig) -> Result<()> {
     Ok(())
 }
 
+/// Roll every per-tenant infra-supervisor Deployment after the
+/// supervisor image was rebuilt, so tenants pick up the new binary
+/// instead of running stale code until their pod happens to restart.
+/// Supervisors live one-per-tenant across `wm-tenant-*` namespaces.
+/// `rollout restart` has no `--all-namespaces`, so we first list the
+/// (namespace, name) pairs by role label cluster-wide, then roll each
+/// in its namespace. `rollout restart` is graceful (rolling, not a
+/// hard pod-delete). Best-effort: a failure doesn't fail the refresh
+/// (the next register reconciles), but we log it loudly.
+async fn roll_supervisor_deployments() -> Result<()> {
+    let out = kubectl(&[
+        "get",
+        "deployments",
+        "--all-namespaces",
+        "-l",
+        "weft.dev/role=infra-supervisor",
+        "-o",
+        "jsonpath={range .items[*]}{.metadata.namespace} {.metadata.name}{\"\\n\"}{end}",
+    ])
+    .output()
+    .await?;
+    if !out.status.success() {
+        tracing::warn!(
+            target: "weft_cli::daemon",
+            "listing infra-supervisor deployments failed; skipping supervisor roll"
+        );
+        return Ok(());
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let mut rolled = 0;
+    for line in listing.lines() {
+        let Some((ns, name)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let status = kubectl(&["-n", ns, "rollout", "restart", &format!("deployment/{name}")])
+            .status()
+            .await?;
+        if status.success() {
+            rolled += 1;
+        } else {
+            tracing::warn!(
+                target: "weft_cli::daemon",
+                "rollout restart {ns}/{name} failed; tenant may run a stale supervisor \
+                 until its pod restarts"
+            );
+        }
+    }
+    if rolled > 0 {
+        println!("rolled {rolled} infra-supervisor deployment(s)");
+    }
+    Ok(())
+}
+
 async fn start_port_forward() -> Result<()> {
     let cfg = cluster_config();
     fs::create_dir_all(data_dir())?;
@@ -587,32 +771,67 @@ fn kubectl(args: &[&str]) -> Command {
 }
 
 async fn kubectl_apply_file(path: &Path) -> Result<()> {
-    kubectl_apply_file_changed(path).await.map(|_| ())
+    kubectl_apply_changed(path, &[]).await.map(|_| ())
 }
 
-/// `kubectl apply -f path`. Returns true iff at least one resource
-/// in the manifest reported a change (`created` / `configured`).
-/// `unchanged` lines mean the resourceVersion-match was a no-op at
-/// the kube-apiserver. Used by `restart` to decide whether to roll
-/// the dispatcher pod.
-async fn kubectl_apply_file_changed(path: &Path) -> Result<bool> {
-    let out = kubectl(&["apply", "-f"]).arg(path).output().await?;
+async fn kubectl_apply_templated(path: &Path, vars: &[(&str, String)]) -> Result<()> {
+    kubectl_apply_changed(path, vars).await.map(|_| ())
+}
+
+/// The one `kubectl apply` path. Reads the manifest, substitutes
+/// `${VAR}` placeholders from `vars` (empty for manifests with no
+/// placeholders), pipes the result to `kubectl apply -f -`, and
+/// reports whether any resource changed (`created`/`configured`, vs
+/// the `unchanged` no-op `restart` uses to decide whether to roll the
+/// dispatcher pod). Always fails loud on a leftover `${...}` so a
+/// typo'd or unpassed placeholder can never apply literally to the
+/// cluster, regardless of which manifest it's in.
+async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<bool> {
+    let mut manifest = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    for (key, value) in vars {
+        manifest = manifest.replace(&format!("${{{key}}}"), value);
+    }
+    if let Some(idx) = manifest.find("${") {
+        let tail = &manifest[idx..(idx + 40).min(manifest.len())];
+        anyhow::bail!(
+            "unsubstituted placeholder in {} near `{tail}`: pass it in `vars`",
+            path.display()
+        );
+    }
+    use tokio::io::AsyncWriteExt;
+    let mut child = kubectl(&["apply", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn kubectl apply: {e}"))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(manifest.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write manifest to kubectl stdin: {e}"))?;
+    let out = child.wait_with_output().await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("kubectl apply -f {} failed: {stderr}", path.display());
+        anyhow::bail!("kubectl apply ({}) failed: {stderr}", path.display());
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Lines look like:
-    //   `networkpolicy.networking.k8s.io/foo created`
-    //   `networkpolicy.networking.k8s.io/foo configured`
-    //   `networkpolicy.networking.k8s.io/foo unchanged`
-    let changed = stdout.lines().any(|l| {
-        let trimmed = l.trim();
-        !trimmed.is_empty()
-            && !trimmed.ends_with(" unchanged")
-    });
     print!("{stdout}");
-    Ok(changed)
+    Ok(apply_output_reported_change(&stdout))
+}
+
+/// True iff a `kubectl apply` stdout reports at least one changed
+/// resource. Lines look like `networkpolicy.../foo created` /
+/// `configured` / `unchanged`; only `unchanged` is a no-op.
+fn apply_output_reported_change(stdout: &str) -> bool {
+    stdout.lines().any(|l| {
+        let trimmed = l.trim();
+        !trimmed.is_empty() && !trimmed.ends_with(" unchanged")
+    })
 }
 
 async fn require_binary(name: &str) -> Result<()> {
@@ -646,4 +865,50 @@ fn signal_term(pid: i32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apiserver_clusterip, check_cidr};
+
+    #[test]
+    fn rejects_unparseable_cidr() {
+        assert!(check_cidr("not-a-cidr", false).is_err());
+        assert!(check_cidr("10.0.0.0/99", false).is_err());
+    }
+
+    #[test]
+    fn strict_accepts_tight_private_ranges() {
+        // kind default + the common private Service CIDRs.
+        assert!(check_cidr("10.96.0.0/12", true).is_ok());
+        assert!(check_cidr("172.20.0.0/16", true).is_ok());
+        assert!(check_cidr("192.168.0.0/16", true).is_ok());
+    }
+
+    #[test]
+    fn strict_rejects_the_containment_breach_cases() {
+        // The whole point: a broad / public CIDR here would open the
+        // broker's apiserver-egress NetworkPolicy to the internet.
+        assert!(check_cidr("0.0.0.0/0", true).is_err());
+        assert!(check_cidr("10.0.0.0/4", true).is_err()); // prefix too short
+        assert!(check_cidr("8.8.8.0/24", true).is_err()); // public range
+    }
+
+    #[test]
+    fn non_strict_allows_any_valid_cidr() {
+        // The pod CIDR isn't the containment boundary; only parse-check it.
+        assert!(check_cidr("0.0.0.0/0", false).is_ok());
+        assert!(check_cidr("10.244.0.0/16", false).is_ok());
+    }
+
+    #[test]
+    fn apiserver_clusterip_is_first_address_of_service_cidr() {
+        // The broker egress NetworkPolicy is scoped to this /32, so it
+        // must be the apiserver's real ClusterIP (network + 1).
+        assert_eq!(apiserver_clusterip("10.96.0.0/12").unwrap(), "10.96.0.1");
+        assert_eq!(apiserver_clusterip("172.20.0.0/16").unwrap(), "172.20.0.1");
+        // IPv6: same network+1 derivation (the egress /32 is security-critical).
+        assert_eq!(apiserver_clusterip("fd00::/108").unwrap(), "fd00::1");
+        assert!(apiserver_clusterip("garbage").is_err());
+    }
 }

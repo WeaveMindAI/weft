@@ -119,19 +119,23 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # AND of namespace-label and pod-label: only worker / listener
-    # pods in tenant namespaces. Sidecars are user-defined code and
-    # have no business calling the broker; if a sidecar later needs
-    # DB-fronting, it gets its own role and a separate allow rule.
+    # Worker / listener / infra-supervisor pods reach the broker
+    # from two namespace flavors:
+    #   - `weft.dev/role=tenant` (listener, infra-supervisor live there)
+    #   - `weft.dev/role=project` (worker pods live there post-v2)
+    # The pod label filter narrows to the three roles that are
+    # actually allowed to call the broker.
     - from:
         - namespaceSelector:
-            matchLabels:
-              weft.dev/role: tenant
+            matchExpressions:
+              - key: weft.dev/role
+                operator: In
+                values: [tenant, project]
           podSelector:
             matchExpressions:
               - key: weft.dev/role
                 operator: In
-                values: [worker, listener]
+                values: [worker, listener, infra-supervisor]
       ports:
         - protocol: TCP
           port: 9090
@@ -170,22 +174,19 @@ spec:
           port: 53
     # kube-apiserver (TokenReview).
     #
-    # The apiserver doesn't live in a Pod we can pod-select; the
-    # only reliable selector is its ClusterIP via ipBlock. The
-    # cluster Service CIDR is operator-defined: kind's default is
-    # 10.96.0.0/12 (apiserver lives at 10.96.0.1). For other
-    # distros, replace this CIDR via the `setup.sh` install path
-    # (which substitutes ${WEFT_APISERVER_CIDR} at apply time).
-    #
-    # Refusing to allow internet egress here is the whole point: a
-    # compromised broker (RCE in a handler) cannot reach external
-    # services with the SA token, and only TokenReview is a
-    # legitimate destination.
+    # The apiserver doesn't live in a Pod we can pod-select; the only
+    # reliable selector is its ClusterIP via ipBlock. We scope to the
+    # apiserver's SINGLE ClusterIP /32 (the first address in the
+    # Service CIDR; kind: 10.96.0.1), NOT the whole Service CIDR.
+    # Scoping to the CIDR would let a compromised broker reach every
+    # other ClusterIP Service in the cluster on 443; this rule's whole
+    # purpose is that only TokenReview (the apiserver) is reachable.
+    # The `weft daemon` apply path substitutes ${WEFT_APISERVER_CLUSTERIP}
+    # (derived from the validated Service CIDR's .1) so a non-kind
+    # operator with a different CIDR gets the right address.
     - to:
         - ipBlock:
-            cidr: 10.96.0.0/12
+            cidr: ${WEFT_APISERVER_CLUSTERIP}/32
       ports:
         - protocol: TCP
           port: 443
-        - protocol: TCP
-          port: 6443

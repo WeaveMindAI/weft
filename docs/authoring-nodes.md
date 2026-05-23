@@ -397,210 +397,285 @@ load), the durable-replay model works against you. A future
 let you opt into a warm-worker model where the future actually
 awaits and the worker pod stays alive. Not yet implemented.
 
-## Infra nodes: declaring a sidecar
+
+## Infra nodes: long-running backing services
 
 Some nodes need a long-running process the user can't easily run
-themselves: a WhatsApp bridge daemon, a headless browser session, a
-local LLM server. Weft calls those *infra nodes*. The pattern: the
-node declares Kubernetes manifests in its `metadata.json`, the
-dispatcher applies them during `weft infra start`, and the node
-talks to the running pod over HTTP at fire time.
+themselves: a WhatsApp bridge daemon, a headless browser, a local LLM
+server, a database. Weft calls those *infra nodes*. The pattern: the
+node returns a typed `InfraSpec` from `provision()`, the supervisor
+compiles it to Kubernetes manifests and applies them, and the node
+talks to the running pod(s) over HTTP at fire time.
 
-### The lifecycle
+You never write Kubernetes YAML by hand. You build an `InfraSpec` with
+typed Rust structs (`Container`, `Endpoint`, `Volume`, ...); the
+compiler turns it into Deployments, Services, PVCs, NetworkPolicies,
+HPAs, and stamps all the `weft.dev/*` labels for you.
 
-`weft infra start` spawns a worker in `Phase::InfraSetup`. Only
-nodes with `requires_infra: true` and their upstream dependencies
-run. Each infra node's body calls `ctx.provision_sidecar(spec)`;
-the dispatcher applies the manifests through `kubectl apply` and
-returns a handle with the pod's ClusterIP service URL.
+### Two methods: `provision` and `execute`
 
-In `Phase::Fire` and `Phase::TriggerSetup`, the same node calls
-`ctx.sidecar_endpoint()` to fetch the URL and makes HTTP requests
-to the running sidecar. The pod is shared across every execution;
-the node never spawns it itself.
+An infra node sets `requires_infra: true` in `metadata.json` and
+implements two methods:
 
-`weft infra stop` scales the Deployment to 0 (keeps state on PVC,
-keeps the Service so the URL stays stable). `weft infra terminate`
-sweeps everything by the `weft.dev/instance=<id>` label the
-dispatcher injected at apply time. `weft infra upgrade` is a
-scale-to-zero plus a fresh provision with a new image hash.
+- **`provision(ctx, input) -> InfraSpec`**: returns the desired infra
+  shape. Pure: it emits no pulses, it just describes what should run.
+  Runs in `Phase::InfraSetup`, before `execute`. The `ctx`
+  (`InfraProvisionContext`) carries `project_id`, `node_id`,
+  `namespace`, `tenant_id`. The default impl returns an error, so only
+  infra nodes override it.
+- **`execute(ctx) -> NodeOutput`**: the node's actual logic, same as
+  any node. By the time `execute` runs, the infra is applied and the
+  node can resolve its endpoints.
 
-### Node code
+The split is the rule: **provision describes infra, execute produces
+pulses.** Provision can do async work (a registry lookup) but its job
+is the spec.
 
 ```rust
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
-    match ctx.phase {
-        Phase::InfraSetup => {
-            let meta: NodeMetadata = serde_json::from_str(METADATA_JSON)?;
-            let spec = meta.features.sidecar.ok_or_else(|| {
-                WeftError::Config("missing sidecar spec".into())
-            })?;
-            let handle = ctx.provision_sidecar(spec).await?;
-            Ok(NodeOutput::empty()
-                .set("endpointUrl", Value::String(handle.endpoint_url)))
-        }
-        Phase::Fire | Phase::TriggerSetup => {
-            let url = ctx.sidecar_endpoint().await?;
-            let resp = reqwest::Client::new()
-                .get(format!("{url}/outputs"))
-                .send().await?;
-            // ... forward fields to output ports
-        }
-    }
+async fn provision(&self, _ctx: InfraProvisionContext, _input: NodeInput)
+    -> WeftResult<InfraSpec>
+{
+    const PORT: u16 = 8090;
+    Ok(InfraSpec {
+        units: vec![Unit {
+            name: "bridge".into(),
+            on_upgrade: UpgradeBehavior::Recreate,
+            containers: vec![
+                Container::new("whatsapp", Image::Local { name: "bridge".into() })
+                    .with_env(vec![EnvEntry::Literal { name: "PORT".into(), value: PORT.to_string() }])
+                    .with_ports(vec![ContainerPort { name: "http".into(), port: PORT, protocol: Protocol::Tcp }])
+                    .with_readiness(Probe::http("/health", PORT).with_initial_delay(5)),
+            ],
+            ..Default::default()
+        }],
+        endpoints: vec![Endpoint {
+            name: "api".into(), unit: "bridge".into(), container: "whatsapp".into(),
+            port: "http".into(), expose: Expose::ClusterInternal,
+        }],
+        ..Default::default()
+    })
 }
 ```
 
-### The manifest contract
+### The `InfraSpec` reference
 
-You write `metadata.json` by hand. `features.sidecar.manifests` is a
-list of raw Kubernetes documents. At minimum you need a `Deployment`
-running your container and a `Service` exposing the port. You can
-add anything else (`PersistentVolumeClaim`, `ConfigMap`, `Secret`,
-`Ingress`, ...) and the dispatcher will apply each one.
+Everything reachable from `InfraSpec` (in `weft-core/src/infra/types.rs`).
+Maps are `BTreeMap` (not `HashMap`) on purpose: the compiled spec is
+hashed for drift detection and HashMap iteration order would randomize
+the hash.
 
-The dispatcher substitutes three placeholders in every document
-before `kubectl apply`:
+**`InfraSpec`** (all fields default, so `InfraSpec::default()` is valid):
+- `units: Vec<Unit>`: pod templates. Most nodes have one.
+- `volumes: Vec<Volume>`: PVCs / emptyDir / mounted ConfigMaps+Secrets.
+- `config: Vec<ConfigSource>`: Secrets / ConfigMaps to create, inline or by ref.
+- `endpoints: Vec<Endpoint>`: named ports exposed via Services.
+- `access: Access`: NetworkPolicy ingress/egress (default: workers in, internet out).
+- `lifecycle: Lifecycle`: terminate policy (PVC preservation).
+- `extras: Vec<Value>`: raw k8s manifests for things the typed surface doesn't model. Labels get stamped automatically.
 
-| Placeholder         | Replaced with                                            |
-| ------------------- | -------------------------------------------------------- |
-| `__INSTANCE_ID__`   | Per-instance pod name (used as Deployment/Service name). |
-| `__NAMESPACE__`     | Tenant namespace (e.g. `wm-tenant-foo`).                 |
-| `__SIDECAR_IMAGE__` | Hash-tagged image `weft-sidecar-{name}:{hash}`.          |
+**`Unit`** (one Pod template; the *operational* unit, see lifecycle below):
+- `name` (required), `kind: UnitKind` (`Deployment` default / `StatefulSet` / `DaemonSet` / `Job`).
+- `containers`, `init_containers`, `pod_options`.
+- `scaling: ScalingPolicy`: `replicas` + optional `autoscale` (HPA). Per-unit.
+- `on_upgrade: UpgradeBehavior`: `Rolling{...}` (default) or `Recreate`. Per-unit; only honored for Deployments.
+- `on_stop: StopBehavior`: `ScaleToZero` (default) or `NoOp`. Per-unit. See "Stop behavior" below.
+- `health: UnitHealth`: per-unit flaky/recovery window overrides (`flaky_after_seconds`, `recovery_after_seconds`); unset = supervisor defaults (30s).
 
-The dispatcher also injects four labels into every document's
-`metadata.labels`:
+**`Container`** (no `Default`, image is mandatory): build with
+`Container::new(name, image)` then chain `.with_env / .with_ports /
+.with_resources / .with_mounts / .with_readiness / .with_liveness /
+.with_startup / .with_command / .with_args / .with_security_context /
+.with_pre_stop`. `pre_stop` is a k8s preStop hook for graceful
+shutdown; **Weft calls no Rust callback at stop time**, graceful
+shutdown lives entirely in the container.
 
+**`Image`**: `Image::Local { name }` (built from a dir in the node's
+`images`, hash-tagged by the CLI) or `Image::Upstream { reference }`
+(e.g. `"postgres:16"`). The local name is the directory basename of an
+entry in `metadata.images`.
+
+**`Endpoint`**: `name`, `unit`, `container`, `port` (the named
+`ContainerPort`), `expose` (`ClusterInternal` default / `TenantPublic{path}`
+/ `NodePort{port}`). The (unit, container, port) chain is validated at
+compile.
+
+**`Volume`** (`VolumeKind`): `Persistent { size, storage_class?, access_modes }`
+(PVC, preserved across stop+upgrade, deleted on terminate unless in
+`preserve_pvcs`), `EmptyDir`, `ConfigMap`, `Secret`.
+
+**`Access`**: ingress rules (`FromWorkers` default, `FromNode`,
+`FromInternet`, `FromCidrs`, `FromLabel`) + egress (`ToInternet`
+default, `ToNode`, `ToCidrs`). Compiles to one NetworkPolicy on top of
+the namespace baseline.
+
+**`ScalingPolicy` / `AutoscaleSpec`**: static `replicas`, or an HPA
+(`min/max_replicas`, `metrics` of CPU/Memory/Custom utilization).
+
+The compiler validates DNS-1123 names, uniqueness per kind, and the
+endpoint chains; a bad spec fails the apply loud (the node shows
+`Failed` with the reason).
+
+### Talking to your infra: `ctx.endpoint(name)`
+
+At fire time, the node resolves an endpoint **by name**:
+
+```rust
+let api = ctx.endpoint("api").await?;     // one broker round-trip, caches the URL
+let out = api.call(EndpointMethod::Get, "/outputs", None).await?;  // HTTP
+let url = api.url();                       // bare service URL (no path, no trailing /)
 ```
-weft.dev/role: infra
-weft.dev/project: <project_id>
-weft.dev/node: <infra_node_id>
-weft.dev/instance: <instance_id>
+
+`ctx.endpoint("api")` returns an `EndpointHandle` that caches the
+cluster-internal URL (`<scheme>://<instance>-<name>.<ns>.svc.cluster.local:<port>`).
+`.url()` is the bare URL; `.call(method, path, body)` does one HTTP
+round-trip against it. The endpoint resolves only when the **whole
+node is running** (all its units up): an endpoint is a front door to
+the node, so a request must not land while a sibling unit is degraded.
+
+**Endpoint resolution is by-name and per-node.** Only the node that
+*declared* the endpoint can call `ctx.endpoint(name)`. A sibling node
+(e.g. a "send" node targeting a "bridge" node) gets the URL by the
+bridge **explicitly exporting it as an output port** and wiring it
+downstream:
+
+```rust
+// bridge node, in execute:
+let api = ctx.endpoint("api").await?;
+Ok(NodeOutput::empty().set("apiUrl", Value::String(api.url().to_string())))
+
+// send node, in execute: reads the wired URL, appends its own path
+let base = ctx.input.get("apiUrl")?;       // the bridge's exported URL
+let resp = post(format!("{}/action", base.trim_end_matches('/')), body).await?;
 ```
 
-The `weft.dev/instance` label is what `weft infra terminate` uses
-to sweep every resource owned by one provision. Anything you ship
-in `manifests` gets that label, so a custom PVC or ConfigMap is
-cleaned up alongside the Deployment.
+The author chooses what to send downstream; there's no magic
+auto-exported URL. With multiple endpoints, export each by name.
 
-### Minimal example
+### Container-exposed HTTP routes (the capability contracts)
 
-A stateless HTTP sidecar needs three documents in `manifests`:
+These are routes your container serves; Weft (or other nodes) call
+them. Implement the ones you need.
+
+| Route | Method | Who calls it | Contract |
+| --- | --- | --- | --- |
+| `/health` (or any path) | GET | the k8s readiness probe | Return 2xx when ready. Wire it via `Probe::http("/health", port)` on the container. The path is whatever you pass to `Probe`. |
+| `/live` | GET | the dispatcher proxy (graph body panel) | Return `{ "items": [{ "type": "text"\|"image", "label": "...", "data": "..." }] }`. The graph polls this every 3s and renders the items (a QR code, a status line). Opt in by setting `features.liveEndpoint` to the endpoint name (below). |
+| `/outputs` | GET | the declaring node's own `execute` | Return a flat JSON object; the node folds each key into an output port. The key set must match the node's declared `outputs` in metadata.json (a hand-maintained contract, not enforced). |
+| `/action`, `/events`, ... | any | sibling nodes via the wired URL | Your own convention. e.g. a send node POSTs `/action`, a receive node opens an SSE stream at `/events`. The route names live in the node code, the URL comes from the wired endpoint export. |
+
+`/live` is special because the *dispatcher* (not a node) calls it, so
+it needs to know which endpoint serves it. Declare it in metadata:
 
 ```json
-[
-  {
-    "apiVersion": "apps/v1",
-    "kind": "Deployment",
-    "metadata": { "name": "__INSTANCE_ID__" },
-    "spec": {
-      "replicas": 1,
-      "selector": { "matchLabels": { "app": "__INSTANCE_ID__" } },
-      "template": {
-        "metadata": { "labels": { "app": "__INSTANCE_ID__" } },
-        "spec": {
-          "containers": [{
-            "name": "sidecar",
-            "image": "__SIDECAR_IMAGE__",
-            "ports": [{ "containerPort": 8080 }]
-          }]
-        }
-      }
-    }
-  },
-  {
-    "apiVersion": "v1",
-    "kind": "Service",
-    "metadata": { "name": "__INSTANCE_ID__" },
-    "spec": {
-      "selector": { "app": "__INSTANCE_ID__" },
-      "ports": [{ "port": 8080, "targetPort": 8080 }]
-    }
-  }
-]
+"features": { "liveEndpoint": "api" }
 ```
 
-That's enough to provision and reach the pod from your node. See
-`catalog/whatsapp/bridge/metadata.json` for a full example with
-persistence and a readiness probe.
+`liveEndpoint` names the endpoint whose URL the dispatcher appends
+`/live` to. Unset = no `/live` (the graph shows no body panel). There
+is no separate `hasLive` flag: naming the endpoint *is* opting in.
+
+### Node packaging
+
+```
+catalog/whatsapp/
+  package.toml          # shared cargo deps for all nodes in the package
+  bridge/
+    mod.rs              # the node impl
+    metadata.json       # requires_infra, images, features, ports
+    deps.toml           # per-node cargo deps
+    images/bridge/      # Dockerfile + source for the Image::Local "bridge"
+```
+
+`metadata.json` for an infra node:
+
+```json
+{
+  "type": "WhatsAppBridge",
+  "requires_infra": true,
+  "images": ["images/bridge"],
+  "outputs": [ { "name": "apiUrl", "type": "String" }, ... ],
+  "features": { "liveEndpoint": "api" }
+}
+```
+
+Each entry in `images` is a directory (relative to the package root)
+containing a `Dockerfile`; its basename is the `Image::Local { name }`.
+The CLI hashes the dir, tags `weft-infra-{name}:{hash}`, and (for kind)
+loads it into the cluster.
+
+### Lifecycle: stop, start, upgrade, terminate
+
+The unit is the *operational* granularity. Each `Unit` independently
+has a status (running / stopped / flaky / ...) and a `on_stop`.
+
+**`weft infra start`** brings *down* units up to spec. Units that are
+already up are left untouched (something downstream may depend on them
+running). So a plain start never disturbs a running unit.
+
+**`weft infra stop`** takes units down per their `on_stop`:
+- `ScaleToZero` (default): scale the unit's workloads to 0. PVCs and
+  Services are kept (the endpoint URL stays stable), so a later start
+  brings it back fast.
+- `NoOp`: the unit **stays up**. Use it for a unit that's expensive or
+  slow to recreate (a model that took an hour to download, a license
+  server with live sessions) and that downstream work depends on. Only
+  terminate, or an explicit force-stop, takes a NoOp unit down.
+
+**`weft infra upgrade`** is just **stop then start**: it stops
+(respecting `on_stop`) then starts. ScaleToZero units cycle onto the
+new spec; NoOp units stayed up through the stop, so start leaves them
+**frozen at their current version**.
+
+**Updating a frozen (NoOp) unit** requires an explicit force-stop:
+
+```
+weft infra node-stop <node_id> --force   # ignores on_stop, scales the node's units to 0
+weft infra start                         # recreates them at the new spec
+```
+
+`--force` is the conscious "I accept the downtime, take it down so I can
+update it" override. The graph's per-node right-click "stop" uses
+`--force` automatically (you explicitly picked one node, so its NoOp
+units come down too).
+
+**`weft infra terminate`** deletes everything for the node (all units,
+PVCs unless listed in `lifecycle.on_terminate.preserve_pvcs`). Deleting
+a node from the graph terminates it on the next sync (orphan reap);
+removing a single *unit* from a node's spec terminates that unit's
+workloads on the next apply.
+
+### Health
+
+The supervisor watches each unit's replicas. A unit continuously
+below its readiness threshold for `flaky_after_seconds` (default 30)
+is marked `flaky`; continuously ready for `recovery_after_seconds`
+returns it to `running`. Health is per-unit: one flaky sidecar doesn't
+drag a healthy primary down, and a project's HealthProtocols can target
+a specific unit (`NodeReadyReplicas { node_id, unit, ... }`) for
+remediation (bounce pods, scale, park triggers). Override the windows
+per unit via `Unit.health`.
 
 ### Security and resources: your call
 
-The dispatcher applies whatever you ship verbatim. **No security
-context, resource limits, or capability drops are added on your
-behalf.** A sidecar that runs as root with no CPU limit will start
-without complaint.
+The compiler stamps labels and namespaces but adds **no security
+context or resource limits on your behalf**. Cross-tenant isolation
+comes from the namespace boundary and the baseline NetworkPolicies; a
+runaway container can still starve its node. To be a good citizen, set
+`Resources` (cpu/memory requests+limits) on the container and a
+`ContainerSecurityContext` / `PodSecurityContext` (run as non-root,
+read-only root fs, drop capabilities, `RuntimeDefault` seccomp) to
+satisfy the k8s `restricted` baseline. Your image has to cooperate
+(run as the chosen UID, tolerate a read-only root). If it can't, skip
+it; within your own namespace you can do what you want.
 
-Cross-tenant isolation comes from the namespace boundary and the
-NetworkPolicies the dispatcher applies once per tenant; nothing
-about your pod's internal posture affects other tenants. But a
-runaway sidecar can starve the kubernetes node it lands on, and a
-compromised sidecar that runs as root can do more damage to itself
-than a hardened one.
+### Limitations to know
 
-If you want to be a good citizen, add the following to the
-container spec:
-
-```json
-"resources": {
-  "requests": { "cpu": "100m", "memory": "128Mi" },
-  "limits":   { "cpu": "500m", "memory": "512Mi" }
-},
-"securityContext": {
-  "allowPrivilegeEscalation": false,
-  "readOnlyRootFilesystem": true,
-  "capabilities": { "drop": ["ALL"] }
-}
-```
-
-And at the pod level (inside `spec.template.spec`):
-
-```json
-"securityContext": {
-  "runAsNonRoot": true,
-  "runAsUser": 65532,
-  "runAsGroup": 65532,
-  "fsGroup": 65532,
-  "seccompProfile": { "type": "RuntimeDefault" }
-}
-```
-
-These satisfy the Kubernetes Pod Security `restricted` baseline.
-Your image has to cooperate: it must run as UID 65532 with `/`
-mounted read-only. Most Go and Rust images do this trivially; many
-Python images need a writable `/tmp` mounted via `emptyDir`. If
-your image can't comply, skip the hardening; within your own
-namespace you can do whatever you want.
-
-### Network policy
-
-Each tenant namespace gets a set of NetworkPolicies applied at
-provisioning time (see `tenant_namespace.rs`):
-
-- **default-deny**: drops every pod's ingress and egress by default.
-- **worker-policy**: workers can reach the broker, sidecars in their
-  own namespace, and the internet. They cannot reach pods in other
-  tenant namespaces.
-- **listener-policy**: listeners can reach the broker and accept
-  HTTP from the dispatcher.
-- **sidecar-policy**: sidecars accept ingress from workers in the
-  same namespace. They can call out to the internet.
-
-You don't need to add anything; the labels the dispatcher injects
-(`weft.dev/role: infra`) are the selectors the policies match. If
-your sidecar needs to talk to another pod inside the same
-namespace, that traffic is allowed by default; cross-namespace is
-blocked.
-
-### Image building
-
-Sidecar images are built by the CLI from a `Dockerfile` in the
-node's directory. The CLI hashes the build context, tags the
-image as `weft-sidecar-{name}:{shorthash}`, and writes the hash
-into the `/infra/start` request body. The dispatcher uses that
-hash to construct `__SIDECAR_IMAGE__`. Drift detection compares
-running vs desired hash to light up the "Upgrade infra"
-affordance.
-
-If you change the sidecar source, the hash changes and `weft infra
-upgrade` is the path to apply the new image (scales the old pod
-to zero, provisions a new one, returns the new handle).
+- **Upstream mutable image tags don't trigger drift.** `Image::Upstream`
+  with a tag like `:latest` is passed through verbatim; Weft does not
+  resolve it to a digest. If the tag rolls underneath you, the spec
+  hash doesn't change, so the graph won't surface "upgrade available".
+  `weft infra upgrade` still re-applies manually if you know there's a
+  new version. Use a digest (`@sha256:...`) for reproducibility.
+- **`/outputs` <-> output ports is a convention**, not enforced: keep
+  your container's `/outputs` keys in sync with `metadata.json`
+  `outputs` by hand.

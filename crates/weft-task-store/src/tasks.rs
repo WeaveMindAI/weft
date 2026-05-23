@@ -8,8 +8,9 @@
 //! success (Pod crash mid-task). Cluster ops should treat
 //! "already exists" as success.
 //!
-//! Dedup: a partial unique index on `(kind, dedup_key)` for live
-//! rows lets producers attach to in-flight work via `enqueue_dedup`.
+//! Dedup: a partial unique index on `(tenant_id, kind, dedup_key)`
+//! for live rows lets producers attach to in-flight work via
+//! `enqueue_dedup`. Tenant-scoped so dedup never crosses tenants.
 
 use std::time::Duration;
 
@@ -73,7 +74,12 @@ impl TaskTarget {
 
 /// A row from the `task` table. Producers fill `NewTask`; consumers
 /// receive `Task` from `claim_one`.
-#[derive(Debug, Clone)]
+///
+/// Derives serde directly: this is also the wire shape used by
+/// `weft-broker-client::protocol`. A new field on this struct
+/// shows up on the wire automatically; no mirror type to keep in
+/// sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
     pub kind: String,
@@ -84,7 +90,10 @@ pub struct Task {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone)]
+/// Producer-side spec for enqueuing a task. Serializable for the
+/// same reason as `Task`: it's the wire shape on
+/// `/v1/task/enqueue_dedup`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewTask {
     pub kind: TaskKind,
     pub target: TaskTarget,
@@ -101,7 +110,11 @@ pub struct NewTask {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone)]
+/// Filter on which kinds of tasks the caller wants to claim.
+/// Internally-tagged serde shape so the wire form is
+/// `{"kind": "dispatcher"}` or `{"kind": "worker", "project_id": "..."}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClaimFilter {
     Dispatcher,
     Worker { project_id: String },
@@ -159,8 +172,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         r#"CREATE INDEX IF NOT EXISTS idx_task_claimed_expired
             ON task(claimed_until_unix)
             WHERE status = 'claimed'"#,
+        // Tenant-scoped: isolation is enforced by the index itself,
+        // not by the convention that every dedup_key embeds a
+        // scope-checked resource. Two tenants can never collide on /
+        // suppress each other's dedup tasks even if a future task kind
+        // uses a non-scope-checked dedup_key.
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup_live
-            ON task(kind, dedup_key)
+            ON task(tenant_id, kind, dedup_key)
             WHERE dedup_key IS NOT NULL AND status IN ('pending', 'claimed')"#,
         r#"CREATE INDEX IF NOT EXISTS idx_task_color
             ON task(color)
@@ -208,15 +226,16 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
 }
 
 /// Insert with dedup. If a pending or claimed task with the same
-/// `(kind, dedup_key)` already exists, returns its id without
-/// inserting.
+/// `(tenant_id, kind, dedup_key)` already exists, returns its id
+/// without inserting.
 ///
 /// Concurrency: a transaction-scoped advisory lock keyed on
-/// `hashtextextended(kind || dedup_key, 0)` serializes concurrent
-/// callers on the same dedup key. Without the lock, two producers
-/// could both pass the SELECT (their snapshots don't see each
-/// other's uncommitted INSERT) and the second would hit a unique-
-/// violation on the partial index instead of returning AlreadyLive.
+/// `hashtextextended("{tenant}|{kind}|{dedup_key}", 0)` serializes
+/// concurrent callers on the same (tenant, kind, dedup_key). Without
+/// the lock, two producers could both pass the SELECT (their snapshots
+/// don't see each other's uncommitted INSERT) and the second would hit
+/// a unique-violation on the partial index instead of returning
+/// AlreadyLive.
 pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome> {
     let dedup = spec
         .dedup_key
@@ -224,7 +243,13 @@ pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome>
         .ok_or_else(|| anyhow::anyhow!("enqueue_dedup requires dedup_key"))?;
 
     let mut tx = pool.begin().await?;
-    let lock_input = format!("{}|{}", spec.kind.as_str(), dedup);
+    // Lock + SELECT are scoped by tenant_id to match the
+    // `(tenant_id, kind, dedup_key)` unique index: dedup never crosses
+    // a tenant boundary. (`tenant_id IS NOT DISTINCT FROM $3` so a
+    // NULL-tenant task dedups against other NULL-tenant tasks, matching
+    // how the unique index treats them.)
+    let tenant = spec.tenant_id.as_deref().unwrap_or("");
+    let lock_input = format!("{}|{}|{}", tenant, spec.kind.as_str(), dedup);
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&lock_input)
         .execute(&mut *tx)
@@ -232,9 +257,11 @@ pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome>
 
     let existing: Option<(Uuid,)> = sqlx::query_as(
         r#"SELECT id FROM task
-           WHERE kind = $1 AND dedup_key = $2 AND status IN ('pending', 'claimed')
+           WHERE tenant_id IS NOT DISTINCT FROM $1
+             AND kind = $2 AND dedup_key = $3 AND status IN ('pending', 'claimed')
            LIMIT 1"#,
     )
+    .bind(spec.tenant_id.as_deref())
     .bind(spec.kind.as_str())
     .bind(dedup)
     .fetch_optional(&mut *tx)
@@ -295,6 +322,18 @@ pub async fn claim_one(
     // tasks be addressed to one specific pod in a multi-pod pool.
     // Tasks without an address are claimable by any pod matching
     // the (target, project) scope.
+    // Worker-target claims must verify the picking pod is still
+    // alive in `worker_pod`. Without this, a pod that's been marked
+    // dead (e.g. by replace_stale_worker_if_needed during a sync that
+    // bumped the source_hash) keeps claiming tasks for the up-to-10s
+    // window until its own heartbeat detects the dead row. Those
+    // claims then fail when the fencing trigger rejects the
+    // resulting journal writes. The DB has the source of truth;
+    // let it enforce.
+    //
+    // Dispatcher-target claims aren't affected: dispatcher pods have
+    // no `worker_pod` row at all, so the EXISTS check is gated on
+    // target.
     let row = sqlx::query(
         r#"SELECT id, kind, status, project_id, color, tenant_id, payload
            FROM task
@@ -303,6 +342,14 @@ pub async fn claim_one(
              AND (target_pod_name IS NULL OR target_pod_name = $3)
              AND (status = 'pending'
                   OR (status = 'claimed' AND claimed_until_unix < $4))
+             AND (
+                 target = 'dispatcher'
+                 OR EXISTS (
+                     SELECT 1 FROM worker_pod wp
+                     WHERE wp.pod_name = $3
+                       AND wp.status IN ('spawning', 'alive')
+                 )
+             )
            ORDER BY created_at_unix ASC
            FOR UPDATE SKIP LOCKED
            LIMIT 1"#,
@@ -337,7 +384,7 @@ pub async fn claim_one(
 
     tx.commit().await?;
 
-    Ok(Some(row_to_task(row)))
+    Ok(Some(row_to_task(row)?))
 }
 
 /// Renew the claim's lease. Returns false if the row no longer
@@ -481,16 +528,23 @@ pub async fn sweep_terminal(pool: &PgPool) -> Result<u64> {
     Ok(rows.rows_affected())
 }
 
-fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
-    let id: Uuid = row.try_get("id").expect("id");
-    let kind: String = row.try_get("kind").expect("kind");
-    let status_str: String = row.try_get("status").expect("status");
-    let status = TaskStatus::parse(&status_str).expect("known status");
-    let project_id: Option<String> = row.try_get("project_id").ok().flatten();
-    let color: Option<String> = row.try_get("color").ok().flatten();
-    let tenant_id: Option<String> = row.try_get("tenant_id").ok().flatten();
-    let payload: Value = row.try_get("payload").expect("payload");
-    Task {
+/// Decode a `task` row. Every column propagates its decode error
+/// via `?` (no `.expect()`, no `.ok().flatten()`): a decode failure
+/// is schema drift and must fail loud, NOT silently null out
+/// `project_id`/`tenant_id` (which would misroute work). The
+/// nullable columns are typed `Option<_>`, so a real NULL is `None`
+/// while a type mismatch is an `Err`.
+fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
+    let id: Uuid = row.try_get("id")?;
+    let kind: String = row.try_get("kind")?;
+    let status_str: String = row.try_get("status")?;
+    let status = TaskStatus::parse(&status_str)
+        .ok_or_else(|| anyhow::anyhow!("unknown task status '{status_str}'"))?;
+    let project_id: Option<String> = row.try_get("project_id")?;
+    let color: Option<String> = row.try_get("color")?;
+    let tenant_id: Option<String> = row.try_get("tenant_id")?;
+    let payload: Value = row.try_get("payload")?;
+    Ok(Task {
         id,
         kind,
         status,
@@ -498,12 +552,12 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
         color,
         tenant_id,
         payload,
-    }
+    })
 }
 
 pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .expect("system clock past UNIX_EPOCH")
+        .as_secs() as i64
 }

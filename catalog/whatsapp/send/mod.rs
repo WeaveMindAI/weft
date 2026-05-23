@@ -1,6 +1,6 @@
 //! WhatsAppSend: POSTs a `sendMessage` action to the project's
-//! WhatsApp bridge sidecar. Pure Fire-phase; no registration or
-//! infra lifecycle of its own.
+//! WhatsApp bridge. Pure Fire-phase; no registration or infra
+//! lifecycle of its own.
 
 use async_trait::async_trait;
 
@@ -54,15 +54,12 @@ impl Node for WhatsAppSendNode {
             "action": "sendMessage",
             "payload": { "to": to, "text": message },
         });
-        // The bridge sidecar mounts the action router at `/action`.
-        // `endpointUrl` from WhatsAppBridge is the bare service
-        // DNS (http://<svc>.<ns>.svc.cluster.local:PORT) so we
-        // append the path here. Trim to keep idempotent even if
-        // a future version starts emitting an already-suffixed URL.
-        let action_url = {
-            let base = endpoint_url.trim_end_matches('/').trim_end_matches("/action");
-            format!("{base}/action")
-        };
+        // The bridge mounts the action router at `/action`. The
+        // contract for `endpointUrl` (WhatsAppBridge's output) is
+        // bare service DNS, so we append the path here. No
+        // defensive trim: a contract violation should surface, not
+        // be papered over.
+        let action_url = format!("{}/action", endpoint_url.trim_end_matches('/'));
         let resp = reqwest::Client::new()
             .post(&action_url)
             .json(&body)
@@ -81,20 +78,25 @@ impl Node for WhatsAppSendNode {
             .json()
             .await
             .map_err(|e| WeftError::NodeExecution(format!("parse bridge response: {e}")))?;
-        let result = parsed.get("result").cloned().unwrap_or_default();
-        if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
-            return Ok(NodeOutput::empty()
-                .set("messageId", serde_json::Value::String(String::new()))
-                .set("success", serde_json::Value::Bool(false))
-                .set("error", serde_json::Value::String(err.to_string())));
+        // The bridge signals SOFT failures (e.g. "WhatsApp not
+        // connected" when the phone isn't paired) as a 200 with
+        // `result.error` (only THROWN errors become non-2xx, handled
+        // above). Surface that reason loudly instead of letting it fall
+        // through to a misleading "missing messageId".
+        let result = parsed.get("result");
+        if let Some(err) = result.and_then(|r| r.get("error")).and_then(|v| v.as_str()) {
+            return Err(WeftError::NodeExecution(format!("bridge: {err}")));
         }
         let message_id = result
-            .get("messageId")
+            .and_then(|r| r.get("messageId"))
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+            .ok_or_else(|| {
+                WeftError::NodeExecution(format!(
+                    "bridge send response missing result.messageId: {parsed}"
+                ))
+            })?;
         Ok(NodeOutput::empty()
-            .set("messageId", serde_json::Value::String(message_id))
+            .set("messageId", serde_json::Value::String(message_id.to_string()))
             .set("success", serde_json::Value::Bool(true)))
     }
 }

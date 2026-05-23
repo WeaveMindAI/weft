@@ -26,6 +26,18 @@ pub trait TaskExecutor<Ctx: Send + Sync>: Send + Sync {
     async fn execute(&self, ctx: &Ctx, task: &Task) -> Result<Value>;
 }
 
+/// Worker idle self-exit. After the picker has been idle (no task
+/// claimed) for the idle window, it calls `try_idle_exit`. The impl
+/// attempts the guarded `alive -> done` CAS (no pending/claimed work
+/// for the project); returning `true` means the pod won the flip and
+/// the picker should stop. The CAS, not the picker's idle timer, is
+/// the correctness boundary: a task in flight (claimed) or queued
+/// (pending) fails the CAS, so the picker keeps running.
+#[async_trait]
+pub trait IdleExit: Send + Sync {
+    async fn try_idle_exit(&self) -> Result<bool>;
+}
+
 #[async_trait]
 pub trait WorkerTaskKind<Ctx: Send + Sync>: Send + Sync {
     /// Synchronous handler: runs to completion before the picker
@@ -148,11 +160,11 @@ impl<Ctx: Send + Sync> WorkerTaskRegistryBuilder<Ctx> {
 }
 
 /// Maximum concurrent dispatcher tasks per Pod. Tasks like
-/// `register_signal` (HTTP to listener) and `provision_sidecar`
-/// (image pull) can take seconds; running them sequentially would
-/// head-of-line-block the picker. 8 is enough that one slow op
-/// doesn't park everything else, low enough that we don't open
-/// arbitrarily many DB connections at once.
+/// `register_signal` (HTTP to listener) and `apply_infra`
+/// (image pull + kubectl apply + readiness wait) can take seconds;
+/// running them sequentially would head-of-line-block the picker. 8
+/// is enough that one slow op doesn't park everything else, low
+/// enough that we don't open arbitrarily many DB connections at once.
 pub const DISPATCHER_PICKER_CONCURRENCY: usize = 8;
 
 /// Dispatcher picker: claims `target=dispatcher` tasks and runs each
@@ -221,7 +233,13 @@ fn spawn_dispatcher_task<Ctx>(
                 id = %task.id, kind = %task.kind, error = %err,
                 "rejecting unknown task kind"
             );
-            let _ = store.fail(task.id, &pod_id, err).await;
+            if let Err(e) = store.fail(task.id, &pod_id, err).await {
+                tracing::warn!(
+                    target: "weft_task_store::executor",
+                    id = %task.id, error = %e,
+                    "fail write failed for unknown-kind reject; row sits claimed until lease expiry"
+                );
+            }
             return;
         };
         let task_id = task.id;
@@ -249,7 +267,7 @@ fn spawn_dispatcher_task<Ctx>(
 /// before the executor finishes, abandon the executor and synthesize
 /// a fail outcome. The sibling pod that re-claims will redo the work
 /// idempotently (every dispatcher task kind is idempotent on retry,
-/// e.g. RegisterSignal / ProvisionSidecar / RouteEntry).
+/// e.g. RegisterSignal / ApplyInfra / RouteEntry).
 async fn run_with_lease_guard<F>(
     fut: F,
     lease_lost: CancellationToken,
@@ -352,18 +370,65 @@ pub async fn run_worker_picker<Ctx>(
     pod_name: String,
     project_id: String,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    idle_exit: Arc<dyn IdleExit>,
+    idle_window: Duration,
 ) where
     Ctx: Send + Sync + Clone + 'static,
 {
     use std::sync::atomic::Ordering;
     let poll_interval = Duration::from_millis(50);
+    // When the picker first went idle (no task claimed). Reset to
+    // None on every successful claim. When idle longer than
+    // `idle_window`, attempt the guarded idle-exit CAS. Uses
+    // `tokio::time::Instant` (not `std`) so the idle window is
+    // virtualized under `tokio::time::pause()` in tests; in prod
+    // it's the same monotonic clock.
+    let mut idle_since: Option<tokio::time::Instant> = None;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
         match try_worker_one(&store, &ctx, &registry, &pod_name, &project_id).await {
-            Ok(true) => continue,
-            Ok(false) => tokio::time::sleep(poll_interval).await,
+            Ok(true) => {
+                idle_since = None;
+                continue;
+            }
+            Ok(false) => {
+                let idle_for = match idle_since {
+                    Some(t) => t.elapsed(),
+                    None => {
+                        idle_since = Some(tokio::time::Instant::now());
+                        Duration::ZERO
+                    }
+                };
+                if idle_for >= idle_window {
+                    // Attempt the guarded exit. The CAS fails if any
+                    // pending/claimed work exists (incl. a background
+                    // exec holding a claimed task), so this is safe
+                    // even though the picker only sees the claim queue.
+                    match idle_exit.try_idle_exit().await {
+                        Ok(true) => {
+                            shutdown.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Ok(false) => {
+                            // Lost the race (work arrived / in flight).
+                            // Reset the timer and keep claiming.
+                            idle_since = None;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "weft_task_store::executor",
+                                error = %e,
+                                "idle-exit CAS failed; will retry"
+                            );
+                            idle_since = None;
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "weft_task_store::executor",
@@ -405,7 +470,13 @@ where
             id = %task.id, kind = %task.kind, error = %err,
             "rejecting unknown worker task kind"
         );
-        let _ = store.fail(task.id, pod_name, err).await;
+        if let Err(e) = store.fail(task.id, pod_name, err).await {
+            tracing::warn!(
+                target: "weft_task_store::executor",
+                id = %task.id, error = %e,
+                "fail write failed for unknown-kind reject; row sits claimed until lease expiry"
+            );
+        }
         return Ok(true);
     };
 
@@ -548,4 +619,115 @@ fn spawn_claim_heartbeat(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod idle_exit_tests {
+    use super::*;
+    use crate::tasks::ClaimFilter;
+    use std::sync::atomic::{AtomicU32, Ordering as AtOrd};
+    use uuid::Uuid;
+
+    /// TaskStoreClient that never yields a task (the worker is idle).
+    /// Only the picker's claim path is exercised; the enqueue/wait
+    /// methods are never reached by `run_worker_picker`.
+    struct IdleStore;
+    #[async_trait]
+    impl TaskStoreClient for IdleStore {
+        async fn enqueue_dedup(&self, _spec: crate::tasks::NewTask) -> Result<crate::tasks::DedupOutcome> {
+            unreachable!("picker never enqueues")
+        }
+        async fn wait_for_terminal(
+            &self,
+            _id: Uuid,
+            _timeout: Duration,
+            _poll: Duration,
+        ) -> Result<crate::tasks::TaskOutcome> {
+            unreachable!("picker never waits for terminal")
+        }
+        async fn claim_one(&self, _pod: &str, _f: ClaimFilter) -> Result<Option<Task>> {
+            Ok(None)
+        }
+        async fn heartbeat(&self, _id: Uuid, _pod: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn complete(&self, _id: Uuid, _pod: &str, _r: Value) -> Result<()> {
+            Ok(())
+        }
+        async fn fail(&self, _id: Uuid, _pod: &str, _e: String) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Records how many times the picker attempted the idle-exit
+    /// CAS, and returns a configurable result.
+    struct CountingIdleExit {
+        attempts: Arc<AtomicU32>,
+        win: bool,
+    }
+    #[async_trait]
+    impl IdleExit for CountingIdleExit {
+        async fn try_idle_exit(&self) -> Result<bool> {
+            self.attempts.fetch_add(1, AtOrd::Relaxed);
+            Ok(self.win)
+        }
+    }
+
+    fn idle_picker(
+        idle_exit: Arc<dyn IdleExit>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        window: Duration,
+    ) -> impl std::future::Future<Output = ()> {
+        run_worker_picker(
+            Arc::new(IdleStore),
+            (),
+            WorkerTaskRegistry::<()>::builder().build(),
+            "wp-1".into(),
+            "p1".into(),
+            shutdown,
+            idle_exit,
+            window,
+        )
+    }
+
+    /// The picker must NOT attempt the idle-exit CAS before the idle
+    /// window elapses, and MUST attempt + stop once it does (when the
+    /// CAS wins).
+    #[tokio::test(start_paused = true)]
+    async fn attempts_idle_exit_after_window_and_stops_on_win() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let idle_exit = Arc::new(CountingIdleExit {
+            attempts: attempts.clone(),
+            win: true,
+        });
+        // Picker runs to completion: it idles, crosses the 30s
+        // window, the CAS wins, it sets shutdown and returns.
+        idle_picker(idle_exit, shutdown.clone(), Duration::from_secs(30)).await;
+        assert_eq!(attempts.load(AtOrd::Relaxed), 1, "exactly one winning CAS");
+        assert!(shutdown.load(AtOrd::Relaxed), "picker set shutdown on win");
+    }
+
+    /// When the CAS loses (work arrived/in-flight), the picker keeps
+    /// running: it does NOT stop, and retries on the next window.
+    #[tokio::test(start_paused = true)]
+    async fn keeps_running_when_cas_loses() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let idle_exit = Arc::new(CountingIdleExit {
+            attempts: attempts.clone(),
+            win: false,
+        });
+        let sd = shutdown.clone();
+        let handle = tokio::spawn(idle_picker(idle_exit, sd, Duration::from_secs(30)));
+        // Virtual sleep past two idle windows; auto-advance drives
+        // the picker's poll loop. The picker keeps attempting the
+        // CAS (losing each time) and never stops.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        assert!(!shutdown.load(AtOrd::Relaxed), "lost CAS must not stop the picker");
+        assert!(attempts.load(AtOrd::Relaxed) >= 1, "attempted at least once");
+        // Externally stop so the spawned picker task ends.
+        shutdown.store(true, AtOrd::Relaxed);
+        let _ = handle.await;
+    }
 }

@@ -25,6 +25,8 @@ A [clone] is a DRY violation: logic that exists in two or more places when it sh
 
 A [shortcut] is code that solves the immediate problem but makes the next problem harder. "For now" approaches. Development-only hacks. Backend-specific logic hardcoded where it should be generic. Shortcuts are high severity. They become permanent.
 
+A [bypass] is when the codebase already has a generic, extensible mechanism for some concern (a registry, a trait, a dispatcher, a hook system, a centralized helper with existing wiring) and the new code builds a parallel side path instead of plugging into it. The new path may work in isolation, but it fragments the architecture: the generic system no longer knows about this case, future extensions have to choose between two paths, and feature-specific logic ends up scattered where the framework already exposed a way to express it generically. Before flagging, verify the generic mechanism actually exists and could host the new case without contortion. Bypasses are high severity. They ossify the codebase.
+
 A [stub] is code left as a TODO or placeholder for future work, embedded directly in the source. Enum variants that return "not yet implemented". Match arms with `todo!()` or empty bodies and a "Future:" comment. Functions that exist but do nothing. If future work is needed, it belongs in a task tracker or a planning document, not as dead infrastructure in the code. Stubs are high severity. They get forgotten and become ghosts.
 
 A [contract break] is when the interface between two components disagrees. A Rust struct field that doesn't match the JSON the frontend sends. A callback payload shape that doesn't match what the handler expects. A Restate handler registered with a different name than what the client calls. Contract breaks are critical severity.
@@ -39,8 +41,9 @@ Your review process:
 2. For each changed file, check: does this change leave behind any [ghost]? Search for old references, stale imports, dead match arms.
 3. For each new function or pattern, check: does this already exist elsewhere? Search the codebase before reporting. Only flag [clone] if you find the actual duplicate.
 4. For each new abstraction, check: is it a [shortcut]? Does it hardcode something that should be dynamic? Does it assume a single variant where the design supports many?
-5. For each interface boundary (Rust to frontend, handler to handler, node to executor), check: do the types and field names agree on both sides? Flag any [contract break].
-6. Check for actual bugs: logic errors, unhandled error paths, race conditions, null/undefined access, security vulnerabilities.
+5. For each new code path, check: does the codebase already expose a generic mechanism for this concern? Search for existing registries, traits, dispatchers, or centralized helpers in the relevant area. If one exists and the new code rolls its own path instead of plugging in, flag a [bypass]. Only flag if the generic mechanism could realistically host the new case.
+6. For each interface boundary (Rust to frontend, handler to handler, node to executor), check: do the types and field names agree on both sides? Flag any [contract break].
+7. Check for actual bugs: logic errors, unhandled error paths, race conditions, null/undefined access, security vulnerabilities.
 
 When you find a [finding], report it in this format:
 

@@ -20,8 +20,6 @@ pub enum TaskKind {
     /// Dispatcher: register a wake signal with the listener and
     /// return its mint info to the worker that asked.
     RegisterSignal,
-    /// Dispatcher: provision a sidecar Pod for an infra node.
-    ProvisionSidecar,
     /// Dispatcher: spawn a worker Pod for the project's pool.
     SpawnPod,
     /// Dispatcher: fire a held-event signal that the listener
@@ -57,7 +55,6 @@ impl TaskKind {
         match self {
             Self::RouteEntry => "route_entry",
             Self::RegisterSignal => "register_signal",
-            Self::ProvisionSidecar => "provision_sidecar",
             Self::SpawnPod => "spawn_pod",
             Self::FireSignal => "fire_signal",
             Self::Execute => "execute",

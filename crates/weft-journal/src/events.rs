@@ -39,9 +39,10 @@ pub enum ExecEvent {
         /// Execution phase: Fire (normal user run, trigger fire, or
         /// resume), InfraSetup (scoped run that only runs nodes
         /// upstream of infra-provisioning), or TriggerSetup (scoped
-        /// run that registers triggers). Defaults to Fire when
-        /// missing on older rows.
-        #[serde(default)]
+        /// run that registers triggers). Every writer sets it
+        /// explicitly; a row missing it is corruption and fails the
+        /// deserialize (loud-skip in `events_for_color`), not a silent
+        /// default to Fire.
         phase: weft_core::context::Phase,
         at_unix: u64,
     },
@@ -369,8 +370,26 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
         value: Value,
         gathered: bool,
     ) {
-        let id = pulse_id.parse().unwrap_or_else(|_| uuid::Uuid::new_v4());
-        let mut pulse = Pulse {
+        // A pulse_id is always written via `Uuid::to_string()`, so a
+        // parse failure means journal corruption. Minting a fresh
+        // random UUID would be the worst response: the pulse would
+        // never match `NodeStarted.pulses_absorbed` (matched by exact
+        // UUID), so it'd sit Pending forever and re-fire the node on
+        // every resume. Log loud and SKIP, matching the malformed-row
+        // handling in `events_for_color` (a missing pulse surfaces as
+        // a stuck/incomplete fold, not a silently-mismatched one).
+        let id = match pulse_id.parse::<uuid::Uuid>() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(
+                    target: "weft_journal::fold",
+                    %color, pulse_id, error = %e,
+                    "skip pulse with unparseable id during fold (journal corruption)"
+                );
+                return;
+            }
+        };
+        let pulse = Pulse {
             id,
             color,
             lane,
@@ -380,8 +399,29 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
             status: PulseStatus::Pending,
             gathered,
         };
-        pulse.gathered = gathered;
         pulses.entry(target_node.to_string()).or_default().push(pulse);
+    }
+
+    /// Parse a list of absorbed-pulse-id strings to UUIDs, logging
+    /// loud and skipping any that don't parse. Same posture as
+    /// `push_pulse`: an unparseable id is journal corruption, and a
+    /// silently-dropped absorb leaves the pulse Pending → the node
+    /// re-fires on every resume. One helper so every absorb site in
+    /// the fold handles corruption identically.
+    fn parse_absorbed_ids(ids: &[String], color: Color) -> Vec<uuid::Uuid> {
+        ids.iter()
+            .filter_map(|s| match s.parse::<uuid::Uuid>() {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::error!(
+                        target: "weft_journal::fold",
+                        %color, absorbed_pulse_id = s, error = %e,
+                        "skip absorb with unparseable id during fold (journal corruption)"
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 
     for ev in events {
@@ -434,12 +474,22 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 // UUIDs. Lane = base_lane + lane_suffix (the suffix
                 // can be >1 frame when `lane_depth` peels multiple
                 // list layers in a single Expand operation).
-                if let Some(absorbed_id) = absorbed_pulse_id.parse::<uuid::Uuid>().ok() {
-                    if let Some(bucket) = pulses.get_mut(node_id) {
-                        if let Some(p) = bucket.iter_mut().find(|p| p.id == absorbed_id) {
-                            p.status = PulseStatus::Absorbed;
+                match absorbed_pulse_id.parse::<uuid::Uuid>() {
+                    Ok(absorbed_id) => {
+                        if let Some(bucket) = pulses.get_mut(node_id) {
+                            if let Some(p) = bucket.iter_mut().find(|p| p.id == absorbed_id) {
+                                p.status = PulseStatus::Absorbed;
+                            }
                         }
                     }
+                    // Corrupt id: log loud (a silently-skipped absorb
+                    // leaves the pulse Pending and re-fires the node on
+                    // every resume). Same posture as `push_pulse`.
+                    Err(e) => tracing::error!(
+                        target: "weft_journal::fold",
+                        %c, absorbed_pulse_id, error = %e,
+                        "skip absorb with unparseable id during fold (journal corruption)"
+                    ),
                 }
                 for child in children {
                     let mut lane = base_lane.clone();
@@ -466,10 +516,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 value,
                 ..
             } => {
-                let absorbed: Vec<uuid::Uuid> = absorbed_pulse_ids
-                    .iter()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
+                let absorbed = parse_absorbed_ids(absorbed_pulse_ids, *c);
                 if let Some(bucket) = pulses.get_mut(node_id) {
                     for p in bucket.iter_mut() {
                         if absorbed.contains(&p.id) {
@@ -489,10 +536,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 );
             }
             ExecEvent::NodeStarted { node_id, lane, input, pulses_absorbed, at_unix, color: c } => {
-                let absorbed_uuids: Vec<uuid::Uuid> = pulses_absorbed
-                    .iter()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
+                let absorbed_uuids = parse_absorbed_ids(pulses_absorbed, *c);
                 // UUID-exact absorb. The worker minted these UUIDs
                 // when emitting / expanding / gathering; the fold
                 // pushed pulses with the same UUIDs above; flipping
@@ -567,10 +611,14 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         e.callback_id = None;
                     }
                 }
-                if !token.is_empty() {
-                    suspensions.remove(token);
-                    pending_deliveries.remove(token);
-                }
+                // The resume consumed this suspension's delivery. Clear
+                // unconditionally: `NodeResumed` is only ever written by
+                // the engine with a real (non-empty) token, so a guard
+                // here would silently leak the suspension on corruption
+                // (re-delivering an already-consumed fire on the next
+                // fold) instead of failing visibly.
+                suspensions.remove(token);
+                pending_deliveries.remove(token);
             }
             ExecEvent::NodeCancelled { node_id, lane, reason, at_unix, color: c } => {
                 if let Some(execs) = executions.get_mut(node_id) {

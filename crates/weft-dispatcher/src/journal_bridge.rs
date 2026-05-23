@@ -98,47 +98,18 @@ async fn drain_new_rows(
     .bind(cursor.last_id)
     .fetch_all(&state.pg_pool)
     .await?;
+    // Per-row processing returns Ok on both happy path AND
+    // intentional skips (malformed payload, color/project parse
+    // miss). Cursor advances on Ok. A hard error (DB write inside
+    // `terminal_cleanup`, journal read, publish) bails via `?` and
+    // leaves the cursor at the last successful row, so the next
+    // tick retries.
     let mut max_id_processed = cursor.last_id;
     for row in rows {
         let id: i64 = row.try_get("id")?;
-        let payload: String = row.try_get("payload_json")?;
-        let color_str: String = row.try_get("color")?;
+        process_one_row(state, &row, id).await?;
         cursor.last_id = id;
         max_id_processed = id;
-        let event: ExecEvent = match serde_json::from_str(&payload) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    target: "weft_dispatcher::journal_bridge",
-                    %id, error = %e,
-                    "could not parse journal payload; skipping"
-                );
-                continue;
-            }
-        };
-        let Ok(color) = color_str.parse() else { continue };
-        let project_id = match state.journal.execution_project(color).await {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
-        // Terminal events drive signal-row cleanup + the
-        // deactivate-drain CAS. Idempotent across Pods: only the
-        // first Pod observing the terminal row removes the signal
-        // entries; sibling Pods see an empty result and skip.
-        match &event {
-            ExecEvent::ExecutionCompleted { .. }
-            | ExecEvent::ExecutionFailed { .. }
-            | ExecEvent::ExecutionCancelled { .. } => {
-                terminal_cleanup(state, color).await?;
-            }
-            _ => {}
-        }
-        if let Some(de) = to_dispatcher_event(&event, project_id) {
-            // Local-only: every dispatcher pod runs this same bridge,
-            // so every pod's own subscribers get the event from its
-            // own poll. NOTIFY would cause double-delivery.
-            state.events.publish_local(de).await;
-        }
     }
     if max_id_processed > 0 {
         sqlx::query(
@@ -160,6 +131,57 @@ async fn drain_new_rows(
 /// the running set is now empty: if so, CAS the project's status
 /// to `Inactive` (the deactivate-with-runningPolicy=wait drain has
 /// finished).
+/// Side effects for one exec_event row. Soft skips (malformed
+/// payload, unparseable color, missing execution project) return
+/// Ok so the caller advances the cursor past them. Hard errors
+/// (DB writes inside terminal_cleanup, publish) propagate via `?`
+/// so the cursor stays put and the next tick retries.
+async fn process_one_row(
+    state: &DispatcherState,
+    row: &sqlx::postgres::PgRow,
+    id: i64,
+) -> anyhow::Result<()> {
+    let payload: String = row.try_get("payload_json")?;
+    let color_str: String = row.try_get("color")?;
+    let event: ExecEvent = match serde_json::from_str(&payload) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                target: "weft_dispatcher::journal_bridge",
+                %id, error = %e,
+                "could not parse journal payload; skipping"
+            );
+            return Ok(());
+        }
+    };
+    let Ok(color) = color_str.parse() else {
+        return Ok(());
+    };
+    let project_id = match state.journal.execution_project(color).await? {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    // Terminal events drive signal-row cleanup + the
+    // deactivate-drain CAS. Idempotent across pods: only the
+    // first pod observing the terminal row removes the signal
+    // entries; sibling pods see an empty result and skip.
+    match &event {
+        ExecEvent::ExecutionCompleted { .. }
+        | ExecEvent::ExecutionFailed { .. }
+        | ExecEvent::ExecutionCancelled { .. } => {
+            terminal_cleanup(state, color).await?;
+        }
+        _ => {}
+    }
+    if let Some(de) = to_dispatcher_event(&event, project_id) {
+        // Local-only: every dispatcher pod runs this same bridge,
+        // so every pod's own subscribers get the event from its
+        // own poll. NOTIFY would cause double-delivery.
+        state.events.publish_local(de).await;
+    }
+    Ok(())
+}
+
 async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> anyhow::Result<()> {
     let removed = state.journal.signal_remove_for_color(color).await?;
     let project_id = removed.first().map(|m| m.project_id.clone());
@@ -193,7 +215,9 @@ async fn try_finish_drain(state: &DispatcherState, project_id: &str) -> anyhow::
         Ok(id) => id,
         Err(_) => return Ok(()),
     };
-    let lifecycle = state.projects.lifecycle(id).await;
+    let Some(lifecycle) = state.projects.lifecycle(id).await? else {
+        return Ok(());
+    };
     if lifecycle.status != ProjectStatus::Deactivating {
         return Ok(());
     }
@@ -204,7 +228,7 @@ async fn try_finish_drain(state: &DispatcherState, project_id: &str) -> anyhow::
     let flipped = state
         .projects
         .cas_status(id, ProjectStatus::Deactivating, ProjectStatus::Inactive)
-        .await;
+        .await?;
     if flipped {
         tracing::info!(
             target: "weft_dispatcher::journal_bridge",
@@ -228,7 +252,7 @@ fn to_dispatcher_event(ev: &ExecEvent, project_id: String) -> Option<DispatcherE
             Some(DispatcherEvent::NodeStarted {
                 color: *color,
                 node: node_id.clone(),
-                lane: serde_json::to_string(lane).unwrap_or_default(),
+                lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                 input: input.clone(),
                 project_id,
             })
@@ -237,7 +261,7 @@ fn to_dispatcher_event(ev: &ExecEvent, project_id: String) -> Option<DispatcherE
             Some(DispatcherEvent::NodeCompleted {
                 color: *color,
                 node: node_id.clone(),
-                lane: serde_json::to_string(lane).unwrap_or_default(),
+                lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                 output: output.clone(),
                 project_id,
             })
@@ -246,7 +270,7 @@ fn to_dispatcher_event(ev: &ExecEvent, project_id: String) -> Option<DispatcherE
             Some(DispatcherEvent::NodeFailed {
                 color: *color,
                 node: node_id.clone(),
-                lane: serde_json::to_string(lane).unwrap_or_default(),
+                lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                 error: error.clone(),
                 project_id,
             })
@@ -255,7 +279,7 @@ fn to_dispatcher_event(ev: &ExecEvent, project_id: String) -> Option<DispatcherE
             Some(DispatcherEvent::NodeSkipped {
                 color: *color,
                 node: node_id.clone(),
-                lane: serde_json::to_string(lane).unwrap_or_default(),
+                lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                 project_id,
             })
         }
@@ -263,7 +287,7 @@ fn to_dispatcher_event(ev: &ExecEvent, project_id: String) -> Option<DispatcherE
             Some(DispatcherEvent::NodeSuspended {
                 color: *color,
                 node: node_id.clone(),
-                lane: serde_json::to_string(lane).unwrap_or_default(),
+                lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                 token: token.clone(),
                 project_id,
             })
@@ -272,7 +296,7 @@ fn to_dispatcher_event(ev: &ExecEvent, project_id: String) -> Option<DispatcherE
             Some(DispatcherEvent::NodeResumed {
                 color: *color,
                 node: node_id.clone(),
-                lane: serde_json::to_string(lane).unwrap_or_default(),
+                lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                 token: token.clone(),
                 value: value.clone(),
                 project_id,
@@ -282,7 +306,7 @@ fn to_dispatcher_event(ev: &ExecEvent, project_id: String) -> Option<DispatcherE
             Some(DispatcherEvent::NodeCancelled {
                 color: *color,
                 node: node_id.clone(),
-                lane: serde_json::to_string(lane).unwrap_or_default(),
+                lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
                 reason: reason.clone(),
                 project_id,
             })

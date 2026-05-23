@@ -3,10 +3,6 @@
 //! stale rows dead. The trigger on `exec_event` rejects writes whose
 //! pod_name is not in `{spawning, alive}`, fencing stale Pods out.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::Result;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -50,7 +46,20 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             status TEXT NOT NULL,
             owner_dispatcher TEXT NOT NULL,
             last_heartbeat_unix BIGINT NOT NULL,
-            created_at_unix BIGINT NOT NULL
+            created_at_unix BIGINT NOT NULL,
+            -- Set when the row transitions to a terminal status
+            -- (done | dead). NULL while spawning/alive. The pod-GC
+            -- sweep ages terminal rows against this to delete the
+            -- finished k8s Pod object after a grace window.
+            terminal_at_unix BIGINT,
+            -- Source hash the pod's image was built from. Recorded at
+            -- spawn time. The spawn_pod executor compares this against
+            -- the project's current running_source_hash on every spawn
+            -- attempt: a mismatch means the alive pod has a stale
+            -- project definition (e.g. user added an infra node since
+            -- it spawned). The dispatcher kills the stale pod and
+            -- proceeds with a fresh spawn.
+            source_hash TEXT NOT NULL DEFAULT ''
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_worker_pod_project_alive
             ON worker_pod(project_id)
@@ -106,21 +115,31 @@ pub async fn register_alive(
     project_id: &str,
 ) -> Result<()> {
     let now = unix_now();
+    // `AND status = 'spawning'` is load-bearing: without it a dead-
+    // marked row (the reaper called `mark_dead` between this worker's
+    // boot and its first heartbeat) could be flipped back to `alive`
+    // by the worker, defeating the generation fencing. With the
+    // guard, a dead row stays dead; rows_affected = 0 surfaces the
+    // condition and the worker exits via `bail!` instead of
+    // resurrecting itself.
     let res = sqlx::query(
         r#"UPDATE worker_pod
            SET status = $3, last_heartbeat_unix = $4
-           WHERE pod_name = $1 AND project_id = $2"#,
+           WHERE pod_name = $1 AND project_id = $2 AND status = $5"#,
     )
     .bind(pod_name)
     .bind(project_id)
     .bind(STATUS_ALIVE)
     .bind(now)
+    .bind(STATUS_SPAWNING)
     .execute(pool)
     .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!(
-            "no worker_pod row for pod_name='{pod_name}' project_id='{project_id}'; \
-             dispatcher must call insert_spawning before the worker boots"
+            "no spawning worker_pod row for pod_name='{pod_name}' \
+             project_id='{project_id}'; the row was either never \
+             inserted by the dispatcher or was marked dead before \
+             this worker registered"
         );
     }
     Ok(())
@@ -135,13 +154,14 @@ pub async fn insert_spawning(
     project_id: &str,
     namespace: &str,
     owner_dispatcher: &str,
+    source_hash: &str,
 ) -> Result<()> {
     let now = unix_now();
     sqlx::query(
         r#"INSERT INTO worker_pod (
             pod_name, project_id, namespace, status, owner_dispatcher,
-            last_heartbeat_unix, created_at_unix
-        ) VALUES ($1, $2, $3, $4, $5, $6, $6)
+            last_heartbeat_unix, created_at_unix, source_hash
+        ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
         ON CONFLICT (pod_name) DO NOTHING"#,
     )
     .bind(pod_name)
@@ -150,6 +170,7 @@ pub async fn insert_spawning(
     .bind(STATUS_SPAWNING)
     .bind(owner_dispatcher)
     .bind(now)
+    .bind(source_hash)
     .execute(pool)
     .await?;
     Ok(())
@@ -173,11 +194,12 @@ pub async fn heartbeat(pool: &PgPool, pod_name: &str) -> Result<bool> {
 pub async fn mark_done(pool: &PgPool, pod_name: &str) -> Result<()> {
     sqlx::query(
         r#"UPDATE worker_pod
-           SET status = $1
+           SET status = $1, terminal_at_unix = $3
            WHERE pod_name = $2 AND status IN ('spawning', 'alive')"#,
     )
     .bind(STATUS_DONE)
     .bind(pod_name)
+    .bind(crate::tasks::unix_now())
     .execute(pool)
     .await?;
     Ok(())
@@ -186,19 +208,61 @@ pub async fn mark_done(pool: &PgPool, pod_name: &str) -> Result<()> {
 pub async fn mark_dead(pool: &PgPool, pod_name: &str) -> Result<()> {
     sqlx::query(
         r#"UPDATE worker_pod
-           SET status = $1
+           SET status = $1, terminal_at_unix = $3
            WHERE pod_name = $2 AND status IN ('spawning', 'alive')"#,
     )
     .bind(STATUS_DEAD)
     .bind(pod_name)
+    .bind(crate::tasks::unix_now())
     .execute(pool)
     .await?;
     Ok(())
 }
 
+/// Idle self-exit (worker-driven). Flip this pod's row `alive ->
+/// done` IFF there is no outstanding worker work for its project
+/// (no pending task to claim, no claimed task in-flight). The
+/// no-work check and the status flip are ONE atomic UPDATE, so a
+/// task arriving concurrently is caught:
+///   - lands BEFORE the CAS commits: the `NOT EXISTS` fails, the
+///     row stays `alive`, the worker keeps running and claims it;
+///   - lands AFTER: the row is already `done`, cold_start sees no
+///     live pod and spawns a fresh one for the new work.
+/// Either way no exec is ever routed to a dying worker. Returns
+/// true if this call won the flip (caller should then exit).
+pub async fn mark_done_if_idle(pool: &PgPool, pod_name: &str) -> Result<bool> {
+    // The no-work check is correlated to the pod's OWN project
+    // (`task.project_id = worker_pod.project_id`), read from the
+    // row, never from a caller-supplied value. A worker can only
+    // ever flip its own row (`pod_name = $1`), and only against its
+    // own project's work: there's no project_id parameter to lie
+    // about.
+    let res = sqlx::query(
+        r#"UPDATE worker_pod wp
+           SET status = $2, terminal_at_unix = $3
+           WHERE wp.pod_name = $1
+             AND wp.status = 'alive'
+             AND NOT EXISTS (
+                 SELECT 1 FROM task t
+                 WHERE t.target = 'worker'
+                   AND t.project_id = wp.project_id
+                   AND t.status IN ('pending', 'claimed')
+             )"#,
+    )
+    .bind(pod_name)
+    .bind(STATUS_DONE)
+    .bind(crate::tasks::unix_now())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 pub async fn has_live_for_project(pool: &PgPool, project_id: &str) -> Result<bool> {
+    // Cast literal to bigint so sqlx's i64 type expectation matches.
+    // PostgreSQL types untyped integer literals as INT4; the column
+    // shape doesn't matter here because we throw the value away.
     let row: Option<(i64,)> = sqlx::query_as(
-        r#"SELECT 1 FROM worker_pod
+        r#"SELECT 1::bigint FROM worker_pod
            WHERE project_id = $1 AND status IN ('spawning', 'alive')
            LIMIT 1"#,
     )
@@ -206,6 +270,27 @@ pub async fn has_live_for_project(pool: &PgPool, project_id: &str) -> Result<boo
     .fetch_optional(pool)
     .await?;
     Ok(row.is_some())
+}
+
+/// Look up the currently-alive worker pod for `project_id`. Returns
+/// the `(pod_name, namespace, source_hash)` of the first match, or
+/// None when no pod is alive. Used by `spawn_pod` to decide whether
+/// to reuse the existing pod or replace it (when its source_hash no
+/// longer matches the project's current `running_source_hash`).
+pub async fn alive_pod_for_project_full(
+    pool: &PgPool,
+    project_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        r#"SELECT pod_name, namespace, source_hash FROM worker_pod
+           WHERE project_id = $1 AND status IN ('spawning', 'alive')
+           ORDER BY created_at_unix ASC
+           LIMIT 1"#,
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// Pod that currently owns the project's worker pool, if any. Used
@@ -235,52 +320,49 @@ pub async fn list_stale(pool: &PgPool, threshold_unix: i64) -> Result<Vec<Worker
     .bind(threshold_unix)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().filter_map(parse_row).collect())
+    rows.into_iter().map(parse_row).collect()
 }
 
-fn parse_row(row: sqlx::postgres::PgRow) -> Option<WorkerPodRow> {
-    let pod_name: String = row.try_get("pod_name").ok()?;
-    let project_id: String = row.try_get("project_id").ok()?;
-    let namespace: String = row.try_get("namespace").ok()?;
-    let last_heartbeat_unix: i64 = row.try_get("last_heartbeat_unix").ok()?;
-    Some(WorkerPodRow {
-        pod_name,
-        project_id,
-        namespace,
-        last_heartbeat_unix,
+/// Terminal rows (`done` | `dead`) whose `terminal_at_unix` is
+/// older than the threshold. The pod-GC sweep `kubectl delete`s
+/// the finished k8s Pod object (using the row's own namespace, so
+/// no namespace-mapper guessing) and removes the row. Driven off
+/// the table, not `kubectl get`, so it's the single source of
+/// truth and is fakeable in tests.
+pub async fn list_terminal(pool: &PgPool, threshold_unix: i64) -> Result<Vec<WorkerPodRow>> {
+    let rows = sqlx::query(
+        r#"SELECT pod_name, project_id, namespace, last_heartbeat_unix
+           FROM worker_pod
+           WHERE status IN ('done', 'dead')
+             AND terminal_at_unix IS NOT NULL
+             AND terminal_at_unix < $1"#,
+    )
+    .bind(threshold_unix)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(parse_row).collect()
+}
+
+/// Remove a worker_pod row. Called by the pod-GC sweep after the
+/// k8s Pod object is deleted, so the row and the object retire
+/// together.
+pub async fn delete_row(pool: &PgPool, pod_name: &str) -> Result<()> {
+    sqlx::query("DELETE FROM worker_pod WHERE pod_name = $1")
+        .bind(pod_name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Decode a worker_pod row, propagating decode errors. A `.ok()`
+/// drop here would silently skip a stale/terminal pod from the
+/// reaper's / GC's list -> the pod leaks with no error. Fail loud
+/// on schema drift instead.
+fn parse_row(row: sqlx::postgres::PgRow) -> Result<WorkerPodRow> {
+    Ok(WorkerPodRow {
+        pod_name: row.try_get("pod_name")?,
+        project_id: row.try_get("project_id")?,
+        namespace: row.try_get("namespace")?,
+        last_heartbeat_unix: row.try_get("last_heartbeat_unix")?,
     })
-}
-
-/// Spawn a background heartbeat task. Sets `shutdown` to true if the
-/// row stops being alive (mark_done / mark_dead, row deleted).
-pub fn spawn_heartbeat(pool: PgPool, pod_name: String, shutdown: Arc<AtomicBool>) {
-    let interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(interval).await;
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            match heartbeat(&pool, &pod_name).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tracing::warn!(
-                        target: "weft_task_store::worker_pod",
-                        %pod_name,
-                        "worker_pod row no longer alive; signalling shutdown"
-                    );
-                    shutdown.store(true, Ordering::Relaxed);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_task_store::worker_pod",
-                        error = %e,
-                        "heartbeat error; will retry"
-                    );
-                }
-            }
-        }
-        let _ = mark_done(&pool, &pod_name).await;
-    });
 }

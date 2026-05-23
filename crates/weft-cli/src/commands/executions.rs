@@ -96,8 +96,8 @@ pub async fn clean(
     let arr = resp.as_array().cloned().unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .expect("system clock past UNIX_EPOCH")
+        .as_secs();
     let cutoff = if all {
         u64::MAX
     } else {

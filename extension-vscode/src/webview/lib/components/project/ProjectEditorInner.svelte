@@ -49,6 +49,8 @@
 		onStartInfra,
 		onStopInfra,
 		onTerminateInfra,
+		onInfraNodeStop,
+		onInfraNodeTerminate,
 		onUpgradeInfra,
 		actionBarState,
 		drift,
@@ -80,6 +82,12 @@
 		onStartInfra?: () => void;
 		onStopInfra?: () => void;
 		onTerminateInfra?: () => void;
+		/// Per-node infra lifecycle. The graph's node context-menu
+		/// emits these when the user right-clicks an infra node.
+		/// Routed through the host's CLI verb path so the action
+		/// bar's `cli_running` overlay covers them.
+		onInfraNodeStop?: (nodeId: string) => void;
+		onInfraNodeTerminate?: (nodeId: string) => void;
 		onUpgradeInfra?: () => void;
 		// Action-bar state machine (host-owned single source of
 		// truth) and drift snapshot. Passed straight through to
@@ -89,7 +97,7 @@
 		// Per-node infra status, keyed by node_id. Used by the
 		// graph node decorations (badge under each infra node);
 		// independent of the action bar's infra rollup.
-		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string }>;
+		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string; failureStage?: string; failureMessage?: string }>;
 		// Source-derived flags from the parsed project: does this
 		// graph DECLARE infra / trigger nodes. Drives bar-section
 		// visibility (don't show Infra section on a project with
@@ -108,7 +116,7 @@
 		validationErrors?: Map<string, import('$lib/types').ValidationError[]>;
 		autoOrganizeOnMount?: boolean;
 		fitViewAfterOrganize?: boolean;
-		/// Per-node sidecar /live tick state. Read for nodes whose
+		/// Per-node infra /live tick state. Read for nodes whose
 		/// `requiresInfra` flag is true; ignored otherwise.
 		infraFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
 		/// Per-node listener /display tick state. Read for nodes whose
@@ -920,6 +928,8 @@
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
 					infraNodeStatus: infraNodes?.find(inf => inf.nodeId === n.id)?.status,
+					infraFailureStage: infraNodes?.find(inf => inf.nodeId === n.id)?.failureStage,
+					infraFailureMessage: infraNodes?.find(inf => inf.nodeId === n.id)?.failureMessage,
 				},
 				...(hiddenByCollapsedGroup
 					? { style: 'display: none;' }
@@ -1086,8 +1096,22 @@
 			nodes = nodes.map(n => {
 				const backendNode = list.find(inf => inf.nodeId === n.id);
 				const newStatus = backendNode?.status;
-				if (n.data.infraNodeStatus !== newStatus) {
-					return { ...n, data: { ...n.data, infraNodeStatus: newStatus } };
+				const newStage = backendNode?.failureStage;
+				const newMsg = backendNode?.failureMessage;
+				if (
+					n.data.infraNodeStatus !== newStatus ||
+					n.data.infraFailureStage !== newStage ||
+					n.data.infraFailureMessage !== newMsg
+				) {
+					return {
+						...n,
+						data: {
+							...n.data,
+							infraNodeStatus: newStatus,
+							infraFailureStage: newStage,
+							infraFailureMessage: newMsg,
+						},
+					};
 				}
 				return n;
 			});
@@ -1095,7 +1119,7 @@
 	});
 
 	// Per-node body-panel feed. Each node consumes AT MOST ONE feed
-	// based on its role: infra nodes get sidecar /live ticks, trigger
+	// based on its role: infra nodes get infra /live ticks, trigger
 	// nodes get listener /display ticks, anything else gets nothing.
 	// Roles are mutually exclusive (see lib/utils/node-roles); the
 	// `bodyFeed` field on node.data is what ProjectNode.svelte renders.
@@ -2902,18 +2926,25 @@
 			</div>
 		{/if}
 
-		<!-- Drift banner. The Upgrade Infra button on the action bar
-		     is the primary affordance; this banner is a redundant
-		     surfacing for the case where the user might miss the
-		     button. Independent of the user-action overlay (drift is
-		     a backend fact). Visibility tracks the backend's
-		     `available_actions` so banner and button agree on what
-		     the user can do. -->
+		<!-- Drift banner. A redundant surfacing of the action-bar
+		     affordance, in case the user misses the button. The verb
+		     it names must match whichever button is actually showing:
+		     if infra is running + drifted the button is Upgrade; if
+		     it's stopped + drifted the button is Start (Start re-applies
+		     the changed spec and reaps orphans on the way up). Keyed on
+		     `available_actions` so banner text and button agree. -->
 		{#if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_upgrade')}
 			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
 				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
 					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
 					Infrastructure has changed. Click Upgrade to apply.
+				</div>
+			</div>
+		{:else if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_start')}
+			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
+				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
+					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+					Infrastructure has changed. Click Start to apply.
 				</div>
 			</div>
 		{/if}
@@ -2962,7 +2993,10 @@
 				{@const targetNodeId = contextMenu.nodeId}
 				{@const nodeToEdit = nodes.find(n => n.id === targetNodeId)}
 				{@const nodeConfig = nodeToEdit ? NODE_TYPE_CONFIG[nodeToEdit.data.nodeType as NodeType] : null}
-				
+				{@const infraInfo = infraNodes?.find(n => n.nodeId === targetNodeId)}
+				{@const canNodeStop = !!infraInfo && (infraInfo.status === 'running' || infraInfo.status === 'flaky')}
+				{@const canNodeTerminate = !!infraInfo && infraInfo.status !== 'terminating'}
+
 				{#if nodeToEdit && nodeConfig}
 					<div class="px-1">
 						<button
@@ -2979,6 +3013,30 @@
 							<span class="text-xs">Del</span>
 							<span>Delete</span>
 						</button>
+						{#if infraInfo && (canNodeStop || canNodeTerminate)}
+							<div class="my-1 mx-2 border-t"></div>
+							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">
+								Infra ({infraInfo.status})
+							</div>
+							{#if canNodeStop && onInfraNodeStop}
+								<button
+									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; onInfraNodeStop?.(id); }}
+								>
+									<span class="text-muted-foreground text-xs">⏸</span>
+									<span>Stop this node</span>
+								</button>
+							{/if}
+							{#if canNodeTerminate && onInfraNodeTerminate}
+								<button
+									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
+									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; onInfraNodeTerminate?.(id); }}
+								>
+									<span class="text-xs">✕</span>
+									<span>Terminate this node</span>
+								</button>
+							{/if}
+						{/if}
 					</div>
 				{/if}
 			{:else}

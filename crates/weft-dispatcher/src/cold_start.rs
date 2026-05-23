@@ -12,7 +12,6 @@ use sqlx::Row;
 use tokio::time::sleep;
 
 use crate::state::DispatcherState;
-use crate::tenant::TenantId;
 use weft_task_store::tasks::{enqueue_dedup, NewTask, TaskTarget};
 use weft_task_store::{SpawnPodPayload, TaskKind};
 
@@ -34,7 +33,11 @@ pub fn spawn(state: DispatcherState) {
 }
 
 async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
-    // Find projects with pending worker tasks but no live Pod.
+    // Find projects with pending worker tasks that have no live
+    // pod. The sync handler's `replace_stale_worker_if_needed`
+    // already kills + waits-for-fresh-spawn when the source_hash
+    // changes BEFORE enqueueing any work, so by the time cold_start
+    // runs we only need the simple "no pod, work pending" case.
     let rows = sqlx::query(
         r#"SELECT DISTINCT t.project_id, t.tenant_id
            FROM task t
@@ -53,11 +56,28 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
 
     for row in rows {
         let project_id: String = row.try_get("project_id")?;
-        let tenant_id: Option<String> = row.try_get("tenant_id").ok().flatten();
+        // `task.tenant_id` is nullable: some task kinds enqueue
+        // without resolving a tenant (NewTask.tenant_id is
+        // Option). When NULL, derive the tenant from the project
+        // via the router. A decode failure (not a NULL value)
+        // propagates via `?` as schema drift.
+        let tenant_id: Option<String> = row.try_get("tenant_id")?;
         let tenant = tenant_id
             .clone()
             .unwrap_or_else(|| state.tenant_router.tenant_for_project(&project_id).to_string());
-        let namespace = state.namespace_mapper.namespace_for(&TenantId(tenant.clone()));
+        // Workers live in the PROJECT namespace. The namespace is
+        // written on register (NOT NULL in the schema); a None
+        // here means the project was unregistered between the task
+        // enqueue and now. Skip; the task will time out and the
+        // user retries. DB errors propagate via `?`.
+        let Some(namespace) = state.projects.project_namespace(&project_id).await? else {
+            tracing::warn!(
+                target: "weft_dispatcher::cold_start",
+                project_id = %project_id,
+                "project_namespace lookup returned None; project unregistered. skipping spawn"
+            );
+            continue;
+        };
         let payload = SpawnPodPayload {
             project_id: project_id.clone(),
             tenant: tenant.clone(),
@@ -65,7 +85,12 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
             owner_dispatcher: state.pod_id.as_str().to_string(),
         };
         let dedup = format!("{project_id}:spawn");
-        let _ = enqueue_dedup(
+        // Propagate enqueue failures. The outer loop catches and
+        // logs+backs off; silently discarding means the project has
+        // pending worker tasks but no spawn task, and the failure
+        // mode (DB hiccup, serde error) stays invisible until
+        // next-tick rediscovery.
+        enqueue_dedup(
             &state.pg_pool,
             NewTask {
                 kind: TaskKind::SpawnPod,
@@ -78,7 +103,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
                 payload: serde_json::to_value(&payload)?,
             },
         )
-        .await;
+        .await?;
     }
 
     Ok(())

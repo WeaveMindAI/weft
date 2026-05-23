@@ -50,8 +50,12 @@ impl KindHandler for TimerHandler {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
         if let TimerSpec::After { duration_ms } = timer.spec {
-            let fire_at = (unix_now_ms() + duration_ms) / 1000;
-            return Ok(serde_json::json!({ "next_fire_at_unix": fire_at as i64 }));
+            // Pin in MILLISECONDS (no /1000 truncation): a sub-second
+            // `After` (duration_ms < 1000, which validation allows)
+            // must not floor to 0 and fire immediately. At/Cron are
+            // already ms-precise; After matches.
+            let fire_at_ms = unix_now_ms() + duration_ms;
+            return Ok(serde_json::json!({ "next_fire_at_unix_ms": fire_at_ms as i64 }));
         }
         Ok(Value::Object(serde_json::Map::new()))
     }
@@ -67,7 +71,7 @@ impl KindHandler for TimerHandler {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
         let pinned_after = kind_state
-            .get("next_fire_at_unix")
+            .get("next_fire_at_unix_ms")
             .and_then(|v| v.as_i64());
         Ok(Some(spawn_loop(
             token.to_string(),
@@ -82,11 +86,12 @@ impl KindHandler for TimerHandler {
         _sig: &RegisteredSignal,
         payload: Value,
     ) -> ProcessOutcome {
+        // A timer tick (raised internally by the tick loop, delivered
+        // through the FireSignal broker task) routes to the entry
+        // trigger.
         ProcessOutcome {
             value: payload,
-            target: ProcessTarget::Drop {
-                reason: Some("timer is internal-fire only".into()),
-            },
+            target: ProcessTarget::Entry,
         }
     }
 
@@ -109,7 +114,7 @@ fn spawn_loop(
         // value is ignored.
         let mut pinned = pinned_after_unix;
         loop {
-            let Some(next) = next_fire(&spec, pinned.take()) else {
+            let Some((next, deadline)) = next_fire(&spec, pinned.take()) else {
                 tracing::warn!(
                     target: "weft_listener::timer",
                     %token,
@@ -119,10 +124,13 @@ fn spawn_loop(
             };
             sleep_until(next).await;
 
-            let now_iso = Utc::now().to_rfc3339();
+            // scheduledTime = the intended deadline; actualTime = when
+            // we actually woke. They differ when the wakeup is late
+            // (the whole point of exposing both, per the cron node's
+            // metadata).
             let payload = serde_json::json!({
-                "scheduledTime": now_iso,
-                "actualTime": now_iso,
+                "scheduledTime": deadline.to_rfc3339(),
+                "actualTime": Utc::now().to_rfc3339(),
             });
             if let Err(e) = sink.fire(&token, payload).await {
                 tracing::warn!(
@@ -139,18 +147,24 @@ fn spawn_loop(
     })
 }
 
-fn next_fire(spec: &TimerSpec, pinned_after_unix: Option<i64>) -> Option<Instant> {
+/// The next fire as both the monotonic `Instant` to sleep on AND the
+/// intended wall-clock deadline (reported as `scheduledTime` so a
+/// late wakeup is distinguishable from an on-time one).
+fn next_fire(spec: &TimerSpec, pinned_after_unix_ms: Option<i64>) -> Option<(Instant, DateTime<Utc>)> {
     match spec {
         TimerSpec::After { duration_ms: _ } => {
-            // `After` is one-shot and must be pinned at register
-            // time so a listener restart preserves the deadline. If
-            // the pin is missing, the register flow is broken; fail
-            // loudly instead of silently restarting the clock.
-            let target_unix = pinned_after_unix
-                .expect("After timer must have pinned next_fire_at_unix in kind_state");
-            let now_unix = (unix_now_ms() / 1000) as i64;
-            let delta = (target_unix - now_unix).max(0) as u64;
-            Some(Instant::now() + Duration::from_secs(delta))
+            // `After` is one-shot and must be pinned (in ms) at
+            // register time so a listener restart preserves the
+            // deadline. If the pin is missing, the register flow is
+            // broken; fail loudly instead of silently restarting the
+            // clock. Millisecond-precise throughout (no second
+            // truncation): a sub-second After fires after its real
+            // duration, not immediately.
+            let target_ms = pinned_after_unix_ms
+                .expect("After timer must have pinned next_fire_at_unix_ms in kind_state");
+            let delta_ms = (target_ms - unix_now_ms() as i64).max(0) as u64;
+            let deadline = DateTime::from_timestamp_millis(target_ms)?;
+            Some((Instant::now() + Duration::from_millis(delta_ms), deadline))
         }
         TimerSpec::At { when } => {
             let now = Utc::now();
@@ -159,22 +173,36 @@ fn next_fire(spec: &TimerSpec, pinned_after_unix: Option<i64>) -> Option<Instant
             if ms <= 0 {
                 None
             } else {
-                Some(Instant::now() + Duration::from_millis(ms as u64))
+                Some((Instant::now() + Duration::from_millis(ms as u64), *when))
             }
         }
         TimerSpec::Cron { expression } => {
-            // The expression is already validated at register time
-            // (Signal::validate ran in register_signal task), so
-            // from_str cannot fail here. `expect` surfaces the
-            // invariant violation if the validator and the parser
-            // ever drift apart.
-            let schedule = cron::Schedule::from_str(expression)
-                .expect("cron expression validated at register time");
+            // The expression is supposed to be validated at register
+            // time (Signal::validate inside register_signal). If the
+            // validator and the `cron` parser drift apart on a minor
+            // version bump, a panic here would crash the timer task
+            // and silently take down every other timer the same task
+            // owned. Log + return None instead: the signal stays
+            // registered but doesn't fire until the underlying bug
+            // is fixed.
+            let schedule = match cron::Schedule::from_str(expression) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        target: "weft_listener::timer",
+                        expression,
+                        error = %e,
+                        "cron parser rejected a previously-validated expression; \
+                         skipping this timer (parser/validator drift)"
+                    );
+                    return None;
+                }
+            };
             let now: DateTime<Utc> = Utc::now();
             let next_dt = schedule.upcoming(Utc).next()?;
             let delta = next_dt - now;
             let ms = delta.num_milliseconds().max(0) as u64;
-            Some(Instant::now() + Duration::from_millis(ms))
+            Some((Instant::now() + Duration::from_millis(ms), next_dt))
         }
     }
 }
@@ -182,8 +210,8 @@ fn next_fire(spec: &TimerSpec, pinned_after_unix: Option<i64>) -> Option<Instant
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .expect("system clock is past UNIX_EPOCH")
+        .as_millis() as u64
 }
 
 inventory::submit!(&TimerHandler as &dyn KindHandler);

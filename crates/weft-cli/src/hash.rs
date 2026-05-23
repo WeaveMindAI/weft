@@ -7,8 +7,8 @@
 //!   worker docker image tag. Inputs:
 //!     - project source: `main.weft`, `weft.toml`, `nodes/` recursive.
 //!     - stdlib catalog: every catalog package, including their
-//!       sidecar source dirs (it's cheaper to walk the lot than to
-//!       carve out sidecar/ subtrees; cargo's build cache makes a
+//!       infra source dirs (it's cheaper to walk the lot than to
+//!       carve out infra-image subtrees; cargo's build cache makes a
 //!       false-positive flip a no-op rebuild).
 //!     - weft workspace: `crates/`, `Cargo.toml`, `Cargo.lock`. Any
 //!       engine change invalidates every project's worker image.
@@ -20,16 +20,16 @@
 //!     - graph definition: `main.weft`, `weft.toml`.
 //!     - per closure-node: full source dir (host-side `mod.rs`,
 //!       `metadata.json`, `deps.toml`, shared package files,
-//!       `sidecar/` dir if present).
+//!       `images/` dir if present).
 //!     - weft workspace: `crates/`, `Cargo.toml`, `Cargo.lock`. The
 //!       engine runs InfraSetup; engine changes can change the
 //!       running infra's behavior.
 //!
-//! Plus one per-sidecar hash kept as docker-tag plumbing only:
+//! Plus one per-image hash kept as docker-tag plumbing only:
 //!
-//! - **`compute_sidecar_hash`**: per-sidecar source dir hash. Used
+//! - **`compute_image_hash`**: per-image source dir hash. Used
 //!   verbatim as the docker image tag suffix
-//!   (`weft-sidecar-<name>:<short>`) so a stale sidecar source
+//!   (`weft-infra-<name>:<short>`) so a stale image source
 //!   produces a fresh image. NOT a drift signal anymore: drift is
 //!   the project-level `infra_hash` exclusively.
 //!
@@ -126,23 +126,23 @@ pub fn compute_infra_hash(
     Ok(hex(&hasher.finalize()))
 }
 
-/// Hash a single sidecar's source: Dockerfile + every file in the
-/// sidecar source dir, scoped by node type. Used verbatim as the
-/// sidecar docker image tag suffix.
-pub fn compute_sidecar_hash(
+/// Hash a single image's source: Dockerfile + every file in the
+/// image source dir, scoped by node type. Used verbatim as the
+/// infra docker image tag suffix.
+pub fn compute_image_hash(
     node_type: &str,
-    sidecar_source_dir: &Path,
+    image_source_dir: &Path,
 ) -> Result<SourceHash> {
     let mut hasher = Sha256::new();
-    hasher.update(b"weft-sidecar-v1\n");
+    hasher.update(b"weft-image-v1\n");
     hasher.update(node_type.as_bytes());
     hasher.update(b"\n");
-    hash_path(&mut hasher, sidecar_source_dir)?;
+    hash_path(&mut hasher, image_source_dir)?;
     Ok(hex(&hasher.finalize()))
 }
 
 /// Convenience: load + enrich a project to a `ProjectDefinition`
-/// without running cargo / docker. Drift detection and the sidecar
+/// without running cargo / docker. Drift detection and the infra
 /// build paths both need an enriched project to walk the closure.
 pub fn load_enriched_project(project: &Project) -> Result<ProjectDefinition> {
     use weft_compiler::build::build_project_catalog;

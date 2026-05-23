@@ -8,7 +8,6 @@
 
 pub mod execute;
 pub mod fire_signal;
-pub mod provision_sidecar;
 pub mod record_cost;
 pub mod record_log;
 pub mod register_signal;
@@ -20,7 +19,6 @@ pub mod spawn_pod;
 // result types are imported directly by their producers (e.g.
 // `cold_start.rs` imports `SpawnPodPayload` from the submodule).
 pub use fire_signal::FireSignalExecutor;
-pub use provision_sidecar::ProvisionSidecarExecutor;
 pub use record_cost::RecordCostExecutor;
 pub use record_log::RecordLogExecutor;
 pub use register_signal::RegisterSignalExecutor;

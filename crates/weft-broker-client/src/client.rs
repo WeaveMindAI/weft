@@ -1,7 +1,7 @@
 //! HTTP-backed implementations of the trait surfaces defined in
 //! `weft-journal::traits` and `weft-task-store::traits`. Drop-in
 //! replacements for the Postgres clients on the user-pod side
-//! (worker, listener, sidecar).
+//! (worker, listener, infra).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,6 +97,57 @@ impl HttpCore {
         let parsed: Res = resp.json().await.with_context(|| format!("parse {path}"))?;
         Ok(parsed)
     }
+
+    /// Variant of `post` that converts HTTP 410 Gone into
+    /// `WriteOutcome::Raced`. Used by lifecycle write paths where
+    /// the broker returns 410 when the row was already-completed
+    /// or reclaimed by a sibling pod (lease takeover, remove_node
+    /// cascade). Lets callers distinguish "this raced, no-op
+    /// gracefully" from "real failure, bubble up."
+    pub async fn post_or_raced<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<WriteOutcome<Res>> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let bearer = self.token.read().await.context("read SA token")?;
+        let resp = self.client
+            .post(&url)
+            .bearer_auth(bearer)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        if resp.status() == reqwest::StatusCode::GONE {
+            return Ok(WriteOutcome::Raced);
+        }
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            anyhow::bail!("broker {path} returned {code}: {txt}");
+        }
+        let parsed: Res = resp.json().await.with_context(|| format!("parse {path}"))?;
+        Ok(WriteOutcome::Applied(parsed))
+    }
+}
+
+/// Outcome of a lifecycle-bound broker write. `Applied(_)` means
+/// the write landed and the caller can rely on its effect.
+/// `Raced` means the broker returned 410 Gone: the row was
+/// already completed, the lease was reassigned to a sibling pod,
+/// or the underlying object (infra_node) was removed mid-flight.
+/// Callers should treat `Raced` as "someone else handled it" and
+/// move on (log + return, don't bubble as error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOutcome<T> {
+    Applied(T),
+    Raced,
+}
+
+impl<T> WriteOutcome<T> {
+    pub fn is_raced(&self) -> bool {
+        matches!(self, WriteOutcome::Raced)
+    }
 }
 
 // ---------- Journal ----------
@@ -120,9 +171,17 @@ impl JournalClient for BrokerJournalClient {
         event: &ExecEvent,
         pod_name: Option<&str>,
     ) -> Result<()> {
+        // The broker journal path is worker-only: every write is
+        // fenced by the writer's pod. A `None` here is a contract
+        // violation (only the dispatcher's in-process writer is
+        // pod-less, and it never goes through the broker), so fail
+        // loud rather than send a pod-less write the broker rejects.
+        let pod_name = pod_name.ok_or_else(|| {
+            anyhow::anyhow!("broker journal write requires a pod_name (worker-only path)")
+        })?;
         let req = JournalRecordRequest {
             event: event.clone(),
-            pod_name: pod_name.map(str::to_string),
+            pod_name: pod_name.to_string(),
         };
         let _: JournalRecordResponse = self.http.post("/v1/journal/record", &req).await?;
         Ok(())
@@ -163,9 +222,7 @@ impl BrokerTaskStoreClient {
 #[async_trait]
 impl TaskStoreClient for BrokerTaskStoreClient {
     async fn enqueue_dedup(&self, spec: NewTask) -> Result<DedupOutcome> {
-        let req = TaskEnqueueDedupRequest {
-            spec: NewTaskWire::from_new_task(&spec),
-        };
+        let req = TaskEnqueueDedupRequest { spec };
         let resp: TaskEnqueueDedupResponse =
             self.http.post("/v1/task/enqueue_dedup", &req).await?;
         Ok(if resp.inserted {
@@ -195,10 +252,10 @@ impl TaskStoreClient for BrokerTaskStoreClient {
     async fn claim_one(&self, pod_id: &str, filter: ClaimFilter) -> Result<Option<Task>> {
         let req = TaskClaimOneRequest {
             pod_id: pod_id.to_string(),
-            filter: ClaimFilterWire::from_filter(&filter),
+            filter,
         };
         let resp: TaskClaimOneResponse = self.http.post("/v1/task/claim_one", &req).await?;
-        Ok(resp.task.map(TaskWire::into_task))
+        Ok(resp.task)
     }
 
     async fn heartbeat(&self, task_id: Uuid, pod_id: &str) -> Result<bool> {
@@ -280,6 +337,15 @@ impl WorkerPodClient for BrokerWorkerPodClient {
             self.http.post("/v1/worker_pod/mark_done", &req).await?;
         Ok(())
     }
+
+    async fn mark_done_if_idle(&self, pod_name: &str) -> Result<bool> {
+        let req = WorkerPodMarkDoneIfIdleRequest {
+            pod_name: pod_name.to_string(),
+        };
+        let resp: WorkerPodMarkDoneIfIdleResponse =
+            self.http.post("/v1/worker_pod/mark_done_if_idle", &req).await?;
+        Ok(resp.exited)
+    }
 }
 
 // ---------- Signals (listener-only rehydrate) ----------
@@ -324,13 +390,335 @@ impl BrokerInfraClient {
 
 #[async_trait]
 impl InfraReader for BrokerInfraClient {
-    async fn sidecar_endpoint(&self, project_id: &str, node_id: &str) -> Result<Option<String>> {
-        let req = InfraSidecarEndpointRequest {
+    async fn endpoint_url(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        endpoint_name: &str,
+    ) -> Result<Option<String>> {
+        let req = InfraEndpointUrlRequest {
+            project_id: project_id.to_string(),
+            node_id: node_id.to_string(),
+            endpoint_name: endpoint_name.to_string(),
+        };
+        let resp: InfraEndpointUrlResponse =
+            self.http.post("/v1/infra/endpoint_url", &req).await?;
+        Ok(resp.endpoint_url)
+    }
+}
+
+// ---------- Supervisor ----------
+
+/// Broker client for the infra-supervisor. Talks to the
+/// `/v1/supervisor/*` endpoints under the InfraSupervisor role.
+pub struct BrokerSupervisorClient {
+    http: HttpCore,
+}
+
+impl BrokerSupervisorClient {
+    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
+        Arc::new(Self {
+            http: HttpCore::new(base_url, token),
+        })
+    }
+
+    pub async fn projects_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<SupervisorProject>> {
+        let req = SupervisorProjectsForTenantRequest {
+            tenant_id: tenant_id.to_string(),
+        };
+        let resp: SupervisorProjectsForTenantResponse = self
+            .http
+            .post("/v1/supervisor/projects_for_tenant", &req)
+            .await?;
+        Ok(resp.projects)
+    }
+
+    pub async fn infra_nodes(&self, project_id: &str) -> Result<Vec<SupervisorInfraNode>> {
+        let req = SupervisorInfraNodesRequest {
+            project_id: project_id.to_string(),
+        };
+        let resp: SupervisorInfraNodesResponse =
+            self.http.post("/v1/supervisor/infra_nodes", &req).await?;
+        Ok(resp.nodes)
+    }
+
+    pub async fn health_protocols(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let req = SupervisorHealthProtocolsRequest {
+            project_id: project_id.to_string(),
+        };
+        let resp: SupervisorHealthProtocolsResponse = self
+            .http
+            .post("/v1/supervisor/health_protocols", &req)
+            .await?;
+        Ok(resp.protocols)
+    }
+
+    pub async fn claim_command(
+        &self,
+        tenant_id: &str,
+        claimer_pod: &str,
+    ) -> Result<Option<SupervisorCommandRow>> {
+        let req = SupervisorClaimCommandRequest {
+            tenant_id: tenant_id.to_string(),
+            claimer_pod: claimer_pod.to_string(),
+        };
+        let resp: SupervisorClaimCommandResponse =
+            self.http.post("/v1/supervisor/claim_command", &req).await?;
+        Ok(resp.command)
+    }
+
+    pub async fn event_record(
+        &self,
+        project_id: &str,
+        node_id: Option<&str>,
+        event: crate::protocol::InfraEvent,
+    ) -> Result<i64> {
+        let (kind, payload) = event.into_record();
+        let req = SupervisorEventRecordRequest {
+            project_id: project_id.to_string(),
+            node_id: node_id.map(|s| s.to_string()),
+            kind,
+            payload,
+        };
+        let resp: SupervisorEventRecordResponse =
+            self.http.post("/v1/supervisor/event_record", &req).await?;
+        Ok(resp.id)
+    }
+
+    pub async fn set_status(
+        &self,
+        command_id: Option<i64>,
+        project_id: &str,
+        node_id: &str,
+        unit: Option<&str>,
+        status: crate::protocol::InfraNodeStatus,
+        failure_stage: Option<crate::protocol::FailureStage>,
+        failure_message: Option<&str>,
+    ) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
+        let req = SupervisorSetStatusRequest {
+            command_id,
+            project_id: project_id.to_string(),
+            node_id: node_id.to_string(),
+            unit: unit.map(|s| s.to_string()),
+            status,
+            failure_stage,
+            failure_message: failure_message.map(|s| s.to_string()),
+        };
+        self.http
+            .post_or_raced::<_, SupervisorSetStatusResponse>("/v1/supervisor/set_status", &req)
+            .await
+    }
+
+    pub async fn remove_node(&self, project_id: &str, node_id: &str) -> Result<bool> {
+        let req = SupervisorRemoveNodeRequest {
             project_id: project_id.to_string(),
             node_id: node_id.to_string(),
         };
-        let resp: InfraSidecarEndpointResponse =
-            self.http.post("/v1/infra/sidecar_endpoint", &req).await?;
-        Ok(resp.endpoint_url)
+        let resp: SupervisorRemoveNodeResponse =
+            self.http.post("/v1/supervisor/remove_node", &req).await?;
+        Ok(resp.removed)
+    }
+
+    pub async fn command_complete(
+        &self,
+        command_id: i64,
+        error: Option<&str>,
+    ) -> Result<WriteOutcome<SupervisorCommandCompleteResponse>> {
+        let req = SupervisorCommandCompleteRequest {
+            command_id,
+            error: error.map(|s| s.to_string()),
+        };
+        self.http
+            .post_or_raced::<_, SupervisorCommandCompleteResponse>(
+                "/v1/supervisor/command_complete",
+                &req,
+            )
+            .await
+    }
+
+    pub async fn running_count(&self, project_id: &str) -> Result<i64> {
+        let req = SupervisorRunningCountRequest {
+            project_id: project_id.to_string(),
+        };
+        let resp: SupervisorRunningCountResponse =
+            self.http.post("/v1/supervisor/running_count", &req).await?;
+        Ok(resp.running_count)
+    }
+
+    /// True if a user infra action (any uncompleted
+    /// infra_lifecycle_command: apply / stop / terminate) is in flight
+    /// for the project. The health loop stands down for the project
+    /// while this holds, so it never fights the action.
+    pub async fn infra_command_in_flight(&self, project_id: &str) -> Result<bool> {
+        let req = SupervisorInfraCommandInFlightRequest {
+            project_id: project_id.to_string(),
+        };
+        let resp: SupervisorInfraCommandInFlightResponse = self
+            .http
+            .post("/v1/supervisor/infra_command_in_flight", &req)
+            .await?;
+        Ok(resp.in_flight)
+    }
+
+    pub async fn trigger_deps(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<SupervisorTriggerDep>> {
+        let req = SupervisorTriggerDepsRequest {
+            project_id: project_id.to_string(),
+        };
+        let resp: SupervisorTriggerDepsResponse =
+            self.http.post("/v1/supervisor/trigger_deps", &req).await?;
+        Ok(resp.deps)
+    }
+
+    pub async fn set_applied(
+        &self,
+        command_id: i64,
+        project_id: &str,
+        node_id: &str,
+        instance_id: &str,
+        applied_spec_hash: &str,
+        endpoints: std::collections::BTreeMap<String, String>,
+        namespace: &str,
+        preserve_pvcs: Vec<String>,
+        units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
+    ) -> Result<WriteOutcome<SupervisorSetAppliedResponse>> {
+        let req = SupervisorSetAppliedRequest {
+            command_id,
+            project_id: project_id.to_string(),
+            node_id: node_id.to_string(),
+            instance_id: instance_id.to_string(),
+            applied_spec_hash: applied_spec_hash.to_string(),
+            endpoints,
+            namespace: namespace.to_string(),
+            preserve_pvcs,
+            units,
+        };
+        self.http
+            .post_or_raced::<_, SupervisorSetAppliedResponse>("/v1/supervisor/set_applied", &req)
+            .await
+    }
+
+    /// Pre-apply commitment: writes the infra_node row at
+    /// Provisioning status with the locked-in instance_id +
+    /// namespace + preserve_pvcs. A subsequent apply failure
+    /// leaves a visible row the user can Terminate (delete_by_label
+    /// keyed on instance_id + preserve_pvcs). Apply success flips
+    /// to Running via `set_applied`.
+    pub async fn set_provisioning(
+        &self,
+        command_id: i64,
+        project_id: &str,
+        node_id: &str,
+        instance_id: &str,
+        namespace: &str,
+        preserve_pvcs: Vec<String>,
+        units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
+    ) -> Result<WriteOutcome<SupervisorSetProvisioningResponse>> {
+        let req = SupervisorSetProvisioningRequest {
+            command_id,
+            project_id: project_id.to_string(),
+            node_id: node_id.to_string(),
+            instance_id: instance_id.to_string(),
+            namespace: namespace.to_string(),
+            preserve_pvcs,
+            units,
+        };
+        self.http
+            .post_or_raced::<_, SupervisorSetProvisioningResponse>(
+                "/v1/supervisor/set_provisioning",
+                &req,
+            )
+            .await
+    }
+
+    pub async fn project_image_tags(
+        &self,
+        project_id: &str,
+        node_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let req = SupervisorProjectImageTagsRequest {
+            project_id: project_id.to_string(),
+            node_id: node_id.to_string(),
+        };
+        let resp: SupervisorProjectImageTagsResponse = self
+            .http
+            .post("/v1/supervisor/project_image_tags", &req)
+            .await?;
+        Ok(resp.tags)
+    }
+
+    /// Enqueue a dispatcher-targeted lifecycle command
+    /// (`Deactivate(...)` | `Reactivate`). Used by HealthProtocol
+    /// action dispatch in the supervisor. Verb-and-payload are
+    /// typed via `LifecycleSpec`, so the supervisor cannot
+    /// accidentally enqueue a supervisor-owned verb.
+    pub async fn enqueue_lifecycle(
+        &self,
+        project_id: &str,
+        spec: crate::protocol::LifecycleSpec,
+    ) -> Result<i64> {
+        let req = SupervisorEnqueueLifecycleRequest {
+            project_id: project_id.to_string(),
+            spec,
+        };
+        let resp: SupervisorEnqueueLifecycleResponse = self
+            .http
+            .post("/v1/supervisor/enqueue_lifecycle", &req)
+            .await?;
+        Ok(resp.command_id)
+    }
+}
+
+/// Worker-callable broker client. Used by the engine to hand off an
+/// InfraSpec to the supervisor and wait for it to settle. The worker
+/// never reads prior applied state, never compiles, never decides
+/// skip/fresh/replace; the supervisor owns the whole apply pipeline.
+pub struct BrokerInfraStateClient {
+    http: HttpCore,
+}
+
+impl BrokerInfraStateClient {
+    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
+        Arc::new(Self {
+            http: HttpCore::new(base_url, token),
+        })
+    }
+
+    pub async fn enqueue_apply(
+        &self,
+        project_id: &str,
+        node_id: &str,
+        spec_json: serde_json::Value,
+    ) -> Result<i64> {
+        let req = InfraEnqueueApplyRequest {
+            project_id: project_id.to_string(),
+            node_id: node_id.to_string(),
+            spec_json,
+        };
+        let resp: InfraEnqueueApplyResponse =
+            self.http.post("/v1/infra/enqueue_apply", &req).await?;
+        Ok(resp.command_id)
+    }
+
+    pub async fn wait_apply(
+        &self,
+        project_id: &str,
+        command_id: i64,
+    ) -> Result<InfraWaitApplyResponse> {
+        let req = InfraWaitApplyRequest {
+            project_id: project_id.to_string(),
+            command_id,
+        };
+        let resp: InfraWaitApplyResponse =
+            self.http.post("/v1/infra/wait_apply", &req).await?;
+        Ok(resp)
     }
 }

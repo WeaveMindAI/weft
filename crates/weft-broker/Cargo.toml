@@ -35,4 +35,4 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 getrandom = "0.2"
-parking_lot = "0.12"
+parking_lot = { workspace = true }

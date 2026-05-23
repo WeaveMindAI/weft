@@ -38,10 +38,21 @@ pub fn find_ready_nodes<'a>(
     let mut result = Vec::new();
 
     for node in &project.nodes {
-        let Some(node_pulses) = pulses.get(&node.id) else { continue };
-        if !node_pulses.iter().any(|p| p.status.is_pending()) {
+        let Some(node_pulses) = pulses.get(&node.id) else {
+            tracing::trace!(target: "weft::exec::ready", node = %node.id, "skip: no pulse bucket");
+            continue;
+        };
+        let pending_count = node_pulses.iter().filter(|p| p.status.is_pending()).count();
+        if pending_count == 0 {
+            tracing::trace!(target: "weft::exec::ready", node = %node.id, "skip: no pending pulses");
             continue;
         }
+        tracing::info!(
+            target: "weft::exec::ready",
+            node = %node.id,
+            pending_count,
+            "considering node"
+        );
 
         let incoming = edge_idx.get_incoming(project, &node.id);
         let wired: HashSet<&str> = incoming
@@ -67,11 +78,23 @@ pub fn find_ready_nodes<'a>(
             }
         }
 
-        for group in find_groups_for_node(node, node_pulses, &required, &wired, &config_filled, has_incoming) {
+        let groups = find_groups_for_node(node, node_pulses, &required, &wired, &config_filled, has_incoming);
+        tracing::info!(
+            target: "weft::exec::ready",
+            node = %node.id,
+            groups_returned = groups.len(),
+            "find_groups_for_node done"
+        );
+        for group in groups {
             result.push((node.id.clone(), group));
         }
     }
 
+    tracing::info!(
+        target: "weft::exec::ready",
+        ready_total = result.len(),
+        "find_ready_nodes summary"
+    );
     result
 }
 
@@ -227,19 +250,20 @@ fn build_input(
         }
     }
 
-    // Runtime type enforcement on Single-mode ports.
+    // Runtime type enforcement on input ports: the single check point
+    // (see `check_input`). A mismatch on a required port aggregates
+    // into `type_errors` (the node fails loudly); a mismatch on an
+    // optional port nulls the port and the node proceeds.
     for port in &node.inputs {
-        if port.lane_mode != LaneMode::Single || port.port_type.is_unresolved() {
+        let Some(value) = obj.get(&port.name) else {
             continue;
-        }
-        if let Some(value) = obj.get(&port.name) {
-            if !value.is_null() && !runtime_type_check(&port.port_type, value) {
-                let err = format!(
-                    "type mismatch on '{}': expected {}, got {}",
-                    port.name,
-                    port.port_type,
-                    WeftType::infer(value)
-                );
+        };
+        match check_input(port, value) {
+            InputCheck::Ok => {}
+            InputCheck::NullIt => {
+                obj.insert(port.name.clone(), Value::Null);
+            }
+            InputCheck::Fail(err) => {
                 tracing::error!(target: "weft::exec::ready", node = %node.id, "{err}");
                 type_errors.push(err);
                 obj.insert(port.name.clone(), Value::Null);
@@ -248,6 +272,55 @@ fn build_input(
     }
 
     Value::Object(obj)
+}
+
+/// Outcome of checking one incoming value against an input port type.
+#[derive(Debug, PartialEq, Eq)]
+enum InputCheck {
+    /// Value matches the port type (or there's nothing to check).
+    Ok,
+    /// Type mismatch on an OPTIONAL port: the node didn't get a valid
+    /// value here, but it declared it can do without one, so null the
+    /// port and let the node proceed.
+    NullIt,
+    /// Type mismatch on a REQUIRED port: the node cannot proceed.
+    Fail(String),
+}
+
+/// Check one incoming value against its input port type. THE single
+/// place input type enforcement lives.
+///
+/// Uniform across lane modes because port types are POST-TRANSFORM:
+/// by the time a value reaches here the Expand split / Gather collect
+/// already happened, and the port type describes exactly what this
+/// lane carries (Single: `T`; one Expand element: `T`; gathered list:
+/// `List[T]`). So there is no expand/gather branching: every value is
+/// checked against the port type as a whole.
+///
+/// The consequence of a mismatch is decided ONLY by required-vs-
+/// optional, never by where the value came from:
+///   - optional port (not required, or type admits null) -> `NullIt`
+///   - required port -> `Fail`
+///
+/// Null = "no pulse" is never itself a mismatch; an unresolved port
+/// type is never a mismatch (the compiler resolves the types that
+/// matter before dispatch).
+fn check_input(port: &crate::project::PortDefinition, value: &Value) -> InputCheck {
+    if value.is_null() || port.port_type.is_unresolved() || runtime_type_check(&port.port_type, value)
+    {
+        return InputCheck::Ok;
+    }
+    // Optional = not required, or the declared type explicitly admits
+    // null (`T?` / `T | Null`).
+    if !port.required || port.port_type.contains_null() {
+        return InputCheck::NullIt;
+    }
+    InputCheck::Fail(format!(
+        "type mismatch on '{}': expected {}, got {}",
+        port.name,
+        port.port_type,
+        WeftType::infer(value)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -317,4 +390,87 @@ fn format_lane(lane: &Lane) -> String {
     }
     let parts: Vec<String> = lane.iter().map(|f: &LaneFrame| format!("{}:{}", f.count, f.index)).collect();
     format!("[{}]", parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_input, InputCheck};
+    use crate::project::PortDefinition;
+    use serde_json::json;
+
+    fn port(ty: &str, lane_mode: &str, required: bool) -> PortDefinition {
+        serde_json::from_value(json!({
+            "name": "p", "portType": ty, "required": required, "laneMode": lane_mode
+        }))
+        .expect("port")
+    }
+
+    #[test]
+    fn matching_value_is_ok_regardless_of_required() {
+        assert_eq!(check_input(&port("String", "Single", true), &json!("ok")), InputCheck::Ok);
+        assert_eq!(check_input(&port("String", "Single", false), &json!("ok")), InputCheck::Ok);
+    }
+
+    #[test]
+    fn null_is_ok_no_pulse() {
+        // Null is "no pulse", never itself a mismatch (the skip layer
+        // decides whether a required port being null elides the node).
+        assert_eq!(check_input(&port("String", "Single", true), &json!(null)), InputCheck::Ok);
+    }
+
+    #[test]
+    fn mismatch_on_required_fails() {
+        let p = port("String", "Single", true);
+        match check_input(&p, &json!(42)) {
+            InputCheck::Fail(msg) => assert!(msg.contains("expected")),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mismatch_on_optional_nulls_it() {
+        // Optional = not required. The node declared it can do without
+        // a valid value here, so a mismatch nulls the port (no fail).
+        assert_eq!(check_input(&port("String", "Single", false), &json!(42)), InputCheck::NullIt);
+    }
+
+    #[test]
+    fn mismatch_on_nullable_required_nulls_it() {
+        // A required port whose TYPE admits null (`String | Null`) is
+        // optional in the "can-do-without" sense: a mismatch nulls it.
+        assert_eq!(
+            check_input(&port("String | Null", "Single", true), &json!(42)),
+            InputCheck::NullIt
+        );
+    }
+
+    #[test]
+    fn gather_checks_assembled_list_as_a_whole() {
+        // A gather input is declared `List[T]` (POST-transform), checked
+        // against `List[T]` like any value. No expand/gather special-
+        // casing: same code path as Single.
+        let req = port("List[Number]", "Gather", true);
+        assert_eq!(check_input(&req, &json!([1, 2, 3])), InputCheck::Ok);
+        // A skipped sibling's null makes the list `List[Number|Null]`,
+        // which fails `List[Number]` on a required port.
+        match check_input(&req, &json!([1, null, 3])) {
+            InputCheck::Fail(_) => {}
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        // Same gather, optional port: the bad list nulls instead.
+        let opt = port("List[Number]", "Gather", false);
+        assert_eq!(check_input(&opt, &json!([1, null, 3])), InputCheck::NullIt);
+    }
+
+    #[test]
+    fn expand_lane_element_checked_against_element_type() {
+        // After the split, an Expand lane carries one element checked
+        // against the element type T -- the SAME whole-value check.
+        let req = port("Number", "Expand", true);
+        assert_eq!(check_input(&req, &json!(7)), InputCheck::Ok);
+        match check_input(&req, &json!("nan")) {
+            InputCheck::Fail(_) => {}
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
 }

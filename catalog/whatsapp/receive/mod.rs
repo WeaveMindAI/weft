@@ -53,12 +53,9 @@ async fn register(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
             )
         })?
         .to_string();
-    let base = bridge.trim_end_matches('/');
-    let events_url = if base.ends_with("/action") {
-        format!("{}/events", &base[..base.len() - "/action".len()])
-    } else {
-        format!("{}/events", base)
-    };
+    // `endpointUrl` is the bridge's bare endpoint URL (the bridge node
+    // exports `ctx.endpoint("api").url()`, no path). Append our route.
+    let events_url = format!("{}/events", bridge.trim_end_matches('/'));
     ctx.register_signal(Sse {
         url: events_url,
         event_name: "message.received".into(),
@@ -68,22 +65,15 @@ async fn register(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
 }
 
 fn fire(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
-    let payload = ctx
+    // The SSE listener delivers the parsed `data:` object as the
+    // fire payload, which the dispatcher seeds verbatim into
+    // `__seed__`. That object is the message itself.
+    let data = ctx
         .input
         .values
         .get("__seed__")
         .cloned()
         .unwrap_or(Value::Null);
-    // Support both the SSE payload shape (listener passes `evt.data`
-    // as the payload) and the legacy webhook nesting `{body: {data: ...}}`.
-    let data = if let Some(nested) = payload
-        .get("body")
-        .and_then(|b| b.get("data"))
-    {
-        nested.clone()
-    } else {
-        payload
-    };
 
     let mut output = NodeOutput::empty();
     output = output.set(
@@ -119,12 +109,6 @@ fn fire(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
         data.get("chatId")
             .cloned()
             .unwrap_or(Value::String(String::new())),
-    );
-    output = output.set(
-        "messageType",
-        data.get("messageType")
-            .cloned()
-            .unwrap_or(Value::String("text".into())),
     );
     Ok(output)
 }

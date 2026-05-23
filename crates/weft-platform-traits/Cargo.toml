@@ -1,0 +1,26 @@
+[package]
+name = "weft-platform-traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Shared trait surface + production impls for cross-cutting platform
+# concerns (k8s API access, clock). Fakes live behind `test-helpers`
+# so production builds don't link them. See docs/v2-testing-strategy.md.
+
+[features]
+default = []
+test-helpers = ["dep:parking_lot"]
+
+[dependencies]
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# Fake-only lock. parking_lot's Mutex never poisons and lints cleanly
+# against accidental cross-await holding (vs std's Mutex which clippy
+# warns on but doesn't prevent). Behind the feature so production
+# builds don't pull it.
+parking_lot = { workspace = true, optional = true }

@@ -30,8 +30,8 @@ pub use executor::{
     WorkerTaskKind, WorkerTaskRegistry, WorkerTaskRegistryBuilder,
 };
 pub use kinds::{
-    CancelExecutionPayload, ExecutionPayload, FireSignalPayload, RecordCostPayload,
-    RecordLogPayload, SpawnPodPayload, TaskKind,
+    CancelExecutionPayload, ExecutionPayload,
+    FireSignalPayload, RecordCostPayload, RecordLogPayload, SpawnPodPayload, TaskKind,
 };
 pub use tasks::{
     claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,
@@ -42,7 +42,7 @@ pub use traits::{
     PostgresTaskStoreClient, PostgresWorkerPodClient, TaskStoreClient, WorkerPodClient,
 };
 pub use worker_pod::{
-    alive_pod_for_project, has_live_for_project, insert_spawning, list_stale, mark_dead,
-    mark_done, register_alive, spawn_heartbeat, WorkerPodRow, HEARTBEAT_INTERVAL_SECS,
-    HEARTBEAT_STALE_SECS,
+    alive_pod_for_project, alive_pod_for_project_full, delete_row, has_live_for_project,
+    insert_spawning, list_stale, list_terminal, mark_dead, mark_done, mark_done_if_idle,
+    register_alive, WorkerPodRow, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_STALE_SECS,
 };

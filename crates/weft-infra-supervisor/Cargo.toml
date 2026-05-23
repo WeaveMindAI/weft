@@ -1,0 +1,48 @@
+[package]
+name = "weft-infra-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "weft_infra_supervisor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weft-infra-supervisor"
+path = "src/main.rs"
+
+[features]
+default = []
+# Pulls in FakeBroker + the testing rig so other crates (and tests
+# in this crate's `tests/` dir) can exercise the supervisor against
+# in-memory dependencies. Cascades into platform-traits' fakes.
+test-helpers = ["weft-platform-traits/test-helpers", "dep:parking_lot"]
+
+[dependencies]
+weft-core = { workspace = true }
+weft-broker-client = { path = "../weft-broker-client" }
+weft-platform-traits = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+# Optional: only the FakeBroker's Mutex needs it. parking_lot's
+# Mutex doesn't poison and won't deadlock at compile-time if a
+# future refactor accidentally holds it across .await.
+parking_lot = { workspace = true, optional = true }
+
+[dev-dependencies]
+weft-infra-supervisor = { path = ".", features = ["test-helpers"] }
+weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+# `test-util` enables tokio's paused virtual clock so the hung-action
+# timeout test fires deterministically without a real 5s wait.
+tokio = { workspace = true, features = ["test-util"] }

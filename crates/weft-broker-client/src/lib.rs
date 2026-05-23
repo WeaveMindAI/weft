@@ -9,11 +9,12 @@
 //! without any in-process refresh logic).
 
 pub mod client;
+pub mod lifecycle_command;
 pub mod protocol;
 pub mod token;
 
 pub use client::{
-    BrokerInfraClient, BrokerJournalClient, BrokerSignalClient, BrokerTaskStoreClient,
-    BrokerWorkerPodClient,
+    BrokerInfraClient, BrokerInfraStateClient, BrokerJournalClient, BrokerSignalClient,
+    BrokerSupervisorClient, BrokerTaskStoreClient, BrokerWorkerPodClient, WriteOutcome,
 };
 pub use token::TokenSource;

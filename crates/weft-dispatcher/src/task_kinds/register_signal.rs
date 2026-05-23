@@ -256,17 +256,28 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         let project_uuid: uuid::Uuid = project_id
             .parse()
             .map_err(|e| anyhow::anyhow!("project_id parse: {e}"))?;
-        let tags = state
+        // Unfold the lookup. Both "project missing" and "node not in
+        // project" used to collapse to empty tags, which downstream
+        // signal-row enumeration filters by tag : so the trigger
+        // would silently never fire. Fail explicitly on either case.
+        let project_def = state
             .projects
             .project(project_uuid)
-            .await
-            .and_then(|p| {
-                p.nodes
-                    .into_iter()
-                    .find(|n| n.id == payload.node_id)
-                    .map(|n| n.tags())
-            })
-            .unwrap_or_default();
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("register_signal: project_id={project_uuid} not registered")
+            })?;
+        let node = project_def
+            .nodes
+            .iter()
+            .find(|n| n.id == payload.node_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "register_signal: node_id='{}' not in project_id={project_uuid}",
+                    payload.node_id
+                )
+            })?;
+        let tags = node.tags();
 
         let insert_result = state
             .journal
@@ -327,10 +338,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             // here triggers the task framework to retry, and
             // signal_insert's UPSERT is idempotent so the second
             // pass converges cleanly.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = crate::lease::now_unix() as u64;
             let lane_key = payload
                 .lane
                 .iter()

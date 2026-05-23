@@ -34,9 +34,31 @@ use weft_task_store::{
 use crate::context::EngineClients;
 use crate::loop_driver::run_one_execution;
 
+/// How long the worker picker sits idle (no claimable work) before
+/// attempting its guarded self-exit. The grace this gives a burst
+/// of executions: a new exec arriving within this window reuses the
+/// warm pod instead of paying a cold respawn.
+const WORKER_IDLE_EXIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Pod-scoped registry: per-color cancellation flag for an in-flight
 /// execution. cancel_execution looks up by color and fires the flag.
 type CancelRegistry = Arc<Mutex<HashMap<Color, Arc<CancellationFlag>>>>;
+
+/// `IdleExit` impl backed by the broker's guarded CAS. The picker
+/// calls `try_idle_exit` after the idle window; the broker flips
+/// `alive -> done` only if no pending/claimed work exists for the
+/// project, so a concurrent exec keeps the pod alive.
+struct WorkerIdleExit {
+    worker_pods: Arc<dyn WorkerPodClient>,
+    pod_name: String,
+}
+
+#[async_trait::async_trait]
+impl weft_task_store::executor::IdleExit for WorkerIdleExit {
+    async fn try_idle_exit(&self) -> anyhow::Result<bool> {
+        self.worker_pods.mark_done_if_idle(&self.pod_name).await
+    }
+}
 
 /// Per-Pod runtime context for worker task kinds. The registry's
 /// `WorkerTaskKind::handle` impls receive `&WorkerCtx`.
@@ -47,6 +69,11 @@ struct WorkerCtx {
     clients: EngineClients,
     pod_name: String,
     tenant_id: String,
+    /// The k8s namespace this worker pod runs in (the project
+    /// namespace: `wm-project-{tenant}-{project}`). Threaded into
+    /// `InfraProvisionContext` so `Node::provision` bodies see the
+    /// runtime namespace they're being applied into.
+    namespace: String,
     cancel_registry: CancelRegistry,
 }
 
@@ -58,6 +85,7 @@ pub async fn run_pod(
     pod_name: String,
     project_id: String,
     tenant_id: String,
+    namespace: String,
 ) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let cancel_registry: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -78,6 +106,7 @@ pub async fn run_pod(
         clients,
         pod_name: pod_name.clone(),
         tenant_id,
+        namespace,
         cancel_registry: cancel_registry.clone(),
     };
 
@@ -87,6 +116,13 @@ pub async fn run_pod(
         .register(TaskKind::CancelExecution, Arc::new(CancelExecutionKind))
         .build();
 
+    // Idle self-exit: after `WORKER_IDLE_EXIT` of no claimable
+    // work, the picker attempts the guarded `alive -> done` CAS via
+    // the broker. The CAS (not the timer) is the correctness gate.
+    let idle_exit: Arc<dyn weft_task_store::executor::IdleExit> = Arc::new(WorkerIdleExit {
+        worker_pods: worker_pods.clone(),
+        pod_name: pod_name.clone(),
+    });
     run_worker_picker(
         picker_tasks,
         ctx,
@@ -94,6 +130,8 @@ pub async fn run_pod(
         pod_name.clone(),
         project_id,
         shutdown.clone(),
+        idle_exit,
+        WORKER_IDLE_EXIT,
     )
     .await;
 
@@ -204,6 +242,7 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             ctx.clients.clone(),
             ctx.pod_name.clone(),
             ctx.tenant_id.clone(),
+            ctx.namespace.clone(),
             flag,
         )
         .await;

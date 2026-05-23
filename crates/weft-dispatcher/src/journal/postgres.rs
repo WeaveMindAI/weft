@@ -129,7 +129,7 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             created_at BIGINT NOT NULL,
             -- Opaque per-kind state persisted at register time and
             -- read back at rehydrate time. Empty for most kinds.
-            -- Timer uses it to persist absolute next_fire_at_unix
+            -- Timer uses it to persist absolute next_fire_at_unix_ms
             -- for After-style schedules so a listener restart
             -- doesn't reset the clock. Future stateful kinds (e.g.
             -- SSE last-event-id, socket reconnect token) use the
@@ -152,6 +152,13 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             -- the claim-stale threshold so a dispatcher crash
             -- mid-step doesn't leave the row uncloseable.
             drain_claimed_at_unix BIGINT,
+            -- Per-claim owner nonce. Set when a drain claims the row;
+            -- every pop + the release is fenced on it. If a stale-claim
+            -- sweep hands the row to a sibling pod mid-drain, the
+            -- original drainer's fenced pop matches 0 rows and it aborts
+            -- instead of popping an element the new owner already
+            -- dispatched (which would silently drop an undispatched fire).
+            drain_claimed_by TEXT,
             consumer_kind TEXT,
             tags TEXT[] NOT NULL DEFAULT '{}',
             consumer_payload TEXT,
@@ -279,7 +286,7 @@ impl Journal for PostgresJournal {
         .bind(&tok.allowed_projects)
         .bind(&tok.allowed_tags)
         .bind(metadata_str)
-        .bind(now_unix() as i64)
+        .bind(crate::lease::now_unix())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -584,7 +591,7 @@ impl Journal for PostgresJournal {
         .bind(&sig.node_id)
         .bind(sig.is_resume)
         .bind(&sig.spec_json)
-        .bind(now_unix() as i64)
+        .bind(crate::lease::now_unix())
         .bind(sig.consumer_kind.as_deref())
         .bind(&sig.tags)
         .bind(payload_str)
@@ -752,7 +759,7 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
         ExecEvent::NodeStarted { color, node_id, lane, input, at_unix, .. } => Some(NodeExecEvent {
             color: *color,
             node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).unwrap_or_default(),
+            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
             kind: NodeExecKind::Started,
             input: Some(input.clone()),
             output: None,
@@ -765,7 +772,7 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
         ExecEvent::NodeSuspended { color, node_id, lane, token, at_unix } => Some(NodeExecEvent {
             color: *color,
             node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).unwrap_or_default(),
+            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
             kind: NodeExecKind::Suspended,
             input: None,
             output: None,
@@ -778,7 +785,7 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
         ExecEvent::NodeResumed { color, node_id, lane, token, value, at_unix } => Some(NodeExecEvent {
             color: *color,
             node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).unwrap_or_default(),
+            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
             kind: NodeExecKind::Resumed,
             input: None,
             output: None,
@@ -791,7 +798,7 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
         ExecEvent::NodeCancelled { color, node_id, lane, reason, at_unix } => Some(NodeExecEvent {
             color: *color,
             node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).unwrap_or_default(),
+            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
             kind: NodeExecKind::Cancelled,
             input: None,
             output: None,
@@ -804,7 +811,7 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
         ExecEvent::NodeCompleted { color, node_id, lane, output, at_unix } => Some(NodeExecEvent {
             color: *color,
             node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).unwrap_or_default(),
+            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
             kind: NodeExecKind::Completed,
             input: None,
             output: Some(output.clone()),
@@ -817,7 +824,7 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
         ExecEvent::NodeFailed { color, node_id, lane, error, at_unix } => Some(NodeExecEvent {
             color: *color,
             node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).unwrap_or_default(),
+            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
             kind: NodeExecKind::Failed,
             input: None,
             output: None,
@@ -830,7 +837,7 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
         ExecEvent::NodeSkipped { color, node_id, lane, at_unix } => Some(NodeExecEvent {
             color: *color,
             node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).unwrap_or_default(),
+            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
             kind: NodeExecKind::Skipped,
             input: None,
             output: None,
@@ -844,9 +851,4 @@ fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// `crate::lease::now_unix` is the canonical wall-clock reader.

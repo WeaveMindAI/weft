@@ -1,0 +1,18 @@
+{
+  "name": "weft-whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@cacheable/node-cache": "^3.0.1",
+    "@hapi/boom": "^10.0.1",
+    "baileys": "7.0.0-rc11",
+    "express": "^5.2.1",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4"
+  }
+}

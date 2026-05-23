@@ -69,6 +69,7 @@ pub fn emit(
     let packages = group_by_package(catalog, &referenced)?;
 
     write_cargo_toml(&crate_root, project, &weft_root, catalog, &referenced, &packages)?;
+    write_rust_toolchain(&crate_root, &weft_root)?;
     write_project_json(&src_dir, project)?;
     write_project_rs(&src_dir)?;
     write_package_shims(&src_dir, catalog, &packages)?;
@@ -180,6 +181,11 @@ fn write_cargo_toml(
         &mut merged,
         "weft-broker-client",
         toml::Value::Table(path_table("../weft/crates/weft-broker-client")),
+    );
+    insert_dep(
+        &mut merged,
+        "weft-platform-traits",
+        toml::Value::Table(path_table("../weft/crates/weft-platform-traits")),
     );
     insert_dep(
         &mut merged,
@@ -297,6 +303,21 @@ path = "src/main.rs"
         deps = deps_fragment,
     );
     std::fs::write(crate_root.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
+    Ok(())
+}
+
+/// Propagate the workspace's pinned toolchain into the generated
+/// worker crate. The worker builds in its own crate dir (`/work` in
+/// the image), which is a sibling of the weft mount, so `cargo build`
+/// there wouldn't otherwise find the root `rust-toolchain.toml`.
+/// Copying it in keeps the root file the single source of truth, so the
+/// worker compiles on the exact toolchain the rest of the system uses.
+/// Fails loud if the root pin is missing: a worker built on the wrong
+/// toolchain would fail confusingly deep in the node compile instead.
+fn write_rust_toolchain(crate_root: &Path, weft_root: &Path) -> Result<(), CompileError> {
+    let pin = std::fs::read_to_string(weft_root.join("rust-toolchain.toml"))
+        .map_err(|e| CompileError::Build(format!("read rust-toolchain.toml: {e}")))?;
+    std::fs::write(crate_root.join("rust-toolchain.toml"), pin).map_err(CompileError::Io)?;
     Ok(())
 }
 
@@ -565,8 +586,8 @@ use std::sync::Arc;
 use clap::Parser;
 
 use weft_broker_client::{{
-    BrokerInfraClient, BrokerJournalClient, BrokerTaskStoreClient, BrokerWorkerPodClient,
-    TokenSource,
+    BrokerInfraClient, BrokerInfraStateClient, BrokerJournalClient, BrokerTaskStoreClient,
+    BrokerWorkerPodClient, TokenSource,
 }};
 use weft_core::NodeCatalog;
 use weft_engine::EngineClients;
@@ -635,11 +656,18 @@ async fn main() -> anyhow::Result<()> {{
     let tasks = BrokerTaskStoreClient::new(args.broker_url.clone(), token.clone());
     let worker_pods = BrokerWorkerPodClient::new(args.broker_url.clone(), token.clone());
     let infra = BrokerInfraClient::new(args.broker_url.clone(), token.clone());
+    let infra_state = BrokerInfraStateClient::new(args.broker_url.clone(), token.clone());
 
+    // The Broker*Client constructors already return `Arc<Self>`, so
+    // pass them straight into the `Arc<dyn _>` fields (re-wrapping
+    // would make `Arc<Arc<_>>`, which doesn't implement the trait).
+    // `SystemClock` is bare, so it still needs the `Arc::new`.
     let clients = EngineClients {{
         journal,
         tasks,
         infra,
+        infra_state,
+        clock: std::sync::Arc::new(weft_platform_traits::clock::SystemClock),
     }};
 
     let project = project::project().clone();
@@ -653,6 +681,7 @@ async fn main() -> anyhow::Result<()> {{
         args.pod_name,
         args.project_id,
         args.tenant_id,
+        args.namespace,
     )
     .await?;
 

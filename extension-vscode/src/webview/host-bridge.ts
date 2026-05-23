@@ -163,7 +163,7 @@ export function translateProject(
   const edges = host.edges.map((e) => toV1Edge(e, groupIds));
 
   // The dispatcher's ProjectDefinition always emits position=(0,0);
-  // persistent positions live in the sidecar `.layout.json` file
+  // persistent positions live in the companion `.layout.json` file
   // (v1 convention). Apply them here so the graph opens where the
   // user last saved it instead of a stack at the origin. Same logic
   // as project-hydration.ts, but we do it post-translate because our

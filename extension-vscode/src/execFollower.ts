@@ -31,7 +31,31 @@ export type DispatcherEvent =
   | { kind: 'node_skipped'; color: string; node: string; lane: string; project_id: string }
   | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown }
   | { kind: 'execution_failed'; color: string; project_id: string; error: string }
-  | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string };
+  | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string }
+  // Infra lifecycle. Emitted by the dispatcher's infra_event_bridge
+  // from supervisor-written rows; drive action-bar refresh so
+  // transient `stopping` / `terminating` states show up in the UI.
+  | { kind: 'infra_status_changed'; project_id: string; node_id: string; status: string }
+  | { kind: 'infra_flaky'; project_id: string; node_id: string; reason: string }
+  | { kind: 'infra_recovered'; project_id: string; node_id: string }
+  | { kind: 'infra_terminated'; project_id: string; node_id: string }
+  // Project lifecycle. Emitted by the dispatcher when a project's
+  // overall lifecycle state changes (independent of any single
+  // execution). Drive action-bar refresh so the UI sees the new
+  // verb set without polling.
+  | { kind: 'project_registered'; project_id: string; name: string }
+  | { kind: 'project_activated'; project_id: string }
+  | { kind: 'project_deactivated'; project_id: string }
+  // External-URL invalidation. Trigger nodes that mint a tenant-
+  // public URL emit this when the URL changes (re-activate, new
+  // mount path, etc.). UI invalidates any cached chip.
+  | { kind: 'trigger_url_changed'; project_id: string; node_id: string; url: string }
+  // Cost report. Workers emit one per `report_cost` call.
+  | { kind: 'cost_reported'; color: string; project_id: string; service: string; amount_usd: number }
+  // Operator-visible banner: the supervisor couldn't parse the
+  // project's `health_protocols_json`. Surfaces as an action-bar
+  // banner; the user fixes the config and the next tick recovers.
+  | { kind: 'infra_config_error'; project_id: string; error: string };
 
 export type PostFn = (msg: HostMessage) => void;
 
@@ -178,6 +202,31 @@ export class ExecutionFollower implements vscode.Disposable {
                 : 'failed',
         });
         break;
+      // Events handled by `autoFollow` (action-bar refresh) or
+      // user-facing banners; this execution-scoped follower
+      // intentionally no-ops on them. Listing them keeps the
+      // switch exhaustive so a new variant fails to compile here
+      // until a reviewer routes it explicitly.
+      case 'execution_started':
+      case 'infra_status_changed':
+      case 'infra_flaky':
+      case 'infra_recovered':
+      case 'infra_terminated':
+      case 'project_registered':
+      case 'project_activated':
+      case 'project_deactivated':
+      case 'trigger_url_changed':
+      case 'cost_reported':
+      case 'infra_config_error':
+        break;
+      default: {
+        // Exhaustiveness: if a new DispatcherEvent variant is
+        // added to the union without a route here, TypeScript
+        // will narrow `e` to the new shape (not `never`) and
+        // this assignment will fail to compile.
+        const _exhaustive: never = e;
+        return _exhaustive;
+      }
     }
   }
 }

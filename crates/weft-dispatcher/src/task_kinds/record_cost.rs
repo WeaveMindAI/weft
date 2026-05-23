@@ -29,10 +29,7 @@ impl TaskExecutor<DispatcherState> for RecordCostExecutor {
             .color
             .parse()
             .map_err(|e| anyhow::anyhow!("bad color in record_cost payload: {e}"))?;
-        let at_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let at_unix = crate::lease::now_unix() as u64;
         // Dedup at the journal layer too: a task-executor retry of
         // the same task re-runs `execute` (lease loss + reclaim).
         // Without a journal-side dedup_key, retries would double-

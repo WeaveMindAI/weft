@@ -468,15 +468,6 @@ use super::*;
   }
 
   #[test]
-  fn expand_element_type() {
-      let ls = WeftType::list(WeftType::primitive(WeftPrimitive::String));
-      assert_eq!(ls.expand_element_type(), Some(WeftType::primitive(WeftPrimitive::String)));
-      // Non-list can't be expanded
-      let s = WeftType::primitive(WeftPrimitive::String);
-      assert_eq!(s.expand_element_type(), None);
-  }
-
-  #[test]
   fn runtime_check_list() {
       let ls = WeftType::list(WeftType::primitive(WeftPrimitive::String));
       assert!(check(&ls, &serde_json::json!(["a", "b"])));

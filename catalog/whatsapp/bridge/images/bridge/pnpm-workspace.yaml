@@ -1,0 +1,23 @@
+## pnpm 11 turned several supply-chain defaults on. This file is
+## pnpm's canonical config slot in v11 (`.npmrc` no longer accepts
+## non-auth/registry settings).
+##
+## ── blockExoticSubdeps ─────────────────────────────────────────
+## Rejects any transitive dep resolved via git URL / tarball.
+## Baileys (every version) pulls `libsignal` from
+## `git+https://github.com/whiskeysockets/libsignal-node.git` : the
+## maintainer vendors their GPLv3-fork of libsignal-node this way on
+## purpose. Pinning Baileys to an older version doesn't help.
+## See https://pnpm.io/blog/releases/11.0
+blockExoticSubdeps: false
+
+## ── allowBuilds ────────────────────────────────────────────────
+## Default-deny on running `postinstall` scripts; explicit allow per
+## package. Baileys + protobufjs + sharp all build native code at
+## install time (Signal protocol bindings, protobuf precompilation,
+## libvips image-processing native bindings).
+## See https://pnpm.io/settings
+allowBuilds:
+  baileys: true
+  protobufjs: true
+  sharp: true

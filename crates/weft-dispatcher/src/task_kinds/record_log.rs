@@ -22,10 +22,7 @@ impl TaskExecutor<DispatcherState> for RecordLogExecutor {
             .color
             .parse()
             .map_err(|e| anyhow::anyhow!("bad color in record_log payload: {e}"))?;
-        let at_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let at_unix = crate::lease::now_unix() as u64;
         let dedup_key = format!("record_log:{}", task.id);
         state
             .journal

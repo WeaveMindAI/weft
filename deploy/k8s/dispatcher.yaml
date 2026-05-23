@@ -3,7 +3,7 @@
 # system namespace, kept separate from tenant workloads). The
 # binding below grants it cluster-wide read/write on the resources
 # it needs to manage in tenant namespaces (workers, listeners,
-# sidecars).
+# infra pods).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -14,31 +14,65 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: weft-dispatcher
-# Scoped to exactly what dispatcher's `kubectl apply` / `kubectl
-# delete` paths touch: tenant pods (workers, sidecars), the
-# listener Deployment+Service, tenant namespace bundles
-# (Namespace + ServiceAccount + NetworkPolicy). No ConfigMap, Job,
-# PVC, Ingress, or read-only diagnostics. Sweeper uses `get` on
-# pods to list terminal-phase ones; that's it.
+# Two sources of scope: (1) what the dispatcher's own `kubectl
+# apply` / `kubectl delete` paths touch (tenant pods, the listener
+# Deployment+Service, tenant namespace bundles: Namespace + SA +
+# NetworkPolicy; sweeper `get`s pods), AND (2) the UNION of the
+# supervisor + listener ClusterRole verbs, which the dispatcher must
+# also hold to pass kube's escalation-prevention check when it
+# creates their RoleBindings (see the rule comment below). That's
+# why configmaps/secrets/pvc/jobs/ingress/hpa appear here even
+# though dispatcher runtime code never calls them directly.
 rules:
+  # K8s RBAC's escalation-prevention rule: when the dispatcher
+  # creates a RoleBinding referencing a ClusterRole, kube-apiserver
+  # checks that the dispatcher itself ALREADY HOLDS every verb in
+  # that ClusterRole. The supervisor + listener ClusterRoles we
+  # bind into project namespaces include `watch` on most resources,
+  # `delete` on pods, `patch`/`update` on workload scale, plus
+  # `get,list,watch` on endpoints (for the listener's service
+  # resolution). The dispatcher needs all of those too, even though
+  # its own runtime code doesn't call them, otherwise the RoleBinding
+  # apply is rejected.
   - apiGroups: [""]
     resources: [namespaces]
-    verbs: [get, list, create]
+    verbs: [get, list, create, delete]
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list, watch, create, delete]
+    verbs: [get, list, watch, create, patch, delete]
   - apiGroups: [""]
     resources: [services]
-    verbs: [get, list, create, update, patch, delete]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [endpoints]
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [serviceaccounts]
     verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [configmaps, secrets, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [apps]
-    resources: [deployments]
-    verbs: [get, list, create, update, patch, delete]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # `/scale` subresource: required so the RoleBindings we create
+  # (which include this verb in the supervisor's grant) pass k8s's
+  # escalation-prevention check at apply time.
+  - apiGroups: [apps]
+    resources: [deployments/scale, statefulsets/scale]
+    verbs: [update, patch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [networking.k8s.io]
-    resources: [networkpolicies]
+    resources: [networkpolicies, ingresses]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
     verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch, create, update, patch, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -108,12 +142,13 @@ spec:
             # Cluster CIDR knobs: required in-cluster so the
             # dispatcher can render NetworkPolicies that allow
             # internet egress while denying intra-cluster Pod traffic.
-            # The default values match Kind's defaults; production
-            # operators MUST override.
+            # Substituted by the `weft daemon` apply path from the
+            # WEFT_CLUSTER_{POD,SERVICE}_CIDR env vars (default to
+            # Kind's values); a non-kind operator sets those env vars.
             - name: WEFT_CLUSTER_POD_CIDR
-              value: "10.244.0.0/16"
+              value: "${WEFT_CLUSTER_POD_CIDR}"
             - name: WEFT_CLUSTER_SERVICE_CIDR
-              value: "10.96.0.0/12"
+              value: "${WEFT_CLUSTER_SERVICE_CIDR}"
             - name: WEFT_BROKER_URL
               value: "http://weft-broker.weft-db.svc.cluster.local:9090"
             # Public ingress URL surfaced to users in webhook /

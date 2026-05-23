@@ -20,11 +20,10 @@ interface RoleNodeShape {
   features?: { isTrigger?: boolean } | undefined;
 }
 
-/// True iff the node is sidecar-backed (`/live` poller applies).
+/// True iff the node is infra-backed (`/live` poller applies).
 export function nodeRequiresInfra(node: RoleNodeShape & { requiresInfra?: boolean }): boolean {
   if (node.requiresInfra) return true;
-  const catalog = NODE_TYPE_CONFIG[node.nodeType];
-  return !!(catalog as { requires_infra?: boolean } | undefined)?.requires_infra;
+  return !!NODE_TYPE_CONFIG[node.nodeType]?.requiresInfra;
 }
 
 /// True iff the node is a trigger (`/display` poller applies).

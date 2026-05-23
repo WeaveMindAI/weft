@@ -156,7 +156,11 @@ pub mod kube_client {
             if !parsed.status.authenticated {
                 anyhow::bail!(
                     "tokenreview rejected: {}",
-                    parsed.status.error.unwrap_or_default()
+                    parsed
+                        .status
+                        .error
+                        .as_deref()
+                        .unwrap_or("(no error message from kube-apiserver)")
                 );
             }
             // Audience verification: kube-apiserver returns the
