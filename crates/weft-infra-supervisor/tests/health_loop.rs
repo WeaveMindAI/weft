@@ -810,3 +810,116 @@ async fn default_protocol_does_not_fire_when_status_mismatches() {
         "neither (Active+healthy) nor (Inactive+broken) should fire the default two-stage protocol"
     );
 }
+// ---------- autonomous 3-stage recovery: deactivate -> bounce -> reactivate ----------
+
+#[tokio::test]
+async fn three_stage_recovery_deactivate_bounce_reactivate() {
+    // A node author wires an autonomous flaky-recovery protocol set:
+    //   1. flaky + Active   -> ParkTriggers   (deactivate the triggers)
+    //   2. flaky + Inactive -> BouncePods     (restart the wedged unit)
+    //   3. healthy+ Inactive-> AutoRecover    (reactivate the triggers)
+    // No human in the loop. This proves the framework can express + run
+    // the full cycle. The supervisor enqueues the deactivate/reactivate
+    // (the dispatcher's claimer would run them + flip project status);
+    // here we flip status manually to simulate the claimer, since the
+    // rig runs only the health loop. The flaky window is 30s; each
+    // protocol gets timeout 5s. The `unit` selector targets "bridge".
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    let protocols = serde_json::json!({
+        "protocols": [
+            {
+                "name": "park",
+                "when": { "kind": "all", "conds": [
+                    { "kind": "node_ready_replicas", "node_id": NODE, "unit": "bridge", "op": "eq", "value": 0 },
+                    { "kind": "project_status_eq", "status": "active" }
+                ]},
+                "action": { "kind": "park_triggers" },
+                "timeout_seconds": 5
+            },
+            {
+                "name": "bounce",
+                "when": { "kind": "all", "conds": [
+                    { "kind": "node_ready_replicas", "node_id": NODE, "unit": "bridge", "op": "eq", "value": 0 },
+                    { "kind": "project_status_eq", "status": "inactive" }
+                ]},
+                "action": { "kind": "bounce_pods", "node_id": NODE, "unit": "bridge" },
+                "timeout_seconds": 5
+            },
+            {
+                "name": "recover",
+                "when": { "kind": "all", "conds": [
+                    { "kind": "not", "cond": [
+                        { "kind": "node_ready_replicas", "node_id": NODE, "unit": "bridge", "op": "eq", "value": 0 }
+                    ]},
+                    { "kind": "project_status_eq", "status": "inactive" }
+                ]},
+                "action": { "kind": "auto_recover" },
+                "timeout_seconds": 5
+            }
+        ]
+    });
+    rig.broker.set_health_protocols(PROJECT, protocols);
+
+    // The unit goes flaky (0 of 1 ready). Project starts Active.
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![workload_with_unit("inst1-bridge", NODE, "bridge", 1, 0)],
+    );
+
+    // --- Stage 1: flaky + Active -> ParkTriggers (Deactivate enqueued) ---
+    rig.advance(Duration::from_secs(35)); // past the flaky window
+    rig.tick_health().await.unwrap();
+    let last_lifecycle = |rig: &SupervisorTestRig| {
+        rig.broker.calls().into_iter().rev().find_map(|c| match c {
+            BrokerCall::EnqueueLifecycle { spec, .. } => Some(spec),
+            _ => None,
+        })
+    };
+    use weft_broker_client::protocol::LifecycleSpec;
+    assert!(
+        matches!(last_lifecycle(&rig), Some(LifecycleSpec::Deactivate(_))),
+        "stage 1 must enqueue a Deactivate (park)"
+    );
+    // Simulate the claimer running the deactivate: project -> Inactive.
+    rig.broker.add_project_with_status(
+        PROJECT,
+        NAMESPACE,
+        weft_broker_client::protocol::ProjectStatus::Inactive,
+    );
+
+    // --- Stage 2: flaky + Inactive -> BouncePods (delete_pods) ---
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    assert!(
+        rig.kube.calls().iter().any(|c| matches!(c, KubeCall::DeletePods { .. })),
+        "stage 2 must bounce pods (delete_pods)"
+    );
+
+    // The bounce worked: the unit is ready again.
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![workload_with_unit("inst1-bridge", NODE, "bridge", 1, 1)],
+    );
+
+    // --- Stage 3: healthy + Inactive -> AutoRecover (Reactivate enqueued) ---
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    assert!(
+        matches!(last_lifecycle(&rig), Some(LifecycleSpec::Reactivate)),
+        "stage 3 must enqueue a Reactivate (auto-recover)"
+    );
+
+    // Exactly one of each lifecycle verb fired across the whole cycle:
+    // park (deactivate) once, recover (reactivate) once. The fired-set
+    // prevents re-firing within the episode.
+    let calls = rig.broker.calls();
+    let deactivates = calls.iter().filter(|c| {
+        matches!(c, BrokerCall::EnqueueLifecycle { spec: LifecycleSpec::Deactivate(_), .. })
+    }).count();
+    let reactivates = calls.iter().filter(|c| {
+        matches!(c, BrokerCall::EnqueueLifecycle { spec: LifecycleSpec::Reactivate, .. })
+    }).count();
+    assert_eq!(deactivates, 1, "exactly one deactivate across the cycle");
+    assert_eq!(reactivates, 1, "exactly one reactivate across the cycle");
+}
