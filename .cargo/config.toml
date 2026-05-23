@@ -1,4 +1,0 @@
-[env]
-# Use committed .sqlx cache for compile-time query checking.
-# When DATABASE_URL is set and reachable, SQLx uses the live DB instead.
-SQLX_OFFLINE = "true"
