@@ -285,18 +285,13 @@ enum InfraAction {
     /// prior partial-state. Cheap when most nodes are already
     /// healthy (hash match short-circuits).
     Restart,
-    /// Re-apply against current images / sources. When the project is
-    /// Active, triggers deactivate (same picker as `weft deactivate`)
-    /// for the duration; after the apply settles, re-activate per
-    /// --auto-reactivate.
+    /// Re-apply against current images / sources (stop then start).
+    /// When the project is Active, triggers deactivate (same picker as
+    /// `weft deactivate`) for the duration. The project is left
+    /// deactivated afterward; click Activate when ready.
     Upgrade {
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
-        /// Re-activate the project after the upgrade settles.
-        /// Defaults to true on a TTY (prompts when omitted). In
-        /// `--json` mode the flag is required when project is Active.
-        #[arg(long, value_name = "true|false")]
-        auto_reactivate: Option<bool>,
     },
     /// Scale infra workloads to 0 (PVCs preserved). When the project
     /// is Active, triggers deactivate via the standard picker.
@@ -376,28 +371,23 @@ enum DaemonAction {
 
 impl InfraAction {
     fn split(self) -> (commands::infra::InfraAction, commands::infra::InfraOpts) {
-        let opts_from = |t: TriggerDeactivationOpts, auto: Option<bool>| commands::infra::InfraOpts {
+        let opts_from = |t: TriggerDeactivationOpts| commands::infra::InfraOpts {
             mode: t.mode,
             grace: t.grace,
             running_policy: t.running_policy,
-            auto_reactivate: auto,
         };
         match self {
             InfraAction::Start => (commands::infra::InfraAction::Start, Default::default()),
             InfraAction::Restart => (commands::infra::InfraAction::Restart, Default::default()),
             InfraAction::Stop { opts } => {
-                (commands::infra::InfraAction::Stop, opts_from(opts, None))
+                (commands::infra::InfraAction::Stop, opts_from(opts))
             }
             InfraAction::Terminate { opts } => {
-                (commands::infra::InfraAction::Terminate, opts_from(opts, None))
+                (commands::infra::InfraAction::Terminate, opts_from(opts))
             }
-            InfraAction::Upgrade {
-                opts,
-                auto_reactivate,
-            } => (
-                commands::infra::InfraAction::Upgrade,
-                opts_from(opts, auto_reactivate),
-            ),
+            InfraAction::Upgrade { opts } => {
+                (commands::infra::InfraAction::Upgrade, opts_from(opts))
+            }
             InfraAction::Status => (commands::infra::InfraAction::Status, Default::default()),
             InfraAction::NodeStop { node_id, force } => (
                 commands::infra::InfraAction::NodeStop { node_id, force },

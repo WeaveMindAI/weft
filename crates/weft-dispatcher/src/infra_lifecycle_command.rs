@@ -253,15 +253,23 @@ pub async fn wait_for_command(
 /// so the command outcome is the only honest "is it done" signal).
 pub async fn read_command_outcome(
     pool: &PgPool,
+    project_id: &str,
     command_id: i64,
 ) -> Result<Option<WaitOutcome>> {
     use sqlx::Row;
     use weft_broker_client::protocol::LifecycleOutcome;
+    // Scope by project, NOT just the (globally unique) id: the HTTP
+    // endpoint is `/projects/{project}/infra/commands/{id}`, and a
+    // caller authorized for one project must not read another's command
+    // outcome (which carries raw supervisor error strings). A command
+    // under a different project returns None, indistinguishable from
+    // pending, so no existence leak.
     let row = sqlx::query(
         "SELECT completed_at_unix, outcome, outcome_message \
-         FROM infra_lifecycle_command WHERE id = $1",
+         FROM infra_lifecycle_command WHERE id = $1 AND project_id = $2",
     )
     .bind(command_id)
+    .bind(project_id)
     .fetch_optional(pool)
     .await?;
     let Some(r) = row else {

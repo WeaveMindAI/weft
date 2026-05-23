@@ -613,8 +613,9 @@ export class GraphViewController {
   }
 
   /// Project-level infra Upgrade. Same trigger-deactivation flow as
-  /// Stop / Terminate when the project is Active, plus a follow-up
-  /// "auto-reactivate after the upgrade?" Yes/No.
+  /// Stop / Terminate when the project is Active. The project is left
+  /// deactivated after the upgrade; the user clicks Activate when ready
+  /// (no auto-reactivate: the user is here, it's their call).
   private async confirmAndDispatchInfraUpgrade(): Promise<void> {
     const active = await this.projectIsActive();
     if (!active) {
@@ -623,31 +624,7 @@ export class GraphViewController {
     }
     const deactivationArgs = await this.promptTriggerDeactivation('infra upgrade');
     if (!deactivationArgs) return;
-    const reactivate = await vscode.window.showQuickPick(
-      [
-        {
-          label: 'Re-activate after upgrade',
-          detail: 'Re-register triggers as soon as the apply settles. Recommended.',
-          value: true,
-        },
-        {
-          label: 'Leave inactive',
-          detail: 'Triggers stay parked after the upgrade. Click Activate manually later.',
-          value: false,
-        },
-      ],
-      {
-        placeHolder: 'infra upgrade: re-activate after the upgrade?',
-        ignoreFocusOut: true,
-      },
-    );
-    if (!reactivate) return;
-    void this.dispatchVerb('infra', [
-      'upgrade',
-      ...deactivationArgs,
-      '--auto-reactivate',
-      String(reactivate.value),
-    ]);
+    void this.dispatchVerb('infra', ['upgrade', ...deactivationArgs]);
   }
 
   /// Per-node infra verb (stop / terminate) for partial-state

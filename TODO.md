@@ -304,3 +304,19 @@ version when this lands.
 [Update Notice Warning] If we touch `compute_drift` /
 `running_infra_hash` / `desired_infra_hash` or `ProjectInfraEntry`,
 revisit this entry.
+
+## Infra namespace-escape hardening
+
+A node author ships arbitrary container specs + raw `extras` k8s
+manifests that get applied into the project namespace. Node packages are
+untrusted third-party code, so verify a node CANNOT escape its namespace.
+Audit: `extras` namespace forced + cluster-scoped kinds rejected;
+`PodOptions.service_account` constrained; Pod Security admission rejects
+privileged / hostPath / host-namespaces; NetworkPolicy blocks
+cross-tenant traffic; supervisor RBAC not turnable into a cross-namespace
+write. Goal: compiler rejects escaping specs loudly + namespace admission
+enforces, not "we assume they can't".
+
+[Update Notice Warning] If we touch `compile.rs` extras/namespace
+stamping, `PodOptions`, `project_namespace.rs` policies/RBAC, or the
+supervisor apply path, revisit.

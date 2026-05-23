@@ -31,22 +31,22 @@ pub enum InfraAction {
     NodeTerminate { node_id: String },
 }
 
-/// Trigger-deactivation + post-sync auto-reactivate choices for the
-/// infra verbs that take triggers down (Stop, Terminate, Upgrade).
-/// Mirrors the shared `prompt_trigger_deactivation` argument shape;
-/// `auto_reactivate` is the post-Upgrade reactivate decision.
+/// Trigger-deactivation choices for the infra verbs that take triggers
+/// down (Stop, Terminate, Upgrade). Mirrors the shared
+/// `prompt_trigger_deactivation` argument shape.
 ///
 /// All fields are optional at the CLI surface; missing fields prompt
 /// the user on a TTY or error in `--json` mode (per the shared
-/// helper's contract). Inactive projects ignore everything except
-/// `auto_reactivate`, which is also ignored because there's nothing
-/// to reactivate.
+/// helper's contract). There is NO auto-reactivate: a user-triggered
+/// upgrade leaves the project deactivated, and the user clicks Activate
+/// when ready. Automatic reactivation belongs only to the autonomous
+/// health-recovery path (deactivate -> fix infra -> reactivate with no
+/// human present), not to a verb the user invoked themselves.
 #[derive(Default, Clone)]
 pub struct InfraOpts {
     pub mode: Option<String>,
     pub grace: Option<u32>,
     pub running_policy: Option<String>,
-    pub auto_reactivate: Option<bool>,
 }
 
 pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
@@ -180,27 +180,15 @@ async fn infra_sync(
         None
     };
 
-    // Auto-reactivate decision. Only meaningful when active (Upgrade
-    // path); ignored otherwise. Default: true. Prompted on TTY when
-    // active and not specified; errors in --json mode without the
-    // flag so the extension always passes it explicitly.
-    let auto_reactivate = if active {
-        match opts.auto_reactivate {
-            Some(b) => b,
-            None if ctx.json() => anyhow::bail!(
-                "infra {verb_label}: project is active, --auto-reactivate <true|false> required"
-            ),
-            None => prompt_auto_reactivate()?,
-        }
-    } else {
-        true
-    };
+    // No auto-reactivate: an Upgrade/Restart leaves the project
+    // deactivated (the user invoked it, they click Activate when
+    // ready). The trigger-deactivation choice above still applies (it
+    // governs HOW triggers come down during the stop).
 
     let mut body = serde_json::Map::new();
     body.insert("sourceHash".into(), serde_json::json!(handle.source_hash));
     body.insert("infraHash".into(), serde_json::json!(handle.infra_hash));
     body.insert("imageHashes".into(), serde_json::to_value(&image_tags)?);
-    body.insert("autoReactivate".into(), serde_json::json!(auto_reactivate));
     if let Some(td) = trigger_deactivation {
         body.insert("triggerDeactivation".into(), td);
     }
@@ -221,24 +209,6 @@ async fn infra_sync(
     // overlay mid-upgrade (the bar would flicker through intermediate
     // interactive states). This stays a phase, not a terminus.
     Ok(())
-}
-
-fn prompt_auto_reactivate() -> Result<bool> {
-    println!(
-        "After the upgrade, re-activate the project? \
-         [Y/n] (yes = re-register triggers; no = leave inactive, click Activate later)"
-    );
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(true);
-    }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        other => anyhow::bail!("aborted: expected yes/no/y/n, got '{other}'"),
-    }
 }
 
 fn action_verb_label(a: &InfraAction) -> &'static str {

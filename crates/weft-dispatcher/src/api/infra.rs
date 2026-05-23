@@ -56,16 +56,6 @@ pub struct SyncRequest {
     /// reuse one picker UI.
     #[serde(default, rename = "triggerDeactivation", alias = "trigger_deactivation")]
     pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
-    /// After the sync settles, re-activate the project. Only relevant
-    /// when the project WAS Active at sync start (Upgrade case).
-    /// Defaults to true. When false, triggers stay parked and the
-    /// user clicks Activate manually.
-    #[serde(default = "default_auto_reactivate", rename = "autoReactivate", alias = "auto_reactivate")]
-    pub auto_reactivate: bool,
-}
-
-fn default_auto_reactivate() -> bool {
-    true
 }
 
 #[derive(Debug, Serialize)]
@@ -317,23 +307,13 @@ async fn sync_inner(
         return Err(err);
     }
 
-    // Auto-reactivate: only meaningful when the project was Active
-    // at sync start (Start/Restart from Inactive has nothing to
-    // reactivate). Honors the client's `autoReactivate` flag so the
-    // user can choose to leave triggers parked after Upgrade and
-    // click Activate manually later.
-    if was_active && body.auto_reactivate {
-        if let Err(err) =
-            crate::api::project::activate_inner(&state, id, None, None, None).await
-        {
-            tracing::warn!(
-                target: "weft_dispatcher::api::infra",
-                error = ?err,
-                project_id = %project_id,
-                "auto-reactivate after sync failed; user must reactivate manually"
-            );
-        }
-    }
+    // No auto-reactivate. Upgrade is CLI-orchestrated stop-then-start:
+    // the stop already deactivated the project, and a user-invoked
+    // upgrade intentionally leaves it deactivated (the user clicks
+    // Activate when ready). Automatic reactivation lives only in the
+    // autonomous health-recovery path (the supervisor's AutoRecover
+    // protocol -> dispatcher lifecycle_claimer -> activate_inner), where
+    // there is no human to click.
 
     Ok(Json(SyncResponse {
         nodes: read_infra_entries(&state, &project_id).await?,
@@ -569,14 +549,15 @@ pub async fn command_status(
     State(state): State<DispatcherState>,
     Path((id_str, cmd_id)): Path<(String, i64)>,
 ) -> Result<Json<CommandStatusResponse>, (StatusCode, String)> {
-    // parse_id validates the project id even though the command is
-    // looked up by its own id (the id is globally unique); keeps the
-    // route shape consistent and rejects a malformed project path.
-    parse_id(&id_str)?;
+    // Scope the command read to this project: the command is looked up
+    // by `(id, project_id)`, so a caller can't read another project's
+    // command outcome by enumerating the sequential id.
+    let project_id = parse_id(&id_str)?.to_string();
     use infra_lifecycle_command::WaitOutcome;
-    let outcome = infra_lifecycle_command::read_command_outcome(&state.pg_pool, cmd_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read command: {e}")))?;
+    let outcome =
+        infra_lifecycle_command::read_command_outcome(&state.pg_pool, &project_id, cmd_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read command: {e}")))?;
     Ok(Json(match outcome {
         None => CommandStatusResponse { done: false, outcome: None, message: None },
         Some(WaitOutcome::Succeeded) => {
@@ -695,8 +676,6 @@ mod tests {
         assert!(r.infra_hash.is_none());
         assert!(r.image_hashes.is_empty());
         assert!(r.trigger_deactivation.is_none());
-        // autoReactivate defaults to true.
-        assert!(r.auto_reactivate);
     }
 
     #[test]
@@ -710,7 +689,6 @@ mod tests {
                 "graceMinutes": 30,
                 "runningPolicy": "wait",
             },
-            "autoReactivate": false,
         }))
         .unwrap();
         assert_eq!(camel.source_hash.as_deref(), Some("abc"));
@@ -718,7 +696,6 @@ mod tests {
         assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
         assert_eq!(td.grace_minutes, 30);
         assert_eq!(td.running_policy, RunningPolicy::Wait);
-        assert!(!camel.auto_reactivate);
 
         let snake: SyncRequest = serde_json::from_value(json!({
             "source_hash": "abc",
@@ -726,7 +703,6 @@ mod tests {
                 "mode": "wipe",
                 "running_policy": "cancel",
             },
-            "auto_reactivate": false,
         }))
         .unwrap();
         let td = snake.trigger_deactivation.expect("present");
