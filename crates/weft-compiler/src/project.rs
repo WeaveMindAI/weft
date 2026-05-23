@@ -142,10 +142,6 @@ impl Project {
         self.root.join("main.weft")
     }
 
-    pub fn main_loom(&self) -> PathBuf {
-        self.root.join("main.loom")
-    }
-
     pub fn nodes_dir(&self) -> PathBuf {
         self.root.join("nodes")
     }

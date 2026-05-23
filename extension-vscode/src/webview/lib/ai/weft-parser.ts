@@ -3083,7 +3083,7 @@ function coerceConfigValues(node: ParsedNode, template: (typeof NODE_TYPE_CONFIG
 }
 
 // ── Type resolution and validation pipeline ─────────────────────────────────
-// SYNC WARNING: This pipeline mirrors the backend enrich.rs (weft-nodes crate).
+// SYNC WARNING: This pipeline mirrors the backend enrich.rs (weft-compiler crate).
 // Both must produce identical errors for the same input. When changing logic here,
 // update enrich.rs too (and vice versa). The backend is the authoritative check
 // at execution time; this frontend copy provides instant editor feedback.
@@ -4018,7 +4018,7 @@ export function resolveAndValidateTypes(
 	// it wastes compute/money (LlmInference, LlmConfig) or signals a bug in the graph.
 	// Skip nodes with no outputs at all (pure sinks) and Passthrough boundaries.
 	// Note: this is a warning, not an error, because some nodes may be terminal
-	// and exposed via the runner's loom `output` declaration (not visible to this parser).
+	// outputs that are consumed outside the graph rather than wired to another node.
 	if (warnings) {
 		const origConnectedOutputs = new Set<string>();
 		for (const edge of origEdges) {
@@ -4561,13 +4561,13 @@ function validateAndBuild(parsed: ParseResult): { project: ProjectDefinition; er
 	// same-named config value and no incoming edge, infer the value's type and
 	// check it against the port type. Catches "user wrote template: 42 but port
 	// expects String" at parse time. Mirrors validate_config_filled_ports in
-	// weft-nodes/src/enrich.rs.
+	// weft-compiler/src/enrich.rs.
 	validateConfigFilledPorts(nodeInstances, edges, errors);
 
 	// System-wide required-port check: every required input on every non-
 	// passthrough/non-group node must be either wired by an edge, or filled
 	// from a same-named config value on a configurable port. Mirrors
-	// validate_required_ports in weft-nodes/src/enrich.rs.
+	// validate_required_ports in weft-compiler/src/enrich.rs.
 	validateRequiredPorts(nodeInstances, edges, errors);
 
 	// Validate infrastructure subgraph (non-fatal, just warnings)

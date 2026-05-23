@@ -365,15 +365,7 @@ export interface PortDefinition {
 // TODO: add 'openai' and 'anthropic' providers when we support direct API keys for those
 export type ApiKeyProvider = "openrouter" | "elevenlabs" | "tavily" | "apollo";
 
-export type FieldType = "text" | "textarea" | "code" | "select" | "multiselect" | "number" | "checkbox" | "password" | "blob" | "api_key" | "form_builder";
-
-export interface FileRef {
-	file_id?: string;  // Only present for cloud-managed files
-	url: string;
-	filename: string;
-	mime_type: string;
-	size_bytes: number;
-}
+export type FieldType = "text" | "textarea" | "code" | "select" | "multiselect" | "number" | "checkbox" | "password" | "api_key" | "form_builder";
 
 export interface FieldDefinition {
 	key: string;
@@ -383,7 +375,6 @@ export interface FieldDefinition {
 	options?: string[];
 	defaultValue?: unknown;
 	description?: string;
-	accept?: string; // For blob fields: mime type filter (e.g., 'audio/*', 'image/*')
 	provider?: ApiKeyProvider; // For api_key fields: which platform key to use
 	min?: number; // For number fields: minimum allowed value (clamped on blur)
 	max?: number; // For number fields: maximum allowed value (clamped on blur)

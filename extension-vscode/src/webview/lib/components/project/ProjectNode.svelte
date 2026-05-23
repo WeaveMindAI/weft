@@ -12,10 +12,6 @@
 	import { getStatusBadgeColor, getStatusIcon } from "$lib/utils/status";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2 } from '@lucide/svelte';
 	import { createFieldEditor } from '$lib/utils/field-editor.svelte';
-	import { handleBlobFieldUpload, validateExternalUrl, formatBytes } from '$lib/utils/blob-upload';
-	import FilePicker from './FilePicker.svelte';
-	import type { FileRef } from '$lib/types';
-	import BlobField from "./BlobField.svelte";
 	import { createPortContextMenu, buildPortMenuItems } from "$lib/utils/port-context-menu";
 	import { portMarkerStyle } from "$lib/utils/port-marker";
 	import ExecutionInspector from './ExecutionInspector.svelte';
@@ -351,7 +347,7 @@
 		}
 	}
 
-	function updateConfig(key: string, value: string | string[] | number | FormFieldDef[] | FileRef | null) {
+	function updateConfig(key: string, value: string | string[] | number | FormFieldDef[] | null) {
 		if (data.onUpdate) {
 			const newConfig = { ...data.config, [key]: value };
 			if (typeConfig.features?.hasFormSchema && key === 'fields') {
@@ -1128,14 +1124,6 @@
 									>+ Add field</button>
 								{/if}
 							</div>
-						{:else if field.type === "blob"}
-							<BlobField
-								fileRef={(data.config as Record<string, unknown>)?.[field.key] as import('$lib/types').FileRef | undefined}
-								accept={field.accept}
-								id={`${id}-${field.key}`}
-								placeholder={field.placeholder}
-								onUpdate={(ref) => updateConfig(field.key, ref)}
-							/>
 						{:else}
 							<input
 								id={`${id}-field-${field.key}`}

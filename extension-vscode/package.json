@@ -1,7 +1,7 @@
 {
   "name": "weft-vscode",
   "displayName": "Weft",
-  "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, runner view for .loom files, AI streaming edits.",
+  "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, AI streaming edits.",
   "version": "0.2.0",
   "publisher": "weavemind",
   "engines": {
@@ -26,17 +26,6 @@
         ],
         "extensions": [
           ".weft"
-        ],
-        "configuration": "./language-configuration.json"
-      },
-      {
-        "id": "loom",
-        "aliases": [
-          "Loom",
-          "loom"
-        ],
-        "extensions": [
-          ".loom"
         ],
         "configuration": "./language-configuration.json"
       }

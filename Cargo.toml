@@ -71,7 +71,6 @@ minillmlib = { path = "../MiniLLMLibRS" }
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }
 weft-compiler = { path = "crates/weft-compiler" }
-weft-stdlib = { path = "crates/weft-stdlib" }
 weft-engine = { path = "crates/weft-engine" }
 weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }

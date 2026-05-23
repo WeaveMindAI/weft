@@ -144,17 +144,3 @@ export function extractWeftPatchBlock(rawResponse: string): string | null {
 export function hasWeftPatchMarker(rawResponse: string): boolean {
 	return /````weft-patch\s*\n/.test(rawResponse);
 }
-
-export function extractLoomPatchBlock(rawResponse: string): string | null {
-	const match = rawResponse.match(/````loom-patch\s*\n([\s\S]*?)\n````/);
-	return match ? match[1] : null;
-}
-
-export function hasLoomPatchMarker(rawResponse: string): boolean {
-	return /````loom-patch\s*\n/.test(rawResponse);
-}
-
-/** Apply a loom-patch block to a Loom DSL string. Same algorithm as weft-patch. */
-export function applyLoomPatchText(currentLoom: string, patchBody: string): PatchApplyResult {
-	return applyWeftPatch(currentLoom, patchBody);
-}

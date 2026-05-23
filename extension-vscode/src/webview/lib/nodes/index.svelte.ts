@@ -151,7 +151,7 @@ function resolveIcon(name: string | undefined): Component {
 // kind under field_type with serde(tag = "kind"), so textarea
 // arrives as { kind: "textarea" } and select arrives as
 // { kind: "select", options: [...] }. v1 components read flat
-// properties (type, options, min, max, provider, accept, ...) so
+// properties (type, options, min, max, provider, ...) so
 // we transform here.
 interface RustFieldType {
 	kind: string;
@@ -159,7 +159,6 @@ interface RustFieldType {
 	min?: number;
 	max?: number;
 	provider?: string;
-	accept?: string;
 	placeholder?: string;
 }
 
@@ -207,7 +206,6 @@ function flattenField(f: RustFieldDef): FieldDefinition {
 	if (ft.min !== undefined) flat.min = ft.min;
 	if (ft.max !== undefined) flat.max = ft.max;
 	if (ft.provider) flat.provider = ft.provider;
-	if (ft.accept) flat.accept = ft.accept;
 	if (ft.placeholder) flat.placeholder = ft.placeholder;
 	if (f.placeholder) flat.placeholder = f.placeholder;
 	if (f.default_value !== undefined && f.default_value !== null)

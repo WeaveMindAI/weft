@@ -1,9 +1,9 @@
 # Authoring Nodes
 
 This guide covers patterns and gotchas when writing a node implementation
-for Weft. Start with the existing nodes in `crates/weft-nodes` for
-working examples; this document explains the cross-cutting concerns
-that aren't obvious from any single node.
+for Weft. Start with the existing nodes in `catalog/` for working
+examples; this document explains the cross-cutting concerns that aren't
+obvious from any single node.
 
 ## Cancellation
 
@@ -389,13 +389,6 @@ fresh worker pod spawns, folds the journal, and re-runs every node
 that has a fire to deliver. The body re-runs from the top; each
 prior `await_signal` and `ctx.run` returns instantly from the
 journal.
-
-If your node holds in-process state that can't be replayed cheaply
-(a browser session with thousands of cookies, a long-lived ML model
-load), the durable-replay model works against you. A future
-`ctx.hold_signal` primitive (see `docs/v2-held-suspensions.md`) will
-let you opt into a warm-worker model where the future actually
-awaits and the worker pod stays alive. Not yet implemented.
 
 
 ## Infra nodes: long-running backing services

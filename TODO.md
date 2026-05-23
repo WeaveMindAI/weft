@@ -320,3 +320,42 @@ enforces, not "we assume they can't".
 [Update Notice Warning] If we touch `compile.rs` extras/namespace
 stamping, `PodOptions`, `project_namespace.rs` policies/RBAC, or the
 supervisor apply path, revisit.
+
+## Held suspensions (warm-worker model)
+
+**Problem.** The durable-replay model dies-and-resumes the worker pod
+on every suspension: a worker dies whenever all lanes park on
+`await_signal`, and a fresh pod folds the journal to resume. That's the
+right trade for thousands of cheap parked flows (a HumanQuery waiting
+days costs only journal rows). But it works against a node that holds
+in-process state too expensive to rebuild on replay: a browser session
+with thousands of cookies, a long-lived local model load, a warm
+connection pool. Replaying the journal doesn't reconstruct that state;
+it's gone with the pod.
+
+**Direction.** A `ctx.hold_signal` primitive that opts a node into a
+warm-worker model: the future actually awaits in place and the worker
+pod stays alive across the suspension, instead of unwinding and dying.
+The node keeps its in-process state; the await is a real await, not a
+replay boundary.
+
+**Requirements.**
+- Opt-in per call site. The default stays die-and-resume (it's correct
+  for the common case and is what makes massive park-fanout cheap);
+  holding is the exception a node asks for when it has unreplayable
+  state.
+- Crosses the node/language boundary cleanly (the "nodes do no
+  plumbing" rule): the node awaits a future, it does not reach into the
+  worker lifecycle or the dispatcher.
+- Honest about the cost: a held suspension pins a worker pod for its
+  whole duration, so the language should make that trade visible (this
+  is no longer free parking).
+- Composes with the existing wake-signal contract: a held await resolves
+  on the same fire path as a parked one, the difference is only whether
+  the worker stayed warm.
+
+**Why deferred.** Needs a design pass on how a held await coexists with
+the journal/replay machinery (the worker that holds is the same worker
+that would otherwise have died and refolded) and on the lifecycle/leasing
+implications of a pinned worker. Surfaced from the node-authoring docs,
+which promised this primitive before it existed.

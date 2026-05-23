@@ -501,7 +501,6 @@ pub enum FieldType {
     Multiselect { options: Vec<String> },
     Password,
     ApiKey { provider: String },
-    Blob { accept: Option<String> },
     FormBuilder,
 }
 
