@@ -151,6 +151,22 @@ enum Cmd {
     /// Print the per-project catalog as JSON (for Tangle, VS Code,
     /// dashboard introspection).
     DescribeNodes,
+    /// Parse weft source (read from stdin) against the project's
+    /// `nodes/` catalog and print the project + referenced catalog +
+    /// diagnostics as JSON. The editor's live graph feedback. Lenient:
+    /// unknown node types become placeholders rather than errors.
+    Parse,
+    /// Validate weft source (read from stdin) against the project's
+    /// `nodes/` catalog and print diagnostics as JSON. The editor's
+    /// Problems-panel feedback. Strict: the full compile + enrich +
+    /// validate pipeline.
+    Validate,
+    /// Manage the project's base node catalog (the stdlib mirror
+    /// under `nodes/base_catalog/`).
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
     /// Manage extension tokens (browser extension auth).
     Token {
         #[command(subcommand)]
@@ -204,6 +220,17 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         build_cache: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogAction {
+    /// Re-sync `nodes/base_catalog/` from the installed weft's
+    /// bundled catalog. Wipes and recopies: picks up edited node
+    /// source, added nodes, and removed nodes. Your own nodes
+    /// (anywhere else under `nodes/`) are untouched. Anything you
+    /// edited in place under `base_catalog/` IS overwritten; copy a
+    /// node out of `base_catalog/` first if you want to keep changes.
+    Update,
 }
 
 #[derive(Debug, Subcommand)]
@@ -472,6 +499,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,
+        Cmd::Parse => commands::parse::parse(ctx).await,
+        Cmd::Validate => commands::parse::validate(ctx).await,
+        Cmd::Catalog { action } => match action {
+            CatalogAction::Update => commands::catalog::update(ctx).await,
+        },
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
         Cmd::Executions { limit } => commands::executions::list(ctx, limit).await,
         Cmd::Events { color } => commands::executions::events(ctx, color).await,

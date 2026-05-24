@@ -11,14 +11,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::codegen;
-use crate::enrich::enrich;
 use crate::error::{CompileError, CompileResult};
 use crate::project::Project;
-use crate::validate::validate;
-use crate::weft_compiler::compile;
+use crate::validate::ValidationMode;
 use crate::worker_image;
-use crate::Severity;
-use weft_catalog::{CatalogOrigin, CatalogSource, FsCatalog, stdlib_root};
+use crate::compile_checked;
+use weft_catalog::FsCatalog;
 
 /// Build-phase artifact. The host never holds a compiled binary
 /// (cargo runs inside the builder container). What we return is
@@ -60,32 +58,13 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
     let project = Project::load(project_root)?;
     let source = project.read_main_weft()?;
 
-    let mut definition = compile(&source, project.id()).map_err(|errors| {
-        let msg = errors
-            .iter()
-            .map(|e| format!("{}: {}", e.line, e.message))
-            .collect::<Vec<_>>()
-            .join("\n");
-        CompileError::Parse(msg)
-    })?;
-    definition.name = project.manifest.package.name.clone();
-
+    // One pipeline: compile + strict enrich + validate, abort on any
+    // error. `Structural` (not `Runtime`) because a project may build
+    // without every secret filled; runtime-rule gaps surface at run.
     let catalog = build_project_catalog(&project.root)?;
-    enrich(&mut definition, &catalog)?;
-
-    let diagnostics = validate(&definition, &catalog);
-    let errors: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| matches!(d.severity, Severity::Error))
-        .collect();
-    if !errors.is_empty() {
-        let msg = errors
-            .iter()
-            .map(|d| format!("{}:{} {}", d.line, d.column, d.message))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(CompileError::Validate(msg));
-    }
+    let mut definition =
+        compile_checked(&source, project.id(), &catalog, ValidationMode::Structural)?;
+    definition.name = project.manifest.package.name.clone();
 
     let crate_root = project_root.join(".weft").join("target").join("build");
     let referenced_nodes = codegen::collect_node_types(&definition);
@@ -106,7 +85,14 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
     std::fs::write(&dockerfile_path, &dockerfile_summary.body).map_err(CompileError::Io)?;
 
     let weft_root = resolve_weft_root()?;
-    let build_context = stage_build_context(project_root, &crate_root, &weft_root, &dockerfile_path)?;
+    let build_context = stage_build_context(
+        project_root,
+        &crate_root,
+        &weft_root,
+        &dockerfile_path,
+        &catalog,
+        &referenced_nodes,
+    )?;
 
     Ok(BuildResult {
         build_context,
@@ -124,19 +110,32 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
 /// worker-image/
 ///   Dockerfile           (copy of Dockerfile.worker)
 ///   build/               (the generated cargo crate)
-///   weft/                (the weft workspace: crates, catalog, Cargo.toml, Cargo.lock)
+///   weft/                (the weft workspace: crates, Cargo.toml, Cargo.lock)
+///   project-nodes/       (the project's nodes/ dir: every node's source)
 /// ```
 ///
-/// The weft copy is minimal: only the directories the builder
-/// needs. Avoids shipping `.git`, `target/`, `node_modules/`,
-/// etc. into the build context (would bloat docker's tarball
-/// and invalidate the layer cache every time a host artifact
-/// changes).
+/// `weft/` carries only the language runtime (the workspace crates the
+/// generated binary depends on as path deps), NOT any node code. Node
+/// source comes entirely from `project-nodes/`: the project owns all
+/// its nodes. The copies are minimal so docker's tarball and layer
+/// cache aren't churned by unrelated host artifacts (`.git`, `target/`,
+/// `node_modules/`).
+///
+/// `project-nodes/` holds ONLY the package roots the project actually
+/// references, each copied to its path relative to `nodes/` so the
+/// `#[path]` shims resolve. Discovery already walked `nodes/` and
+/// grouped nodes under package roots; staging copies those roots
+/// rather than re-walking the tree, so there is a single directory
+/// walker (discovery) and nothing for a second walker to disagree
+/// with (e.g. on symlink handling). Unreferenced nodes never enter the
+/// build context.
 fn stage_build_context(
     project_root: &Path,
     crate_root: &Path,
     weft_root: &Path,
     dockerfile_path: &Path,
+    catalog: &FsCatalog,
+    referenced_nodes: &BTreeSet<String>,
 ) -> CompileResult<PathBuf> {
     let ctx = project_root.join(".weft").join("target").join("worker-image");
     if ctx.exists() {
@@ -151,13 +150,19 @@ fn stage_build_context(
     // belt-and-suspenders.
     copy_dir_filtered(crate_root, &ctx.join("build"), &["target"])?;
 
-    // `weft/` = weft workspace. Include crates, catalog, Cargo.toml,
-    // Cargo.lock. Exclude target, crates-v1 (unused), node_modules
-    // (extension), anything else heavy.
+    // `weft/` = the language runtime workspace (crates + manifest).
+    // No catalog: node source comes from `project-nodes/` below.
+    // Excludes match the source-hash walk over `weft_root/crates`
+    // (`hash::walk_dir` uses NODE_TREE_EXCLUDE), so what's staged is
+    // exactly what's hashed: a file copied-but-not-hashed (or vice
+    // versa) is a stale-image hole.
     let weft_stage = ctx.join("weft");
     std::fs::create_dir_all(&weft_stage).map_err(CompileError::Io)?;
-    copy_dir_filtered(&weft_root.join("crates"), &weft_stage.join("crates"), &["target"])?;
-    copy_dir_filtered(&weft_root.join("catalog"), &weft_stage.join("catalog"), &[])?;
+    copy_dir_filtered(
+        &weft_root.join("crates"),
+        &weft_stage.join("crates"),
+        weft_catalog::NODE_TREE_EXCLUDE,
+    )?;
     // Workspace Cargo.toml + Cargo.lock are required for path deps
     // to resolve inside the container.
     for name in ["Cargo.toml", "Cargo.lock"] {
@@ -167,13 +172,32 @@ fn stage_build_context(
         }
     }
 
+    // `project-nodes/` = each referenced package root, placed at its
+    // path relative to `nodes/` so the `#[path]` includes resolve.
+    let nodes_root = project_root.join("nodes");
+    let project_nodes = ctx.join("project-nodes");
+    for root in catalog.package_roots_for(referenced_nodes) {
+        let rel = root.strip_prefix(&nodes_root).map_err(|_| {
+            CompileError::Build(format!(
+                "package root {} is not under project nodes root {}",
+                root.display(),
+                nodes_root.display()
+            ))
+        })?;
+        // The shared node-tree exclude (same set the source hash walks
+        // over), so staging and hashing agree on a node's byte-content:
+        // a file the build copies but the hash skips (or vice versa)
+        // is how a stale worker image gets served.
+        copy_dir_filtered(&root, &project_nodes.join(rel), weft_catalog::NODE_TREE_EXCLUDE)?;
+    }
+
     Ok(ctx)
 }
 
 /// Recursive directory copy with a simple exclude list matched on
 /// the immediate entry name. Skips symlinks to avoid infinite
 /// recursion and unexpected escapes from the staged context.
-fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
+pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
     std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
     for entry in std::fs::read_dir(src).map_err(CompileError::Io)? {
         let entry = entry.map_err(CompileError::Io)?;
@@ -236,20 +260,11 @@ pub fn sanitize_crate_name(raw: &str) -> String {
     out
 }
 
-/// Build the catalog the compiler should search for a given project.
-/// Order is low-priority first: stdlib < vendor < user. Later sources
-/// shadow earlier ones, so a user-defined `Foo` overrides a vendored
-/// or stdlib `Foo`.
+/// Build the catalog for a project: discover every node under its
+/// `nodes/` directory. That is the single source of truth (the stdlib
+/// is cloned in at `weft new`), so the project is self-contained and
+/// nothing reaches into the weft installation at build time.
 pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
-    let stdlib = CatalogSource { root: stdlib_root(), origin: CatalogOrigin::Stdlib };
-    let vendor = CatalogSource {
-        root: project_root.join("nodes").join("vendor"),
-        origin: CatalogOrigin::Vendor,
-    };
-    let user = CatalogSource {
-        root: project_root.join("nodes"),
-        origin: CatalogOrigin::User,
-    };
-    FsCatalog::discover(&[stdlib, vendor, user])
+    FsCatalog::discover(&project_root.join("nodes"))
         .map_err(|e| CompileError::Enrich(format!("catalog: {e}")))
 }

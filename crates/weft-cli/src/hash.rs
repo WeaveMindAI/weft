@@ -5,11 +5,12 @@
 //! - **`compute_source_hash`**: hashes everything that affects the
 //!   worker binary's compilation. Drives the resync prompt AND the
 //!   worker docker image tag. Inputs:
-//!     - project source: `main.weft`, `weft.toml`, `nodes/` recursive.
-//!     - stdlib catalog: every catalog package, including their
-//!       infra source dirs (it's cheaper to walk the lot than to
-//!       carve out infra-image subtrees; cargo's build cache makes a
-//!       false-positive flip a no-op rebuild).
+//!     - graph: `main.weft`, `weft.toml`.
+//!     - the REFERENCED nodes' package roots (the exact set the build
+//!       stages + codegen shims). The stdlib reaches the worker only
+//!       through its clone under `nodes/`, captured here via its roots;
+//!       an unreferenced node can't change the worker, so it doesn't
+//!       flip this hash.
 //!     - weft workspace: `crates/`, `Cargo.toml`, `Cargo.lock`. Any
 //!       engine change invalidates every project's worker image.
 //!
@@ -40,7 +41,7 @@
 //! runs the engine has no fingerprint of its own; engine identity is
 //! captured by hashing `crates/` directly.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -57,25 +58,57 @@ pub type SourceHash = String;
 
 /// Hash everything that compiles into the worker binary. Used as
 /// both the worker docker tag suffix AND the resync drift signal.
-pub fn compute_source_hash(project_root: &Path, weft_root: &Path) -> Result<SourceHash> {
+///
+/// Scoped to exactly what the build compiles in: the referenced
+/// nodes' package roots (the same set `stage_build_context` copies and
+/// codegen emits shims for), NOT all of `nodes/`. An unreferenced node
+/// can't change the worker binary, so it must not flip this hash; and
+/// hashing the same package roots the build stages, through the same
+/// node-tree walk policy, is what makes "hash captures the build
+/// inputs" true by construction. The weft `catalog/` is deliberately
+/// absent: it's only a seed source for `weft new` / `weft catalog
+/// update`, never a build input (the stdlib reaches the worker only
+/// through its clone under `nodes/`, captured here via its roots).
+pub fn compute_source_hash(
+    project: &ProjectDefinition,
+    project_root: &Path,
+    weft_root: &Path,
+    catalog: &FsCatalog,
+) -> Result<SourceHash> {
     let mut hasher = Sha256::new();
     hasher.update(b"weft-source-v1\n");
 
-    // Project-local source.
     hash_path(&mut hasher, &project_root.join("main.weft"))?;
     hash_path(&mut hasher, &project_root.join("weft.toml"))?;
-    let nodes_dir = project_root.join("nodes");
-    if nodes_dir.is_dir() {
-        hash_path(&mut hasher, &nodes_dir)?;
-    }
 
-    // Workspace surface that lands in the worker.
+    let referenced = weft_compiler::codegen::collect_node_types(project);
+    hash_package_roots(&mut hasher, &catalog.package_roots_for(&referenced))?;
+
+    // Workspace surface that lands in the worker (the language runtime
+    // the generated crate links as path deps).
     hash_path(&mut hasher, &weft_root.join("crates"))?;
-    hash_path(&mut hasher, &weft_root.join("catalog"))?;
     hash_path(&mut hasher, &weft_root.join("Cargo.toml"))?;
     hash_path(&mut hasher, &weft_root.join("Cargo.lock"))?;
 
     Ok(hex(&hasher.finalize()))
+}
+
+/// Hash a sorted, deduped set of package roots, each prefixed by its
+/// path so a node moving between packages changes the digest. Shared
+/// by the source hash (referenced roots) and the infra hash (closure
+/// roots): both fold "the node trees that matter" into a digest the
+/// same way, over the same node-tree walk policy (`walk_dir`).
+fn hash_package_roots(hasher: &mut Sha256, roots: &[PathBuf]) -> Result<()> {
+    let mut sorted: Vec<&PathBuf> = roots.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    for root in sorted {
+        hasher.update(b"package:");
+        hasher.update(root.to_string_lossy().as_bytes());
+        hasher.update(b"\n");
+        hash_path(hasher, root)?;
+    }
+    Ok(())
 }
 
 /// Hash everything that affects the running infrastructure.
@@ -99,23 +132,18 @@ pub fn compute_infra_hash(
 
     let closure = closure_with_upstream(project, |n| n.requires_infra);
 
-    // Hash each package root that owns a closure node. Walking the
-    // package root catches mod.rs / metadata.json / deps.toml of
-    // every node in the package PLUS package-level shared `.rs`
-    // files and `package.toml`. Multiple closure nodes from the
-    // same package collapse to a single hash of that package root.
-    let mut closure_packages: BTreeSet<PathBuf> = BTreeSet::new();
-    for node_id in &closure {
-        let Some(node) = project.nodes.iter().find(|n| n.id == *node_id) else { continue };
-        let Some(pkg) = catalog.package_of(&node.node_type) else { continue };
-        closure_packages.insert(pkg.root.clone());
-    }
-    for pkg_root in &closure_packages {
-        hasher.update(b"package:");
-        hasher.update(pkg_root.to_string_lossy().as_bytes());
-        hasher.update(b"\n");
-        hash_path(&mut hasher, pkg_root)?;
-    }
+    // Hash each package root that owns a closure node (mod.rs /
+    // metadata.json / deps.toml of every node in the package, plus
+    // shared `.rs` and `package.toml`). Same folding the source hash
+    // uses; multiple closure nodes from one package collapse to one
+    // root via the helper's dedup.
+    let closure_roots: Vec<PathBuf> = closure
+        .iter()
+        .filter_map(|id| project.nodes.iter().find(|n| n.id == *id))
+        .filter_map(|n| catalog.package_of(&n.node_type))
+        .map(|pkg| pkg.root.clone())
+        .collect();
+    hash_package_roots(&mut hasher, &closure_roots)?;
 
     // Workspace: engine + core compile into the worker binary that
     // runs InfraSetup. Engine changes can change provision behavior.
@@ -141,30 +169,23 @@ pub fn compute_image_hash(
     Ok(hex(&hasher.finalize()))
 }
 
-/// Convenience: load + enrich a project to a `ProjectDefinition`
-/// without running cargo / docker. Drift detection and the infra
-/// build paths both need an enriched project to walk the closure.
-pub fn load_enriched_project(project: &Project) -> Result<ProjectDefinition> {
+/// Load + enrich a project to a `ProjectDefinition` AND return the
+/// catalog it was enriched against, without running cargo / docker.
+/// Returns both because every caller (drift hashes, infra build) needs
+/// the same catalog the definition was built from; returning it here is
+/// one discovery per command instead of each caller re-walking `nodes/`.
+pub fn load_enriched_project(project: &Project) -> Result<(ProjectDefinition, FsCatalog)> {
     use weft_compiler::build::build_project_catalog;
-    use weft_compiler::compile_source;
-    use weft_compiler::enrich::enrich;
+    use weft_compiler::compile_enriched;
     let source = project
         .read_main_weft()
         .map_err(|e| anyhow::anyhow!("read main.weft: {e}"))?;
-    let mut definition = compile_source(&source, project.id()).map_err(|errors| {
-        let msg = errors
-            .iter()
-            .map(|e| format!("{}: {}", e.line, e.message))
-            .collect::<Vec<_>>()
-            .join("\n");
-        anyhow::anyhow!("compile: {msg}")
-    })?;
-    definition.name = project.manifest.package.name.clone();
     let catalog = build_project_catalog(&project.root)
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
-    enrich(&mut definition, &catalog)
-        .map_err(|e| anyhow::anyhow!("enrich: {e}"))?;
-    Ok(definition)
+    let mut definition = compile_enriched(&source, project.id(), &catalog)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    definition.name = project.manifest.package.name.clone();
+    Ok((definition, catalog))
 }
 
 // ---- internals ----

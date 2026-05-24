@@ -7,7 +7,7 @@
     setCachedParseResponse,
     type WeftParseError,
   } from './lib/ai/weft-parser';
-  import { registerCatalog, type CatalogEntry } from './lib/nodes';
+  import { registerCatalog, setCatalog, type CatalogEntry } from './lib/nodes';
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution } from './lib/types';
@@ -15,6 +15,11 @@
 
   let project: V1Project | null = $state(null);
   let error: string | null = $state(null);
+  // Catalog feedback, independent of the parse banner: a full-load
+  // failure (catalogError.error) or per-node soft warnings. Lives on
+  // its own so a successful parse can't erase a live catalog problem.
+  let catalogError: string | null = $state(null);
+  let catalogWarnings: string[] = $state([]);
   let weftCode = $state('');
   let layoutCode = $state('');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -102,7 +107,7 @@
     window.addEventListener('weft-signal-action', onSignalAction as EventListener);
     const unsub = onMessage((msg) => {
       if (msg.kind === 'catalogAll') {
-        registerCatalog(msg.catalog as unknown as Record<string, CatalogEntry>);
+        setCatalog(msg.catalog as unknown as Record<string, CatalogEntry>);
         return;
       }
       if (msg.kind === 'parseResult') {
@@ -138,6 +143,11 @@
       }
       if (msg.kind === 'parseError') {
         error = msg.error;
+        return;
+      }
+      if (msg.kind === 'catalogError') {
+        catalogError = msg.error ?? null;
+        catalogWarnings = msg.warnings ?? [];
         return;
       }
       if (msg.kind === 'execReset') {
@@ -361,6 +371,21 @@
 </script>
 
 <div class="absolute inset-0">
+  <!-- Catalog feedback: a non-blocking banner. When the graph renders,
+       it floats over the top edge (z-10) so it doesn't push layout.
+       When a parse error has taken over the view, it stacks ABOVE the
+       parse-error text (normal flow) so the two error surfaces don't
+       overlap. Independent of the parse `error` state either way. -->
+  {#if catalogError || catalogWarnings.length > 0}
+    <div class="{error ? 'relative' : 'absolute top-0 inset-x-0 z-10'} p-2 text-xs">
+      {#if catalogError}
+        <div class="text-destructive">node catalog: {catalogError}</div>
+      {/if}
+      {#each catalogWarnings as w}
+        <div class="text-yellow-600">node catalog: {w}</div>
+      {/each}
+    </div>
+  {/if}
   {#if error}
     <div class="p-4 text-destructive">parse error: {error}</div>
   {:else if project}

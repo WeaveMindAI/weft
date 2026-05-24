@@ -490,8 +490,8 @@ export interface NodeTemplate {
 	/// Mirrors the node's `metadata.requires_infra` flag. The infra
 	/// subgraph extractor + node-role helpers key off this to decide
 	/// whether to seed from this node. Always present in templates
-	/// built from the dispatcher's /describe/nodes payload; defaults
-	/// to false when the catalog entry doesn't declare it.
+	/// built from the `weft describe-nodes` payload; defaults to false
+	/// when the catalog entry doesn't declare it.
 	requiresInfra: boolean;
 	fields: FieldDefinition[];
 	defaultInputs: PortDefinition[];

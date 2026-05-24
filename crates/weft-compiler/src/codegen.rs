@@ -44,7 +44,7 @@ use crate::error::{CompileError, CompileResult};
 /// docstring. Returns the crate root (passed to `invoke_cargo`).
 pub fn emit(
     project: &ProjectDefinition,
-    _project_root: &Path,
+    project_root: &Path,
     target_root: &Path,
     catalog: &FsCatalog,
 ) -> CompileResult<PathBuf> {
@@ -68,12 +68,12 @@ pub fn emit(
     // shim per distinct package.
     let packages = group_by_package(catalog, &referenced)?;
 
-    write_cargo_toml(&crate_root, project, &weft_root, catalog, &referenced, &packages)?;
+    write_cargo_toml(&crate_root, project, catalog, &referenced, &packages)?;
     write_rust_toolchain(&crate_root, &weft_root)?;
     write_project_json(&src_dir, project)?;
     write_project_rs(&src_dir)?;
-    write_package_shims(&src_dir, catalog, &packages)?;
-    write_registry_rs(&src_dir, catalog, &packages)?;
+    write_package_shims(&src_dir, project_root, catalog, &packages)?;
+    write_registry_rs(&src_dir, &packages)?;
     write_main_rs(&src_dir, &packages)?;
 
     Ok(crate_root)
@@ -148,24 +148,17 @@ pub fn collect_node_types(project: &ProjectDefinition) -> BTreeSet<String> {
 fn write_cargo_toml(
     crate_root: &Path,
     project: &ProjectDefinition,
-    weft_root: &Path,
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
     packages: &[PackageEmit<'_>],
 ) -> CompileResult<()> {
     let package_name = sanitize_crate_name(&project.name);
 
-    // Inside the builder container, the weft workspace crates live
-    // at `/weft/crates/*` and the generated project crate lives at
-    // `/work/`. Relative path from the project crate's Cargo.toml
-    // back to weft's crates is `../weft/crates/<name>`. This also
-    // holds on the host: the docker build context is assembled to
-    // match the same layout so `cargo check` from the IDE resolves.
-    //
-    // `weft_root` is captured at host time but not embedded in the
-    // generated Cargo.toml (the container doesn't know the host
-    // path). Only the in-container relative path matters.
-    let _ = weft_root;
+    // Path deps point at `../weft/crates/<name>`, a path that resolves
+    // INSIDE the builder container (weft workspace at `/weft`, project
+    // crate at `/work`) AND on the host (the build context is staged to
+    // the same layout, so an IDE `cargo check` resolves too). The host
+    // weft repo path is never embedded; only this relative path matters.
     let mut merged: BTreeMap<String, toml::Value> = BTreeMap::new();
     insert_dep(
         &mut merged,
@@ -424,26 +417,26 @@ pub fn project() -> &'static ProjectDefinition {
 }
 
 /// One shim file per referenced package. `#[path]` includes point
-/// at paths INSIDE the builder container: the build step mounts
-/// the project's referenced catalog subdirectories at `/catalog/`,
-/// so a shim for the `basic` package reaches its debug node at
-/// `/catalog/basic/debug/mod.rs`.
+/// at paths INSIDE the builder container: the build step stages the
+/// project's `nodes/` at `NODES_MOUNT` (`/weft/project-nodes`), so a
+/// shim for the `basic` package reaches its debug node at
+/// `/weft/project-nodes/basic/debug/mod.rs`.
 ///
 /// Nodes reach their shared helpers via plain `use super::<shared>;`
 /// because the shim wraps every node and shared file under one
 /// Rust module (one module per package).
 fn write_package_shims(
     src_dir: &Path,
+    project_root: &Path,
     catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
 ) -> CompileResult<()> {
-    // Anchor every node's `#[path]` at the catalog root. The
-    // docker build copies `catalog/` verbatim to `/weft/catalog`
-    // in the builder container, so a node living at
-    // `catalog/basic/debug/mod.rs` resolves to
-    // `/weft/catalog/basic/debug/mod.rs` via the same relative
+    // Anchor every node's `#[path]` at the project's `nodes/` root.
+    // The docker build stages `nodes/` verbatim at NODES_MOUNT, so a
+    // node living at `nodes/basic/debug/mod.rs` resolves to
+    // `/weft/project-nodes/basic/debug/mod.rs` via the same relative
     // suffix.
-    let catalog_root = weft_catalog::stdlib_root();
+    let nodes_root = project_root.join("nodes");
     for pkg in packages {
         let mut body = String::new();
         body.push_str(&format!(
@@ -461,16 +454,16 @@ fn write_package_shims(
                         shared_path.display()
                     ))
                 })?;
-            let rel = shared_path.strip_prefix(&catalog_root).map_err(|_| {
+            let rel = shared_path.strip_prefix(&nodes_root).map_err(|_| {
                 CompileError::Build(format!(
-                    "shared file {} is not under catalog root {}",
+                    "shared file {} is not under project nodes root {}",
                     shared_path.display(),
-                    catalog_root.display()
+                    nodes_root.display()
                 ))
             })?;
             let in_container = format!(
                 "{}/{}",
-                crate::worker_image::CATALOG_MOUNT,
+                crate::worker_image::NODES_MOUNT,
                 rel.display().to_string().replace('\\', "/"),
             );
             body.push_str(&format!(
@@ -480,16 +473,16 @@ fn write_package_shims(
         for node_type in &pkg.node_types {
             let entry = catalog.entry(node_type).expect("collected from catalog");
             let mod_rs = entry.source_dir.join("mod.rs");
-            let rel = mod_rs.strip_prefix(&catalog_root).map_err(|_| {
+            let rel = mod_rs.strip_prefix(&nodes_root).map_err(|_| {
                 CompileError::Build(format!(
-                    "node source {} is not under catalog root {}",
+                    "node source {} is not under project nodes root {}",
                     mod_rs.display(),
-                    catalog_root.display()
+                    nodes_root.display()
                 ))
             })?;
             let in_container = format!(
                 "{}/{}",
-                crate::worker_image::CATALOG_MOUNT,
+                crate::worker_image::NODES_MOUNT,
                 rel.display().to_string().replace('\\', "/"),
             );
             let mod_name = ident_for_node_type(node_type);
@@ -505,7 +498,6 @@ fn write_package_shims(
 
 fn write_registry_rs(
     src_dir: &Path,
-    catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
 ) -> CompileResult<()> {
     let mut body = String::new();
@@ -546,7 +538,6 @@ fn write_registry_rs(
     body.push_str("        &[]\n    }\n}\n\n");
     body.push_str("pub static PROJECT_CATALOG: ProjectCatalog = ProjectCatalog;\n");
 
-    let _ = catalog;
     std::fs::write(src_dir.join("registry.rs"), body).map_err(CompileError::Io)?;
     Ok(())
 }

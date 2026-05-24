@@ -185,10 +185,10 @@ export interface CatalogEntry {
     hidden?: boolean;
   };
   /** Form-field vocabulary for nodes whose `features.hasFormSchema`
-   *  is true. Empty/undefined for everything else. The dispatcher's
-   *  `/describe/nodes` endpoint inlines this from each node's
-   *  `form_field_specs.json` so the form_builder editor can drive
-   *  the field-type dropdown without a separate fetch. */
+   *  is true. Empty/undefined for everything else. `weft describe-nodes`
+   *  inlines this from each node's `form_field_specs.json` so the
+   *  form_builder editor can drive the field-type dropdown without a
+   *  separate fetch. */
   formFieldSpecs?: FormFieldSpecWire[];
 }
 
@@ -522,6 +522,15 @@ export type HostMessage =
   | { kind: 'parseError'; error: string }
   | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled' }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
+  /// The node catalog (full set, from `weft describe-nodes`) failed to
+  /// load, or loaded with soft warnings. Distinct from `parseError`:
+  /// the source may parse fine while the catalog is unavailable
+  /// (weft not on PATH, a project error) or partial (a node mid-rename
+  /// with bad metadata.json). Rendered as a non-blocking banner so it
+  /// isn't erased by an unrelated successful parse. `error` set means
+  /// the whole catalog is missing; `warnings` carries per-node soft
+  /// failures when the catalog loaded but some nodes were skipped.
+  | { kind: 'catalogError'; error?: string; warnings?: string[] }
   | { kind: 'execEvent'; event: NodeExecEvent }
   /// Infra `/live` poll result for one infra node. Routed to
   /// the node's body panel iff the node has `requiresInfra: true`.

@@ -1,15 +1,15 @@
-// Publish dispatcher /validate results to VS Code's Problems panel.
-// Triggered on a longer debounce than /parse so the Problems panel
-// doesn't flash during every keystroke.
+// Publish `weft validate` results to VS Code's Problems panel.
+// Triggered on a longer debounce than parse so the Problems panel
+// doesn't flash during every keystroke. Validation runs through the
+// local CLI (it needs the project's `nodes/` catalog, which the
+// dispatcher pod can't see).
 
+import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { DispatcherClient } from './dispatcher';
+import { runWeftJson, projectDirOf } from './cli';
 import type { Diagnostic as WeftDiagnostic, Severity } from './shared/protocol';
 
-export function attachDiagnostics(
-  context: vscode.ExtensionContext,
-  client: DispatcherClient,
-): void {
+export function attachDiagnostics(context: vscode.ExtensionContext): void {
   const collection = vscode.languages.createDiagnosticCollection('weft');
   context.subscriptions.push(collection);
 
@@ -26,10 +26,30 @@ export function attachDiagnostics(
     timers.set(
       key,
       setTimeout(() => {
-        void runValidation(client, collection, doc);
+        void runValidation(collection, doc);
       }, debounce),
     );
   };
+
+  // A change under a `nodes/` dir alters the catalog validation runs
+  // against, but no text changed, so reschedule the affected .weft
+  // docs. Scope to the project that owns the changed node (the docs
+  // whose project dir is an ancestor of the change), so a node edit in
+  // one project doesn't fan out a `weft validate` spawn for every open
+  // doc in every other project. One workspace watcher (the set of open
+  // projects shifts at runtime; filtering the fan-out is simpler and
+  // leak-free versus rebinding N per-project watchers).
+  const revalidateForChange = (changed: vscode.Uri) => {
+    const changedPath = changed.fsPath;
+    for (const doc of vscode.workspace.textDocuments) {
+      if (doc.languageId !== 'weft') continue;
+      const projectDir = projectDirOf(doc);
+      if (changedPath === projectDir || changedPath.startsWith(projectDir + path.sep)) {
+        schedule(doc);
+      }
+    }
+  };
+  const nodesWatcher = vscode.workspace.createFileSystemWatcher('**/nodes/**');
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((e) => schedule(e.document)),
@@ -40,27 +60,34 @@ export function attachDiagnostics(
       if (t) clearTimeout(t);
       timers.delete(doc.uri.toString());
     }),
+    nodesWatcher,
+    nodesWatcher.onDidCreate(revalidateForChange),
+    nodesWatcher.onDidChange(revalidateForChange),
+    nodesWatcher.onDidDelete(revalidateForChange),
   );
 
   for (const doc of vscode.workspace.textDocuments) schedule(doc);
 }
 
 async function runValidation(
-  client: DispatcherClient,
   collection: vscode.DiagnosticCollection,
   doc: vscode.TextDocument,
 ): Promise<void> {
   try {
-    const result = await client.validate(doc.getText());
+    const result = await runWeftJson<{ diagnostics: WeftDiagnostic[] }>(
+      ['validate'],
+      projectDirOf(doc),
+      { stdin: doc.getText() },
+    );
     collection.set(doc.uri, result.diagnostics.map(toVsCodeDiagnostic));
   } catch (err) {
-    // Dispatcher unreachable? Surface a single warning so the user
-    // isn't confused by silent staleness.
+    // CLI failed (not found, project error)? Surface a single warning
+    // so the user isn't confused by silent staleness.
     const msg = err instanceof Error ? err.message : String(err);
     collection.set(doc.uri, [
       new vscode.Diagnostic(
         new vscode.Range(0, 0, 0, 0),
-        `weft dispatcher unreachable: ${msg}`,
+        `weft validate failed: ${msg}`,
         vscode.DiagnosticSeverity.Warning,
       ),
     ]);

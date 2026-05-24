@@ -55,10 +55,11 @@ pub struct BuildSection {
 ///   → yum, `homebrew/brew` → brew). Unknown base images fall back
 ///   to apt with a warning.
 /// - `dockerfile_template`: path (relative to the project root)
-///   to a user-provided Dockerfile template. When set,
-///   overrides the built-in template entirely. Supports the
-///   same `{{base_image}}` / `{{install_system_packages}}` /
-///   `{{copy_binary}}` substitution tokens.
+///   to a user-provided Dockerfile template. When set, overrides the
+///   built-in template entirely. Must use the same substitution
+///   tokens the built-in one does; see `worker_image::default_template`
+///   for the canonical token set (kept there so this doc can't drift
+///   out of sync with what `emit` actually substitutes).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerBuildSection {
     #[serde(default)]
@@ -123,6 +124,13 @@ impl Project {
         std::fs::create_dir_all(root.join("nodes")).map_err(CompileError::Io)?;
         std::fs::create_dir_all(root.join(".weft")).map_err(CompileError::Io)?;
 
+        // Seed the standard library into `nodes/base_catalog/`. From
+        // here the project owns all its nodes and the build never
+        // reaches back into the weft installation. The user's own
+        // nodes live elsewhere under `nodes/`; `base_catalog/` is the
+        // managed mirror that `weft catalog update` re-syncs.
+        seed_base_catalog(root)?;
+
         Self::load(root)
     }
 
@@ -146,8 +154,11 @@ impl Project {
         self.root.join("nodes")
     }
 
-    pub fn vendor_dir(&self) -> PathBuf {
-        self.root.join("nodes").join("vendor")
+    /// The managed stdlib mirror under `nodes/`. Seeded at `weft new`
+    /// and re-synced by `weft catalog update`. The user's own nodes
+    /// live elsewhere under `nodes/`, never here.
+    pub fn base_catalog_dir(&self) -> PathBuf {
+        base_catalog_dir(&self.root)
     }
 
     pub fn state_dir(&self) -> PathBuf {
@@ -180,4 +191,31 @@ impl Project {
             }
         }
     }
+}
+
+/// `nodes/base_catalog/` under a project root.
+pub fn base_catalog_dir(project_root: &Path) -> PathBuf {
+    project_root.join("nodes").join("base_catalog")
+}
+
+/// (Re)seed `nodes/base_catalog/` from the weft installation's bundled
+/// catalog. Wipes the existing `base_catalog/` and copies the current
+/// catalog in: picks up edited node source, added nodes, and removed
+/// nodes in one shot. The user's own nodes (anywhere else under
+/// `nodes/`) are untouched. Used by `weft new` and `weft catalog
+/// update`. (A future registry replaces `stdlib_root()` as the source;
+/// the destination shape stays the same.)
+pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
+    let dest = base_catalog_dir(project_root);
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest).map_err(CompileError::Io)?;
+    }
+    // Same node-tree exclude the build's staging copy uses, so a seed
+    // source that ever carries a build/cache dir (a `target/`, a
+    // `node_modules/`) doesn't get cloned into the user's `nodes/`.
+    crate::build::copy_dir_filtered(
+        &weft_catalog::stdlib_root(),
+        &dest,
+        weft_catalog::NODE_TREE_EXCLUDE,
+    )
 }

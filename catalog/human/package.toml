@@ -1,6 +1,5 @@
 [package]
 name = "human"
-nodes = ["query", "trigger"]
 
 [dependencies]
 async-trait = "0.1"

@@ -8,7 +8,10 @@
 //! - `/events/*`: SSE streams for project and execution state.
 //! - `/ext/*`: browser extension API (token-scoped).
 //! - `/dashboard/*`: the ops dashboard UI (static assets + SSE).
-//! - `/describe/*`: catalog introspection for tooling.
+//!
+//! The dispatcher does NO node-aware work: parse, validate, and
+//! catalog introspection are client-side (the CLI reads the project's
+//! `nodes/`), because the dispatcher has no access to those nodes.
 
 use axum::{routing::{get, post}, Router};
 use tower_http::cors::CorsLayer;
@@ -21,9 +24,7 @@ mod events;
 mod extension;
 mod extension_names;
 mod dashboard;
-mod describe;
 mod infra;
-mod parse;
 pub(crate) mod signal;
 
 pub fn router(state: DispatcherState) -> Router {
@@ -94,9 +95,6 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/", get(dashboard::serve_root))
         .route("/dashboard", get(dashboard::serve_root))
         .route("/dashboard/{*path}", get(dashboard::serve))
-        .route("/describe/nodes", get(describe::nodes))
-        .route("/parse", post(parse::parse))
-        .route("/validate", post(parse::validate))
         .route("/listener/inspect", get(signal::listener_inspect))
         // Inspector proxy: project-scoped read of signal display
         // info (mount_path, plaintext key while listener still

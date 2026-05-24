@@ -25,7 +25,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("locate project: {e}"))?;
         let weft_root = weft_compiler::build::resolve_weft_root()
             .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-        let source_hash = crate::hash::compute_source_hash(&project.root, &weft_root)?;
+        let (definition, catalog) = crate::hash::load_enriched_project(&project)?;
+        let source_hash =
+            crate::hash::compute_source_hash(&definition, &project.root, &weft_root, &catalog)?;
         let image_tag = worker_image_tag(&project, &source_hash);
         ensure_worker_image_with_progress(&progress, &project, &image_tag).await?;
         progress.complete(&format!("worker image {}", short_hash(&source_hash)));
