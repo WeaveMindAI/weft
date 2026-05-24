@@ -40,6 +40,6 @@ pub async fn run(_ctx: Ctx, name: String) -> anyhow::Result<()> {
         project.id(),
         root.display()
     );
-    println!("next: cd {name} && weft start && weft run");
+    println!("next: cd {name} && weft daemon start && weft run");
     Ok(())
 }

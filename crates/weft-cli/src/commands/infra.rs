@@ -17,7 +17,6 @@ use super::Ctx;
 use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::images;
 use crate::progress::{ActionVerb, Progress};
-use weft_catalog::stdlib_catalog;
 
 #[derive(Clone)]
 pub enum InfraAction {
@@ -354,8 +353,7 @@ async fn build_infra_images(
     project: &weft_compiler::project::Project,
     project_id: &str,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-    let definition = crate::hash::load_enriched_project(project)?;
-    let catalog = stdlib_catalog().map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
+    let (definition, catalog) = crate::hash::load_enriched_project(project)?;
 
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut seen_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();

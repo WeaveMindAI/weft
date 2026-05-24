@@ -101,20 +101,18 @@ impl PackageManager {
 pub const DEFAULT_BASE_IMAGE: &str = "debian:bookworm-slim";
 
 /// Weft workspace mount point INSIDE the builder container. The
-/// docker build context copies the entire weft repo to this
-/// path, which gives the generated crate access to the
-/// weft-engine / weft-core crates via `../weft/crates/*` path
-/// dependencies, AND access to the catalog node sources via
-/// `/weft/catalog/<pkg>/<node>/mod.rs` in the `#[path]` shims.
-///
-/// `{{catalog_path}}` substitutions in node `[build.env]` values
-/// expand to the node's path under this mount (e.g.
-/// `/weft/catalog/basic/exec_python`).
+/// docker build context copies the language-runtime workspace
+/// (`crates/`, `Cargo.toml`, `Cargo.lock`) to this path, giving the
+/// generated crate access to the weft-engine / weft-core crates via
+/// `../weft/crates/*` path dependencies. No node code lives here.
 pub const WEFT_MOUNT: &str = "/weft";
 
-/// In-container path to the catalog directory. Derived from
-/// `WEFT_MOUNT` because catalog lives at `<weft>/catalog`.
-pub const CATALOG_MOUNT: &str = "/weft/catalog";
+/// In-container path to the project's `nodes/` directory. The build
+/// context stages `project-nodes/` here; every node's `#[path]` shim
+/// and every `{{catalog_path}}` substitution resolves under it (e.g.
+/// `/weft/project-nodes/basic/exec_python/mod.rs`). This is the only
+/// place node source comes from: the project owns all its nodes.
+pub const NODES_MOUNT: &str = "/weft/project-nodes";
 
 /// Emit the Dockerfile for a project's worker image.
 ///
@@ -143,7 +141,7 @@ pub fn emit(
         collect_stage_packages(catalog, referenced, &base, BuildStage::Build)?;
     let runtime_packages =
         collect_stage_packages(catalog, referenced, &base, BuildStage::Runtime)?;
-    let build_env = collect_build_env(catalog, referenced)?;
+    let build_env = collect_build_env(catalog, referenced, project_root)?;
 
     let template = match &build.dockerfile_template {
         Some(rel) => {
@@ -179,7 +177,8 @@ pub fn emit(
         )
         .replace("{{build_env_lines}}", &render_build_env_lines(&build_env))
         .replace("{{binary_name}}", binary_name)
-        .replace("{{weft_mount}}", WEFT_MOUNT);
+        .replace("{{weft_mount}}", WEFT_MOUNT)
+        .replace("{{nodes_mount}}", NODES_MOUNT);
 
     Ok(WorkerDockerfile {
         body,
@@ -252,12 +251,13 @@ fn collect_stage_packages(
 }
 
 /// Collect and substitute `[build.env]` across referenced nodes.
-/// `{{catalog_path}}` expands to the node's in-container path
-/// under `/catalog` (matches where the build context mounts it).
-/// Conflicts on the same variable abort the build.
+/// `{{catalog_path}}` expands to the node's in-container path under
+/// `NODES_MOUNT` (matches where the build context mounts the project's
+/// nodes). Conflicts on the same variable abort the build.
 fn collect_build_env(
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
+    project_root: &Path,
 ) -> CompileResult<std::collections::BTreeMap<String, String>> {
     let mut merged: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -279,7 +279,7 @@ fn collect_build_env(
                 "node '{node_type}' declares [build.env] but has no source dir"
             )));
         };
-        let catalog_path = node_catalog_path(catalog, node_type, source_dir)?;
+        let catalog_path = node_catalog_path(node_type, source_dir, project_root)?;
 
         for (k, v) in deps.build.env.iter() {
             let resolved = v.replace("{{catalog_path}}", &catalog_path);
@@ -300,24 +300,23 @@ fn collect_build_env(
     Ok(merged)
 }
 
-/// Compute the in-container path for a node's source dir. The
-/// docker build rebases the catalog under `CATALOG_MOUNT`
-/// (`/weft/catalog`); the node's in-container path is its
-/// on-disk location relative to the catalog root.
+/// Compute the in-container path for a node's source dir. The docker
+/// build stages the project's `nodes/` under `NODES_MOUNT`; the node's
+/// in-container path is its on-disk location relative to `nodes/`.
 fn node_catalog_path(
-    _catalog: &FsCatalog,
     node_type: &str,
     source_dir: &Path,
+    project_root: &Path,
 ) -> CompileResult<String> {
-    let catalog_root = weft_catalog::stdlib_root();
-    let rel = source_dir.strip_prefix(&catalog_root).map_err(|_| {
+    let nodes_root = project_root.join("nodes");
+    let rel = source_dir.strip_prefix(&nodes_root).map_err(|_| {
         CompileError::Build(format!(
-            "node '{node_type}' source dir {} is not under catalog root {}",
+            "node '{node_type}' source dir {} is not under project nodes root {}",
             source_dir.display(),
-            catalog_root.display()
+            nodes_root.display()
         ))
     })?;
-    Ok(format!("{CATALOG_MOUNT}/{}", rel.display()))
+    Ok(format!("{NODES_MOUNT}/{}", rel.display()))
 }
 
 /// Parse a base-image string into a `BaseImage`. Recognizes the
@@ -551,6 +550,7 @@ fn default_template() -> &'static str {
         "WORKDIR /work\n",
         "COPY build/ /work/\n",
         "COPY weft/ {{weft_mount}}/\n",
+        "COPY project-nodes/ {{nodes_mount}}/\n",
         "\n",
         "{{build_env_lines}}",
         "\n",

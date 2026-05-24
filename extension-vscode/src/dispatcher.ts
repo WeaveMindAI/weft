@@ -1,7 +1,5 @@
 // Thin HTTP client for the dispatcher.
 
-import type { Diagnostic, ParseResponse } from './shared/protocol';
-
 /** Minimal SSE subscription handle. `EventSource` is a browser global
  *  that VS Code's Node-based extension host doesn't ship, so we roll a
  *  tiny client on top of `fetch` + ReadableStream (Node 18+). We only
@@ -125,20 +123,6 @@ export class DispatcherClient {
   subscribe(path: string, onEvent: (ev: { data: string }) => void): SseSubscription {
     return subscribeSse(`${this.baseUrl}${path}`, (data) => onEvent({ data }), (err) => {
       console.warn('[weft/dispatcher] SSE subscription failed:', err);
-    });
-  }
-
-  async parse(source: string, projectId?: string): Promise<ParseResponse> {
-    return this.post<ParseResponse>('/parse', {
-      source,
-      project_id: projectId,
-    });
-  }
-
-  async validate(source: string, projectId?: string): Promise<{ diagnostics: Diagnostic[] }> {
-    return this.post<{ diagnostics: Diagnostic[] }>('/validate', {
-      source,
-      project_id: projectId,
     });
   }
 }

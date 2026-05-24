@@ -1,7 +1,11 @@
 // Extension-host side of the graph view. Owns a single WebviewPanel
 // that tracks the currently-active .weft document, parses via the
-// dispatcher on every text change (debounced), and streams saves
+// local `weft` CLI on every text change (debounced), and streams saves
 // back into the document / .layout.json companion.
+//
+// Parse and describe-nodes go through the CLI (not the dispatcher)
+// because they need the project's `nodes/` catalog, which lives on the
+// user's machine; the dispatcher pod can't see it.
 //
 // The webview does all the text surgery in-process via v1's
 // weft-editor.ts. When the user edits something, the webview sends
@@ -12,7 +16,8 @@
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import { HttpError } from './dispatcher';
-import type { HostMessage, LiveDataItem, ProjectDefinition, WebviewMessage } from './shared/protocol';
+import { runWeftJson, projectDirOf } from './cli';
+import type { HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, WebviewMessage } from './shared/protocol';
 import { readProjectIdFromToml } from './sidebar/projects';
 
 export class GraphViewController {
@@ -20,7 +25,12 @@ export class GraphViewController {
   private watchedDoc: vscode.TextDocument | undefined;
   private watchedProjectId: string | undefined;
   private parseTimer: NodeJS.Timeout | undefined;
+  private catalogRefreshTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
+  /// The `nodes/` watcher for the currently-watched doc's project.
+  /// Rebound whenever the panel follows a .weft file in a different
+  /// project (its `nodes/` dir moves with it).
+  private nodesWatcher: vscode.Disposable | undefined;
   private lastProject: ProjectDefinition | undefined;
   // Host-side callbacks wired by extension.ts.
   private runHandler: (() => void) | undefined;
@@ -147,9 +157,9 @@ export class GraphViewController {
     // Resolve the project id for this file. Explicit caller arg
     // wins (sidebar pin path); otherwise walk up from the .weft
     // file looking for a `weft.toml` that declares an id. Falling
-    // back to undefined means the dispatcher returns nil UUID on
-    // /parse, which breaks every /projects/{id}/... endpoint for
-    // this panel (live poll, infra status, trigger status).
+    // back to undefined leaves the panel without a project id, which
+    // breaks every /projects/{id}/... dispatcher endpoint for this
+    // panel (live poll, infra status, trigger status).
     const resolved = projectId ?? readProjectIdFromToml(doc.uri.fsPath);
     if (resolved) this.watchedProjectId = resolved;
     // Graph takes ViewColumn.Active so the .weft text doesn't
@@ -203,11 +213,11 @@ export class GraphViewController {
           // .weft files can belong to different projects, and
           // the old watchedProjectId must not leak into the
           // polls we kick off from triggerParse below. If the
-          // new file has no weft.toml, clear the id so the
-          // dispatcher resolves it on /parse instead of using
-          // the stale previous-project id.
+          // new file has no weft.toml, clear the id rather than
+          // carry the stale previous-project id.
           const newId = readProjectIdFromToml(ed.document.uri.fsPath);
           this.watchedProjectId = newId ?? undefined;
+          this.watchNodesDir(ed.document);
           void this.triggerParse();
         }
       }),
@@ -218,8 +228,44 @@ export class GraphViewController {
       // doc hasn't moved.
       vscode.window.tabGroups.onDidChangeTabs(() => this.pushSourceState()),
     );
+    this.watchNodesDir(doc);
     // Initial state push.
     this.pushSourceState();
+  }
+
+  /// Watch the project's `nodes/` directory. Editing a node's
+  /// metadata.json (ports, fields) changes the catalog on disk, but
+  /// nothing in the text-change path notices. Without this, the open
+  /// graph shows the stale catalog until the file is reopened. On any
+  /// change under `nodes/`, re-run the full catalog refresh (palette +
+  /// parse), debounced so a multi-file save fires once.
+  ///
+  /// Rebound when the panel follows a .weft in a different project, so
+  /// the watcher always points at the watched doc's own `nodes/`.
+  private watchNodesDir(doc: vscode.TextDocument): void {
+    this.nodesWatcher?.dispose();
+    const root = projectDirOf(doc);
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(root, 'nodes/**'),
+    );
+    const onChange = () => this.scheduleCatalogRefresh();
+    this.nodesWatcher = vscode.Disposable.from(
+      watcher,
+      watcher.onDidCreate(onChange),
+      watcher.onDidChange(onChange),
+      watcher.onDidDelete(onChange),
+    );
+  }
+
+  private scheduleCatalogRefresh(): void {
+    const debounce = vscode.workspace
+      .getConfiguration('weft.parse')
+      .get<number>('debounceMs', 100);
+    if (this.catalogRefreshTimer) clearTimeout(this.catalogRefreshTimer);
+    this.catalogRefreshTimer = setTimeout(() => {
+      void this.sendGlobalCatalog();
+      void this.triggerParse();
+    }, debounce);
   }
 
   private pushSourceState(): void {
@@ -248,7 +294,11 @@ export class GraphViewController {
     const source = this.watchedDoc.getText();
     const layoutCode = await this.readLayoutCode(this.watchedDoc);
     try {
-      const response = await this.client.parse(source, this.watchedProjectId);
+      const response = await runWeftJson<ParseResponse>(
+        ['parse'],
+        projectDirOf(this.watchedDoc),
+        { stdin: source },
+      );
       this.lastProject = response.project;
       // Latch the parsed project id as the authoritative watch id
       // when we don't already have one. Guards against the case
@@ -909,26 +959,38 @@ export class GraphViewController {
 
   private async sendGlobalCatalog(): Promise<void> {
     if (!this.watchedDoc) return;
-    const docPath = this.watchedDoc.uri.fsPath;
-    const lastSep = Math.max(docPath.lastIndexOf('/'), docPath.lastIndexOf('\\'));
-    const projectRoot = lastSep > 0 ? docPath.slice(0, lastSep) : undefined;
-    const qs = projectRoot ? `?project_root=${encodeURIComponent(projectRoot)}` : '';
     try {
-      const response = await this.client.get<{
+      const response = await runWeftJson<{
         catalog: Record<string, unknown>;
         warnings?: string[];
-      }>(`/describe/nodes${qs}`);
+      }>(['describe-nodes'], projectDirOf(this.watchedDoc));
       this.post({
         kind: 'catalogAll',
         catalog: response.catalog as Record<string, import('./shared/protocol').CatalogEntry>,
       });
+      // Catalog loaded. Clear any prior catalog error, and surface
+      // per-node soft warnings (a node mid-rename with bad metadata)
+      // so they aren't computed-then-dropped. Its own channel, not
+      // parseError: a successful parse must not erase it.
+      this.post({ kind: 'catalogError', warnings: response.warnings ?? [] });
     } catch (err) {
-      console.warn('[weft/graphView] /describe/nodes failed', err);
+      // The full node catalog failed to load (weft not on PATH, a
+      // project error, bad JSON). Surface it on the catalog channel,
+      // independent of the parse banner: the source may parse fine
+      // while the catalog is unavailable, and a later successful parse
+      // must not silently clear this.
+      this.post({
+        kind: 'catalogError',
+        error: `node catalog unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      });
     }
   }
 
   private onDispose(): void {
     if (this.parseTimer) clearTimeout(this.parseTimer);
+    if (this.catalogRefreshTimer) clearTimeout(this.catalogRefreshTimer);
+    this.nodesWatcher?.dispose();
+    this.nodesWatcher = undefined;
     this.stopAllLivePollers();
     for (const d of this.disposables) d.dispose();
     this.disposables = [];

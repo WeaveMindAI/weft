@@ -1,11 +1,11 @@
 //! End-to-end compile + enrich tests against the stdlib catalog.
 
-use weft_catalog::{stdlib_catalog, FsCatalog};
+use weft_catalog::{stdlib_root, FsCatalog};
 use weft_compiler::enrich::enrich;
 use weft_compiler::weft_compiler::compile;
 
 fn catalog() -> FsCatalog {
-    stdlib_catalog().expect("stdlib")
+    FsCatalog::discover(&stdlib_root()).expect("stdlib")
 }
 
 #[test]

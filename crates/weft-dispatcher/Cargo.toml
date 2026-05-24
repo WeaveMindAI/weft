@@ -11,8 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 weft-core = { workspace = true }
-weft-compiler = { workspace = true }
-weft-catalog = { workspace = true }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
 weft-listener = { path = "../weft-listener" }

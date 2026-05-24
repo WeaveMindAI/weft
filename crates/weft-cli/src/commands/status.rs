@@ -18,17 +18,21 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // project.running_infra_hash to decide which drift bits to set.
     let weft_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-    let desired_source = crate::hash::compute_source_hash(&project.root, &weft_root)
-        .ok()
-        .map(|h| crate::commands::build::short_hash(&h));
-    let desired_infra = match crate::hash::load_enriched_project(project) {
-        Ok(def) => match weft_compiler::build::build_project_catalog(&project.root) {
-            Ok(catalog) => crate::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
+    // Both hashes are scoped to the compiled project's referenced /
+    // infra-closure nodes, so both need the definition + catalog. If
+    // the project can't compile, leave both desired hashes unset:
+    // status is display-only and tolerates an in-progress project.
+    let short = |h: String| crate::commands::build::short_hash(&h);
+    let (desired_source, desired_infra) = match crate::hash::load_enriched_project(project) {
+        Ok((def, catalog)) => (
+            crate::hash::compute_source_hash(&def, &project.root, &weft_root, &catalog)
                 .ok()
-                .map(|h| crate::commands::build::short_hash(&h)),
-            Err(_) => None,
-        },
-        Err(_) => None,
+                .map(short),
+            crate::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
+                .ok()
+                .map(short),
+        ),
+        Err(_) => (None, None),
     };
 
     let mut path = format!("/projects/{project_id}/status");

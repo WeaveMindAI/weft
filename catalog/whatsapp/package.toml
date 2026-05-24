@@ -1,6 +1,5 @@
 [package]
 name = "whatsapp"
-nodes = ["bridge", "receive", "send"]
 
 [dependencies]
 async-trait = "0.1"

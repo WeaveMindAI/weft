@@ -851,7 +851,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   );
 
-  attachDiagnostics(context, dispatcher);
+  attachDiagnostics(context);
 
   context.subscriptions.push(
     registerStreamingEditApi(),

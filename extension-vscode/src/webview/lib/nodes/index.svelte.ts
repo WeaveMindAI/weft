@@ -3,12 +3,12 @@
  *
  * v1's standalone dashboard ships one `.ts` file per node template
  * under this folder and auto-discovers them at build time. The VS
- * Code extension instead gets catalog entries from the dispatcher
- * at parse time (one request → metadata for every node type the
- * project references, covering both stdlib and any project-local
- * nodes/ folder). We populate NODE_TYPE_CONFIG at runtime, BEFORE
- * App.svelte mounts ProjectEditor, so downstream `$derived` reads
- * on first render see a populated registry.
+ * Code extension instead gets catalog entries from the local `weft`
+ * CLI: `weft describe-nodes` for the full set (via setCatalog) and
+ * `weft parse` for the referenced subset (via registerCatalog), both
+ * reading the project's `nodes/` folder. We populate NODE_TYPE_CONFIG
+ * at runtime, BEFORE App.svelte mounts ProjectEditor, so downstream
+ * `$derived` reads on first render see a populated registry.
  */
 
 import type { NodeTemplate, NodeCategory, FieldDefinition, PortDefinition, NodeFeatures } from '$lib/types';
@@ -172,9 +172,8 @@ interface RustFieldDef {
 	placeholder?: string;
 }
 
-// Shape the dispatcher sends per node type. Mirrors Rust
-// NodeMetadata serialization plus the per-node FormFieldSpec[]
-// inlined by the dispatcher's `/describe/nodes` route.
+// Shape sent per node type. Mirrors Rust NodeMetadata serialization
+// plus the per-node FormFieldSpec[] inlined by `weft describe-nodes`.
 export interface CatalogEntry {
 	type: string;
 	label: string;
@@ -234,10 +233,9 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		defaultInputs: entry.inputs ?? [],
 		defaultOutputs: entry.outputs ?? [],
 		features: entry.features,
-		// The dispatcher's `/describe/nodes` ships the field-type
-		// vocabulary inline for nodes whose features.hasFormSchema
-		// is true; the form_builder editor reads it via
-		// `typeConfig.formFieldSpecs`.
+		// `weft describe-nodes` ships the field-type vocabulary inline
+		// for nodes whose features.hasFormSchema is true; the
+		// form_builder editor reads it via `typeConfig.formFieldSpecs`.
 		formFieldSpecs: entry.formFieldSpecs,
 	};
 }
@@ -314,10 +312,27 @@ function registerBuiltins(): void {
 }
 registerBuiltins();
 
-/** Called by App.svelte on every parseResult AND once on mount
- *  with the global /describe/nodes response. Mutates the $state
- *  registry; readers re-run because the proxy tracks set ops. */
+/** Merge catalog entries into the registry. Used by `parseResult`,
+ *  which carries only the node types the current `main.weft`
+ *  references: it augments the palette with freshly-parsed metadata
+ *  but must never define the full set (it doesn't know it). Mutates
+ *  the $state registry; readers re-run because the proxy tracks sets. */
 export function registerCatalog(entries: Record<string, CatalogEntry>): void {
+	for (const [type, entry] of Object.entries(entries)) {
+		registry[type] = toTemplate(entry);
+	}
+	registerBuiltins();
+}
+
+/** Replace the registry with the authoritative full catalog. Used by
+ *  `catalogAll` (the `weft describe-nodes` response), which is the
+ *  complete set of known node types. Replacing (not merging) is what
+ *  lets a deleted node disappear from the palette: a merge can never
+ *  express removal. Builtins (Group) are re-seeded after the clear. */
+export function setCatalog(entries: Record<string, CatalogEntry>): void {
+	for (const type of Object.keys(registry)) {
+		delete registry[type];
+	}
 	for (const [type, entry] of Object.entries(entries)) {
 		registry[type] = toTemplate(entry);
 	}

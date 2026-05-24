@@ -1,14 +1,14 @@
 //! End-to-end tests for the validate pass. Each test compiles a
 //! weft source, enriches strictly, then asserts on the diagnostics.
 
-use weft_catalog::{stdlib_catalog, FsCatalog};
+use weft_catalog::{stdlib_root, FsCatalog};
 use weft_compiler::enrich::enrich;
 use weft_compiler::validate::validate;
 use weft_compiler::weft_compiler::compile;
 use weft_compiler::{Diagnostic, Severity};
 
 fn catalog() -> FsCatalog {
-    stdlib_catalog().expect("stdlib catalog")
+    FsCatalog::discover(&stdlib_root()).expect("stdlib catalog")
 }
 
 fn parse_enrich(source: &str) -> weft_core::ProjectDefinition {

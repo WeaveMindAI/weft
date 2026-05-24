@@ -8,10 +8,8 @@ use axum::{extract::{Path, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_compiler::{Diagnostic, Severity};
 use weft_core::project::EdgeIndex;
 use weft_core::ProjectDefinition;
-use weft_catalog::stdlib_catalog;
 
 use weft_core::primitive::RootSeed;
 use crate::events::DispatcherEvent;
@@ -44,18 +42,18 @@ pub async fn list(
     ))
 }
 
-/// Payload accepted by `POST /projects`. The client (CLI, VS Code
-/// extension) sends the raw `main.weft` source and a stable project
-/// id; the dispatcher compiles, enriches, and registers the result.
-///
-/// Keeping compilation inside the dispatcher means every client calls
-/// one endpoint to register, not two (parse + register). Matches the
-/// `cargo build` shape: hand the tool a source tree, it does the work.
+/// Payload accepted by `POST /projects`. The client (CLI) sends an
+/// already compiled + enriched `ProjectDefinition`; the dispatcher
+/// stores it and provisions namespaces. The dispatcher does NO
+/// node-aware work: it has no access to the project's `nodes/` (those
+/// live on the user's machine), so compilation and enrichment, which
+/// need the catalog, happen entirely client-side. The dispatcher is a
+/// dumb store of the compiled artifact.
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub id: uuid::Uuid,
     pub name: String,
-    pub source: String,
+    pub definition: ProjectDefinition,
     /// Source hash of the worker image. CLI computes from project
     /// source + workspace; dispatcher persists on the project row
     /// (used as worker docker tag suffix AND as the resync drift
@@ -73,74 +71,26 @@ pub struct RegisterRequest {
 #[derive(Debug, Serialize)]
 pub struct RegisterError {
     pub error: String,
-    pub diagnostics: Vec<Diagnostic>,
 }
 
 fn register_internal_error(msg: String) -> (StatusCode, Json<RegisterError>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(RegisterError {
-            error: msg,
-            diagnostics: Vec::new(),
-        }),
+        Json(RegisterError { error: msg }),
     )
 }
 
-/// Compile the supplied source and register the resulting project.
-/// Returns 400 with structured diagnostics on compile or enrich
-/// failure so the editor can highlight the offending lines.
+/// Register an already compiled + enriched project. The CLI does all
+/// node-aware work (compile + enrich against the local `nodes/`) and
+/// hands over the finished `ProjectDefinition`; the dispatcher only
+/// stores it and provisions the namespace bundle.
 pub async fn register(
     State(state): State<DispatcherState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<ProjectSummary>, (StatusCode, Json<RegisterError>)> {
-    let mut project = match weft_compiler::weft_compiler::compile(&req.source, req.id) {
-        Ok(p) => p,
-        Err(errors) => {
-            let diagnostics = errors
-                .into_iter()
-                .map(|e| Diagnostic {
-                    line: e.line,
-                    column: 0,
-                    severity: Severity::Error,
-                    message: e.message,
-                    code: Some("parse".into()),
-                })
-                .collect();
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(RegisterError {
-                    error: "compile".into(),
-                    diagnostics,
-                }),
-            ));
-        }
-    };
+    let mut project = req.definition;
+    project.id = req.id;
     project.name = req.name;
-
-    let catalog = stdlib_catalog().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(RegisterError {
-                error: format!("catalog: {e}"),
-                diagnostics: Vec::new(),
-            }),
-        )
-    })?;
-    if let Err(e) = weft_compiler::enrich::enrich(&mut project, &catalog) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(RegisterError {
-                error: "enrich".into(),
-                diagnostics: vec![Diagnostic {
-                    line: 0,
-                    column: 0,
-                    severity: Severity::Error,
-                    message: format!("{e}"),
-                    code: Some("enrich".into()),
-                }],
-            }),
-        ));
-    }
 
     let project_id_str = project.id.to_string();
     let tenant = state.tenant_router.tenant_for_project(&project_id_str);
@@ -200,7 +150,6 @@ pub async fn register(
                         "ensure_project_namespace {}: {e}",
                         project_namespace
                     ),
-                    diagnostics: Vec::new(),
                 }),
             )
         })?;
@@ -213,7 +162,6 @@ pub async fn register(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(RegisterError {
                     error: format!("register: {e}"),
-                    diagnostics: Vec::new(),
                 }),
             )
         })?;

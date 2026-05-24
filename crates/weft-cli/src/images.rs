@@ -136,24 +136,18 @@ pub async fn image_present(tag: &str) -> Result<bool> {
 
 /// Load a locally-built image into the named kind cluster so its
 /// Pods can pull it without a registry.
+///
+/// Skip when the tag is already present on the node: worker/infra tags
+/// are content-addressed (the tag suffix is the source/image hash), so
+/// the same tag is the same content by construction. There is no
+/// "tag present but content diverged" case to guard, a content change
+/// produces a new tag. We deliberately do NOT compare image IDs across
+/// the docker/containerd boundary: the two runtimes digest the same
+/// image differently (docker's config blob vs containerd's), so an
+/// ID comparison never matches and would re-load every run.
 pub async fn kind_load(cluster: &str, tag: &str) -> Result<()> {
-    // Compare host docker's image ID against what's in the kind
-    // node. `kind load docker-image` skips itself when a same-tag
-    // image already exists there, even if the content diverged
-    // (tag present + ID mismatch silently leaves the old image in
-    // place). We detect that, delete the stale node-side image,
-    // then load fresh.
-    let host_id = docker_image_id(tag).await?;
-    let node_id = kind_node_image_id(cluster, tag).await.unwrap_or(None);
-    if host_id.is_some() && host_id == node_id {
+    if kind_node_has_tag(cluster, tag).await {
         return Ok(());
-    }
-    if node_id.is_some() {
-        let node = format!("{cluster}-control-plane");
-        let _ = Command::new("docker")
-            .args(["exec", &node, "crictl", "rmi", tag])
-            .status()
-            .await;
     }
     let status = Command::new("kind")
         .args(["load", "docker-image", tag, "--name", cluster])
@@ -165,45 +159,33 @@ pub async fn kind_load(cluster: &str, tag: &str) -> Result<()> {
     Ok(())
 }
 
-async fn docker_image_id(tag: &str) -> Result<Option<String>> {
-    let out = Command::new("docker")
-        .args(["image", "inspect", "--format", "{{.Id}}", tag])
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(if id.is_empty() { None } else { Some(id) })
-}
-
-async fn kind_node_image_id(cluster: &str, tag: &str) -> Result<Option<String>> {
+/// Whether the kind node already has an image tagged `tag`. Tag
+/// presence alone is the answer: tags are content-addressed (the
+/// suffix is the source hash), so a present tag is the right content.
+/// We match on `repoTags`, not the image id, precisely because docker
+/// and containerd report different ids for the same image.
+async fn kind_node_has_tag(cluster: &str, tag: &str) -> bool {
     let node = format!("{cluster}-control-plane");
     let (repo, version) = tag.split_once(':').unwrap_or((tag, "latest"));
-    let out = Command::new("docker")
-        .args(["exec", &node, "crictl", "images", "-q", "-o", "json"])
+    let out = match Command::new("docker")
+        .args(["exec", &node, "crictl", "images", "-o", "json"])
         .output()
-        .await?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    // `crictl images -o json` emits {"images": [{"id": "...", "repoTags": [...]}]}
-    let text = String::from_utf8_lossy(&out.stdout);
-    let parsed: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
     };
-    for img in parsed.get("images").and_then(|v| v.as_array()).into_iter().flatten() {
-        let tags = img
-            .get("repoTags")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>())
-            .unwrap_or_default();
-        if tags.iter().any(|t| *t == format!("{repo}:{version}") || *t == format!("docker.io/library/{repo}:{version}")) {
-            if let Some(id) = img.get("id").and_then(|v| v.as_str()) {
-                return Ok(Some(format!("sha256:{}", id.trim_start_matches("sha256:"))));
-            }
-        }
-    }
-    Ok(None)
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    parsed
+        .get("images")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|img| img.get("repoTags").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|t| t.as_str())
+        .any(|t| t == format!("{repo}:{version}") || t == format!("docker.io/library/{repo}:{version}"))
 }

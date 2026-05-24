@@ -37,29 +37,27 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
     let cwd = std::env::current_dir().context("cwd")?;
     let project = weft_compiler::project::Project::discover(&cwd)
         .map_err(|e| anyhow::anyhow!("discover project: {e}"))?;
-    let source = project
-        .read_main_weft()
-        .map_err(|e| anyhow::anyhow!("read main.weft: {e}"))?;
 
     let weft_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+
+    // Compile + enrich once; both hashes are scoped to the referenced
+    // / infra-closure nodes, so they need the definition + catalog.
+    // Cheap, and downstream code after ensure_registered needs these
+    // anyway.
+    let (definition, catalog) = crate::hash::load_enriched_project(&project)?;
 
     // Worker image: hash-skip + build + kind-load. The dispatcher
     // gets the source_hash on every spawn-relevant call so the
     // project row's `running_source_hash` stays current regardless
     // of whether we rebuilt or hit the cache.
-    let source_hash = crate::hash::compute_source_hash(&project.root, &weft_root)?;
+    let source_hash =
+        crate::hash::compute_source_hash(&definition, &project.root, &weft_root, &catalog)?;
     let image_tag = crate::commands::build::worker_image_tag(&project, &source_hash);
     crate::commands::build::ensure_worker_image_with_progress(progress, &project, &image_tag)
         .await
         .context("worker image")?;
 
-    // Infra hash: parse + enrich so we can walk the infra closure.
-    // Cheap; we already need the catalog loaded for downstream
-    // code paths that follow ensure_registered.
-    let definition = crate::hash::load_enriched_project(&project)?;
-    let catalog = weft_compiler::build::build_project_catalog(&project.root)
-        .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
     let infra_hash =
         crate::hash::compute_infra_hash(&definition, &project.root, &weft_root, &catalog)?;
 
@@ -68,10 +66,13 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
 
     let source_short = crate::commands::build::short_hash(&source_hash);
     let infra_short = crate::commands::build::short_hash(&infra_hash);
+    // Send the already compiled + enriched definition (built above for
+    // the infra hash). The dispatcher can't compile it: the nodes live
+    // here, not in the dispatcher pod. It stores the artifact as-is.
     let register_body = serde_json::json!({
         "id": project.id().to_string(),
         "name": project.manifest.package.name,
-        "source": source,
+        "definition": definition,
         "sourceHash": source_short,
         "infraHash": infra_short,
     });
