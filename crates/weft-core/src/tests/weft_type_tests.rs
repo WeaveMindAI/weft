@@ -1338,3 +1338,81 @@ use super::*;
           }
       })));
   }
+
+  // ── cast_text (@file value injection) ────────────────────────────────
+
+  fn ty(s: &str) -> WeftType {
+      WeftType::parse(s).unwrap()
+  }
+
+  #[test]
+  fn cast_string_is_verbatim() {
+      // String never parses: the bytes become a JSON string as-is, including
+      // content that looks like JSON or numbers.
+      assert_eq!(ty("String").cast_text("hello world"), Ok(serde_json::json!("hello world")));
+      assert_eq!(ty("String").cast_text("  spaces kept  "), Ok(serde_json::json!("  spaces kept  ")));
+      assert_eq!(ty("String").cast_text("42"), Ok(serde_json::json!("42")));
+      assert_eq!(ty("String").cast_text("{\"a\":1}"), Ok(serde_json::json!("{\"a\":1}")));
+      assert_eq!(ty("String").cast_text("line1\nline2"), Ok(serde_json::json!("line1\nline2")));
+  }
+
+  #[test]
+  fn cast_number() {
+      assert_eq!(ty("Number").cast_text("42"), Ok(serde_json::json!(42.0)));
+      assert_eq!(ty("Number").cast_text("  3.14  "), Ok(serde_json::json!(3.14)));
+      assert_eq!(ty("Number").cast_text("-7"), Ok(serde_json::json!(-7.0)));
+      assert!(ty("Number").cast_text("hello").is_err());
+      assert!(ty("Number").cast_text("").is_err());
+  }
+
+  #[test]
+  fn cast_boolean() {
+      assert_eq!(ty("Boolean").cast_text("true"), Ok(serde_json::json!(true)));
+      assert_eq!(ty("Boolean").cast_text("  false  "), Ok(serde_json::json!(false)));
+      assert!(ty("Boolean").cast_text("yes").is_err());
+      assert!(ty("Boolean").cast_text("True").is_err());
+  }
+
+  #[test]
+  fn cast_json_dict() {
+      let jd = WeftType::JsonDict;
+      assert_eq!(
+          jd.cast_text("{\"model\": \"gpt\", \"temp\": 0.7}"),
+          Ok(serde_json::json!({"model": "gpt", "temp": 0.7}))
+      );
+      // A JSON array is not a dict.
+      assert!(jd.cast_text("[1, 2, 3]").is_err());
+      // Not valid JSON.
+      assert!(jd.cast_text("not json").is_err());
+  }
+
+  #[test]
+  fn cast_list() {
+      assert_eq!(
+          ty("List[Number]").cast_text("[1, 2, 3]"),
+          Ok(serde_json::json!([1, 2, 3]))
+      );
+      assert_eq!(
+          ty("List[String]").cast_text("[\"a\", \"b\"]"),
+          Ok(serde_json::json!(["a", "b"]))
+      );
+      // Wrong element type surfaces as an incompatibility error.
+      assert!(ty("List[Number]").cast_text("[\"a\", \"b\"]").is_err());
+      // An empty list is compatible with any List[T] (Empty is bottom).
+      assert!(ty("List[Number]").cast_text("[]").is_ok());
+  }
+
+  #[test]
+  fn cast_dict() {
+      assert_eq!(
+          ty("Dict[String, Number]").cast_text("{\"a\": 1, \"b\": 2}"),
+          Ok(serde_json::json!({"a": 1, "b": 2}))
+      );
+      assert!(ty("Dict[String, Number]").cast_text("{\"a\": \"x\"}").is_err());
+  }
+
+  #[test]
+  fn cast_rejects_unresolved_types() {
+      assert!(ty("T").cast_text("anything").is_err());
+      assert!(WeftType::MustOverride.cast_text("anything").is_err());
+  }

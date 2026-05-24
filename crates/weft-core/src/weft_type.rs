@@ -421,6 +421,60 @@ impl WeftType {
 
         parse_single_type(trimmed)
     }
+
+    // ── Casting external text ───────────────────────────────────────────
+
+    /// Cast raw external text (a file's content) into a JSON value of this
+    /// type. Used by `@file("path", Type)` to inject a file as a typed value
+    /// at compile time.
+    ///
+    /// `String` is verbatim: the bytes become a JSON string, no parsing. This
+    /// is the common case (a prompt, a document) and the reason `String` is
+    /// the default. Every other concrete type parses the text and checks the
+    /// result matches: `Number`/`Boolean` parse the trimmed scalar, everything
+    /// structural (`JsonDict`, `List`, `Dict`, `Union`) parses JSON and
+    /// validates the inferred type against `self` via `is_compatible`.
+    ///
+    /// Unresolved targets (`TypeVar`, `MustOverride`) are rejected: a `@file`
+    /// cast must name a concrete type.
+    pub fn cast_text(&self, text: &str) -> Result<serde_json::Value, std::string::String> {
+        match self {
+            WeftType::Primitive(WeftPrimitive::String) => {
+                Ok(serde_json::Value::String(text.to_string()))
+            }
+            WeftType::Primitive(WeftPrimitive::Number) => {
+                let n: f64 = text.trim().parse().map_err(|_| {
+                    format!("expected Number, file content is not a number: {:?}", text.trim())
+                })?;
+                serde_json::Number::from_f64(n)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| format!("Number is not finite: {}", n))
+            }
+            WeftType::Primitive(WeftPrimitive::Boolean) => match text.trim() {
+                "true" => Ok(serde_json::Value::Bool(true)),
+                "false" => Ok(serde_json::Value::Bool(false)),
+                other => Err(format!("expected Boolean (true/false), got {:?}", other)),
+            },
+            WeftType::TypeVar(_) | WeftType::MustOverride => {
+                Err(format!("@file cannot cast to {}: name a concrete type", self))
+            }
+            // Structural and media types: parse the file as JSON, then check the
+            // inferred shape is compatible with the declared type.
+            _ => {
+                let value: serde_json::Value = serde_json::from_str(text.trim())
+                    .map_err(|e| format!("expected {}, file is not valid JSON: {}", self, e))?;
+                let inferred = WeftType::infer(&value);
+                if WeftType::is_compatible(&inferred, self) {
+                    Ok(value)
+                } else {
+                    Err(format!(
+                        "file content has type {} but @file declares {}",
+                        inferred, self
+                    ))
+                }
+            }
+        }
+    }
 }
 
 fn parse_single_type(s: &str) -> Option<WeftType> {
