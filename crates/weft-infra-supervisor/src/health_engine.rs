@@ -165,6 +165,9 @@ pub struct ProtocolEvalInputs {
     pub ready_ratio: HashMap<(String, String), f32>,
     pub ready_replicas: HashMap<(String, String), u32>,
     pub project_status: weft_broker_client::protocol::ProjectStatus,
+    /// Did the health loop perform the current deactivation? Gates
+    /// `HealthCondition::DeactivatedByHealth` (auto-recover).
+    pub deactivated_by_health: bool,
 }
 
 impl Default for ProtocolEvalInputs {
@@ -173,6 +176,7 @@ impl Default for ProtocolEvalInputs {
             ready_ratio: HashMap::new(),
             ready_replicas: HashMap::new(),
             project_status: weft_broker_client::protocol::ProjectStatus::Registered,
+            deactivated_by_health: false,
         }
     }
 }
@@ -210,6 +214,7 @@ pub fn evaluate_protocols<'a>(
             ready_ratio: &inputs.ready_ratio,
             ready_replicas: &inputs.ready_replicas,
             project_status: inputs.project_status,
+            deactivated_by_health: inputs.deactivated_by_health,
         };
         if !evaluate_condition(&proto.when, &ctx) {
             continue;
@@ -539,6 +544,7 @@ mod tests {
             ready_ratio: r,
             ready_replicas: HashMap::new(),
             project_status: weft_broker_client::protocol::ProjectStatus::Active,
+            deactivated_by_health: false,
         }
     }
 
