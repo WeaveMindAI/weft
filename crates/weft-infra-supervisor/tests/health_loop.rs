@@ -740,20 +740,23 @@ async fn default_protocol_parks_active_project_on_infra_broken() {
 #[tokio::test]
 async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
     // Stage 2 of the two-stage protocol: an Inactive project with
-    // every infra node ready triggers a reactivate.
+    // every infra node ready triggers a reactivate, BUT ONLY if the
+    // health loop is the one that deactivated it (`deactivated_by_health`).
     let rig = rig();
     rig.broker.add_project_with_status(
         "proj-inactive",
         "wm-project-test-inactive",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
+    // The health loop parked it: auto-recover is allowed to undo it.
+    rig.broker.set_deactivated_by_health("proj-inactive", true);
     rig.broker.add_infra_node("proj-inactive", NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
         "wm-project-test-inactive",
         vec![workload("inst1-bridge", NODE, 1, 1)],
     );
 
-    // Tick: infra is healthy, project is inactive → reactivate.
+    // Tick: infra is healthy, project is inactive, health parked it → reactivate.
     rig.tick_health().await.unwrap();
 
     let calls = rig.broker.calls();
@@ -766,6 +769,44 @@ async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
     assert!(
         reactivated,
         "default protocol auto-recover-when-infra-healthy must enqueue a reactivate when infra is up on an Inactive project"
+    );
+}
+
+#[tokio::test]
+async fn default_protocol_does_not_reactivate_user_deactivated_project() {
+    // Regression: the user clicked Stop infra (or Deactivate / Upgrade)
+    // on a running+active project. The deactivation flips the project
+    // Inactive, but the infra pods are still up for a moment (or being
+    // brought back up by a later Start). A health tick that lands while
+    // (infra healthy + Inactive) must NOT auto-reactivate, because the
+    // USER deactivated (`deactivated_by_health == false`), not the
+    // health loop. Before the gate, this raced into a reactivate and
+    // left the user with active triggers but no/just-stopped infra.
+    let rig = rig();
+    rig.broker.add_project_with_status(
+        "proj-user-off",
+        "wm-project-test-user-off",
+        weft_broker_client::protocol::ProjectStatus::Inactive,
+    );
+    // The USER deactivated: the flag stays false (default).
+    rig.broker.add_infra_node("proj-user-off", NODE, "inst1", Status::Running);
+    rig.kube.set_workloads(
+        "wm-project-test-user-off",
+        vec![workload("inst1-bridge", NODE, 1, 1)], // pods still healthy
+    );
+
+    rig.tick_health().await.unwrap();
+
+    let any_reactivate = rig.broker.calls().iter().any(|c| matches!(
+        c,
+        BrokerCall::EnqueueLifecycle { project_id, spec }
+            if project_id == "proj-user-off"
+            && matches!(spec, weft_broker_client::protocol::LifecycleSpec::Reactivate)
+    ));
+    assert!(
+        !any_reactivate,
+        "a USER-deactivated project (deactivated_by_health=false) must NOT be auto-reactivated, \
+         even when infra is healthy + Inactive"
     );
 }
 

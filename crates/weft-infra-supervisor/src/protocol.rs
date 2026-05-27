@@ -73,6 +73,13 @@ pub enum HealthCondition {
     ProjectStatusEq {
         status: weft_broker_client::protocol::ProjectStatus,
     },
+    /// True iff the project's current deactivation was performed by
+    /// the health loop (not the user). The default auto-recover
+    /// protocol pairs this with `infra healthy` + `Inactive` so it
+    /// reactivates ONLY a deactivation it did itself: a user stop /
+    /// deactivate sets the flag false, so auto-recover leaves it
+    /// alone (the user is present and didn't ask to be reactivated).
+    DeactivatedByHealth,
     /// All sub-conditions must hold. Struct variant (`conds: [...]`)
     /// instead of tuple variant because internally-tagged enums
     /// can't serialize a tuple-newtype-with-Vec via serde_json.
@@ -178,6 +185,12 @@ pub fn default_protocols() -> HealthProtocols {
                         HealthCondition::ProjectStatusEq {
                             status: ProjectStatus::Inactive,
                         },
+                        // ONLY reactivate a park the health loop itself
+                        // did. A user stop / deactivate sets the flag
+                        // false, so this protocol never overrides the
+                        // user's explicit deactivation (they're present
+                        // and don't want a surprise reactivation).
+                        HealthCondition::DeactivatedByHealth,
                     ],
                 },
                 action: ProtocolAction::AutoRecover,
@@ -196,6 +209,9 @@ pub struct ConditionContext<'a> {
     pub ready_ratio: &'a std::collections::HashMap<(String, String), f32>,
     pub ready_replicas: &'a std::collections::HashMap<(String, String), u32>,
     pub project_status: weft_broker_client::protocol::ProjectStatus,
+    /// Did the health loop perform the current deactivation? Feeds
+    /// `HealthCondition::DeactivatedByHealth`.
+    pub deactivated_by_health: bool,
 }
 
 /// True if a `(node_id, unit)` selector pair (each possibly `"*"`)
@@ -253,6 +269,7 @@ pub fn evaluate_condition(cond: &HealthCondition, ctx: &ConditionContext<'_>) ->
             }
         }
         HealthCondition::ProjectStatusEq { status } => ctx.project_status == *status,
+        HealthCondition::DeactivatedByHealth => ctx.deactivated_by_health,
         HealthCondition::All { conds } => conds.iter().all(|c| evaluate_condition(c, ctx)),
         HealthCondition::Any { conds } => conds.iter().any(|c| evaluate_condition(c, ctx)),
         HealthCondition::Not { cond } => match cond.first() {
@@ -293,6 +310,7 @@ mod tests {
                 ready_ratio: &rr,
                 ready_replicas: &rp,
                 project_status: weft_broker_client::protocol::ProjectStatus::Active,
+                deactivated_by_health: false,
             },
         )
     }

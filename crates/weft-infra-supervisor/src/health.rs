@@ -406,6 +406,7 @@ async fn tick_project(
         ready_ratio,
         ready_replicas,
         project_status: project.status,
+        deactivated_by_health: project.deactivated_by_health,
     };
 
     // Snapshot the per-project in_flight + fired sets under the

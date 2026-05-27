@@ -2209,6 +2209,7 @@ pub async fn execute_trigger_deactivation(
         spec.mode,
         spec.grace_minutes,
         spec.running_policy,
+        false, // user-initiated (stop / upgrade / terminate)
     )
     .await?;
     if !existed {
@@ -2236,6 +2237,7 @@ pub async fn deactivate(
         spec.mode,
         spec.grace_minutes,
         spec.running_policy,
+        false, // user-initiated (the standalone Deactivate verb)
     )
     .await?;
     if !existed {
@@ -2467,6 +2469,7 @@ pub async fn deactivate_project(
         DeactivationMode::Wipe,
         0,
         crate::infra_lifecycle_command::RunningPolicy::Cancel,
+        false, // project teardown (delete / rm), not a health park
     )
     .await
 }
@@ -2500,6 +2503,7 @@ pub async fn deactivate_project_with_mode(
     mode: DeactivationMode,
     grace_minutes: u32,
     running_policy: crate::infra_lifecycle_command::RunningPolicy,
+    by_health: bool,
 ) -> Result<bool, (StatusCode, String)> {
     use crate::project_store::{ProjectLifecycle, ProjectStatus};
 
@@ -2508,14 +2512,20 @@ pub async fn deactivate_project_with_mode(
     // Resolve the target lifecycle (the axes the gate must be
     // showing on completion). For wait mode we wrap it in
     // `deactivating_to(target)` so status=Deactivating but the
-    // gate axes are already the target's.
-    let target = match mode {
-        DeactivationMode::Wipe => ProjectLifecycle::wiped(),
-        DeactivationMode::Hibernate => {
-            let deadline = crate::lease::now_unix() + (grace_minutes as i64) * 60;
-            ProjectLifecycle::hibernating(deadline)
+    // gate axes are already the target's. `by_health` stamps WHO
+    // deactivated: true only on the health loop's autonomous park,
+    // so its auto-recover can later reactivate ONLY its own park (a
+    // user deactivate sets false and is never auto-reactivated).
+    let target = ProjectLifecycle {
+        deactivated_by_health: by_health,
+        ..match mode {
+            DeactivationMode::Wipe => ProjectLifecycle::wiped(),
+            DeactivationMode::Hibernate => {
+                let deadline = crate::lease::now_unix() + (grace_minutes as i64) * 60;
+                ProjectLifecycle::hibernating(deadline)
+            }
+            DeactivationMode::Park => ProjectLifecycle::parked(),
         }
-        DeactivationMode::Park => ProjectLifecycle::parked(),
     };
 
     // For wipe (always paired with cancel), do the cancel + drop

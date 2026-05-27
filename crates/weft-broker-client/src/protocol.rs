@@ -495,6 +495,11 @@ pub struct SupervisorProject {
     /// broker and supervisor deploy together, a missing field is
     /// schema drift and should fail loud on deserialize.
     pub status: ProjectStatus,
+    /// True iff the current deactivation was performed by the health
+    /// loop (autonomous park), not the user. The default auto-recover
+    /// protocol gates its reactivate on this so it never overrides a
+    /// user-initiated stop / deactivate. See `ProjectLifecycle`.
+    pub deactivated_by_health: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1260,6 +1265,7 @@ mod supervisor_protocol_tests {
                     "project_id": "p1",
                     "project_namespace": "wm-project-alice-p1",
                     "status": "active",
+                    "deactivated_by_health": false,
                 }
             ]
         }))
@@ -1268,6 +1274,7 @@ mod supervisor_protocol_tests {
         assert_eq!(resp.projects[0].project_id, "p1");
         assert_eq!(resp.projects[0].project_namespace, "wm-project-alice-p1");
         assert_eq!(resp.projects[0].status, ProjectStatus::Active);
+        assert!(!resp.projects[0].deactivated_by_health);
     }
 
     /// `SupervisorProject::status` has NO `serde(default)`, so a
@@ -1283,6 +1290,25 @@ mod supervisor_protocol_tests {
         assert!(
             res.is_err(),
             "missing status should fail deserialize; got {:?}",
+            res
+        );
+    }
+
+    /// `SupervisorProject::deactivated_by_health` also has NO
+    /// `serde(default)`: a missing field is schema drift and must fail
+    /// loud (the broker + supervisor deploy together). Pin it so a
+    /// future `serde(default)` slipping in would break CI rather than
+    /// silently defaulting the auto-recover gate to false.
+    #[test]
+    fn projects_for_tenant_missing_deactivated_by_health_fails() {
+        let res: Result<SupervisorProjectsForTenantResponse, _> = serde_json::from_value(json!({
+            "projects": [
+                { "project_id": "p1", "project_namespace": "wm-project-alice-p1", "status": "active" }
+            ]
+        }));
+        assert!(
+            res.is_err(),
+            "missing deactivated_by_health should fail deserialize; got {:?}",
             res
         );
     }

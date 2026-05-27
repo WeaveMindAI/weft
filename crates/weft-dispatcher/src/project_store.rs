@@ -208,6 +208,16 @@ pub struct ProjectLifecycle {
     pub accepting_fires: bool,
     pub fires_visible_to_consumers: bool,
     pub fires_deadline_unix: Option<i64>,
+    /// True iff the CURRENT deactivation was performed by the health
+    /// loop (autonomous park because infra broke), NOT by the user.
+    /// The health loop's auto-recover reactivate fires ONLY when this
+    /// is true, so it never overrides a deactivation the user did
+    /// themselves (stop / upgrade / terminate / manual deactivate):
+    /// the user is present for those and doesn't want a surprise
+    /// reactivation. Every non-health lifecycle constructor sets it
+    /// false; only `deactivate_project_with_mode(by_health=true)`
+    /// (the claimer's health-park path) sets it true.
+    pub deactivated_by_health: bool,
 }
 
 impl ProjectLifecycle {
@@ -218,6 +228,7 @@ impl ProjectLifecycle {
             accepting_fires: true,
             fires_visible_to_consumers: true,
             fires_deadline_unix: None,
+            deactivated_by_health: false,
         }
     }
 
@@ -233,6 +244,7 @@ impl ProjectLifecycle {
             accepting_fires: true,
             fires_visible_to_consumers: false,
             fires_deadline_unix: None,
+            deactivated_by_health: false,
         }
     }
 
@@ -244,6 +256,7 @@ impl ProjectLifecycle {
             accepting_fires: false,
             fires_visible_to_consumers: false,
             fires_deadline_unix: None,
+            deactivated_by_health: false,
         }
     }
 
@@ -255,6 +268,7 @@ impl ProjectLifecycle {
             accepting_fires: true,
             fires_visible_to_consumers: false,
             fires_deadline_unix: Some(deadline_unix),
+            deactivated_by_health: false,
         }
     }
 
@@ -266,6 +280,7 @@ impl ProjectLifecycle {
             accepting_fires: true,
             fires_visible_to_consumers: true,
             fires_deadline_unix: None,
+            deactivated_by_health: false,
         }
     }
 
@@ -280,6 +295,10 @@ impl ProjectLifecycle {
             accepting_fires: target.accepting_fires,
             fires_visible_to_consumers: target.fires_visible_to_consumers,
             fires_deadline_unix: target.fires_deadline_unix,
+            // Carry the target's flag so a health-park that drains
+            // through Deactivating keeps `deactivated_by_health` set
+            // the whole way (the gate is correct from the first write).
+            deactivated_by_health: target.deactivated_by_health,
         }
     }
 
@@ -395,6 +414,12 @@ impl PostgresProjectStore {
                 accepting_fires BOOLEAN NOT NULL DEFAULT TRUE,
                 fires_visible_to_consumers BOOLEAN NOT NULL DEFAULT TRUE,
                 fires_deadline_unix BIGINT,
+                -- True iff the CURRENT deactivation was performed by the
+                -- health loop (autonomous park), not the user. Gates the
+                -- health auto-recover reactivate so it never overrides a
+                -- user-initiated stop/deactivate. Cleared by every
+                -- non-health lifecycle write.
+                deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
                 tenant_id TEXT NOT NULL DEFAULT 'local',
                 -- Project namespace (wm-project-<tenant>--<project>).
                 -- Set on register (NOT NULL: no default; populated by
@@ -590,19 +615,21 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn lifecycle(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectLifecycle>> {
-        let row: Option<(String, bool, bool, Option<i64>)> = sqlx::query_as(
-            "SELECT status, accepting_fires, fires_visible_to_consumers, fires_deadline_unix \
+        let row: Option<(String, bool, bool, Option<i64>, bool)> = sqlx::query_as(
+            "SELECT status, accepting_fires, fires_visible_to_consumers, fires_deadline_unix, \
+                    deactivated_by_health \
              FROM project WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(status, accepting, visible, deadline)| {
+        row.map(|(status, accepting, visible, deadline, by_health)| {
             Ok(ProjectLifecycle {
                 status: project_status_from_str(&status)?,
                 accepting_fires: accepting,
                 fires_visible_to_consumers: visible,
                 fires_deadline_unix: deadline,
+                deactivated_by_health: by_health,
             })
         })
         .transpose()
@@ -619,13 +646,15 @@ impl ProjectStoreOps for PostgresProjectStore {
                  accepting_fires = $2, \
                  fires_visible_to_consumers = $3, \
                  fires_deadline_unix = $4, \
-                 updated_at = $5 \
-             WHERE id = $6",
+                 deactivated_by_health = $5, \
+                 updated_at = $6 \
+             WHERE id = $7",
         )
         .bind(lifecycle.status.as_str())
         .bind(lifecycle.accepting_fires)
         .bind(lifecycle.fires_visible_to_consumers)
         .bind(lifecycle.fires_deadline_unix)
+        .bind(lifecycle.deactivated_by_health)
         .bind(crate::lease::now_unix())
         .bind(id)
         .execute(&self.pool)
@@ -664,13 +693,15 @@ impl ProjectStoreOps for PostgresProjectStore {
                  accepting_fires = $2, \
                  fires_visible_to_consumers = $3, \
                  fires_deadline_unix = $4, \
-                 updated_at = $5 \
-             WHERE id = $6 AND status = $7",
+                 deactivated_by_health = $5, \
+                 updated_at = $6 \
+             WHERE id = $7 AND status = $8",
         )
         .bind(to.status.as_str())
         .bind(to.accepting_fires)
         .bind(to.fires_visible_to_consumers)
         .bind(to.fires_deadline_unix)
+        .bind(to.deactivated_by_health)
         .bind(crate::lease::now_unix())
         .bind(id)
         .bind(from.as_str())
@@ -687,13 +718,15 @@ impl ProjectStoreOps for PostgresProjectStore {
                  accepting_fires = $2, \
                  fires_visible_to_consumers = $3, \
                  fires_deadline_unix = $4, \
-                 updated_at = $5 \
-             WHERE id = $6 AND status <> 'activating'",
+                 deactivated_by_health = $5, \
+                 updated_at = $6 \
+             WHERE id = $7 AND status <> 'activating'",
         )
         .bind(activating.status.as_str())
         .bind(activating.accepting_fires)
         .bind(activating.fires_visible_to_consumers)
         .bind(activating.fires_deadline_unix)
+        .bind(activating.deactivated_by_health)
         .bind(crate::lease::now_unix())
         .bind(id)
         .execute(&self.pool)
@@ -1010,6 +1043,7 @@ impl ProjectStoreOps for MockProjectStore {
                     accepting_fires: true,
                     fires_visible_to_consumers: true,
                     fires_deadline_unix: None,
+                    deactivated_by_health: false,
                 }),
         ))
     }

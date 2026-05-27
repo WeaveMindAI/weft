@@ -180,8 +180,18 @@ impl FakeBroker {
                 project_id: project_id.to_string(),
                 project_namespace: project_namespace.to_string(),
                 status,
+                deactivated_by_health: false,
             },
         );
+    }
+
+    /// Flip `deactivated_by_health` on a seeded project. Lets a test
+    /// distinguish "the health loop parked this" (true) from "the user
+    /// deactivated" (false) when exercising the auto-recover gate.
+    pub fn set_deactivated_by_health(&self, project_id: &str, by_health: bool) {
+        if let Some(p) = self.inner.lock().projects.get_mut(project_id) {
+            p.deactivated_by_health = by_health;
+        }
     }
 
     /// Seed an infra_node row. Pass `endpoints` as you'd expect a

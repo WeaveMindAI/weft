@@ -470,7 +470,7 @@ pub async fn supervisor_projects_for_tenant(
     scope::require_tenant_eq(&caller, &req.tenant_id)?;
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT id::TEXT AS project_id, project_namespace, status \
+        "SELECT id::TEXT AS project_id, project_namespace, status, deactivated_by_health \
          FROM project WHERE tenant_id = $1",
     )
     .bind(&req.tenant_id)
@@ -494,6 +494,9 @@ pub async fn supervisor_projects_for_tenant(
                     "project.status='{status_str}' is not a known ProjectStatus"
                 ))
             })?;
+        let deactivated_by_health: bool = r
+            .try_get("deactivated_by_health")
+            .map_err(|e| internal(anyhow::anyhow!("decode deactivated_by_health: {e}")))?;
         if project_namespace.is_empty() {
             // Skip projects without a namespace (mid-register state).
             continue;
@@ -502,6 +505,7 @@ pub async fn supervisor_projects_for_tenant(
             project_id,
             project_namespace,
             status,
+            deactivated_by_health,
         });
     }
     Ok(Json(SupervisorProjectsForTenantResponse { projects }))

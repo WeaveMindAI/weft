@@ -248,6 +248,7 @@ async fn run_deactivate(
         spec.mode,
         spec.grace_minutes,
         spec.running_policy,
+        true, // health-loop autonomous park: its auto-recover MAY reactivate this
     )
     .await
     .map_err(|(_, m)| anyhow::anyhow!("deactivate: {m}"))?;

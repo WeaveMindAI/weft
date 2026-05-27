@@ -65,9 +65,6 @@ tempfile = "3"
 parking_lot = "0.12"
 ipnet = "2"
 
-# minillmlib: local path during development, crates.io for release
-minillmlib = { path = "../MiniLLMLibRS" }
-
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }
 weft-compiler = { path = "crates/weft-compiler" }
