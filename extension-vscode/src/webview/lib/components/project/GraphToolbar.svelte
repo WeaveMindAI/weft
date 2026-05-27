@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FileText, Pin, PinOff } from '@lucide/svelte';
+  import { ArrowLeft, Code, Pin, PinOff } from '@lucide/svelte';
 
   let {
     mode,
@@ -9,6 +9,9 @@
     onCatchUp,
     onOpenSource,
     sourceOpen = false,
+    navDepth = 0,
+    navFileName = '',
+    onNavigateBack,
   }: {
     mode: 'latest' | 'pinned';
     color: string | undefined;
@@ -21,12 +24,29 @@
     /// the user sees at a glance that clicking will reveal an
     /// existing tab (vs creating a new one).
     sourceOpen?: boolean;
+    /// Include-navigation depth: > 0 means viewing an @include'd file, so a
+    /// Return button shows. navFileName labels the current file.
+    navDepth?: number;
+    navFileName?: string;
+    onNavigateBack?: () => void;
   } = $props();
 
   const shortColor = $derived(color ? color.slice(0, 8) : '');
 </script>
 
 <div class="absolute top-3 left-3 z-30 flex items-center gap-2 pointer-events-auto">
+  {#if navDepth > 0}
+    <button
+      type="button"
+      onclick={() => onNavigateBack?.()}
+      class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-violet-300 bg-white text-violet-700 shadow-sm text-xs font-medium hover:bg-violet-50 transition"
+      title="Return to the file you came from"
+    >
+      <ArrowLeft class="w-3 h-3" />
+      Return{navFileName ? ` · ${navFileName}` : ''}
+    </button>
+  {/if}
+
   {#if mode === 'pinned' && pendingCount > 0}
     <button
       type="button"
@@ -72,7 +92,7 @@
         ? 'Source is open. Click to focus the existing tab.'
         : 'Open the .weft source in a side editor.'}
     >
-      <FileText class="w-3 h-3" />
+      <Code class="w-3 h-3" />
       Source
     </button>
   {/if}

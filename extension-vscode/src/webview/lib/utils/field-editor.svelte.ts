@@ -14,7 +14,10 @@
  *   //              onblur={() => editor.blur(key, saveFn)}
  */
 
-const DEFAULT_DEBOUNCE_MS = 2000;
+// Snappy enough that edits autosave shortly after you stop typing (no need to
+// click away to commit), long enough not to hammer the surgical editor / file
+// writes on every keystroke.
+const DEFAULT_DEBOUNCE_MS = 700;
 
 export interface FieldEditor {
 	/** Get the display value: local value if editing this key, otherwise the store value. */

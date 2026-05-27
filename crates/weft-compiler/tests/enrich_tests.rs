@@ -18,7 +18,7 @@ out = Debug
 
 out.data = greeting.value
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
 
     let text = project.nodes.iter().find(|n| n.id == "greeting").unwrap();
@@ -42,7 +42,7 @@ sink = Debug
 
 sink.data = hello.value
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
 
     let sink = project.nodes.iter().find(|n| n.id == "sink").unwrap();
@@ -64,7 +64,7 @@ fn enrich_rejects_unknown_node_type() {
 
 bad = NotARealNode
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("NotARealNode"), "expected NotARealNode in error, got: {msg}");

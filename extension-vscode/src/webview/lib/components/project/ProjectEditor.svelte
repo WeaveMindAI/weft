@@ -1,10 +1,16 @@
 <script lang="ts">
 	import { SvelteFlowProvider } from "@xyflow/svelte";
 	import ProjectEditorInner from "./ProjectEditorInner.svelte";
-	import type { ValidationError } from "$lib/types";
+	import type { ProjectDefinition } from "$lib/types";
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	let inner: any = $state();
+	// The bound inner instance's public API this wrapper forwards. Typed (not
+	// `any`) so a signature drift between wrapper and inner is a compile error,
+	// the arity bug this interface was added to prevent.
+	interface InnerApi {
+		flushAllPendingSaves(): void;
+		applyExternalSource(project: ProjectDefinition, weftCode: string, layoutCode: string): void;
+	}
+	let inner: InnerApi | undefined = $state();
 
 	/// Flush every pending debounced save. Called by App.svelte
 	/// before posting runProject so the host sees the user's
@@ -13,13 +19,15 @@
 		inner?.flushAllPendingSaves();
 	}
 
-	export function applyExternalSource(weftCode: string, layoutCode: string): void {
-		inner?.applyExternalSource(weftCode, layoutCode);
+	export function applyExternalSource(project: ProjectDefinition, weftCode: string, layoutCode: string): void {
+		inner?.applyExternalSource(project, weftCode, layoutCode);
 	}
 
 	let {
 		project,
 		onSave,
+		onApplyEdits,
+		onApplyTextEdit,
 		onRun,
 		onStop,
 		onDismissError,
@@ -42,15 +50,21 @@
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
 		executionState,
-		validationErrors,
 		autoOrganizeOnMount = false,
-		fitViewAfterOrganize = false,
 		infraFeedByNode,
 		signalFeedByNode,
 		structuralLock = false,
+		onOpenInclude = () => {},
+		execPrefix = '',
+		fileContents = {},
 	}: {
 		project: ProjectDefinition;
-		onSave: (data: { name?: string; description?: string; weftCode?: string }) => void;
+		onSave: (data: { name?: string; description?: string; layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
+		onApplyEdits: (ops: import('../../../../shared/protocol').EditOp[]) => Promise<import('../../../../shared/protocol').TextEdit | null>;
+		onApplyTextEdit: (edit: import('../../../../shared/protocol').TextEdit) => Promise<import('../../../../shared/protocol').TextEdit | null>;
+		onOpenInclude?: (path: string, alias: string) => void;
+		execPrefix?: string;
+		fileContents?: Record<string, import('../../../../shared/protocol').FileContent>;
 		onRun?: () => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
@@ -81,9 +95,7 @@
 			nodeStatuses: Record<string, string>;
 			nodeExecutions: import('$lib/types').NodeExecutionTable;
 		};
-		validationErrors?: Map<string, ValidationError[]>;
 		autoOrganizeOnMount?: boolean;
-		fitViewAfterOrganize?: boolean;
 		/// Per-node infra /live tick state. Only consumed for nodes
 		/// with `requiresInfra: true`.
 		infraFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
@@ -99,6 +111,8 @@
 		bind:this={inner}
 		{project}
 		{onSave}
+		{onApplyEdits}
+		{onApplyTextEdit}
 		{onRun}
 		{onStop}
 		{onDismissError}
@@ -121,11 +135,12 @@
 		{hasInfraInGraph}
 		{hasTriggersInGraph}
 		{executionState}
-		{validationErrors}
 		{autoOrganizeOnMount}
-		{fitViewAfterOrganize}
 		{infraFeedByNode}
 		{signalFeedByNode}
 		{structuralLock}
+		{onOpenInclude}
+		{execPrefix}
+		{fileContents}
 	/>
 </SvelteFlowProvider>

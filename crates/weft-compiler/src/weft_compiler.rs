@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
-    Edge, GroupBoundary, GroupBoundaryRole, LaneMode, NodeDefinition, PortDefinition, Position,
-    ProjectDefinition, Span,
+    ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, LaneMode, NodeDefinition,
+    PortDefinition, Position, ProjectDefinition, Span,
 };
 use weft_core::weft_type::WeftType;
 
@@ -57,8 +57,16 @@ struct ParsedNode {
     /// Source range of the header line (`id = NodeType`), used when
     /// adding a config field to a bare node.
     header_span: Option<Span>,
-    /// Span per config field name.
-    config_spans: std::collections::BTreeMap<String, Span>,
+    /// Span + origin (inline vs connection-line) per config field name.
+    config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// Resolved `@file(...)` references per config field name. Populated by
+    /// the file-ref resolution pass; carried to NodeDefinition so the editor
+    /// knows which fields are file-backed.
+    file_refs: std::collections::BTreeMap<String, weft_core::project::FileRef>,
+    /// Set on an opaque `@include` interface node (Interface mode): the path
+    /// of the included `.weft` file. The editor renders this node as an
+    /// expandable group that navigates into the file.
+    include_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +93,13 @@ struct ParsedGroup {
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
     child_groups: Vec<ParsedGroup>,
+    /// True for the anonymous top-level group of an included file (declared
+    /// `Group(...) { }` with no `name =`). The include resolver requires this;
+    /// the editor labels it from the filename. Always false for named groups.
+    anonymous: bool,
+    /// `@include("path")` declarations inside this group body, resolved after
+    /// parse into child groups (Full) or opaque nodes (Interface).
+    includes: Vec<ParsedInclude>,
     /// Source range covering the entire `label = Group(...) -> (...) { body }`
     /// block. Used by the webview / surgical layer to delete or rewrite the
     /// whole group region.
@@ -94,13 +109,55 @@ struct ParsedGroup {
     header_span: Option<Span>,
 }
 
+impl ParsedGroup {
+    /// True if `scoped_id` is already a member of this group by ANY declaration
+    /// kind: a child node, a child group, or an `@include` alias. Same shared
+    /// id namespace as the top level (`ParseState::has_top_level_id`), so the
+    /// nested duplicate check must span all three. Ids are already scoped
+    /// (`group_id.local`) when this is called.
+    fn has_member_id(&self, scoped_id: &str) -> bool {
+        self.nodes.iter().any(|n| n.id == scoped_id)
+            || self.child_groups.iter().any(|g| g.id == scoped_id)
+            || self.includes.iter().any(|x| x.alias == scoped_id)
+    }
+}
+
 struct ParseState {
     name: String,
     description: String,
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
     groups: Vec<ParsedGroup>,
+    /// `@include("path")` declarations, resolved after parse by
+    /// `crate::include::resolve_includes` into either a full rescoped group
+    /// (build) or an opaque interface node (interactive parse).
+    includes: Vec<ParsedInclude>,
     errors: Vec<CompileError>,
+}
+
+impl ParseState {
+    /// True if `id` is already declared at the top level by ANY declaration
+    /// kind: a node, a group, or an `@include` alias. Nodes, groups, and
+    /// include aliases share one id namespace (an include resolves into a
+    /// group or node under its alias), so the duplicate check must span all
+    /// three regardless of declaration order.
+    fn has_top_level_id(&self, id: &str) -> bool {
+        self.nodes.iter().any(|n| n.id == id)
+            || self.groups.iter().any(|g| g.id == id)
+            || self.includes.iter().any(|x| x.alias == id)
+    }
+}
+
+/// A `c = @include("path")` declaration captured at parse time. `alias` is
+/// the call-site name (the group id after resolution), `path` is the file to
+/// splice, `line` is for error reporting.
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedInclude {
+    pub alias: String,
+    pub path: String,
+    pub line: usize,
+    pub span: Option<Span>,
+    pub header_span: Option<Span>,
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -115,12 +172,439 @@ struct ParseState {
 ///
 /// Groups are flattened: each group produces two Passthrough nodes
 /// ({groupId}__in and {groupId}__out) with edges rewired accordingly.
-pub fn compile(source: &str, project_id: Uuid) -> Result<ProjectDefinition, Vec<CompileError>> {
-    let state = parse_weft(source);
+pub fn compile(
+    source: &str,
+    project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
+) -> Result<ProjectDefinition, Vec<CompileError>> {
+    compile_with_mode(source, project_id, base_dir, IncludeMode::Full)
+}
+
+/// How `@include` is resolved. `Full` inlines the referenced group's whole
+/// body (build: one binary). `Interface` emits a single opaque node carrying
+/// only the group's ports (interactive parse: the editor renders an opaque
+/// block and navigates into the file to edit the body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncludeMode {
+    Full,
+    Interface,
+}
+
+pub fn compile_with_mode(
+    source: &str,
+    project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
+    include_mode: IncludeMode,
+) -> Result<ProjectDefinition, Vec<CompileError>> {
+    // Strict: any error aborts (the build must not produce a half-project).
+    let (project, errors) = compile_lenient(source, project_id, base_dir, include_mode);
+    if errors.is_empty() {
+        Ok(project)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Lenient compile: ALWAYS returns a project, parsing as much as possible and
+/// collecting per-line errors as diagnostics instead of aborting. A single bad
+/// line (e.g. a stray `debug` mid-edit) becomes one diagnostic; every valid
+/// node/edge around it still renders. This is the editor's parse path; the
+/// build path uses `compile_with_mode` (strict) which fails on any error.
+pub fn compile_lenient(
+    source: &str,
+    project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
+    include_mode: IncludeMode,
+) -> (ProjectDefinition, Vec<CompileError>) {
+    let mut errors = Vec::new();
+
+    // Parse (the parser already builds a partial ParseState alongside its
+    // errors). Resolve this file's own `@file` markers, collecting errors.
+    let mut state = parse_weft(source);
+    errors.append(&mut state.errors);
+    for node in &mut state.nodes {
+        resolve_node_file_refs_in(node, base_dir, &mut errors);
+    }
+    for group in &mut state.groups {
+        resolve_group_file_refs(group, base_dir, &mut errors);
+    }
+
+    // Resolve `@include` declarations (Full inlines, Interface emits opaque
+    // nodes), collecting errors.
+    resolve_includes(&mut state, base_dir, include_mode, &mut Vec::new(), &mut errors);
+
+    // Flatten the partial state into a project. flatten builds from whatever
+    // the parser produced and never fails.
+    let project = flatten(state, project_id);
+    (project, errors)
+}
+
+/// Parse one file and resolve its `@file(...)` config markers against
+/// `base_dir`. Shared by the top-level compile and the include resolver so
+/// every file's `@file` refs resolve relative to that file's own directory.
+fn parse_and_resolve_file_refs(
+    source: &str,
+    base_dir: Option<&std::path::Path>,
+) -> Result<ParseState, Vec<CompileError>> {
+    let mut state = parse_weft(source);
     if !state.errors.is_empty() {
         return Err(state.errors);
     }
-    flatten(state, project_id)
+    let mut errors = Vec::new();
+    for node in &mut state.nodes {
+        resolve_node_file_refs_in(node, base_dir, &mut errors);
+    }
+    for group in &mut state.groups {
+        resolve_group_file_refs(group, base_dir, &mut errors);
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(state)
+}
+
+/// Resolve a single node's `@file` markers (top-level helper bridging the
+/// private `ParsedNode` fields to `file_ref::resolve_node_file_refs`).
+fn resolve_node_file_refs_in(
+    node: &mut ParsedNode,
+    base_dir: Option<&std::path::Path>,
+    errors: &mut Vec<CompileError>,
+) {
+    crate::file_ref::resolve_node_file_refs(
+        &mut node.config,
+        &node.config_spans,
+        &mut node.file_refs,
+        node.span.map(|s| s.start_line).unwrap_or(0),
+        base_dir,
+        errors,
+    );
+}
+
+/// Resolve `@file` markers in a group body and all its descendants, so a
+/// `@file` inside a group (including the anonymous root group of an included
+/// file) resolves too.
+fn resolve_group_file_refs(
+    group: &mut ParsedGroup,
+    base_dir: Option<&std::path::Path>,
+    errors: &mut Vec<CompileError>,
+) {
+    for node in &mut group.nodes {
+        resolve_node_file_refs_in(node, base_dir, errors);
+    }
+    for child in &mut group.child_groups {
+        resolve_group_file_refs(child, base_dir, errors);
+    }
+}
+
+// ─── Include resolution ───────────────────────────────────────────────────────
+
+/// Internal node type for an opaque `@include` block in Interface mode. The
+/// editor renders it as an expandable group that navigates into the file.
+pub const INCLUDE_NODE_TYPE: &str = "IncludedGroup";
+
+/// Sentinel id for the anonymous top-level group in an included file. The
+/// include pass rescopes it under the call-site alias, so the name is never
+/// user-visible; it only needs to be unique within the included file's parse.
+/// Also the signal, when present as a top-level group in a parsed project,
+/// that the file is a component (validated with component rules, not
+/// project rules: its outputs are the group interface, not a Debug node).
+pub(crate) const INCLUDE_ROOT_ID: &str = "__include_root__";
+
+/// Compose a flattened edge id from its endpoints. The single definition of
+/// the edge-id shape, used by `parsed_to_edge` (at flatten) and by the
+/// component relabel (to recompute ids after renaming endpoints) so the two
+/// can never drift.
+fn edge_id(source: &str, source_handle: &str, target: &str, target_handle: &str) -> String {
+    format!("e-{source}-{source_handle}-{target}-{target_handle}")
+}
+
+/// The display label for a group's boundary Passthrough. Single definition of
+/// the shape, used at flatten and by the component relabel (to recompute the
+/// label after renaming) so they can't drift.
+fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -> String {
+    let suffix = match role {
+        weft_core::project::GroupBoundaryRole::In => "in",
+        weft_core::project::GroupBoundaryRole::Out => "out",
+    };
+    format!("{group_id} ({suffix})")
+}
+
+/// Rename the anonymous top-level component group (parsed under the sentinel
+/// `INCLUDE_ROOT_ID`) to a caller-supplied id + label, in place, across the
+/// flattened project. Run when a component file is opened standalone in the
+/// editor so the sentinel never surfaces; no-op if there's no anonymous root.
+///
+/// This lives in the compiler (not the CLI) because it depends on the flattened
+/// shape the compiler owns: which fields carry ids, how boundary passthroughs
+/// are labeled (`"{id} (in)"`), and the edge-id format. The CLI supplies only
+/// the filename-derived name.
+pub fn relabel_anonymous_root(project: &mut ProjectDefinition, new_id: &str, label: &str) {
+    let old = INCLUDE_ROOT_ID;
+    let is_root = project
+        .groups
+        .iter()
+        .any(|g| g.parent_group_id.is_none() && g.anonymous && g.id == old);
+    if !is_root {
+        return;
+    }
+    // Rewrite one flattened id: `old` exactly (the group's own id), or `old`
+    // followed by an id boundary (`old__in`/`old__out` passthroughs, `old.child`
+    // scoped members). The boundary check keeps an unrelated id that merely
+    // starts with `old` (`old_helper`) untouched.
+    let map = |id: &str| -> String {
+        if id == old {
+            new_id.to_string()
+        } else if let Some(rest) = id.strip_prefix(old) {
+            if rest.starts_with("__") || rest.starts_with('.') {
+                format!("{new_id}{rest}")
+            } else {
+                id.to_string()
+            }
+        } else {
+            id.to_string()
+        }
+    };
+    for g in project.groups.iter_mut() {
+        let old_id = g.id.clone();
+        g.id = map(&old_id);
+        g.parent_group_id = g.parent_group_id.as_deref().map(map);
+        for c in g.child_group_ids.iter_mut() {
+            *c = map(c);
+        }
+        for n in g.node_ids.iter_mut() {
+            *n = map(n);
+        }
+        // The relabeled root takes the human label. A child group's label is
+        // id-derived (collect_group_definitions defaults label = id); re-derive
+        // it to the new id so no nested group keeps the sentinel in its label.
+        if g.id == new_id {
+            g.label = Some(label.to_string());
+        } else if g.label.as_deref() == Some(old_id.as_str()) {
+            g.label = Some(g.id.clone());
+        }
+    }
+    for n in project.nodes.iter_mut() {
+        n.id = map(&n.id);
+        for s in n.scope.iter_mut() {
+            *s = map(s);
+        }
+        if let Some(obj) = n.config.as_object_mut() {
+            if let Some(pid) = obj.get("parentId").and_then(|v| v.as_str()) {
+                let mapped = map(pid);
+                obj.insert("parentId".into(), serde_json::Value::String(mapped));
+            }
+        }
+        // A boundary Passthrough: rescope its group id and rebuild its display
+        // label from the new id + role (reconstruct, never substring-replace).
+        if let Some(gb) = n.group_boundary.as_mut() {
+            gb.group_id = map(&gb.group_id);
+            n.label = Some(boundary_label(&gb.group_id, gb.role));
+        }
+    }
+    for e in project.edges.iter_mut() {
+        e.source = map(&e.source);
+        e.target = map(&e.target);
+        // Recompute the id from the mapped endpoints (not string-replace), so
+        // it always matches the canonical edge-id shape.
+        e.id = edge_id(
+            &e.source,
+            e.source_handle.as_deref().unwrap_or(""),
+            &e.target,
+            e.target_handle.as_deref().unwrap_or(""),
+        );
+    }
+}
+
+/// True if a top-level line begins an anonymous group: `Group` followed
+/// (after optional whitespace) by a port signature `(`, a body `{`, an
+/// output arrow `->`, or end of line. Distinguishes the included-file form
+/// `Group(raw: String) -> (...) {` from an identifier that merely starts
+/// with "Group" (`GroupThing = ...`) AND from a node literally named `Group`
+/// (`Group = SomeNode { ... }`): an `=` after the whitespace is NOT a group
+/// header, so it falls through to the normal `id = Type` declaration path.
+fn is_anonymous_group_header(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("Group") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.is_empty() || rest.starts_with('(') || rest.starts_with('{') || rest.starts_with("->")
+}
+
+/// Resolve every `@include("path")` in `state`. `Full` inlines each
+/// referenced file's single top-level Group (rescoped under the alias) into
+/// `state.groups`; `Interface` emits one opaque node per include carrying the
+/// group's ports. `in_progress` is the cycle-detection stack of canonical
+/// file paths currently being resolved.
+fn resolve_includes(
+    state: &mut ParseState,
+    base_dir: Option<&std::path::Path>,
+    mode: IncludeMode,
+    in_progress: &mut Vec<std::path::PathBuf>,
+    errors: &mut Vec<CompileError>,
+) {
+    let includes = std::mem::take(&mut state.includes);
+    for inc in includes {
+        let Some(root) = base_dir else {
+            errors.push(CompileError {
+                line: inc.line,
+                message: format!("@include(\"{}\") cannot be resolved outside a project", inc.path),
+            });
+            continue;
+        };
+        match resolve_one_include(&inc, root, mode, in_progress) {
+            Ok(IncludeResult::Group(group)) => state.groups.push(*group),
+            Ok(IncludeResult::Node(node)) => state.nodes.push(*node),
+            Err(msg) => errors.push(CompileError { line: inc.line, message: msg }),
+        }
+    }
+    // Resolve includes nested inside group bodies, anywhere in the tree.
+    for group in &mut state.groups {
+        resolve_group_includes(group, base_dir, mode, in_progress, errors);
+    }
+}
+
+/// Resolve `@include`s declared inside a group body, recursing through child
+/// groups. Full-mode includes become child groups; Interface-mode includes
+/// become opaque member nodes.
+fn resolve_group_includes(
+    group: &mut ParsedGroup,
+    base_dir: Option<&std::path::Path>,
+    mode: IncludeMode,
+    in_progress: &mut Vec<std::path::PathBuf>,
+    errors: &mut Vec<CompileError>,
+) {
+    let includes = std::mem::take(&mut group.includes);
+    for inc in includes {
+        let Some(root) = base_dir else {
+            errors.push(CompileError {
+                line: inc.line,
+                message: format!("@include(\"{}\") cannot be resolved outside a project", inc.path),
+            });
+            continue;
+        };
+        match resolve_one_include(&inc, root, mode, in_progress) {
+            Ok(IncludeResult::Group(g)) => group.child_groups.push(*g),
+            Ok(IncludeResult::Node(mut n)) => {
+                // The opaque interface node is a member of this group (its id
+                // is already scoped `group.child`); set parent_id so flatten
+                // assigns it the group's scope, like any other child node.
+                // Without this its scope is empty and edges from siblings trip
+                // the scope-reachability check.
+                n.parent_id = Some(group.id.clone());
+                group.nodes.push(*n);
+            }
+            Err(msg) => errors.push(CompileError { line: inc.line, message: msg }),
+        }
+    }
+    for child in &mut group.child_groups {
+        resolve_group_includes(child, base_dir, mode, in_progress, errors);
+    }
+}
+
+enum IncludeResult {
+    Group(Box<ParsedGroup>),
+    Node(Box<ParsedNode>),
+}
+
+fn resolve_one_include(
+    inc: &ParsedInclude,
+    base_dir: &std::path::Path,
+    mode: IncludeMode,
+    in_progress: &mut Vec<std::path::PathBuf>,
+) -> Result<IncludeResult, String> {
+    let joined = base_dir.join(&inc.path);
+    let canonical_root = base_dir
+        .canonicalize()
+        .map_err(|e| format!("project root {base_dir:?} is unreadable: {e}"))?;
+    let canonical = joined
+        .canonicalize()
+        .map_err(|e| format!("@include path {:?} cannot be read: {e}", inc.path))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("@include path {:?} escapes the project root", inc.path));
+    }
+    if in_progress.contains(&canonical) {
+        return Err(format!("@include cycle: {:?} includes itself", inc.path));
+    }
+
+    let source = std::fs::read_to_string(&canonical)
+        .map_err(|e| format!("@include path {:?} cannot be read: {e}", inc.path))?;
+    let included_dir = canonical.parent().map(|p| p.to_path_buf());
+
+    // Parse the included file and resolve ITS own @file markers relative to
+    // its directory.
+    let mut sub = parse_and_resolve_file_refs(source.as_str(), included_dir.as_deref())
+        .map_err(|errs| {
+            errs.into_iter()
+                .map(|e| format!("{}: {}:{}", inc.path, e.line, e.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
+
+    // An included file must be exactly one anonymous top-level Group and
+    // nothing else: the Group header is the file's interface, and the file
+    // name is its identity (no top-level name). A named group, multiple
+    // groups, or loose nodes are rejected.
+    let single_anon = sub.nodes.is_empty()
+        && sub.includes.is_empty()
+        && sub.groups.len() == 1
+        && sub.groups[0].anonymous;
+    if !single_anon {
+        return Err(format!(
+            "@include(\"{}\"): an included file must be exactly one anonymous top-level Group, e.g. `Group(in: T) -> (out: U) {{ ... }}`",
+            inc.path
+        ));
+    }
+    let mut group = sub.groups.pop().unwrap();
+
+    match mode {
+        IncludeMode::Interface => {
+            // Opaque block: a node carrying only the group's ports. The body
+            // is not loaded; the editor navigates into the file to edit it.
+            let node = ParsedNode {
+                id: inc.alias.clone(),
+                node_type: INCLUDE_NODE_TYPE.to_string(),
+                label: None,
+                config: serde_json::Map::new(),
+                parent_id: None,
+                in_ports: group.in_ports.clone(),
+                out_ports: group.out_ports.clone(),
+                one_of_required: group.one_of_required.clone(),
+                span: inc.span,
+                header_span: inc.header_span,
+                config_spans: Default::default(),
+                file_refs: Default::default(),
+                include_path: Some(inc.path.clone()),
+            };
+            Ok(IncludeResult::Node(Box::new(node)))
+        }
+        IncludeMode::Full => {
+            // Resolve the included group's OWN nested @includes first, against
+            // the included file's directory (not the parent's), so nested
+            // composition inlines fully. Cycle stack guards self-inclusion.
+            in_progress.push(canonical.clone());
+            let mut errs = Vec::new();
+            resolve_group_includes(&mut group, included_dir.as_deref(), mode, in_progress, &mut errs);
+            in_progress.pop();
+            if !errs.is_empty() {
+                return Err(errs
+                    .into_iter()
+                    .map(|e| format!("{}: {}:{}", inc.path, e.line, e.message))
+                    .collect::<Vec<_>>()
+                    .join("; "));
+            }
+            // Rescope the group's internals under the call-site alias, then
+            // adopt the alias as its id (the standard nested-group splice).
+            let old_id = group.id.clone();
+            rescope_group(&mut group, &old_id, &inc.alias);
+            group.id = inc.alias.clone();
+            // Once spliced under a call-site alias it is a named member group
+            // of the parent, NOT a standalone-component root. Clear the flag so
+            // it can't trip the component-validation rule (which treats a
+            // top-level anonymous group as "this file IS a component").
+            group.anonymous = false;
+            Ok(IncludeResult::Group(Box::new(group)))
+        }
+    }
 }
 
 // ─── Parser ──────────────────────────────────────────────────────────────────
@@ -147,6 +631,9 @@ struct ConfigFill {
     target_id: String,
     target_port: String,
     value: serde_json::Value,
+    /// Source span of the `target.port = value` line(s). Recorded so the
+    /// filled field gets a connection-origin config span on the target node.
+    span: Option<Span>,
 }
 
 fn parse_weft(source: &str) -> ParseState {
@@ -157,6 +644,7 @@ fn parse_weft(source: &str) -> ParseState {
         nodes: Vec::new(),
         connections: Vec::new(),
         groups: Vec::new(),
+        includes: Vec::new(),
         errors: Vec::new(),
     };
 
@@ -183,16 +671,30 @@ fn parse_weft(source: &str) -> ParseState {
         if let Some((result, next_i)) = try_parse_declaration(&lines, i, &mut state.errors, &mut inline_scope) {
             match result {
                 Declaration::Node(node) => {
-                    if state.nodes.iter().any(|n| n.id == node.id) {
-                        state.errors.push(CompileError { line: line_num, message: format!("Duplicate node ID '{}'", node.id) });
+                    if state.has_top_level_id(&node.id) {
+                        state.errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}'", node.id) });
                     }
                     state.nodes.push(node);
                 }
                 Declaration::Group(group) => {
-                    if state.groups.iter().any(|g| g.id == group.id) {
-                        state.errors.push(CompileError { line: line_num, message: format!("Duplicate group name '{}'", group.id) });
+                    if state.has_top_level_id(&group.id) {
+                        // Two anonymous top-level groups collide on the sentinel
+                        // id; surface the real cause (an included file is one
+                        // anonymous Group) rather than leaking the sentinel.
+                        let message = if group.id == INCLUDE_ROOT_ID {
+                            "an included file must be exactly one anonymous top-level Group".to_string()
+                        } else {
+                            format!("Duplicate id '{}'", group.id)
+                        };
+                        state.errors.push(CompileError { line: line_num, message });
                     }
                     state.groups.push(group);
+                }
+                Declaration::Include(inc) => {
+                    if state.has_top_level_id(&inc.alias) {
+                        state.errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}'", inc.alias) });
+                    }
+                    state.includes.push(inc);
                 }
             }
             // Merge any inline children produced by this declaration.
@@ -248,6 +750,7 @@ fn parse_weft(source: &str) -> ParseState {
 enum Declaration {
     Node(ParsedNode),
     Group(ParsedGroup),
+    Include(ParsedInclude),
 }
 
 /// Try to parse a declaration: `id = Type(...)` or `id = Type { ... }` or `id = Type`
@@ -262,30 +765,70 @@ fn try_parse_declaration(
     let trimmed = lines[start].trim();
     let line_num = start + 1;
 
-    // Match: id = Type  (then optionally ( or { on same line)
-    let eq_pos = trimmed.find('=')?;
+    // Anonymous top-level group: `Group(...) -> (...) {` with no `id =`. This
+    // is the form an included file uses (the filename is the component's
+    // identity; the include pass rescopes this group under the call-site
+    // alias, discarding the sentinel id). Detected before the `id = Type`
+    // path because it has no leading `=`.
+    let (id, right) = if is_anonymous_group_header(trimmed) {
+        (INCLUDE_ROOT_ID.to_string(), trimmed)
+    } else {
+        // Match: id = Type  (then optionally ( or { on same line)
+        let eq_pos = trimmed.find('=')?;
 
-    // Make sure this isn't a connection (target.port = source.port)
-    let left = trimmed[..eq_pos].trim();
-    if left.contains('.') {
-        return None; // This is a connection, not a declaration
+        // Make sure this isn't a connection (target.port = source.port)
+        let left = trimmed[..eq_pos].trim();
+        if left.contains('.') {
+            return None; // This is a connection, not a declaration
+        }
+
+        let right = trimmed[eq_pos + 1..].trim();
+
+        // Validate identifier
+        if left.is_empty() { return None; }
+        let first = left.chars().next()?;
+        if !first.is_alphabetic() && first != '_' { return None; }
+        if !left.chars().all(|c| c.is_alphanumeric() || c == '_') { return None; }
+
+        // Check reserved words. `self` is the scope pronoun; `Group` and
+        // `Passthrough` are structural type keywords (`x = Group()...`), so
+        // naming a node/group after one makes every later reference to it
+        // ambiguous with the keyword (e.g. `foo = Group.out` reads as an inline
+        // group). Reject at the declaration so it fails HERE, loudly, instead
+        // of cryptically three lines down where the name is used.
+        if left == "self" {
+            errors.push(CompileError { line: line_num, message: "'self' is a reserved word and cannot be used as an identifier".to_string() });
+            return None;
+        }
+        if left == "Group" || left == "Passthrough" {
+            errors.push(CompileError { line: line_num, message: format!("'{left}' is a reserved type keyword and cannot be used as a node or group name") });
+            return None;
+        }
+
+        (left.to_string(), right)
+    };
+
+    // `id = @include("path")`: a file-composition include. Captured as a
+    // marker; the post-parse include pass resolves it (full group inline for
+    // build, opaque interface node for interactive parse).
+    if right.starts_with("@include") {
+        let after = right["@include".len()..].trim();
+        let path = match parse_include_arg(after) {
+            Ok(p) => p,
+            Err(msg) => {
+                errors.push(CompileError { line: line_num, message: msg });
+                return None;
+            }
+        };
+        let inc = ParsedInclude {
+            alias: id,
+            path,
+            line: line_num,
+            span: Some(Span::single_line(line_num, 0, lines[start].len())),
+            header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
+        };
+        return Some((Declaration::Include(inc), start + 1));
     }
-
-    let right = trimmed[eq_pos + 1..].trim();
-
-    // Validate identifier
-    if left.is_empty() { return None; }
-    let first = left.chars().next()?;
-    if !first.is_alphabetic() && first != '_' { return None; }
-    if !left.chars().all(|c| c.is_alphanumeric() || c == '_') { return None; }
-
-    // Check reserved words
-    if left == "self" {
-        errors.push(CompileError { line: line_num, message: "'self' is a reserved word and cannot be used as an identifier".to_string() });
-        return None;
-    }
-
-    let id = left.to_string();
 
     // Extract the type name
     let type_end = right.find(|c: char| c == '(' || c == '{' || c.is_whitespace()).unwrap_or(right.len());
@@ -388,9 +931,10 @@ fn try_parse_declaration(
                     end_col: 0,
                 });
                 ParsedGroup {
+                    anonymous: id == INCLUDE_ROOT_ID,
                     id, in_ports, out_ports,
                     one_of_required,
-                    nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(),
+                    nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(), includes: Vec::new(),
                     span,
                     header_span,
                 }
@@ -421,9 +965,10 @@ fn try_parse_declaration(
                 end_col: 0,
             });
             ParsedGroup {
+                anonymous: id == INCLUDE_ROOT_ID,
                 id, in_ports, out_ports,
                 one_of_required,
-                nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(),
+                nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(), includes: Vec::new(),
                 span,
                 header_span,
             }
@@ -469,7 +1014,7 @@ fn try_parse_declaration(
             (after_ports_clean.to_string(), None)
         };
 
-        let (config, label, next_i) = if after_ports_for_config.starts_with('{') {
+        let (config, label, config_spans, next_i) = if after_ports_for_config.starts_with('{') {
             if after_ports_for_config.ends_with('}') && after_ports_for_config.len() > 1 {
                 // One-liner: { key: val, key: val }. Each pair value may be
                 // a literal, a port wiring (dotted ref), or an inline
@@ -479,6 +1024,10 @@ fn try_parse_declaration(
                 let body = &after_ports_for_config[1..after_ports_for_config.len() - 1].trim();
                 let mut config = serde_json::Map::new();
                 let mut label = None;
+                // One-liner body: every field sits on the declaration line, so
+                // each field's span is that single line.
+                let mut config_spans: ConfigSpanMap = Default::default();
+                let one_liner_span = Span::single_line(line_num, 0, lines[start].len());
                 if !body.is_empty() {
                     for pair in split_respecting_quotes(body, ',') {
                         let pair = pair.trim();
@@ -533,22 +1082,24 @@ fn try_parse_declaration(
                             let dedented = dedent(inner);
                             let unescaped = dedented.replace("\\```", "```").replace("\\`", "`");
                             config.insert(key.to_string(), serde_json::Value::String(unescaped));
+                            config_spans.insert(key.to_string(), ConfigFieldSpan::inline(one_liner_span));
                             continue;
                         }
                         if let Some(l) = try_extract_label(pair) {
                             label = Some(l);
-                        } else {
-                            parse_kv(pair, &mut config, line_num, errors);
+                            config_spans.insert("_label".to_string(), ConfigFieldSpan::inline(one_liner_span));
+                        } else if let Some(k) = parse_kv(pair, &mut config, line_num, errors) {
+                            config_spans.insert(k, ConfigFieldSpan::inline(one_liner_span));
                         }
                     }
                 }
-                (config, label, body_start_line + 1)
+                (config, label, config_spans, body_start_line + 1)
             } else if after_ports_for_config == "{" {
                 // Multi-line config block. The parser detects inline expressions
                 // inside config-field values and emits child nodes + edges into
                 // inline_scope. Anon IDs are generated from the parent id + field
                 // name (e.g. `llm_config__systemPrompt`).
-                let (config, label, extra_in, extra_out, extra_oor, mut end_i) = parse_config_block(lines, body_start_line, line_num, errors, &id, inline_scope);
+                let (config, label, extra_in, extra_out, extra_oor, mut end_i, config_spans) = parse_config_block(lines, body_start_line, line_num, errors, &id, inline_scope);
                 let mut all_in = in_ports.clone();
                 let mut all_out = out_ports.clone();
                 all_in.extend(extra_in);
@@ -616,7 +1167,9 @@ fn try_parse_declaration(
                     parent_id: None, in_ports: all_in, out_ports: all_out, one_of_required: all_oor,
                     span: Some(Span { start_line: line_num, start_col: 0, end_line: end_i, end_col: 0 }),
                     header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
-                    config_spans: Default::default(),
+                    config_spans,
+                    file_refs: Default::default(),
+                    include_path: None,
                 };
                 return Some((Declaration::Node(node), end_i));
             } else {
@@ -625,7 +1178,7 @@ fn try_parse_declaration(
             }
         } else if after_ports_clean.is_empty() {
             // Bare node, no config
-            (serde_json::Map::new(), None, body_start_line + 1)
+            (serde_json::Map::new(), None, ConfigSpanMap::default(), body_start_line + 1)
         } else {
             errors.push(CompileError { line: line_num, message: format!("Unexpected after node declaration: {}", after_ports_clean) });
             return None;
@@ -659,7 +1212,9 @@ fn try_parse_declaration(
             parent_id: None, in_ports: in_ports, out_ports: final_out, one_of_required: final_oor,
             span: Some(Span { start_line: line_num, start_col: 0, end_line: next_i, end_col: 0 }),
             header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
-            config_spans: Default::default(),
+            config_spans,
+            file_refs: Default::default(),
+            include_path: None,
         };
         Some((Declaration::Node(node), next_i))
     }
@@ -1227,6 +1782,8 @@ fn parse_group_body(
         nodes: Vec::new(),
         connections: Vec::new(),
         child_groups: Vec::new(),
+        anonymous: group_id == INCLUDE_ROOT_ID,
+        includes: Vec::new(),
         // The caller overrides these once the header/body extents are
         // fully known.
         span: None,
@@ -1331,8 +1888,8 @@ fn parse_group_body(
                     let local_id = node.id.clone();
                     node.id = format!("{}.{}", group_id, local_id);
                     node.parent_id = Some(group_id.to_string());
-                    if group.nodes.iter().any(|n| n.id == node.id) {
-                        errors.push(CompileError { line: line_num, message: format!("Duplicate node ID '{}' in group '{}'", local_id, group_id) });
+                    if group.has_member_id(&node.id) {
+                        errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}' in group '{}'", local_id, group_id) });
                     }
                     group.nodes.push(node);
                 }
@@ -1342,10 +1899,21 @@ fn parse_group_body(
                     // Rescope all internal IDs
                     rescope_group(&mut child_group, &local_id, &scoped_id);
                     child_group.id = scoped_id.clone();
-                    if group.child_groups.iter().any(|g| g.id == child_group.id) {
-                        errors.push(CompileError { line: line_num, message: format!("Duplicate group name '{}' in group '{}'", local_id, group_id) });
+                    if group.has_member_id(&child_group.id) {
+                        errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}' in group '{}'", local_id, group_id) });
                     }
                     group.child_groups.push(child_group);
+                }
+                Declaration::Include(mut inc) => {
+                    // Nested include inside a group body. Scope the alias under
+                    // the group; the include pass resolves it relative to the
+                    // group's own file when it walks this group's includes.
+                    let local_alias = inc.alias.clone();
+                    inc.alias = format!("{}.{}", group_id, local_alias);
+                    if group.has_member_id(&inc.alias) {
+                        errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}' in group '{}'", local_alias, group_id) });
+                    }
+                    group.includes.push(inc);
                 }
             }
             // Merge inline children generated by this declaration. The anon
@@ -1494,6 +2062,22 @@ fn rescope_id(id: &mut String, old_prefix: &str, new_prefix: &str) {
 ///   - literals (quoted string, number, bool, JSON, triple-backtick)
 ///   - port wirings: `key: source.port` emits an edge targeting parent.key
 ///   - inline expressions: `key: Type { ... }.port` or bare `Type.port`
+/// Per-config-field source spans keyed by field name, with the inline /
+/// connection-line origin the editor needs to rewrite a field in place.
+type ConfigSpanMap = std::collections::BTreeMap<String, ConfigFieldSpan>;
+
+/// Span for a config field that runs from its `key:` line (1-based
+/// `start_line`) through the last consumed line. The loop tracks the next
+/// line index `next` (0-based, one past the last consumed line); the last
+/// consumed line is `next - 1` 0-based, i.e. line number `next` 1-based. The
+/// editor splices whole lines for a multi-line field, so columns are
+/// whole-line (0 .. last line length).
+fn multi_line_span(lines: &[&str], start_line: usize, next: usize) -> Span {
+    let end_line = next; // 1-based line number of the last consumed line
+    let end_col = lines.get(end_line.saturating_sub(1)).map_or(0, |l| l.len());
+    Span { start_line, start_col: 0, end_line, end_col }
+}
+
 fn parse_config_block(
     lines: &[&str],
     start: usize,
@@ -1501,9 +2085,9 @@ fn parse_config_block(
     errors: &mut Vec<CompileError>,
     parent_id: &str,
     inline_scope: &mut InlineScope,
-) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize) {
-    let (cfg, lbl, ins, outs, oor, end_i, _close_line) = parse_config_block_inner(lines, start, base_line, errors, parent_id, inline_scope);
-    (cfg, lbl, ins, outs, oor, end_i)
+) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, ConfigSpanMap) {
+    let (cfg, lbl, ins, outs, oor, end_i, _close_line, spans) = parse_config_block_inner(lines, start, base_line, errors, parent_id, inline_scope);
+    (cfg, lbl, ins, outs, oor, end_i, spans)
 }
 
 /// Variant of parse_config_block that also returns the 0-based index of
@@ -1519,7 +2103,7 @@ fn parse_config_block_with_close(
     errors: &mut Vec<CompileError>,
     parent_id: &str,
     inline_scope: &mut InlineScope,
-) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, usize) {
+) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, usize, ConfigSpanMap) {
     parse_config_block_inner(lines, start, base_line, errors, parent_id, inline_scope)
 }
 
@@ -1530,12 +2114,14 @@ fn parse_config_block_inner(
     errors: &mut Vec<CompileError>,
     parent_id: &str,
     inline_scope: &mut InlineScope,
-) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, usize) {
+) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, usize, ConfigSpanMap) {
     let mut config = serde_json::Map::new();
     let mut label = None;
     let in_ports = Vec::new();
     let out_ports = Vec::new();
     let mut one_of_required = Vec::new();
+    // Per-field source spans, origin Inline (this block IS an inline body).
+    let mut config_spans: ConfigSpanMap = Default::default();
 
     let mut i = start + 1;
     while i < lines.len() {
@@ -1549,9 +2135,9 @@ fn parse_config_block_inner(
             // multi-line JSON with its own standalone `}` lines).
             let close_line = i;
             if inner == "}" {
-                return (config, label, in_ports, out_ports, one_of_required, i + 1, close_line);
+                return (config, label, in_ports, out_ports, one_of_required, i + 1, close_line, config_spans);
             } else {
-                return (config, label, in_ports, out_ports, one_of_required, i, close_line);
+                return (config, label, in_ports, out_ports, one_of_required, i, close_line, config_spans);
             }
         }
         if inner.is_empty() || inner.starts_with('#') {
@@ -1606,16 +2192,19 @@ fn parse_config_block_inner(
             // Check for inline form: key: ```content```
             if after.ends_with("```") && after.len() > 3 {
                 let inline_val = &after[..after.len() - 3];
-                store_config_value(&key, inline_val, &mut config, line_num, errors);
+                if let Some(k) = store_config_value(&key, inline_val, &mut config, line_num, errors) {
+                    config_spans.insert(k, ConfigFieldSpan::inline(Span::single_line(line_num, 0, lines[i].len())));
+                }
                 i += 1;
                 continue;
             }
 
             // Multi-line: collect until closing ```.
             let (value, next) = collect_heredoc_value(lines, i + 1, after);
+            if let Some(k) = store_config_value(&key, &value, &mut config, line_num, errors) {
+                config_spans.insert(k, ConfigFieldSpan::inline(multi_line_span(lines, line_num, next)));
+            }
             i = next;
-
-            store_config_value(&key, &value, &mut config, line_num, errors);
             continue;
         }
 
@@ -1627,8 +2216,10 @@ fn parse_config_block_inner(
                 if !balanced {
                     errors.push(CompileError { line: line_num, message: format!("Broken JSON for '{}': brackets not balanced", key) });
                 }
+                if let Some(k) = store_config_value(key, &collected, &mut config, line_num, errors) {
+                    config_spans.insert(k, ConfigFieldSpan::inline(multi_line_span(lines, line_num, next)));
+                }
                 i = next;
-                store_config_value(key, &collected, &mut config, line_num, errors);
                 continue;
             }
         }
@@ -1691,18 +2282,23 @@ fn parse_config_block_inner(
         // label: "value"
         if let Some(l) = try_extract_label(inner) {
             label = Some(l);
+            // Record a span for the label line so the editor can locate it to
+            // rewrite/remove, even though the value is promoted to node.label.
+            config_spans.insert("_label".to_string(), ConfigFieldSpan::inline(Span::single_line(line_num, 0, lines[i].len())));
             i += 1;
             continue;
         }
 
         // key: value
-        parse_kv(inner, &mut config, line_num, errors);
+        if let Some(k) = parse_kv(inner, &mut config, line_num, errors) {
+            config_spans.insert(k, ConfigFieldSpan::inline(Span::single_line(line_num, 0, lines[i].len())));
+        }
         i += 1;
     }
 
     errors.push(CompileError { line: base_line, message: "Unclosed config block".to_string() });
     // No matching `}` found; use `i` as a sentinel close_line (out of range).
-    (config, label, in_ports, out_ports, one_of_required, i, i)
+    (config, label, in_ports, out_ports, one_of_required, i, i, config_spans)
 }
 
 /// Collect a multi-line triple-backtick heredoc value starting after the
@@ -1811,30 +2407,32 @@ fn is_json_balanced(s: &str) -> bool {
     depth == 0
 }
 
+/// Stores a config value. Returns the key actually stored (so the caller can
+/// record its source span), or `None` if the value was rejected.
 fn store_config_value(
     key: &str,
     value: &str,
     config: &mut serde_json::Map<String, serde_json::Value>,
     line_num: usize,
     errors: &mut Vec<CompileError>,
-) {
+) -> Option<String> {
     // Reject removed config keys
     if key == "mock" || key == "mocked" {
         errors.push(CompileError { line: line_num, message: format!("'{}' is not a valid config key. Use test configs for mocking.", key) });
-        return;
+        return None;
     }
 
     // Try to parse as JSON if value looks like JSON (starts with [ or {)
     if value.trim_start().starts_with('[') || value.trim_start().starts_with('{') {
-        match serde_json::from_str::<serde_json::Value>(value) {
-            Ok(json_val) => { config.insert(key.to_string(), json_val); return; }
-            Err(_) => {
-                // Fall through to store as string
-            }
+        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(value) {
+            config.insert(key.to_string(), json_val);
+            return Some(key.to_string());
         }
+        // Fall through to store as string
     }
     // Default: store as string
     config.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    Some(key.to_string())
 }
 
 fn dedent(s: &str) -> String {
@@ -1962,17 +2560,39 @@ fn parse_dotted(s: &str) -> Option<(String, String)> {
     Some((node.to_string(), port.to_string()))
 }
 
+/// Parse the argument of `@include(...)`: a single quoted path. `after` is
+/// the text following `@include` (e.g. `("components/cleaner.weft")`).
+fn parse_include_arg(after: &str) -> Result<String, String> {
+    let inner = after
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| "@include expects (\"path\")".to_string())?
+        .trim();
+    if inner.len() >= 2 && inner.starts_with('"') && inner.ends_with('"') {
+        let path = &inner[1..inner.len() - 1];
+        if path.is_empty() {
+            return Err("@include path is empty".into());
+        }
+        Ok(path.to_string())
+    } else {
+        Err(format!("@include path must be a quoted string, got {inner:?}"))
+    }
+}
+
 // ─── Config Value Parsing ───────────────────────────────────────────────────
 
+/// Parses one `key: value` pair into `config`. Returns the key actually
+/// stored (so the caller can record its source span), or `None` if the line
+/// wasn't a valid pair or the value was rejected.
 fn parse_kv(
     s: &str,
     config: &mut serde_json::Map<String, serde_json::Value>,
     line: usize,
     errors: &mut Vec<CompileError>,
-) {
+) -> Option<String> {
     let colon_pos = match s.find(':') {
         Some(p) => p,
-        None => return,
+        None => return None,
     };
     let key = s[..colon_pos].trim();
     let raw = s[colon_pos + 1..].trim();
@@ -1980,7 +2600,7 @@ fn parse_kv(
     // Reject removed config keys
     if key == "mock" || key == "mocked" {
         errors.push(CompileError { line, message: format!("'{}' is not a valid config key. Use test configs for mocking.", key) });
-        return;
+        return None;
     }
 
     // Hard break: pre-arch4 keys were renamed to leading-underscore
@@ -1991,14 +2611,14 @@ fn parse_kv(
             line,
             message: "'label' was renamed to '_label' (reserved internal key)".into(),
         });
-        return;
+        return None;
     }
     if key == "is_output" {
         errors.push(CompileError {
             line,
             message: "'is_output' was renamed to '_is_output' (reserved internal key)".into(),
         });
-        return;
+        return None;
     }
 
     // Reserved internal keys: only specific ones are valid; anything
@@ -2015,7 +2635,7 @@ fn parse_kv(
                     ALLOWED.join(", ")
                 ),
             });
-            return;
+            return None;
         }
     }
 
@@ -2061,18 +2681,19 @@ fn parse_kv(
                     line,
                     message: format!("invalid _tags: {e}"),
                 });
-                return;
+                return None;
             }
         } else {
             errors.push(CompileError {
                 line,
                 message: "_tags must be a list of strings, e.g. _tags: [\"support\"]".into(),
             });
-            return;
+            return None;
         }
     }
 
     config.insert(key.to_string(), value);
+    Some(key.to_string())
 }
 
 fn unquote(s: &str) -> String {
@@ -2138,7 +2759,7 @@ fn split_respecting_quotes(s: &str, delimiter: char) -> Vec<String> {
 
 // ─── Flattener ──────────────────────────────────────────────────────────────
 
-fn flatten(state: ParseState, project_id: Uuid) -> Result<ProjectDefinition, Vec<CompileError>> {
+fn flatten(state: ParseState, project_id: Uuid) -> ProjectDefinition {
     let mut nodes: Vec<NodeDefinition> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -2181,7 +2802,7 @@ fn flatten(state: ParseState, project_id: Uuid) -> Result<ProjectDefinition, Vec
         });
     }
 
-    Ok(ProjectDefinition {
+    ProjectDefinition {
         id: project_id,
         name: state.name,
         description: if state.description.is_empty() { None } else { Some(state.description) },
@@ -2190,7 +2811,7 @@ fn flatten(state: ParseState, project_id: Uuid) -> Result<ProjectDefinition, Vec
         groups,
         created_at: now,
         updated_at: now,
-    })
+    }
 }
 
 /// Walk the ParsedGroup tree and emit a GroupDefinition per group.
@@ -2244,6 +2865,7 @@ fn collect_group_definitions(
         parent_group_id: parent_group_id.clone(),
         child_group_ids,
         node_ids,
+        anonymous: group.anonymous,
         span: group.span.clone(),
         header_span: group.header_span.clone(),
     });
@@ -2311,7 +2933,7 @@ fn flatten_group(
     nodes.push(NodeDefinition {
         id: in_pt_id.clone(),
         node_type: "Passthrough".to_string(),
-        label: Some(format!("{} (in)", group.id)),
+        label: Some(boundary_label(&group.id, weft_core::project::GroupBoundaryRole::In)),
         config: serde_json::json!({"parentId": group.id}),
         position: Position { x: 0.0, y: 0.0 },
         inputs: in_pt_inputs,
@@ -2324,6 +2946,8 @@ fn flatten_group(
         span: None,
         header_span: None,
         config_spans: Default::default(),
+        file_refs: Default::default(),
+        include_path: None,
     });
 
     // 2. Create output passthrough: {groupId}__out
@@ -2353,7 +2977,7 @@ fn flatten_group(
     nodes.push(NodeDefinition {
         id: out_pt_id.clone(),
         node_type: "Passthrough".to_string(),
-        label: Some(format!("{} (out)", group.id)),
+        label: Some(boundary_label(&group.id, weft_core::project::GroupBoundaryRole::Out)),
         config: serde_json::json!({"parentId": group.id}),
         position: Position { x: 0.0, y: 0.0 },
         inputs: out_pt_inputs,
@@ -2366,6 +2990,8 @@ fn flatten_group(
         span: None,
         header_span: None,
         config_spans: Default::default(),
+        file_refs: Default::default(),
+        include_path: None,
     });
 
     // 3. Add internal nodes
@@ -2441,12 +3067,14 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),
+        file_refs: pn.file_refs.clone(),
+        include_path: pn.include_path.clone(),
     }
 }
 
 fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
     Edge {
-        id: format!("e-{}-{}-{}-{}", pc.source_id, pc.source_port, pc.target_id, pc.target_port),
+        id: edge_id(&pc.source_id, &pc.source_port, &pc.target_id, &pc.target_port),
         source: pc.source_id.clone(),
         target: pc.target_id.clone(),
         source_handle: Some(pc.source_port.clone()),
@@ -2663,6 +3291,8 @@ fn try_parse_inline_expression(
                 span: None,
                 header_span: None,
                 config_spans: Default::default(),
+                file_refs: Default::default(),
+                include_path: None,
             };
             inline_scope.nodes.push(node);
             inline_scope.connections.push(ParsedConnection {
@@ -2682,7 +3312,7 @@ fn try_parse_inline_expression(
         }
     }
 
-    let (config, label, body_end_line, one_liner_after_close) = if after_ports.starts_with('{') {
+    let (config, label, config_spans, body_end_line, one_liner_after_close) = if after_ports.starts_with('{') {
         // Find the matching `}` for the opening `{` on this line. If it's
         // there, this is a one-liner. Otherwise it's multi-line.
         if let Some(close_pos) = find_matching_brace_on_line(after_ports) {
@@ -2690,14 +3320,16 @@ fn try_parse_inline_expression(
             let body = after_ports[1..close_pos].trim();
             let mut config = serde_json::Map::new();
             let mut label = None;
+            let mut config_spans: ConfigSpanMap = Default::default();
+            let anon_line_span = Span::single_line(line_num, 0, lines[start_line].len());
             if !body.is_empty() {
                 for pair in split_respecting_quotes(body, ',') {
                     let pair = pair.trim();
                     if pair.is_empty() { continue; }
                     if let Some(l) = try_extract_label(pair) {
                         label = Some(l);
-                    } else {
-                        parse_kv(pair, &mut config, line_num, errors);
+                    } else if let Some(k) = parse_kv(pair, &mut config, line_num, errors) {
+                        config_spans.insert(k, ConfigFieldSpan::inline(anon_line_span));
                     }
                 }
             }
@@ -2706,15 +3338,15 @@ fn try_parse_inline_expression(
             // it with rfind on the full source line (fragile when the line
             // contains `}` inside quoted strings).
             let after_close = after_ports[close_pos + 1..].trim().to_string();
-            (config, label, start_line, Some(after_close))
+            (config, label, config_spans, start_line, Some(after_close))
         } else if after_ports == "{" {
-            let (cfg, lbl, _extra_in, _extra_out, _extra_oor, _end_i, close_line) =
+            let (cfg, lbl, _extra_in, _extra_out, _extra_oor, _end_i, close_line, spans) =
                 parse_config_block_with_close(lines, body_start_line, line_num, errors, &anon_id, inline_scope);
             if close_line >= lines.len() {
                 errors.push(CompileError { line: line_num, message: "Unclosed inline expression".to_string() });
                 return None;
             }
-            (cfg, lbl, close_line, None)
+            (cfg, lbl, spans, close_line, None)
         } else {
             errors.push(CompileError { line: line_num, message: format!("Invalid inline node syntax: {}", after_ports) });
             return None;
@@ -2788,7 +3420,9 @@ fn try_parse_inline_expression(
         one_of_required: one_of_required,
         span: None,
         header_span: None,
-        config_spans: Default::default(),
+        config_spans,
+        file_refs: Default::default(),
+        include_path: None,
     };
     inline_scope.nodes.push(node);
     inline_scope.connections.push(ParsedConnection {
@@ -2865,6 +3499,73 @@ fn parse_inline_dot_port(s: &str) -> Option<String> {
 /// instead of returning a ParsedConnection. The caller applies it to the
 /// target node's config. Literals take over from any inline config value
 /// for the same `(target, port)` pair because they appear later in source.
+/// Classify a connection-line RHS that is a CONFIG FILL (not an edge): an
+/// `@file(...)` marker, a single-line literal, a triple-backtick heredoc
+/// (inline or multi-line), or multi-line JSON. Pushes the `ConfigFill` against
+/// `scoped_target` (the caller passes the already-scoped target id, so this is
+/// identical at top level and inside a group, which is why `@file` works in
+/// both by construction). Returns `Some(next_line)` if the RHS was a config
+/// fill, `None` if it's something else (an edge / not a connection).
+///
+/// Edge RHS shapes (inline expressions, dotted refs) are NOT handled here: they
+/// differ by scoping between top level and group bodies, so each caller keeps
+/// its own edge handling.
+fn push_config_fill_rhs(
+    lines: &[&str],
+    start: usize,
+    scoped_target: &str,
+    target_port: &str,
+    right: &str,
+    errors: &mut Vec<CompileError>,
+    inline_scope: &mut InlineScope,
+) -> Option<usize> {
+    let line = lines[start];
+    let single_line_span = Some(Span::single_line(start + 1, 0, line.len()));
+    let mut push = |value: serde_json::Value, span: Option<Span>, next: usize| {
+        inline_scope.config_fills.push(ConfigFill {
+            target_id: scoped_target.to_string(),
+            target_port: target_port.to_string(),
+            value,
+            span,
+        });
+        Some(next)
+    };
+
+    // `@file(...)` marker: stored verbatim; the post-parse file-ref pass
+    // resolves it (the shared recognizer so parse + resolution agree).
+    if crate::file_ref::parse_marker(right).is_some() {
+        return push(serde_json::Value::String(right.to_string()), single_line_span, start + 1);
+    }
+    // Single-line literal.
+    if let Some(value) = try_parse_literal(right) {
+        return push(value, single_line_span, start + 1);
+    }
+    // Triple-backtick heredoc, inline `= ```x``` ` or multi-line.
+    if right.starts_with("```") {
+        let after_bt = &right[3..];
+        if after_bt.ends_with("```") && after_bt.len() > 3 {
+            let inline_val = &after_bt[..after_bt.len() - 3];
+            return push(serde_json::Value::String(inline_val.to_string()), single_line_span, start + 1);
+        }
+        let (unescaped, next) = collect_heredoc_value(lines, start + 1, after_bt);
+        return push(serde_json::Value::String(unescaped), Some(multi_line_span(lines, start + 1, next)), next);
+    }
+    // Multi-line JSON `= { ... }` / `= [ ... ]`.
+    if let Some((collected, balanced, next)) = collect_multiline_json(lines, start + 1, start, right) {
+        if !balanced {
+            errors.push(CompileError {
+                line: start + 1,
+                message: format!("Broken JSON for '{}.{}': brackets not balanced", scoped_target, target_port),
+            });
+            return Some(next);
+        }
+        let value = serde_json::from_str::<serde_json::Value>(&collected)
+            .unwrap_or(serde_json::Value::String(collected));
+        return push(value, Some(multi_line_span(lines, start + 1, next)), next);
+    }
+    None
+}
+
 fn try_parse_connection_with_inline(
     lines: &[&str],
     start: usize,
@@ -2902,73 +3603,22 @@ fn try_parse_connection_with_inline(
     if let Some((source_id, source_port)) = parse_dotted(right) {
         return ParseConnectionResult::Edge(
             ParsedConnection {
-                source_id: source_id,
-                source_port: source_port,
-                target_id: target_id,
-                target_port: target_port,
+                source_id,
+                source_port,
+                target_id,
+                target_port,
                 span: Some(Span::single_line(start + 1, 0, line.len())),
             },
             start + 1,
         );
     }
 
-    // Single-line literal RHS: config fill.
-    if let Some(value) = try_parse_literal(right) {
-        inline_scope.config_fills.push(ConfigFill {
-            target_id,
-            target_port,
-            value,
-        });
-        return ParseConnectionResult::ConfigFill(start + 1);
+    // Config-fill RHS (@file / literal / heredoc / multi-line JSON): shared
+    // with the group-body parser. Top-level target is unscoped.
+    match push_config_fill_rhs(lines, start, &target_id, &target_port, right, errors, inline_scope) {
+        Some(next) => ParseConnectionResult::ConfigFill(next),
+        None => ParseConnectionResult::NotAConnection,
     }
-
-    // Multi-line triple-backtick RHS: `target.port = ``` ... ``` ` spanning
-    // several lines. Collect, dedent, unescape, store as a string.
-    if right.starts_with("```") {
-        let after_bt = &right[3..];
-        // Inline one-liner `target.port = ```content``` ` already fails the
-        // check above because `right` starts with ``` and doesn't parse via
-        // try_parse_literal. Handle it here too.
-        if after_bt.ends_with("```") && after_bt.len() > 3 {
-            let inline_val = &after_bt[..after_bt.len() - 3];
-            inline_scope.config_fills.push(ConfigFill {
-                target_id,
-                target_port,
-                value: serde_json::Value::String(inline_val.to_string()),
-            });
-            return ParseConnectionResult::ConfigFill(start + 1);
-        }
-        // Multi-line: collect until closing ```.
-        let (unescaped, next) = collect_heredoc_value(lines, start + 1, after_bt);
-        inline_scope.config_fills.push(ConfigFill {
-            target_id,
-            target_port,
-            value: serde_json::Value::String(unescaped),
-        });
-        return ParseConnectionResult::ConfigFill(next);
-    }
-
-    // Multi-line JSON RHS: `target.port = { ... }` or `target.port = [ ... ]`
-    // with braces/brackets spread across lines.
-    if let Some((collected, balanced, next)) = collect_multiline_json(lines, start + 1, start, right) {
-        if !balanced {
-            errors.push(CompileError {
-                line: start + 1,
-                message: format!("Broken JSON for '{}.{}': brackets not balanced", target_id, target_port),
-            });
-            return ParseConnectionResult::ConfigFill(next);
-        }
-        let value = serde_json::from_str::<serde_json::Value>(&collected)
-            .unwrap_or(serde_json::Value::String(collected));
-        inline_scope.config_fills.push(ConfigFill {
-            target_id,
-            target_port,
-            value,
-        });
-        return ParseConnectionResult::ConfigFill(next);
-    }
-
-    ParseConnectionResult::NotAConnection
 }
 
 enum ParseConnectionResult {
@@ -2983,6 +3633,9 @@ enum ParseConnectionResult {
 /// catches the bad target separately.
 fn apply_config_fill(nodes: &mut Vec<ParsedNode>, fill: ConfigFill) {
     if let Some(node) = nodes.iter_mut().find(|n| n.id == fill.target_id) {
+        if let Some(span) = fill.span {
+            node.config_spans.insert(fill.target_port.clone(), ConfigFieldSpan::connection(span));
+        }
         node.config.insert(fill.target_port, fill.value);
     }
 }
@@ -3071,62 +3724,16 @@ fn try_parse_group_connection_with_inline(
         return ParseConnectionResult::Edge(conn, next_i);
     }
 
-    // Literal RHS config fill. Works for `child.port = literal` inside a
-    // group body. `self.port = literal` is nonsensical (self is the group's
-    // output, driven by a child, not by a literal), so we skip it here.
+    // Config-fill RHS (@file / literal / heredoc / multi-line JSON) for a
+    // `child.port = ...` inside a group body, scoped under the group. Shared
+    // with the top-level parser (so `@file` works in both). `self.port = lit`
+    // is nonsensical (self is the group's output, driven by a child not a
+    // literal), so skip it and let the edge parser handle/reject it.
     let left = trimmed[..eq_pos].trim();
     if !left.starts_with("self.") {
         if let Some((target_id_local, target_port)) = parse_dotted(left) {
             let scoped_target = format!("{}.{}", group_id, target_id_local);
-
-            // Single-line literal.
-            if let Some(value) = try_parse_literal(right) {
-                inline_scope.config_fills.push(ConfigFill {
-                    target_id: scoped_target,
-                    target_port,
-                    value,
-                });
-                return ParseConnectionResult::ConfigFill(start + 1);
-            }
-
-            // Multi-line triple-backtick RHS.
-            if right.starts_with("```") {
-                let after_bt = &right[3..];
-                if after_bt.ends_with("```") && after_bt.len() > 3 {
-                    let inline_val = &after_bt[..after_bt.len() - 3];
-                    inline_scope.config_fills.push(ConfigFill {
-                        target_id: scoped_target,
-                        target_port,
-                        value: serde_json::Value::String(inline_val.to_string()),
-                    });
-                    return ParseConnectionResult::ConfigFill(start + 1);
-                }
-                // Multi-line: collect until closing ```.
-                let (unescaped, next) = collect_heredoc_value(lines, start + 1, after_bt);
-                inline_scope.config_fills.push(ConfigFill {
-                    target_id: scoped_target,
-                    target_port,
-                    value: serde_json::Value::String(unescaped),
-                });
-                return ParseConnectionResult::ConfigFill(next);
-            }
-
-            // Multi-line JSON RHS.
-            if let Some((collected, balanced, next)) = collect_multiline_json(lines, start + 1, start, right) {
-                if !balanced {
-                    errors.push(CompileError {
-                        line: line_num,
-                        message: format!("Broken JSON for '{}.{}': brackets not balanced", target_id_local, target_port),
-                    });
-                    return ParseConnectionResult::ConfigFill(next);
-                }
-                let value = serde_json::from_str::<serde_json::Value>(&collected)
-                    .unwrap_or(serde_json::Value::String(collected));
-                inline_scope.config_fills.push(ConfigFill {
-                    target_id: scoped_target,
-                    target_port,
-                    value,
-                });
+            if let Some(next) = push_config_fill_rhs(lines, start, &scoped_target, &target_port, right, errors, inline_scope) {
                 return ParseConnectionResult::ConfigFill(next);
             }
         }
@@ -3136,6 +3743,30 @@ fn try_parse_group_connection_with_inline(
     match try_parse_group_connection(trimmed, line_num, group_id, errors) {
         Some(c) => ParseConnectionResult::Edge(c, start + 1),
         None => ParseConnectionResult::NotAConnection,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_anonymous_group_header;
+
+    #[test]
+    fn anonymous_group_header_detection() {
+        // The anonymous include-group form: Group followed by a signature,
+        // body, output arrow, or end of line (optional whitespace).
+        assert!(is_anonymous_group_header("Group(raw: String) -> (out: String) {"));
+        assert!(is_anonymous_group_header("Group -> (out: String) {"));
+        assert!(is_anonymous_group_header("Group {"));
+        assert!(is_anonymous_group_header("Group"));
+        assert!(is_anonymous_group_header("Group ("));
+
+        // NOT anonymous-group headers: an `=` after `Group` is a declaration
+        // (`id = Type`), and an identifier merely prefixed by "Group" is its
+        // own name. These must fall through to the normal declaration path.
+        assert!(!is_anonymous_group_header("Group = Text { value: \"x\" }"));
+        assert!(!is_anonymous_group_header("Group = Group(in: String) { }"));
+        assert!(!is_anonymous_group_header("GroupThing = Llm"));
+        assert!(!is_anonymous_group_header("grouped = Text"));
     }
 }
 

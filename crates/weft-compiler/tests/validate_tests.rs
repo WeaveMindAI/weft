@@ -12,7 +12,7 @@ fn catalog() -> FsCatalog {
 }
 
 fn parse_enrich(source: &str) -> weft_core::ProjectDefinition {
-    let mut project = compile(source, uuid::Uuid::new_v4()).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     project
 }
@@ -44,6 +44,31 @@ out.data = hi.value
     );
     let d = validate(&project, &catalog());
     assert!(errors(&d).is_empty(), "unexpected errors: {:?}", d);
+}
+
+#[test]
+fn node_named_after_a_type_is_flagged() {
+    // Naming a node after a catalog type (`Debug`) is ambiguous: a later
+    // `Debug.port` reference would parse as an inline Debug node. Flagged as a
+    // reserved-name error on the declaration line (line 3 here).
+    let project = parse_enrich("# Project: Clash\n\nDebug = Debug {}\n");
+    let d = validate(&project, &catalog());
+    let reserved: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("reserved-name")).collect();
+    assert_eq!(reserved.len(), 1, "expected one reserved-name error, got {d:?}");
+    assert_eq!(reserved[0].line, 3, "must point at the declaration line");
+    assert_eq!(reserved[0].severity, Severity::Error);
+}
+
+#[test]
+fn node_named_after_a_type_inside_a_group_is_flagged() {
+    // The ambiguity is about the LOCAL name. A node `Debug` inside a group gets
+    // scoped id `grp.Debug`, but the source reference is still local `Debug.port`.
+    // The check must compare the local segment, not the scoped id.
+    let project = parse_enrich("# Project: Clash\n\ngrp = Group() -> () {\n  Debug = Debug {}\n}\n");
+    let d = validate(&project, &catalog());
+    let reserved: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("reserved-name")).collect();
+    assert_eq!(reserved.len(), 1, "nested type-named node must be flagged, got {d:?}");
+    assert!(reserved[0].message.contains("'Debug'"), "message names the local id: {:?}", reserved[0].message);
 }
 
 #[test]
@@ -193,4 +218,33 @@ out.data = a.value
     project.edges[0].source = "ghost".into();
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"unknown-source-node"), "{d:?}");
+}
+
+#[test]
+fn top_level_include_does_not_make_project_look_like_a_component() {
+    // Regression: a Full-mode @include must NOT leave its group flagged
+    // `anonymous`, or check_output_reachability treats the whole build as a
+    // standalone component and skips the no-output-node requirement (a
+    // non-runnable project would silently pass the build gate).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("comp.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n s = Text { value: \"x\" }\n self.cleaned = s.value\n}\n",
+    ).unwrap();
+
+    // No output node anywhere: must fire no-output-node.
+    let src_no_out = "c = @include(\"comp.weft\")\n";
+    let mut p = compile(src_no_out, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    enrich(&mut p, &catalog()).expect("enrich");
+    let d = validate(&p, &catalog());
+    assert!(codes(&d).contains(&"no-output-node"), "expected no-output-node, got {d:?}");
+
+    // With a real Debug output downstream of the include: no no-output error,
+    // and the Debug node is NOT spuriously flagged unreachable.
+    let src_out = "c = @include(\"comp.weft\")\nc.raw = \"hi\"\nout = Debug\nout.data = c.cleaned\n";
+    let mut p2 = compile(src_out, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    enrich(&mut p2, &catalog()).expect("enrich");
+    let d2 = validate(&p2, &catalog());
+    assert!(!codes(&d2).contains(&"no-output-node"), "unexpected no-output: {d2:?}");
+    assert!(!d2.iter().any(|x| x.code.as_deref() == Some("unreachable-from-output") && x.message.contains("out")), "Debug wrongly unreachable: {d2:?}");
 }

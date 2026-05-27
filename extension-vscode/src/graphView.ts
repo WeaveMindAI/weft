@@ -1,29 +1,38 @@
-// Extension-host side of the graph view. Owns a single WebviewPanel
-// that tracks the currently-active .weft document, parses via the
-// local `weft` CLI on every text change (debounced), and streams saves
-// back into the document / .layout.json companion.
+// Extension-host side of the graph view. Owns a single WebviewPanel that
+// tracks the currently-active .weft document, parses/edits it through the
+// long-lived `weft parse-server` (debounced on text change), and persists
+// node positions to the project's `layouts/` mirror tree.
 //
-// Parse and describe-nodes go through the CLI (not the dispatcher)
-// because they need the project's `nodes/` catalog, which lives on the
-// user's machine; the dispatcher pod can't see it.
-//
-// The webview does all the text surgery in-process via v1's
-// weft-editor.ts. When the user edits something, the webview sends
-// the entire new weft source via `saveWeft`; the host applies a
-// full-range TextEdit and the resulting onDidChangeTextDocument
-// kicks off the next parse.
+// The webview never touches `.weft` text: GUI edits arrive as structured
+// EditOps which this host runs through the parse-server's edit request (Rust
+// is the single source of truth for rewriting `.weft`), writing the returned
+// source to the document. The raw code-panel path is gone. Parse and
+// describe-nodes go through the local CLI / server (not the dispatcher)
+// because they need the project's `nodes/` catalog on the user's machine.
 
 import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
+import type { ParseServer } from './parseServer';
+import { textTabsForPath } from './tabs';
 import type { HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, WebviewMessage } from './shared/protocol';
-import { readProjectIdFromToml } from './sidebar/projects';
+import * as nodePath from 'node:path';
+import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
 
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
   private watchedDoc: vscode.TextDocument | undefined;
   private watchedProjectId: string | undefined;
+  /// Include-navigation back-stack. Each frame records the doc the user came
+  /// from and the include alias they clicked to descend (used to build the
+  /// execution-id prefix so sub-graph journal values render). `openInclude`
+  /// pushes; Return pops. The bottom is the project's main.weft.
+  private navStack: { doc: vscode.TextDocument; alias: string }[] = [];
+  /// Set when the next parse is for a freshly-swapped file (navigation),
+  /// so the webview treats its parseResult as a fresh mount (rebuild +
+  /// auto-organize if no layout) rather than an in-place edit. Consumed once.
+  private freshMount = false;
   private parseTimer: NodeJS.Timeout | undefined;
   private catalogRefreshTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
@@ -31,7 +40,19 @@ export class GraphViewController {
   /// Rebound whenever the panel follows a .weft file in a different
   /// project (its `nodes/` dir moves with it).
   private nodesWatcher: vscode.Disposable | undefined;
-  private lastProject: ProjectDefinition | undefined;
+  /// Watches the `@file`/`@include` targets the current view references, so
+  /// editing a backing file externally re-parses the graph (file -> graph).
+  /// Rebuilt after each parse from the response's fileRefs + include paths.
+  private refWatcher: vscode.Disposable | undefined;
+  private watchedRefPaths = '';
+  /// The current view's `@file` resolution base (the watched file's dir) and
+  /// the relative paths it references, so saveFileRef and the watcher reship
+  /// contents consistently.
+  private fileBaseDir = '';
+  private fileRelPaths = new Set<string>();
+  /// Monotonic stamp per parse; a result is dropped if a newer parse started
+  /// while it was in flight (see triggerParse).
+  private parseSeq = 0;
   // Host-side callbacks wired by extension.ts.
   private runHandler: (() => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
@@ -72,11 +93,6 @@ export class GraphViewController {
   /// schedule a debounced status refetch so live source edits keep
   /// the action bar's drift signals (source / infra) current.
   private parseSuccessHandler: (() => void) | undefined;
-  // Set while we're applying our own TextEdit to the document.
-  // onDidChangeTextDocument fires during the edit; if we parsed
-  // twice (once for the webview save, once for the VS Code change)
-  // we'd loop.
-  private suppressReparse = false;
   // One entry per (project, infra node) we're polling /live for.
   // Keyed by nodeId. Cleared on parseResult and dispose. Posts
   // `infraLive` messages to the webview.
@@ -100,6 +116,7 @@ export class GraphViewController {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly client: DispatcherClient,
+    private readonly parseServer: ParseServer,
   ) {}
 
   /** Called by extension.ts so sidebar-initiated runs and action-bar
@@ -152,8 +169,27 @@ export class GraphViewController {
     return this.panel !== undefined;
   }
 
+  /// Bring the graph panel to front (e.g. after a `.weft` click stole focus
+  /// to a stray text tab we're about to close).
+  reveal(): void {
+    this.panel?.reveal();
+  }
 
-  async open(doc: vscode.TextDocument, projectId?: string): Promise<void> {
+  /// Path of the `.weft` the graph is currently showing. This tracks include
+  /// navigation (it's the navigated-into file, not the project entry), so the
+  /// Source button opens the file you're actually looking at.
+  currentFilePath(): string | undefined {
+    return this.watchedDoc?.uri.fsPath;
+  }
+
+
+  async open(doc: vscode.TextDocument, projectId?: string, keepNavStack = false): Promise<void> {
+    // A fresh open (sidebar, command) resets include-navigation; only
+    // navigateInto/navigateBack preserve the stack.
+    if (!keepNavStack && this.navStack.length > 0) {
+      this.navStack = [];
+      this.sendNavState();
+    }
     // Resolve the project id for this file. Explicit caller arg
     // wins (sidebar pin path); otherwise walk up from the .weft
     // file looking for a `weft.toml` that declares an id. Falling
@@ -176,7 +212,7 @@ export class GraphViewController {
 
     this.panel = vscode.window.createWebviewPanel(
       'weft.graph',
-      `Weft Graph: ${doc.fileName.split(/[\\/]/).pop() ?? ''}`,
+      this.panelTitle(doc),
       vscode.ViewColumn.Active,
       {
         enableScripts: true,
@@ -201,13 +237,32 @@ export class GraphViewController {
       this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
       this.panel.onDidDispose(() => this.onDispose()),
       vscode.workspace.onDidChangeTextDocument((e) => {
-        if (this.suppressReparse) return;
+        // Skip our OWN write to this path (the shared writer is mid-edit);
+        // path-scoped so an unrelated concurrent write can't unsuppress us.
+        if (this.writingPaths.has(e.document.uri.fsPath)) return;
         if (this.watchedDoc && e.document === this.watchedDoc) {
           this.scheduleParse();
+          return;
+        }
+        // A referenced @file target edited in its own editor tab (even
+        // unsaved): reship contents so the graph field updates live.
+        const rel = nodePath.relative(this.fileBaseDir, e.document.uri.fsPath);
+        if (this.fileBaseDir && this.fileRelPaths.has(rel)) {
+          void this.shipFileContents(this.fileBaseDir, this.fileRelPaths);
         }
       }),
       vscode.window.onDidChangeActiveTextEditor((ed) => {
         if (ed && ed.document.languageId === 'weft') {
+          // Focusing a DIFFERENT .weft tab is a fresh context (a whole new
+          // graph), not an include navigation (navigateInto sets watchedDoc to
+          // its target before this fires, so that case sees no change here).
+          const isDifferentDoc = ed.document !== this.watchedDoc;
+          // Drop any include back-stack so the Return button / execPrefix don't
+          // dangle against an unrelated graph.
+          if (isDifferentDoc && this.navStack.length > 0) {
+            this.navStack = [];
+            this.sendNavState();
+          }
           this.watchedDoc = ed.document;
           // Re-resolve project id for the new file: different
           // .weft files can belong to different projects, and
@@ -218,6 +273,16 @@ export class GraphViewController {
           const newId = readProjectIdFromToml(ed.document.uri.fsPath);
           this.watchedProjectId = newId ?? undefined;
           this.watchNodesDir(ed.document);
+          // Switching to a different graph is a fresh mount: rebuild from the
+          // new project + its saved layout, not the in-place edit-reconcile
+          // path (which would diff the new graph against the old one's
+          // positions and stack everything vertically). Refocusing the SAME
+          // tab is not a fresh mount (no needless rebuild/relayout).
+          if (isDifferentDoc) {
+            this.freshMount = true;
+            // Retitle to the new project's root folder.
+            if (this.panel) this.panel.title = this.panelTitle(ed.document);
+          }
           void this.triggerParse();
         }
       }),
@@ -257,6 +322,87 @@ export class GraphViewController {
     );
   }
 
+  /// Ship the content of every `@file` target (so the webview can display
+  /// file-backed fields, whose config holds only the marker) and watch all
+  /// referenced files so external edits stay live. Two kinds of change:
+  ///   - a `@file` backing file changed -> reship contents (the graph shape
+  ///     is unchanged; only the displayed value updates). file -> graph.
+  ///   - an `@include` target changed -> reparse (the included interface or
+  ///     the graph structure may have changed).
+  /// `@file` paths are kept relative (the marker's path) so the webview can
+  /// look them up by the path in its `@file(...)` tag. Rebuilt only when the
+  /// referenced set changes, to avoid watcher churn on every parse.
+  private watchReferencedFiles(response: ParseResponse): void {
+    const doc = this.watchedDoc;
+    if (!doc) return;
+    const baseDir = nodePath.dirname(doc.uri.fsPath);
+    // relative path (marker form) -> absolute, for the two kinds.
+    const fileRel = new Set<string>();
+    const includeRel = new Set<string>();
+    for (const n of response.project.nodes as Array<{ fileRefs?: Record<string, { path: string }>; includePath?: string }>) {
+      if (n.fileRefs) for (const ref of Object.values(n.fileRefs)) fileRel.add(ref.path);
+      if (n.includePath) includeRel.add(n.includePath);
+    }
+    // Record the resolution base + @file set so saveFileRef and the watcher
+    // reship from the same source of truth.
+    this.fileBaseDir = baseDir;
+    this.fileRelPaths = fileRel;
+    // Ship current @file contents now (every parse), keyed by relative path.
+    void this.shipFileContents(baseDir, fileRel);
+
+    // Key on ABSOLUTE resolved paths, not the relative marker strings: two
+    // files in different dirs can reference the same relative path, and a
+    // relative-only key would skip the rebuild on navigation, leaving the
+    // watchers bound to the previous file's dir (silent file -> graph break).
+    const absFile = [...fileRel].map((r) => nodePath.resolve(baseDir, r)).sort();
+    const absInclude = [...includeRel].map((r) => nodePath.resolve(baseDir, r)).sort();
+    const key = JSON.stringify([absFile, absInclude]);
+    if (key === this.watchedRefPaths) return; // set unchanged: keep watchers
+    this.watchedRefPaths = key;
+    this.refWatcher?.dispose();
+    this.refWatcher = undefined;
+    if (fileRel.size === 0 && includeRel.size === 0) return;
+    const disposables: vscode.Disposable[] = [];
+    for (const abs of absFile) {
+      const w = vscode.workspace.createFileSystemWatcher(abs);
+      // Reship from current instance state (set every parse), not captured
+      // locals, so a base-dir change is always honored.
+      const onChange = () => this.shipFileContents(this.fileBaseDir, this.fileRelPaths);
+      disposables.push(w, w.onDidChange(onChange), w.onDidCreate(onChange), w.onDidDelete(onChange));
+    }
+    for (const rel of includeRel) {
+      const w = vscode.workspace.createFileSystemWatcher(nodePath.resolve(baseDir, rel));
+      const onChange = () => this.scheduleParse();
+      disposables.push(w, w.onDidChange(onChange), w.onDidCreate(onChange), w.onDidDelete(onChange));
+    }
+    this.refWatcher = vscode.Disposable.from(...disposables);
+  }
+
+  /// Read each `@file` target and post the relative-path -> state map. An
+  /// unreadable file ships an `{error}` (no silent omit): a file-backed field
+  /// fails loudly rather than falling back to showing the marker as a value.
+  private async shipFileContents(baseDir: string, relPaths: Set<string>): Promise<void> {
+    const contents: Record<string, { content: string } | { error: string }> = {};
+    await Promise.all([...relPaths].map(async (rel) => {
+      const resolved = nodePath.resolve(baseDir, rel);
+      // Prefer an open editor's live text (reflects in-editor typing even
+      // while dirty) over disk, so file -> graph stays live and disk/buffer
+      // never disagree.
+      const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === resolved);
+      if (openDoc) {
+        contents[rel] = { content: openDoc.getText() };
+        return;
+      }
+      try {
+        const data = await vscode.workspace.fs.readFile(vscode.Uri.file(resolved));
+        contents[rel] = { content: new TextDecoder().decode(data) };
+      } catch (e) {
+        contents[rel] = { error: e instanceof Error ? e.message : String(e) };
+      }
+    }));
+    this.post({ kind: 'fileContents', contents });
+  }
+
   private scheduleCatalogRefresh(): void {
     const debounce = vscode.workspace
       .getConfiguration('weft.parse')
@@ -264,20 +410,14 @@ export class GraphViewController {
     if (this.catalogRefreshTimer) clearTimeout(this.catalogRefreshTimer);
     this.catalogRefreshTimer = setTimeout(() => {
       void this.sendGlobalCatalog();
-      void this.triggerParse();
+      // The `nodes/` catalog changed: have the warm server rebuild it.
+      void this.triggerParse(true);
     }, debounce);
   }
 
   private pushSourceState(): void {
     if (!this.panel || !this.watchedDoc) return;
-    const target = this.watchedDoc.uri.fsPath;
-    const open = vscode.window.tabGroups.all.some((g) =>
-      g.tabs.some(
-        (t) =>
-          t.input instanceof vscode.TabInputText
-          && t.input.uri.fsPath === target,
-      ),
-    );
+    const open = textTabsForPath(this.watchedDoc.uri.fsPath).length > 0;
     this.post({ kind: 'sourceState', open });
   }
 
@@ -289,40 +429,55 @@ export class GraphViewController {
     this.parseTimer = setTimeout(() => void this.triggerParse(), debounce);
   }
 
-  private async triggerParse(): Promise<void> {
+  private async triggerParse(reloadCatalog = false): Promise<void> {
     if (!this.panel || !this.watchedDoc) return;
     const source = this.watchedDoc.getText();
     const layoutCode = await this.readLayoutCode(this.watchedDoc);
+    // Parses run concurrently (many triggers); stamp each and drop a result if
+    // a newer parse started while this one was in flight, otherwise a slow
+    // older parse could land last and render stale graph or consume freshMount
+    // (the navigation/switch rebuild) on the wrong response.
+    const seq = ++this.parseSeq;
     try {
-      const response = await runWeftJson<ParseResponse>(
-        ['parse'],
-        projectDirOf(this.watchedDoc),
-        { stdin: source },
-      );
-      this.lastProject = response.project;
-      // Latch the parsed project id as the authoritative watch id
-      // when we don't already have one. Guards against the case
-      // where weft.toml lookup failed on open but the dispatcher
-      // returns a real uuid (e.g. a project registered by the CLI
-      // that knows the id from its own weft.toml).
-      const nilUuid = '00000000-0000-0000-0000-000000000000';
-      if (
-        response.project.id &&
-        response.project.id !== nilUuid &&
-        !this.watchedProjectId
-      ) {
-        this.watchedProjectId = response.project.id;
-      }
-      this.post({ kind: 'parseResult', response, source, layoutCode });
-      this.syncInfraLivePollers(response);
-      this.syncSignalDisplayPollers(response);
-      this.parseSuccessHandler?.();
+      const response = await this.parseServer.request<ParseResponse>({
+        kind: 'parse',
+        source,
+        file: this.watchedDoc.uri.fsPath,
+        reloadCatalog,
+      });
+      if (seq !== this.parseSeq) return; // superseded by a newer parse
+      this.applyParseResult(response, source, layoutCode);
     } catch (err) {
       this.post({
         kind: 'parseError',
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  /** Render a parse into the webview + sync host-side state from it. The single
+   *  post-parse path: a `parse` request feeds it (via triggerParse, behind the
+   *  seq guard), and an `edit` feeds the parse the edit-server already returned
+   *  (so a GUI edit re-renders from that ONE round-trip, no second parse). */
+  private applyParseResult(response: ParseResponse, source: string, layoutCode: string): void {
+    // Latch the parsed project id as the authoritative watch id when we don't
+    // already have one (weft.toml lookup failed on open but the parse returns a
+    // real uuid, e.g. a project the CLI knows from its own weft.toml).
+    const nilUuid = '00000000-0000-0000-0000-000000000000';
+    if (response.project.id && response.project.id !== nilUuid && !this.watchedProjectId) {
+      this.watchedProjectId = response.project.id;
+    }
+    // Update referenced-file state (fileBaseDir/fileRelPaths + watchers) before
+    // posting parseResult, so the edit-reship handler reads state consistent
+    // with the parse the webview is rendering. The fileContents post is async
+    // (file reads) and lands AFTER parseResult; file-backed fields briefly show
+    // "loading…" and the late-arrival $effect in the webview reconciles them.
+    this.watchReferencedFiles(response);
+    this.post({ kind: 'parseResult', response, source, layoutCode, freshMount: this.freshMount });
+    this.freshMount = false;
+    this.syncInfraLivePollers(response);
+    this.syncSignalDisplayPollers(response);
+    this.parseSuccessHandler?.();
   }
 
   /** Compare the latest parse to the set of infra nodes we're
@@ -467,12 +622,6 @@ export class GraphViewController {
    *  reduced to button-routing; the host's ActionBarStore owns all
    *  state transitions and surfaces them via actionBarState.
    */
-  /// Show a quick-pick for preservation mode and dispatch
-  /// `weft deactivate --mode <choice>`. The CLI's interactive prompt
-  /// only fires for human terminals; under `--json` it would silently
-  /// pick "wipe", which is dangerous (HumanQuery flows mid-suspension
-  /// would die). Surfacing the picker host-side keeps the choice
-  /// explicit and matches the terminal-CLI behavior.
   /// Trigger a kind-specific action on a signal (e.g. regenerate
   /// an api key). Hits the dispatcher's per-project action proxy;
   /// the listener's kind impl owns the action's payload schema.
@@ -785,11 +934,23 @@ export class GraphViewController {
         // extension.ts. Hand off so it can re-push.
         this.readyHandler?.();
         break;
-      case 'saveWeft':
-        void this.saveWeft(msg.source);
+      case 'applyEdits':
+        void this.applyEditTransaction(msg.requestId, { kind: 'edit', ops: msg.ops });
+        break;
+      case 'applyTextEdit':
+        void this.applyEditTransaction(msg.requestId, { kind: 'applyEdit', textEdit: msg.edit });
         break;
       case 'saveLayout':
         void this.saveLayoutCode(msg.layoutCode);
+        break;
+      case 'saveFileRef':
+        void this.saveFileRef(msg.path, msg.content);
+        break;
+      case 'openInclude':
+        void this.navigateInto(msg.path, msg.alias);
+        break;
+      case 'navigateBack':
+        void this.navigateBack();
         break;
       case 'log':
         console[msg.level]('[weft/webview]', msg.message);
@@ -870,71 +1031,156 @@ export class GraphViewController {
     }
   }
 
-  /// Promise that resolves when the most-recent saveWeft has
-  /// finished writing to disk. extension.ts's runPinned awaits
-  /// this before reading the .weft so the build always sees the
-  /// freshest source, even if the user clicked Run before the
-  /// debounced graph-edit save round-trip finished.
-  private pendingSaveWeft: Promise<void> | undefined;
-
-  /// Public: extension.ts's runPinned calls this before reading
-  /// the .weft from disk. Resolves immediately if no save is in
-  /// flight.
+  /// Public: extension.ts's runPinned calls this before reading the .weft from
+  /// disk, so the build always sees the freshest source even if the user
+  /// clicked Run before an in-flight edit's write+reparse finished. Awaits the
+  /// watched doc's per-path write chain (the one `applyEditTransaction` uses).
   async waitForPendingSave(): Promise<void> {
-    if (this.pendingSaveWeft) {
-      await this.pendingSaveWeft;
-    }
+    const key = this.watchedDoc?.uri.fsPath;
+    const pending = key ? this.pendingWrites.get(key) : undefined;
+    if (pending) await pending.catch(() => {});
   }
 
-  /** Replace the watched document's text with the webview's copy
-   *  AND persist it to disk. The webview already debounces
-   *  saveWeft (~1s after the user stops editing), so this is
-   *  effectively "auto-save the .weft 1s after every graph edit
-   *  pause." Without persisting to disk, the .weft tab stays
-   *  dirty and `weft build` reads the stale on-disk version
-   *  when the user clicks Run.
-   *
-   *  Suppress re-entry so we don't reparse on our own edit.
-   *  Tracks the in-flight write via `pendingSaveWeft` so
-   *  runPinned can await it before reading the file from disk. */
-  private async saveWeft(source: string): Promise<void> {
-    // Capture watchedDoc at entry. If the user switches the
-    // active editor between now and when applyEdit/save runs,
-    // we must NOT redirect this write to the new doc; the
-    // source we were handed belongs to whatever was watched
-    // when the saveWeft message was queued.
-    const doc = this.watchedDoc;
-    if (!doc) return;
-    if (doc.getText() === source) return;
-    const edit = new vscode.WorkspaceEdit();
-    const last = doc.lineCount - 1;
-    const end = doc.lineAt(last).range.end;
-    edit.replace(doc.uri, new vscode.Range(0, 0, end.line, end.character), source);
-    const previous = this.pendingSaveWeft ?? Promise.resolve();
+  /// In-flight full-text write per file (keyed by resolved fsPath). Each write
+  /// to a path chains behind the previous one to that path and computes its
+  /// replace range AFTER the predecessor lands, so a queued write never
+  /// applies a stale range. Used by edit transactions, raw layout/file-ref
+  /// writes, and waitForPendingSave (run/activate awaits it before reading disk).
+  /// Value is purely a sequencing token (its result is never read), so it's
+  /// `Promise<unknown>`: a transaction can resolve to any type (a write is
+  /// void, but an edit transaction is free to return its own value).
+  private pendingWrites = new Map<string, Promise<unknown>>();
+  /// Paths whose open document we are actively editing right now. The
+  /// onDidChangeTextDocument handler skips the self-reparse for these, scoped
+  /// exactly to our own edit (no shared boolean that overlapping writes can
+  /// clobber).
+  private writingPaths = new Set<string>();
+
+  /// Replace a document's entire text with `text`, persisted to disk,
+  /// serialized per path. If the file is open in an editor its document is
+  /// edited (so the open buffer stays in sync, no disk-write-behind-editor
+  /// conflict); otherwise fs.writeFile. Returns the chained promise.
+  /// Run `fn` serialized on the per-path chain: it starts only after the
+  /// previous transaction for `key` has settled, and becomes the new tail.
+  /// Both raw writes (layout / file-ref) and edit transactions (read source
+  /// -> edit-server -> write) go through here, so an edit always sees the
+  /// result of the edit before it (no stale-read-then-clobber race).
+  private serializeOnPath<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    // Chain off the predecessor's SETTLEMENT, not its value: a rejected
+    // predecessor must not poison the chain for later transactions.
+    const previous = (this.pendingWrites.get(key) ?? Promise.resolve()).catch(() => {});
     const work = (async () => {
       await previous;
-      this.suppressReparse = true;
+      return fn();
+    })();
+    this.pendingWrites.set(key, work);
+    void work.finally(() => {
+      if (this.pendingWrites.get(key) === work) this.pendingWrites.delete(key);
+    });
+    return work;
+  }
+
+  /// Write `text` to a document/file. Caller must hold the path chain (call
+  /// inside `serializeOnPath`). Recomputes the range against the live doc.
+  private async writeTextRaw(uri: vscode.Uri, text: string): Promise<void> {
+    const key = uri.fsPath;
+    const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === key);
+    if (openDoc) {
+      if (openDoc.getText() === text) return;
+      const end = openDoc.lineAt(openDoc.lineCount - 1).range.end;
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(uri, new vscode.Range(0, 0, end.line, end.character), text);
+      // Suppress the self-reparse for exactly this edit (scoped to the path).
+      this.writingPaths.add(key);
       try {
         await vscode.workspace.applyEdit(edit);
-        await doc.save();
+        await openDoc.save();
       } finally {
-        this.suppressReparse = false;
+        this.writingPaths.delete(key);
       }
-    })();
-    this.pendingSaveWeft = work;
-    try {
-      await work;
-      void this.triggerParse();
-    } finally {
-      // Clear only if no later saveWeft has taken over.
-      if (this.pendingSaveWeft === work) {
-        this.pendingSaveWeft = undefined;
-      }
+    } else {
+      await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(text));
     }
   }
 
+  /** Full-text overwrite of a file, serialized on its path chain (so it can't
+   *  race a concurrent edit transaction to the same file). Used for raw writes
+   *  that aren't edit-ops: a file-backed config field's content (saveFileRef).
+   *  Graph edits don't come through here; they go through applyEditTransaction,
+   *  which writes via writeTextRaw inside its own serialized chain. */
+  private writeDocumentText(uri: vscode.Uri, text: string): Promise<void> {
+    return this.serializeOnPath(uri.fsPath, () => this.writeTextRaw(uri, text));
+  }
+
+  /// Run a source-edit transaction: feed `req` (an `edit` ops batch or an
+  /// `applyEdit` text-edit replay) to the edit-server, write the result, render
+  /// it, and reply to the webview with the INVERSE text edit (its undo). The
+  /// webview owns the undo stack, so it correlates the reply by `requestId`.
+  /// The whole transaction (read source -> server -> write) is serialized on
+  /// the per-path chain so a rapid second edit can't read pre-first-edit text
+  /// and clobber it.
+  private async applyEditTransaction(
+    requestId: number,
+    req: { kind: 'edit'; ops: import('./shared/protocol').EditOp[] } | { kind: 'applyEdit'; textEdit: import('./shared/protocol').TextEdit },
+  ): Promise<void> {
+    const doc = this.watchedDoc;
+    if (!doc) {
+      this.post({ kind: 'editApplied', requestId, ok: false });
+      return;
+    }
+    const key = doc.uri.fsPath;
+    try {
+      const result = await this.serializeOnPath(key, async () => {
+        const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === key) ?? doc;
+        const r = await this.parseServer.request<{ source: string; parse: ParseResponse; inverse: import('./shared/protocol').TextEdit }>({
+          ...req,
+          source: openDoc.getText(),
+          file: key,
+        });
+        await this.writeTextRaw(doc.uri, r.source);
+        // Suppress the RENDER (not the write) if the user switched `.weft` while
+        // this was in flight: applyParseResult reads the live watchedDoc and
+        // consumes freshMount, so rendering A after the view moved to B would
+        // bind A's refs against B and steal B's rebuild. Same discipline as
+        // triggerParse's seq guard. The write already landed on the right doc.
+        if (this.watchedDoc === doc) {
+          this.parseSeq++; // authoritative result; drop a concurrent stale parse
+          this.applyParseResult(r.parse, r.source, await this.readLayoutCode(doc));
+        }
+        return r.inverse;
+      });
+      this.post({ kind: 'editApplied', requestId, ok: true, inverse: result });
+    } catch (err) {
+      this.post({ kind: 'editApplied', requestId, ok: false });
+      this.post({ kind: 'parseError', error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /// Panel title: the project's root folder name (so it tracks the project,
+  /// not the file, and stays stable across nested `.weft` files in the same
+  /// project). Falls back to the file name when the doc isn't under a project
+  /// root (no `weft.toml`).
+  private panelTitle(doc: vscode.TextDocument): string {
+    const root = findProjectRoot(doc.uri.fsPath);
+    const name = root
+      ? nodePath.basename(root)
+      : (doc.fileName.split(/[\\/]/).pop() ?? '');
+    return `Weft Graph: ${name}`;
+  }
+
+  /// Layout files live in a `layouts/` tree at the project root, mirroring
+  /// the source path: `<root>/components/cleaner.weft` -> `<root>/layouts/
+  /// components/cleaner.layout`. Keeps the source tree clean (no companion
+  /// files next to each `.weft`). Falls back to next-to-file only when the
+  /// doc isn't under a project root.
   private layoutUriFor(doc: vscode.TextDocument): vscode.Uri {
-    return vscode.Uri.parse(doc.uri.toString() + '.layout.json');
+    const fsPath = doc.uri.fsPath;
+    const root = findProjectRoot(fsPath);
+    if (!root) {
+      return vscode.Uri.file(fsPath.replace(/\.weft$/, '') + '.layout');
+    }
+    const rel = nodePath.relative(root, fsPath).replace(/\.weft$/, '') + '.layout';
+    return vscode.Uri.file(nodePath.join(root, 'layouts', rel));
   }
 
   private async readLayoutCode(doc: vscode.TextDocument): Promise<string> {
@@ -949,7 +1195,95 @@ export class GraphViewController {
   private async saveLayoutCode(layoutCode: string): Promise<void> {
     if (!this.watchedDoc) return;
     const uri = this.layoutUriFor(this.watchedDoc);
+    // The layouts/ mirror tree may not exist yet; fs.writeFile won't create
+    // parent dirs, so ensure them first.
+    const dir = vscode.Uri.file(nodePath.dirname(uri.fsPath));
+    await vscode.workspace.fs.createDirectory(dir);
     await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(layoutCode));
+  }
+
+  /// Write-back for a file-backed config field (`@file("path", Type)`). The
+  /// path is project-root-relative (the same root the compiler resolves
+  /// against). The resolved path must stay inside the project root, mirroring
+  /// the compiler's escape guard; an escaping path is dropped, not written.
+  /// After writing, re-parse so the graph reflects the new resolved value.
+  private async saveFileRef(relPath: string, content: string): Promise<void> {
+    const doc = this.watchedDoc;
+    if (!doc) return;
+    // `@file` paths resolve against the file's own dir (same base the compiler
+    // and watcher use), not the project root: a navigated-in component edits
+    // its own relative paths. The result must stay inside the project root.
+    const baseDir = nodePath.dirname(doc.uri.fsPath);
+    const root = findProjectRoot(doc.uri.fsPath) ?? baseDir;
+    const resolved = nodePath.resolve(baseDir, relPath);
+    const relToRoot = nodePath.relative(root, resolved);
+    if (relToRoot.startsWith('..') || nodePath.isAbsolute(relToRoot)) {
+      console.error('[weft] refusing saveFileRef: path escapes project root', relPath);
+      return;
+    }
+    // Serialized full-text write (open-doc-aware, recomputes range after any
+    // predecessor) via the shared writer. No graph reparse: config is
+    // unchanged; reship the resolved content for display once the write lands.
+    await this.writeDocumentText(vscode.Uri.file(resolved), content);
+    void this.shipFileContents(this.fileBaseDir, this.fileRelPaths);
+  }
+
+  /// Navigate into an `@include`d file: open its graph in this panel and
+  /// push the current doc onto the back-stack. The path is project-root
+  /// relative (the compiler's resolution root); escaping paths are refused.
+  /// One view = one file, so this swaps the watched doc rather than inlining.
+  private async navigateInto(relPath: string, alias: string): Promise<void> {
+    const current = this.watchedDoc;
+    if (!current) return;
+    const root = findProjectRoot(current.uri.fsPath);
+    if (!root) return;
+    const resolved = nodePath.resolve(root, relPath);
+    const rel = nodePath.relative(root, resolved);
+    if (rel.startsWith('..') || nodePath.isAbsolute(rel)) {
+      console.error('[weft] refusing openInclude: path escapes project root', relPath);
+      return;
+    }
+    let target: vscode.TextDocument;
+    try {
+      target = await vscode.workspace.openTextDocument(vscode.Uri.file(resolved));
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Weft: cannot open included file ${relPath}: ${e}`);
+      return;
+    }
+    this.navStack.push({ doc: current, alias });
+    this.freshMount = true;
+    // Send navState BEFORE the parse it depends on: open() posts parseResult
+    // (freshMount), which remounts the editor and looks up execution values via
+    // execPrefix. navState (computed from the now-updated navStack) must arrive
+    // first so that lookup uses the correct prefix on the first render.
+    this.sendNavState();
+    await this.open(target, undefined, true);
+  }
+
+  /// Pop the include back-stack (Return button): reopen the previous file.
+  private async navigateBack(): Promise<void> {
+    const previous = this.navStack.pop();
+    if (!previous) return;
+    this.freshMount = true;
+    // navState (from the popped navStack) before the parse it feeds, same as
+    // navigateInto.
+    this.sendNavState();
+    await this.open(previous.doc, undefined, true);
+  }
+
+  /// Push the current navigation depth, file name, and execution-id prefix to
+  /// the webview. The prefix is the dotted alias chain descended through
+  /// (e.g. `c.` or `c.inner.`), so sub-graph journal values (keyed by the
+  /// fully-qualified id) line up with this file's bare node ids.
+  private sendNavState(): void {
+    const fileName = this.watchedDoc?.uri.fsPath.split(/[\\/]/).pop() ?? '';
+    const execPrefix = this.navStack.map((f) => `${f.alias}.`).join('');
+    void this.panel?.webview.postMessage({
+      kind: 'navState',
+      depth: this.navStack.length,
+      fileName,
+      execPrefix,
+    });
   }
 
   /** Fetch every node type available in the current project scope
@@ -991,6 +1325,8 @@ export class GraphViewController {
     if (this.catalogRefreshTimer) clearTimeout(this.catalogRefreshTimer);
     this.nodesWatcher?.dispose();
     this.nodesWatcher = undefined;
+    this.refWatcher?.dispose();
+    this.refWatcher = undefined;
     this.stopAllLivePollers();
     for (const d of this.disposables) d.dispose();
     this.disposables = [];

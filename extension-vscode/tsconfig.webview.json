@@ -16,11 +16,18 @@
     "baseUrl": ".",
     "paths": {
       "$lib": ["src/webview/lib"],
-      "$lib/*": ["src/webview/lib/*"],
       "$lib/utils": ["src/webview/lib/utils.ts"],
       "$app/environment": ["src/webview/shims/app-environment.ts"],
-      "$app/navigation": ["src/webview/shims/app-navigation.ts"]
+      // Svelte-5 rune modules live in `index.svelte.ts`, which TS's bundler
+      // resolution won't pick up as a bare directory index (it looks for
+      // index.ts). Vite resolves them via its `.svelte.ts` extension; mirror
+      // that here so svelte-check resolves the same modules vite bundles.
+      "$lib/nodes": ["src/webview/lib/nodes/index.svelte.ts"],
+      "$lib/*": ["src/webview/lib/*"]
     }
   },
-  "include": ["src/webview/**/*.ts", "src/webview/**/*.svelte", "src/shared/**/*.ts"]
+  "include": ["src/webview/**/*.ts", "src/webview/**/*.svelte", "src/shared/**/*.ts"],
+  // Vitest specs are run by vitest (its own tsconfig/globals), not bundled into
+  // the webview, so they don't belong to this typecheck.
+  "exclude": ["src/webview/**/*.test.ts"]
 }

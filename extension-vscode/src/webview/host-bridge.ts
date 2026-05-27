@@ -1,14 +1,12 @@
-// Bridge between the VS Code host and v1's ProjectEditor.
+// Bridge between the host parse and the graph editor.
 //
-// Responsibility: translate the dispatcher's ProjectDefinition
-// (flat passthroughs + separate groups array) into v1's
+// Responsibility: translate the Rust compiler's ProjectDefinition (flat
+// passthroughs + separate groups array, scoped ids) into the editor's
 // ProjectDefinition shape (groups folded back into `nodes` as
-// nodeType:"Group" NodeInstances with __inner handle routing).
-// Also caches the latest parse response so the v1 parser shim
-// (`parseWeft`) can return it synchronously.
+// nodeType:"Group" NodeInstances with __inner handle routing). The Rust
+// parse is the single source of the graph; this only reshapes it for xyflow.
 
 import type {
-  ParseResponse,
   ProjectDefinition as HostProject,
   NodeDefinition as HostNode,
   Edge as HostEdge,
@@ -22,7 +20,7 @@ import type {
   PortDefinition as V1Port,
   LaneMode,
 } from './lib/types';
-import { parseLayoutCode } from './lib/ai/weft-editor';
+import { parseLayoutCode } from './lib/layout';
 
 function toV1Port(p: HostPort): V1Port {
   return {
@@ -42,8 +40,8 @@ function toV1Edge(e: HostEdge, groupIds: Set<string>): V1Edge {
   // boundary port. Matches v1 parser:4543-4554.
   let source = e.source;
   let target = e.target;
-  let sourceHandle = e.sourceHandle ?? undefined;
-  let targetHandle = e.targetHandle ?? undefined;
+  let sourceHandle = e.sourceHandle ?? null;
+  let targetHandle = e.targetHandle ?? null;
 
   const srcBound = parseBoundary(e.source, groupIds);
   const tgtBound = parseBoundary(e.target, groupIds);
@@ -126,6 +124,16 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
   // the inline config form.
   const rawConfig = (n.config ?? {}) as Record<string, unknown>;
   const { label: _stripped, ...cleanConfig } = rawConfig;
+  // The Rust parse resolves `@file` to the file's content in config. The
+  // editor's invariant is that config holds the structural `@file` MARKER
+  // ({path, type}), never resolved content, so it serializes safely and
+  // renders file-backed. Put the structural ref back from `fileRefs`; the
+  // resolved content is shown separately via the host's fileContents map.
+  if (n.fileRefs) {
+    for (const [key, ref] of Object.entries(n.fileRefs)) {
+      cleanConfig[key] = { __weftFileRef: { path: ref.path, type: ref.type } };
+    }
+  }
   return {
     id: n.id,
     nodeType: n.nodeType,
@@ -138,6 +146,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     features: n.features as unknown as NodeInstance['features'],
     scope: n.scope,
     groupBoundary: n.groupBoundary ?? undefined,
+    includePath: n.includePath,
   };
 }
 
@@ -162,12 +171,9 @@ export function translateProject(
   }
   const edges = host.edges.map((e) => toV1Edge(e, groupIds));
 
-  // The dispatcher's ProjectDefinition always emits position=(0,0);
-  // persistent positions live in the companion `.layout.json` file
-  // (v1 convention). Apply them here so the graph opens where the
-  // user last saved it instead of a stack at the origin. Same logic
-  // as project-hydration.ts, but we do it post-translate because our
-  // flow goes through /parse rather than parseWeft.
+  // The Rust ProjectDefinition always emits position=(0,0); persistent
+  // positions live in the companion `.layout` file. Apply them here so the
+  // graph opens where the user last saved it instead of a stack at the origin.
   if (layoutCode) {
     const layoutMap = parseLayoutCode(layoutCode);
     for (const n of structuralNodes) {
@@ -191,30 +197,4 @@ export function translateProject(
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-}
-
-// Cache of the latest parse response. v1's parseWeft shim reads
-// from here. Declared in its own module so weft-parser's shim can
-// import without App.svelte circular dep.
-let latestResponse: ParseResponse | null = null;
-let latestSource: string = '';
-let latestLayoutCode: string = '';
-
-export function setLatestParseResponse(
-  response: ParseResponse,
-  source: string,
-  layoutCode: string,
-): void {
-  latestResponse = response;
-  latestSource = source;
-  latestLayoutCode = layoutCode;
-}
-
-export function getLatestParseResponse(): {
-  response: ParseResponse;
-  source: string;
-  layoutCode: string;
-} | null {
-  if (!latestResponse) return null;
-  return { response: latestResponse, source: latestSource, layoutCode: latestLayoutCode };
 }

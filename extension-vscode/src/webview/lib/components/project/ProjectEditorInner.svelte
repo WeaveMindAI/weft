@@ -11,31 +11,37 @@
 	import ActionBar from "./ActionBar.svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "$lib/nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures } from "$lib/types";
+	import type { EditOp, TextEdit } from "../../../../shared/protocol";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "$lib/constants/colors";
-	import { autoOrganize, parseWeft, type OpaqueBlock, type WeftParseError, type WeftWarning } from "$lib/ai/weft-parser";
-	import { updateNodeConfig as weftUpdateConfig, updateNodeLabel as weftUpdateLabel, addNode as weftAddNode, addGroup as weftAddGroup, removeNode as weftRemoveNode, removeGroup as weftRemoveGroup, addEdge as weftAddEdge, removeEdge as weftRemoveEdge, updateNodePorts as weftUpdatePorts, updateGroupPorts as weftUpdateGroupPorts, updateProjectMeta as weftUpdateMeta, moveNodeScope as weftMoveNodeScope, moveGroupScope as weftMoveGroupScope, renameGroup as weftRenameGroup, updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutPrefix } from "$lib/ai/weft-editor";
-	import { findSearchMatch } from "$lib/ai/weft-patch";
+	import { autoOrganize } from "$lib/auto-organize";
+	import { updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutPrefix, applyLayoutOps, diffLayoutOps, type LayoutOp } from "$lib/layout";
+	import { formatConfigValue } from "$lib/value-format";
+	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "$lib/utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "$lib/utils/trigger-subgraph";
 	import { nodeBodyFeedKind } from "$lib/utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 
-	// Undo/Redo history
-	// History stores snapshots. historyIndex points to current state.
-	// Undo: go back one, Redo: go forward one
-	// saveToHistory() should be called AFTER making changes to save the new state
-	type HistoryState = { nodes: Node[]; edges: Edge[]; weftCode: string };
-	const MAX_HISTORY = 50;
-	let history = $state<HistoryState[]>([]);
-	let historyIndex = $state(-1);
-	let isUndoRedo = false;
-	let lastPushTime = 0;
-	const DEBOUNCE_MS = 100; // Prevent multiple pushes within 100ms
+	// Undo/Redo: two stacks of reversible actions (Monaco's model). An action is
+	// the inverse edits needed to go one step in a direction: a source TextEdit
+	// (applied via the Rust edit-server) and/or a layout LayoutOp batch (applied
+	// locally). Applying an undo action yields the redo action (its inverse) and
+	// vice-versa. No graph snapshots, no raw-source replay: source actions are
+	// minimal text-edit hunks that restore exact bytes (so `@file` survives).
+	type ReversibleAction = {
+		source?: import('../../../../shared/protocol').TextEdit;
+		layout?: import('$lib/layout').LayoutOp[];
+	};
+	const MAX_HISTORY = 100;
+	let undoStack = $state<ReversibleAction[]>([]);
+	let redoStack = $state<ReversibleAction[]>([]);
 
 	let {
 		project,
 		onSave,
+		onApplyEdits,
+		onApplyTextEdit,
 		onRun,
 		onStop,
 		onDismissError,
@@ -58,15 +64,31 @@
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
 		executionState,
-		validationErrors,
 		autoOrganizeOnMount = false,
-		fitViewAfterOrganize = false,
 		infraFeedByNode,
 		signalFeedByNode,
 		structuralLock = false,
+		onOpenInclude = () => {},
+		execPrefix = '',
+		fileContents = {},
 	}: {
 		project: ProjectDefinition;
-		onSave: (data: { name?: string; description?: string; weftCode?: string; layoutCode?: string }) => void;
+		onSave: (data: { name?: string; description?: string; layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
+		// Graph (GUI) edits: emit structured intents; Rust rewrites the source and
+		// returns the inverse text edit (the action's undo), or null on failure.
+		onApplyEdits: (ops: import('../../../../shared/protocol').EditOp[]) => Promise<import('../../../../shared/protocol').TextEdit | null>;
+		// Replay a raw source text edit (undo/redo); returns its inverse.
+		onApplyTextEdit: (edit: import('../../../../shared/protocol').TextEdit) => Promise<import('../../../../shared/protocol').TextEdit | null>;
+		// Navigate into an @include'd file; host opens it + pushes a back-stack.
+		onOpenInclude?: (path: string, alias: string) => void;
+		// Dotted alias chain (e.g. `c.`) prepended to node ids for execution
+		// value lookup when navigated into an included file. The Return
+		// button itself lives in the GraphToolbar (App level), not here.
+		execPrefix?: string;
+		// Resolved content of @file targets, keyed by the marker's relative
+		// path. The display value for file-backed fields (config holds only
+		// the `@file(...)` marker, never the resolved content).
+		fileContents?: Record<string, import('../../../../shared/protocol').FileContent>;
 		// Action-bar verb callbacks. The webview emits these; the
 		// host translates each into a CLI shell-out.
 		onRun?: () => void;
@@ -113,9 +135,7 @@
 			nodeStatuses: Record<string, string>;
 			nodeExecutions: import('$lib/types').NodeExecutionTable;
 		};
-		validationErrors?: Map<string, import('$lib/types').ValidationError[]>;
 		autoOrganizeOnMount?: boolean;
-		fitViewAfterOrganize?: boolean;
 		/// Per-node infra /live tick state. Read for nodes whose
 		/// `requiresInfra` flag is true; ignored otherwise.
 		infraFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
@@ -133,14 +153,29 @@
 	// The editor owns these after init; saves flow outward via onSave.
 	let weftCode = $state(untrack(() => project.weftCode) ?? '');
 	let layoutCode = $state(untrack(() => project.layoutCode) ?? '');
-	let weftOpaqueBlocks = $state<OpaqueBlock[]>([]);
+	// Child ProjectNodes register their field-editor flushes here so
+	// flushAllPendingSaves can commit in-progress typing on teardown.
+	const fieldEditorRegistry = provideFieldEditorRegistry();
 	let saveStatus = $state<'idle' | 'saved'>('idle');
 	let saveStatusTimer: ReturnType<typeof setTimeout> | null = null;
 
-	/** Get the scoped layout key for a node. Both node IDs and group IDs are already
-	 *  scoped by the parser (e.g., "GroupName.nodeId", "Outer.Inner"). */
+	/** The one scoped-layout-key idiom: a node/group is keyed by its enclosing
+	 *  scope + its local id. The single place this string is shaped, so the
+	 *  position writer and the scope-move rename can never disagree on it. */
+	function scopedLayoutKey(localId: string, parentId: string | undefined): string {
+		return parentId ? `${parentId}.${localId}` : localId;
+	}
+
+	/** The scoped layout key for a node, from its CURRENT scope (`parentId`) +
+	 *  local id, NOT its raw `node.id`. Normally these agree (the parser hands
+	 *  back already-scoped ids); they diverge for one frame after a drag
+	 *  reparents a node (the capture handler sets the new `parentId` while the
+	 *  optimistic `node.id` stays bare until the round-trip re-ids it). Keying
+	 *  off `parentId` keeps every writer agreeing on ONE key, so a reparented
+	 *  node's position can't orphan itself under a stale key. */
 	function getLayoutKey(node: Node): string {
-		return node.id;
+		const parentId = (node.data.config as Record<string, string> | undefined)?.parentId;
+		return scopedLayoutKey(node.id.split('.').pop()!, parentId);
 	}
 
 	/** Update layout for a node, modifies layoutCode, NOT weftCode. */
@@ -153,37 +188,34 @@
 			cfg?.expanded as boolean | undefined ?? undefined);
 	}
 
-	/** Move a node or group to a different scope in weftCode. targetGroupLabel is the label of the target group, or undefined for top level. */
-	/**
-	 * Move a node or group to a different scope in weftCode and update layoutCode.
-	 * targetGroupId is the scoped group ID (e.g., "Outer.Inner"), or undefined for top level.
-	 * targetGroupLabel is the group's label as used by the weft text editor.
-	 */
+	/** Move a node or group to a different scope: emit the move intent (Rust
+	 *  rewrites the source) and rename its layoutCode entry to the new scoped id.
+	 *  targetGroupLabel is the target group's label (undefined = top level);
+	 *  targetGroupId is its scoped id (e.g. "Outer.Inner") for the layout key.
+	 *
+	 *  PRECONDITION: `node` must be the node's state BEFORE its `parentId` was
+	 *  reparented (so `getLayoutKey(node)` yields the OLD key). All callers (the
+	 *  drag capture handlers) pass the pre-mutation reference; if a future caller
+	 *  re-fetches the node post-reparent, oldKey would equal newKey and the
+	 *  old-scope entry would orphan. */
 	function weftMoveScopeAny(node: Node, targetGroupLabel: string | undefined, targetGroupId?: string) {
 		const oldKey = getLayoutKey(node);
 		const isGroup = node.type === 'group' || node.type === 'groupCollapsed';
-		if (isGroup && node.data.label) {
-			weftCode = weftMoveGroupScope(weftCode, node.data.label as string, targetGroupLabel);
-		} else {
-			weftCode = weftMoveNodeScope(weftCode, node.id, targetGroupLabel);
-		}
-		// Update layoutCode: the scoped ID changes when moving between scopes.
+		const op: EditOp = isGroup && node.data.label
+			? { op: 'moveGroupScope', group: node.data.label as string, targetGroup: targetGroupLabel ?? null }
+			: { op: 'moveNodeScope', node: node.id, targetGroup: targetGroupLabel ?? null };
 		const localId = isGroup ? (node.data.label as string) : node.id.split('.').pop()!;
-		const scopePrefix = targetGroupId || targetGroupLabel;
-		const newKey = scopePrefix ? `${scopePrefix}.${localId}` : localId;
-		if (oldKey !== newKey) {
+		const newKey = scopedLayoutKey(localId, targetGroupId || targetGroupLabel);
+		recordEdit([op], () => {
+			if (oldKey === newKey) return;
 			if (isGroup) {
-				// Group + all children need renaming
-				layoutCode = renameLayoutPrefix(layoutCode, oldKey, newKey);
+				layoutCode = renameLayoutPrefix(layoutCode, oldKey, newKey); // group + all children
 			} else {
-				const layoutMap = parseLayoutCode(layoutCode);
-				const entry = layoutMap[oldKey];
+				const entry = parseLayoutCode(layoutCode)[oldKey];
 				layoutCode = removeLayoutEntry(layoutCode, oldKey);
-				if (entry) {
-					layoutCode = updateLayoutEntry(layoutCode, newKey, entry.x, entry.y, entry.w, entry.h, entry.expanded);
-				}
+				if (entry) layoutCode = updateLayoutEntry(layoutCode, newKey, entry.x, entry.y, entry.w, entry.h, entry.expanded);
 			}
-		}
+		});
 	}
 
 	/**
@@ -253,62 +285,6 @@
 		return `${snake}_${i}`;
 	}
 
-	function stripWeftFences(code: string): string {
-		return code
-			.replace(/^````weft(?:-patch)?\s*\n/, '')
-			.replace(/\n````\s*$/, '');
-	}
-
-	function parseWeftCode(rawCode: string): ReturnType<typeof parseWeft> {
-		const result = parseWeft('````weft\n' + rawCode + '\n````');
-		// Apply positions from layoutCode to parsed nodes. The
-		// parser cache holds shared `n.position` / `n.config`
-		// references; if we mutated them in place, two callers
-		// reading the cache with different `layoutCode` values
-		// would cross-contaminate. Clone the project + per-node
-		// position/config so each caller sees its own layout.
-		if (result.projects.length > 0) {
-			const layoutMap = parseLayoutCode(layoutCode);
-			result.projects = result.projects.map(w => ({
-				...w,
-				project: {
-					...w.project,
-					nodes: w.project.nodes.map(n => {
-						const entry = layoutMap[n.id];
-						if (!entry) {
-							// Even unmatched nodes get fresh position
-							// + config so callers can mutate freely.
-							return { ...n, position: { ...n.position }, config: { ...(n.config as Record<string, unknown>) } };
-						}
-						const config = { ...(n.config as Record<string, unknown>) };
-						if (entry.w !== undefined) config.width = entry.w;
-						if (entry.h !== undefined) config.height = entry.h;
-						if (entry.expanded !== undefined) config.expanded = entry.expanded;
-						return {
-							...n,
-							position: { x: entry.x, y: entry.y },
-							config,
-						};
-					}),
-				},
-			}));
-		}
-		return result;
-	}
-
-	function applyParseResult(w: { opaqueBlocks: OpaqueBlock[] }) {
-		weftOpaqueBlocks = w.opaqueBlocks;
-	}
-
-	function clearWeftParseState() {
-		weftOpaqueBlocks = [];
-	}
-
-	let weftStreaming = $state(false);
-	let weftSyncDirection: 'none' | 'to-code' | 'to-editor' = 'none';
-	let weftSyncTimer: ReturnType<typeof setTimeout> | null = null;
-	let codeEditInFlight = false;
-	const WEFT_SYNC_DEBOUNCE_MS = 500;
 	let editingName = $state(false);
 	let editingNameValue = $state('');
 	let saveProjectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -325,48 +301,9 @@
 	function initWeftCode() {
 		if (weftInitialized) return;
 		weftInitialized = true;
-		// On first load, the weftCode comes from the project prop (already persisted).
-		// If it's empty, we leave it empty, new projects start with no code.
-		if (project.weftCode) {
-			weftCode = project.weftCode;
-			const result = parseWeftCode(weftCode);
-			if (result.projects.length > 0) {
-				applyParseResult(result.projects[0]);
-				// Sync name/description from weft code if the DB has a generic name
-				const parsed = result.projects[0].project;
-				if (parsed.name && parsed.name !== 'Untitled Project' && project.name === 'Untitled project') {
-					project.name = parsed.name;
-				}
-				if (parsed.description !== undefined && !project.description) {
-					project.description = parsed.description;
-				}
-			}
-		}
-	}
-
-	function handleWeftCodeChange(newCode: string) {
-		if (weftSyncDirection === 'to-code') return;
-		if (weftSyncTimer) clearTimeout(weftSyncTimer);
-		weftCode = newCode;
-		codeEditInFlight = true;
-		weftSyncTimer = setTimeout(async () => {
-			weftSyncDirection = 'to-editor';
-			const result = parseWeftCode(weftCode);
-			if (result.projects.length > 0) {
-				const w = result.projects[0];
-				applyParseResult(w);
-				if (w.project.name) project.name = w.project.name;
-				if (w.project.description !== undefined) project.description = w.project.description;
-				const savedOpaqueBlocks = [...weftOpaqueBlocks];
-				await patchFromProject(w.project);
-				weftOpaqueBlocks = savedOpaqueBlocks;
-				saveProject();
-			}
-			// Wait for Svelte's reactive cycle to settle before clearing the guard
-			await tick();
-			weftSyncDirection = 'none';
-			codeEditInFlight = false;
-		}, WEFT_SYNC_DEBOUNCE_MS);
+		// The project prop already came from the host's authoritative parse
+		// (translateProject), so the graph is rendered; just sync the raw text.
+		if (project.weftCode) weftCode = project.weftCode;
 	}
 
 	// Sort/reorder removed, code ordering is user-controlled now
@@ -477,8 +414,6 @@
 		}
 	}
 
-	let configEditTimer: ReturnType<typeof setTimeout> | null = null;
-
 	/** Parse width/height from an xyflow node's style string + measured fallback */
 	function getNodeRect(n: Node): { width: number; height: number } {
 		// Try explicit style first
@@ -490,13 +425,48 @@
 	}
 
 
+	/** Write-back for a file-backed config field. The content goes to the
+	 *  referenced file via `onSave`, not to the weft source. The `@file(...)`
+	 *  token in the source is left untouched, so no surgical weft edit runs. */
+	function saveFileRef(path: string, content: string) {
+		onSave({ fileRef: { path, content } });
+	}
+
+	/** Navigate into an `@include`d file: the host opens that file's graph in
+	 *  this panel and pushes the current view onto the back-stack. `alias` is
+	 *  the include node id, accumulated into the execution-id prefix. */
+	function openInclude(path: string, alias: string) {
+		onOpenInclude(path, alias);
+	}
+
+	/** Map a local node id to its execution-journal key. When navigated into
+	 *  an included file, journal events are keyed by the fully-qualified id
+	 *  (e.g. `c.strip`) while this view's nodes are bare (`strip`), so prepend
+	 *  the accumulated alias prefix. No-op at the top level (empty prefix). */
+	function execKey(localId: string): string {
+		return execPrefix + localId;
+	}
+
 	function createNodeUpdateHandler(nodeId: string) {
 		return (updates: { label?: string | null; config?: Record<string, unknown>; inputs?: PortDefinition[]; outputs?: PortDefinition[] }) => {
 			if ('config' in updates && 'expanded' in (updates.config || {})) {
 				console.debug(`[nodeUpdateHandler] node=${nodeId} expanded=${updates.config!.expanded} incomingConfigKeys=${Object.keys(updates.config || {}).join(',')}`);
 			}
-			// Detect if this is an expand/collapse toggle
-			const isExpandToggle = updates.config && 'expanded' in updates.config;
+			// A collapse/expand TOGGLE is `expanded` actually CHANGING value, not
+			// merely present. Resize senders spread the whole config (which always
+			// carries the node's current `expanded`), so a key-presence test would
+			// classify every resize as a toggle and run the heavy collapse path
+			// (visibility + viewport pin). Compare against the live value instead:
+			// a resize spreads the unchanged flag (not a toggle => falls to resize),
+			// a real toggle flips it.
+			const priorExpanded = (nodes.find(n => n.id === nodeId)?.data.config as Record<string, boolean> | undefined)?.expanded;
+			const nextExpanded = (updates.config as Record<string, boolean> | undefined)?.expanded;
+			const isExpandToggle = nextExpanded !== undefined && nextExpanded !== priorExpanded;
+			if (isExpandToggle) {
+				const priorEntry = parseLayoutCode(layoutCode)[nodeId];
+				console.log('[exp] toggle node=', nodeId, '-> expanded=', nextExpanded,
+					'| had layout entry?', !!priorEntry, priorEntry ? JSON.stringify(priorEntry) : '(none)');
+			}
 
 			// Capture old group label BEFORE updating (for rename in weft code)
 			const oldGroupLabel = ('label' in updates) ? nodes.find(n => n.id === nodeId)?.data.label as string | undefined : undefined;
@@ -525,60 +495,7 @@
 				if ('config' in updates) newData.config = updates.config;
 				if ('inputs' in updates) newData.inputs = updates.inputs;
 				if ('outputs' in updates) newData.outputs = updates.outputs;
-
-				const newConfig = newData.config as Record<string, unknown> | undefined;
-				const configWidth = newConfig?.width as number | undefined;
-				const configHeight = newConfig?.height as number | undefined;
-				// Annotations always use fixed dimensions
-				if (n.type === 'annotation') {
-					const w = configWidth || 250;
-					const h = configHeight || 120;
-					return { ...n, data: newData, style: `width: ${w}px; height: ${h}px;` };
-				}
-
-				// Groups: expanded = group type with container dimensions, collapsed = groupCollapsed type like regular node
-				if (n.type === 'group' || n.type === 'groupCollapsed') {
-					const groupExpanded = (newConfig?.expanded as boolean) ?? true;
-					if (groupExpanded) {
-						// Preserve current dimensions if config doesn't specify (avoids flash during streaming)
-						const currentRect = getNodeRect(n);
-						const w = configWidth || currentRect.width || 400;
-						const h = configHeight || currentRect.height || 300;
-						return { ...n, type: 'group', data: newData, zIndex: -1, style: `width: ${w}px; height: ${h}px;` };
-					} else {
-						const nodeInputs = (newData as Record<string, unknown>).inputs as PortDefinition[] | undefined;
-						const nodeOutputs = (newData as Record<string, unknown>).outputs as PortDefinition[] | undefined;
-						const minW = computeMinNodeWidth(nodeInputs, nodeOutputs);
-						return { ...n, type: 'groupCollapsed', data: newData, zIndex: 4, style: `width: ${minW}px; height: auto;`, width: undefined, height: undefined };
-					}
-				}
-
-				// Regular project nodes: use expanded state (default collapsed)
-				const isExpanded = (newConfig?.expanded as boolean) ?? false;
-				const nodeInputs = ((newData as Record<string, unknown>).inputs || (newConfig as Record<string, unknown> | undefined)?.inputs) as PortDefinition[] | undefined;
-				const nodeOutputs = ((newData as Record<string, unknown>).outputs || (newConfig as Record<string, unknown> | undefined)?.outputs) as PortDefinition[] | undefined;
-				const minW = computeMinNodeWidth(nodeInputs, nodeOutputs);
-
-				if (!isExpanded) {
-					return { 
-						...n, 
-						data: newData, 
-						style: `width: ${minW}px; height: auto;`,
-						width: undefined,
-						height: undefined,
-					};
-				} else if (configWidth && configHeight) {
-					const w = Math.max(configWidth, minW);
-					return { 
-						...n, 
-						data: newData, 
-						style: `width: ${w}px; height: ${configHeight}px;`,
-						width: w,
-						height: configHeight,
-					};
-				}
-				const w = Math.max(320, minW);
-				return { ...n, data: newData, style: `width: ${w}px; height: auto;`, width: undefined, height: undefined };
+				return applyNodeSizing(n, newData);
 			});
 
 			// Recompute visibility for all nodes and edges based on ancestor chain
@@ -611,32 +528,10 @@
 					const xyParentId = directParentExpanded && !hidden ? rawParentId : undefined;
 					if (hidden) {
 						return { ...n, parentId: undefined, style: 'display: none;' };
-					} else {
-						// Restore proper style based on node type
-						const cfg = n.data.config as Record<string, unknown> | undefined;
-						const cw = cfg?.width as number | undefined;
-						const ch = cfg?.height as number | undefined;
-						let style: string | undefined;
-						if (n.type === 'group' || n.type === 'groupCollapsed') {
-							const expanded = (cfg?.expanded as boolean) ?? true;
-							style = expanded
-								? `width: ${cw || 400}px; height: ${ch || 300}px;`
-								: `width: ${computeMinNodeWidth(n.data.inputs as PortDefinition[], n.data.outputs as PortDefinition[])}px; height: auto;`;
-						} else if (n.type === 'annotation') {
-							style = `width: ${cw || 250}px; height: ${ch || 120}px;`;
-						} else {
-							const expanded = (cfg?.expanded as boolean) ?? false;
-							const minW = computeMinNodeWidth(n.data.inputs as PortDefinition[], n.data.outputs as PortDefinition[]);
-							if (!expanded) {
-								style = `width: ${minW}px; height: auto;`;
-							} else if (cw && ch) {
-								style = `width: ${Math.max(cw, minW)}px; height: ${ch}px;`;
-							} else {
-								style = `width: ${Math.max(320, minW)}px; height: auto;`;
-							}
-						}
-						return { ...n, parentId: xyParentId, ...(style ? { style } : {}) };
 					}
+					// Visible: restyle through the one sizing ladder, then layer the
+					// xyflow parentId (collapsed-parent children detach to top level).
+					return { ...applyNodeSizing(n, n.data as Record<string, unknown>), parentId: xyParentId };
 				});
 
 				// Hide/show edges touching hidden nodes
@@ -649,9 +544,8 @@
 			}
 
 			// Expand/collapse: run ELK, then adjust viewport so the toggled node's
-			// top-right corner stays at the same screen position (no node shifting)
-			// Skip during streaming, the regular streaming auto-organize handles layout
-			if (isExpandToggle && !weftStreaming) {
+			// top-right corner stays at the same screen position (no node shifting).
+			if (isExpandToggle) {
 				const pinnedNodeId = nodeId;
 				// Capture the top-right corner in flow coordinates before toggle
 				const currentNode = nodes.find(n => n.id === nodeId);
@@ -681,7 +575,7 @@
 									}
 								}
 
-								// Re-hide edges touching hidden nodes (runAutoOrganize unhides all edges)
+								// Keep edges touching collapsed-group-hidden nodes hidden.
 								const currentHidden = new Set(nodes.filter(n => n.style === 'display: none;').map(n => n.id));
 								if (currentHidden.size > 0) {
 									edges = edges.map(e => {
@@ -691,11 +585,7 @@
 										return e;
 									});
 								}
-								for (const n of nodes) {
-									layoutUpdateAny(n);
-								}
-								saveToHistory();
-								saveProject();
+								// runAutoOrganize already persisted layout + history.
 							});
 						});
 					});
@@ -707,75 +597,105 @@
 				tick().then(() => updateNodeInternals(nodeId));
 			}
 
-			// Update weftCode surgically based on what changed
+			// Build structured edit intents from what changed. Rust applies
+			// them to the source (the webview never edits `.weft` text). Layout
+			// keys (width/height/expanded) are NOT source edits: they go to the
+			// companion layout file via layoutUpdateAny.
+			const ops: import('../../../../shared/protocol').EditOp[] = [];
+
+			// Layout mutations are deferred into a closure so recordEdit captures
+			// them in its before/after diff (one reversible action with the source
+			// ops). Layout-only changes (resize/collapse) carry no source ops.
+			let mutateLayout: () => void = () => {};
+			let hasLayout = false;
+
 			if ('label' in updates) {
 				const node = nodes.find(n => n.id === nodeId);
 				const isGroup = node?.type === 'group' || node?.type === 'groupCollapsed';
 				if (isGroup && oldGroupLabel && updates.label) {
-					weftCode = weftRenameGroup(weftCode, oldGroupLabel, updates.label as string);
-					// Rename layout entries: the old scoped ID (node.id) and all children
-					// e.g., nodeId="Outer.Inner", oldGroupLabel="Inner", newLabel="Processing"
-					// → old scoped ID is "Outer.Inner", new is "Outer.Processing"
+					ops.push({ op: 'renameGroup', oldLabel: oldGroupLabel, newLabel: updates.label as string });
+					// Rename layout entries: old scoped id (node.id) + children.
 					const parts = nodeId.split('.');
 					parts[parts.length - 1] = updates.label as string;
-					const newScopedId = parts.join('.');
-					layoutCode = renameLayoutPrefix(layoutCode, nodeId, newScopedId);
+					const newPrefix = parts.join('.');
+					mutateLayout = () => { layoutCode = renameLayoutPrefix(layoutCode, nodeId, newPrefix); };
+					hasLayout = true;
 				} else {
-					weftCode = weftUpdateLabel(weftCode, nodeId, updates.label ?? null);
+					ops.push({ op: 'setLabel', node: nodeId, label: (updates.label as string | null) ?? null });
 				}
 			}
 			if ('config' in updates) {
 				const cfg = updates.config!;
-				let layoutUpdated = false;
+				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
 					if (['parentId', 'textareaHeights', '_opaqueChildren'].includes(key)) continue;
 					if (['width', 'height', 'expanded'].includes(key)) {
-						// Layout-related: update @layout directive (once for all layout keys)
-						if (!layoutUpdated) {
-							const n = nodes.find(nd => nd.id === nodeId);
-							if (n) {
-								layoutUpdateAny({ ...n, data: { ...n.data, config: cfg } });
-							}
-							layoutUpdated = true;
-						}
+						needsLayout = true;
 						continue;
 					}
-					weftCode = weftUpdateConfig(weftCode, nodeId, key, value);
+					if (value === undefined || value === null) {
+						ops.push({ op: 'removeConfig', node: nodeId, key });
+					} else {
+						ops.push({ op: 'setConfig', node: nodeId, key, value: formatConfigValue(value) });
+					}
+				}
+				if (needsLayout) {
+					mutateLayout = () => {
+						const n = nodes.find(nd => nd.id === nodeId);
+						if (n) layoutUpdateAny({ ...n, data: { ...n.data, config: cfg } });
+					};
+					hasLayout = true;
 				}
 			}
 			if ('inputs' in updates || 'outputs' in updates) {
 				const node = nodes.find(n => n.id === nodeId);
 				if (node?.data) {
-					const inputs = (updates.inputs ?? node.data.inputs) as Array<{ name: string; required?: boolean; laneMode?: string; portType?: string }>;
-					const outputs = (updates.outputs ?? node.data.outputs) as Array<{ name: string; laneMode?: string; portType?: string }>;
+					const inputs = toPortSigs((updates.inputs ?? node.data.inputs) as PortLike[]);
+					const outputs = toPortSigs((updates.outputs ?? node.data.outputs) as PortLike[]);
 					const isGroup = node.type === 'group' || node.type === 'groupCollapsed';
 					if (isGroup && node.data.label) {
-						weftCode = weftUpdateGroupPorts(weftCode, node.data.label as string, inputs, outputs);
+						ops.push({ op: 'updateGroupPorts', group: node.data.label as string, inputs, outputs });
 					} else {
-						weftCode = weftUpdatePorts(weftCode, nodeId, inputs, outputs);
+						ops.push({ op: 'updateNodePorts', node: nodeId, inputs, outputs });
 					}
 				}
 			}
 
-			// Check if this is a resize operation (width/height in config)
-			const isResize = updates.config && ('width' in updates.config || 'height' in updates.config);
+			// Resize vs collapse/expand are distinct events (see the value-change
+			// classifier above). A TOGGLE flips `expanded` and is handled by the
+			// isExpandToggle block above (visual restyle + visibility + viewport
+			// pin + ELK, which records the layout incl. the toggled flag). A RESIZE
+			// changes width/height with `expanded` unchanged: it reflows neighbours
+			// via ELK with NO viewport pin.
+			const isResize = !!updates.config && !isExpandToggle
+				&& ('width' in updates.config || 'height' in updates.config);
 
-			if ('config' in updates && !isResize) {
-				// For text config changes (typing), debounce the history save
-				if (configEditTimer) clearTimeout(configEditTimer);
-				configEditTimer = setTimeout(() => {
-					saveToHistory();
-				}, 500);
-				// Debounce the API save for typing (5s)
-				if (saveProjectTimer) clearTimeout(saveProjectTimer);
-				saveProjectTimer = setTimeout(() => {
-					saveProjectTimer = null;
-					saveProject();
-				}, SAVE_DEBOUNCE_MS);
-			} else {
-				// For resize, ports, label - save immediately
-				saveToHistory();
-				saveProject();
+			if (isExpandToggle) {
+				// Layout (incl. the toggled `expanded` flag) is recorded by the
+				// isExpandToggle block's ELK pass. Only flush any text ops that
+				// rode along (rare).
+				if (ops.length > 0) { flushPendingConfigOps(); recordEdit(ops); }
+			} else if (isResize) {
+				// Resize: a new footprint means neighbours should make room, so
+				// re-run ELK (no viewport pin); runAutoOrganize records the layout.
+				void runAutoOrganize(false);
+			} else if ('config' in updates) {
+				// Text config typing: accumulate ops across keystrokes and flush as
+				// one atomic batch (one undo unit) once typing pauses. The buffer
+				// survives handler calls so edits to different fields aren't lost.
+				if (ops.length > 0) {
+					pendingConfigOps.push(...ops);
+					if (saveProjectTimer) clearTimeout(saveProjectTimer);
+					saveProjectTimer = setTimeout(() => {
+						saveProjectTimer = null;
+						flushPendingConfigOps();
+					}, SAVE_DEBOUNCE_MS);
+				}
+			} else if (ops.length > 0 || hasLayout) {
+				// Ports/label (structural): flush pending typing first (order), then
+				// apply as one reversible action with its layout part.
+				flushPendingConfigOps();
+				recordEdit(ops, mutateLayout);
 			}
 		};
 	}
@@ -802,7 +722,10 @@
 	}
 
 	// Node types that have their own SvelteFlow components (not in NODE_TYPE_CONFIG)
-	const SPECIAL_NODE_TYPES = new Set(['Group', 'Annotation']);
+	// 'IncludedGroup' is the opaque @include block: no catalog entry by
+	// design (its ports come from the included file's Group header), so it
+	// must be allowed through the catalog filter explicitly.
+	const SPECIAL_NODE_TYPES = new Set(['Group', 'Annotation', 'IncludedGroup']);
 
 	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean }>): Node[] {
 		// Unknown node types are already handled by the parser as opaque blocks
@@ -854,15 +777,11 @@
 			}
 			const parentId = (rawParentId && parentGroupExpanded && !hiddenByCollapsedGroup) ? rawParentId : undefined;
 
-			// Build style for resizable nodes (groups, annotations, and project nodes)
 			const configWidth = (n.config as Record<string, number>)?.width;
 			const configHeight = (n.config as Record<string, number>)?.height;
 			const isExpanded = (n.config as Record<string, boolean>)?.expanded ?? (isGroup ? true : false);
-			
-			const nodeType = isGroup ? (isExpanded ? 'group' : 'groupCollapsed') : isAnnotation ? 'annotation' : 'project';
 
-			// Z-index order: expanded groups/annotations at bottom, nested groups above parents.
-			// Compute nesting depth so child groups render above parent groups.
+			// Nesting depth so child groups render above parent groups.
 			let nestingDepth = 0;
 			if (isGroup && isExpanded && rawParentId) {
 				let pid: string | undefined = rawParentId;
@@ -872,52 +791,29 @@
 					pid = p ? (p.config as Record<string, string>)?.parentId : undefined;
 				}
 			}
-			const zIndex = isAnnotation ? -1 : isGroup ? (isExpanded ? -1 + nestingDepth : 4) : 4;
-			let nodeStyle: string | undefined;
-			
-			if (isAnnotation) {
-				nodeStyle = `width: ${configWidth || 250}px; height: ${configHeight || 120}px;`;
-			} else if (isGroup) {
-				if (isExpanded) {
-					// Check layoutMap for saved dimensions, then config, then default
-					const layoutEntry = layoutMap?.[n.id];
-					const w = configWidth || layoutEntry?.w || 400;
-					const h = configHeight || layoutEntry?.h || 300;
-					nodeStyle = `width: ${w}px; height: ${h}px;`;
-				} else {
-					const minW = computeMinNodeWidth(n.inputs, n.outputs);
-					nodeStyle = `width: ${minW}px; height: auto;`;
-				}
-			}
-			
-			// For regular project nodes: collapsed = fit content, expanded = saved dimensions or fit content
-			let nodeWidth: number | undefined;
-			let nodeHeight: number | undefined;
-			if (!isGroup && !isAnnotation) {
-				const minW = computeMinNodeWidth(n.inputs, n.outputs);
-				if (!isExpanded) {
-					nodeStyle = `width: ${minW}px; height: auto;`;
-					nodeWidth = undefined;
-					nodeHeight = undefined;
-				} else if (configWidth && configHeight) {
-					const w = Math.max(configWidth, minW);
-					nodeStyle = `width: ${w}px; height: ${configHeight}px;`;
-					nodeWidth = w;
-					nodeHeight = configHeight;
-				} else {
-					// Expanded but no saved dimensions - fit to content
-					const w = Math.max(320, minW);
-					nodeStyle = `width: ${w}px; height: auto;`;
-				}
-			}
-			
+			// One sizing ladder (shared with applyNodeSizing). Group expanded dims
+			// fall back to the saved layout entry when config doesn't specify.
+			const layoutEntry = layoutMap?.[n.id];
+			const sizing = computeSizing({
+				isGroup,
+				isAnnotation,
+				isExpanded,
+				configWidth,
+				configHeight,
+				fallbackWidth: layoutEntry?.w,
+				fallbackHeight: layoutEntry?.h,
+				inputs: n.inputs,
+				outputs: n.outputs,
+				nestingDepth,
+			});
+
 			return {
 				id: n.id,
-				type: nodeType,
+				type: sizing.type,
 				position: n.position,
-				zIndex,
-				...(nodeWidth !== undefined ? { width: nodeWidth } : {}),
-				...(nodeHeight !== undefined ? { height: nodeHeight } : {}),
+				zIndex: sizing.zIndex,
+				...(sizing.width !== undefined ? { width: sizing.width } : {}),
+				...(sizing.height !== undefined ? { height: sizing.height } : {}),
 				data: {
 					label: n.label,
 					nodeType: n.nodeType,
@@ -925,15 +821,19 @@
 					inputs: n.inputs,
 					outputs: n.outputs,
 					features: n.features,
+					fileContents,
+					includePath: (n as typeof n & { includePath?: string }).includePath,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
+					onSaveFileRef: saveFileRef,
+					onOpenInclude: openInclude,
 					infraNodeStatus: infraNodes?.find(inf => inf.nodeId === n.id)?.status,
 					infraFailureStage: infraNodes?.find(inf => inf.nodeId === n.id)?.failureStage,
 					infraFailureMessage: infraNodes?.find(inf => inf.nodeId === n.id)?.failureMessage,
 				},
 				...(hiddenByCollapsedGroup
 					? { style: 'display: none;' }
-					: nodeStyle ? { style: nodeStyle } : {}),
+					: { style: sizing.style }),
 				parentId,
 			};
 		});
@@ -1002,11 +902,11 @@
 					// the node type.
 					let debugData: unknown = undefined;
 					if (nodeTypeConfig?.features?.showDebugPreview) {
-						const hasOutputs = (nodeTypeConfig.outputs?.length ?? 0) > 0;
+						const hasOutputs = (nodeTypeConfig.defaultOutputs?.length ?? 0) > 0;
 						if (hasOutputs) {
-							debugData = nodeOutputs[n.id];
+							debugData = nodeOutputs[execKey(n.id)];
 						} else {
-							const rows = nodeExecutions[n.id];
+							const rows = nodeExecutions[execKey(n.id)];
 							const latest = rows?.[rows.length - 1];
 							debugData = latest?.input;
 						}
@@ -1018,14 +918,14 @@
 						const groupId = n.id;
 
 						// Boundary passthrough executions (compiled IDs follow {groupId}__in / {groupId}__out)
-						const inExecs = nodeExecutions[`${groupId}__in`] || [];
-						const outExecs = nodeExecutions[`${groupId}__out`] || [];
+						const inExecs = nodeExecutions[execKey(`${groupId}__in`)] || [];
+						const outExecs = nodeExecutions[execKey(`${groupId}__out`)] || [];
 
 						// Collect internal node executions via scope field
 						const internalExecs: import('$lib/types').NodeExecution[] = [];
 						for (const projNode of project.nodes) {
-							if (projNode.scope?.includes(groupId) && nodeExecutions[projNode.id]) {
-								internalExecs.push(...nodeExecutions[projNode.id]);
+							if (projNode.scope?.includes(groupId) && nodeExecutions[execKey(projNode.id)]) {
+								internalExecs.push(...nodeExecutions[execKey(projNode.id)]);
 							}
 						}
 
@@ -1062,7 +962,7 @@
 							};
 						});
 					} else {
-						executions = nodeExecutions[n.id] || [];
+						executions = nodeExecutions[execKey(n.id)] || [];
 					}
 
 					// Derive SvelteFlow wrapper class from the latest execution status
@@ -1115,6 +1015,26 @@
 				}
 				return n;
 			});
+		});
+	});
+
+	// buildNodes bakes the current fileContents into each node at construction.
+	// This effect handles the LATE-ARRIVAL case: fileContents is its own
+	// message (it lands after parseResult, and again on external file change
+	// with no rebuild), so patch the already-built nodes when it updates. Only
+	// reassign `nodes` if some node actually needed patching, so a no-op reship
+	// (common: periodic external-file reships) doesn't allocate a fresh array
+	// and retrigger every other derivation that reads `nodes`.
+	$effect(() => {
+		const contents = fileContents;
+		untrack(() => {
+			let changed = false;
+			const next = nodes.map(n => {
+				if (n.data.fileContents === contents) return n;
+				changed = true;
+				return { ...n, data: { ...n.data, fileContents: contents } };
+			});
+			if (changed) nodes = next;
 		});
 	});
 
@@ -1213,92 +1133,209 @@
 	
 	let preDragPositions = new Map<string, { x: number; y: number }>();
 
-	function cloneState(): HistoryState {
+	// Commit one reversible action: mutate layout (sync, the existing inline
+	// layoutCode edits) and/or apply a source change, then return the INVERSE
+	// action. The layout inverse is a diff of layoutCode after-vs-before (so
+	// every existing layout-mutation line is captured with zero changes to it);
+	// the source inverse is the text edit the edit-server returns. This single
+	// primitive backs new edits (recordEdit) and undo/redo replay (applyAction).
+	async function commit(
+		applySource: () => Promise<TextEdit | null>,
+		mutateLayout: () => void,
+	): Promise<ReversibleAction> {
+		// Source first: it's the fallible/async half. Only mutate layout once the
+		// source change landed, so a failed source op can't leave an orphan
+		// layout entry (e.g. a position for a node that was never added).
+		const source = (await applySource()) ?? undefined;
+		const layoutBefore = layoutCode;
+		mutateLayout();
+		if (layoutCode !== layoutBefore) saveLayout();
+		const layout = diffLayoutOps(layoutCode, layoutBefore); // ops: after -> before
+		return { source, layout: layout.length > 0 ? layout : undefined };
+	}
+
+	// All graph mutations (new edits + undo/redo replay) run through this one
+	// queue. They share mutable state (layoutCode, the undo/redo stacks) and each
+	// awaits an async source round-trip, so serializing keeps that state
+	// consistent under rapid edits / ctrl-z held down (no interleaving).
+	let historyChain: Promise<void> = Promise.resolve();
+	function enqueue(fn: () => Promise<void>): void {
+		historyChain = historyChain.then(fn, fn);
+	}
+
+	// When a gesture spans several recordEdit calls (e.g. a drag that also
+	// reparents nodes), they accumulate here so the whole gesture is ONE undo
+	// unit. `transaction(fn)` opens it; recordEdit calls inside fn buffer their
+	// ops + layout closures; on close they commit as a single action.
+	type BufferedEdit = { ops: EditOp[]; mutateLayout: () => void };
+	let txBuffer: BufferedEdit[] | null = null;
+	function transaction(fn: () => void): void {
+		if (txBuffer) { fn(); return; } // already inside one: just nest
+		const buffer: BufferedEdit[] = [];
+		txBuffer = buffer;
+		try {
+			fn();
+		} finally {
+			txBuffer = null;
+		}
+		if (buffer.length === 0) return;
+		const ops = buffer.flatMap(e => e.ops);
+		const mutateLayout = () => { for (const e of buffer) e.mutateLayout(); };
+		pushAction(ops, mutateLayout);
+	}
+
+	// Record a user edit as a reversible action (or buffer it into the open
+	// transaction). Callers pass the source ops (Rust applies them, returns the
+	// inverse) and optionally a layout mutation closure (the existing inline
+	// layoutCode edits). History bookkeeping is automatic: no saveToHistory.
+	function recordEdit(ops: EditOp[], mutateLayout: () => void = () => {}): void {
+		if (txBuffer) { txBuffer.push({ ops, mutateLayout }); return; }
+		pushAction(ops, mutateLayout);
+	}
+
+	function pushAction(ops: EditOp[], mutateLayout: () => void): void {
+		enqueue(async () => {
+			const undoAction = await commit(() => (ops.length > 0 ? onApplyEdits(ops) : Promise.resolve(null)), mutateLayout);
+			if (undoAction.source || undoAction.layout) {
+				undoStack = [...undoStack, undoAction].slice(-MAX_HISTORY);
+				redoStack = [];
+			}
+		});
+	}
+
+	// Replay a stored action (undo/redo): source half is a text edit replayed
+	// through the edit-server, layout half is layout ops applied locally.
+	function applyAction(a: ReversibleAction): Promise<ReversibleAction> {
+		return commit(
+			() => (a.source ? onApplyTextEdit(a.source) : Promise.resolve(null)),
+			() => {
+				if (!a.layout) return;
+				layoutCode = applyLayoutOps(layoutCode, a.layout);
+				// A layout undo has no reparse to re-render from, so push the new
+				// layoutCode onto the live node positions/sizes.
+				reconcileNodesFromLayout();
+			},
+		);
+	}
+
+	// Compute a node's type/style/zIndex/dimensions from its `data` (which holds
+	// config.expanded + config.width/height). The single source of truth for
+	// node sizing: used by the optimistic config-edit update AND by layout
+	// undo/redo reconciliation, so a collapsed node always renders collapsed (it
+	// never gets blown up to its saved expanded size) regardless of which path
+	// last touched it.
+	// The ONE node-sizing ladder: given what a node IS (group/annotation/node),
+	// whether it's expanded, its config + fallback dimensions, and its inputs/
+	// outputs, decide its xyflow type / zIndex / style / explicit w-h. Both
+	// buildNodes (constructing from the parse) and applyNodeSizing (restyling a
+	// live node) route through this, so a collapsed node renders min-width/auto
+	// no matter which path touched it last (no second ladder to drift).
+	type SizingInput = {
+		isGroup: boolean;
+		isAnnotation: boolean;
+		isExpanded: boolean;
+		configWidth?: number;
+		configHeight?: number;
+		fallbackWidth?: number;  // group expanded dims when config has none (layout entry / live rect)
+		fallbackHeight?: number;
+		inputs?: PortDefinition[];
+		outputs?: PortDefinition[];
+		nestingDepth?: number;   // expanded groups stack above their parents
+	};
+	type Sizing = { type: 'group' | 'groupCollapsed' | 'annotation' | 'project'; zIndex: number; style: string; width?: number; height?: number };
+	function computeSizing(s: SizingInput): Sizing {
+		if (s.isAnnotation) {
+			return { type: 'annotation', zIndex: -1, style: `width: ${s.configWidth || 250}px; height: ${s.configHeight || 120}px;` };
+		}
+		if (s.isGroup) {
+			if (s.isExpanded) {
+				const w = s.configWidth || s.fallbackWidth || 400;
+				const h = s.configHeight || s.fallbackHeight || 300;
+				return { type: 'group', zIndex: -1 + (s.nestingDepth ?? 0), style: `width: ${w}px; height: ${h}px;` };
+			}
+			const minW = computeMinNodeWidth(s.inputs, s.outputs);
+			return { type: 'groupCollapsed', zIndex: 4, style: `width: ${minW}px; height: auto;` };
+		}
+		// Regular node: collapsed (default) = min-width/auto; expanded = saved
+		// w/h (>= minW), else fit. A collapsed node ignores any saved w/h.
+		const minW = computeMinNodeWidth(s.inputs, s.outputs);
+		if (!s.isExpanded) {
+			return { type: 'project', zIndex: 4, style: `width: ${minW}px; height: auto;` };
+		}
+		if (s.configWidth && s.configHeight) {
+			const w = Math.max(s.configWidth, minW);
+			return { type: 'project', zIndex: 4, style: `width: ${w}px; height: ${s.configHeight}px;`, width: w, height: s.configHeight };
+		}
+		return { type: 'project', zIndex: 4, style: `width: ${Math.max(320, minW)}px; height: auto;` };
+	}
+
+	// Restyle a live xyflow node from its (possibly just-edited) data, via the
+	// one ladder. Used by the optimistic config-edit update + layout undo/redo.
+	function applyNodeSizing(n: Node, newData: Record<string, unknown>): Node {
+		const cfg = newData.config as Record<string, unknown> | undefined;
+		const isGroup = n.type === 'group' || n.type === 'groupCollapsed';
+		const rect = isGroup ? getNodeRect(n) : undefined; // preserve current group dims if config has none (no flash)
+		const sizing = computeSizing({
+			isGroup,
+			isAnnotation: n.type === 'annotation',
+			isExpanded: (cfg?.expanded as boolean) ?? (isGroup ? true : false),
+			configWidth: cfg?.width as number | undefined,
+			configHeight: cfg?.height as number | undefined,
+			fallbackWidth: rect?.width,
+			fallbackHeight: rect?.height,
+			inputs: (newData.inputs ?? cfg?.inputs) as PortDefinition[] | undefined,
+			outputs: (newData.outputs ?? cfg?.outputs) as PortDefinition[] | undefined,
+		});
 		return {
-			nodes: JSON.parse(JSON.stringify(nodes)),
-			edges: JSON.parse(JSON.stringify(edges)),
-			weftCode,
+			...n,
+			type: sizing.type,
+			data: newData,
+			zIndex: sizing.zIndex,
+			style: sizing.style,
+			width: sizing.width,
+			height: sizing.height,
 		};
 	}
 
-	/** Fast content hash (djb2) to avoid serializing the entire graph twice for equality checks. */
-	function hashState(state: HistoryState): string {
-		// Hash the weft code (source of truth) + node count + edge count as a fast fingerprint.
-		// Full JSON equality is too expensive for large graphs.
-		const s = state.weftCode + ':' + state.nodes.length + ':' + state.edges.length;
-		let hash = 5381;
-		for (let i = 0; i < s.length; i++) {
-			hash = ((hash * 33) ^ s.charCodeAt(i)) >>> 0;
-		}
-		return hash.toString(16);
-	}
-
-	let lastHistoryHash = '';
-
-	// Called AFTER an action to save the new state
-	function saveToHistory() {
-		if (isUndoRedo) return;
-
-		// Debounce: prevent multiple saves within DEBOUNCE_MS
-		const now = Date.now();
-		if (now - lastPushTime < DEBOUNCE_MS) return;
-		lastPushTime = now;
-
-		const currentState = cloneState();
-
-		// Don't save if state hasn't changed (fast hash comparison)
-		const currentHash = hashState(currentState);
-		if (currentHash === lastHistoryHash) return;
-		lastHistoryHash = currentHash;
-
-		// Truncate any redo history and add new state
-		const newHistory = history.slice(0, historyIndex + 1);
-		newHistory.push(currentState);
-		if (newHistory.length > MAX_HISTORY) {
-			newHistory.shift();
-		}
-		history = newHistory;
-		historyIndex = history.length - 1;
-	}
-	
-
-	function restoreFromHistory(state: HistoryState) {
-		const restoredNodes: Node[] = JSON.parse(JSON.stringify(state.nodes));
-		// Re-attach function callbacks lost during JSON serialization
-		for (const n of restoredNodes) {
-			n.data.onUpdate = createNodeUpdateHandler(n.id);
-		}
-		nodes = restoredNodes;
-		edges = JSON.parse(JSON.stringify(state.edges));
-		weftCode = state.weftCode;
+	// Push the current layoutCode (positions + sizes + expanded state) onto the
+	// live xyflow nodes. A layout undo/redo has no reparse to re-render from, so
+	// reconcile here, routing sizing through applyNodeSizing so a collapsed node
+	// stays collapsed (its saved expanded w/h is remembered, not applied).
+	function reconcileNodesFromLayout() {
+		const map = parseLayoutCode(layoutCode);
+		nodes = nodes.map((n) => {
+			const e = map[n.id];
+			if (!e) return n;
+			const config = { ...(n.data.config as Record<string, unknown>) };
+			if (e.w !== undefined) config.width = e.w;
+			if (e.h !== undefined) config.height = e.h;
+			if (e.expanded !== undefined) config.expanded = e.expanded;
+			const sized = applyNodeSizing(n, { ...n.data, config });
+			return { ...sized, position: { x: e.x, y: e.y } };
+		});
 	}
 
 	function undo() {
-		if (historyIndex <= 0) return;
-		isUndoRedo = true;
-		historyIndex--;
-		restoreFromHistory(history[historyIndex]);
-		isUndoRedo = false;
-		saveProject();
+		enqueue(async () => {
+			const a = undoStack[undoStack.length - 1];
+			if (!a) return;
+			const inverse = await applyAction(a); // may throw; swap stacks only on success
+			undoStack = undoStack.slice(0, -1);
+			redoStack = [...redoStack, inverse];
+		});
 	}
-
 	function redo() {
-		if (historyIndex >= history.length - 1) return;
-		isUndoRedo = true;
-		historyIndex++;
-		restoreFromHistory(history[historyIndex]);
-		isUndoRedo = false;
-		saveProject();
+		enqueue(async () => {
+			const a = redoStack[redoStack.length - 1];
+			if (!a) return;
+			const inverse = await applyAction(a);
+			redoStack = redoStack.slice(0, -1);
+			undoStack = [...undoStack, inverse];
+		});
 	}
 
-	// Initialize weftCode from project prop and history with current state
-	$effect(() => {
-		if (history.length === 0) {
-			initWeftCode();
-			history = [cloneState()];
-			historyIndex = 0;
-		}
-	});
+	// Seed the working source copy from the prop on first mount.
+	$effect(() => { initWeftCode(); });
 
 	function doFitView(padding = 0.2) {
 		const flowContainer = document.querySelector('.svelte-flow');
@@ -1421,95 +1458,64 @@
 			nodes = nodes.map((n) => {
 				const pos = positions.get(n.id);
 				const groupSize = groupSizes.get(n.id);
-				// Remove pending-layout class from nodes that were hidden during patch wait
-				const nodeClass = typeof n.class === 'string' ? n.class : '';
-				const hasPending = nodeClass.includes('node-pending-layout');
-				let updated = hasPending ? { ...n, class: nodeClass.replace('node-pending-layout', '').trim() || undefined } : n;
+				let updated = n;
 				if (pos) updated = { ...updated, position: pos };
 				if (groupSize) {
-					const existingConfig = updated.data.config as Record<string, unknown>;
 					const w = groupSize.width;
 					const h = groupSize.height;
-					const newConfig = { ...existingConfig, width: w, height: h };
+					const newConfig = { ...(updated.data.config as Record<string, unknown>), width: w, height: h };
 					updated = { ...updated, style: `width: ${w}px; height: ${h}px;`, data: { ...updated.data, config: newConfig } };
 				}
 				return updated;
 			});
-			// Unhide edges that were hidden during streaming/patch wait (marked with pendingLayout)
-			if (edges.some(e => (e.data as Record<string, unknown>)?.pendingLayout)) {
-				edges = edges.map(e => {
-					if ((e.data as Record<string, unknown>)?.pendingLayout) {
-						const { pendingLayout, ...rest } = e.data as Record<string, unknown>;
-						return { ...e, hidden: false, data: rest };
-					}
-					return e;
-				});
-			}
-			// Write ELK-computed positions to layoutCode (separate from weftCode)
-			for (const n of nodes) {
-				if (positions.has(n.id) || groupSizes.has(n.id)) {
+			// ELK positions are LAYOUT, not source: record as one reversible
+			// layout action (recordEdit persists + captures the diff for undo).
+			// Persist EVERY visible node, not only the ones ELK repositioned:
+			// ELK may leave a node in place (no `positions` entry), and a
+			// collapse/expand toggle drives this path precisely to persist the
+			// toggled node's `expanded` flag. Gating on ELK movement dropped that
+			// flag for untouched nodes, so they snapped back to their default on
+			// the next rebuild (the intermittent recollapse). Hidden nodes
+			// (display:none under a collapsed ancestor) keep their stored entry.
+			recordEdit([], () => {
+				for (const n of nodes) {
+					if (n.style === 'display: none;') continue;
 					layoutUpdateAny(n);
 				}
-			}
-			saveToHistory();
-			saveProject();
+			});
+			console.log('[exp] after runAutoOrganize: layoutCode entries=', Object.keys(parseLayoutCode(layoutCode)).length,
+				'| sample expanded states=', JSON.stringify(Object.fromEntries(Object.entries(parseLayoutCode(layoutCode)).map(([k,v])=>[k,v.expanded]))));
 			if (andFitView) setTimeout(() => doFitView(), 50);
 		});
 	}
 
-	// Surgical patch: apply a new project definition without remounting the editor.
-	// Preserves positions of unchanged nodes, then re-runs ELK (same path as the palette auto-organize).
-	/** VS Code embedding: the host owns the authoritative .weft text.
-	 *  Whenever it sends us a parseResult we may need to overwrite
-	 *  our local weftCode + layoutCode copy (e.g. the user edited
-	 *  the file directly in the text editor).
+	/** Apply a host parseResult in place (no remount): the host owns the
+	 *  authoritative .weft text and re-sends it on direct file edits, focus
+	 *  changes, background ticks, etc.
 	 *
-	 *  Race window: in-graph config edits update `weftCode`
-	 *  locally, then debounce `saveProject` for ~1s. During that
-	 *  window, anything that triggers a host-side `triggerParse`
-	 *  (a focus-change, an iframe rebuild's `ready` re-emit, a
-	 *  background tick) reads the OLD source from disk and posts
-	 *  it back as a parseResult. If we naively accept that, the
-	 *  in-memory edit reverts to the disk version. We avoid that
-	 *  by treating any unsaved edit (saveProjectTimer pending OR
-	 *  fieldEditor with an active key) as authoritative and
-	 *  dropping the host echo until the saveWeft round-trip
-	 *  completes. */
-	export function applyExternalSource(newWeftCode: string, newLayoutCode: string): void {
+	 *  Staleness guard: GUI config edits are buffered (pendingConfigOps) and
+	 *  flushed on a ~1s `saveProjectTimer`. While that timer is pending, a
+	 *  host-side reparse triggered by something else (a focus-change, a `ready`
+	 *  re-emit) can echo the PRE-edit source back. Accepting it would revert the
+	 *  not-yet-flushed edit, so we drop any echo that differs from our working
+	 *  copy while a flush is pending; the round-trip after the flush reconciles. */
+	export function applyExternalSource(newProject: ProjectDefinition, newWeftCode: string, newLayoutCode: string): void {
 		if (newLayoutCode !== layoutCode) layoutCode = newLayoutCode;
-		// Local copy is ahead of the host's view of the .weft. A
-		// pending saveProjectTimer is the canonical signal: a
-		// debounced saveWeft is in flight, the local weftCode
-		// reflects the user's most recent edits, and the host
-		// echo is necessarily stale. Drop the echo; the next
-		// round-trip after saveProjectTimer fires will reconcile.
 		if (saveProjectTimer !== null && newWeftCode !== weftCode) {
 			return;
 		}
-		// Fast path: if the source matches what we already have,
-		// the user-visible structure didn't change, but the
-		// COMPILER may have re-inferred port metadata that isn't
-		// captured in the source text (laneMode for implicit
-		// Gather/Expand, inferred concrete portTypes from edges).
-		// We need to refresh those without re-running ELK or
-		// rebuilding the node list. mergeInferredPortMetadata
-		// patches the existing nodes in place.
+		// Fast path: the source text didn't change, but the compiler may have
+		// re-inferred port metadata not captured in the text (laneMode for
+		// implicit Gather/Expand, concrete portTypes from edges). Patch those in
+		// place without rebuilding the node list or re-running ELK.
 		if (newWeftCode === weftCode) {
-			const cached = parseWeftCode(weftCode);
-			if (cached.projects.length > 0) {
-				mergeInferredPortMetadata(cached.projects[0].project);
-			}
+			mergeInferredPortMetadata(newProject);
 			return;
 		}
 		weftCode = newWeftCode;
-		const result = parseWeftCode(weftCode);
-		if (result.projects.length > 0) {
-			const w = result.projects[0];
-			applyParseResult(w);
-			if (w.project.name) project.name = w.project.name;
-			if (w.project.description !== undefined) project.description = w.project.description;
-			void patchFromProject(w.project);
-		}
+		if (newProject.name) project.name = newProject.name;
+		if (newProject.description !== undefined) project.description = newProject.description;
+		void patchFromProject(newProject);
 	}
 
 	/// Update each existing graph node's `data.inputs` / `data.outputs`
@@ -1549,259 +1555,38 @@
 		return true;
 	}
 
-	export async function patchFromProject(newProject: ProjectDefinition, andFitView = false): Promise<void> {
-		// Reset opaque blocks since we're applying a new project (errors are preserved, set by applyParseResult)
-		weftOpaqueBlocks = [];
-		// Build a position map from the current editor state so unchanged nodes keep their spot
+	/// Re-render the graph from a structural parse (the round-trip after an
+	/// edit). This NEVER auto-organizes: a structural edit (field change,
+	/// delete, add-edge, move, hand-placed add) must not reshuffle the graph.
+	/// ELK relayout is a separate, explicit thing driven by the layout side
+	/// (resize, expand/collapse) or the toolbar Auto-organize button, which
+	/// call `runAutoOrganize` directly. Fresh-mount layout is the mount $effect.
+	export async function patchFromProject(newProject: ProjectDefinition): Promise<void> {
 		const currentPositions = new Map(nodes.map(n => [n.id, n.position]));
+		const layoutMap = parseLayoutCode(layoutCode);
 
-		// Rebuild nodes from the new project, injecting preserved positions where available.
-		// New nodes get class 'node-pending-layout' (opacity:0) so they render+measure but stay invisible.
-		// runAutoOrganize removes this class after ELK completes.
-		const newNodes = buildNodes(newProject.nodes, newProject.edges, parseLayoutCode(layoutCode)).map(n => {
+		// A node keeps its position from the current render or its saved
+		// `.layout` entry (e.g. a just-placed node). A node with neither (e.g.
+		// added by typing in the code panel) is placed below existing content so
+		// it's visible without an ELK pass shuffling everything.
+		let nextFreeY = 0;
+		for (const n of nodes) nextFreeY = Math.max(nextFreeY, n.position.y + (n.measured?.height ?? 100) + 40);
+		const newNodes = buildNodes(newProject.nodes, newProject.edges, layoutMap).map(n => {
 			const existingPos = currentPositions.get(n.id);
 			if (existingPos) return { ...n, position: existingPos };
-			// New node: invisible but rendered so SvelteFlow can measure it
-			return { ...n, class: ((n.class ?? '') + ' node-pending-layout').trim() };
+			const layoutEntry = layoutMap[n.id];
+			if (layoutEntry) return { ...n, position: { x: layoutEntry.x, y: layoutEntry.y } };
+			const pos = { x: 0, y: nextFreeY };
+			nextFreeY += 140;
+			return { ...n, position: pos };
 		});
 		nodes = newNodes;
 
-		// New edges get hidden so they don't flash in wrong positions before ELK runs.
 		const currentEdgeIds = new Set(edges.map(e => e.id));
 		edges = buildEdges(newProject.edges, newProject.nodes).map(e =>
-			currentEdgeIds.has(e.id) ? e : { ...e, hidden: true, data: { ...e.data, pendingLayout: true } }
+			currentEdgeIds.has(e.id) ? e : { ...e }
 		);
-
-		// Wait for SvelteFlow to measure the new nodes before running ELK.
-		// Without this, n.measured is empty and ELK uses wrong size estimates.
 		await tick();
-		await new Promise(resolve => setTimeout(resolve, 300));
-		await runAutoOrganize(andFitView);
-	}
-
-	// Weft streaming: AI streams raw weft text into the code editor
-	let streamLastNodeIds = new Set<string>();
-	let streamLastEdgeIds = new Set<string>();
-	let streamParseTimer: ReturnType<typeof setTimeout> | null = null;
-	let streamOrganizePending = false;
-
-	function streamSyncVisual(parsed: ProjectDefinition) {
-		weftSyncDirection = 'to-editor';
-		const currentPositions = new Map(nodes.map(n => [n.id, n.position]));
-		// Preserve existing styles for nodes that are already rendered, so groups
-		// keep their ELK-computed sizes instead of flashing back to defaults.
-		const currentStyles = new Map(nodes.map(n => [n.id, n.style]));
-		// Also preserve current group configs (width/height from ELK) for buildNodes
-		const currentGroupConfigs = new Map<string, { width?: number; height?: number }>();
-		for (const n of nodes) {
-			if (n.type === 'group') {
-				const cfg = n.data.config as Record<string, unknown> | undefined;
-				const rect = getNodeRect(n);
-				currentGroupConfigs.set(n.id, {
-					width: (cfg?.width as number) || rect.width || undefined,
-					height: (cfg?.height as number) || rect.height || undefined,
-				});
-			}
-		}
-		// Inject preserved group dimensions into parsed nodes before buildNodes
-		for (const pn of parsed.nodes) {
-			if (pn.nodeType === 'Group') {
-				const saved = currentGroupConfigs.get(pn.id);
-				if (saved) {
-					const cfg = (pn.config as Record<string, unknown>) || {};
-					if (!cfg.width && saved.width) cfg.width = saved.width;
-					if (!cfg.height && saved.height) cfg.height = saved.height;
-					(pn as any).config = cfg;
-				}
-			}
-		}
-		// Compute the right edge of existing content so new nodes can be placed
-		// to the right instead of on top of existing nodes.
-		let existingRightEdge = 0;
-		for (const n of nodes) {
-			if (n.style === 'display: none;') continue;
-			const w = n.measured?.width ?? 200;
-			existingRightEdge = Math.max(existingRightEdge, n.position.x + w);
-		}
-		let newNodeOffsetY = 0;
-		const newNodes = buildNodes(parsed.nodes, parsed.edges, parseLayoutCode(layoutCode)).map(n => {
-			const existingPos = currentPositions.get(n.id);
-			const existingStyle = currentStyles.get(n.id);
-			if (existingPos) {
-				// Keep existing style if available (prevents group resize flicker)
-				const style = existingStyle && existingStyle !== 'display: none;' ? existingStyle : n.style;
-				return { ...n, position: existingPos, style };
-			}
-			// New node: place to the right of existing content, stacked vertically
-			const pos = { x: existingRightEdge + 100, y: newNodeOffsetY };
-			newNodeOffsetY += 80;
-			return { ...n, position: pos, class: ((n.class ?? '') + ' node-pending-layout').trim() };
-		});
-		nodes = newNodes;
-		// Track which nodes are truly "unanchored" (pending layout AND not inside
-		// an already-positioned group). Children of existing groups inherit position
-		// from the parent, so their edges should be visible immediately.
-		const pendingNodeIds = new Set<string>();
-		for (const n of newNodes) {
-			if (typeof n.class !== 'string' || !n.class.includes('node-pending-layout')) continue;
-			// If this node's parent group is already positioned, don't consider it pending
-			if (n.parentId && currentPositions.has(n.parentId)) continue;
-			pendingNodeIds.add(n.id);
-		}
-		const currentEdgeIds = new Set(edges.map(e => e.id));
-		edges = buildEdges(parsed.edges, parsed.nodes).map(e => {
-			if (currentEdgeIds.has(e.id)) return e;
-			// Hide new edges until ELK positions everything (prevents flash to wrong position)
-			return { ...e, hidden: true, data: { ...e.data, pendingLayout: true } };
-		});
-		weftSyncDirection = 'none';
-		// Debounce auto-organize so we don't run ELK on every single item
-		if (!streamOrganizePending) {
-			streamOrganizePending = true;
-			tick().then(() => {
-				setTimeout(() => {
-					streamOrganizePending = false;
-					runAutoOrganize(false);
-				}, 400);
-			});
-		}
-	}
-
-	let streamLastWeftContent = '';
-	function streamTryIncrementalParse() {
-		const fenced = '````weft\n' + weftCode + '\n````';
-		const result = parseWeft(fenced);
-		if (result.projects.length === 0) return;
-		const { project: parsed } = result.projects[0];
-
-		// Check if the set of node/edge IDs changed (handles add, remove, and modify)
-		const newNodeIds = new Set(parsed.nodes.map(n => n.id));
-		const newEdgeIds = new Set(parsed.edges.map(e => e.id));
-		const nodesDiffer = newNodeIds.size !== streamLastNodeIds.size || [...newNodeIds].some(id => !streamLastNodeIds.has(id));
-		const edgesDiffer = newEdgeIds.size !== streamLastEdgeIds.size || [...newEdgeIds].some(id => !streamLastEdgeIds.has(id));
-		// Detect any content change (length OR content) so same-length patches still sync
-		const contentChanged = weftCode !== streamLastWeftContent;
-
-		if (nodesDiffer || edgesDiffer || contentChanged) {
-			streamLastNodeIds = newNodeIds;
-			streamLastEdgeIds = newEdgeIds;
-			streamLastWeftContent = weftCode;
-			streamSyncVisual(parsed);
-		}
-	}
-
-	export function weftStreamStart(mode: 'weft' | 'weft-patch' | 'weft-continue') {
-		weftStreaming = true;
-		weftSyncDirection = 'to-code';
-		streamOrganizePending = false;
-		if (streamParseTimer) { clearTimeout(streamParseTimer); streamParseTimer = null; }
-		// Cancel any pending code-edit debounce so stale user edits don't fire mid-stream
-		if (weftSyncTimer) { clearTimeout(weftSyncTimer); weftSyncTimer = null; codeEditInFlight = false; }
-		// Force-blur the code panel to prevent focus-related sync bugs during AI edits
-		if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
-		if (mode === 'weft') {
-			// Full weft: clear editor for incoming content
-			weftCode = '';
-			clearWeftParseState();
-			streamLastNodeIds = new Set();
-			streamLastEdgeIds = new Set();
-			streamLastWeftContent = '';
-		} else {
-			// weft-patch and weft-continue: preserve existing code
-			if (mode === 'weft-continue' && weftCode.length > 0 && !weftCode.endsWith('\n')) {
-				weftCode += '\n';
-			}
-			streamLastNodeIds = new Set(nodes.map(n => n.id));
-			streamLastEdgeIds = new Set(edges.map(e => e.id));
-			streamLastWeftContent = weftCode;
-		}
-	}
-
-	export function weftStreamDelta(delta: string, mode: 'weft' | 'weft-patch' | 'weft-continue', at?: number) {
-		if (at !== undefined && at >= 0) {
-			// Positional insertion: splice delta at the given character offset
-			weftCode = weftCode.slice(0, at) + delta + weftCode.slice(at);
-		} else {
-			// Append mode (weft / weft-continue)
-			weftCode += delta;
-		}
-		// Try incremental parse (debounced to avoid parsing on every token)
-		if (streamParseTimer) clearTimeout(streamParseTimer);
-		streamParseTimer = setTimeout(() => {
-			streamParseTimer = null;
-			streamTryIncrementalParse();
-		}, 100);
-	}
-
-	export function getWeftCode(): string {
-		return weftCode;
-	}
-
-	export function getRawWeftCode(): string {
-		return weftCode;
-	}
-
-	export function getLayoutCode(): string {
-		return layoutCode;
-	}
-
-	export function isStreaming(): boolean {
-		return weftStreaming;
-	}
-
-	export function updateNodeConfigs(configUpdates: Array<{ nodeId: string; fieldKey: string; value: unknown }>) {
-		nodes = nodes.map(n => {
-			const updates = configUpdates.filter(u => u.nodeId === n.id);
-			if (updates.length === 0) return n;
-			let newConfig = { ...(n.data.config as Record<string, unknown>) };
-			for (const u of updates) newConfig[u.fieldKey] = u.value;
-			return { ...n, data: { ...n.data, config: newConfig } };
-		});
-		// Surgically update weftCode for each config change
-		for (const u of configUpdates) {
-			weftCode = weftUpdateConfig(weftCode, u.nodeId, u.fieldKey, u.value);
-		}
-		saveProject();
-	}
-
-	/** Find a SEARCH block match in weftCode, erase the matched region, return insert offset. */
-	export function weftStreamPatchSearch(searchText: string): { insertAt: number } | { error: string } {
-		const match = findSearchMatch(weftCode, searchText);
-		if ('error' in match) return match;
-		weftCode = weftCode.slice(0, match.offset) + weftCode.slice(match.offset + match.length);
-		return { insertAt: match.offset };
-	}
-
-	export async function weftStreamEnd(): Promise<{ errors: WeftParseError[]; warnings: WeftWarning[]; opaqueBlocks: OpaqueBlock[] }> {
-		if (streamParseTimer) { clearTimeout(streamParseTimer); streamParseTimer = null; }
-		// Safety: strip any fences from weftCode before wrapping
-		weftCode = stripWeftFences(weftCode);
-		// Final parse and sync
-		const result = parseWeftCode(weftCode);
-		if (result.projects.length > 0) {
-			const { project: parsed, opaqueBlocks, errors, warnings } = result.projects[0];
-			applyParseResult(result.projects[0]);
-
-			// Sync name/description so saveProject uses the updated values
-			if (parsed.name) project.name = parsed.name;
-			if (parsed.description !== undefined) project.description = parsed.description;
-
-			// Visual sync and auto-organize
-			streamSyncVisual(parsed);
-			weftStreaming = false;
-			// Wait for auto-organize to settle (ELK writes @layout back to weftCode)
-			await tick();
-			await new Promise(resolve => setTimeout(resolve, 600));
-			await tick();
-			// Save after auto-organize so @layout directives reflect ELK positions
-			saveProject();
-
-			return { errors, warnings, opaqueBlocks };
-		}
-
-		weftStreaming = false;
-		weftSyncDirection = 'none';
-		return { errors: result.errors, warnings: [], opaqueBlocks: [] };
 	}
 
 	// Fit view to graph on initial load
@@ -1847,9 +1632,6 @@
 			case 'run':
 				onRun?.();
 				break;
-			case 'add_group':
-				addNode('Group');
-				break;
 			case 'undo':
 				undo();
 				break;
@@ -1873,31 +1655,30 @@
 					}
 				}
 				break;
-			case 'delete':
-				// Delete selected node(s)
-				if (selectedNodeId) {
-					deleteNode(selectedNodeId);
-				} else {
-					const selectedNodes = nodes.filter(n => n.selected);
-					if (selectedNodes.length > 0) {
-						deleteNodes(selectedNodes.map(n => n.id));
-					}
+			case 'delete': {
+				// Selected edges take priority over nodes (matches canvas Delete).
+				const selectedEdges = edges.filter(e => e.selected);
+				if (selectedEdges.length > 0) {
+					recordEdit(selectedEdges.map(e => {
+						const ref = toWeftEdgeRef(e.source, e.sourceHandle || 'value', e.target, e.targetHandle || 'value');
+						return { op: 'removeEdge' as const, source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+					}));
+					edges = edges.filter(e => !e.selected);
+					break;
 				}
+				const selectedNodes = nodes.filter(n => n.selected);
+				if (selectedNodes.length > 0) deleteNodes(selectedNodes.map(n => n.id));
+				else if (selectedNodeId) deleteNodes([selectedNodeId]);
+				break;
+			}
+			case 'escape':
+				contextMenu = null;
+				pendingConnection = null;
 				break;
 			case 'autoOrganize': {
-				// Re-parse current code and re-layout visually
-				const result = parseWeftCode(weftCode);
-				if (result.projects.length > 0) {
-					const w = result.projects[0];
-					applyParseResult(w);
-					patchFromProject(w.project, true).then(() => {
-						// After auto-organize, update @layout directives in weftCode
-						for (const n of nodes) {
-							layoutUpdateAny(n);
-						}
-						saveProject();
-					});
-				}
+				// Re-layout the current graph with ELK. No re-parse (rendered
+				// nodes are current); runAutoOrganize persists the layout itself.
+				void runAutoOrganize(true);
 				break;
 			}
 		}
@@ -1988,12 +1769,13 @@
 		if (structuralLock) return;
 		reconnectSuccessful = true;
 
-		// Remove old edge from weft code, add new one
+		// Remove old edge, add new one: one atomic batch.
 		const oldRef = toWeftEdgeRef(oldEdge.source, oldEdge.sourceHandle || 'value', oldEdge.target, oldEdge.targetHandle || 'value');
-		weftCode = weftRemoveEdge(weftCode, oldRef.srcRef, oldRef.srcPort, oldRef.tgtRef, oldRef.tgtPort);
-
 		const newRef = toWeftEdgeRef(newConnection.source, newConnection.sourceHandle || 'value', newConnection.target, newConnection.targetHandle || 'value');
-		weftCode = weftAddEdge(weftCode, newRef.srcRef, newRef.srcPort, newRef.tgtRef, newRef.tgtPort, newRef.scopeGroupLabel);
+		recordEdit([
+			{ op: 'removeEdge', source: oldRef.srcRef, sourcePort: oldRef.srcPort, target: oldRef.tgtRef, targetPort: oldRef.tgtPort, scopeGroup: oldRef.scopeGroupLabel ?? null },
+			{ op: 'addEdge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null },
+		]);
 
 		// Update the edge with new connection
 		edges = edges.map(e => {
@@ -2008,7 +1790,6 @@
 			}
 			return e;
 		});
-		saveToHistory();
 	}
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2016,9 +1797,8 @@
 		// If reconnection wasn't successful (dropped on empty space), delete the edge
 		if (!reconnectSuccessful && !structuralLock) {
 			const ref = toWeftEdgeRef(edge.source, edge.sourceHandle || 'value', edge.target, edge.targetHandle || 'value');
-			weftCode = weftRemoveEdge(weftCode, ref.srcRef, ref.srcPort, ref.tgtRef, ref.tgtPort);
+			recordEdit([{ op: 'removeEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
 			edges = edges.filter(e => e.id !== edge.id);
-			saveToHistory();
 		}
 		reconnectSuccessful = false;
 	}
@@ -2106,13 +1886,10 @@
 			},
 		};
 		
-		// Schedule save after the edge is added
+		// Emit the add-edge intent after the optimistic edge is added.
 		setTimeout(() => {
-			// Add edge to weftCode with proper scoping
 			const ref = toWeftEdgeRef(connection.source!, sourceHandle || 'value', connection.target!, targetHandle || 'value');
-			weftCode = weftAddEdge(weftCode, ref.srcRef, ref.srcPort, ref.tgtRef, ref.tgtPort, ref.scopeGroupLabel);
-			saveToHistory();
-			saveProject();
+			recordEdit([{ op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
 		}, 0);
 
 		return newEdge;
@@ -2139,10 +1916,20 @@
 
 	function addNode(type: NodeType) {
 		if (structuralLock) return;
-		const id = generateNodeId(type);
 		const typeConfig = NODE_TYPE_CONFIG[type];
 		const isGroup = type === 'Group';
 		const isAnnotation = type === 'Annotation';
+		// A group is declared in source by its label (`MyGroup = Group()...`),
+		// so the label IS its node id once parsed. Use the label as the
+		// optimistic node's id too, otherwise the optimistic node (`group_1`)
+		// and the round-tripped node (`MyGroup`) have different ids: the graph
+		// flashes (swap) and the position is lost (no currentPositions match).
+		// Seed group names from a safe default, NOT the type's display label:
+		// that label is "Group", which is a reserved type keyword the compiler
+		// rejects as an identifier (and `MyGroup.out` references would misparse
+		// as inline groups). "MyGroup" is a valid, non-reserved starting point.
+		const groupLabel = isGroup ? generateUniqueGroupLabel('MyGroup') : null;
+		const id = isGroup ? groupLabel! : generateNodeId(type);
 		const pos = contextMenuFlowPos ?? getViewportCenter();
 		contextMenuFlowPos = null;
 		const newNode: Node = {
@@ -2151,7 +1938,7 @@
 			position: { x: pos.x, y: pos.y },
 			selected: true, // Select the new node
 			data: {
-				label: isGroup ? generateUniqueGroupLabel(typeConfig.label) : null,
+				label: groupLabel,
 				nodeType: type,
 				config: isGroup ? { width: 400, height: 300, expanded: true } : isAnnotation ? { width: 250, height: 120, content: '' } : {},
 				inputs: [...typeConfig.defaultInputs],
@@ -2173,17 +1960,17 @@
 			nodes = [...deselectedNodes, newNode];
 		}
 		selectedNodeId = id;
-		// Add node/group to weftCode
-		if (isGroup) {
-			const groupLabel = newNode.data.label as string;
-			weftCode = weftAddGroup(weftCode, groupLabel);
-			layoutCode = updateLayoutEntry(layoutCode, groupLabel, pos.x, pos.y, 400, 300);
-		} else {
-			weftCode = weftAddNode(weftCode, type, id);
-			layoutCode = updateLayoutEntry(layoutCode, id, pos.x, pos.y);
-		}
-		saveToHistory();
-		saveProject();
+		// One reversible action: the add intent (source) + the drop position
+		// (layout). The source round-trip re-renders; the layout entry keeps the
+		// node where it was dropped (patchFromProject reads it, so the round-trip
+		// doesn't ELK-place it).
+		const op: EditOp = isGroup
+			? { op: 'addGroup', label: newNode.data.label as string, parentGroup: null }
+			: { op: 'addNode', id, nodeType: type, parentGroup: null };
+		recordEdit([op], () => {
+			if (isGroup) layoutCode = updateLayoutEntry(layoutCode, newNode.data.label as string, pos.x, pos.y, 400, 300);
+			else layoutCode = updateLayoutEntry(layoutCode, id, pos.x, pos.y);
+		});
 	}
 
 	function deleteNodes(nodeIds: string[]) {
@@ -2247,108 +2034,72 @@
 			selectedNodeId = null;
 		}
 		contextMenu = null;
-		// Remove deleted nodes/groups from weftCode and layoutCode
-		// Delete non-group nodes first so children are removed while still inside their group scope
+		// Emit removals as one atomic batch. Non-group nodes first so children
+		// are removed while still inside their group scope; layout entries clear
+		// locally.
+		const ops: EditOp[] = [];
+		const layoutKeysToDrop: string[] = [];
 		for (const nodeId of nodeIds) {
 			if (!groupLabels.has(nodeId)) {
-				weftCode = weftRemoveNode(weftCode, nodeId);
-				layoutCode = removeLayoutEntry(layoutCode, nodeId);
+				ops.push({ op: 'removeNode', node: nodeId });
+				layoutKeysToDrop.push(nodeId);
 			}
 		}
 		for (const nodeId of nodeIds) {
 			const groupLabel = groupLabels.get(nodeId);
 			if (groupLabel) {
-				weftCode = weftRemoveGroup(weftCode, groupLabel);
-				layoutCode = removeLayoutEntry(layoutCode, groupLabel);
+				ops.push({ op: 'removeGroup', group: groupLabel });
+				layoutKeysToDrop.push(groupLabel);
 			}
 		}
-		saveToHistory();
-		saveProject();
+		recordEdit(ops, () => {
+			for (const key of layoutKeysToDrop) layoutCode = removeLayoutEntry(layoutCode, key);
+		});
 	}
+
+	// The single canvas keymap: chord -> action name, dispatched through
+	// handlePaletteAction (the one action dispatcher; the palette's command list
+	// routes through it too). One declaration site, so no two handlers can claim
+	// the same chord (the double-undo bug). `inEditable` entries fire even while
+	// typing in a field (only Ctrl+S); everything else is canvas-only.
+	// `when` gates a chord on editor state (e.g. Escape only acts when there's a
+	// menu/connection to close, so it otherwise falls through to xyflow's own
+	// Escape handling). `inEditable` lets a chord fire while typing in a field
+	// (only Ctrl+S); everything else is canvas-only.
+	type Chord = { ctrl?: boolean; shift?: boolean; key: string; action: string; inEditable?: boolean; when?: () => boolean };
+	const KEYMAP: Chord[] = [
+		{ ctrl: true, key: 's', action: 'save', inEditable: true },
+		{ ctrl: true, shift: false, key: 'z', action: 'undo' },
+		{ ctrl: true, key: 'y', action: 'redo' },
+		{ ctrl: true, shift: true, key: 'z', action: 'redo' },
+		{ ctrl: true, key: 'a', action: 'selectAll' },
+		{ ctrl: true, key: 'd', action: 'duplicate' },
+		{ ctrl: true, key: 'Enter', action: 'run' },
+		{ key: 'Delete', action: 'delete' },
+		{ key: 'Backspace', action: 'delete' },
+		{ key: 'Escape', action: 'escape', when: () => contextMenu !== null || pendingConnection !== null },
+	];
 
 	function handleKeyDown(event: KeyboardEvent) {
 		const target = event.target as HTMLElement;
-		// Skip if user is typing in an input, textarea, or contenteditable element
-		// This allows native text editing shortcuts (Ctrl+A, Ctrl+Z, etc.) to work
-		const isEditableElement = 
-			target.tagName === 'INPUT' || 
-			target.tagName === 'TEXTAREA' || 
+		const isEditableElement =
+			target.tagName === 'INPUT' ||
+			target.tagName === 'TEXTAREA' ||
 			target.isContentEditable ||
 			target.closest('[role="dialog"]') ||
 			target.closest('.edit-textarea') ||
 			target.closest('.annotation-node.editing');
-		
-		// Ctrl+S: save (works from anywhere, including code editors)
-		if ((event.ctrlKey || event.metaKey) && event.key === 's') {
-			event.preventDefault();
-			// Flush pending code panel debounce: parse + update diagram + save
-			if (weftSyncTimer && codeEditInFlight) {
-				clearTimeout(weftSyncTimer);
-				weftSyncTimer = null;
-				codeEditInFlight = false;
-				const result = parseWeftCode(weftCode);
-				if (result.projects.length > 0) {
-					const w = result.projects[0];
-					applyParseResult(w);
-					if (w.project.name) project.name = w.project.name;
-					if (w.project.description !== undefined) project.description = w.project.description;
-					patchFromProject(w.project);
-				}
-			}
-			saveProject();
-			return;
-		}
 
-		if (isEditableElement) return;
-
-		// Escape: close context menu and cancel pending connection
-		if (event.key === 'Escape') {
-			if (contextMenu || pendingConnection) {
-				event.preventDefault();
-				contextMenu = null;
-				pendingConnection = null;
-				return;
-			}
-		}
-		
-		// Undo: Ctrl+Z
-		if ((event.ctrlKey || event.metaKey) && event.key === 'z' && !event.shiftKey) {
+		const ctrl = event.ctrlKey || event.metaKey;
+		for (const c of KEYMAP) {
+			if (c.key !== event.key) continue;
+			if ((c.ctrl ?? false) !== ctrl) continue;
+			if (c.shift !== undefined && c.shift !== event.shiftKey) continue;
+			if (isEditableElement && !c.inEditable) return; // let the field handle it
+			if (c.when && !c.when()) return; // precondition not met: don't claim the key
 			event.preventDefault();
-			undo();
+			handlePaletteAction(c.action);
 			return;
-		}
-		
-		// Redo: Ctrl+Y or Ctrl+Shift+Z
-		if ((event.ctrlKey || event.metaKey) && (event.key === 'y' || (event.key === 'z' && event.shiftKey))) {
-			event.preventDefault();
-			redo();
-			return;
-		}
-		
-		// Delete
-		if (event.key === 'Delete' || event.key === 'Backspace') {
-			const selectedEdges = edges.filter(e => e.selected);
-			if (selectedEdges.length > 0) {
-				event.preventDefault();
-				// Remove edges from weftCode
-				for (const e of selectedEdges) {
-					const ref = toWeftEdgeRef(e.source, e.sourceHandle || 'value', e.target, e.targetHandle || 'value');
-					weftCode = weftRemoveEdge(weftCode, ref.srcRef, ref.srcPort, ref.tgtRef, ref.tgtPort);
-				}
-				edges = edges.filter(e => !e.selected);
-				saveToHistory();
-				saveProject();
-				return;
-			}
-			
-			const selectedNodes = nodes.filter(n => n.selected);
-			if (selectedNodes.length > 0) {
-				event.preventDefault();
-				deleteNodes(selectedNodes.map(n => n.id));
-			} else if (selectedNodeId) {
-				event.preventDefault();
-				deleteNodes([selectedNodeId]);
-			}
 		}
 	}
 
@@ -2395,8 +2146,6 @@
 	}
 
 	function onNodeDragStart({ targetNode, nodes: draggedNodes }: { targetNode: Node | null; event: MouseEvent | TouchEvent; nodes: Node[] }) {
-		// Capture state before drag - will be saved when drag stops
-		lastPushTime = 0; // Reset debounce to allow save
 		// Store pre-drag positions for all dragged nodes (for scope-blocked revert)
 		preDragPositions.clear();
 		for (const dn of draggedNodes) {
@@ -2412,59 +2161,60 @@
 	function onNodeDragStop({ targetNode, nodes: draggedNodes }: { targetNode: Node | null; nodes: Node[] }) {
 		if (!targetNode) return;
 
-		// Re-read from current nodes state after each step to avoid stale references.
-		let currentNode = nodes.find(n => n.id === targetNode.id);
-		if (currentNode) {
-			if (currentNode.parentId) {
-				checkNodeLeavesGroup(currentNode);
-				currentNode = nodes.find(n => n.id === targetNode.id);
-			}
+		// One reversible action for the whole gesture: any reparent (move ops
+		// from the capture checks) + the final positions are committed together,
+		// so a single undo reverts the entire drag, not piece by piece.
+		transaction(() => {
+			// Re-read from current nodes state after each step to avoid stale refs.
+			let currentNode = nodes.find(n => n.id === targetNode.id);
 			if (currentNode) {
-				checkNodeCapturedByGroup(currentNode);
-				currentNode = nodes.find(n => n.id === targetNode.id);
+				if (currentNode.parentId) {
+					checkNodeLeavesGroup(currentNode);
+					currentNode = nodes.find(n => n.id === targetNode.id);
+				}
+				if (currentNode) {
+					checkNodeCapturedByGroup(currentNode);
+					currentNode = nodes.find(n => n.id === targetNode.id);
+				}
+				if (currentNode?.type === 'group' || currentNode?.type === 'groupCollapsed') {
+					checkGroupCapturesNodes(currentNode);
+				}
 			}
-			if (currentNode?.type === 'group' || currentNode?.type === 'groupCollapsed') {
-				checkGroupCapturesNodes(currentNode);
-			}
-		}
-
-		// Update weftCode with new positions for all dragged nodes
-		for (const dn of draggedNodes) {
-			const n = nodes.find(nd => nd.id === dn.id);
-			if (!n) continue;
-			layoutUpdateAny(n);
-		}
-		saveToHistory();
-		saveProject();
+			recordEdit([], () => {
+				for (const dn of draggedNodes) {
+					const n = nodes.find(nd => nd.id === dn.id);
+					if (n) layoutUpdateAny(n);
+				}
+			});
+		});
 	}
 
 	function onSelectionDragStop(_event: MouseEvent, selectedNodes: Node[]) {
-		// Check group captures for each selected node.
-		// Re-read from current nodes state to avoid stale parentId.
-		for (const selectedNode of selectedNodes) {
-			let node = nodes.find(n => n.id === selectedNode.id);
-			if (!node) continue;
-			if (node.parentId) {
-				checkNodeLeavesGroup(node);
-				node = nodes.find(n => n.id === selectedNode.id);
+		// One reversible action for the whole multi-select drag (reparents + the
+		// final positions), so a single undo reverts the entire gesture.
+		transaction(() => {
+			for (const selectedNode of selectedNodes) {
+				let node = nodes.find(n => n.id === selectedNode.id);
+				if (!node) continue;
+				if (node.parentId) {
+					checkNodeLeavesGroup(node);
+					node = nodes.find(n => n.id === selectedNode.id);
+				}
+				if (node) {
+					checkNodeCapturedByGroup(node);
+					node = nodes.find(n => n.id === selectedNode.id);
+				}
+				if (node && (node.type === 'group' || node.type === 'groupCollapsed')) {
+					checkGroupCapturesNodes(node);
+				}
 			}
-			if (node) {
-				checkNodeCapturedByGroup(node);
-				node = nodes.find(n => n.id === selectedNode.id);
-			}
-			if (node && (node.type === 'group' || node.type === 'groupCollapsed')) {
-				checkGroupCapturesNodes(node);
-			}
-		}
-
-		// Update weftCode with new positions
-		for (const sn of selectedNodes) {
-			const n = nodes.find(nd => nd.id === sn.id);
-			if (!n) continue;
-			layoutUpdateAny(n);
-		}
-		saveToHistory();
-		saveProject();
+			recordEdit([], () => {
+				for (const sn of selectedNodes) {
+					const n = nodes.find(nd => nd.id === sn.id);
+					if (n) layoutUpdateAny(n);
+				}
+			});
+		});
 	}
 
 	let lastScopeBlockToastTime = 0;
@@ -2746,8 +2496,11 @@
 		if (!nodeToDuplicate) return;
 
 		const nodeType = nodeToDuplicate.data.nodeType as string;
-		const newId = generateNodeId(nodeType);
 		const isGroup = nodeToDuplicate.type === 'group' || nodeToDuplicate.type === 'groupCollapsed';
+		// A group's id is its label in source; keep optimistic id == label so the
+		// round-tripped node matches (no flash, position preserved). See addNode.
+		const newLabel = isGroup ? generateUniqueGroupLabel((nodeToDuplicate.data.label as string) || 'MyGroup') : (nodeToDuplicate.data.label as string | null);
+		const newId = isGroup ? (newLabel as string) : generateNodeId(nodeType);
 		const newPos = { x: nodeToDuplicate.position.x + 50, y: nodeToDuplicate.position.y + 50 };
 
 		const newNode: Node = {
@@ -2756,7 +2509,7 @@
 			position: newPos,
 			data: {
 				...nodeToDuplicate.data,
-				label: isGroup ? generateUniqueGroupLabel((nodeToDuplicate.data.label as string) || 'Group') : nodeToDuplicate.data.label,
+				label: newLabel,
 				onUpdate: createNodeUpdateHandler(newId),
 			},
 		};
@@ -2764,70 +2517,85 @@
 		selectedNodeId = newId;
 		contextMenu = null;
 
-		// Sync to weftCode
+		// The duplication as one reversible action (add + copy config fields,
+		// source) with the new node's drop position (layout).
+		const ops: EditOp[] = [];
+		let mutateLayout: () => void;
 		if (isGroup) {
 			const groupLabel = newNode.data.label as string;
-			weftCode = weftAddGroup(weftCode, groupLabel);
-			layoutCode = updateLayoutEntry(layoutCode, groupLabel, newPos.x, newPos.y,
-				(newNode.data.config as Record<string, number>)?.width,
-				(newNode.data.config as Record<string, number>)?.height);
+			const cfg = newNode.data.config as Record<string, number>;
+			ops.push({ op: 'addGroup', label: groupLabel, parentGroup: null });
+			mutateLayout = () => { layoutCode = updateLayoutEntry(layoutCode, groupLabel, newPos.x, newPos.y, cfg?.width, cfg?.height); };
 		} else {
-			weftCode = weftAddNode(weftCode, nodeType, newId);
-			layoutCode = updateLayoutEntry(layoutCode, newId, newPos.x, newPos.y);
-			// Copy config fields from the original node
+			ops.push({ op: 'addNode', id: newId, nodeType, parentGroup: null });
+			mutateLayout = () => { layoutCode = updateLayoutEntry(layoutCode, newId, newPos.x, newPos.y); };
 			const config = nodeToDuplicate.data.config as Record<string, unknown> | undefined;
 			if (config) {
 				for (const [key, value] of Object.entries(config)) {
 					if (['parentId', 'textareaHeights', 'width', 'height', 'expanded'].includes(key)) continue;
-					if (value === undefined || value === null || value === '') continue;
-					weftCode = weftUpdateConfig(weftCode, newId, key, value);
+					// Copy every set field, incl a deliberately-empty string (the
+					// live-edit path emits "", so duplicate must too or it drops
+					// an intentionally-blank field).
+					if (value === undefined || value === null) continue;
+					ops.push({ op: 'setConfig', node: newId, key, value: formatConfigValue(value) });
 				}
 			}
 		}
-		saveToHistory();
-		saveProject();
+		recordEdit(ops, mutateLayout);
 	}
-	
+
+	// Explicit save (Ctrl+S / palette): the source is already the host's via the
+	// edit-server, so this only flushes pending GUI edits and persists layout.
 	function saveProject() {
-		onSave({ name: project.name, description: project.description ?? undefined, weftCode, layoutCode });
+		flushAllPendingSaves();
+		saveLayout();
 		flashSaveStatus();
 	}
 
-	function flushPendingEdits() {
-		if (weftSyncTimer && codeEditInFlight) {
-			clearTimeout(weftSyncTimer);
-			weftSyncTimer = null;
-			codeEditInFlight = false;
-			saveProject();
-		}
+	/// Persist ONLY the layout (positions/sizes), not the source. Graph edits
+	/// send the source via onApplyEdits; their layout side (drop position of a
+	/// new node, a drag, a resize) persists through here so it survives a fresh
+	/// reload. Without this a GUI-placed node would lose its position.
+	function saveLayout() {
+		onSave({ layoutCode });
 	}
 
-	/// Flush every pending debounced save. Called before the host
-	/// kicks off Run / Activate / InfraStart so the build always
-	/// sees the user's latest edits, even if the 1s saveProjectTimer
-	/// debounce hasn't elapsed yet.
+	// GUI edits buffered while the user types in a config field; flushed as one
+	// atomic batch once typing pauses (see createNodeUpdateHandler).
+	let pendingConfigOps: import('../../../../shared/protocol').EditOp[] = [];
+
+	function flushPendingConfigOps() {
+		if (pendingConfigOps.length === 0) return;
+		const batch = pendingConfigOps;
+		pendingConfigOps = [];
+		recordEdit(batch);
+		flashSaveStatus();
+	}
+
+	type PortLike = { name: string; required?: boolean; portType?: string };
+	function toPortSigs(ports: PortLike[]): import('../../../../shared/protocol').EditPortSig[] {
+		return (ports ?? []).map(p => ({ name: p.name, required: p.required !== false, portType: p.portType }));
+	}
+
+	/// Flush every pending debounced edit. Called before the host kicks off
+	/// Run / Activate / InfraStart (so the build sees the user's latest edits)
+	/// and on teardown. Commits mid-typing field editors (their flush pushes the
+	/// pending value into pendingConfigOps), cancels the debounce, and drains the
+	/// op buffer as one reversible action via flushPendingConfigOps.
 	export function flushAllPendingSaves(): void {
-		// Code panel (raw .weft text edits): commit pending sync.
-		flushPendingEdits();
-		// Config-edit history timer: just save state, no saveWeft.
-		if (configEditTimer) {
-			clearTimeout(configEditTimer);
-			configEditTimer = null;
-			saveToHistory();
-		}
-		// Debounced saveProject from createNodeUpdateHandler. This
-		// is the one that actually calls onSave({ weftCode }) which
-		// posts saveWeft to the host. Fire it now.
+		fieldEditorRegistry.flushAll();
 		if (saveProjectTimer) {
 			clearTimeout(saveProjectTimer);
 			saveProjectTimer = null;
-			saveProject();
 		}
+		flushPendingConfigOps();
 	}
 
-	// Flush pending edits when the component is destroyed
+	// Flush buffered GUI config ops when the component is destroyed (panel
+	// close, background) so an in-flight edit isn't lost. NOTE: navigation
+	// flushes in the nav handlers (before the host swaps the watched doc).
 	$effect(() => {
-		return () => { flushPendingEdits(); };
+		return () => { flushAllPendingSaves(); };
 	});
 
 	function flashSaveStatus() {
@@ -2838,7 +2606,7 @@
 
 	</script>
 
-<svelte:window onkeydown={handleKeyDown} onbeforeunload={() => { flushPendingEdits(); }} onvisibilitychange={() => { if (document.hidden) { flushPendingEdits(); } }} />
+<svelte:window onkeydown={handleKeyDown} onbeforeunload={() => { flushAllPendingSaves(); }} onvisibilitychange={() => { if (document.hidden) { flushAllPendingSaves(); } }} />
 
 <!-- Command Palette -->
 <CommandPalette
@@ -3113,12 +2881,6 @@
 		stroke-linejoin: round;
 	}
 	
-	/* New nodes during patch: rendered for measurement but invisible until ELK positions them */
-	:global(.svelte-flow__node.node-pending-layout) {
-		opacity: 0 !important;
-		pointer-events: none !important;
-	}
-
 	/* Infrastructure subgraph highlighting */
 	:global(.svelte-flow__node.infra-dimmed) {
 		opacity: 0.15 !important;

@@ -1217,6 +1217,8 @@ mod scope_tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            file_refs: Default::default(),
+            include_path: None,
         }
     }
 

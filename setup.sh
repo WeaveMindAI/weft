@@ -78,6 +78,11 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# The VS Code extension id (publisher.name from extension-vscode/package.json).
+# Single source so install, version-probe, and uninstall can never drift (a
+# stale `weavemindai.` typo made --uninstall silently match nothing).
+ext_id="weavemind.weft-vscode"
+
 # ---- visual library --------------------------------------------------
 #
 # Colors + symbols. Disabled when stdout isn't a TTY (CI pipelines,
@@ -191,6 +196,30 @@ spin_passthrough() {
   fi
 }
 
+# Print the path of a LIVE VS Code IPC socket under /run/user/$UID (closed
+# terminals leave dead sockets behind, so probe for one that answers). Used by
+# both the install side and the uninstall/reinstall side; defined once here so
+# the two can't drift. Returns non-zero if no live socket is found.
+pick_live_vscode_socket() {
+  local run_dir="/run/user/${UID}"
+  [[ -d "${run_dir}" ]] || return 1
+  local sock
+  for sock in $(ls -1t "${run_dir}"/vscode-ipc-*.sock 2>/dev/null); do
+    if command -v socat >/dev/null 2>&1; then
+      if timeout 0.3 socat -u /dev/null UNIX-CONNECT:"${sock}" >/dev/null 2>&1; then
+        printf '%s' "${sock}"; return 0
+      fi
+    elif command -v nc >/dev/null 2>&1; then
+      if timeout 0.3 nc -U -z "${sock}" >/dev/null 2>&1; then
+        printf '%s' "${sock}"; return 0
+      fi
+    else
+      printf '%s' "${sock}"; return 0
+    fi
+  done
+  return 1
+}
+
 # ---- defaults --------------------------------------------------------
 
 profile="release"
@@ -289,6 +318,12 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Worktree banner: this script builds/installs from its OWN directory (`here`).
+# With multiple git worktrees of this repo checked out, it is easy to run the
+# wrong one and rebuild stale source; print the tree up front so a wrong-tree
+# run is obvious before anything is built.
+hint "building from ${C_BOLD}${here}${C_RESET}"
 
 bin_dir="${prefix}/bin"
 weft_bin="${bin_dir}/weft"
@@ -417,30 +452,11 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     #    so an open VS Code window picks up the change without a
     #    manual reload.
     if command -v code >/dev/null 2>&1; then
-      pick_live_vscode_socket() {
-        local run_dir="/run/user/${UID}"
-        [[ -d "${run_dir}" ]] || return 1
-        local sock
-        for sock in $(ls -1t "${run_dir}"/vscode-ipc-*.sock 2>/dev/null); do
-          if command -v socat >/dev/null 2>&1; then
-            if timeout 0.3 socat -u /dev/null UNIX-CONNECT:"${sock}" >/dev/null 2>&1; then
-              printf '%s' "${sock}"; return 0
-            fi
-          elif command -v nc >/dev/null 2>&1; then
-            if timeout 0.3 nc -U -z "${sock}" >/dev/null 2>&1; then
-              printf '%s' "${sock}"; return 0
-            fi
-          else
-            printf '%s' "${sock}"; return 0
-          fi
-        done
-        return 1
-      }
       if live_sock="$(pick_live_vscode_socket)"; then
         VSCODE_IPC_HOOK_CLI="${live_sock}" \
-          code --uninstall-extension weavemindai.weft-vscode >/dev/null 2>&1 || true
+          code --uninstall-extension "${ext_id}" >/dev/null 2>&1 || true
       else
-        code --uninstall-extension weavemindai.weft-vscode >/dev/null 2>&1 || true
+        code --uninstall-extension "${ext_id}" >/dev/null 2>&1 || true
       fi
       ok "VS Code extension uninstalled (if present)"
     else
@@ -732,81 +748,113 @@ if [[ $build_vscode -eq 1 ]]; then
     {
       find src -type f \( -name '*.ts' -o -name '*.svelte' -o -name '*.css' \) -print0 \
         2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
-      sha256sum package.json pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs \
+      # package.json WITHOUT its version field: every build bumps the version
+      # (so VS Code reinstalls), and that bump must not itself count as a source
+      # change, or the skip would never hit and we'd rebuild on every run.
+      node -e "const p=require('./package.json');delete p.version;process.stdout.write(JSON.stringify(p))" 2>/dev/null
+      sha256sum pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs \
         tsconfig.json tsconfig.webview.json language-configuration.json 2>/dev/null
     } | sha256sum | awk '{print $1}'
   )"
   prior_hash="$(cat "${hash_file}" 2>/dev/null || echo)"
   existing_vsix="$(ls -t weft-vscode-*.vsix 2>/dev/null | head -n 1 || true)"
 
+  # Reuse the cached .vsix only if the source hash matches AND the .vsix is
+  # newer than every source file. The hash alone isn't enough: an interrupted
+  # build (crash between bundle and package) can leave a stamp whose .vsix
+  # predates the current source, silently installing stale code. The mtime
+  # guard makes that impossible (a changed source file is always newer than a
+  # stale .vsix).
+  vsix_is_fresh=""
   if [[ -n "${existing_vsix}" && "${current_hash}" == "${prior_hash}" ]]; then
-    ok "no source changes; reusing ${C_DIM}${existing_vsix}${C_RESET}"
-    vsix="${existing_vsix}"
+    # NB: package.json is excluded here on purpose. Each build bumps its
+    # version (touching its mtime), so it would always look "newer" than the
+    # vsix and defeat the skip. The version-stripped content hash above already
+    # catches any real package.json change.
+    newest_src="$(find src pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs tsconfig.json tsconfig.webview.json -type f -newer "${existing_vsix}" -print -quit 2>/dev/null)"
+    [[ -z "${newest_src}" ]] && vsix_is_fresh="yes"
+  fi
+
+  # Three idempotent gates. The version is the FINGERPRINT of the compiled
+  # output: it is bumped only when source actually changes, so it uniquely and
+  # stably identifies a build. That lets each step be a no-op when already done:
+  #
+  #   1. COMPILE (tsc + vite, slow): only when the source hash changed. Bumps
+  #      the version + repackages as part of the same step (a new build => a new
+  #      version => a new .vsix). Writes the stamp last.
+  #   2. PACKAGE (vsce, slow): only inside the compile step, OR if the .vsix for
+  #      the current version is missing. Never re-zips an unchanged build.
+  #   3. INSTALL: only if VS Code's installed version differs from package.json's
+  #      version. Unchanged-and-already-installed => nothing happens at all.
+  current_ver="$(node -p "require('./package.json').version")"
+  if [[ -n "${vsix_is_fresh}" ]]; then
+    ok "no source changes (compiled ${C_DIM}v${current_ver}${C_RESET})"
   else
     spin "pnpm install" pnpm install --prefer-offline
     spin "tsc compile" pnpm run compile
     spin "vite bundle webview" pnpm run bundle:webview
+    # New compiled output => bump the fingerprint version + repackage.
+    prev_ver="${current_ver}"
+    npm version patch --no-git-tag-version >/dev/null
+    current_ver="$(node -p "require('./package.json').version")"
+    ok "version bumped: ${C_DIM}${prev_ver} ${SYM_ARROW} ${current_ver}${C_RESET}"
+    rm -f weft-vscode-*.vsix
     spin "package .vsix" pnpm dlx @vscode/vsce package \
-      --no-dependencies \
-      --allow-missing-repository \
-      --skip-license
+      --no-dependencies --allow-missing-repository --skip-license
+    mkdir -p "${hash_dir}"
+    printf '%s' "${current_hash}" >"${hash_file}"
+  fi
+
+  # Ensure a .vsix matching the current version exists (e.g. it was deleted, or
+  # a prior run compiled but crashed before packaging). Cheap when present.
+  vsix="weft-vscode-${current_ver}.vsix"
+  if [[ ! -f "${vsix}" ]]; then
+    rm -f weft-vscode-*.vsix
+    spin "package .vsix" pnpm dlx @vscode/vsce package \
+      --no-dependencies --allow-missing-repository --skip-license
     vsix="$(ls -t weft-vscode-*.vsix 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${vsix}" ]]; then
-      mkdir -p "${hash_dir}"
-      printf '%s' "${current_hash}" >"${hash_file}"
-    fi
   fi
 
   popd >/dev/null
 
-  if [[ -z "${vsix}" ]]; then
-    fail "vsce ran but no .vsix was produced"
+  if [[ -z "${vsix}" || ! -f "${ext_dir}/${vsix}" ]]; then
+    fail "no .vsix for v${current_ver} was produced"
     exit 1
   fi
 
   ok "packaged ${C_DIM}${ext_dir}/${vsix}${C_RESET}"
 
-  # Auto-install via `code` IPC. Pick a live socket under
-  # /run/user/$UID/ since closed terminals leave dead sockets in
-  # VSCODE_IPC_HOOK_CLI under WSL/remote-SSH.
-  pick_live_vscode_socket() {
-    local run_dir="/run/user/${UID}"
-    [[ -d "${run_dir}" ]] || return 1
-    local sock
-    for sock in $(ls -1t "${run_dir}"/vscode-ipc-*.sock 2>/dev/null); do
-      if command -v socat >/dev/null 2>&1; then
-        if timeout 0.3 socat -u /dev/null UNIX-CONNECT:"${sock}" >/dev/null 2>&1; then
-          printf '%s' "${sock}"; return 0
-        fi
-      elif command -v nc >/dev/null 2>&1; then
-        if timeout 0.3 nc -U -z "${sock}" >/dev/null 2>&1; then
-          printf '%s' "${sock}"; return 0
-        fi
-      else
-        printf '%s' "${sock}"; return 0
-      fi
-    done
-    return 1
+  # Auto-install via `code` IPC, using the shared live-socket probe (closed
+  # terminals leave dead sockets in VSCODE_IPC_HOOK_CLI under WSL/remote-SSH).
+
+  # The installed version of the extension, queried through the SAME live
+  # socket we install through (so it reflects this VS Code window, not some
+  # global registry). Empty if not installed / no socket.
+  installed_ext_version() {
+    local sock="$1"
+    VSCODE_IPC_HOOK_CLI="${sock}" code --list-extensions --show-versions 2>/dev/null \
+      | sed -n 's/^weavemind\.weft-vscode@//p' | head -n1
   }
 
-  if command -v code >/dev/null 2>&1; then
-    if live_sock="$(pick_live_vscode_socket)"; then
-      if VSCODE_IPC_HOOK_CLI="${live_sock}" \
-          code --install-extension "${ext_dir}/${vsix}" --force >/dev/null 2>&1; then
-        ok "installed into VS Code (live window)"
-      else
-        warn "code --install-extension failed via live socket"
-        hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
-      fi
-    elif code --install-extension "${ext_dir}/${vsix}" --force >/dev/null 2>&1; then
-      ok "installed into VS Code"
-    else
-      warn "no live VS Code window found"
-      hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
-    fi
-  else
+  if ! command -v code >/dev/null 2>&1; then
     warn "'code' not on PATH"
     hint "install manually: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
+  elif ! live_sock="$(pick_live_vscode_socket)"; then
+    warn "no live VS Code window found"
+    hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
+  else
+    installed_ver="$(installed_ext_version "${live_sock}")"
+    if [[ "${installed_ver}" == "${current_ver}" ]]; then
+      # Already installed and matches the compiled output: do nothing.
+      ok "VS Code already running ${C_DIM}v${current_ver}${C_RESET}; nothing to install"
+    elif VSCODE_IPC_HOOK_CLI="${live_sock}" \
+        code --install-extension "${ext_dir}/${vsix}" --force >/dev/null 2>&1; then
+      ok "installed ${C_DIM}v${current_ver}${C_RESET} into VS Code (was ${C_DIM}v${installed_ver:-none}${C_RESET})"
+      hint "reload to apply: ${C_BOLD}Developer: Reload Window${C_RESET} (host code), or reopen the graph panel (webview-only changes)"
+    else
+      warn "code --install-extension failed via live socket"
+      hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
+    fi
   fi
 fi
 

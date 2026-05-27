@@ -56,6 +56,11 @@ pub struct GroupDefinition {
     /// Does NOT include the In/Out boundary Passthroughs.
     #[serde(rename = "nodeIds", default)]
     pub node_ids: Vec<String>,
+    /// True for the anonymous top-level group of an included `.weft` file
+    /// (no `name =`). The editor labels it from the filename and validates it
+    /// as a component (no project-level output requirement).
+    #[serde(default)]
+    pub anonymous: bool,
     #[serde(default)]
     pub span: Option<Span>,
     #[serde(default, rename = "headerSpan")]
@@ -89,6 +94,35 @@ pub struct Span {
 impl Span {
     pub fn single_line(line: usize, start_col: usize, end_col: usize) -> Self {
         Self { start_line: line, start_col, end_line: line, end_col }
+    }
+}
+
+/// Where a config field's value was written in source. The editor needs this
+/// to rewrite a field in place: an inline field (`n = Type { k: v }`) is
+/// rewritten as `k: v`, a connection-line field (`n.k = v`) keeps its
+/// `n.k = ` prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigOrigin {
+    Inline,
+    Connection,
+}
+
+/// Source range of one config field plus how it was written. The editor edits
+/// a single field surgically using `span`, and uses `origin` to reconstruct
+/// the correct line prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigFieldSpan {
+    pub span: Span,
+    pub origin: ConfigOrigin,
+}
+
+impl ConfigFieldSpan {
+    pub fn inline(span: Span) -> Self {
+        Self { span, origin: ConfigOrigin::Inline }
+    }
+    pub fn connection(span: Span) -> Self {
+        Self { span, origin: ConfigOrigin::Connection }
     }
 }
 
@@ -144,7 +178,30 @@ pub struct NodeDefinition {
     /// surgically edit one field without re-serializing the whole
     /// config block.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "configSpans")]
-    pub config_spans: std::collections::BTreeMap<String, Span>,
+    pub config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// File-backed config fields, keyed by field name. Present when a field
+    /// value came from `@file("path", Type)`. `config` holds the resolved
+    /// value; this records the source reference so the editor renders the
+    /// field as file-backed and routes edits to the referenced file instead
+    /// of rewriting the `@file(...)` token in the source.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "fileRefs")]
+    pub file_refs: std::collections::BTreeMap<String, FileRef>,
+    /// Set on an opaque `@include` interface node: the path of the included
+    /// `.weft` file. The editor renders such a node as an expandable group
+    /// that navigates into the file. Only present in interface-parse output.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "includePath")]
+    pub include_path: Option<String>,
+}
+
+/// A `@file("path", Type)` reference attached to a config field: where the
+/// value was read from and the type it was cast to. Serializes as
+/// `{ "path": "...", "type": "String" }`. Lives in weft-core because it
+/// flows on the parse wire to the editor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileRef {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub ty: WeftType,
 }
 
 fn default_config() -> Value {

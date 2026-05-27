@@ -33,16 +33,23 @@ export function deriveProjectId(fsPath: string): string {
  *  a TOML dep for this is overkill.
  */
 export function readProjectIdFromToml(entryFsPath: string): string | undefined {
+  const root = findProjectRoot(entryFsPath);
+  if (!root) return undefined;
+  try {
+    return extractPackageId(fs.readFileSync(path.join(root, 'weft.toml'), 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Walk up from a file (max 8 levels) to the directory containing `weft.toml`,
+ *  the project root the compiler resolves `@file`/`@include` paths against.
+ *  The single project-root walk; `readProjectIdFromToml` builds on it. */
+export function findProjectRoot(entryFsPath: string): string | undefined {
   let dir = path.dirname(entryFsPath);
   for (let i = 0; i < 8; i++) {
-    const candidate = path.join(dir, 'weft.toml');
-    if (fs.existsSync(candidate)) {
-      try {
-        const text = fs.readFileSync(candidate, 'utf8');
-        return extractPackageId(text);
-      } catch {
-        return undefined;
-      }
+    if (fs.existsSync(path.join(dir, 'weft.toml'))) {
+      return dir;
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;

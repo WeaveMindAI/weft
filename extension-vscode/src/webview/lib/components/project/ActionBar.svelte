@@ -165,9 +165,12 @@
 			case 'build': return 'Building...';
 			case 'rm': return 'Removing...';
 		}
-		// `verb` is `never` here if every variant of `ActionVerb`
-		// is covered; adding a new verb to the union forces a
-		// compile error until this switch is updated.
+		// A phase set with no verb (the type allows `verb: undefined` even
+		// though in practice a cli_running overlay carries both): fall back to a
+		// generic label rather than nothing.
+		if (verb === undefined) return 'Working...';
+		// `verb` is `never` here once every ActionVerb variant is covered above;
+		// adding a new verb to the union forces a compile error here.
 		const _exhaustive: never = verb;
 		return _exhaustive;
 	}

@@ -6,16 +6,17 @@
 
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { runWeftJson, projectDirOf } from './cli';
+import { projectDirOf } from './cli';
+import type { ParseServer } from './parseServer';
 import type { Diagnostic as WeftDiagnostic, Severity } from './shared/protocol';
 
-export function attachDiagnostics(context: vscode.ExtensionContext): void {
+export function attachDiagnostics(context: vscode.ExtensionContext, parseServer: ParseServer): void {
   const collection = vscode.languages.createDiagnosticCollection('weft');
   context.subscriptions.push(collection);
 
   const timers = new Map<string, NodeJS.Timeout>();
 
-  const schedule = (doc: vscode.TextDocument) => {
+  const schedule = (doc: vscode.TextDocument, reloadCatalog = false) => {
     if (doc.languageId !== 'weft') return;
     const debounce = vscode.workspace
       .getConfiguration('weft.validate')
@@ -26,7 +27,7 @@ export function attachDiagnostics(context: vscode.ExtensionContext): void {
     timers.set(
       key,
       setTimeout(() => {
-        void runValidation(collection, doc);
+        void runValidation(collection, doc, parseServer, reloadCatalog);
       }, debounce),
     );
   };
@@ -45,7 +46,9 @@ export function attachDiagnostics(context: vscode.ExtensionContext): void {
       if (doc.languageId !== 'weft') continue;
       const projectDir = projectDirOf(doc);
       if (changedPath === projectDir || changedPath.startsWith(projectDir + path.sep)) {
-        schedule(doc);
+        // A `nodes/` change altered the catalog: tell the warm server to
+        // rebuild it before this validation, else it serves a stale catalog.
+        schedule(doc, true);
       }
     }
   };
@@ -72,13 +75,16 @@ export function attachDiagnostics(context: vscode.ExtensionContext): void {
 async function runValidation(
   collection: vscode.DiagnosticCollection,
   doc: vscode.TextDocument,
+  parseServer: ParseServer,
+  reloadCatalog: boolean,
 ): Promise<void> {
   try {
-    const result = await runWeftJson<{ diagnostics: WeftDiagnostic[] }>(
-      ['validate'],
-      projectDirOf(doc),
-      { stdin: doc.getText() },
-    );
+    const result = await parseServer.request<{ diagnostics: WeftDiagnostic[] }>({
+      kind: 'validate',
+      source: doc.getText(),
+      file: doc.uri.fsPath,
+      reloadCatalog,
+    });
     collection.set(doc.uri, result.diagnostics.map(toVsCodeDiagnostic));
   } catch (err) {
     // CLI failed (not found, project error)? Surface a single warning

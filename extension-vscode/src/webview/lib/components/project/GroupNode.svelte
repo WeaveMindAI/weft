@@ -63,10 +63,13 @@
 		}
 	}
 
+	// Resize end: dimensions only (`expanded` is unchanged). The host classifies
+	// resize vs collapse by whether `expanded` changes value, so this stays a
+	// resize even though the spread config still carries the current flag.
 	function handleResizeEnd(_event: unknown, params: ResizeParams) {
 		if (data.onUpdate) {
 			data.onUpdate({
-				config: { ...data.config, width: params.width, height: params.height, expanded: true }
+				config: { ...data.config, width: params.width, height: params.height }
 			});
 		}
 	}

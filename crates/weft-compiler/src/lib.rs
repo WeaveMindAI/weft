@@ -14,6 +14,8 @@
 
 pub mod project;
 pub mod weft_compiler;
+pub mod edit;
+pub mod file_ref;
 pub mod enrich;
 pub mod validate;
 pub mod codegen;
@@ -41,29 +43,33 @@ pub use weft_core::node::{Diagnostic, Severity};
 pub fn parse_only(
     source: &str,
     project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
+    component_name: Option<(&str, &str)>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
-    // Stages 1+2: lex + parse + flatten.
-    let mut project = match weft_compiler::compile(source, project_id) {
-        Ok(p) => p,
-        Err(errors) => {
-            // Parse failed: surface the diagnostics and return an
-            // empty-but-valid project so the UI keeps rendering a
-            // stable last-known-good state rather than breaking.
-            for e in errors {
-                diagnostics.push(Diagnostic {
-                    line: e.line,
-                    column: 0,
-                    severity: Severity::Error,
-                    message: e.message,
-                    code: Some("parse".into()),
-                });
-            }
-            return (empty_project(project_id), diagnostics);
-        }
-    };
+    // Stages 1+2: lex + parse + flatten, LENIENT. A bad line becomes a
+    // diagnostic; every valid node/edge around it still renders (the editor
+    // must keep showing the graph mid-edit, never blank out on one typo).
+    // Interface mode for @include: opaque nodes the editor navigates into.
+    let (mut project, parse_errors) = weft_compiler::compile_lenient(
+        source,
+        project_id,
+        base_dir,
+        weft_compiler::IncludeMode::Interface,
+    );
+    for e in parse_errors {
+        diagnostics.push(Diagnostic {
+            line: e.line,
+            column: 0,
+            severity: Severity::Error,
+            message: e.message,
+            code: Some("parse".into()),
+        });
+    }
+
+    apply_component_name(&mut project, component_name);
 
     // Stage 3: enrich (lenient). Unknown types / catalog misses become
     // empty-port placeholders, not aborts.
@@ -80,6 +86,12 @@ pub fn parse_only(
     // Surface unknown node types as warnings so the IDE can paint a
     // squiggly on the header line even without calling /validate.
     for node in &project.nodes {
+        // Opaque `@include` interface nodes carry no catalog entry by design
+        // (their ports come from the included file's Group header). Don't
+        // flag them as unknown types.
+        if node.include_path.is_some() {
+            continue;
+        }
         if catalog.lookup(&node.node_type).is_none() {
             let line = node
                 .header_span
@@ -127,10 +139,13 @@ pub fn parse_only(
 pub fn compile_strict(
     source: &str,
     project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
     mode: validate::ValidationMode,
+    component_name: Option<(&str, &str)>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
-    let (project, mut diagnostics) = compile_and_enrich(source, project_id, catalog);
+    let (project, mut diagnostics) =
+        compile_and_enrich(source, project_id, base_dir, catalog, component_name);
     diagnostics.extend(validate::validate_with_mode(&project, catalog, mode));
     (project, diagnostics)
 }
@@ -142,10 +157,13 @@ pub fn compile_strict(
 pub fn compile_checked(
     source: &str,
     project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
     mode: validate::ValidationMode,
 ) -> CompileResult<ProjectDefinition> {
-    let (project, diagnostics) = compile_strict(source, project_id, catalog, mode);
+    // Build path: compiles a real project (no anonymous component root), so no
+    // component relabel.
+    let (project, diagnostics) = compile_strict(source, project_id, base_dir, catalog, mode, None);
     bail_on_errors(diagnostics)?;
     Ok(project)
 }
@@ -158,9 +176,11 @@ pub fn compile_checked(
 pub fn compile_enriched(
     source: &str,
     project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
 ) -> CompileResult<ProjectDefinition> {
-    let (project, diagnostics) = compile_and_enrich(source, project_id, catalog);
+    // Topology/hash path: a real project, no anonymous component relabel.
+    let (project, diagnostics) = compile_and_enrich(source, project_id, base_dir, catalog, None);
     bail_on_errors(diagnostics)?;
     Ok(project)
 }
@@ -174,10 +194,12 @@ pub fn compile_enriched(
 fn compile_and_enrich(
     source: &str,
     project_id: Uuid,
+    base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
+    component_name: Option<(&str, &str)>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
-    let mut project = match weft_compiler::compile(source, project_id) {
+    let mut project = match weft_compiler::compile(source, project_id, base_dir) {
         Ok(p) => p,
         Err(errors) => {
             for e in errors {
@@ -192,6 +214,7 @@ fn compile_and_enrich(
             return (empty_project(project_id), diagnostics);
         }
     };
+    apply_component_name(&mut project, component_name);
     if let Err(e) = enrich::enrich(&mut project, catalog) {
         diagnostics.push(Diagnostic {
             line: 0,
@@ -207,6 +230,17 @@ fn compile_and_enrich(
 /// Turn an `Error`-severity diagnostic set into a single loud
 /// `CompileError`; `Ok(())` when only warnings (or nothing) remain.
 /// One place so every aborting entry formats failures identically.
+/// Apply a standalone component's caller-supplied (id, label) by relabeling
+/// the internal `__include_root__` sentinel. The single call site shared by
+/// every pipeline front (parse_only + compile_and_enrich) so the editor's
+/// parse and validate paths can't drift on whether the sentinel is scrubbed.
+/// No-op when `component_name` is `None` (a normal project / build).
+fn apply_component_name(project: &mut ProjectDefinition, component_name: Option<(&str, &str)>) {
+    if let Some((id, label)) = component_name {
+        weft_compiler::relabel_anonymous_root(project, id, label);
+    }
+}
+
 fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> CompileResult<()> {
     let msg = diagnostics
         .iter()

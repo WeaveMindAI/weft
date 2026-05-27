@@ -62,8 +62,13 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
     // error. `Structural` (not `Runtime`) because a project may build
     // without every secret filled; runtime-rule gaps surface at run.
     let catalog = build_project_catalog(&project.root)?;
-    let mut definition =
-        compile_checked(&source, project.id(), &catalog, ValidationMode::Structural)?;
+    let mut definition = compile_checked(
+        &source,
+        project.id(),
+        Some(&project.root),
+        &catalog,
+        ValidationMode::Structural,
+    )?;
     definition.name = project.manifest.package.name.clone();
 
     let crate_root = project_root.join(".weft").join("target").join("build");

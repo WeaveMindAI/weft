@@ -173,25 +173,34 @@ impl WeftType {
         matches!(self, WeftType::TypeVar(_) | WeftType::MustOverride)
     }
 
-    /// Returns true if the type includes Null as a valid value.
-    /// This means null is a legitimate data value, not a skip signal.
-    /// Whether a port of this type should be configurable by default.
-    /// Returns false only for Media primitives (Image/Audio/Video/Document,
-    /// alone or in containers), TypeVar, and MustOverride. Everything else ,
-    /// primitives, lists, dicts, JsonDict, and unions of the above, is
-    /// configurable by default so users can paste literal JSON into the
-    /// config field instead of wiring a separate Text node. Catalog authors
-    /// override per port via `PortDef::wired_only(...)` when the node needs
-    /// a runtime-only value (e.g. a streaming handle).
-    pub fn is_default_configurable(&self) -> bool {
+    /// True if this type is or contains a media primitive (Image/Video/Audio/
+    /// Document) anywhere in its structure. Media is a `{url, mimeType}`
+    /// reference, never inline bytes, so it can't be cast from file text.
+    pub fn references_media(&self) -> bool {
         match self {
-            WeftType::Primitive(p) => !matches!(
+            WeftType::Primitive(p) => matches!(
                 p,
                 WeftPrimitive::Image
                     | WeftPrimitive::Video
                     | WeftPrimitive::Audio
                     | WeftPrimitive::Document
             ),
+            WeftType::List(inner) => inner.references_media(),
+            WeftType::Dict(_, v) => v.references_media(),
+            WeftType::Union(types) => types.iter().any(|t| t.references_media()),
+            WeftType::JsonDict | WeftType::TypeVar(_) | WeftType::MustOverride => false,
+        }
+    }
+
+    /// Whether a port of this type should be configurable by default. False
+    /// only for Media (alone or in containers), TypeVar, and MustOverride.
+    /// Everything else (primitives, lists, dicts, JsonDict, unions of the
+    /// above) is configurable so users can paste literal JSON into the config
+    /// field instead of wiring a separate Text node. Catalog authors override
+    /// per port via `PortDef::wired_only(...)` for runtime-only values.
+    pub fn is_default_configurable(&self) -> bool {
+        match self {
+            WeftType::Primitive(_) => !self.references_media(),
             WeftType::List(inner) => inner.is_default_configurable(),
             WeftType::Dict(_, v) => v.is_default_configurable(),
             WeftType::Union(types) => types.iter().all(|t| t.is_default_configurable()),
@@ -201,6 +210,8 @@ impl WeftType {
         }
     }
 
+    /// True if the type includes Null as a valid value (null is legitimate
+    /// data, not a skip signal).
     pub fn contains_null(&self) -> bool {
         match self {
             WeftType::Primitive(WeftPrimitive::Null) => true,
@@ -458,8 +469,16 @@ impl WeftType {
             WeftType::TypeVar(_) | WeftType::MustOverride => {
                 Err(format!("@file cannot cast to {}: name a concrete type", self))
             }
-            // Structural and media types: parse the file as JSON, then check the
-            // inferred shape is compatible with the declared type.
+            // Media (anywhere in the type: bare, List[Image], Image | String) is
+            // a {url, mimeType} reference, not inline bytes. Loading a binary
+            // file's text and JSON-parsing it would always fail with a confusing
+            // "not valid JSON"; reject loudly with the real reason.
+            _ if self.references_media() => Err(format!(
+                "@file cannot cast to {}: media is referenced by URL, not loaded inline from a file",
+                self
+            )),
+            // Structural types: parse the file as JSON, then check the inferred
+            // shape is compatible with the declared type.
             _ => {
                 let value: serde_json::Value = serde_json::from_str(text.trim())
                     .map_err(|e| format!("expected {}, file is not valid JSON: {}", self, e))?;

@@ -10,8 +10,10 @@
 	import CopyButton from "$lib/components/ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromFields, deriveOutputsFromFields, type FormFieldDef, type FormFieldSpec } from '$lib/utils/form-field-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "$lib/utils/status";
-	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2 } from '@lucide/svelte';
+	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink } from '@lucide/svelte';
 	import { createFieldEditor } from '$lib/utils/field-editor.svelte';
+	import { useFieldEditorRegistry } from './field-editor-registry';
+	import { isFileRefValue } from '$lib/value-format';
 	import { createPortContextMenu, buildPortMenuItems } from "$lib/utils/port-context-menu";
 	import { portMarkerStyle } from "$lib/utils/port-marker";
 	import ExecutionInspector from './ExecutionInspector.svelte';
@@ -26,7 +28,15 @@
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: import('$lib/types').NodeFeatures;
+			// Resolved state of @file targets, keyed by the marker's relative
+			// path (content or read error). A config field whose value is a
+			// `@file(...)` tag displays fileContents[path]; config itself never
+			// holds resolved content.
+			fileContents?: Record<string, import('../../../../shared/protocol').FileContent>;
+			includePath?: string;
 			onUpdate?: (updates: NodeDataUpdates) => void;
+			onSaveFileRef?: (path: string, content: string) => void;
+			onOpenInclude?: (path: string, alias: string) => void;
 			infraNodeStatus?: string;
 			infraFailureStage?: string;
 			infraFailureMessage?: string;
@@ -56,6 +66,24 @@
 		fields: [],
 		defaultInputs: [],
 		defaultOutputs: [],
+	});
+
+	// Opaque `@include` block: carries a file path, navigates into the file
+	// on Open. Renders ports + an Open affordance, no config/body.
+	const isInclude = $derived(!!data.includePath);
+	// Human-readable name of the included component, derived from its filename
+	// (`components/my-cleaner.weft` -> "My Cleaner"): the basename without
+	// `.weft`, `-`/`_` to spaces, each word capitalized. Matches the name the
+	// component's own group shows when you navigate into it.
+	const includeName = $derived.by(() => {
+		const p = data.includePath;
+		if (!p) return '';
+		const stem = (p.split(/[\\/]/).pop() ?? p).replace(/\.weft$/, '');
+		return stem
+			.split(/[-_\s]+/)
+			.filter(Boolean)
+			.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+			.join(' ');
 	});
 
 	const executions = $derived(data.executions ?? []);
@@ -162,11 +190,13 @@
 	// Get expanded state from config (persisted), default collapsed for regular nodes
 	const expanded = $derived((data.config?.expanded as boolean) ?? false);
 	
-	// Handle resize end - save dimensions to config and ensure expanded is true
+	// Resize end: save the new dimensions (width/height only; `expanded` is
+	// unchanged so we don't resend it). The host classifies resize vs collapse
+	// by whether `expanded` actually changes value, so this stays a resize.
 	function handleResizeEnd(_event: unknown, params: ResizeParams) {
 		if (data.onUpdate) {
 			data.onUpdate({
-				config: { ...data.config, width: params.width, height: params.height, expanded: true }
+				config: { ...data.config, width: params.width, height: params.height }
 			});
 		}
 	}
@@ -347,8 +377,56 @@
 		}
 	}
 
+	/** If `config[key]` is a `@file` marker, its {path, type}. The single
+	 *  per-field test for "is this field file-backed". */
+	function fileRefOf(key: string): { path: string; type: string } | null {
+		const v = (data.config as Record<string, unknown>)?.[key];
+		return isFileRefValue(v) ? v.__weftFileRef : null;
+	}
+
+	/** Resolved state of a file-backed field, from the host's fileContents
+	 *  map. `loading` = content not yet delivered (brief, transient).
+	 *  `error` = the file couldn't be read (fail loudly, no fallback). */
+	function fileFieldState(key: string): { path: string; content?: string; error?: string; loading: boolean } | null {
+		const ref = fileRefOf(key);
+		if (!ref) return null;
+		const entry = data.fileContents?.[ref.path];
+		if (entry === undefined) return { path: ref.path, loading: true };
+		if ('error' in entry) return { path: ref.path, error: entry.error, loading: false };
+		return { path: ref.path, content: entry.content, loading: false };
+	}
+
+	/** A file-backed field whose content isn't loaded yet (loading or error)
+	 *  is read-only: its display is a status string, not editable content.
+	 *  False for a normal field or a loaded file-backed field. The single
+	 *  editability rule applied across every editable field branch. */
+	function fileFieldUnready(key: string): boolean {
+		const fs = fileFieldState(key);
+		return fs ? fs.content === undefined : false;
+	}
+
 	function updateConfig(key: string, value: string | string[] | number | FormFieldDef[] | null) {
+		// File-backed field: the edit goes to the referenced file, never to the
+		// weft source. The `@file(...)` marker in config (and source) is left
+		// untouched; only the file's content changes.
+		const fs = fileFieldState(key);
+		if (fs) {
+			// Only a loaded field is editable. Editing while loading or on a
+			// read error must not write (it would clobber the file with a
+			// status string); the field is read-only in those states, but
+			// guard loudly here too.
+			if (fs.content === undefined) {
+				toast.error(`Cannot edit ${fs.path}: ${fs.error ?? 'still loading'}`);
+				return;
+			}
+			const content = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+			data.onSaveFileRef?.(fs.path, content);
+			return;
+		}
 		if (data.onUpdate) {
+			// config holds the `@file(...)` tag for file-backed fields (never the
+			// resolved content), so serializing the whole config re-emits the
+			// marker. No special handling needed for sibling file-backed fields.
 			const newConfig = { ...data.config, [key]: value };
 			if (typeConfig.features?.hasFormSchema && key === 'fields') {
 				const fields = value as FormFieldDef[];
@@ -364,8 +442,22 @@
 	}
 
 	const fieldEditor = createFieldEditor();
+	const fieldEditorRegistry = useFieldEditorRegistry();
+	// Register this node's field-editor flush so a teardown (window hidden,
+	// panel close) that doesn't fire a field `blur` still commits the last
+	// <700ms of typing. $effect's cleanup unregisters on destroy.
+	$effect(() => fieldEditorRegistry?.register(fieldEditor.flush));
 
 	function getConfigDisplayValue(fieldKey: string): string {
+		const fs = fileFieldState(fieldKey);
+		if (fs) {
+			// File-backed: show resolved content (editable). While loading or on
+			// a read error, show a status (read-only); never the marker as a
+			// value, never a silent fall back to inline content.
+			if (fs.content !== undefined) return fieldEditor.display(fieldKey, fs.content);
+			if (fs.error !== undefined) return `cannot read ${fs.path}: ${fs.error}`;
+			return `loading ${fs.path}...`;
+		}
 		const v = (data.config as Record<string, unknown>)?.[fieldKey];
 		const storeStr = (v === undefined || v === null) ? '' : (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
 		return fieldEditor.display(fieldKey, storeStr);
@@ -611,7 +703,12 @@
 	>
 		<div class="flex items-center gap-1.5">
 			<span class="text-base leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
-			<span class="text-[11px] font-semibold tracking-wide uppercase" style="color: {typeConfig.color};">{typeConfig.label}</span>
+			{#if isInclude}
+				<FileSymlink size={12} class="text-violet-500" />
+				<span class="text-[11px] font-semibold tracking-wide uppercase text-violet-600">{includeName}</span>
+			{:else}
+				<span class="text-[11px] font-semibold tracking-wide uppercase" style="color: {typeConfig.color};">{typeConfig.label}</span>
+			{/if}
 			{#if data.infraNodeStatus}
 				<span
 					class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none
@@ -638,6 +735,15 @@
 		</div>
 		<div class="flex items-center gap-0.5">
 			<ExecutionInspector {executions} label={data.label || typeConfig.label} />
+		{#if isInclude}
+			<button
+				class="px-1.5 h-5 flex items-center gap-1 rounded hover:bg-violet-100 cursor-pointer transition-colors text-violet-600 text-[10px] font-medium nodrag nopan"
+				onclick={(e) => { e.stopPropagation(); if (data.includePath) data.onOpenInclude?.(data.includePath, id); }}
+				title={`Open ${data.includePath} (edit its graph)`}
+			>
+				<FileSymlink size={11} /> Open
+			</button>
+		{/if}
 		{#if hasExpandableContent}
 			<button
 				class="w-5 h-5 flex items-center justify-center rounded hover:bg-black/5 cursor-pointer transition-colors text-zinc-400"
@@ -665,8 +771,16 @@
 				onkeydown={handleLabelKeydown}
 				onclick={(e) => e.stopPropagation()}
 			/>
+		{:else if isInclude}
+			<button
+				class="text-sm font-medium text-violet-700 hover:underline cursor-pointer px-1 py-0.5 rounded -mx-1 truncate text-left font-mono nodrag nopan flex items-center gap-1"
+				onclick={(e) => { e.stopPropagation(); if (data.includePath) data.onOpenInclude?.(data.includePath, id); }}
+				title={`Open ${data.includePath}`}
+			>
+				<FileSymlink size={12} /> {data.includePath}
+			</button>
 		{:else}
-			<p 
+			<p
 				class="text-sm font-medium text-zinc-800 cursor-text hover:bg-black/5 px-1 py-0.5 rounded -mx-1 truncate"
 				ondblclick={startEditLabel}
 				title="Double-click to edit"
@@ -934,6 +1048,13 @@
 					<div class="space-y-1">
 						<div class="flex items-center justify-between">
 							<label for={`${id}-field-${field.key}`} class="text-[10px] text-muted-foreground font-medium">{field.label}</label>
+							{#if fileRefOf(field.key)}
+								{@const ref = fileRefOf(field.key)}
+								<span
+									class="text-[9px] text-muted-foreground font-mono px-1 py-0.5 rounded bg-muted"
+									title={`Loaded from ${ref?.path} (edits save to this file)`}
+								>📄 {ref?.path}</span>
+							{/if}
 						</div>
 						{#if field.type === "code"}
 							<!-- Code editor field - any node can use this by setting field.type = 'code' -->
@@ -942,19 +1063,27 @@
 							onfocusout={(e) => e.currentTarget.classList.remove('nowheel')}
 						>
 								<CodeEditor
-									value={(data.config as Record<string, string>)?.[field.key] || ""}
+									value={getConfigDisplayValue(field.key)}
+									readonly={fileFieldUnready(field.key)}
 									placeholder={field.placeholder}
 									minHeight="120px"
 									onchange={(newValue) => {
+										// Direct, not via fieldEditor: CodeEditor has no blur to clear
+										// the field editor's active key, which would strand the field
+										// on its local value and mask external (file -> graph) updates.
+										// updateConfig routes a file-backed field to the (serialized)
+										// file write, so per-change writes are safe, just not debounced.
 										updateConfig(field.key, newValue);
 									}}
 								/>
 							</div>
 						{:else if field.type === "textarea"}
+							{@const fileUnready = fileFieldUnready(field.key)}
 							<textarea
 								id={`${id}-field-${field.key}`}
 								data-field-key={field.key}
-								class="text-xs bg-muted px-2 py-1.5 rounded border-none outline-none font-mono nodrag nopan box-border block w-full"
+								class="text-xs px-2 py-1.5 rounded border-none outline-none font-mono nodrag nopan box-border block w-full {fileUnready ? 'bg-rose-50 text-rose-700' : 'bg-muted'}"
+								readonly={fileUnready}
 							onfocusin={(e) => e.currentTarget.classList.add('nowheel')}
 							onfocusout={(e) => e.currentTarget.classList.remove('nowheel')}
 								style="resize: vertical; min-height: 60px; {textareaHeights[field.key] ? `height: ${textareaHeights[field.key]}px;` : ''}"

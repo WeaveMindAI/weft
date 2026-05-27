@@ -390,8 +390,11 @@ export interface FieldDefinition {
 
 export type NodeCategory = "Triggers" | "AI" | "Data" | "Flow" | "Utility" | "Debug" | "Infrastructure";
 
-/** Status of a single node execution. */
-export type NodeExecutionStatus = 'running' | 'completed' | 'failed' | 'waiting_for_input' | 'skipped' | 'cancelled';
+/** Status of a single node execution. `suspended` is a real runtime state
+ *  (the protocol's NodeExecutionStarted state union + status.ts + the node UI
+ *  all handle it); it was missing from this type, so the UI's `=== 'suspended'`
+ *  checks were dead branches the (never-run) webview typecheck flagged. */
+export type NodeExecutionStatus = 'running' | 'completed' | 'failed' | 'waiting_for_input' | 'suspended' | 'skipped' | 'cancelled';
 
 /** Record of a single execution of a node. */
 export interface NodeExecution {
@@ -429,7 +432,6 @@ export type { LiveDataItem } from '../../../shared/protocol';
 
 export interface NodeFeatures {
 	isTrigger?: boolean;
-	runLocationConstraint?: RunLocationConstraint;
 	canAddInputPorts?: boolean;
 	canAddOutputPorts?: boolean;
 	hidden?: boolean;
@@ -547,6 +549,9 @@ export interface NodeInstance {
 	// in the order the user wrote them, even though `project.nodes` ends up
 	// sorted groups-first for SvelteFlow's parent-first requirement.
 	sourceLine?: number;
+	// Set on an opaque `@include` node: the included `.weft` file path. The
+	// editor renders it as an expandable group that navigates into the file.
+	includePath?: string;
 }
 
 // =============================================================================

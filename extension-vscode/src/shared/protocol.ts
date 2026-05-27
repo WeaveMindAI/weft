@@ -18,11 +18,28 @@ export interface PortDefinition {
   description?: string;
 }
 
+/// Source span of one config field plus how it was written. `origin` tells
+/// the editor how to rewrite the field in place: an inline field
+/// (`n = Type { k: v }`) becomes `k: v`; a connection-line field (`n.k = v`)
+/// keeps its `n.k = ` prefix. Matches the Rust `ConfigFieldSpan`.
 export interface ConfigFieldSpan {
-  startLine: number;
-  endLine: number;
+  span: Span;
   origin: 'inline' | 'connection';
 }
+
+/// A `@file("path", Type)` reference on a config field. `config[field]`
+/// holds the resolved value; this says the value came from a file, so the
+/// editor renders the field as file-backed and writes edits to `path`
+/// instead of rewriting the `@file(...)` token in the source.
+export interface FileRef {
+  path: string;
+  type: string;
+}
+
+/// The resolved state of a `@file` target: either its content, or a read
+/// error. No third "fall back to the marker" state by design: a file-backed
+/// field is always file-backed; if the file can't be read it fails loudly.
+export type FileContent = { content: string } | { error: string };
 
 export interface NodeDefinition {
   id: string;
@@ -58,6 +75,10 @@ export interface NodeDefinition {
   span?: Span;
   header_span?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
+  fileRefs?: Record<string, FileRef>;
+  /// Set on an opaque `@include` node: the included `.weft` file path. The
+  /// editor renders this as an expandable group that navigates into the file.
+  includePath?: string;
 }
 
 export interface Edge {
@@ -518,8 +539,27 @@ export type ActionBarOverlay =
   | { kind: 'pending'; verb: ActionVerb; message: string };
 
 export type HostMessage =
-  | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string }
+  | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string; freshMount?: boolean }
   | { kind: 'parseError'; error: string }
+  /// Reply to `applyEdits` / `applyTextEdit`: `inverse` is the text edit that
+  /// undoes what was just applied (the webview stores it on its undo stack).
+  /// `ok:false` means the edit failed (the webview drops the pending action).
+  | { kind: 'editApplied'; requestId: number; ok: boolean; inverse?: TextEdit }
+  /// Resolved state of every `@file`-referenced file in the current view,
+  /// keyed by the marker's relative path. Each entry is either the file's
+  /// content or a read error (unreadable/missing). The webview displays a
+  /// file-backed field from this (config holds only the `@file(...)` marker);
+  /// a missing key means "still loading", an `error` entry fails loudly (no
+  /// fallback to showing the marker as the value). Resent on backing-file
+  /// change (file -> graph) so the display stays live without a reparse.
+  | { kind: 'fileContents'; contents: Record<string, FileContent> }
+  /// Navigation depth in the include back-stack. `depth > 0` means the user
+  /// navigated into an included file; the webview shows a Return button.
+  /// `fileName` is the current file's display name for the navigation bar.
+  /// `execPrefix` is the dotted alias chain descended through (e.g. `c.` or
+  /// `c.inner.`), prepended to node ids when looking up execution values so
+  /// the journal's qualified keys match the sub-graph's bare node ids.
+  | { kind: 'navState'; depth: number; fileName: string; execPrefix: string }
   | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled' }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   /// The node catalog (full set, from `weft describe-nodes`) failed to
@@ -569,8 +609,33 @@ export interface FollowStatus {
 
 export type WebviewMessage =
   | { kind: 'ready' }
-  | { kind: 'saveWeft'; source: string }
+  /// Apply a batch of structured edit intents to the source. The host runs
+  /// them through the Rust edit-server (the single place that knows how to
+  /// rewrite `.weft`), writes the resulting source to the document, and the
+  /// normal parse round-trip re-renders the graph. The webview never edits
+  /// `.weft` text itself; it only expresses intent. This is what makes the
+  /// editor logic reusable across frontends (VS Code, Cursor, dashboard).
+  /// `requestId` correlates the host's `editApplied` reply, which carries the
+  /// inverse text edit the webview stores as this action's undo. The webview
+  /// owns the undo stack (source + layout uniformly).
+  | { kind: 'applyEdits'; ops: EditOp[]; requestId: number }
+  /// Replay a raw source text edit (undo/redo of a source action). Same
+  /// reply shape as `applyEdits` (the inverse undoes THIS replay).
+  | { kind: 'applyTextEdit'; edit: TextEdit; requestId: number }
   | { kind: 'saveLayout'; layoutCode: string }
+  /// Write-back for a file-backed config field (`@file("path", Type)`).
+  /// The edit goes to the referenced file, not the `@file(...)` token in
+  /// the source. `path` is project-root-relative.
+  | { kind: 'saveFileRef'; path: string; content: string }
+  /// Navigate into an `@include`d file (project-root-relative path). `alias`
+  /// is the include node's id (the call-site name), accumulated into the
+  /// execution-id prefix so journal values for the sub-graph (keyed
+  /// `alias.node`) render when navigated in. The host opens that file's graph
+  /// in the same panel and pushes the current view onto a back-stack.
+  | { kind: 'openInclude'; path: string; alias: string }
+  /// Pop the navigation back-stack (Return button), reopening the previous
+  /// file's graph in the panel.
+  | { kind: 'navigateBack' }
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string }
   | { kind: 'runProject' }
   | { kind: 'infraStart' }
@@ -643,7 +708,40 @@ export type WebviewMessage =
   /// to read them.
   | { kind: 'dismissError' };
 
-// The v1 editor performs all text surgery in-process and sends the
-// resulting source with `saveWeft`. No semantic mutation protocol
-// is needed: the extension host just applies the full-range
-// TextEdit and re-parses.
+/// A structured edit intent. Mirrors the Rust `EditOp` enum (serde tag `op`,
+/// camelCase fields). The frontend emits these; the Rust edit-server applies
+/// them to the source. All graph edits go through `applyEdits` so the language
+/// logic lives in Rust only, reusable by any frontend.
+export type EditOp =
+  | { op: 'setConfig'; node: string; key: string; value: string }
+  | { op: 'removeConfig'; node: string; key: string }
+  | { op: 'setLabel'; node: string; label: string | null }
+  | { op: 'addNode'; id: string; nodeType: string; parentGroup: string | null }
+  | { op: 'removeNode'; node: string }
+  | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
+  | { op: 'removeEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
+  | { op: 'addGroup'; label: string; parentGroup: string | null }
+  | { op: 'removeGroup'; group: string }
+  | { op: 'renameGroup'; oldLabel: string; newLabel: string }
+  | { op: 'moveNodeScope'; node: string; targetGroup: string | null }
+  | { op: 'moveGroupScope'; group: string; targetGroup: string | null }
+  | { op: 'updateNodePorts'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
+  | { op: 'updateGroupPorts'; group: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
+  | { op: 'setProjectMeta'; name: string | null; description: string | null };
+
+export interface EditPortSig {
+  name: string;
+  required: boolean;
+  portType?: string;
+}
+
+/// A minimal source text edit (mirrors the Rust `TextEdit`): replace the byte
+/// range `[start, end)` with `text`. The reversible-action unit for source: an
+/// applied edit yields its inverse edit, and the webview's undo stack stores
+/// inverses (source) alongside layout-op inverses. Byte offsets so empty
+/// replacements and trailing newlines are unambiguous.
+export interface TextEdit {
+  start: number;
+  end: number;
+  text: string;
+}

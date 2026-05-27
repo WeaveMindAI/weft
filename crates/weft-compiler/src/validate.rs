@@ -50,7 +50,43 @@ pub fn validate_with_mode(
     check_warnings(project, &mut d);
     check_output_reachability(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
+    check_reserved_names(project, catalog, &mut d);
     d
+}
+
+/// A node or group named after a known node type is ambiguous: a reference
+/// like `MyName.port` parses as an INLINE node of that type, not a reference to
+/// the declaration. Flag it on the declaration line. The catalog is dynamic, so
+/// this lives here (where the catalog is in hand) rather than in the
+/// catalog-agnostic parser; the structural keywords `Group`/`Passthrough` are
+/// rejected in the parser instead, since they are not catalog entries.
+fn check_reserved_names(
+    project: &ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Compare the LOCAL name, not the scoped id: a node inside a group has id
+    // `grp.Llm`, but the ambiguous reference written in source is the local
+    // `Llm.port`, and `grp.Llm` would never match a catalog entry. The local
+    // segment is what collides with a type name.
+    let mut flag = |id: &str, line: usize| {
+        let local = id.rsplit('.').next().unwrap_or(id);
+        if catalog.lookup(local).is_some() {
+            out.push(Diagnostic {
+                line,
+                column: 0,
+                severity: Severity::Error,
+                message: format!("'{local}' is a node type name and cannot be used as a node or group name (a reference like '{local}.port' would parse as an inline node)"),
+                code: Some("reserved-name".into()),
+            });
+        }
+    };
+    for node in &project.nodes {
+        flag(&node.id, node.header_span.map(|s| s.start_line).unwrap_or(0));
+    }
+    for group in &project.groups {
+        flag(&group.id, group.header_span.map(|s| s.start_line).unwrap_or(0));
+    }
 }
 
 /// Evaluate each node's declarative `validate` rules from its
@@ -522,7 +558,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         for (key, value) in obj {
             let Some(port) = node.inputs.iter().find(|p| p.name == *key) else { continue };
             if !port.configurable { continue }
-            let line = node.config_spans.get(key).map(|s| s.start_line)
+            let line = node.config_spans.get(key).map(|s| s.span.start_line)
                 .or_else(|| node.header_span.map(|s| s.start_line)).unwrap_or(0);
             let inferred = weft_core::weft_type::WeftType::infer(value);
             if !weft_core::weft_type::WeftType::is_compatible(&inferred, &port.port_type) {
@@ -662,7 +698,7 @@ fn check_port_coverage(
                 }
                 push(
                     d,
-                    node.config_spans.get(key).map(|s| s.start_line).unwrap_or(line),
+                    node.config_spans.get(key).map(|s| s.span.start_line).unwrap_or(line),
                     Severity::Error,
                     "undeclared-port-no-custom",
                     format!(
@@ -910,7 +946,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 if v.is_null() {
                     push(
                         d,
-                        node.config_spans.get(key).map(|s| s.start_line).unwrap_or(line),
+                        node.config_spans.get(key).map(|s| s.span.start_line).unwrap_or(line),
                         Severity::Warning,
                         "config-null-literal",
                         format!(
@@ -938,12 +974,29 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// they'd otherwise warn even when they're correctly wired into
 /// fire-time subgraphs.
 fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    let outputs: Vec<&str> = project
-        .nodes
+    // A component file (an anonymous top-level Group, used via @include) is
+    // not a standalone runnable project: its outputs are the group's
+    // interface ports, surfaced as the root group's __out Passthrough. Use
+    // that as the output set so the no-output / unreachable rules don't fire
+    // spuriously when the file is opened on its own.
+    let component_out: Option<String> = project
+        .groups
         .iter()
-        .filter(|n| n.is_output())
-        .map(|n| n.id.as_str())
-        .collect();
+        .find(|g| g.parent_group_id.is_none() && g.anonymous)
+        .map(|g| format!("{}__out", g.id));
+
+    let outputs: Vec<&str> = if let Some(ref out_pt) = component_out {
+        // The component's output sink: everything upstream of the group's
+        // __out boundary is reachable; no top-level output node is required.
+        vec![out_pt.as_str()]
+    } else {
+        project
+            .nodes
+            .iter()
+            .filter(|n| n.is_output())
+            .map(|n| n.id.as_str())
+            .collect()
+    };
 
     if outputs.is_empty() {
         push(

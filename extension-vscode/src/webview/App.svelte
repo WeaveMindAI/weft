@@ -3,15 +3,11 @@
   import ProjectEditor from './lib/components/project/ProjectEditor.svelte';
   import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
   import { send, onMessage } from './vscode';
-  import {
-    setCachedParseResponse,
-    type WeftParseError,
-  } from './lib/ai/weft-parser';
-  import { registerCatalog, setCatalog, type CatalogEntry } from './lib/nodes';
+  import { registerCatalog, setCatalog, type CatalogEntry } from '$lib/nodes';
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution } from './lib/types';
-  import type { ActionBarState, ActionAvailability, NodeFeedState } from '../shared/protocol';
+  import type { ActionBarState, ActionAvailability, NodeFeedState, TextEdit, EditOp, FileContent } from '../shared/protocol';
 
   let project: V1Project | null = $state(null);
   let error: string | null = $state(null);
@@ -20,8 +16,34 @@
   // its own so a successful parse can't erase a live catalog problem.
   let catalogError: string | null = $state(null);
   let catalogWarnings: string[] = $state([]);
-  let weftCode = $state('');
   let layoutCode = $state('');
+  // RPC for source edits: applyEdits/applyTextEdit await the host's
+  // `editApplied` reply (correlated by id) carrying the inverse text edit the
+  // editor stores for undo. The webview owns the undo stack.
+  let nextEditRequestId = 0;
+  const pendingEdits = new Map<number, (inverse: TextEdit | null) => void>();
+  function requestEdit(make: (requestId: number) => void): Promise<TextEdit | null> {
+    const requestId = nextEditRequestId++;
+    return new Promise((resolve) => {
+      pendingEdits.set(requestId, resolve);
+      make(requestId);
+    });
+  }
+  // Include-navigation back-stack state, driven by the host's `navState`.
+  let navDepth = $state(0);
+  let navFileName = $state('');
+  let execPrefix = $state('');
+  // Resolved state of @file targets, keyed by the marker's relative path:
+  // content or a read error. The display value for a file-backed field;
+  // config holds only the marker.
+  let fileContents = $state<Record<string, FileContent>>({});
+  // Set true when the opened file has no saved layout, so the editor runs
+  // auto-organize on mount instead of piling nodes at the origin.
+  let autoOrganizeOnMount = $state(false);
+  // Bumped on every fresh view (first open + each include navigation) so the
+  // ProjectEditor is keyed to remount, re-running its mount-time layout
+  // (auto-organize when the file has no saved layout).
+  let viewGeneration = $state(0);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let editorRef: any = $state();
 
@@ -106,23 +128,50 @@
     };
     window.addEventListener('weft-signal-action', onSignalAction as EventListener);
     const unsub = onMessage((msg) => {
+      if (msg.kind === 'editApplied') {
+        // Reply to applyEdits/applyTextEdit: resolve the pending RPC with the
+        // inverse text edit (or null on failure) so the editor's undo stack can
+        // record the reversible action.
+        const pending = pendingEdits.get(msg.requestId);
+        if (pending) {
+          pendingEdits.delete(msg.requestId);
+          pending(msg.ok ? (msg.inverse ?? null) : null);
+        }
+        return;
+      }
       if (msg.kind === 'catalogAll') {
         setCatalog(msg.catalog as unknown as Record<string, CatalogEntry>);
         return;
       }
+      if (msg.kind === 'navState') {
+        navDepth = msg.depth;
+        navFileName = msg.fileName;
+        execPrefix = msg.execPrefix;
+        return;
+      }
+      if (msg.kind === 'fileContents') {
+        // File-backed field display values. Resent when a backing file
+        // changes externally, so file -> graph stays live with no reparse.
+        fileContents = msg.contents;
+        return;
+      }
       if (msg.kind === 'parseResult') {
-        const errs: WeftParseError[] = msg.response.diagnostics
-          .filter((d) => d.severity === 'error')
-          .map((d) => ({ line: d.line, message: d.message }));
         registerCatalog(msg.response.catalog as unknown as Record<string, CatalogEntry>);
-        const firstMount = project === null;
-        setCachedParseResponse(msg.response.project, msg.source, msg.layoutCode, errs);
-        weftCode = msg.source;
+        // A navigation file-swap (freshMount) rebuilds the view from scratch,
+        // same as the very first mount, so it takes the rebuild path (and
+        // auto-organizes when the file has no layout) rather than the
+        // in-place edit-reconciliation path.
+        const freshMount = project === null || msg.freshMount === true;
         layoutCode = msg.layoutCode;
-        if (firstMount) {
-          project = translateProject(msg.response.project, msg.source, msg.layoutCode);
+        const translated = translateProject(msg.response.project, msg.source, msg.layoutCode);
+        if (freshMount) {
+          // No saved layout (fresh file, or layout absent): auto-organize on
+          // mount so the graph isn't a pile at the origin.
+          autoOrganizeOnMount = msg.layoutCode.trim() === '';
+          viewGeneration += 1;
+          project = translated;
         } else if (editorRef) {
-          editorRef.applyExternalSource?.(msg.source, msg.layoutCode);
+          editorRef.applyExternalSource?.(translated, msg.source, msg.layoutCode);
         }
         // Recompute "source has infra / triggers" flags on every
         // parse so the ActionBar follows the user's edits. Source-
@@ -305,17 +354,46 @@
   function onSave(data: {
     name?: string;
     description?: string;
-    weftCode?: string;
     layoutCode?: string;
+    fileRef?: { path: string; content: string };
   }) {
-    if (data.weftCode !== undefined && data.weftCode !== weftCode) {
-      weftCode = data.weftCode;
-      send({ kind: 'saveWeft', source: data.weftCode });
-    }
     if (data.layoutCode !== undefined && data.layoutCode !== layoutCode) {
       layoutCode = data.layoutCode;
       send({ kind: 'saveLayout', layoutCode: data.layoutCode });
     }
+    if (data.fileRef !== undefined) {
+      // File-backed config field edit: the content goes to the
+      // referenced file, not the `@file(...)` token in the source.
+      send({ kind: 'saveFileRef', path: data.fileRef.path, content: data.fileRef.content });
+    }
+  }
+
+  /// A graph (GUI) edit: send the intents to the host (Rust edit-server applies
+  /// + writes the source, parseResult re-renders). Resolves with the inverse
+  /// text edit (this action's undo), or null if nothing was applied / it failed.
+  function onApplyEdits(ops: EditOp[]): Promise<TextEdit | null> {
+    if (ops.length === 0) return Promise.resolve(null);
+    return requestEdit((requestId) => send({ kind: 'applyEdits', ops, requestId }));
+  }
+
+  /// Replay a raw source text edit (undo/redo of a source action). Resolves with
+  /// the inverse (so undo<->redo round-trips).
+  function onApplyTextEdit(edit: TextEdit): Promise<TextEdit | null> {
+    return requestEdit((requestId) => send({ kind: 'applyTextEdit', edit, requestId }));
+  }
+
+  function onOpenInclude(path: string, alias: string) {
+    // Flush pending config-edit saves BEFORE navigating: this queues saveWeft
+    // for the current (parent) doc ahead of openInclude, so the parent's edits
+    // are persisted while it's still the watched doc. (Flushing on the editor's
+    // destroy would fire too late, after the host swapped the watched doc.)
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'openInclude', path, alias });
+  }
+
+  function onNavigateBack() {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'navigateBack' });
   }
 
   // Verb dispatchers. Each flushes pending edit saves (so the
@@ -397,11 +475,21 @@
       onCatchUp={() => send({ kind: 'followCatchUp' })}
       onOpenSource={() => send({ kind: 'openSource' })}
       sourceOpen={sourceOpen}
+      {navDepth}
+      {navFileName}
+      {onNavigateBack}
     />
+    {#key viewGeneration}
     <ProjectEditor
       bind:this={editorRef}
       {project}
       {onSave}
+      {onApplyEdits}
+      {onApplyTextEdit}
+      {onOpenInclude}
+      {execPrefix}
+      {fileContents}
+      {autoOrganizeOnMount}
       {onRun}
       {onStop}
       {onDismissError}
@@ -427,6 +515,7 @@
       {infraFeedByNode}
       {signalFeedByNode}
     />
+    {/key}
   {:else}
     <div class="p-4 text-muted-foreground">loading graph...</div>
   {/if}

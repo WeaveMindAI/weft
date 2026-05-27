@@ -104,7 +104,8 @@
 	// extension (Ctrl+S writes the document, execution is an editor
 	// command). We keep only actions that map to the webview itself.
 	const actions: { id: string; label: string; icon: Component; shortcut?: string }[] = [
-		{ id: "add_group", label: "Add Group", icon: GitFork },
+		// No "Add Group" action: Group is a node type, so it already appears in
+		// the node list (a second entry would be a redundant way to do the same).
 		{ id: "undo", label: "Undo", icon: Undo2, shortcut: "Ctrl+Z" },
 		{ id: "redo", label: "Redo", icon: Redo2, shortcut: "Ctrl+Shift+Z" },
 		{ id: "duplicate", label: "Duplicate Selected", icon: Copy, shortcut: "Ctrl+D" },
@@ -240,56 +241,17 @@
 		}
 	}
 	
-	// Global keyboard shortcut to open (Ctrl+P - cross-platform)
+	// The palette owns exactly ONE global shortcut: Ctrl+P to toggle itself open
+	// (it needs a global listener because the palette can be opened from
+	// anywhere). Every other canvas shortcut lives in ProjectEditorInner's
+	// single KEYMAP; the palette reaches those actions only through its visible
+	// command-list (click -> onAction). Owning them here too is what double-fired
+	// undo, so this listener deliberately handles nothing else.
 	function handleGlobalKeyDown(e: KeyboardEvent) {
-		const target = e.target as HTMLElement;
-		
-		// Skip if user is typing in an editable element (input, textarea, contenteditable)
-		const isEditableElement = 
-			target.tagName === 'INPUT' || 
-			target.tagName === 'TEXTAREA' || 
-			target.isContentEditable ||
-			target.closest('.edit-textarea') ||
-			target.closest('.annotation-node.editing');
-		
-		// Ctrl+P to toggle palette (always works)
 		if (e.ctrlKey && e.key === 'p') {
 			e.preventDefault();
 			e.stopPropagation();
 			open = !open;
-			return;
-		}
-		
-		// Skip other shortcuts if in editable element
-		if (isEditableElement) return;
-		
-		// Prevent browser defaults for our shortcuts when palette is closed
-		if (!open && e.ctrlKey) {
-			if (e.key === 's') {
-				e.preventDefault();
-				onAction?.('save');
-			} else if (e.key === 'z' && !e.shiftKey) {
-				e.preventDefault();
-				onAction?.('undo');
-			} else if (e.key === 'z' && e.shiftKey) {
-				e.preventDefault();
-				onAction?.('redo');
-			} else if (e.key === 'a') {
-				e.preventDefault();
-				onAction?.('selectAll');
-			} else if (e.key === 'd') {
-				e.preventDefault();
-				onAction?.('duplicate');
-			} else if (e.key === 'Enter') {
-				e.preventDefault();
-				onAction?.('run');
-			}
-		}
-		
-		// Delete key (no modifier)
-		if (!open && e.key === 'Delete') {
-			e.preventDefault();
-			onAction?.('delete');
 		}
 	}
 	

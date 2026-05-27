@@ -1416,3 +1416,13 @@ use super::*;
       assert!(ty("T").cast_text("anything").is_err());
       assert!(WeftType::MustOverride.cast_text("anything").is_err());
   }
+
+  #[test]
+  fn cast_rejects_media_types_loudly() {
+      // Media is a {url, mimeType} reference, not inline bytes: @file can't
+      // load it. Fails with a clear reason, not a confusing JSON-parse error.
+      for t in ["Image", "Video", "Audio", "Document"] {
+          let err = ty(t).cast_text("\u{0089}PNG binary").unwrap_err();
+          assert!(err.contains("media is referenced by URL"), "{t}: {err}");
+      }
+  }

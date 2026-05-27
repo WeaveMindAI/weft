@@ -155,12 +155,30 @@ enum Cmd {
     /// `nodes/` catalog and print the project + referenced catalog +
     /// diagnostics as JSON. The editor's live graph feedback. Lenient:
     /// unknown node types become placeholders rather than errors.
-    Parse,
+    Parse {
+        /// Path of the source file (the stdin content's origin). Its
+        /// directory is the base for `@file`/`@include` resolution, so
+        /// relative paths resolve against the file's own location, not the
+        /// project root. Omit when parsing a detached buffer.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+    },
     /// Validate weft source (read from stdin) against the project's
     /// `nodes/` catalog and print diagnostics as JSON. The editor's
     /// Problems-panel feedback. Strict: the full compile + enrich +
     /// validate pipeline.
-    Validate,
+    Validate {
+        /// Path of the source file (see `parse --file`).
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Long-lived parse server for the editor: reads one JSON request per
+    /// line on stdin, writes one JSON response per line on stdout. Holds the
+    /// node catalog warm in memory so each parse/validate is parse-cost, not
+    /// catalog-discovery cost. The VS Code extension spawns one on activate
+    /// and kills it on deactivate. Serves both `parse` and `validate` kinds.
+    #[command(name = "parse-server")]
+    ParseServer,
     /// Manage the project's base node catalog (the stdlib mirror
     /// under `nodes/base_catalog/`).
     Catalog {
@@ -499,8 +517,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,
-        Cmd::Parse => commands::parse::parse(ctx).await,
-        Cmd::Validate => commands::parse::validate(ctx).await,
+        Cmd::Parse { file } => commands::parse::parse(ctx, file).await,
+        Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
+        Cmd::ParseServer => commands::parse::serve(ctx).await,
         Cmd::Catalog { action } => match action {
             CatalogAction::Update => commands::catalog::update(ctx).await,
         },
