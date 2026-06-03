@@ -13,8 +13,6 @@ use crate::weft_type::WeftType;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
     pub id: Uuid,
-    pub name: String,
-    pub description: Option<String>,
     pub nodes: Vec<NodeDefinition>,
     pub edges: Vec<Edge>,
     /// Group structure preserved by the parser. The flattened node
@@ -83,17 +81,18 @@ pub struct GroupDefinition {
 /// streaming edits) to perform surgical text edits without re-serializing
 /// the whole file. Missing (None) when the struct wasn't produced by the
 /// parser (e.g. hand-constructed in tests).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Span {
     pub start_line: usize,
-    pub start_col: usize,
+    pub start_column: usize,
     pub end_line: usize,
-    pub end_col: usize,
+    pub end_column: usize,
 }
 
 impl Span {
-    pub fn single_line(line: usize, start_col: usize, end_col: usize) -> Self {
-        Self { start_line: line, start_col, end_line: line, end_col }
+    pub fn single_line(line: usize, start_column: usize, end_column: usize) -> Self {
+        Self { start_line: line, start_column, end_line: line, end_column }
     }
 }
 
@@ -171,7 +170,7 @@ pub struct NodeDefinition {
     /// Source range of the node's header (`id = NodeType`), the part
     /// before the `{` config block. Used when adding a config field
     /// to a bare node.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "headerSpan", skip_serializing_if = "Option::is_none")]
     pub header_span: Option<Span>,
     /// Per-config-field source ranges, keyed by field name. Each range
     /// covers the `key: value` pair including trailing comma. Used to
@@ -209,6 +208,14 @@ fn default_config() -> Value {
 }
 
 impl NodeDefinition {
+    /// The node's header span, or a default (zero) span when it has none
+    /// (synthetic nodes carry no header). The single home for "point a
+    /// diagnostic at this node's header line", so every diagnostic site uses
+    /// the same fallback rather than repeating `header_span.unwrap_or_default()`.
+    pub fn header_span_or_default(&self) -> Span {
+        self.header_span.unwrap_or_default()
+    }
+
     /// Resolved `_is_output` for this node instance. Reads
     /// `config._is_output` (explicit author override) if set, else
     /// falls back to `features.is_output_default` (node-type default).
@@ -403,4 +410,125 @@ pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)
     }
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod project_wire_tests {
+    use super::*;
+
+    /// Layer-2 wire-shape: `ProjectDefinition` is stored as JSON and crosses the
+    /// CLI->dispatcher boundary. It must (a) NOT serialize a `name`/`description`
+    /// key (those were dropped; identity is the manifest, descriptions per-group)
+    /// and (b) still deserialize OLD json that carries those keys, so existing
+    /// stored project_json rows keep loading (no `deny_unknown_fields`).
+    #[test]
+    fn project_definition_wire_shape() {
+        let p = ProjectDefinition {
+            id: Uuid::nil(),
+            nodes: vec![],
+            edges: vec![],
+            groups: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("name").is_none(), "name must not serialize: {v}");
+        assert!(v.get("description").is_none(), "description must not serialize: {v}");
+
+        // Old JSON with the dropped keys still loads (unknown keys ignored).
+        let old = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "legacy",
+            "description": "legacy desc",
+            "nodes": [], "edges": [], "groups": []
+        });
+        let back: ProjectDefinition = serde_json::from_value(old).expect("old json must still deserialize");
+        assert!(back.nodes.is_empty());
+    }
+
+    /// Pin the camelCase wire keys of the NESTED structs (node, port, edge,
+    /// group) so a `#[serde(rename)]` drift that would break the TS contract
+    /// fails here, not at the customer. Round-trips a populated project.
+    #[test]
+    fn project_definition_nested_wire_keys() {
+        let port = PortDefinition {
+            name: "inp".into(),
+            port_type: WeftType::primitive(crate::weft_type::WeftPrimitive::String),
+            required: true,
+            description: None,
+            lane_mode: crate::LaneMode::Single,
+            lane_depth: 1,
+            configurable: false,
+            user_typed: false,
+        };
+        let node = NodeDefinition {
+            id: "g.n".into(),
+            node_type: "Llm".into(),
+            label: None,
+            config: default_config(),
+            position: Position { x: 0.0, y: 0.0 },
+            scope: vec!["g".into()],
+            group_boundary: None,
+            inputs: vec![port.clone()],
+            outputs: vec![],
+            features: Default::default(),
+            requires_infra: false,
+            images: vec![],
+            span: Some(Span::single_line(1, 0, 5)),
+            header_span: Some(Span::single_line(1, 0, 3)),
+            config_spans: Default::default(),
+            file_refs: Default::default(),
+            include_path: None,
+        };
+        let group = GroupDefinition {
+            id: "g".into(),
+            label: None,
+            in_ports: vec![port],
+            out_ports: vec![],
+            one_of_required: vec![],
+            parent_group_id: None,
+            child_group_ids: vec![],
+            node_ids: vec!["g.n".into()],
+            anonymous: false,
+            span: None,
+            header_span: None,
+        };
+        let edge = Edge {
+            id: "e1".into(),
+            source: "g.n".into(),
+            source_handle: Some("out".into()),
+            target: "g.m".into(),
+            target_handle: Some("in".into()),
+            span: None,
+        };
+        let p = ProjectDefinition {
+            id: Uuid::nil(),
+            nodes: vec![node],
+            edges: vec![edge],
+            groups: vec![group],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        // The renamed keys the TS side depends on:
+        assert!(v["nodes"][0].get("nodeType").is_some(), "nodeType key: {v}");
+        assert!(v["nodes"][0]["inputs"][0].get("portType").is_some(), "portType key: {v}");
+        assert!(v["groups"][0].get("inPorts").is_some(), "inPorts key: {v}");
+        assert!(v["groups"][0].get("nodeIds").is_some(), "nodeIds key: {v}");
+        assert!(v.get("createdAt").is_some(), "createdAt key: {v}");
+        // headerSpan: the editor reads it to underline a node's header line. Both
+        // the key (`headerSpan`) and the nested `Span` fields are camelCase, the
+        // one wire convention this whole module follows; pin them so neither
+        // drifts back to snake_case.
+        let hs = &v["nodes"][0]["headerSpan"];
+        assert!(hs.is_object(), "headerSpan key (camelCase): {v}");
+        assert!(hs.get("startLine").is_some() && hs.get("startColumn").is_some(), "span start bounds (camelCase): {hs}");
+        assert!(hs.get("endLine").is_some() && hs.get("endColumn").is_some(), "span end bounds (camelCase): {hs}");
+        assert!(hs.get("end_col").is_none() && hs.get("start_col").is_none(), "no leftover snake_case span keys: {hs}");
+        // Full round-trip survives.
+        let back: ProjectDefinition = serde_json::from_value(v).expect("round-trip");
+        assert_eq!(back.nodes[0].node_type, "Llm");
+        assert_eq!(back.groups[0].in_ports.len(), 1);
+        assert_eq!(back.nodes[0].header_span, Some(Span::single_line(1, 0, 3)), "headerSpan round-trips");
+    }
 }

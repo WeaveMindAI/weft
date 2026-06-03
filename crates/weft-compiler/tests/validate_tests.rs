@@ -240,11 +240,52 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
     assert!(codes(&d).contains(&"no-output-node"), "expected no-output-node, got {d:?}");
 
     // With a real Debug output downstream of the include: no no-output error,
-    // and the Debug node is NOT spuriously flagged unreachable.
-    let src_out = "c = @include(\"comp.weft\")\nc.raw = \"hi\"\nout = Debug\nout.data = c.cleaned\n";
+    // and the Debug node is NOT spuriously flagged unreachable. The include's
+    // input is driven by an inline node (a group port takes wiring, not a bare
+    // literal).
+    let src_out = "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n";
     let mut p2 = compile(src_out, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
     enrich(&mut p2, &catalog()).expect("enrich");
     let d2 = validate(&p2, &catalog());
     assert!(!codes(&d2).contains(&"no-output-node"), "unexpected no-output: {d2:?}");
-    assert!(!d2.iter().any(|x| x.code.as_deref() == Some("unreachable-from-output") && x.message.contains("out")), "Debug wrongly unreachable: {d2:?}");
+    // The Debug node `out` (the project's output) must NOT be flagged unreachable.
+    // Match the node id precisely (`'out'`), not the substring "out" which also
+    // appears in "output"/"outputs" in unrelated messages.
+    assert!(!d2.iter().any(|x| x.code.as_deref() == Some("unreachable-from-output") && x.message.contains("'out'")), "Debug wrongly unreachable: {d2:?}");
+}
+
+// ── declarative-rule engine (ConfigMatches) ──────────────────────────────────
+
+/// The ApiPost node carries a declarative rule:
+/// `when config_matches(path, "^/") then warn`. These tests exercise the
+/// declarative-rule engine + the `ConfigMatches` condition end-to-end, including
+/// the fail-closed behavior on an absent field (the rule must NOT fire when the
+/// field is missing, like every sibling ConfigX condition).
+#[test]
+fn config_matches_rule_fires_only_when_pattern_matches() {
+    // path starts with `/` -> the rule fires (warning).
+    let with_slash = parse_enrich("# Project: P\n\nt = ApiPost { path: \"/hook\" }\n");
+    let d = validate(&with_slash, &catalog());
+    assert!(
+        d.iter().any(|x| x.message.contains("path starts with '/'")),
+        "config_matches must fire for a leading slash: {d:?}"
+    );
+
+    // path without a leading slash -> no rule.
+    let no_slash = parse_enrich("# Project: P\n\nt = ApiPost { path: \"hook\" }\n");
+    let d2 = validate(&no_slash, &catalog());
+    assert!(
+        !d2.iter().any(|x| x.message.contains("path starts with '/'")),
+        "config_matches must NOT fire without a leading slash: {d2:?}"
+    );
+
+    // path absent entirely -> no rule (fail-closed: an absent field is not a
+    // match, matching every sibling ConfigX condition; the old `unwrap_or(true)`
+    // wrongly fired this).
+    let absent = parse_enrich("# Project: P\n\nt = ApiPost {}\n");
+    let d3 = validate(&absent, &catalog());
+    assert!(
+        !d3.iter().any(|x| x.message.contains("path starts with '/'")),
+        "config_matches must NOT fire when the field is absent: {d3:?}"
+    );
 }

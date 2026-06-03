@@ -101,9 +101,22 @@ async function runValidation(
 }
 
 function toVsCodeDiagnostic(d: WeftDiagnostic): vscode.Diagnostic {
-  const line = Math.max(0, d.line - 1);
-  const col = Math.max(0, d.column);
-  const range = new vscode.Range(line, col, line, col + 1);
+  // Rust lines are 1-based, columns 0-based character offsets; vscode is
+  // 0-based both. The diagnostic carries the culprit's full range
+  // [line:column, endLine:endColumn); underline exactly that. A degenerate
+  // point span (end == start, e.g. a project-level diagnostic with no specific
+  // location) falls back to a 1-char caret so it's still visible.
+  const startLine = Math.max(0, d.line - 1);
+  const startCol = Math.max(0, d.column);
+  // Nullish-coalesce (not `||`) for both end bounds: the fields are OPTIONAL,
+  // so only an absent (null/undefined) end falls back to the start. `||` would
+  // wrongly treat a legitimate `endLine: 0` / `endColumn: 0` as absent.
+  const endLine = Math.max(0, (d.endLine ?? d.line) - 1);
+  const endCol = Math.max(0, d.endColumn ?? d.column);
+  const pointSpan = endLine === startLine && endCol <= startCol;
+  const range = pointSpan
+    ? new vscode.Range(startLine, startCol, startLine, startCol + 1)
+    : new vscode.Range(startLine, startCol, endLine, endCol);
   const diag = new vscode.Diagnostic(range, d.message, toSeverity(d.severity));
   if (d.code) diag.code = d.code;
   diag.source = 'weft';

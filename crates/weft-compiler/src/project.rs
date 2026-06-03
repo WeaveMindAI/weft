@@ -170,26 +170,39 @@ impl Project {
         std::fs::read_to_string(self.main_weft()).map_err(CompileError::Io)
     }
 
-    /// Search upward from `start` for a directory containing
-    /// `weft.toml`. Lets the user invoke `weft run` from a subfolder
-    /// without naming the project root every time.
-    pub fn discover(start: &Path) -> CompileResult<Self> {
-        let start = start.canonicalize().map_err(CompileError::Io)?;
+    /// Search upward from `start` for a directory containing `weft.toml` and
+    /// load it. `Ok(Some)` = found and loaded; `Ok(None)` = no project (no
+    /// `weft.toml` in the tree, OR `start` doesn't resolve to a real directory,
+    /// e.g. an unsaved editor buffer); `Err` = a `weft.toml` was found but FAILED
+    /// to load (a malformed manifest). Only the LAST case is loud, so a caller
+    /// that tolerates "no project" (the editor's lenient parse) surfaces a BROKEN
+    /// manifest while still degrading gracefully on an unresolvable path.
+    pub fn find(start: &Path) -> CompileResult<Option<Self>> {
+        // An unresolvable start path (a phantom/unsaved buffer location) is "no
+        // project", not an error: there's simply nowhere to search from.
+        let Ok(start) = start.canonicalize() else { return Ok(None) };
         let mut cursor: &Path = &start;
         loop {
             if cursor.join("weft.toml").exists() {
-                return Self::load(cursor);
+                return Self::load(cursor).map(Some);
             }
             match cursor.parent() {
                 Some(p) => cursor = p,
-                None => {
-                    return Err(CompileError::Project(format!(
-                        "no weft.toml found at {} or any parent",
-                        start.display()
-                    )));
-                }
+                None => return Ok(None),
             }
         }
+    }
+
+    /// Like [`find`], but a missing project is an error (the common case for
+    /// commands that require a project root). Lets the user invoke `weft run`
+    /// from a subfolder without naming the project root every time.
+    pub fn discover(start: &Path) -> CompileResult<Self> {
+        Self::find(start)?.ok_or_else(|| {
+            CompileError::Project(format!(
+                "no weft.toml found at {} or any parent",
+                start.display()
+            ))
+        })
     }
 }
 
@@ -218,4 +231,37 @@ pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
         &dest,
         weft_catalog::NODE_TREE_EXCLUDE,
     )
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    /// `Project::find` is three-way: a valid manifest loads, a missing manifest is
+    /// `Ok(None)` (lenient), and a MALFORMED manifest is a loud `Err` (never
+    /// silently degraded to no-project, which would render every node unknown).
+    #[test]
+    fn find_distinguishes_missing_from_malformed() {
+        // No weft.toml anywhere -> Ok(None).
+        let empty = tempfile::tempdir().unwrap();
+        assert!(matches!(Project::find(empty.path()), Ok(None)), "missing manifest is no-project");
+
+        // A valid weft.toml -> Ok(Some).
+        let good = tempfile::tempdir().unwrap();
+        std::fs::write(
+            good.path().join("weft.toml"),
+            "[package]\nname = \"p\"\nid = \"00000000-0000-0000-0000-000000000000\"\n",
+        ).unwrap();
+        assert!(matches!(Project::find(good.path()), Ok(Some(_))), "valid manifest loads");
+
+        // A malformed weft.toml -> Err (loud), NOT Ok(None).
+        let bad = tempfile::tempdir().unwrap();
+        std::fs::write(bad.path().join("weft.toml"), "this is = = not valid toml [[[\n").unwrap();
+        assert!(matches!(Project::find(bad.path()), Err(_)), "malformed manifest fails loud, not silent no-project");
+
+        // An unresolvable start path -> Ok(None) (an unsaved buffer is no-project,
+        // not an error).
+        let phantom = empty.path().join("does/not/exist");
+        assert!(matches!(Project::find(&phantom), Ok(None)), "unresolvable path is no-project");
+    }
 }

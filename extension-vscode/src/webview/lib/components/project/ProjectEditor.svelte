@@ -59,7 +59,7 @@
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
-		onSave: (data: { name?: string; description?: string; layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
+		onSave: (data: { layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
 		onApplyEdits: (ops: import('../../../../shared/protocol').EditOp[]) => Promise<import('../../../../shared/protocol').TextEdit | null>;
 		onApplyTextEdit: (edit: import('../../../../shared/protocol').TextEdit) => Promise<import('../../../../shared/protocol').TextEdit | null>;
 		onOpenInclude?: (path: string, alias: string) => void;

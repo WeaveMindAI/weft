@@ -16,7 +16,7 @@ use std::time::Duration;
 use weft_broker_client::protocol::InfraNodeStatus as Status;
 use weft_infra_supervisor::broker_ops::{BrokerCall, BrokerSupervisorOps};
 use weft_infra_supervisor::testing::SupervisorTestRig;
-use weft_platform_traits::kube::{KubeCall, KubeClient, WorkloadKind, WorkloadReplicaState};
+use weft_platform_traits::kube::{KubeCall, WorkloadKind, WorkloadReplicaState};
 
 /// A one-unit roster (unit named `unit`, at `status`, default windows).
 fn unit_map(

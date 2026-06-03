@@ -47,6 +47,7 @@ pub fn emit(
     project_root: &Path,
     target_root: &Path,
     catalog: &FsCatalog,
+    crate_name: &str,
 ) -> CompileResult<PathBuf> {
     let crate_root = target_root.to_path_buf();
     let src_dir = crate_root.join("src");
@@ -68,7 +69,7 @@ pub fn emit(
     // shim per distinct package.
     let packages = group_by_package(catalog, &referenced)?;
 
-    write_cargo_toml(&crate_root, project, catalog, &referenced, &packages)?;
+    write_cargo_toml(&crate_root, catalog, &referenced, &packages, crate_name)?;
     write_rust_toolchain(&crate_root, &weft_root)?;
     write_project_json(&src_dir, project)?;
     write_project_rs(&src_dir)?;
@@ -147,12 +148,12 @@ pub fn collect_node_types(project: &ProjectDefinition) -> BTreeSet<String> {
 
 fn write_cargo_toml(
     crate_root: &Path,
-    project: &ProjectDefinition,
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
     packages: &[PackageEmit<'_>],
+    crate_name: &str,
 ) -> CompileResult<()> {
-    let package_name = sanitize_crate_name(&project.name);
+    let package_name = crate::build::sanitize_crate_name(crate_name);
 
     // Path deps point at `../weft/crates/<name>`, a path that resolves
     // INSIDE the builder container (weft workspace at `/weft`, project
@@ -365,22 +366,6 @@ fn version_with_features(version: &str, features: &[&str]) -> toml::Table {
 
 fn insert_dep(map: &mut BTreeMap<String, toml::Value>, name: &str, value: toml::Value) {
     map.insert(name.into(), value);
-}
-
-fn sanitize_crate_name(raw: &str) -> String {
-    let lowered = raw.to_ascii_lowercase();
-    let mut out = String::with_capacity(lowered.len());
-    for ch in lowered.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
-        out.insert(0, 'p');
-    }
-    out
 }
 
 fn write_project_json(src_dir: &Path, project: &ProjectDefinition) -> CompileResult<()> {

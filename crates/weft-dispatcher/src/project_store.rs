@@ -29,6 +29,7 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn register(
         &self,
         project: ProjectDefinition,
+        name: &str,
         tenant_id: &str,
         project_namespace: &str,
     ) -> anyhow::Result<StoredProjectSummary>;
@@ -485,11 +486,12 @@ impl ProjectStoreOps for PostgresProjectStore {
     async fn register(
         &self,
         project: ProjectDefinition,
+        name: &str,
         tenant_id: &str,
         project_namespace: &str,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
-        let name = project.name.clone();
+        let name = name.to_string();
         let project_json = serde_json::to_string(&project)?;
         sqlx::query(
             "INSERT INTO project \
@@ -944,11 +946,12 @@ impl ProjectStoreOps for MockProjectStore {
     async fn register(
         &self,
         project: ProjectDefinition,
+        name: &str,
         tenant_id: &str,
         project_namespace: &str,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
-        let name = project.name.clone();
+        let name = name.to_string();
         self.inner
             .write()
             .await

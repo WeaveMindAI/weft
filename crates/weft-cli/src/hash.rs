@@ -182,9 +182,11 @@ pub fn load_enriched_project(project: &Project) -> Result<(ProjectDefinition, Fs
         .map_err(|e| anyhow::anyhow!("read main.weft: {e}"))?;
     let catalog = build_project_catalog(&project.root)
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
-    let mut definition = compile_enriched(&source, project.id(), Some(&project.root), &catalog)
+    let definition = compile_enriched(&source, project.id(), Some(&project.root), &catalog)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    definition.name = project.manifest.package.name.clone();
+    // The parsed definition carries no name (it's a manifest property); the
+    // manifest file itself is hashed via the project-dir walk, so identity is
+    // covered without piggybacking it onto the graph.
     Ok((definition, catalog))
 }
 

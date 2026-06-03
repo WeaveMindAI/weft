@@ -63,13 +63,15 @@
 		}
 	}
 
-	// Resize end: dimensions only (`expanded` is unchanged). The host classifies
-	// resize vs collapse by whether `expanded` changes value, so this stays a
-	// resize even though the spread config still carries the current flag.
+	// Resize end: the user dragged the resize handle. `resized: true` tells the
+	// host this is a real user resize (re-run ELK so neighbours make room), as
+	// opposed to a programmatic dimension write like the min-height auto-enforce
+	// below, which carries height too but must NOT trigger a relayout.
 	function handleResizeEnd(_event: unknown, params: ResizeParams) {
 		if (data.onUpdate) {
 			data.onUpdate({
-				config: { ...data.config, width: params.width, height: params.height }
+				config: { ...data.config, width: params.width, height: params.height },
+				resized: true,
 			});
 		}
 	}

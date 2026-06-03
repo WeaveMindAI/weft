@@ -90,7 +90,9 @@ pub async fn register(
 ) -> Result<Json<ProjectSummary>, (StatusCode, Json<RegisterError>)> {
     let mut project = req.definition;
     project.id = req.id;
-    project.name = req.name;
+    // The project's display name is a register-request property (the CLI sends
+    // it from `weft.toml`), not a field of the parsed graph definition.
+    let name = req.name;
 
     let project_id_str = project.id.to_string();
     let tenant = state.tenant_router.tenant_for_project(&project_id_str);
@@ -155,7 +157,7 @@ pub async fn register(
         })?;
     let summary = state
         .projects
-        .register(project, tenant.as_str(), &project_namespace)
+        .register(project, &name, tenant.as_str(), &project_namespace)
         .await
         .map_err(|e| {
             (
@@ -2935,8 +2937,6 @@ mod trigger_seed_tests {
             .collect();
         let body = serde_json::json!({
             "id": uuid::Uuid::new_v4(),
-            "name": "t",
-            "description": null,
             "nodes": n_json,
             "edges": e_json,
             "groups": []
@@ -3094,8 +3094,6 @@ mod infra_seed_and_dep_tests {
             .collect();
         let body = serde_json::json!({
             "id": uuid::Uuid::new_v4(),
-            "name": "t",
-            "description": null,
             "nodes": n_json,
             "edges": e_json,
             "groups": []

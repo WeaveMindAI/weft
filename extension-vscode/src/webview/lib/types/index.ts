@@ -568,8 +568,8 @@ export interface Edge {
 
 export interface ProjectDefinition {
 	id: string;
-	name: string;
-	description: string | null;
+	// A project carries no name/description: identity is the manifest file name,
+	// descriptions are per-group (`# Description:`). (Matches the Rust wire type.)
 	// Stored (source of truth)
 	weftCode?: string | null;
 	layoutCode?: string | null;
@@ -593,6 +593,11 @@ export interface NodeDataUpdates {
 	config?: Record<string, unknown>;
 	inputs?: PortDefinition[];
 	outputs?: PortDefinition[];
+	/// Set ONLY when the user dragged the resize handle. The host re-runs ELK on a
+	/// resize (neighbours make room), so this must distinguish a real user resize
+	/// from a programmatic dimension write (min-height auto-enforce, a rebuild after
+	/// a move), which carry width/height too but must NOT trigger a relayout.
+	resized?: boolean;
 }
 
 // =============================================================================

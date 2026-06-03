@@ -352,8 +352,6 @@
   });
 
   function onSave(data: {
-    name?: string;
-    description?: string;
     layoutCode?: string;
     fileRef?: { path: string; content: string };
   }) {

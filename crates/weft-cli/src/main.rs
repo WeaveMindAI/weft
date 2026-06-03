@@ -517,7 +517,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,
-        Cmd::Parse { file } => commands::parse::parse(ctx, file).await,
+        Cmd::Parse { file } => commands::parse::parse(file).await,
         Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
         Cmd::ParseServer => commands::parse::serve(ctx).await,
         Cmd::Catalog { action } => match action {

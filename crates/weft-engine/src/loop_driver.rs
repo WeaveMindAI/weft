@@ -1236,8 +1236,6 @@ mod scope_tests {
     fn mk_project(nodes: Vec<NodeDefinition>, edges: Vec<Edge>) -> ProjectDefinition {
         let v = serde_json::json!({
             "id": uuid::Uuid::new_v4(),
-            "name": "t",
-            "description": null,
             "nodes": nodes,
             "edges": edges,
             "groups": []

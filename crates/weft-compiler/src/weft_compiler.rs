@@ -20,13 +20,28 @@ use weft_core::weft_type::WeftType;
 
 #[derive(Debug, Clone)]
 pub struct CompileError {
-    pub line: usize,
+    /// Source range of the exact culprit (token/node), bounded as tightly as the
+    /// error allows. 1-based lines, 0-based character columns, end-exclusive.
+    pub span: Span,
     pub message: String,
+}
+
+impl CompileError {
+    /// An error anchored to a span (the normal case: the offending token/node).
+    pub fn at(span: Span, message: impl Into<String>) -> Self {
+        Self { span, message: message.into() }
+    }
+
+    /// 1-based start line (convenience for consumers that only show a line).
+    pub fn line(&self) -> usize {
+        self.span.start_line
+    }
 }
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {}", self.line, self.message)
+        // `line:col: message` (rustc/TSC convention; columns shown 1-based).
+        write!(f, "{}:{}: {}", self.span.start_line, self.span.start_column + 1, self.message)
     }
 }
 
@@ -123,8 +138,6 @@ impl ParsedGroup {
 }
 
 struct ParseState {
-    name: String,
-    description: String,
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
     groups: Vec<ParsedGroup>,
@@ -150,14 +163,14 @@ impl ParseState {
 
 /// A `c = @include("path")` declaration captured at parse time. `alias` is
 /// the call-site name (the group id after resolution), `path` is the file to
-/// splice, `line` is for error reporting.
+/// splice, `span` is the decl's source range (diagnostics + the opaque node).
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedInclude {
     pub alias: String,
     pub path: String,
-    pub line: usize,
-    pub span: Option<Span>,
-    pub header_span: Option<Span>,
+    /// Source range of the `alias = @include(...)` decl (the include IS its
+    /// header), used both for diagnostics and as the opaque node's span.
+    pub span: Span,
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -177,7 +190,7 @@ pub fn compile(
     project_id: Uuid,
     base_dir: Option<&std::path::Path>,
 ) -> Result<ProjectDefinition, Vec<CompileError>> {
-    compile_with_mode(source, project_id, base_dir, IncludeMode::Full)
+    compile_with_mode(source, project_id, base_dir, IncludeMode::Full, None)
 }
 
 /// How `@include` is resolved. `Full` inlines the referenced group's whole
@@ -195,9 +208,10 @@ pub fn compile_with_mode(
     project_id: Uuid,
     base_dir: Option<&std::path::Path>,
     include_mode: IncludeMode,
+    source_name: Option<&str>,
 ) -> Result<ProjectDefinition, Vec<CompileError>> {
     // Strict: any error aborts (the build must not produce a half-project).
-    let (project, errors) = compile_lenient(source, project_id, base_dir, include_mode);
+    let (project, errors) = compile_lenient(source, project_id, base_dir, include_mode, source_name);
     if errors.is_empty() {
         Ok(project)
     } else {
@@ -210,17 +224,26 @@ pub fn compile_with_mode(
 /// line (e.g. a stray `debug` mid-edit) becomes one diagnostic; every valid
 /// node/edge around it still renders. This is the editor's parse path; the
 /// build path uses `compile_with_mode` (strict) which fails on any error.
+/// `source_name` is the file's identity (e.g. `MyCleaner` from `my-cleaner.weft`,
+/// or `Untitled` for an unsaved buffer). It's the id given to an anonymous
+/// top-level group (`Group(){...}` with no `name =`), so a file's anon root has
+/// the SAME id at parse, edit, and render: there's no sentinel to rename later.
 pub fn compile_lenient(
     source: &str,
     project_id: Uuid,
     base_dir: Option<&std::path::Path>,
     include_mode: IncludeMode,
+    source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<CompileError>) {
     let mut errors = Vec::new();
 
     // Parse (the parser already builds a partial ParseState alongside its
     // errors). Resolve this file's own `@file` markers, collecting errors.
-    let mut state = parse_weft(source);
+    // The file's identity: derived from the filename for an anonymous top-level
+    // group (`Group(){...}`), so the file's anon root has the same id at parse,
+    // edit, and render. `None`/an unsaved buffer falls back to `Untitled`.
+    let source_id = source_name.unwrap_or("Untitled");
+    let mut state = parse_weft(source, source_id);
     errors.append(&mut state.errors);
     for node in &mut state.nodes {
         resolve_node_file_refs_in(node, base_dir, &mut errors);
@@ -245,8 +268,9 @@ pub fn compile_lenient(
 fn parse_and_resolve_file_refs(
     source: &str,
     base_dir: Option<&std::path::Path>,
+    source_id: &str,
 ) -> Result<ParseState, Vec<CompileError>> {
-    let mut state = parse_weft(source);
+    let mut state = parse_weft(source, source_id);
     if !state.errors.is_empty() {
         return Err(state.errors);
     }
@@ -274,7 +298,7 @@ fn resolve_node_file_refs_in(
         &mut node.config,
         &node.config_spans,
         &mut node.file_refs,
-        node.span.map(|s| s.start_line).unwrap_or(0),
+        node.span.unwrap_or_default(),
         base_dir,
         errors,
     );
@@ -302,132 +326,20 @@ fn resolve_group_file_refs(
 /// editor renders it as an expandable group that navigates into the file.
 pub const INCLUDE_NODE_TYPE: &str = "IncludedGroup";
 
-/// Sentinel id for the anonymous top-level group in an included file. The
-/// include pass rescopes it under the call-site alias, so the name is never
-/// user-visible; it only needs to be unique within the included file's parse.
-/// Also the signal, when present as a top-level group in a parsed project,
-/// that the file is a component (validated with component rules, not
-/// project rules: its outputs are the group interface, not a Debug node).
-pub(crate) const INCLUDE_ROOT_ID: &str = "__include_root__";
-
-/// Compose a flattened edge id from its endpoints. The single definition of
-/// the edge-id shape, used by `parsed_to_edge` (at flatten) and by the
-/// component relabel (to recompute ids after renaming endpoints) so the two
-/// can never drift.
+/// Compose a flattened edge id from its endpoints. The single definition of the
+/// edge-id shape, used by `parsed_to_edge` at flatten.
 fn edge_id(source: &str, source_handle: &str, target: &str, target_handle: &str) -> String {
     format!("e-{source}-{source_handle}-{target}-{target_handle}")
 }
 
 /// The display label for a group's boundary Passthrough. Single definition of
-/// the shape, used at flatten and by the component relabel (to recompute the
-/// label after renaming) so they can't drift.
+/// the shape, used at flatten.
 fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -> String {
     let suffix = match role {
         weft_core::project::GroupBoundaryRole::In => "in",
         weft_core::project::GroupBoundaryRole::Out => "out",
     };
     format!("{group_id} ({suffix})")
-}
-
-/// Rename the anonymous top-level component group (parsed under the sentinel
-/// `INCLUDE_ROOT_ID`) to a caller-supplied id + label, in place, across the
-/// flattened project. Run when a component file is opened standalone in the
-/// editor so the sentinel never surfaces; no-op if there's no anonymous root.
-///
-/// This lives in the compiler (not the CLI) because it depends on the flattened
-/// shape the compiler owns: which fields carry ids, how boundary passthroughs
-/// are labeled (`"{id} (in)"`), and the edge-id format. The CLI supplies only
-/// the filename-derived name.
-pub fn relabel_anonymous_root(project: &mut ProjectDefinition, new_id: &str, label: &str) {
-    let old = INCLUDE_ROOT_ID;
-    let is_root = project
-        .groups
-        .iter()
-        .any(|g| g.parent_group_id.is_none() && g.anonymous && g.id == old);
-    if !is_root {
-        return;
-    }
-    // Rewrite one flattened id: `old` exactly (the group's own id), or `old`
-    // followed by an id boundary (`old__in`/`old__out` passthroughs, `old.child`
-    // scoped members). The boundary check keeps an unrelated id that merely
-    // starts with `old` (`old_helper`) untouched.
-    let map = |id: &str| -> String {
-        if id == old {
-            new_id.to_string()
-        } else if let Some(rest) = id.strip_prefix(old) {
-            if rest.starts_with("__") || rest.starts_with('.') {
-                format!("{new_id}{rest}")
-            } else {
-                id.to_string()
-            }
-        } else {
-            id.to_string()
-        }
-    };
-    for g in project.groups.iter_mut() {
-        let old_id = g.id.clone();
-        g.id = map(&old_id);
-        g.parent_group_id = g.parent_group_id.as_deref().map(map);
-        for c in g.child_group_ids.iter_mut() {
-            *c = map(c);
-        }
-        for n in g.node_ids.iter_mut() {
-            *n = map(n);
-        }
-        // The relabeled root takes the human label. A child group's label is
-        // id-derived (collect_group_definitions defaults label = id); re-derive
-        // it to the new id so no nested group keeps the sentinel in its label.
-        if g.id == new_id {
-            g.label = Some(label.to_string());
-        } else if g.label.as_deref() == Some(old_id.as_str()) {
-            g.label = Some(g.id.clone());
-        }
-    }
-    for n in project.nodes.iter_mut() {
-        n.id = map(&n.id);
-        for s in n.scope.iter_mut() {
-            *s = map(s);
-        }
-        if let Some(obj) = n.config.as_object_mut() {
-            if let Some(pid) = obj.get("parentId").and_then(|v| v.as_str()) {
-                let mapped = map(pid);
-                obj.insert("parentId".into(), serde_json::Value::String(mapped));
-            }
-        }
-        // A boundary Passthrough: rescope its group id and rebuild its display
-        // label from the new id + role (reconstruct, never substring-replace).
-        if let Some(gb) = n.group_boundary.as_mut() {
-            gb.group_id = map(&gb.group_id);
-            n.label = Some(boundary_label(&gb.group_id, gb.role));
-        }
-    }
-    for e in project.edges.iter_mut() {
-        e.source = map(&e.source);
-        e.target = map(&e.target);
-        // Recompute the id from the mapped endpoints (not string-replace), so
-        // it always matches the canonical edge-id shape.
-        e.id = edge_id(
-            &e.source,
-            e.source_handle.as_deref().unwrap_or(""),
-            &e.target,
-            e.target_handle.as_deref().unwrap_or(""),
-        );
-    }
-}
-
-/// True if a top-level line begins an anonymous group: `Group` followed
-/// (after optional whitespace) by a port signature `(`, a body `{`, an
-/// output arrow `->`, or end of line. Distinguishes the included-file form
-/// `Group(raw: String) -> (...) {` from an identifier that merely starts
-/// with "Group" (`GroupThing = ...`) AND from a node literally named `Group`
-/// (`Group = SomeNode { ... }`): an `=` after the whitespace is NOT a group
-/// header, so it falls through to the normal `id = Type` declaration path.
-fn is_anonymous_group_header(trimmed: &str) -> bool {
-    let Some(rest) = trimmed.strip_prefix("Group") else {
-        return false;
-    };
-    let rest = rest.trim_start();
-    rest.is_empty() || rest.starts_with('(') || rest.starts_with('{') || rest.starts_with("->")
 }
 
 /// Resolve every `@include("path")` in `state`. `Full` inlines each
@@ -445,16 +357,13 @@ fn resolve_includes(
     let includes = std::mem::take(&mut state.includes);
     for inc in includes {
         let Some(root) = base_dir else {
-            errors.push(CompileError {
-                line: inc.line,
-                message: format!("@include(\"{}\") cannot be resolved outside a project", inc.path),
-            });
+            errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
             continue;
         };
         match resolve_one_include(&inc, root, mode, in_progress) {
             Ok(IncludeResult::Group(group)) => state.groups.push(*group),
             Ok(IncludeResult::Node(node)) => state.nodes.push(*node),
-            Err(msg) => errors.push(CompileError { line: inc.line, message: msg }),
+            Err(msg) => errors.push(CompileError::at(inc.span, msg)),
         }
     }
     // Resolve includes nested inside group bodies, anywhere in the tree.
@@ -476,10 +385,7 @@ fn resolve_group_includes(
     let includes = std::mem::take(&mut group.includes);
     for inc in includes {
         let Some(root) = base_dir else {
-            errors.push(CompileError {
-                line: inc.line,
-                message: format!("@include(\"{}\") cannot be resolved outside a project", inc.path),
-            });
+            errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
             continue;
         };
         match resolve_one_include(&inc, root, mode, in_progress) {
@@ -493,7 +399,7 @@ fn resolve_group_includes(
                 n.parent_id = Some(group.id.clone());
                 group.nodes.push(*n);
             }
-            Err(msg) => errors.push(CompileError { line: inc.line, message: msg }),
+            Err(msg) => errors.push(CompileError::at(inc.span, msg)),
         }
     }
     for child in &mut group.child_groups {
@@ -530,22 +436,30 @@ fn resolve_one_include(
         .map_err(|e| format!("@include path {:?} cannot be read: {e}", inc.path))?;
     let included_dir = canonical.parent().map(|p| p.to_path_buf());
 
-    // Parse the included file and resolve ITS own @file markers relative to
-    // its directory.
-    let mut sub = parse_and_resolve_file_refs(source.as_str(), included_dir.as_deref())
+    // Parse the included file with the CALL-SITE ALIAS as its anon-root id, so
+    // its top-level group lowers directly to `{alias}` and its internals to
+    // `{alias}.*` (the final scoped ids), with NO post-parse rescope pass. The
+    // alias is already scoped (`c` at top level, `g.c` nested), so this is the
+    // SAME single-pass scoping the rest of the lowering uses; there is no second
+    // string-surgery rescoping engine. (`@file` markers still resolve against the
+    // included file's own directory.)
+    let mut sub = parse_and_resolve_file_refs(source.as_str(), included_dir.as_deref(), &inc.alias)
         .map_err(|errs| {
             errs.into_iter()
-                .map(|e| format!("{}: {}:{}", inc.path, e.line, e.message))
+                .map(|e| format!("{}: {}", inc.path, e))
                 .collect::<Vec<_>>()
                 .join("; ")
         })?;
 
     // An included file must be exactly one anonymous top-level Group and
     // nothing else: the Group header is the file's interface, and the file
-    // name is its identity (no top-level name). A named group, multiple
-    // groups, or loose nodes are rejected.
+    // name is its identity (no top-level name). A named group, multiple groups,
+    // loose nodes, OR a loose top-level connection are rejected. (Only the group
+    // is consumed below; any other top-level content would be silently dropped,
+    // so the gate must catch it loudly.)
     let single_anon = sub.nodes.is_empty()
         && sub.includes.is_empty()
+        && sub.connections.is_empty()
         && sub.groups.len() == 1
         && sub.groups[0].anonymous;
     if !single_anon {
@@ -569,8 +483,8 @@ fn resolve_one_include(
                 in_ports: group.in_ports.clone(),
                 out_ports: group.out_ports.clone(),
                 one_of_required: group.one_of_required.clone(),
-                span: inc.span,
-                header_span: inc.header_span,
+                span: Some(inc.span),
+                header_span: Some(inc.span),
                 config_spans: Default::default(),
                 file_refs: Default::default(),
                 include_path: Some(inc.path.clone()),
@@ -588,19 +502,16 @@ fn resolve_one_include(
             if !errs.is_empty() {
                 return Err(errs
                     .into_iter()
-                    .map(|e| format!("{}: {}:{}", inc.path, e.line, e.message))
+                    .map(|e| format!("{}: {}", inc.path, e))
                     .collect::<Vec<_>>()
                     .join("; "));
             }
-            // Rescope the group's internals under the call-site alias, then
-            // adopt the alias as its id (the standard nested-group splice).
-            let old_id = group.id.clone();
-            rescope_group(&mut group, &old_id, &inc.alias);
-            group.id = inc.alias.clone();
-            // Once spliced under a call-site alias it is a named member group
-            // of the parent, NOT a standalone-component root. Clear the flag so
-            // it can't trip the component-validation rule (which treats a
-            // top-level anonymous group as "this file IS a component").
+            // The group was parsed with the alias as its anon-root id, so its id
+            // is already `{alias}` and its internals `{alias}.*`: no rescope.
+            // Once spliced under a call-site alias it is a named member group of
+            // the parent, NOT a standalone-component root. Clear the flag so it
+            // can't trip the component-validation rule (which treats a top-level
+            // anonymous group as "this file IS a component").
             group.anonymous = false;
             Ok(IncludeResult::Group(Box::new(group)))
         }
@@ -614,1017 +525,1282 @@ fn resolve_one_include(
 /// (or on the RHS of a connection), the parser appends the resulting child
 /// node and the synthetic edge to this scope. The caller merges them into
 /// its own scope (root project or group body).
-///
-/// `config_fills` collects `target.port = literal` assignments: the parser
-/// emits these here instead of as edges so the caller can apply them to the
-/// corresponding node's config map. Later writes override earlier ones for
-/// the same (target, port) pair.
 #[derive(Default)]
 struct InlineScope {
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
-    config_fills: Vec<ConfigFill>,
 }
 
-#[derive(Debug, Clone)]
-struct ConfigFill {
-    target_id: String,
-    target_port: String,
-    value: serde_json::Value,
-    /// Source span of the `target.port = value` line(s). Recorded so the
-    /// filled field gets a connection-origin config span on the target node.
-    span: Option<Span>,
+// ─── CST lowering: the single parser ─────────────────────────────────────────
+//
+// `parse_weft` is the one parser for `.weft`. It parses source into the lossless
+// CST (`crate::cst`), then LOWERS that tree into the `ParseState` AST that the
+// rest of the pipeline (`@file`/`@include` resolution, `flatten`, codegen)
+// consumes. So there is ONE place that reads raw text (the CST lexer/parser);
+// everything downstream is a projection of it.
+//
+// The CST handles the delimiting (where a node/group/value begins and ends)
+// structurally, so the lowering hands each construct's clean text slice to the
+// pure value-parsers (`WeftType::parse`, `parse_kv`, `store_config_value`,
+// inline-expression synthesis, ...). Spans are derived from CST byte ranges via
+// `LineIndex` (1-based lines, the form `flatten`/`NodeDefinition` and the editor
+// diagnostics expect).
+
+/// Byte offset → 1-based (line, char-column), for turning a CST `text_range()`
+/// into the `Span`s the AST and diagnostics carry. Columns are CHARACTER counts
+/// from the line start (0-based), not byte offsets, so a span over `héllo` is
+/// correct in an editor (what rustc/TSC/LSP report).
+struct LineIndex<'s> {
+    source: &'s str,
+    /// Byte offset of the start of each line (line i starts at `starts[i]`).
+    starts: Vec<usize>,
 }
 
-fn parse_weft(source: &str) -> ParseState {
-    let lines: Vec<&str> = source.lines().collect();
+impl<'s> LineIndex<'s> {
+    fn new(source: &'s str) -> Self {
+        let mut starts = vec![0usize];
+        for (i, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                starts.push(i + 1);
+            }
+        }
+        LineIndex { source, starts }
+    }
+
+    /// 1-based line number containing byte offset `off`.
+    fn line(&self, off: usize) -> usize {
+        match self.starts.binary_search(&off) {
+            Ok(i) => i + 1,
+            Err(i) => i, // i = count of starts <= off = the 1-based line
+        }
+    }
+
+    /// 0-based CHARACTER column of byte offset `off` within its line.
+    fn col(&self, off: usize) -> usize {
+        let line_start = self.starts[self.line(off).saturating_sub(1)];
+        let off = off.min(self.source.len());
+        self.source[line_start..off].chars().count()
+    }
+
+    /// The (line, char-col) of a byte offset.
+    fn pos(&self, off: usize) -> (usize, usize) {
+        (self.line(off), self.col(off))
+    }
+
+    /// A `Span` covering a byte range, columns as character counts. `end` is
+    /// exclusive (the CST convention), so the span ends at the column just past
+    /// the last contained char.
+    fn span_for(&self, start: usize, end: usize) -> Span {
+        let (start_line, start_column) = self.pos(start);
+        let (end_line, end_column) = self.pos(end.max(start));
+        Span { start_line, start_column, end_line, end_column }
+    }
+
+    /// `Span` of a CST node's CONTENT (leading trivia skipped). The single home
+    /// for "where does this node really start", used by diagnostics + config
+    /// spans so they point at what the user wrote, not the blank line above it.
+    fn span_of(&self, node: &crate::cst::SyntaxNode) -> Span {
+        let start: usize = content_start(node).into();
+        let end: usize = node.text_range().end().into();
+        self.span_for(start, end)
+    }
+
+    /// `Span` of a single token (tight: just the token's own range).
+    fn span_of_token(&self, tok: &crate::cst::SyntaxToken) -> Span {
+        let r = tok.text_range();
+        self.span_for(r.start().into(), r.end().into())
+    }
+}
+
+/// The byte offset where a node's CONTENT begins, skipping leading trivia (a
+/// decl/connection owns its leading comment/blank-line trivia per the CST
+/// attachment rule). The single trivia-skip, shared by span computation and
+/// structural-error reporting.
+fn content_start(node: &crate::cst::SyntaxNode) -> rowan::TextSize {
+    node.descendants_with_tokens()
+        .find(|e| e.as_token().map(|t| !t.kind().is_trivia()).unwrap_or(false))
+        .map(|e| e.text_range().start())
+        .unwrap_or_else(|| node.text_range().start())
+}
+
+/// Parse source into the `ParseState` AST via the CST. The single parser: it
+/// reads raw text once (the CST), and lowers that tree into `ParseState`.
+fn parse_weft(source: &str, source_id: &str) -> ParseState {
+    use crate::cst::nodes::{Decl as CstDecl, WeftFile};
+    let root = crate::cst::parse(source);
+    let li = LineIndex::new(source);
     let mut state = ParseState {
-        name: "Untitled Project".to_string(),
-        description: String::new(),
         nodes: Vec::new(),
         connections: Vec::new(),
         groups: Vec::new(),
         includes: Vec::new(),
         errors: Vec::new(),
     };
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-        let line_num = i + 1;
-
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            // Parse metadata headers
-            if let Some(rest) = trimmed.strip_prefix("# Project:") {
-                state.name = rest.trim().to_string();
-            } else if let Some(rest) = trimmed.strip_prefix("# Description:") {
-                state.description = rest.trim().to_string();
+    let Some(file) = WeftFile::cast(root) else {
+        return state;
+    };
+    // Top-level items: an InlineScope accumulates inline-expr children + edges.
+    let mut inline = InlineScope::default();
+    // Defer top-level connections: a `node.field = <literal>` connection is
+    // really a config-origin field on `node`, which we can only attribute once
+    // the target node is lowered. Collect the CST connection nodes first.
+    let mut conn_nodes: Vec<crate::cst::SyntaxNode> = Vec::new();
+    for child in file.syntax().children() {
+        match child.kind() {
+            crate::cst::SyntaxKind::CONNECTION => conn_nodes.push(child.clone()),
+            crate::cst::SyntaxKind::NODE_DECL
+            | crate::cst::SyntaxKind::GROUP_DECL
+            | crate::cst::SyntaxKind::INCLUDE_DECL => {
+                if let Some(decl) = CstDecl::cast(child.clone()) {
+                    lower_decl(&decl, None, source_id, &li, &mut state, &mut inline);
+                }
             }
-            i += 1;
-            continue;
+            _ => {}
         }
-
-        // Node or Group declaration: id = Type(...) -> (...) { ... }
-        let mut inline_scope = InlineScope::default();
-        if let Some((result, next_i)) = try_parse_declaration(&lines, i, &mut state.errors, &mut inline_scope) {
-            match result {
-                Declaration::Node(node) => {
-                    if state.has_top_level_id(&node.id) {
-                        state.errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}'", node.id) });
-                    }
-                    state.nodes.push(node);
-                }
-                Declaration::Group(group) => {
-                    if state.has_top_level_id(&group.id) {
-                        // Two anonymous top-level groups collide on the sentinel
-                        // id; surface the real cause (an included file is one
-                        // anonymous Group) rather than leaking the sentinel.
-                        let message = if group.id == INCLUDE_ROOT_ID {
-                            "an included file must be exactly one anonymous top-level Group".to_string()
-                        } else {
-                            format!("Duplicate id '{}'", group.id)
-                        };
-                        state.errors.push(CompileError { line: line_num, message });
-                    }
-                    state.groups.push(group);
-                }
-                Declaration::Include(inc) => {
-                    if state.has_top_level_id(&inc.alias) {
-                        state.errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}'", inc.alias) });
-                    }
-                    state.includes.push(inc);
-                }
-            }
-            // Merge any inline children produced by this declaration.
-            for child in inline_scope.nodes {
-                if state.nodes.iter().any(|n| n.id == child.id) {
-                    state.errors.push(CompileError { line: line_num, message: format!("Duplicate node ID '{}' (generated from inline expression)", child.id) });
-                }
-                state.nodes.push(child);
-            }
-            state.connections.extend(inline_scope.connections);
-            i = next_i;
-            continue;
-        }
-
-        // Connection: target.port = source.port | inline expression | literal config fill
-        let mut conn_scope = InlineScope::default();
-        match try_parse_connection_with_inline(&lines, i, &mut state.errors, &mut conn_scope) {
-            ParseConnectionResult::Edge(conn, next_i) => {
-                state.connections.push(conn);
-                for child in conn_scope.nodes {
-                    if state.nodes.iter().any(|n| n.id == child.id) {
-                        state.errors.push(CompileError { line: line_num, message: format!("Duplicate node ID '{}' (generated from inline expression)", child.id) });
-                    }
-                    state.nodes.push(child);
-                }
-                state.connections.extend(conn_scope.connections);
-                for fill in conn_scope.config_fills {
-                    apply_config_fill(&mut state.nodes, fill);
-                }
-                i = next_i;
-                continue;
-            }
-            ParseConnectionResult::ConfigFill(next_i) => {
-                for fill in conn_scope.config_fills {
-                    apply_config_fill(&mut state.nodes, fill);
-                }
-                i = next_i;
-                continue;
-            }
-            ParseConnectionResult::NotAConnection => {}
-        }
-
-        // Unknown line
-        state.errors.push(CompileError { line: line_num, message: format!("Unexpected: {}", trimmed) });
-        i += 1;
     }
+    for cn in conn_nodes {
+        lower_top_level_connection(&cn, &li, &mut state, &mut inline);
+    }
+    // Merge top-level inline-expr children + edges.
+    merge_inline_nodes(&mut state.nodes, inline.nodes, &mut state.errors);
+    state.connections.extend(inline.connections);
 
+    // Structural error detection over the CST: an ERROR node is unparseable
+    // content (e.g. `this is not valid syntax` at root), and a BODY missing its
+    // closing `}` is an unclosed block. Both are loud per-line diagnostics.
+    detect_structural_errors(file.syntax(), &li, &mut state.errors);
     state
 }
 
-// ─── Declaration Parsing ────────────────────────────────────────────────────
-
-enum Declaration {
-    Node(ParsedNode),
-    Group(ParsedGroup),
-    Include(ParsedInclude),
-}
-
-/// Try to parse a declaration: `id = Type(...)` or `id = Type { ... }` or `id = Type`
-/// If Type is "Group", parse as a group (body contains children).
-/// Port signatures can span multiple lines: `id = Type(\n  port1,\n  port2\n) -> (\n  out\n) {`
-fn try_parse_declaration(
-    lines: &[&str],
-    start: usize,
-    errors: &mut Vec<CompileError>,
-    inline_scope: &mut InlineScope,
-) -> Option<(Declaration, usize)> {
-    let trimmed = lines[start].trim();
-    let line_num = start + 1;
-
-    // Anonymous top-level group: `Group(...) -> (...) {` with no `id =`. This
-    // is the form an included file uses (the filename is the component's
-    // identity; the include pass rescopes this group under the call-site
-    // alias, discarding the sentinel id). Detected before the `id = Type`
-    // path because it has no leading `=`.
-    let (id, right) = if is_anonymous_group_header(trimmed) {
-        (INCLUDE_ROOT_ID.to_string(), trimmed)
-    } else {
-        // Match: id = Type  (then optionally ( or { on same line)
-        let eq_pos = trimmed.find('=')?;
-
-        // Make sure this isn't a connection (target.port = source.port)
-        let left = trimmed[..eq_pos].trim();
-        if left.contains('.') {
-            return None; // This is a connection, not a declaration
-        }
-
-        let right = trimmed[eq_pos + 1..].trim();
-
-        // Validate identifier
-        if left.is_empty() { return None; }
-        let first = left.chars().next()?;
-        if !first.is_alphabetic() && first != '_' { return None; }
-        if !left.chars().all(|c| c.is_alphanumeric() || c == '_') { return None; }
-
-        // Check reserved words. `self` is the scope pronoun; `Group` and
-        // `Passthrough` are structural type keywords (`x = Group()...`), so
-        // naming a node/group after one makes every later reference to it
-        // ambiguous with the keyword (e.g. `foo = Group.out` reads as an inline
-        // group). Reject at the declaration so it fails HERE, loudly, instead
-        // of cryptically three lines down where the name is used.
-        if left == "self" {
-            errors.push(CompileError { line: line_num, message: "'self' is a reserved word and cannot be used as an identifier".to_string() });
-            return None;
-        }
-        if left == "Group" || left == "Passthrough" {
-            errors.push(CompileError { line: line_num, message: format!("'{left}' is a reserved type keyword and cannot be used as a node or group name") });
-            return None;
-        }
-
-        (left.to_string(), right)
-    };
-
-    // `id = @include("path")`: a file-composition include. Captured as a
-    // marker; the post-parse include pass resolves it (full group inline for
-    // build, opaque interface node for interactive parse).
-    if right.starts_with("@include") {
-        let after = right["@include".len()..].trim();
-        let path = match parse_include_arg(after) {
-            Ok(p) => p,
-            Err(msg) => {
-                errors.push(CompileError { line: line_num, message: msg });
-                return None;
-            }
-        };
-        let inc = ParsedInclude {
-            alias: id,
-            path,
-            line: line_num,
-            span: Some(Span::single_line(line_num, 0, lines[start].len())),
-            header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
-        };
-        return Some((Declaration::Include(inc), start + 1));
-    }
-
-    // Extract the type name
-    let type_end = right.find(|c: char| c == '(' || c == '{' || c.is_whitespace()).unwrap_or(right.len());
-    let node_type = right[..type_end].trim().to_string();
-
-    if node_type.is_empty() { return None; }
-    if !node_type.chars().next()?.is_uppercase() { return None; }
-    if !node_type.chars().all(|c| c.is_alphanumeric()) { return None; }
-
-    // Passthrough is a compiler-internal node type emitted by the
-    // group-flattening pass. Users cannot declare it directly.
-    if node_type == "Passthrough" {
-        errors.push(CompileError {
-            line: line_num,
-            message: "'Passthrough' is a compiler-internal node type and cannot be used directly. \
-                      Passthrough nodes are emitted automatically when a group is flattened."
-                .into(),
-        });
-        return None;
-    }
-
-    let after_type = right[type_end..].trim();
-
-    // Collect the full declaration header across multiple lines. If
-    // `after_type` starts with `(` or `->`, find the matching `)` then
-    // optionally `-> (...)`, then `{` or end. Use the `_with_body` variant
-    // so that one-liner-style headers with multi-line triple-backtick
-    // values (like `n = Type { code: ``` \n ... \n ``` }`) are collected
-    // fully. Inline expressions use the non-collecting variant elsewhere.
-    let (header_text, header_end_line) = if after_type.starts_with('(') || after_type.starts_with("->") {
-        collect_declaration_header_with_body(lines, start, after_type)
-    } else {
-        (after_type.to_string(), start)
-    };
-
-    let header_text = header_text.trim();
-
-    // Parse optional port signature from the collected header
-    let (in_ports, out_ports, one_of_required, after_ports) = if header_text.starts_with('(') {
-        parse_port_signature(header_text, line_num, errors)
-    } else if header_text.starts_with("->") {
-        // No input ports, just -> (outputs)
-        let arrow_rest = header_text.strip_prefix("->").unwrap().trim();
-        if arrow_rest.starts_with('(') {
-            let mut out_ports = Vec::new();
-            let mut one_of_required = Vec::new();
-            let (output_content, after_output) = match find_matching_paren(arrow_rest) {
-                Some((content, rest)) => (content, rest),
-                None => {
-                    errors.push(CompileError { line: line_num, message: "Unclosed output port list '('".to_string() });
-                    (String::new(), String::new())
-                }
-            };
-            parse_port_list(&output_content, &mut out_ports, &mut one_of_required, "out", line_num, errors);
-            (Vec::new(), out_ports, one_of_required, after_output)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new(), header_text.to_string())
-        }
-    } else {
-        (Vec::new(), Vec::new(), Vec::new(), header_text.to_string())
-    };
-
-    let after_ports = after_ports.trim();
-
-    // Detect wrong-order post-config outputs: `-> (pre) -> (post) { config }`.
-    // The correct order is `-> (pre) { config } -> (post)`.
-    if after_ports.starts_with("->") {
-        errors.push(CompileError {
-            line: line_num,
-            message: "Two arrow clauses before the config block. You wrote: Type -> (out: T) -> (extra: T2) { config }. Fix: merge both port lists into one: Type -> (out: T, extra: T2) { config }. Just add the extra ports to the first arrow clause. Other errors below are likely caused by this, ignore them until this is fixed.".to_string(),
-        });
-    }
-
-    // The body parsing should start from header_end_line, not start
-    let body_start_line = header_end_line;
-
-    // Strip inline comments from after_ports
-    let after_ports_clean = if let Some(hash_pos) = after_ports.find('#') {
-        if hash_pos > 0 { after_ports[..hash_pos].trim() } else { after_ports }
-    } else {
-        after_ports
-    };
-
-    if node_type == "Group" {
-        // The header occupies lines [line_num .. header_end_line+1].
-        let header_span = Some(Span {
-            start_line: line_num,
-            start_col: 0,
-            end_line: header_end_line + 1,
-            end_col: 0,
-        });
-        // Parse as group
-        let group = if after_ports_clean.starts_with('{') {
-            if after_ports_clean == "{}" || (after_ports_clean.starts_with('{') && after_ports_clean.ends_with('}') && after_ports_clean.len() > 1) {
-                // One-liner empty group or group with inline body.
-                let span = Some(Span {
-                    start_line: line_num,
-                    start_col: 0,
-                    end_line: header_end_line + 1,
-                    end_col: 0,
-                });
-                ParsedGroup {
-                    anonymous: id == INCLUDE_ROOT_ID,
-                    id, in_ports, out_ports,
-                    one_of_required,
-                    nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(), includes: Vec::new(),
-                    span,
-                    header_span,
-                }
-            } else if after_ports_clean == "{" {
-                // Multi-line group body. Note: inline children inside group
-                // nodes are added to the group's own `nodes` list by
-                // parse_group_body (which maintains its own InlineScope),
-                // not to the top-level inline_scope we received.
-                let (mut group, next_i) = parse_group_body(lines, body_start_line, &id, in_ports, out_ports, one_of_required, errors);
-                group.header_span = header_span;
-                group.span = Some(Span {
-                    start_line: line_num,
-                    start_col: 0,
-                    end_line: next_i,
-                    end_col: 0,
-                });
-                return Some((Declaration::Group(group), next_i));
-            } else {
-                errors.push(CompileError { line: line_num, message: format!("Invalid group syntax: {}", trimmed) });
-                return None;
-            }
-        } else if after_ports_clean.is_empty() {
-            // No body: bare group.
-            let span = Some(Span {
-                start_line: line_num,
-                start_col: 0,
-                end_line: header_end_line + 1,
-                end_col: 0,
-            });
-            ParsedGroup {
-                anonymous: id == INCLUDE_ROOT_ID,
-                id, in_ports, out_ports,
-                one_of_required,
-                nodes: Vec::new(), connections: Vec::new(), child_groups: Vec::new(), includes: Vec::new(),
-                span,
-                header_span,
-            }
-        } else {
-            errors.push(CompileError { line: line_num, message: format!("Unexpected after group declaration: {}", after_ports_clean) });
-            return None;
-        };
-        Some((Declaration::Group(group), body_start_line + 1))
-    } else {
-        // Parse as node
-        //
-        // Handle one-liner with post-config outputs on the same line:
-        //   LlmInference -> (response: JsonDict) { parseJson: true } -> (summary: String)
-        // Split into config part `{ parseJson: true }` and post-config `-> (summary: String)`.
-        let (after_ports_for_config, one_liner_post_config): (String, Option<String>) = if after_ports_clean.starts_with('{')
-            && !after_ports_clean.ends_with('}')
-        {
-            // Find the closing brace that ends the config, respecting nesting
-            let mut depth = 0i32;
-            let mut in_quote = false;
-            let mut split_pos = None;
-            for (i, c) in after_ports_clean.char_indices() {
-                if c == '"' { in_quote = !in_quote; continue; }
-                if in_quote { continue; }
-                if c == '{' { depth += 1; }
-                if c == '}' {
-                    depth -= 1;
-                    if depth == 0 { split_pos = Some(i); break; }
+/// Walk the CST emitting a CompileError for each ERROR node (unparseable text)
+/// and each unclosed BODY (no R_BRACE token).
+fn detect_structural_errors(node: &crate::cst::SyntaxNode, li: &LineIndex, errors: &mut Vec<CompileError>) {
+    use crate::cst::SyntaxKind as K;
+    // A malformed `@require_one_of` is NOT checked here: the lowering validates
+    // every `@require_one_of` (port-list + body directive) through the one
+    // `marker::require_one_of_ports` gate and fails loud there. This sweep stays
+    // purely structural (ERROR nodes + unclosed bodies).
+    for n in node.descendants() {
+        match n.kind() {
+            K::ERROR => {
+                let text = n.to_string();
+                let snippet = text.trim();
+                if !snippet.is_empty() {
+                    // Span the ERROR's content (trivia skipped via li.span_of).
+                    errors.push(CompileError::at(li.span_of(&n), format!("Unexpected content: '{snippet}'")));
                 }
             }
-            if let Some(pos) = split_pos {
-                let config_part = &after_ports_clean[..pos + 1];
-                let rest = after_ports_clean[pos + 1..].trim();
-                if rest.starts_with("->") {
-                    (config_part.to_string(), Some(rest.strip_prefix("->").unwrap().trim().to_string()))
-                } else {
-                    (after_ports_clean.to_string(), None)
-                }
-            } else {
-                (after_ports_clean.to_string(), None)
-            }
-        } else {
-            (after_ports_clean.to_string(), None)
-        };
-
-        let (config, label, config_spans, next_i) = if after_ports_for_config.starts_with('{') {
-            if after_ports_for_config.ends_with('}') && after_ports_for_config.len() > 1 {
-                // One-liner: { key: val, key: val }. Each pair value may be
-                // a literal, a port wiring (dotted ref), or an inline
-                // expression (`Type { ... }.port` or bare `Type.port`).
-                // The splitter is brace-aware, so inline values with nested
-                // braces stay in the same pair.
-                let body = &after_ports_for_config[1..after_ports_for_config.len() - 1].trim();
-                let mut config = serde_json::Map::new();
-                let mut label = None;
-                // One-liner body: every field sits on the declaration line, so
-                // each field's span is that single line.
-                let mut config_spans: ConfigSpanMap = Default::default();
-                let one_liner_span = Span::single_line(line_num, 0, lines[start].len());
-                if !body.is_empty() {
-                    for pair in split_respecting_quotes(body, ',') {
-                        let pair = pair.trim();
-                        if pair.is_empty() { continue; }
-                        let colon_pos = match pair.find(':') {
-                            Some(p) => p,
-                            None => {
-                                errors.push(CompileError { line: line_num, message: format!("Invalid config pair: '{}'", pair) });
-                                continue;
-                            }
-                        };
-                        let key = pair[..colon_pos].trim();
-                        let val = pair[colon_pos + 1..].trim();
-                        // Inline expression FIRST. This is important for
-                        // the bare form `Type.port`, which would otherwise
-                        // look like a dotted ref (`Text.value`) and be
-                        // consumed by the port-wiring branch below. Type
-                        // names start with uppercase, node ids don't, so
-                        // looks_like_inline_start and looks_like_dotted_ref
-                        // are mutually exclusive on valid input.
-                        if is_valid_config_key(key) && looks_like_inline_start(val) {
-                            let synth = vec![val];
-                            let _ = try_parse_inline_expression(
-                                &synth, 0, 0, &id, key, inline_scope, errors,
-                            );
-                            continue;
-                        }
-                        // Port wiring: unquoted dotted ref on the RHS emits
-                        // an edge from source.port to parent.key. Enrichment
-                        // validates the target is a real input port.
-                        if is_valid_config_key(key) && looks_like_dotted_ref(val) {
-                            if let Some((src_id, src_port)) = parse_dotted(val) {
-                                inline_scope.connections.push(ParsedConnection {
-                                    source_id: src_id,
-                                    source_port: src_port,
-                                    target_id: id.clone(),
-                                    target_port: key.to_string(),
-                                    span: None,
-                                });
-                                continue;
-                            }
-                        }
-                        // Multi-line triple-backtick literal: `key: ``` ... ``` `
-                        // where the value spans newlines in the joined body.
-                        // Strip the delimiters, dedent, unescape.
-                        if is_valid_config_key(key) && val.starts_with("```") && val.ends_with("```") && val.len() >= 6 {
-                            let inner = &val[3..val.len() - 3];
-                            // Strip a single leading/trailing newline so
-                            // `key: ``` \n content \n ``` ` becomes "content".
-                            let inner = inner.strip_prefix('\n').unwrap_or(inner);
-                            let inner = inner.strip_suffix('\n').unwrap_or(inner);
-                            let dedented = dedent(inner);
-                            let unescaped = dedented.replace("\\```", "```").replace("\\`", "`");
-                            config.insert(key.to_string(), serde_json::Value::String(unescaped));
-                            config_spans.insert(key.to_string(), ConfigFieldSpan::inline(one_liner_span));
-                            continue;
-                        }
-                        if let Some(l) = try_extract_label(pair) {
-                            label = Some(l);
-                            config_spans.insert("_label".to_string(), ConfigFieldSpan::inline(one_liner_span));
-                        } else if let Some(k) = parse_kv(pair, &mut config, line_num, errors) {
-                            config_spans.insert(k, ConfigFieldSpan::inline(one_liner_span));
-                        }
-                    }
-                }
-                (config, label, config_spans, body_start_line + 1)
-            } else if after_ports_for_config == "{" {
-                // Multi-line config block. The parser detects inline expressions
-                // inside config-field values and emits child nodes + edges into
-                // inline_scope. Anon IDs are generated from the parent id + field
-                // name (e.g. `llm_config__systemPrompt`).
-                let (config, label, extra_in, extra_out, extra_oor, mut end_i, config_spans) = parse_config_block(lines, body_start_line, line_num, errors, &id, inline_scope);
-                let mut all_in = in_ports.clone();
-                let mut all_out = out_ports.clone();
-                all_in.extend(extra_in);
-                all_out.extend(extra_out);
-                let mut all_oor = one_of_required.clone();
-                all_oor.extend(extra_oor);
-                // Check for post-config output ports: } -> (outputs)
-                // The `->` can be on its own line, or on the same line as `}` (e.g. `} -> (out: String)`)
-                let mut peek_i = end_i;
-                // If parse_config_block returned pointing at a `} -> ...` line, extract the arrow part
-                let mut arrow_on_brace_line: Option<String> = None;
-                if peek_i < lines.len() {
-                    let peek_trimmed = lines[peek_i].trim();
-                    if peek_trimmed.starts_with('}') {
-                        let after_brace = peek_trimmed[1..].trim();
-                        if after_brace.starts_with("->") {
-                            arrow_on_brace_line = Some(after_brace.strip_prefix("->").unwrap().trim().to_string());
-                        }
-                        peek_i += 1;
-                    }
-                }
-                while peek_i < lines.len() && lines[peek_i].trim().is_empty() { peek_i += 1; }
-                // Determine arrow_rest: either from the `} ->` line or from a standalone `->` line
-                let arrow_rest_str: Option<String> = if let Some(ref ar) = arrow_on_brace_line {
-                    Some(ar.clone())
-                } else if peek_i < lines.len() && lines[peek_i].trim().starts_with("->") {
-                    Some(lines[peek_i].trim().strip_prefix("->").unwrap().trim().to_string())
-                } else {
-                    None
-                };
-                if let Some(arrow_rest) = arrow_rest_str {
-                    let arrow_line = if arrow_on_brace_line.is_some() { end_i } else { peek_i };
-                    // Collect multi-line output ports
-                    let mut out_sig = arrow_rest.to_string();
-                    let mut out_end = arrow_line;
-                    let mut paren_depth: i32 = 0;
-                    for c in arrow_rest.chars() { if c == '(' { paren_depth += 1; } if c == ')' { paren_depth -= 1; } }
-                    while paren_depth > 0 && out_end + 1 < lines.len() {
-                        out_end += 1;
-                        let ol = lines[out_end].trim();
-                        out_sig.push(' ');
-                        out_sig.push_str(ol);
-                        for c in ol.chars() { if c == '(' { paren_depth += 1; } if c == ')' { paren_depth -= 1; } }
-                    }
-                    if out_sig.starts_with('(') {
-                        if let Some((content, _rest)) = find_matching_paren(&out_sig) {
-                            let existing_names: std::collections::HashSet<String> = all_out.iter().map(|p| p.name.clone()).collect();
-                            let mut post_ports = Vec::new();
-                            let mut post_oor = Vec::new();
-                            parse_port_list(&content, &mut post_ports, &mut post_oor, "out", line_num, errors);
-                            for p in post_ports {
-                                if existing_names.contains(&p.name) {
-                                    errors.push(CompileError { line: line_num, message: format!("Duplicate output port '{}', already declared before the config block", p.name) });
-                                } else {
-                                    all_out.push(p);
-                                }
-                            }
-                            all_oor.extend(post_oor);
-                        }
-                    }
-                    end_i = out_end + 1;
-                }
-                let node = ParsedNode {
-                    id, node_type: node_type, label, config,
-                    parent_id: None, in_ports: all_in, out_ports: all_out, one_of_required: all_oor,
-                    span: Some(Span { start_line: line_num, start_col: 0, end_line: end_i, end_col: 0 }),
-                    header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
-                    config_spans,
-                    file_refs: Default::default(),
-                    include_path: None,
-                };
-                return Some((Declaration::Node(node), end_i));
-            } else {
-                errors.push(CompileError { line: line_num, message: format!("Invalid node syntax: {}", trimmed) });
-                return None;
-            }
-        } else if after_ports_clean.is_empty() {
-            // Bare node, no config
-            (serde_json::Map::new(), None, ConfigSpanMap::default(), body_start_line + 1)
-        } else {
-            errors.push(CompileError { line: line_num, message: format!("Unexpected after node declaration: {}", after_ports_clean) });
-            return None;
-        };
-
-        // Handle post-config outputs from one-liner syntax:
-        //   Type -> (response: JsonDict) { parseJson: true } -> (summary: String, score: Number)
-        let mut final_out = out_ports;
-        let mut final_oor = one_of_required;
-        if let Some(ref post_config_str) = one_liner_post_config {
-            if post_config_str.starts_with('(') {
-                if let Some((content, _rest)) = find_matching_paren(post_config_str) {
-                    let existing_names: std::collections::HashSet<String> = final_out.iter().map(|p| p.name.clone()).collect();
-                    let mut post_ports = Vec::new();
-                    let mut post_oor = Vec::new();
-                    parse_port_list(&content, &mut post_ports, &mut post_oor, "out", line_num, errors);
-                    for p in post_ports {
-                        if existing_names.contains(&p.name) {
-                            errors.push(CompileError { line: line_num, message: format!("Duplicate output port '{}', already declared before the config block", p.name) });
-                        } else {
-                            final_out.push(p);
-                        }
-                    }
-                    final_oor.extend(post_oor);
+            K::BODY => {
+                let has_close = n.children_with_tokens().any(|e| e.kind() == K::R_BRACE);
+                if !has_close {
+                    // A group body and a node config block get distinct messages.
+                    let is_group = n.parent().map(|p| p.kind() == K::GROUP_DECL).unwrap_or(false);
+                    let message = if is_group { "Unclosed group" } else { "Unclosed config block" };
+                    errors.push(CompileError::at(li.span_of(&n), message));
                 }
             }
-        }
-
-        let node = ParsedNode {
-            id, node_type: node_type, label, config,
-            parent_id: None, in_ports: in_ports, out_ports: final_out, one_of_required: final_oor,
-            span: Some(Span { start_line: line_num, start_col: 0, end_line: next_i, end_col: 0 }),
-            header_span: Some(Span::single_line(line_num, 0, lines[start].len())),
-            config_spans,
-            file_refs: Default::default(),
-            include_path: None,
-        };
-        Some((Declaration::Node(node), next_i))
-    }
-}
-
-/// Count structural parens in a line, ignoring parens inside `@require_one_of(...)`.
-/// This prevents directive-internal parens from polluting the port-list paren depth.
-fn count_structural_parens(line: &str, depth: &mut i32, found_brace: &mut bool) {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip @require_one_of(...) directive, its parens are not structural
-        if i + 16 <= bytes.len() && &line[i..i+16] == "@require_one_of(" {
-            // Look ahead to find matching close paren
-            let mut dir_depth: i32 = 1;
-            let mut j = i + 16;
-            while j < bytes.len() && dir_depth > 0 {
-                if bytes[j] == b'(' { dir_depth += 1; }
-                if bytes[j] == b')' { dir_depth -= 1; }
-                if dir_depth > 0 { j += 1; }
-            }
-            // Skip to end of directive (or end of line if unbalanced)
-            i = if dir_depth == 0 { j + 1 } else { bytes.len() };
-            continue;
-        }
-        match bytes[i] {
-            b'(' => *depth += 1,
-            b')' => *depth -= 1,
-            b'{' => *found_brace = true,
             _ => {}
         }
-        i += 1;
     }
 }
 
-/// Collect the full declaration header that may span multiple lines.
-/// Starting from `after_type` (which begins with `(`), collects lines until all parens
-/// are balanced AND we've seen `{`, `{}`, or end of declaration.
-/// Returns (collected_text, last_line_index).
-fn collect_declaration_header(lines: &[&str], start: usize, after_type: &str) -> (String, usize) {
-    collect_declaration_header_impl(lines, start, after_type, false)
+/// A connection whose RHS is a literal: `target.port = <STRING|NUMBER|HEREDOC|
+/// JSON_VALUE|MARKER>`. This is a config-origin field, not an edge. Recognizing
+/// and extracting it is the one subtle, shared piece (telling a literal RHS from
+/// a `src.port` edge); WHERE the value goes (and whether a missing target is an
+/// error or an edge) is scope policy the caller owns.
+struct LiteralFill {
+    target_id: String,
+    port: String,
+    value: String,
+    /// Span of the whole connection (the config field's source range).
+    span: Span,
 }
 
-/// Variant that also collects multi-line config body when the header has an
-/// unclosed `{`. Only called from the top-level declaration path; inline
-/// expressions use the non-collecting variant because they rely on matching
-/// `}.port` on a later line.
-fn collect_declaration_header_with_body(lines: &[&str], start: usize, after_type: &str) -> (String, usize) {
-    collect_declaration_header_impl(lines, start, after_type, true)
+/// Recognize a literal-RHS config fill on `conn` (`node.field = <literal>`) and
+/// extract its data. The recognition RULE (one endpoint, no inline-expr, non-self
+/// target, non-empty port) lives in `cst::nodes::connection_is_config_origin`,
+/// shared with the edit ops so the editor and compiler can't disagree on what a
+/// config field is. Here we just extract the value + spans once the connection is
+/// classified as a fill.
+fn literal_config_fill(conn: &crate::cst::SyntaxNode, li: &LineIndex) -> Option<LiteralFill> {
+    use crate::cst::SyntaxKind as K;
+    if !crate::cst::nodes::connection_is_config_origin(conn, None, None) {
+        return None;
+    }
+    let target = conn.children().find(|n| n.kind() == K::ENDPOINT)?;
+    let (target_id, port) = endpoint_id_port(&target);
+    Some(LiteralFill {
+        target_id,
+        port,
+        value: connection_rhs_text(conn),
+        span: li.span_of(conn),
+    })
 }
 
-fn collect_declaration_header_impl(
-    lines: &[&str],
-    start: usize,
-    after_type: &str,
-    collect_unclosed_body: bool,
-) -> (String, usize) {
-    // Count paren depth in the initial after_type
-    let mut paren_depth: i32 = 0;
-    let mut found_open_brace = false;
+/// Apply a recognized literal fill to a node's config maps (value + a
+/// connection-origin span). The two-line store, shared so the span origin and
+/// value parsing can't diverge between scopes.
+fn apply_literal_fill(
+    fill: &LiteralFill,
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    config_spans: &mut std::collections::BTreeMap<String, ConfigFieldSpan>,
+    errors: &mut Vec<CompileError>,
+) {
+    if let Some(k) = store_value_text(&fill.port, &fill.value, config, fill.span, errors) {
+        config_spans.insert(k, ConfigFieldSpan::connection(fill.span));
+    }
+}
 
-    count_structural_parens(after_type, &mut paren_depth, &mut found_open_brace);
-
-    // If parens are balanced AND there's an open brace, normally nothing
-    // more to collect. When `collect_unclosed_body` is true, we also
-    // collect lines if the `{` has content after it (e.g. `{ code: ``` `)
-    // that isn't balanced yet, so the entire one-liner-style body is
-    // captured. A bare `{` at end of line (like `g = Group() -> (x) {`)
-    // is a normal multi-line-block opener and is left alone.
-    if paren_depth == 0 && found_open_brace {
-        let needs_body_collection = collect_unclosed_body
-            && first_brace_has_content_after(after_type)
-            && !is_brace_balanced_respecting_quotes_and_backticks(after_type);
-        if !needs_body_collection {
-            return (after_type.to_string(), start);
+/// Lower a top-level CONNECTION. A literal RHS (`node.port = "v"`) fills that
+/// NODE's config. A literal to anything else (a group/include alias, an
+/// undeclared target) has no config to fill: it falls through to
+/// `lower_connection`, which rejects the bare literal loudly (only a node's own
+/// port takes a literal; a group/include port is driven by wiring). Otherwise
+/// (an endpoint or inline-expr RHS) it is an edge / node synthesis.
+fn lower_top_level_connection(conn: &crate::cst::SyntaxNode, li: &LineIndex, state: &mut ParseState, inline: &mut InlineScope) {
+    if let Some(fill) = literal_config_fill(conn, li) {
+        if let Some(node) = state.nodes.iter_mut().find(|n| n.id == fill.target_id) {
+            apply_literal_fill(&fill, &mut node.config, &mut node.config_spans, &mut state.errors);
+            return;
         }
+        // Not a node: a literal can't fill a group/include/undeclared port. Fall
+        // through; `lower_connection` emits the single "cannot assign a literal"
+        // error (no phantom empty-source edge).
     }
-
-    // Collect subsequent lines (or check for -> on next line if parens already balanced)
-    let mut collected = after_type.to_string();
-    let mut i = start + 1;
-
-    while i < lines.len() && paren_depth > 0 {
-        let line = lines[i].trim();
-        collected.push('\n');
-        collected.push_str(line);
-
-        count_structural_parens(line, &mut paren_depth, &mut found_open_brace);
-        i += 1;
+    // No enclosing group, so an inline-expr RHS synthesizes its anon node at the
+    // file root (scope None).
+    if let Some(c) = lower_connection(conn, None, li, inline, &mut state.errors) {
+        state.connections.push(c);
     }
+}
 
-    // After parens balanced, check if there's more on this line or next lines
-    // (like `-> (...)` or `{`)
-    // Keep collecting until we find `{` or reach a line that doesn't look like continuation
-    if paren_depth == 0 && !found_open_brace {
-        // Check if the collected text ends with `->` or similar continuation
-        let tail = collected.trim_end();
-        if tail.ends_with("->") || tail.ends_with("-> (") {
-            // Need more lines
-        } else {
-            // Check the remaining text after the last `)` for `->`
-            // Actually, we need to peek at what comes after the balanced parens
-            // Let's check if the rest of the current state has `->`
-            let after_last = collected.rfind(')').map(|p| collected[p + 1..].trim().to_string()).unwrap_or_default();
-            if after_last.starts_with("->") {
-                let after_arrow = after_last.strip_prefix("->").unwrap().trim();
-                if after_arrow.is_empty() || after_arrow == "(" {
-                    // Need to collect the output ports too
-                    while i < lines.len() {
-                        let line = lines[i].trim();
-                        collected.push('\n');
-                        collected.push_str(line);
-
-                        count_structural_parens(line, &mut paren_depth, &mut found_open_brace);
-                        i += 1;
-
-                        if paren_depth == 0 { break; }
-                    }
+/// The RHS text of a connection (everything after the `=`), trimmed.
+fn connection_rhs_text(conn: &crate::cst::SyntaxNode) -> String {
+    use crate::cst::SyntaxKind as K;
+    let mut out = String::new();
+    let mut after_eq = false;
+    for el in conn.children_with_tokens() {
+        match &el {
+            rowan::NodeOrToken::Token(t) => {
+                if t.kind() == K::EQ && !after_eq {
+                    after_eq = true;
+                    continue;
                 }
-            } else if after_last.is_empty() {
-                // Peek at the next line for `->`
-                if i < lines.len() {
-                    let next_trimmed = lines[i].trim();
-                    if next_trimmed.starts_with("->") {
-                        // Collect the arrow and output port lines
-                        collected.push('\n');
-                        collected.push_str(next_trimmed);
-                        count_structural_parens(next_trimmed, &mut paren_depth, &mut found_open_brace);
-                        i += 1;
-
-                        // If output parens are open, keep collecting
-                        while i < lines.len() && paren_depth > 0 {
-                            let line = lines[i].trim();
-                            collected.push('\n');
-                            collected.push_str(line);
-                            count_structural_parens(line, &mut paren_depth, &mut found_open_brace);
-                            i += 1;
-                        }
-                    }
+                if after_eq && t.kind() == K::COMMENT {
+                    continue;
+                }
+                if after_eq {
+                    out.push_str(t.text());
+                }
+            }
+            rowan::NodeOrToken::Node(n) => {
+                if after_eq {
+                    out.push_str(&n.to_string());
                 }
             }
         }
     }
+    out.trim().to_string()
+}
 
-    // Now check if there's a `{` on the next line (if we haven't found one yet)
-    if !found_open_brace && i < lines.len() {
-        let next_trimmed = lines[i].trim();
-        if next_trimmed == "{" || next_trimmed == "{}" {
-            collected.push('\n');
-            collected.push_str(next_trimmed);
-            return (collected, i);
+/// Lower one CST declaration into the ParseState (node / group / include),
+/// scoped under `parent` (None = top level). `source_id` is the file's identity
+/// (filename-derived; `Untitled` if unsaved), used as the id of an anonymous
+/// top-level `Group(){...}`.
+fn lower_decl(
+    decl: &crate::cst::nodes::Decl,
+    parent: Option<&str>,
+    source_id: &str,
+    li: &LineIndex,
+    state: &mut ParseState,
+    inline: &mut InlineScope,
+) {
+    use crate::cst::nodes::Decl as CstDecl;
+    match decl {
+        CstDecl::Node(n) => {
+            if let Some(node) = lower_node(n, parent, li, inline, &mut state.errors) {
+                if state.has_top_level_id(&node.id) {
+                    state.errors.push(CompileError::at(dup_span(node.header_span, node.span), format!("Duplicate id '{}'", node.id)));
+                }
+                state.nodes.push(node);
+            }
         }
-    }
-
-    // If the collected header has an opening `{` WITH content after it
-    // but the brace isn't closed yet (e.g. `n = Type { code: ``` ` with
-    // the value on later lines), keep consuming lines until the matching
-    // `}` at brace depth 0, taking triple-backtick into account so that
-    // `}` inside a code block doesn't close the outer brace. Bare `{`
-    // openers (group body, standard multi-line config) are left for the
-    // downstream `parse_config_block` / `parse_group_body` to handle.
-    if collect_unclosed_body
-        && found_open_brace
-        && first_brace_has_content_after(&collected)
-        && !is_brace_balanced_respecting_quotes_and_backticks(&collected)
-    {
-        while i < lines.len() {
-            let line = lines[i];
-            collected.push('\n');
-            collected.push_str(line);
-            i += 1;
-            if is_brace_balanced_respecting_quotes_and_backticks(&collected) {
-                return (collected, i - 1);
+        CstDecl::Group(g) => {
+            if let Some(group) = lower_group(g, parent, source_id, li, &mut state.errors) {
+                // An anonymous group's id IS `source_id` (the file's filename id),
+                // a second anonymous top-level Group is the shape error "a file
+                // must contain exactly one anonymous top-level Group", not a
+                // generic duplicate id. A named group with a duplicate id is the
+                // normal `Duplicate id` error.
+                if group.anonymous && state.groups.iter().any(|x| x.anonymous) {
+                    state.errors.push(CompileError::at(
+                        dup_span(group.header_span, group.span),
+                        "a file must contain exactly one anonymous top-level Group",
+                    ));
+                    return;
+                }
+                if state.has_top_level_id(&group.id) {
+                    state.errors.push(CompileError::at(dup_span(group.header_span, group.span), format!("Duplicate id '{}'", group.id)));
+                }
+                state.groups.push(group);
+            }
+        }
+        CstDecl::Include(i) => {
+            if let Some(inc) = lower_include(i, parent, li, &mut state.errors) {
+                if state.has_top_level_id(&inc.alias) {
+                    state.errors.push(CompileError::at(inc.span, format!("Duplicate id '{}'", inc.alias)));
+                }
+                state.includes.push(inc);
             }
         }
     }
-
-    // i - 1 because i has been incremented past the last consumed line
-    (collected, if i > start { i - 1 } else { start })
 }
 
-/// True if the first `{` in `s` is followed by real config content on the
-/// same line (not just whitespace or a trailing `#` comment). Used to
-/// distinguish `{ code: ``` ` (one-liner style with content) from a bare
-/// `{` opener for a standard multi-line config block. A trailing
-/// `{ # comment` is treated as a bare opener.
-fn first_brace_has_content_after(s: &str) -> bool {
-    let idx = match s.find('{') { Some(i) => i, None => return false };
-    let rest = &s[idx + 1..];
-    for c in rest.chars() {
-        if c == '\n' { return false; }
-        if c == '#' { return false; } // Comment continues to end of line.
-        if !c.is_whitespace() { return true; }
+/// Pick the tightest available span for a duplicate-id diagnostic: the decl's
+/// header (`id = Type`) if known, else its full span. A parsed decl ALWAYS
+/// carries one of these (the lowering sets `span`/`header_span` on every node it
+/// builds), so the default is unreachable; the `debug_assert` makes a future
+/// regression loud in tests rather than silently mislocating to line 0.
+fn dup_span(header_span: Option<Span>, full_span: Option<Span>) -> Span {
+    debug_assert!(header_span.is_some() || full_span.is_some(), "a parsed decl must carry a span");
+    header_span.or(full_span).unwrap_or_default()
+}
+
+/// Reject a user-written local id (a node/group name or include alias) that
+/// the LANGUAGE owns, pushing a loud error and returning false. The single home
+/// for reserved-name rejection, shared by `lower_node`/`lower_group`/
+/// `lower_include` so they can't drift. Reserved:
+///   - `self` (the boundary keyword), `Group`/`Passthrough` (type keywords);
+///   - any id containing `__`: the compiler synthesizes ids with `__` as the
+///     separator (`{group}__in`/`__out` boundary passthroughs, `{host}__{field}`
+///     inline-expr anon nodes). Letting a user take a `__` name makes those
+///     collide at flatten (`foo__in` vs group `foo`'s `__in`) into a silent
+///     duplicate id. Reserving the separator makes the collision impossible.
+fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileError>) -> bool {
+    if !is_reserved_local(local_id) {
+        return true;
     }
+    // Reserved: pick the message that explains WHICH rule it tripped. The
+    // membership decision itself lives only in `is_reserved_local` (above), so
+    // this match is presentation, not a second copy of the rule.
+    let msg = if local_id == "self" {
+        "'self' is a reserved word and cannot be used as an identifier".to_string()
+    } else if local_id == "Group" || local_id == "Passthrough" {
+        format!("'{local_id}' is a reserved type keyword and cannot be used as a node or group name")
+    } else {
+        format!("'{local_id}' uses '__', which is reserved for compiler-generated ids (group boundaries, inline expressions); pick a name without a double underscore")
+    };
+    errors.push(CompileError::at(span, msg));
     false
 }
 
-/// True if `s` has matched `{`/`}` at depth 0, respecting quoted strings
-/// and triple-backtick code blocks. Used to know when a multi-line `{ ... }`
-/// one-liner style header is complete.
-fn is_brace_balanced_respecting_quotes_and_backticks(s: &str) -> bool {
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut in_backtick = false;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Triple-backtick toggle.
-        if i + 2 < bytes.len() && bytes[i] == b'`' && bytes[i + 1] == b'`' && bytes[i + 2] == b'`' {
-            in_backtick = !in_backtick;
-            i += 3;
-            continue;
-        }
-        if in_backtick {
-            i += 1;
-            continue;
-        }
-        let c = bytes[i];
-        if c == b'\\' && i + 1 < bytes.len() {
-            // Escape: skip the next char.
-            i += 2;
-            continue;
-        }
-        if c == b'"' {
-            in_string = !in_string;
-            i += 1;
-            continue;
-        }
-        if !in_string {
-            if c == b'{' { depth += 1; }
-            if c == b'}' {
-                depth -= 1;
-                if depth == 0 {
-                    // Found matching close. Balanced IFF there's no further
-                    // `{` after this point (to catch weirdness), but we
-                    // only need to detect the end of the first balanced
-                    // block, so return true here.
-                    // Check rest of string for any un-escaped `{` in non-
-                    // string, non-backtick context: if we find any, it's
-                    // another unbalanced block. But for our purposes, we
-                    // only care that the FIRST `{` has been closed.
-                    return true;
-                }
-            }
-        }
-        i += 1;
-    }
-    depth == 0
+/// True iff `id` is a name the language reserves: the `self` boundary keyword,
+/// the `Group`/`Passthrough` type keywords, or any `__`-containing id (the
+/// compiler-id separator). The SINGLE source of the reserved-name membership
+/// rule: `reject_reserved_local` delegates here for the decision (and only adds
+/// per-case messages), and `source_name::derive_id` consults it so a
+/// filename-derived anonymous-root id can never be reserved either.
+pub fn is_reserved_local(id: &str) -> bool {
+    id == "self" || id == "Group" || id == "Passthrough" || id.contains("__")
 }
 
-// ─── Port Signature Parsing ─────────────────────────────────────────────────
+/// The header IDENT (the decl's local id) and the type name, from a HEADER node.
+fn header_id_and_type(header: &crate::cst::SyntaxNode) -> (String, String) {
+    use crate::cst::SyntaxKind as K;
+    let mut id = String::new();
+    let mut ty = String::new();
+    // A header with NO `=` is an anonymous group (`Group(...)`): the leading
+    // `Group` is the TYPE, the id is empty (sentinel-assigned later). A header
+    // WITH `=` is `id = Type`; here a leading `Group` before `=` is the reserved
+    // keyword used as a NAME (`Group = Text`), captured as the id so the lowering
+    // rejects it.
+    let has_eq = header.children_with_tokens().any(|e| e.as_token().map(|t| t.kind() == K::EQ).unwrap_or(false));
+    let mut seen_eq = false;
+    for el in header.children_with_tokens() {
+        if let Some(t) = el.as_token() {
+            match t.kind() {
+                K::EQ => seen_eq = true,
+                K::IDENT if !seen_eq && id.is_empty() => id = t.text().to_string(),
+                K::IDENT if seen_eq && ty.is_empty() => ty = t.text().to_string(),
+                K::KW_GROUP if !seen_eq && has_eq && id.is_empty() => id = "Group".to_string(),
+                K::KW_GROUP if seen_eq && ty.is_empty() => ty = "Group".to_string(),
+                // anonymous group: `Group` with no `=`, it is the type.
+                K::KW_GROUP if !has_eq && ty.is_empty() => ty = "Group".to_string(),
+                _ => {}
+            }
+        }
+    }
+    (id, ty)
+}
 
-/// Parse `(inputs) -> (outputs)` or just `(inputs)` from a string starting with `(`.
-/// Returns (in_ports, out_ports, one_of_required, remaining_string).
-fn parse_port_signature(
-    s: &str,
-    line_num: usize,
+/// Parse a `(...)` port-signature CST node into ParsedPorts (reusing the pure
+/// `try_parse_port_decl`). Also collects `@require_one_of(...)` markers.
+fn lower_port_sig(
+    sig: &crate::cst::SyntaxNode,
+    direction: &str,
+    li: &LineIndex,
     errors: &mut Vec<CompileError>,
-) -> (Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, String) {
+) -> (Vec<ParsedPort>, Vec<Vec<String>>) {
+    use crate::cst::SyntaxKind as K;
+    let mut ports = Vec::new();
+    let mut oor = Vec::new();
+    for el in sig.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Node(n) if n.kind() == K::PORT_DECL => {
+                let text = n.to_string();
+                let text = text.trim().trim_end_matches(',').trim();
+                if text.is_empty() {
+                    continue;
+                }
+                // The culprit is this port decl, not the whole header.
+                let span = li.span_of(&n);
+                match try_parse_port_decl(text) {
+                    Ok(p) => {
+                        if ports.iter().any(|e: &ParsedPort| e.name == p.name) {
+                            errors.push(CompileError::at(span, format!("Duplicate {direction} port \"{}\"", p.name)));
+                        } else {
+                            ports.push(p);
+                        }
+                    }
+                    Err(msg) => errors.push(CompileError::at(span, msg)),
+                }
+            }
+            rowan::NodeOrToken::Token(t) if t.kind() == K::MARKER => {
+                // @require_one_of(a, b) in an input list.
+                if crate::cst::marker::directive(t.text()) == "require_one_of" {
+                    if direction != "in" {
+                        errors.push(CompileError::at(li.span_of_token(&t), "@require_one_of is only valid in input port lists"));
+                    } else {
+                        // Same validity gate as the body directive: a non-empty
+                        // port list, or a loud error (never a silent drop).
+                        match crate::cst::marker::require_one_of_ports(t.text()) {
+                            Ok(ports) => oor.push(ports),
+                            Err(msg) => errors.push(CompileError::at(li.span_of_token(&t), msg.to_string())),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (ports, oor)
+}
+
+/// Read the input/output port signatures off a HEADER (or post-body PORT_SIG_POST
+/// sibling), returning (in_ports, out_ports, one_of_required).
+fn lower_header_ports(
+    decl: &crate::cst::SyntaxNode,
+    header: &crate::cst::SyntaxNode,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) -> (Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>) {
+    use crate::cst::SyntaxKind as K;
     let mut in_ports = Vec::new();
     let mut out_ports = Vec::new();
-    let mut one_of_required: Vec<Vec<String>> = Vec::new();
-
-    // Find matching closing paren for inputs
-    let (input_content, after_input) = match find_matching_paren(s) {
-        Some((content, rest)) => (content, rest),
-        None => {
-            errors.push(CompileError { line: line_num, message: "Unclosed input port list '('".to_string() });
-            return (in_ports, out_ports, one_of_required, String::new());
-        }
-    };
-
-    // Parse input ports
-    parse_port_list(&input_content, &mut in_ports, &mut one_of_required, "in", line_num, errors);
-
-    let after_input = after_input.trim();
-
-    // Check for -> (outputs)
-    if let Some(rest) = after_input.strip_prefix("->") {
-        let rest = rest.trim();
-        if rest.starts_with('(') {
-            let (output_content, after_output) = match find_matching_paren(rest) {
-                Some((content, rest)) => (content, rest),
-                None => {
-                    errors.push(CompileError { line: line_num, message: "Unclosed output port list '('".to_string() });
-                    return (in_ports, out_ports, one_of_required, String::new());
-                }
-            };
-            let mut out_oor = Vec::new();
-            parse_port_list(&output_content, &mut out_ports, &mut out_oor, "out", line_num, errors);
-            // out_oor is unusual but supported
-            one_of_required.extend(out_oor);
-            return (in_ports, out_ports, one_of_required, after_output);
-        } else {
-            errors.push(CompileError { line: line_num, message: "Expected '(' after '->'".to_string() });
-            return (in_ports, out_ports, one_of_required, rest.to_string());
-        }
-    }
-
-    (in_ports, out_ports, one_of_required, after_input.to_string())
-}
-
-/// Find matching ')' for a string starting with '('. Returns (inner_content, rest_after_paren).
-fn find_matching_paren(s: &str) -> Option<(String, String)> {
-    if !s.starts_with('(') { return None; }
-    let mut depth = 0;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip @require_one_of(...) directive, its parens are not structural.
-        // The directive must close on the same line.
-        if i + 16 <= bytes.len() && &s[i..i+16] == "@require_one_of(" {
-            let mut dir_depth: i32 = 1;
-            let mut j = i + 16;
-            while j < bytes.len() && bytes[j] != b'\n' && dir_depth > 0 {
-                if bytes[j] == b'(' { dir_depth += 1; }
-                if bytes[j] == b')' { dir_depth -= 1; }
-                if dir_depth > 0 { j += 1; }
+    let mut oor = Vec::new();
+    for sig in header.children() {
+        match sig.kind() {
+            K::PORT_SIG_IN => {
+                let (p, o) = lower_port_sig(&sig, "in", li, errors);
+                in_ports = p;
+                oor.extend(o);
             }
-            // Skip past directive if balanced within line, otherwise skip to newline
-            if dir_depth == 0 {
-                i = j + 1;
-            } else {
-                while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
-            }
-            continue;
-        }
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((s[1..i].to_string(), s[i + 1..].to_string()));
-                }
+            K::PORT_SIG_OUT => {
+                let (p, o) = lower_port_sig(&sig, "out", li, errors);
+                out_ports = p;
+                oor.extend(o);
             }
             _ => {}
         }
-        i += 1;
     }
-    None
+    // Post-body output ports: a PORT_SIG_POST sibling of the body, under decl.
+    for sib in decl.children() {
+        if sib.kind() == K::PORT_SIG_POST {
+            let (p, _) = lower_port_sig(&sib, "out", li, errors);
+            let sib_span = li.span_of(&sib);
+            for port in p {
+                if out_ports.iter().any(|e: &ParsedPort| e.name == port.name) {
+                    errors.push(CompileError::at(sib_span, format!("Duplicate output port '{}'", port.name)));
+                } else {
+                    out_ports.push(port);
+                }
+            }
+        }
+    }
+    (in_ports, out_ports, oor)
 }
 
-/// Parse a comma/newline-separated port list with optional @require_one_of directives.
-fn parse_port_list(
-    content: &str,
-    ports: &mut Vec<ParsedPort>,
-    one_of_required: &mut Vec<Vec<String>>,
-    direction: &str,
-    line_num: usize,
+/// Lower a NODE_DECL into a ParsedNode (config + ports + spans), synthesizing
+/// inline-expression children/edges into `inline`.
+fn lower_node(
+    n: &crate::cst::nodes::NodeDecl,
+    parent: Option<&str>,
+    li: &LineIndex,
+    inline: &mut InlineScope,
+    errors: &mut Vec<CompileError>,
+) -> Option<ParsedNode> {
+    let header = n.header()?;
+    let (local_id, node_type) = header_id_and_type(header.syntax());
+    if local_id.is_empty() || node_type.is_empty() {
+        return None;
+    }
+    // Diagnostics point at the HEADER (not the decl-node start, which includes
+    // leading comment/blank-line trivia).
+    let header_span = li.span_of(header.syntax());
+    // Identifier + type-name validations: reserved names (`self`, type keywords,
+    // the `__` compiler-id separator) are rejected loudly in one shared place.
+    if !reject_reserved_local(&local_id, header_span, errors) {
+        return None;
+    }
+    if node_type == "Passthrough" {
+        errors.push(CompileError::at(header_span, "'Passthrough' is a compiler-internal node type and cannot be used directly. Passthrough nodes are emitted automatically when a group is flattened."));
+        return None;
+    }
+    let id = scoped(parent, &local_id);
+    let (in_ports, out_ports, one_of_required) = lower_header_ports(n.syntax(), header.syntax(), li, errors);
+
+    let mut config = serde_json::Map::new();
+    let mut label = None;
+    let mut config_spans: std::collections::BTreeMap<String, ConfigFieldSpan> = Default::default();
+    let mut one_of_required = one_of_required;
+    let mut body_oor = Vec::new();
+    if let Some(body) = n.body() {
+        // The inline host is this node's RAW local; its group scope is `parent`.
+        // An inline-expr config value synthesizes its anon node `{local}__field`
+        // raw, scoped to `g.node__field` by lower_group (one scope pass).
+        lower_config_body(&body, &local_id, parent, li, &mut config, &mut label, &mut config_spans, inline, &mut body_oor, errors);
+    }
+    one_of_required.extend(body_oor);
+
+    Some(ParsedNode {
+        id,
+        node_type,
+        label,
+        config,
+        parent_id: parent.map(|p| p.to_string()),
+        in_ports,
+        out_ports,
+        one_of_required,
+        span: Some(li.span_of(n.syntax())),
+        header_span: Some(li.span_of(header.syntax())),
+        config_spans,
+        file_refs: Default::default(),
+        include_path: None,
+    })
+}
+
+/// Lower the config fields / connections / inline-exprs inside a node body.
+/// `host_local` is the host node's RAW local id (matches a `local.key = lit`
+/// config-origin connection, and builds inline anon ids `host_local__field`).
+/// `group_scope` is the enclosing GROUP's scoped id (None at the file root):
+/// the synthesized inline node's scope.
+fn lower_config_body(
+    body: &crate::cst::nodes::Body,
+    host_local: &str,
+    group_scope: Option<&str>,
+    li: &LineIndex,
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    label: &mut Option<String>,
+    config_spans: &mut std::collections::BTreeMap<String, ConfigFieldSpan>,
+    inline: &mut InlineScope,
+    body_oor: &mut Vec<Vec<String>>,
     errors: &mut Vec<CompileError>,
 ) {
-    // Split on top-level commas and newlines
-    for item in split_port_items(content) {
-        let item = item.trim();
-        if item.is_empty() || item.starts_with('#') { continue; }
-
-        // @require_one_of(a, b), only valid in input port lists
-        if let Some(rest) = item.strip_prefix("@require_one_of(") {
-            if direction != "in" {
-                errors.push(CompileError { line: line_num, message: "@require_one_of is only valid in input port lists".to_string() });
-                continue;
+    use crate::cst::SyntaxKind as K;
+    for child in body.syntax().children() {
+        match child.kind() {
+            K::CONFIG_FIELD | K::LABEL_FIELD => {
+                lower_config_field(&child, host_local, group_scope, li, config, label, config_spans, inline, errors);
             }
-            if let Some(body) = rest.strip_suffix(')') {
-                let group: Vec<String> = body.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !group.is_empty() {
-                    one_of_required.push(group);
-                }
-            } else {
-                errors.push(CompileError { line: line_num, message: "@require_one_of missing closing parenthesis".to_string() });
-            }
-            continue;
-        }
-
-        match try_parse_port_decl(item) {
-            Ok(port) => {
-                if ports.iter().any(|p| p.name == port.name) {
-                    errors.push(CompileError { line: line_num, message: format!("Duplicate {} port \"{}\"", direction, port.name) });
-                } else {
-                    ports.push(port);
+            K::CONNECTION => {
+                // Inside a node body, `host.key = <literal>` is a config-origin
+                // field on THIS node (the body's own config maps); anything else
+                // (incl. a literal to a non-host target) is a port-wiring edge.
+                let fill = literal_config_fill(&child, li)
+                    .filter(|f| f.target_id == host_local);
+                match fill {
+                    Some(f) => apply_literal_fill(&f, config, config_spans, errors),
+                    None => {
+                        if let Some(conn) = lower_connection(&child, group_scope, li, inline, errors) {
+                            inline.connections.push(conn);
+                        }
+                    }
                 }
             }
-            Err(msg) => {
-                errors.push(CompileError { line: line_num, message: msg });
-            }
-        }
-    }
-}
-
-/// Split port content on commas and newlines, respecting bracket depth.
-fn split_port_items(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => if depth > 0 { depth -= 1; },
-            ',' | '\n' if depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
+            K::DIRECTIVE => {
+                // @require_one_of inside a config block: collected into
+                // `body_oor` for the caller to merge onto the node/group.
+                if let Some(g) = lower_directive_require_one_of(&child, li, errors) {
+                    body_oor.push(g);
+                }
             }
             _ => {}
         }
     }
-    parts.push(&s[start..]);
-    parts
 }
+
+/// Lower a single CONFIG_FIELD / LABEL_FIELD. `host_local` is the host node's
+/// RAW local id (builds the inline anon id `host_local__field`); `group_scope`
+/// is the enclosing group's scoped id (None at the file root), the inline node's
+/// scope.
+fn lower_config_field(
+    field: &crate::cst::SyntaxNode,
+    host_local: &str,
+    group_scope: Option<&str>,
+    li: &LineIndex,
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    label: &mut Option<String>,
+    config_spans: &mut std::collections::BTreeMap<String, ConfigFieldSpan>,
+    inline: &mut InlineScope,
+    errors: &mut Vec<CompileError>,
+) {
+    use crate::cst::SyntaxKind as K;
+    // key = first IDENT
+    let key = field
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == K::IDENT)
+        .map(|t| t.text().to_string());
+    let Some(key) = key else { return };
+    let span = li.span_of(field);
+
+    // The value: the element(s) after the COLON. Find the value node/token.
+    let value_node = field.children().find(|n| matches!(n.kind(), K::INLINE_EXPR | K::JSON_VALUE | K::ENDPOINT));
+    if let Some(vn) = &value_node {
+        match vn.kind() {
+            K::INLINE_EXPR => {
+                // Synthesize the inline-expr anon node + edge structurally from
+                // the CST (same machinery node decls use), targeting host.key.
+                lower_inline_expr(vn, host_local, &key, group_scope, li, inline, errors);
+                return;
+            }
+            K::ENDPOINT => {
+                // Port wiring: key: src.port. Target is the host's RAW local;
+                // `lower_group` rescopes it once like every other endpoint.
+                let txt = vn.to_string();
+                if let Some((src_id, src_port)) = parse_dotted(txt.trim()) {
+                    inline.connections.push(ParsedConnection {
+                        source_id: src_id,
+                        source_port: src_port,
+                        target_id: host_local.to_string(),
+                        target_port: key.clone(),
+                        span: Some(span),
+                    });
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Otherwise a literal value: reconstruct the value text after the colon.
+    let value_text = field_value_text(field);
+    if field.kind() == K::LABEL_FIELD {
+        // The label has ONE home (`node.label`); set twice is a loud error, the
+        // same rule `store_value_text` enforces for config keys.
+        if label.is_some() {
+            errors.push(CompileError::at(span, "duplicate '_label' field: a node's label may be set only once".to_string()));
+            return;
+        }
+        // A label must be a quoted string / heredoc; a bare `_label: raw` fails loud.
+        if let Some(text) = parse_label_value(&value_text, span, errors) {
+            *label = Some(text);
+            config_spans.insert("_label".to_string(), ConfigFieldSpan::inline(span));
+        }
+        return;
+    }
+    // Heredoc / JSON / scalar: hand the value text to the value-store helper.
+    let stored = store_value_text(&key, &value_text, config, span, errors);
+    if let Some(k) = stored {
+        config_spans.insert(k, ConfigFieldSpan::inline(span));
+    }
+}
+
+/// Lower an INLINE_EXPR value (`Type(sig) { body }.port`) into an anonymous
+/// child node + an edge from that node's `.port` to `host.field`. Built
+/// structurally from the CST node's children using the SAME machinery node
+/// declarations use (`lower_header_ports`, `lower_config_body`) and real spans,
+/// so inline-expr config, ports, nesting, and diagnostics behave identically to
+/// a named node.
+///
+/// `host_local` is the host the inline fills, AS WRITTEN (the connection target
+/// `b`, or a node decl's local id): raw, not group-scoped. The synthesized anon
+/// id is `{host_local}__{field}` and the edge targets `host_local` (also raw).
+/// Both stay raw on purpose: `lower_group` scopes the anon NODE ids and rescopes
+/// ALL edge endpoints together in one pass (a raw `b__field` endpoint and its
+/// node both become `g.b__field`). Pre-scoping here would double-scope a child
+/// that shadows its group's name (`g` in group `g` -> `g.g.g`).
+///
+/// `parent_id` is the enclosing GROUP's scoped id (None at the file root): the
+/// node's scope, so once `lower_group` scopes the id, `id` and `scope` agree.
+fn lower_inline_expr(
+    inline_node: &crate::cst::SyntaxNode,
+    host_local: &str,
+    field_key: &str,
+    parent_id: Option<&str>,
+    li: &LineIndex,
+    inline: &mut InlineScope,
+    errors: &mut Vec<CompileError>,
+) {
+    use crate::cst::SyntaxKind as K;
+    let span = li.span_of(inline_node);
+    // Type = the leading IDENT/KW_GROUP token of the inline expr.
+    let type_tok = inline_node
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| matches!(t.kind(), K::IDENT | K::KW_GROUP));
+    let node_type = match type_tok {
+        Some(t) => t.text().to_string(),
+        None => return,
+    };
+    if node_type == "Group" {
+        errors.push(CompileError::at(span, "Groups cannot be inlined"));
+        return;
+    }
+    if node_type == "Passthrough" {
+        errors.push(CompileError::at(span, "'Passthrough' is a compiler-internal node type and cannot be used directly."));
+        return;
+    }
+
+    // RAW id (`host_local__field`); `lower_group` scopes it to `g.host__field`
+    // in the same pass that rescopes the edge endpoints, so node id and edge
+    // source stay in lockstep and a name-shadowing child can't double-scope.
+    let anon_id = format!("{host_local}__{field_key}");
+    // Ports: the inline expr's PORT_DECLs live directly under the INLINE_EXPR
+    // (no HEADER sub-node), so read them off the node itself.
+    let (in_ports, out_ports, one_of_required) = lower_header_ports(inline_node, inline_node, li, errors);
+
+    // Body config (recurses for nested inline exprs via lower_config_body). The
+    // nested host is THIS anon node (raw `anon_id`), and it shares this node's
+    // group scope (all inline children are flattened siblings in one group), so
+    // thread `parent_id` unchanged.
+    let mut config = serde_json::Map::new();
+    let mut label = None;
+    let mut config_spans: std::collections::BTreeMap<String, ConfigFieldSpan> = Default::default();
+    let mut body_oor = Vec::new();
+    let mut one_of_required = one_of_required;
+    if let Some(body) = inline_node.children().find(|n| n.kind() == K::BODY).and_then(crate::cst::nodes::Body::cast) {
+        lower_config_body(&body, &anon_id, parent_id, li, &mut config, &mut label, &mut config_spans, inline, &mut body_oor, errors);
+    }
+    one_of_required.extend(body_oor);
+
+    // The required trailing `.port` (the inline expr's output read into the field).
+    let output_port = inline_expr_dot_port(inline_node);
+    let Some(output_port) = output_port else {
+        errors.push(CompileError::at(span, format!("inline expression for '{field_key}' is missing its required '.port'")));
+        return;
+    };
+
+    inline.nodes.push(ParsedNode {
+        id: anon_id.clone(),
+        node_type,
+        label,
+        config,
+        // The inline node lives in the host's group scope; setting parent_id makes
+        // its `scope` array match its (post-rescope) group-scoped `id`. Without it
+        // the id became `g.b__field` but scope was [].
+        parent_id: parent_id.map(|s| s.to_string()),
+        in_ports,
+        out_ports,
+        one_of_required,
+        span: Some(li.span_of(inline_node)),
+        header_span: None,
+        config_spans,
+        file_refs: Default::default(),
+        include_path: None,
+    });
+    inline.connections.push(ParsedConnection {
+        source_id: anon_id,
+        source_port: output_port,
+        // Raw `host_local`; rescoped to the host's scoped id by `lower_group`.
+        target_id: host_local.to_string(),
+        target_port: field_key.to_string(),
+        span: Some(li.span_of(inline_node)),
+    });
+}
+
+/// Merge synthesized inline-expr nodes into `dest`. An id collision (two inline
+/// exprs on the same `parent.field` -> the same `{parent}__{field}` id) is a LOUD
+/// error, not a silent drop: dropping the second one silently discards the user's
+/// statement or mis-wires the edge. A collision with a USER node is impossible by
+/// construction: `__` is reserved (see `reject_reserved_local`), so no user id
+/// can equal a `{parent}__{field}` synthesized id. The single home for the merge
+/// so all three lowering scopes agree.
+fn merge_inline_nodes(dest: &mut Vec<ParsedNode>, incoming: Vec<ParsedNode>, errors: &mut Vec<CompileError>) {
+    for n in incoming {
+        if dest.iter().any(|e| e.id == n.id) {
+            errors.push(CompileError::at(
+                n.span.unwrap_or_default(),
+                format!("duplicate id '{}' (an inline expression synthesized a node that collides with an existing one)", n.id),
+            ));
+        } else {
+            dest.push(n);
+        }
+    }
+}
+
+/// Lower a DIRECTIVE body item into an optional `@require_one_of` arg group.
+/// The single home for directive handling, shared by the node-body and group-
+/// body lowering so they can't drift. Returns the parsed port group, or None for
+/// a non-`require_one_of` directive (silently ignored: forward-compatible with
+/// future directives the lowering doesn't yet consume).
+///
+/// A `require_one_of` with NO args fails LOUD rather than silently dropping the
+/// constraint: this catches the `@require_one_of (a, b)` space typo (the lexer
+/// only folds `(...)` into the marker when it abuts `@name`, so the space splits
+/// the args off and the marker arrives bare), and a genuinely empty `()`.
+fn lower_directive_require_one_of(
+    child: &crate::cst::SyntaxNode,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) -> Option<Vec<String>> {
+    use crate::cst::SyntaxKind as K;
+    let tok = child.children_with_tokens().filter_map(|e| e.into_token()).find(|t| t.kind() == K::MARKER)?;
+    if crate::cst::marker::directive(tok.text()) != "require_one_of" {
+        return None;
+    }
+    match crate::cst::marker::require_one_of_ports(tok.text()) {
+        Ok(ports) => Some(ports),
+        Err(msg) => {
+            errors.push(CompileError::at(li.span_of(child), msg.to_string()));
+            None
+        }
+    }
+}
+
+/// The trailing `.port` of an inline expr: the IDENT after the LAST top-level
+/// DOT (the `.port` that follows the body/type, not a dot inside the body).
+fn inline_expr_dot_port(inline_node: &crate::cst::SyntaxNode) -> Option<String> {
+    use crate::cst::SyntaxKind as K;
+    // The `.port` tokens are DIRECT children of INLINE_EXPR (the body's dots are
+    // nested inside the BODY node), so scan only direct tokens.
+    let toks: Vec<crate::cst::SyntaxToken> =
+        inline_node.children_with_tokens().filter_map(|e| e.into_token()).collect();
+    let dot = toks.iter().rposition(|t| t.kind() == K::DOT)?;
+    toks.get(dot + 1).filter(|t| t.kind() == K::IDENT).map(|t| t.text().to_string())
+}
+
+/// The raw value text of a config field: everything after the first COLON token,
+/// trimmed, reconstructed from the field's tokens/nodes.
+fn field_value_text(field: &crate::cst::SyntaxNode) -> String {
+    use crate::cst::SyntaxKind as K;
+    let mut out = String::new();
+    let mut after_colon = false;
+    for el in field.children_with_tokens() {
+        match &el {
+            rowan::NodeOrToken::Token(t) => {
+                if t.kind() == K::COLON && !after_colon {
+                    after_colon = true;
+                    continue;
+                }
+                if after_colon && t.kind() == K::COMMENT {
+                    continue; // drop trailing comment
+                }
+                if after_colon {
+                    out.push_str(t.text());
+                }
+            }
+            rowan::NodeOrToken::Node(n) => {
+                if after_colon {
+                    out.push_str(&n.to_string());
+                }
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Store a value text into config: heredoc (```), JSON ([/{), or scalar via the
+/// existing `parse_kv`-style logic. Returns the key on success.
+///
+/// The SINGLE store both config paths funnel through (a body field `key: v` and a
+/// connection-origin field `node.key = v`), so a DUPLICATE config key for one
+/// node is caught here ONCE rather than silently last-write-wins. A blind
+/// overwrite let the editor's per-key SetConfig/RemoveConfig touch only one of
+/// two values and strand the other; rejecting the duplicate at the source makes
+/// that ambiguous state impossible.
+fn store_value_text(
+    key: &str,
+    value: &str,
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    span: Span,
+    errors: &mut Vec<CompileError>,
+) -> Option<String> {
+    if config.contains_key(key) {
+        errors.push(CompileError::at(span, format!("duplicate config field '{key}': a node's config key may be set only once (as a body field `{key}: ...` OR a connection `node.{key} = ...`, not both)")));
+        return None;
+    }
+    // Heredoc (multiline string): strip fences, single leading/trailing newline,
+    // dedent, unescape.
+    if let Some(text) = unescape_heredoc(value) {
+        config.insert(key.to_string(), serde_json::Value::String(text));
+        return Some(key.to_string());
+    }
+    // JSON or scalar: reuse parse_kv by reconstructing `key: value`.
+    let pair = format!("{key}: {value}");
+    parse_kv(&pair, config, span, errors)
+}
+
+/// Parse a ` ```...``` ` heredoc (multiline string) value into its text, or None
+/// if `value` isn't a heredoc. The single home for heredoc unescaping, shared by
+/// `store_value_text` and the label path.
+fn unescape_heredoc(value: &str) -> Option<String> {
+    if !(value.starts_with("```") && value.ends_with("```") && value.len() >= 6) {
+        return None;
+    }
+    let inner = &value[3..value.len() - 3];
+    let inner = inner.strip_prefix('\n').unwrap_or(inner);
+    let inner = inner.strip_suffix('\n').unwrap_or(inner);
+    Some(dedent(inner).replace("\\```", "```").replace("\\`", "`"))
+}
+
+/// Parse a `_label` value: it must be a STRING (a quoted `"..."` or a ` ``` `
+/// heredoc), same as any string value. A bare/unquoted label (`_label: raw`) or a
+/// non-string (`_label: 42`) fails loud rather than silently coercing.
+fn parse_label_value(value: &str, span: Span, errors: &mut Vec<CompileError>) -> Option<String> {
+    let t = value.trim();
+    if let Some(text) = unescape_heredoc(t) {
+        Some(text)
+    } else if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+        Some(unescape(&t[1..t.len() - 1]))
+    } else {
+        errors.push(CompileError::at(span, format!(
+            "'_label' has an invalid value `{t}`: a label must be a quoted string (`_label: \"{t}\"`)."
+        )));
+        None
+    }
+}
+
+/// Lower a CONNECTION CST node into a ParsedConnection. Endpoints are kept as
+/// written; group-internal rescoping (`self` -> boundary, local child -> scoped)
+/// is applied by `lower_group` after the group's children are known.
+/// `group_scope` is the enclosing GROUP's scoped id (None at the file root),
+/// passed to `lower_inline_expr` as the synthesized anon node's scope (its
+/// `parent_id`) when the RHS is an inline expr.
+fn lower_connection(
+    conn: &crate::cst::SyntaxNode,
+    group_scope: Option<&str>,
+    li: &LineIndex,
+    inline: &mut InlineScope,
+    errors: &mut Vec<CompileError>,
+) -> Option<ParsedConnection> {
+    use crate::cst::SyntaxKind as K;
+    let eps: Vec<crate::cst::SyntaxNode> = conn.children().filter(|n| n.kind() == K::ENDPOINT).collect();
+    // A well-formed endpoint is `id` or `id.port` (1-2 segments). A 3+-segment
+    // ref (`a.b.c`) is malformed: reject it loudly rather than silently keeping
+    // the first two segments and wiring a wrong edge.
+    for ep in &eps {
+        if endpoint_overlong(ep) {
+            errors.push(CompileError::at(li.span_of(ep), "invalid reference: expected 'id' or 'id.port', not a longer dotted path"));
+            return None;
+        }
+    }
+    let target = eps.first()?;
+    let (t_id, t_port) = endpoint_id_port(target);
+    // RHS = an INLINE_EXPR (`target.port = Type{...}.out`): synthesize the anon
+    // node + edge into `target.port`, the SAME path a config-field inline expr
+    // takes. Returns no plain edge (the synthesized edge carries the wiring).
+    if let Some(rhs_inline) = conn.children().find(|n| n.kind() == K::INLINE_EXPR) {
+        // The host is the as-written target `t_id` (raw); the anon node + edge
+        // are built raw and scoped by `lower_group` in one pass. `group_scope`
+        // is the node's scope (parent_id).
+        lower_inline_expr(&rhs_inline, &t_id, &t_port, group_scope, li, inline, errors);
+        return None;
+    }
+    // RHS = a second endpoint (`src.port`): a plain edge. If there is NO second
+    // endpoint, the RHS is a LITERAL. A literal is the "visual config" sugar that
+    // only a NODE has: `node.port = "v"` fills that node's config. The valid
+    // node-config case is peeled off upstream (`literal_config_fill` + node
+    // lookup) before reaching here, so a literal arriving in `lower_connection`
+    // targets something with no config: a group boundary (`self.port`), a
+    // group/include alias port, or an undeclared target. All are invalid: a port
+    // that isn't a node's own config is driven by WIRING (`= src.out`, or an
+    // inline node `= Text { value: "v" }.value`), never a bare constant. Reject
+    // loudly instead of emitting a phantom edge with an empty source.
+    let Some(src_ep) = eps.get(1) else {
+        let target_desc = if t_port.is_empty() { t_id.clone() } else { format!("{t_id}.{t_port}") };
+        // Span the TARGET endpoint (the culprit), not the whole line.
+        errors.push(CompileError::at(
+            li.span_of(target),
+            format!("cannot assign a literal to '{target_desc}': only a node's own port takes a literal config value. Drive this port by wiring (`{target_desc} = source.out`) or an inline node (`{target_desc} = Text {{ value: \"...\" }}.value`)."),
+        ));
+        return None;
+    };
+    let (s_id, s_port) = endpoint_id_port(src_ep);
+    Some(ParsedConnection {
+        source_id: s_id,
+        source_port: s_port,
+        target_id: t_id,
+        target_port: t_port,
+        span: Some(li.span_of(conn)),
+    })
+}
+
+/// True if an ENDPOINT has more than the allowed `id.port` (2) segments.
+fn endpoint_overlong(ep: &crate::cst::SyntaxNode) -> bool {
+    crate::cst::nodes::Endpoint::cast(ep.clone()).map(|e| e.segments().len() > 2).unwrap_or(false)
+}
+
+/// (id, port) of an ENDPOINT node, with absent parts as empty strings. Delegates
+/// to the typed view's `Endpoint::parts` (the single endpoint extractor).
+fn endpoint_id_port(ep: &crate::cst::SyntaxNode) -> (String, String) {
+    let (id, port) = crate::cst::nodes::Endpoint::cast(ep.clone())
+        .map(|e| e.parts())
+        .unwrap_or((None, None));
+    (id.unwrap_or_default(), port.unwrap_or_default())
+}
+
+/// Lower a GROUP_DECL recursively into a ParsedGroup. `source_id` is the file's
+/// filename-derived identity, used as the local id of a top-level anonymous
+/// `Group(){...}` (`Untitled` for an unsaved buffer).
+fn lower_group(
+    g: &crate::cst::nodes::GroupDecl,
+    parent: Option<&str>,
+    source_id: &str,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) -> Option<ParsedGroup> {
+    use crate::cst::nodes::Decl as CstDecl;
+    use crate::cst::SyntaxKind as K;
+    let header = g.header()?;
+    let (local_id, _ty) = header_id_and_type(header.syntax());
+    // Diagnostics point at the HEADER (where the user wrote the decl), not the
+    // decl-node start which includes leading comment/blank-line trivia.
+    let header_span = li.span_of(header.syntax());
+    // Reserved names (`self`, `Group`/`Passthrough`, the `__` compiler-id
+    // separator) rejected loudly, mirroring the node path via the shared gate.
+    // The anonymous case (empty local) skips the gate: it takes `source_id`
+    // below, which `derive_id` already guarantees is a clean bare identifier
+    // (no `__`, never a reserved word).
+    if !local_id.is_empty() && !reject_reserved_local(&local_id, header_span, errors) {
+        return None;
+    }
+    // An anonymous group (`Group(...)` with no `name =`) IS the file: its id
+    // comes from the filename (`my-cleaner.weft` -> `MyCleaner`, an unsaved
+    // buffer -> `Untitled`). Same id at parse, edit, and render: no sentinel.
+    // Only the FILE's top-level group may be anonymous (it's the file's single
+    // interface); a NESTED `Group(){}` with no name has no source to take an id
+    // from, so reject it loudly rather than silently inventing `{source_id}.{source_id}`.
+    let anonymous = local_id.is_empty();
+    if anonymous && parent.is_some() {
+        errors.push(CompileError::at(header_span, "a nested group must be named (`name = Group(...)`); only a file's top-level group may be anonymous"));
+        return None;
+    }
+    let local_id = if anonymous { source_id.to_string() } else { local_id };
+    let id = scoped(parent, &local_id);
+    let (in_ports, out_ports, mut one_of_required) = lower_header_ports(g.syntax(), header.syntax(), li, errors);
+
+    let mut group = ParsedGroup {
+        id: id.clone(),
+        in_ports,
+        out_ports,
+        one_of_required: Vec::new(),
+        nodes: Vec::new(),
+        connections: Vec::new(),
+        child_groups: Vec::new(),
+        anonymous,
+        includes: Vec::new(),
+        span: Some(li.span_of(g.syntax())),
+        header_span: Some(li.span_of(header.syntax())),
+    };
+
+    if let Some(body) = g.body() {
+        let mut inline = InlineScope::default();
+        // Defer connections so child nodes exist first: a `child.field = <lit>`
+        // connection is a config-origin field on that child, not an edge.
+        let mut conn_nodes: Vec<crate::cst::SyntaxNode> = Vec::new();
+        for child in body.syntax().children() {
+            match child.kind() {
+                K::CONNECTION => conn_nodes.push(child.clone()),
+                K::NODE_DECL => {
+                    if let Some(cd) = CstDecl::cast(child.clone()) {
+                        if let CstDecl::Node(nd) = &cd {
+                            if let Some(node) = lower_node(nd, Some(&id), li, &mut inline, errors) {
+                                if group.has_member_id(&node.id) {
+                                    errors.push(CompileError::at(dup_span(node.header_span, node.span), format!("Duplicate id '{}'", node.id)));
+                                }
+                                group.nodes.push(node);
+                            }
+                        }
+                    }
+                }
+                K::GROUP_DECL => {
+                    if let Some(CstDecl::Group(cg)) = CstDecl::cast(child.clone()) {
+                        if let Some(child_group) = lower_group(&cg, Some(&id), source_id, li, errors) {
+                            if group.has_member_id(&child_group.id) {
+                                errors.push(CompileError::at(dup_span(child_group.header_span, child_group.span), format!("Duplicate id '{}'", child_group.id)));
+                            }
+                            group.child_groups.push(child_group);
+                        }
+                    }
+                }
+                K::INCLUDE_DECL => {
+                    if let Some(CstDecl::Include(ci)) = CstDecl::cast(child.clone()) {
+                        if let Some(inc) = lower_include(&ci, Some(&id), li, errors) {
+                            // Nodes, child groups, and include aliases share one
+                            // id namespace within the group: an alias colliding
+                            // with a sibling is a duplicate (parity with the
+                            // node/group arms above).
+                            if group.has_member_id(&inc.alias) {
+                                errors.push(CompileError::at(inc.span, format!("Duplicate id '{}'", inc.alias)));
+                            }
+                            group.includes.push(inc);
+                        }
+                    }
+                }
+                K::DIRECTIVE => {
+                    // @require_one_of directly in the group body.
+                    if let Some(grp) = lower_directive_require_one_of(&child, li, errors) {
+                        one_of_required.push(grp);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Scope the inline-expr anon node ids into THIS group (`b__field` ->
+        // `g.b__field`), then merge. Inline nodes are synthesized with RAW ids so
+        // their ids and their edge endpoints are scoped together below (one pass),
+        // which is what keeps a child that shadows the group's name from being
+        // double-scoped. `prefix_node_ids` is the ONE place anon ids get scoped.
+        prefix_node_ids(&mut inline.nodes, &id);
+        merge_inline_nodes(&mut group.nodes, inline.nodes, errors);
+        group.connections.extend(inline.connections);
+
+        // Process deferred connections: `child.field = <literal>` is a config-
+        // origin field on that local child node; everything else is an edge. A
+        // literal to a non-child target is an edge (it may reference an outer or
+        // boundary scope, validated downstream), so a missing local target is
+        // not an error here.
+        // A connection-RHS inline expr (`child.in = T{...}.out`) synthesizes its
+        // own anon node + edge into this scratch scope, merged below.
+        let mut conn_inline = InlineScope::default();
+        for cn in conn_nodes {
+            let fill = literal_config_fill(&cn, li)
+                .and_then(|f| group.nodes.iter_mut().find(|n| local_of(&n.id) == f.target_id).map(|n| (f, n)));
+            match fill {
+                Some((f, node)) => apply_literal_fill(&f, &mut node.config, &mut node.config_spans, errors),
+                None => {
+                    if let Some(c) = lower_connection(&cn, Some(&id), li, &mut conn_inline, errors) {
+                        group.connections.push(c);
+                    }
+                }
+            }
+        }
+        prefix_node_ids(&mut conn_inline.nodes, &id);
+        merge_inline_nodes(&mut group.nodes, conn_inline.nodes, errors);
+        group.connections.extend(conn_inline.connections);
+
+        // Rescope group-internal connection ENDPOINTS (the node ids were just
+        // scoped by `prefix_node_ids`): `self` -> the group's `__in`/`__out`
+        // boundary; a LOCAL-child ref -> `{group}.child` (this also re-prefixes a
+        // raw anon endpoint like `b__in` to `g.b__in`, matching its node);
+        // anything else is an outer/root ref, left as-is. flatten then rewires
+        // passthroughs.
+        let local_children: std::collections::HashSet<String> = group
+            .nodes
+            .iter()
+            .map(|n| local_of(&n.id))
+            .chain(group.child_groups.iter().map(|g| local_of(&g.id)))
+            .chain(group.includes.iter().map(|x| local_of(&x.alias)))
+            .collect();
+        for conn in &mut group.connections {
+            conn.source_id = rescope_endpoint(&conn.source_id, &id, &local_children, true);
+            conn.target_id = rescope_endpoint(&conn.target_id, &id, &local_children, false);
+        }
+    }
+    group.one_of_required = one_of_required;
+    Some(group)
+}
+
+/// The local (last `.`-segment) id of a possibly-scoped id.
+fn local_of(id: &str) -> String {
+    id.rsplit('.').next().unwrap_or(id).to_string()
+}
+
+/// Prefix each synthesized inline-expr node's RAW id with the enclosing group id
+/// (`b__field` -> `g.b__field`). The ONE place anon node ids get scoped, so they
+/// match the edge endpoints `rescope_endpoint` produces from the same raw form,
+/// and a child that shadows the group's name can't double-scope.
+fn prefix_node_ids(nodes: &mut [ParsedNode], group_id: &str) {
+    for n in nodes {
+        n.id = scoped(Some(group_id), &n.id);
+    }
+}
+
+/// Rescope a group-internal connection endpoint id. `self` becomes the group's
+/// boundary passthrough (`__in` for a source, `__out` for a target); a local
+/// child ref (by its head segment) is prefixed with the group id; an outer ref
+/// is left unchanged.
+fn rescope_endpoint(
+    endpoint: &str,
+    group_id: &str,
+    local_children: &std::collections::HashSet<String>,
+    is_source: bool,
+) -> String {
+    if endpoint == "self" {
+        return format!("{group_id}__{}", if is_source { "in" } else { "out" });
+    }
+    let head = endpoint.split('.').next().unwrap_or(endpoint);
+    if local_children.contains(head) {
+        format!("{group_id}.{endpoint}")
+    } else {
+        endpoint.to_string()
+    }
+}
+
+/// Lower an INCLUDE_DECL into a ParsedInclude marker.
+fn lower_include(
+    i: &crate::cst::nodes::IncludeDecl,
+    parent: Option<&str>,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) -> Option<ParsedInclude> {
+    use crate::cst::SyntaxKind as K;
+    // alias = leading IDENT; path from the MARKER's @include("...") arg.
+    let alias_local = i
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == K::IDENT)
+        .map(|t| t.text().to_string())?;
+    // The alias is a user-written name in the same id namespace as nodes/groups;
+    // reject a reserved one (`__`, `self`, type keyword) loudly via the shared gate.
+    if !reject_reserved_local(&alias_local, li.span_of(i.syntax()), errors) {
+        return None;
+    }
+    let marker = i
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == K::MARKER)?;
+    if crate::cst::marker::directive(marker.text()) != "include" {
+        return None;
+    }
+    // `parse_include_arg` parses the `("path")` arg form; pass the marker's
+    // parenthesized body (the single home for marker-arg extraction).
+    let after = format!("({})", crate::cst::marker::args_raw(marker.text())?);
+    let path = parse_include_arg(&after).ok()?;
+    Some(ParsedInclude {
+        alias: scoped(parent, &alias_local),
+        path,
+        span: li.span_of(i.syntax()),
+    })
+}
+
+/// Scoped id: `parent.local` inside a group, bare local at top level.
+fn scoped(parent: Option<&str>, local: &str) -> String {
+    match parent {
+        Some(p) => format!("{p}.{local}"),
+        None => local.to_string(),
+    }
+}
+
+// ─── Lowering value/id helpers ──────────────────────────────────────────────
+// Pure text helpers used by the CST lowering: port-decl text -> ParsedPort,
+// include-arg parsing, scoped-id rescoping for includes, scalar value parsing,
+// string unquote/unescape, heredoc dedent. (Not parsers; the CST parser owns
+// all tokenization. These operate on already-tokenized fragments' text.)
 
 /// Parse a single port declaration.
 /// Port declaration syntax: `name: Type` (required by default) or
@@ -1677,763 +1853,8 @@ fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
     })
 }
 
-// ─── Group Body Parsing ─────────────────────────────────────────────────────
-
-/// Parse a group body: everything between `{` and `}`.
-/// Contains child nodes, connections, nested groups, and comments.
-/// The first contiguous block of `#` comments is the group description.
-/// Pre-scan a group body (starting at the line AFTER the group declaration
-/// header) and collect the local-scope identifiers: every `id = Type ...`
-/// or `id = Group ...` top-level declaration inside the body, until the
-/// matching closing `}`. Brace-depth aware so nested blocks don't
-/// contribute false positives.
-fn collect_local_child_ids(lines: &[&str], start: usize, _group_id: &str) -> std::collections::HashSet<String> {
-    let mut ids = std::collections::HashSet::new();
-    let mut depth: i32 = 0;
-    // We're already past the group's opening `{`, so depth starts at 0
-    // relative to the body's top level. The first line is start + 1
-    // (start is the declaration line).
-    let mut i = start + 1;
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-
-        // Closing `}` at depth 0 ends the group body.
-        // (Track depth FIRST so we see the close before advancing.)
-        if depth == 0 && (trimmed == "}" || trimmed.starts_with("} ")) {
-            break;
-        }
-
-        // Top-level declaration pattern at depth 0: `id = Type...`.
-        if depth == 0 {
-            if let Some(eq_pos) = trimmed.find('=') {
-                let left = trimmed[..eq_pos].trim();
-                let right = trimmed[eq_pos + 1..].trim();
-                // Must be a bare identifier on the left and uppercase
-                // type name on the right. Dotted left means it's a
-                // connection, not a declaration.
-                if !left.is_empty()
-                    && !left.contains('.')
-                    && left.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && left.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
-                    && right.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
-                {
-                    ids.insert(left.to_string());
-                }
-            }
-        }
-
-        // Track brace depth (respecting quotes, but not tracking
-        // triple-backtick state here since we only care about top-level
-        // identifiers and triple-backtick bodies don't introduce new
-        // declarations at the outer level).
-        let mut in_string: Option<char> = None;
-        let mut escape = false;
-        for c in trimmed.chars() {
-            if escape { escape = false; continue; }
-            if let Some(q) = in_string {
-                if c == '\\' { escape = true; }
-                else if c == q { in_string = None; }
-                continue;
-            }
-            if c == '"' || c == '\'' { in_string = Some(c); continue; }
-            if c == '{' { depth += 1; }
-            if c == '}' { depth -= 1; }
-        }
-
-        i += 1;
-    }
-    ids
-}
-
-/// Check if a source/target identifier refers to something local to the
-/// current group scope. A reference is local if:
-///   - it IS one of the declared child ids
-///   - OR it's an anon inline child id `{localId}__{field}` where `localId`
-///     is a declared child
-///   - OR it starts with `self__` (anon generated from `self.field = Type{}.port`
-///     where the parent is the group itself)
-/// Anything else is an external reference (root or outer scope) and stays
-/// unprefixed.
-fn is_local_ref(id: &str, local_children: &std::collections::HashSet<String>) -> bool {
-    if local_children.contains(id) { return true; }
-    if let Some(idx) = id.find("__") {
-        let head = &id[..idx];
-        if head == "self" { return true; }
-        if local_children.contains(head) { return true; }
-    }
-    false
-}
-
-fn parse_group_body(
-    lines: &[&str],
-    start: usize,
-    group_id: &str,
-    in_ports: Vec<ParsedPort>,
-    out_ports: Vec<ParsedPort>,
-    one_of_required: Vec<Vec<String>>,
-    errors: &mut Vec<CompileError>,
-) -> (ParsedGroup, usize) {
-    let mut group = ParsedGroup {
-        id: group_id.to_string(),
-        in_ports,
-        out_ports,
-        one_of_required,
-        nodes: Vec::new(),
-        connections: Vec::new(),
-        child_groups: Vec::new(),
-        anonymous: group_id == INCLUDE_ROOT_ID,
-        includes: Vec::new(),
-        // The caller overrides these once the header/body extents are
-        // fully known.
-        span: None,
-        header_span: None,
-    };
-
-    // Pre-scan the group body to collect the set of local child ids. Used
-    // when rescoping port-wiring connections emitted from inline bodies:
-    // if the source or target of such a connection refers to a local child,
-    // we prefix with `{group_id}.`; otherwise the reference is to an outer
-    // scope (root, a parent group) and stays unprefixed. Without this
-    // pre-scan we'd blindly prefix everything and turn `src.value` (root
-    // node) into `grp.src.value` (nonexistent).
-    let local_child_ids = collect_local_child_ids(lines, start, group_id);
-
-    let mut i = start + 1; // skip the declaration line
-
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
-        let line_num = i + 1;
-
-        // Empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            i += 1;
-            continue;
-        }
-
-        // Closing brace ends the group (optionally followed by -> (post-config outputs))
-        if trimmed == "}" || trimmed.starts_with("} ->") {
-            if trimmed.starts_with("} ->") {
-                // Post-config output ports on the group: } -> (outputs)
-                let arrow_rest = trimmed[4..].trim();
-                let mut out_sig = arrow_rest.to_string();
-                let mut out_end = i;
-                let mut paren_depth: i32 = 0;
-                for c in out_sig.chars() { if c == '(' { paren_depth += 1; } if c == ')' { paren_depth -= 1; } }
-                while paren_depth > 0 && out_end + 1 < lines.len() {
-                    out_end += 1;
-                    let ol = lines[out_end].trim();
-                    out_sig.push(' ');
-                    out_sig.push_str(ol);
-                    for c in ol.chars() { if c == '(' { paren_depth += 1; } if c == ')' { paren_depth -= 1; } }
-                }
-                if out_sig.starts_with('(') {
-                    if let Some((content, _rest)) = find_matching_paren(&out_sig) {
-                        let existing_names: std::collections::HashSet<String> = group.out_ports.iter().map(|p| p.name.clone()).collect();
-                        let mut post_ports = Vec::new();
-                        let mut post_oor = Vec::new();
-                        parse_port_list(&content, &mut post_ports, &mut post_oor, "out", line_num, errors);
-                        for p in post_ports {
-                            if existing_names.contains(&p.name) {
-                                errors.push(CompileError { line: line_num, message: format!("Duplicate output port '{}' on group '{}'", p.name, group_id) });
-                            } else {
-                                group.out_ports.push(p);
-                            }
-                        }
-                    }
-                }
-                return (group, out_end + 1);
-            }
-            // Check if next non-blank line starts with -> (post-config outputs on separate line)
-            let mut peek = i + 1;
-            while peek < lines.len() && lines[peek].trim().is_empty() { peek += 1; }
-            if peek < lines.len() && lines[peek].trim().starts_with("->") {
-                let arrow_rest = lines[peek].trim().strip_prefix("->").unwrap().trim();
-                let mut out_sig = arrow_rest.to_string();
-                let mut out_end = peek;
-                let mut paren_depth: i32 = 0;
-                for c in out_sig.chars() { if c == '(' { paren_depth += 1; } if c == ')' { paren_depth -= 1; } }
-                while paren_depth > 0 && out_end + 1 < lines.len() {
-                    out_end += 1;
-                    let ol = lines[out_end].trim();
-                    out_sig.push(' ');
-                    out_sig.push_str(ol);
-                    for c in ol.chars() { if c == '(' { paren_depth += 1; } if c == ')' { paren_depth -= 1; } }
-                }
-                if out_sig.starts_with('(') {
-                    if let Some((content, _rest)) = find_matching_paren(&out_sig) {
-                        let existing_names: std::collections::HashSet<String> = group.out_ports.iter().map(|p| p.name.clone()).collect();
-                        let mut post_ports = Vec::new();
-                        let mut post_oor = Vec::new();
-                        parse_port_list(&content, &mut post_ports, &mut post_oor, "out", line_num, errors);
-                        for p in post_ports {
-                            if existing_names.contains(&p.name) {
-                                errors.push(CompileError { line: line_num, message: format!("Duplicate output port '{}' on group '{}'", p.name, group_id) });
-                            } else {
-                                group.out_ports.push(p);
-                            }
-                        }
-                    }
-                }
-                return (group, out_end + 1);
-            }
-            return (group, i + 1);
-        }
-
-        // Child declaration: node or nested group
-        let mut child_inline_scope = InlineScope::default();
-        if let Some((result, next_i)) = try_parse_declaration(&lines, i, errors, &mut child_inline_scope) {
-            match result {
-                Declaration::Node(mut node) => {
-                    let local_id = node.id.clone();
-                    node.id = format!("{}.{}", group_id, local_id);
-                    node.parent_id = Some(group_id.to_string());
-                    if group.has_member_id(&node.id) {
-                        errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}' in group '{}'", local_id, group_id) });
-                    }
-                    group.nodes.push(node);
-                }
-                Declaration::Group(mut child_group) => {
-                    let local_id = child_group.id.clone();
-                    let scoped_id = format!("{}.{}", group_id, local_id);
-                    // Rescope all internal IDs
-                    rescope_group(&mut child_group, &local_id, &scoped_id);
-                    child_group.id = scoped_id.clone();
-                    if group.has_member_id(&child_group.id) {
-                        errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}' in group '{}'", local_id, group_id) });
-                    }
-                    group.child_groups.push(child_group);
-                }
-                Declaration::Include(mut inc) => {
-                    // Nested include inside a group body. Scope the alias under
-                    // the group; the include pass resolves it relative to the
-                    // group's own file when it walks this group's includes.
-                    let local_alias = inc.alias.clone();
-                    inc.alias = format!("{}.{}", group_id, local_alias);
-                    if group.has_member_id(&inc.alias) {
-                        errors.push(CompileError { line: line_num, message: format!("Duplicate id '{}' in group '{}'", local_alias, group_id) });
-                    }
-                    group.includes.push(inc);
-                }
-            }
-            // Merge inline children generated by this declaration. The anon
-            // IDs are already `{parent_local_id}__{field}` form; we prefix
-            // them with the group scope (e.g. `per_lead.email_writer__prompt`)
-            // and set parentId so they participate in the group's scope.
-            for mut child in child_inline_scope.nodes {
-                let local_id = child.id.clone();
-                child.id = format!("{}.{}", group_id, local_id);
-                child.parent_id = Some(group_id.to_string());
-                if group.nodes.iter().any(|n| n.id == child.id) {
-                    errors.push(CompileError { line: line_num, message: format!("Duplicate node ID '{}' in group '{}' (generated from inline expression)", local_id, group_id) });
-                }
-                group.nodes.push(child);
-            }
-            // Rescope the inline connections too. Three distinct cases per
-            // endpoint:
-            //   - "self"               → group In / Out passthrough
-            //   - matches a local child id (or is an anon id generated from
-            //     inline expressions, which always starts with one) → prefix
-            //     with `{group_id}.`
-            //   - anything else        → external reference (root / outer
-            //     scope), leave unprefixed
-            for mut conn in child_inline_scope.connections {
-                if conn.source_id == "self" {
-                    conn.source_id = format!("{}__in", group_id);
-                } else if is_local_ref(&conn.source_id, &local_child_ids) {
-                    conn.source_id = format!("{}.{}", group_id, conn.source_id);
-                }
-                if conn.target_id == "self" {
-                    conn.target_id = format!("{}__out", group_id);
-                } else if is_local_ref(&conn.target_id, &local_child_ids) {
-                    conn.target_id = format!("{}.{}", group_id, conn.target_id);
-                }
-                group.connections.push(conn);
-            }
-            i = next_i;
-            continue;
-        }
-
-        // Connection: target.port = source.port (with self support, inline RHS, and literal config fill)
-        let mut conn_scope = InlineScope::default();
-        match try_parse_group_connection_with_inline(&lines, i, line_num, group_id, errors, &mut conn_scope) {
-            ParseConnectionResult::Edge(conn, next_i) => {
-                group.connections.push(conn);
-                for mut child in conn_scope.nodes {
-                    let local_id = child.id.clone();
-                    child.id = format!("{}.{}", group_id, local_id);
-                    child.parent_id = Some(group_id.to_string());
-                    if group.nodes.iter().any(|n| n.id == child.id) {
-                        errors.push(CompileError { line: line_num, message: format!("Duplicate node ID '{}' in group '{}' (generated from inline expression)", local_id, group_id) });
-                    }
-                    group.nodes.push(child);
-                }
-                for mut conn in conn_scope.connections {
-                    if conn.source_id == "self" {
-                        conn.source_id = format!("{}__in", group_id);
-                    } else if is_local_ref(&conn.source_id, &local_child_ids) {
-                        conn.source_id = format!("{}.{}", group_id, conn.source_id);
-                    }
-                    if conn.target_id == "self" {
-                        conn.target_id = format!("{}__out", group_id);
-                    } else if is_local_ref(&conn.target_id, &local_child_ids) {
-                        conn.target_id = format!("{}.{}", group_id, conn.target_id);
-                    }
-                    group.connections.push(conn);
-                }
-                for fill in conn_scope.config_fills {
-                    apply_config_fill(&mut group.nodes, fill);
-                }
-                i = next_i;
-                continue;
-            }
-            ParseConnectionResult::ConfigFill(next_i) => {
-                for fill in conn_scope.config_fills {
-                    apply_config_fill(&mut group.nodes, fill);
-                }
-                i = next_i;
-                continue;
-            }
-            ParseConnectionResult::NotAConnection => {}
-        }
-
-        errors.push(CompileError { line: line_num, message: format!("Unexpected in group '{}': {}", group_id, trimmed) });
-        i += 1;
-    }
-
-    errors.push(CompileError { line: start + 1, message: format!("Unclosed group '{}'", group_id) });
-    (group, i)
-}
-
-/// Rescope all internal IDs in a group from local_id prefix to scoped_id prefix.
-fn rescope_group(group: &mut ParsedGroup, _local_id: &str, scoped_id: &str) {
-    // Rescope internal nodes
-    for node in &mut group.nodes {
-        // Node IDs are already local_id.node_name from the inner parse, need to become scoped_id.node_name
-        // Actually, when parse_group_body parsed the child group, it didn't scope yet.
-        // The child group's nodes have IDs relative to the child group's local ID.
-        // We need to prefix them with the parent scope.
-        let old_prefix = format!("{}.", group.id);
-        if node.id.starts_with(&old_prefix) {
-            node.id = format!("{}.{}", scoped_id, &node.id[old_prefix.len()..]);
-        } else {
-            node.id = format!("{}.{}", scoped_id, node.id);
-        }
-        node.parent_id = Some(scoped_id.to_string());
-    }
-    // Rescope connections
-    for conn in &mut group.connections {
-        rescope_id(&mut conn.source_id, &group.id, scoped_id);
-        rescope_id(&mut conn.target_id, &group.id, scoped_id);
-    }
-    // Rescope child groups recursively
-    for child in &mut group.child_groups {
-        let old_child_id = child.id.clone();
-        let new_child_id = if old_child_id.starts_with(&format!("{}.", group.id)) {
-            format!("{}.{}", scoped_id, &old_child_id[group.id.len() + 1..])
-        } else {
-            format!("{}.{}", scoped_id, old_child_id)
-        };
-        rescope_group(child, &old_child_id, &new_child_id);
-        child.id = new_child_id;
-    }
-    // Update the group's own ID (caller does this, but we need connections to reference it)
-}
-
-fn rescope_id(id: &mut String, old_prefix: &str, new_prefix: &str) {
-    let old_in = format!("{}__in", old_prefix);
-    let old_out = format!("{}__out", old_prefix);
-    if *id == old_in {
-        *id = format!("{}__in", new_prefix);
-    } else if *id == old_out {
-        *id = format!("{}__out", new_prefix);
-    } else if id.starts_with(&format!("{}.", old_prefix)) {
-        *id = format!("{}.{}", new_prefix, &id[old_prefix.len() + 1..]);
-    }
-}
-
 // ─── Config Block Parsing ───────────────────────────────────────────────────
 
-/// Parse a multi-line config block (inside `{ ... }`).
-/// Returns (config, label, extra_in_ports, extra_out_ports, one_of_required, next_line_index).
-///
-/// Shared by regular node declarations and inline expression bodies. All
-/// three value forms work in both contexts:
-///   - literals (quoted string, number, bool, JSON, triple-backtick)
-///   - port wirings: `key: source.port` emits an edge targeting parent.key
-///   - inline expressions: `key: Type { ... }.port` or bare `Type.port`
-/// Per-config-field source spans keyed by field name, with the inline /
-/// connection-line origin the editor needs to rewrite a field in place.
-type ConfigSpanMap = std::collections::BTreeMap<String, ConfigFieldSpan>;
-
-/// Span for a config field that runs from its `key:` line (1-based
-/// `start_line`) through the last consumed line. The loop tracks the next
-/// line index `next` (0-based, one past the last consumed line); the last
-/// consumed line is `next - 1` 0-based, i.e. line number `next` 1-based. The
-/// editor splices whole lines for a multi-line field, so columns are
-/// whole-line (0 .. last line length).
-fn multi_line_span(lines: &[&str], start_line: usize, next: usize) -> Span {
-    let end_line = next; // 1-based line number of the last consumed line
-    let end_col = lines.get(end_line.saturating_sub(1)).map_or(0, |l| l.len());
-    Span { start_line, start_col: 0, end_line, end_col }
-}
-
-fn parse_config_block(
-    lines: &[&str],
-    start: usize,
-    base_line: usize,
-    errors: &mut Vec<CompileError>,
-    parent_id: &str,
-    inline_scope: &mut InlineScope,
-) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, ConfigSpanMap) {
-    let (cfg, lbl, ins, outs, oor, end_i, _close_line, spans) = parse_config_block_inner(lines, start, base_line, errors, parent_id, inline_scope);
-    (cfg, lbl, ins, outs, oor, end_i, spans)
-}
-
-/// Variant of parse_config_block that also returns the 0-based index of
-/// the line containing the closing `}` for the block. Callers that need
-/// to disambiguate "close brace standalone on its own line" from "close
-/// brace followed by `.port` or `->`" (the inline expression parser) use
-/// this to avoid mis-attributing an earlier bare `}` from multi-line JSON
-/// inside the body.
-fn parse_config_block_with_close(
-    lines: &[&str],
-    start: usize,
-    base_line: usize,
-    errors: &mut Vec<CompileError>,
-    parent_id: &str,
-    inline_scope: &mut InlineScope,
-) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, usize, ConfigSpanMap) {
-    parse_config_block_inner(lines, start, base_line, errors, parent_id, inline_scope)
-}
-
-fn parse_config_block_inner(
-    lines: &[&str],
-    start: usize,
-    base_line: usize,
-    errors: &mut Vec<CompileError>,
-    parent_id: &str,
-    inline_scope: &mut InlineScope,
-) -> (serde_json::Map<String, serde_json::Value>, Option<String>, Vec<ParsedPort>, Vec<ParsedPort>, Vec<Vec<String>>, usize, usize, ConfigSpanMap) {
-    let mut config = serde_json::Map::new();
-    let mut label = None;
-    let in_ports = Vec::new();
-    let out_ports = Vec::new();
-    let mut one_of_required = Vec::new();
-    // Per-field source spans, origin Inline (this block IS an inline body).
-    let mut config_spans: ConfigSpanMap = Default::default();
-
-    let mut i = start + 1;
-    while i < lines.len() {
-        let inner = lines[i].trim();
-        let line_num = i + 1;
-
-        if inner == "}" || inner.starts_with("} ") || inner.starts_with("}->") || inner.starts_with("}.") {
-            // The closing `}` may be followed by `-> (outputs)` or `.port`.
-            // Return the close line index so the caller doesn't need to
-            // reverse-engineer it from the body contents (which can include
-            // multi-line JSON with its own standalone `}` lines).
-            let close_line = i;
-            if inner == "}" {
-                return (config, label, in_ports, out_ports, one_of_required, i + 1, close_line, config_spans);
-            } else {
-                return (config, label, in_ports, out_ports, one_of_required, i, close_line, config_spans);
-            }
-        }
-        if inner.is_empty() || inner.starts_with('#') {
-            i += 1;
-            continue;
-        }
-
-        // @require_one_of inside config block
-        if let Some(rest) = inner.strip_prefix("@require_one_of(") {
-            if let Some(body) = rest.strip_suffix(')') {
-                let group: Vec<String> = body.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !group.is_empty() {
-                    one_of_required.push(group);
-                }
-            } else {
-                errors.push(CompileError { line: line_num, message: "@require_one_of missing closing parenthesis".to_string() });
-            }
-            i += 1;
-            continue;
-        }
-
-
-        // Triple-backtick multiline: `key: ``` ... ```` (the space after `:`
-        // is optional, and whitespace around the colon is also allowed).
-        // We detect by searching for the colon and then the first `` ``` ``
-        // after any whitespace, so all of the following forms parse:
-        //   key: ```content```
-        //   key:```content```
-        //   key  :  ```content```
-        if let Some(bt_match) = inner.find("```").and_then(|bt| {
-            // Find the colon before the backticks.
-            let before_bt = &inner[..bt];
-            let colon = before_bt.rfind(':')?;
-            let key = inner[..colon].trim();
-            // Key must be a bare identifier.
-            if key.is_empty() { return None; }
-            let first = key.chars().next()?;
-            if !first.is_ascii_alphabetic() && first != '_' { return None; }
-            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return None; }
-            // Between colon and `` ``` `` must be only whitespace.
-            let between = &inner[colon + 1..bt];
-            if !between.chars().all(|c| c.is_whitespace()) { return None; }
-            Some((key, bt))
-        }) {
-            let (key, bt_pos) = bt_match;
-            let key = key.to_string();
-            let after = &inner[bt_pos + 3..]; // after the opening `` ``` ``
-
-            // Check for inline form: key: ```content```
-            if after.ends_with("```") && after.len() > 3 {
-                let inline_val = &after[..after.len() - 3];
-                if let Some(k) = store_config_value(&key, inline_val, &mut config, line_num, errors) {
-                    config_spans.insert(k, ConfigFieldSpan::inline(Span::single_line(line_num, 0, lines[i].len())));
-                }
-                i += 1;
-                continue;
-            }
-
-            // Multi-line: collect until closing ```.
-            let (value, next) = collect_heredoc_value(lines, i + 1, after);
-            if let Some(k) = store_config_value(&key, &value, &mut config, line_num, errors) {
-                config_spans.insert(k, ConfigFieldSpan::inline(multi_line_span(lines, line_num, next)));
-            }
-            i = next;
-            continue;
-        }
-
-        // Multi-line JSON: key: [ ... ] or key: { ... } spanning multiple lines
-        if let Some(colon_pos) = inner.find(':') {
-            let key = inner[..colon_pos].trim();
-            let val_start = inner[colon_pos + 1..].trim();
-            if let Some((collected, balanced, next)) = collect_multiline_json(lines, i + 1, i, val_start) {
-                if !balanced {
-                    errors.push(CompileError { line: line_num, message: format!("Broken JSON for '{}': brackets not balanced", key) });
-                }
-                if let Some(k) = store_config_value(key, &collected, &mut config, line_num, errors) {
-                    config_spans.insert(k, ConfigFieldSpan::inline(multi_line_span(lines, line_num, next)));
-                }
-                i = next;
-                continue;
-            }
-        }
-
-        // Inline expression: `key: Type ...` where the value is a node
-        // literal. Detect by checking if the value part (after `:`) starts
-        // with an uppercase identifier followed by `(`, `{`, `->`, or `.`.
-        // Must run BEFORE port wiring because the bare form `Type.port`
-        // would otherwise look like a dotted ref. Validation that `key` is
-        // a configurable input port happens at enrichment time.
-        if let Some(colon_pos) = inner.find(':') {
-            let key = inner[..colon_pos].trim();
-            let val_start = inner[colon_pos + 1..].trim();
-            if looks_like_inline_start(val_start) && is_valid_config_key(key) {
-                let raw_line = lines[i];
-                let raw_colon = raw_line.find(':').unwrap_or(colon_pos);
-                let start_col = raw_colon + 1;
-                match try_parse_inline_expression(
-                    lines, i, start_col, parent_id, key, inline_scope, errors,
-                ) {
-                    Some(next_i) => {
-                        i = next_i;
-                        continue;
-                    }
-                    None => {
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Port wiring: `key: source.port` where source.port is an unquoted
-        // dotted identifier. Emits an edge into inline_scope targeting
-        // parent_id.key and skips storing the value in config. Works in
-        // BOTH inline-expression bodies and regular node declaration
-        // bodies, so `greeting = Template { template: src.value }` wires
-        // src.value into greeting.template without a separate connection
-        // line. Enrichment validates that `key` is a real input port on
-        // the parent node; if not, the edge targets a nonexistent port
-        // and enrichment errors.
-        if let Some(colon_pos) = inner.find(':') {
-            let key = inner[..colon_pos].trim();
-            let val_start = inner[colon_pos + 1..].trim();
-            if is_valid_config_key(key) && looks_like_dotted_ref(val_start) {
-                if let Some((src_id, src_port)) = parse_dotted(val_start) {
-                    inline_scope.connections.push(ParsedConnection {
-                        source_id: src_id,
-                        source_port: src_port,
-                        target_id: parent_id.to_string(),
-                        target_port: key.to_string(),
-                        span: Some(Span::single_line(line_num, 0, lines[i].len())),
-                    });
-                    i += 1;
-                    continue;
-                }
-            }
-        }
-
-        // label: "value"
-        if let Some(l) = try_extract_label(inner) {
-            label = Some(l);
-            // Record a span for the label line so the editor can locate it to
-            // rewrite/remove, even though the value is promoted to node.label.
-            config_spans.insert("_label".to_string(), ConfigFieldSpan::inline(Span::single_line(line_num, 0, lines[i].len())));
-            i += 1;
-            continue;
-        }
-
-        // key: value
-        if let Some(k) = parse_kv(inner, &mut config, line_num, errors) {
-            config_spans.insert(k, ConfigFieldSpan::inline(Span::single_line(line_num, 0, lines[i].len())));
-        }
-        i += 1;
-    }
-
-    errors.push(CompileError { line: base_line, message: "Unclosed config block".to_string() });
-    // No matching `}` found; use `i` as a sentinel close_line (out of range).
-    (config, label, in_ports, out_ports, one_of_required, i, i, config_spans)
-}
-
-/// Collect a multi-line triple-backtick heredoc value starting after the
-/// opening `` ``` ``. `initial_after_bt` is whatever text appeared on the
-/// same line after the opening backticks. Lines are read from
-/// `lines[start_line..]`. Returns `(unescaped_value, next_line_index)`.
-fn collect_heredoc_value(lines: &[&str], start_line: usize, initial_after_bt: &str) -> (String, usize) {
-    let mut value = initial_after_bt.to_string();
-    let mut i = start_line;
-    while i < lines.len() {
-        let ml_trimmed = lines[i].trim();
-        let closes_bare = ml_trimmed == "```";
-        let closes_suffix = !closes_bare
-            && ml_trimmed.ends_with("```")
-            && !ml_trimmed[..ml_trimmed.len() - 3].ends_with('\\');
-        if closes_bare || closes_suffix {
-            let before_close = if closes_bare {
-                ""
-            } else {
-                &ml_trimmed[..ml_trimmed.len() - 3]
-            };
-            if !before_close.is_empty() {
-                if !value.is_empty() { value.push('\n'); }
-                value.push_str(before_close);
-            }
-            i += 1;
-            break;
-        }
-        if !value.is_empty() { value.push('\n'); }
-        value.push_str(lines[i]);
-        i += 1;
-    }
-    let value = dedent(&value);
-    let value = value.replace("\\```", "```").replace("\\`", "`");
-    (value, i)
-}
-
-/// Collect a multi-line JSON value (object or array) with brace-depth
-/// tracking. `initial_value` is the first chunk (e.g. `[` or `{"key":`).
-/// Lines are read from `lines[start_line..]`. `origin_line` is the line
-/// index where the JSON key lives (used for the 500-line safety limit).
-/// Returns `Some((collected_raw_string, is_balanced, next_line_index))`
-/// if `initial_value` starts with `[` or `{` and is not already balanced,
-/// or `None` otherwise.
-fn collect_multiline_json(lines: &[&str], start_line: usize, origin_line: usize, initial_value: &str) -> Option<(String, bool, usize)> {
-    if !(initial_value.starts_with('[') || initial_value.starts_with('{')) || is_json_balanced(initial_value) {
-        return None;
-    }
-    let mut depth: i32 = 0;
-    let mut collected = initial_value.to_string();
-    for c in initial_value.bytes() {
-        if c == b'[' || c == b'{' { depth += 1; }
-        if c == b']' || c == b'}' { depth -= 1; }
-    }
-    let mut i = start_line;
-    let mut hit_boundary = false;
-    while i < lines.len() && depth > 0 {
-        let ml = lines[i].trim();
-        if i - origin_line > 500 { hit_boundary = true; break; }
-        if !looks_like_json(ml) { hit_boundary = true; break; }
-        collected.push('\n');
-        collected.push_str(ml);
-        for c in ml.bytes() {
-            if c == b'[' || c == b'{' { depth += 1; }
-            if c == b']' || c == b'}' { depth -= 1; }
-        }
-        if depth <= 0 { i += 1; break; }
-        i += 1;
-    }
-    let balanced = depth <= 0 && !hit_boundary;
-    Some((collected, balanced, i))
-}
-
-/// Check if a line looks like JSON content (not Weft syntax).
-fn looks_like_json(line: &str) -> bool {
-    use std::sync::OnceLock;
-    static RE_CONN: OnceLock<regex::Regex> = OnceLock::new();
-    static RE_DECL: OnceLock<regex::Regex> = OnceLock::new();
-
-    if line.is_empty() { return true; } // blank lines OK inside JSON
-    // Connections: x.y = z.w
-    if line.contains('.') && line.contains('=') && !line.starts_with('"') {
-        let re = RE_CONN.get_or_init(|| regex::Regex::new(r"^[a-zA-Z_]\w*\.\w+\s*=").unwrap());
-        if re.is_match(line) { return false; }
-    }
-    // Declarations: id = Type
-    if line.contains('=') && !line.starts_with('"') {
-        let re = RE_DECL.get_or_init(|| regex::Regex::new(r"^[a-zA-Z_]\w*\s*=\s*[A-Z]").unwrap());
-        if re.is_match(line) { return false; }
-    }
-    // Comments and directives
-    if line.starts_with('#') || line.starts_with('@') { return false; }
-    true
-}
-
-/// Check if a JSON-like string has balanced brackets/braces.
-fn is_json_balanced(s: &str) -> bool {
-    let mut depth = 0i32;
-    for c in s.bytes() {
-        match c {
-            b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth -= 1,
-            _ => {}
-        }
-    }
-    depth == 0
-}
-
-/// Stores a config value. Returns the key actually stored (so the caller can
-/// record its source span), or `None` if the value was rejected.
-fn store_config_value(
-    key: &str,
-    value: &str,
-    config: &mut serde_json::Map<String, serde_json::Value>,
-    line_num: usize,
-    errors: &mut Vec<CompileError>,
-) -> Option<String> {
-    // Reject removed config keys
-    if key == "mock" || key == "mocked" {
-        errors.push(CompileError { line: line_num, message: format!("'{}' is not a valid config key. Use test configs for mocking.", key) });
-        return None;
-    }
-
-    // Try to parse as JSON if value looks like JSON (starts with [ or {)
-    if value.trim_start().starts_with('[') || value.trim_start().starts_with('{') {
-        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(value) {
-            config.insert(key.to_string(), json_val);
-            return Some(key.to_string());
-        }
-        // Fall through to store as string
-    }
-    // Default: store as string
-    config.insert(key.to_string(), serde_json::Value::String(value.to_string()));
-    Some(key.to_string())
-}
 
 fn dedent(s: &str) -> String {
     let raw = s.trim_end();
@@ -2452,93 +1873,12 @@ fn dedent(s: &str) -> String {
     }
 }
 
-/// Reserved per-instance config keys (any key starting with `_`).
-/// `_label` is hoisted to `NodeDefinition.label`; `_is_output` and
-/// `_tags` stay in `node.config` and are read via the
-/// `NodeDefinition::is_output()` / `tags()` accessors. Validators
-/// skip these keys when checking that config keys match declared
-/// ports.
-fn try_extract_label(s: &str) -> Option<String> {
-    let colon = s.find(':')?;
-    let key = s[..colon].trim();
-    if key != "_label" { return None; }
-    let val = s[colon + 1..].trim();
-    if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
-        Some(unescape(&val[1..val.len() - 1]))
-    } else {
-        Some(val.to_string())
-    }
-}
 
-
-// ─── Connection Parsing ─────────────────────────────────────────────────────
 
 /// Parse connections inside a group. Uses `self` instead of `in`/`out`.
 /// `child.input = self.port` (child receives from group input)
 /// `self.output = child.port` (group output receives from child)
 /// `child.port = other_child.port` (internal wiring)
-fn try_parse_group_connection(
-    trimmed: &str,
-    line_num: usize,
-    group_id: &str,
-    errors: &mut Vec<CompileError>,
-) -> Option<ParsedConnection> {
-    let eq_pos = trimmed.find('=')?;
-    let left = trimmed[..eq_pos].trim();
-    let right = trimmed[eq_pos + 1..].trim();
-
-    // Both sides must be dotted
-    if !left.contains('.') || !right.contains('.') {
-        return None;
-    }
-
-    // Parse left side (target: input being set)
-    let (target_id, target_port) = if let Some(rest) = left.strip_prefix("self.") {
-        // self.port on left = group output being set. The remainder must
-        // be a bare identifier (port name), not further dotted.
-        if rest.is_empty() || !rest.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
-            || !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            errors.push(CompileError { line: line_num, message: format!("Invalid connection target: '{}'", left) });
-            return None;
-        }
-        (format!("{}__out", group_id), rest.to_string())
-    } else if let Some((node, port)) = parse_dotted(left) {
-        (format!("{}.{}", group_id, node), port)
-    } else {
-        errors.push(CompileError { line: line_num, message: format!("Invalid connection target: '{}'", left) });
-        return None;
-    };
-
-    // Parse right side (source: output providing value)
-    let (source_id, source_port) = if let Some(rest) = right.strip_prefix("self.") {
-        // self.port on right = group input providing value. Same bare-ident
-        // constraint as above.
-        if rest.is_empty() || !rest.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
-            || !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            errors.push(CompileError { line: line_num, message: format!("Invalid connection source: '{}'", right) });
-            return None;
-        }
-        (format!("{}__in", group_id), rest.to_string())
-    } else if let Some((node, port)) = parse_dotted(right) {
-        (format!("{}.{}", group_id, node), port)
-    } else {
-        errors.push(CompileError { line: line_num, message: format!("Invalid connection source: '{}'", right) });
-        return None;
-    };
-
-    Some(ParsedConnection {
-        source_id: source_id,
-        source_port: source_port,
-        target_id: target_id,
-        target_port: target_port,
-        span: Some(Span::single_line(line_num, 0, trimmed.len())),
-    })
-}
-
-/// Split `node.port` on the single dot. Both parts must be bare identifiers
-/// (letters, digits, underscores) with at least one character. Rejects any
-/// input with more than one dot so that malformed inputs like
-/// `a.b.c = x.y` don't silently produce ports named `b.c`.
 fn parse_dotted(s: &str) -> Option<(String, String)> {
     let dot = s.find('.')?;
     let node = s[..dot].trim();
@@ -2579,15 +1919,13 @@ fn parse_include_arg(after: &str) -> Result<String, String> {
     }
 }
 
-// ─── Config Value Parsing ───────────────────────────────────────────────────
-
 /// Parses one `key: value` pair into `config`. Returns the key actually
 /// stored (so the caller can record its source span), or `None` if the line
 /// wasn't a valid pair or the value was rejected.
 fn parse_kv(
     s: &str,
     config: &mut serde_json::Map<String, serde_json::Value>,
-    line: usize,
+    span: Span,
     errors: &mut Vec<CompileError>,
 ) -> Option<String> {
     let colon_pos = match s.find(':') {
@@ -2599,7 +1937,7 @@ fn parse_kv(
 
     // Reject removed config keys
     if key == "mock" || key == "mocked" {
-        errors.push(CompileError { line, message: format!("'{}' is not a valid config key. Use test configs for mocking.", key) });
+        errors.push(CompileError::at(span, format!("'{}' is not a valid config key. Use test configs for mocking.", key)));
         return None;
     }
 
@@ -2607,34 +1945,35 @@ fn parse_kv(
     // form. Surface a clear migration error so projects don't pick
     // up the old behavior silently.
     if key == "label" {
-        errors.push(CompileError {
-            line,
-            message: "'label' was renamed to '_label' (reserved internal key)".into(),
-        });
+        errors.push(CompileError::at(span, "'label' was renamed to '_label' (reserved internal key)"));
         return None;
     }
     if key == "is_output" {
-        errors.push(CompileError {
-            line,
-            message: "'is_output' was renamed to '_is_output' (reserved internal key)".into(),
-        });
+        errors.push(CompileError::at(span, "'is_output' was renamed to '_is_output' (reserved internal key)"));
         return None;
     }
 
-    // Reserved internal keys: only specific ones are valid; anything
-    // else with a leading underscore is rejected so the user doesn't
-    // accidentally collide with a future reserved field.
+    // `_label` is NOT a config value: it is the node's LABEL, set ONLY via the
+    // body `_label: "..."` field (which routes through `parse_label_value` into
+    // `node.label`, never here). Reaching `parse_kv` with `_label` means a
+    // connection-origin `node._label = ...`, which would misroute the label into
+    // `config["_label"]` where nothing reads it. Reject loud so a label has one
+    // home (`node.label`) and one syntax (the body field).
+    if key == "_label" {
+        errors.push(CompileError::at(span, "a node's label is set with a body field `_label: \"...\"`, not a connection `node._label = ...`".to_string()));
+        return None;
+    }
+    // Other reserved internal keys (`_is_output`, `_tags`) ARE config keys (read
+    // from `config` downstream); anything else with a leading underscore is
+    // rejected so the user doesn't collide with a future reserved field.
     if key.starts_with('_') {
-        const ALLOWED: &[&str] = &["_label", "_is_output", "_tags"];
+        const ALLOWED: &[&str] = &["_is_output", "_tags"];
         if !ALLOWED.contains(&key) {
-            errors.push(CompileError {
-                line,
-                message: format!(
-                    "'{key}' starts with '_' which is reserved for internal config keys. \
-                     Allowed reserved keys: {}",
-                    ALLOWED.join(", ")
-                ),
-            });
+            errors.push(CompileError::at(span, format!(
+                "'{key}' starts with '_' which is reserved for internal config keys. \
+                 Allowed reserved keys: {}",
+                ALLOWED.join(", ")
+            )));
             return None;
         }
     }
@@ -2644,25 +1983,72 @@ fn parse_kv(
     } else if raw == "false" {
         serde_json::Value::Bool(false)
     } else if raw.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-') && !raw.is_empty() {
-        if !raw.contains('.') {
-            if let Ok(n) = raw.parse::<i64>() {
-                serde_json::json!(n)
-            } else if let Ok(n) = raw.parse::<f64>() {
-                serde_json::json!(n)
-            } else {
-                serde_json::Value::String(unquote(raw))
+        // A numeric-shaped value: parse as integer first, then float. A value that
+        // can't become a finite JSON number (a malformed number like `1.2.3`, or a
+        // magnitude that overflows f64 to infinity) is NEVER silently coerced, it
+        // fails loud, same as the gate's other branches. `Number::from_f64`
+        // returns None for non-finite, which is exactly the "no JSON number for
+        // this" signal (`json!(f64::INFINITY)` would otherwise yield a silent
+        // `null`). (A malformed numeric is in practice already lexed to an ERROR
+        // token and never reaches here as a NUMBER, so the loud arm is the gate
+        // holding by construction, not by luck.)
+        let number = raw.parse::<i64>().ok().map(serde_json::Value::from)
+            .or_else(|| raw.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(serde_json::Value::from));
+        match number {
+            Some(v) => v,
+            None => {
+                errors.push(CompileError::at(span, format!(
+                    "'{key}' has a malformed or out-of-range numeric value `{raw}`. A literal string must be quoted (`{key}: \"...\"`)."
+                )));
+                return None;
             }
-        } else if let Ok(n) = raw.parse::<f64>() {
-            serde_json::json!(n)
-        } else {
-            serde_json::Value::String(unquote(raw))
         }
     } else if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
         serde_json::Value::String(unescape(&raw[1..raw.len() - 1]))
     } else if raw.starts_with('[') || raw.starts_with('{') {
-        serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        // JSON array/object. Malformed JSON is NOT silently coerced to a string
+        // (that hid `[a, b]`-style typos); it fails loud.
+        match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(CompileError::at(span, format!(
+                    "'{key}' has an invalid JSON value `{raw}`: {e}. A literal string must be quoted (`{key}: \"...\"`)."
+                )));
+                return None;
+            }
+        }
+    } else if raw.starts_with('@') {
+        // `@file(...)` is the ONLY marker valid as a config value (resolved
+        // downstream by file_ref). Any other `@...` (a typo, `@include`,
+        // `@require_one_of`, a bare `@`) is not a value and fails loud rather than
+        // becoming a literal string.
+        if crate::cst::marker::directive(raw) == "file" {
+            serde_json::Value::String(raw.to_string())
+        } else {
+            errors.push(CompileError::at(span, format!(
+                "'{key}' has an invalid marker value `{raw}`: the only marker valid as a config value is `@file(\"path\")`."
+            )));
+            return None;
+        }
+    } else if raw.is_empty() {
+        // No value text reached us: the source had a key with nothing parseable
+        // after it (e.g. a malformed token the lexer peeled off into an ERROR, so
+        // `value: 1.2.3` arrives here as an empty value). Name the missing value
+        // rather than printing empty backticks (`invalid value ``).
+        errors.push(CompileError::at(span, format!(
+            "'{key}' is missing a value (or its value is malformed). A literal string must be quoted (`{key}: \"...\"`); to wire a port, reference it as `node_id.port_name`."
+        )));
+        return None;
     } else {
-        serde_json::Value::String(raw.to_string())
+        // An UNQUOTED, non-bool, non-numeric, non-marker scalar is not a valid
+        // value: a string literal must be quoted (`"{raw}"`) and a port reference
+        // must be dotted (`node.port`). A bare identifier here (e.g. `text = raw`
+        // meaning to wire the port `raw`) was silently coerced to the string
+        // `"raw"`, dropping the user's intent with no diagnostic. Reject loudly.
+        errors.push(CompileError::at(span, format!(
+            "'{key}' has an invalid value `{raw}`: a literal string must be quoted (`{key}: \"{raw}\"`); to wire a port, reference it as `node_id.port_name`."
+        )));
+        return None;
     };
 
     // _tags is the only reserved key that carries user-supplied
@@ -2677,31 +2063,17 @@ fn parse_kv(
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
             if let Err(e) = weft_core::tag::validate_tags(&tags) {
-                errors.push(CompileError {
-                    line,
-                    message: format!("invalid _tags: {e}"),
-                });
+                errors.push(CompileError::at(span, format!("invalid _tags: {e}")));
                 return None;
             }
         } else {
-            errors.push(CompileError {
-                line,
-                message: "_tags must be a list of strings, e.g. _tags: [\"support\"]".into(),
-            });
+            errors.push(CompileError::at(span, "_tags must be a list of strings, e.g. _tags: [\"support\"]"));
             return None;
         }
     }
 
     config.insert(key.to_string(), value);
     Some(key.to_string())
-}
-
-fn unquote(s: &str) -> String {
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        unescape(&s[1..s.len() - 1])
-    } else {
-        s.to_string()
-    }
 }
 
 fn unescape(s: &str) -> String {
@@ -2725,37 +2097,6 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// Split `s` on `delimiter`, but only at top level: ignore delimiters
-/// inside strings, parentheses, square brackets, and curly braces. Used
-/// by the one-liner config parser so that values with nested braces
-/// (inline expressions) or brackets (JSON) are not split mid-value.
-fn split_respecting_quotes(s: &str, delimiter: char) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    let mut depth: i32 = 0;
-    for c in s.chars() {
-        if c == '"' {
-            in_quote = !in_quote;
-        }
-        if !in_quote {
-            match c {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        if c == delimiter && !in_quote && depth == 0 {
-            parts.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
-}
 
 // ─── Flattener ──────────────────────────────────────────────────────────────
 
@@ -2788,7 +2129,17 @@ fn flatten(state: ParseState, project_id: Uuid) -> ProjectDefinition {
         flatten_group(group, &mut nodes, &mut edges);
     }
 
-    // Deduplicate edges
+    // Deduplicate nodes by id, then edges. A node-id collision is already a loud
+    // parse error (`Duplicate id`) that aborts the strict build, but the lenient
+    // render path (`compile_lenient`) always returns a project, so without this
+    // it would hand the renderer two `NodeDefinition`s with one id (a broken
+    // contract for anything keyed by id, e.g. two `g.c__in` from an alias clashing
+    // with a same-named group). Keep the first; the diagnostic already tells the
+    // user to fix the source.
+    {
+        let mut seen = std::collections::HashSet::new();
+        nodes.retain(|n| seen.insert(n.id.clone()));
+    }
     {
         let mut seen = std::collections::HashSet::new();
         edges.retain(|e| {
@@ -2804,8 +2155,6 @@ fn flatten(state: ParseState, project_id: Uuid) -> ProjectDefinition {
 
     ProjectDefinition {
         id: project_id,
-        name: state.name,
-        description: if state.description.is_empty() { None } else { Some(state.description) },
         nodes,
         edges,
         groups,
@@ -3108,665 +2457,8 @@ fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
 //   - Anon IDs: `{parent_id}__{field_or_port_name}`. Uniqueness is enforced
 //     at the scope merge point (state.nodes / group.nodes).
 //   - Nested inlines work naturally via recursion: the inline's body is a
-//     config block parsed by the same parse_config_block that handles the
+//     config block parsed by the same config-body lowering that handles the
 //     outer config, so a nested inline in a nested config field is picked
 //     up in the same pass.
 
-/// Check if a string value looks like the start of an inline node expression.
-/// Returns true if it starts with an uppercase identifier followed by `(`,
-/// `{`, `->`, or whitespace then one of those.
-/// True if `s` looks like the start of an inline node expression. Accepted
-/// forms (after stripping leading whitespace) all start with a type name
-/// (uppercase identifier) followed by one of:
-///     Type ( ... ) -> ( ... ) { ... }.port   // full form with ports + config
-///     Type { ... }.port                      // config-only form
-///     Type ( ... ) -> ( ... ).port           // ports-only form
-///     Type.port                              // bare form: default config,
-///                                            // no ports wired, just grab
-///                                            // the output
-fn looks_like_inline_start(s: &str) -> bool {
-    let s = s.trim_start();
-    if s.is_empty() { return false; }
-    let first = match s.chars().next() { Some(c) => c, None => return false };
-    if !first.is_ascii_uppercase() { return false; }
-    let mut ident_len = 0;
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            ident_len += c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    let rest = s[ident_len..].trim_start();
-    if rest.starts_with('(') || rest.starts_with('{') || rest.starts_with("->") {
-        return true;
-    }
-    // Bare form `Type.port`: the dot must be followed by an identifier
-    // character so we don't catch things like `Type.` (trailing dot) or
-    // an unrelated `Type ` at end of line.
-    if let Some(after_dot) = rest.strip_prefix('.') {
-        if let Some(c) = after_dot.chars().next() {
-            return c.is_ascii_alphabetic() || c == '_';
-        }
-    }
-    false
-}
-
-/// A config key must be a bare identifier (no dots, no spaces).
-fn is_valid_config_key(s: &str) -> bool {
-    if s.is_empty() { return false; }
-    let first = match s.chars().next() { Some(c) => c, None => return false };
-    if !first.is_ascii_alphabetic() && first != '_' { return false; }
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// A dotted ref is 2+ identifier segments joined by `.`, no quotes, no
-/// whitespace, no digits-only segments (so `3.14` is NOT a dotted ref).
-/// Used in inline bodies to distinguish port wirings from literal config
-/// values: `name: source.value` is a wiring, `price: 3.14` is a literal.
-fn looks_like_dotted_ref(s: &str) -> bool {
-    let s = s.trim();
-    if s.is_empty() { return false; }
-    if s.contains('"') || s.contains('\'') { return false; }
-    // Exactly one dot: `node.port`. Multi-dot refs like `a.b.c` are not
-    // valid port references and would be silently dropped by parse_dotted.
-    let dot_count = s.chars().filter(|&c| c == '.').count();
-    if dot_count != 1 { return false; }
-    s.split('.').all(|seg| {
-        if seg.is_empty() { return false; }
-        let first = match seg.chars().next() { Some(c) => c, None => return false };
-        if !first.is_ascii_alphabetic() && first != '_' { return false; }
-        seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
-/// Parse an inline expression starting at lines[start_line][start_col..].
-/// Generates an anon child node, emits a connection from the child's output
-/// to parent_id.field_key, and appends both to inline_scope. Returns the
-/// index of the first line AFTER the inline expression (past `.portName`),
-/// or None on parse error.
-fn try_parse_inline_expression(
-    lines: &[&str],
-    start_line: usize,
-    start_col: usize,
-    parent_id: &str,
-    field_key: &str,
-    inline_scope: &mut InlineScope,
-    errors: &mut Vec<CompileError>,
-) -> Option<usize> {
-    let first_line = lines[start_line];
-    let line_num = start_line + 1;
-    let after_start = first_line[start_col..].trim_start();
-
-    // Extract the type name. Stop at the first `(`, `{`, `.`, or whitespace.
-    // The `.` stop is required to support the bare form `Type.port` (no
-    // config block, no ports, default construction).
-    let type_end = after_start
-        .find(|c: char| c == '(' || c == '{' || c == '.' || c.is_whitespace())
-        .unwrap_or(after_start.len());
-    let node_type = after_start[..type_end].trim().to_string();
-    if node_type.is_empty() || !node_type.chars().next()?.is_ascii_uppercase() {
-        return None;
-    }
-    if node_type == "Passthrough" {
-        errors.push(CompileError {
-            line: line_num,
-            message: "'Passthrough' is a compiler-internal node type and cannot be used directly."
-                .into(),
-        });
-        return None;
-    }
-    if !node_type.chars().all(|c| c.is_alphanumeric()) {
-        errors.push(CompileError { line: line_num, message: format!("Invalid inline node type '{}'", node_type) });
-        return None;
-    }
-    if node_type == "Group" {
-        errors.push(CompileError { line: line_num, message: "Groups cannot be inlined".to_string() });
-        return None;
-    }
-
-    let after_type = after_start[type_end..].trim_start();
-
-    // Collect header across multiple lines. Reuse the existing helper which
-    // understands port signatures and multi-line `-> (...)`.
-    let (header_text, header_end_line) = if after_type.starts_with('(') || after_type.starts_with("->") {
-        collect_declaration_header(lines, start_line, after_type)
-    } else {
-        (after_type.to_string(), start_line)
-    };
-    let header_text = header_text.trim();
-
-    // Parse optional port signature.
-    let (in_ports, out_ports, one_of_required, after_ports) = if header_text.starts_with('(') {
-        parse_port_signature(header_text, line_num, errors)
-    } else if header_text.starts_with("->") {
-        let arrow_rest = header_text.strip_prefix("->").unwrap().trim();
-        if arrow_rest.starts_with('(') {
-            let mut outs = Vec::new();
-            let mut oor = Vec::new();
-            let (content, after) = match find_matching_paren(arrow_rest) {
-                Some(p) => p,
-                None => {
-                    errors.push(CompileError { line: line_num, message: "Unclosed output port list in inline expression".to_string() });
-                    return None;
-                }
-            };
-            parse_port_list(&content, &mut outs, &mut oor, "out", line_num, errors);
-            (Vec::new(), outs, oor, after)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new(), header_text.to_string())
-        }
-    } else {
-        (Vec::new(), Vec::new(), Vec::new(), header_text.to_string())
-    };
-
-    let after_ports = after_ports.trim();
-    let body_start_line = header_end_line;
-
-    // Anon id for this inline expression. Field/port name separator is `__`.
-    // Conflict detection happens at scope merge.
-    let anon_id = format!("{}__{}", parent_id, field_key);
-
-    // Body can be:
-    //   - a `{ ... }` block (one-liner or multi-line): parsed into config
-    //   - completely absent (bare form `Type.port`): no config, just grab
-    //     the default node and read one of its outputs. In the bare case
-    //     `after_ports` starts with `.portName` directly.
-    if after_ports.starts_with('.') {
-        // Bare form: no body. Look for `.port` directly in after_ports.
-        if let Some(port) = parse_inline_dot_port(after_ports) {
-            // Synthesize typed input ports for any port wirings that may
-            // have been registered for this anon id by nested inlines.
-            // Bare-form anons never have wirings (no body), so this is
-            // just an empty-ports node.
-            let node = ParsedNode {
-                id: anon_id.clone(),
-                node_type: node_type,
-                label: None,
-                config: serde_json::Map::new(),
-                parent_id: None,
-                in_ports: in_ports,
-                out_ports: out_ports,
-                one_of_required: one_of_required,
-                span: None,
-                header_span: None,
-                config_spans: Default::default(),
-                file_refs: Default::default(),
-                include_path: None,
-            };
-            inline_scope.nodes.push(node);
-            inline_scope.connections.push(ParsedConnection {
-                source_id: anon_id,
-                source_port: port,
-                target_id: parent_id.to_string(),
-                target_port: field_key.to_string(),
-                span: None,
-            });
-            return Some(start_line + 1);
-        } else {
-            errors.push(CompileError {
-                line: line_num,
-                message: format!("Expected '.portName' in bare inline expression, got: '{}'", after_ports),
-            });
-            return None;
-        }
-    }
-
-    let (config, label, config_spans, body_end_line, one_liner_after_close) = if after_ports.starts_with('{') {
-        // Find the matching `}` for the opening `{` on this line. If it's
-        // there, this is a one-liner. Otherwise it's multi-line.
-        if let Some(close_pos) = find_matching_brace_on_line(after_ports) {
-            // One-liner: parse the body between positions 1 and close_pos.
-            let body = after_ports[1..close_pos].trim();
-            let mut config = serde_json::Map::new();
-            let mut label = None;
-            let mut config_spans: ConfigSpanMap = Default::default();
-            let anon_line_span = Span::single_line(line_num, 0, lines[start_line].len());
-            if !body.is_empty() {
-                for pair in split_respecting_quotes(body, ',') {
-                    let pair = pair.trim();
-                    if pair.is_empty() { continue; }
-                    if let Some(l) = try_extract_label(pair) {
-                        label = Some(l);
-                    } else if let Some(k) = parse_kv(pair, &mut config, line_num, errors) {
-                        config_spans.insert(k, ConfigFieldSpan::inline(anon_line_span));
-                    }
-                }
-            }
-            // Pass the text after `}` directly from `after_ports` where we
-            // know the exact matched brace position, instead of re-discovering
-            // it with rfind on the full source line (fragile when the line
-            // contains `}` inside quoted strings).
-            let after_close = after_ports[close_pos + 1..].trim().to_string();
-            (config, label, config_spans, start_line, Some(after_close))
-        } else if after_ports == "{" {
-            let (cfg, lbl, _extra_in, _extra_out, _extra_oor, _end_i, close_line, spans) =
-                parse_config_block_with_close(lines, body_start_line, line_num, errors, &anon_id, inline_scope);
-            if close_line >= lines.len() {
-                errors.push(CompileError { line: line_num, message: "Unclosed inline expression".to_string() });
-                return None;
-            }
-            (cfg, lbl, spans, close_line, None)
-        } else {
-            errors.push(CompileError { line: line_num, message: format!("Invalid inline node syntax: {}", after_ports) });
-            return None;
-        }
-    } else {
-        errors.push(CompileError { line: line_num, message: format!("Expected '{{' in inline expression, got: {}", after_ports) });
-        return None;
-    };
-
-    // After the closing `}` we require `.portName`. For one-liners we have
-    // the text after `}` directly from the brace matcher (handles quoted
-    // `}` correctly). For multi-line we use rfind on the close line (safe
-    // because multi-line close lines are bare `}` or `}.port`).
-    let after_brace_owned: String;
-    let after_brace: &str = if let Some(ref text) = one_liner_after_close {
-        text.as_str()
-    } else {
-        let close_line_text = lines[body_end_line];
-        let close_brace_pos = close_line_text.rfind('}').unwrap_or(0);
-        after_brace_owned = close_line_text[close_brace_pos + 1..].to_string();
-        after_brace_owned.as_str()
-    };
-    let after_brace = after_brace.trim();
-
-    // Forbid post-config outputs: `Type { ... } -> (out: X).out`.
-    if after_brace.starts_with("->") {
-        errors.push(CompileError { line: body_end_line + 1, message: "Inline expressions cannot declare post-config outputs; declare the node with a name instead".to_string() });
-        return None;
-    }
-
-    let (output_port, next_line) = if let Some(port) = parse_inline_dot_port(after_brace) {
-        (port, body_end_line + 1)
-    } else if after_brace.is_empty() {
-        // Look on the next line for `.portName`.
-        if body_end_line + 1 < lines.len() {
-            let next = lines[body_end_line + 1].trim();
-            if next.starts_with("->") {
-                errors.push(CompileError { line: body_end_line + 2, message: "Inline expressions cannot declare post-config outputs".to_string() });
-                return None;
-            }
-            if let Some(port) = parse_inline_dot_port(next) {
-                (port, body_end_line + 2)
-            } else {
-                errors.push(CompileError { line: body_end_line + 1, message: "Inline expression missing required '.portName' after closing '}}'".to_string() });
-                return None;
-            }
-        } else {
-            errors.push(CompileError { line: body_end_line + 1, message: "Inline expression missing required '.portName' after closing '}}'".to_string() });
-            return None;
-        }
-    } else {
-        errors.push(CompileError { line: body_end_line + 1, message: format!("Expected '.portName' after inline '}}', got: '{}'", after_brace) });
-        return None;
-    };
-
-    // Build the anon node. Ports come from the explicit signature
-    // (`Type(x: String) { ... }`) and from catalog defaults at enrichment.
-    // Port-wiring assignments inside the body (`x: src.value`) do NOT
-    // synthesize ports here: the rule is "edges require a pre-existing,
-    // pre-typed port". Literal assignments (`x: "hi"`) may synthesize a
-    // port at enrichment time via WeftType::infer, gated on the catalog
-    // node type's `canAddInputPorts` feature.
-    let node = ParsedNode {
-        id: anon_id.clone(),
-        node_type: node_type,
-        label,
-        config,
-        parent_id: None,
-        in_ports: in_ports,
-        out_ports: out_ports,
-        one_of_required: one_of_required,
-        span: None,
-        header_span: None,
-        config_spans,
-        file_refs: Default::default(),
-        include_path: None,
-    };
-    inline_scope.nodes.push(node);
-    inline_scope.connections.push(ParsedConnection {
-        source_id: anon_id,
-        source_port: output_port,
-        target_id: parent_id.to_string(),
-        target_port: field_key.to_string(),
-        span: None,
-    });
-
-    Some(next_line)
-}
-
-/// Find the position of the `}` that matches the opening `{` at the start
-/// of `s`. Respects string literals so that `{` or `}` inside quotes don't
-/// break matching. Returns None if there's no matching close on this line.
-fn find_matching_brace_on_line(s: &str) -> Option<usize> {
-    if !s.starts_with('{') { return None; }
-    let bytes = s.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_string: Option<u8> = None;
-    let mut escape = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if escape { escape = false; i += 1; continue; }
-        if let Some(q) = in_string {
-            if c == b'\\' { escape = true; }
-            else if c == q { in_string = None; }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' | b'\'' => in_string = Some(c),
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 { return Some(i); }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Parse a `.portName` suffix. Accepts strings like `.text`, ` .text`,
-/// ` .text `. Rejects anything with extra characters after the port name.
-fn parse_inline_dot_port(s: &str) -> Option<String> {
-    let t = s.trim();
-    let rest = t.strip_prefix('.')?;
-    if rest.is_empty() { return None; }
-    let mut end = 0;
-    for c in rest.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            end += c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    if end == 0 { return None; }
-    let (name, tail) = rest.split_at(end);
-    if !tail.trim().is_empty() { return None; }
-    Some(name.to_string())
-}
-
-/// Top-level connection parser with inline RHS support. Accepts:
-///   - `target.port = source.port`          (edge)
-///   - `target.port = InlineType { ... }.x` (inline expression + edge)
-///   - `target.port = Type.port`            (bare inline + edge)
-///   - `target.port = "literal"` / number / bool / JSON  (config fill)
-///
-/// For literal RHS the parser pushes a `ConfigFill` into `inline_scope`
-/// instead of returning a ParsedConnection. The caller applies it to the
-/// target node's config. Literals take over from any inline config value
-/// for the same `(target, port)` pair because they appear later in source.
-/// Classify a connection-line RHS that is a CONFIG FILL (not an edge): an
-/// `@file(...)` marker, a single-line literal, a triple-backtick heredoc
-/// (inline or multi-line), or multi-line JSON. Pushes the `ConfigFill` against
-/// `scoped_target` (the caller passes the already-scoped target id, so this is
-/// identical at top level and inside a group, which is why `@file` works in
-/// both by construction). Returns `Some(next_line)` if the RHS was a config
-/// fill, `None` if it's something else (an edge / not a connection).
-///
-/// Edge RHS shapes (inline expressions, dotted refs) are NOT handled here: they
-/// differ by scoping between top level and group bodies, so each caller keeps
-/// its own edge handling.
-fn push_config_fill_rhs(
-    lines: &[&str],
-    start: usize,
-    scoped_target: &str,
-    target_port: &str,
-    right: &str,
-    errors: &mut Vec<CompileError>,
-    inline_scope: &mut InlineScope,
-) -> Option<usize> {
-    let line = lines[start];
-    let single_line_span = Some(Span::single_line(start + 1, 0, line.len()));
-    let mut push = |value: serde_json::Value, span: Option<Span>, next: usize| {
-        inline_scope.config_fills.push(ConfigFill {
-            target_id: scoped_target.to_string(),
-            target_port: target_port.to_string(),
-            value,
-            span,
-        });
-        Some(next)
-    };
-
-    // `@file(...)` marker: stored verbatim; the post-parse file-ref pass
-    // resolves it (the shared recognizer so parse + resolution agree).
-    if crate::file_ref::parse_marker(right).is_some() {
-        return push(serde_json::Value::String(right.to_string()), single_line_span, start + 1);
-    }
-    // Single-line literal.
-    if let Some(value) = try_parse_literal(right) {
-        return push(value, single_line_span, start + 1);
-    }
-    // Triple-backtick heredoc, inline `= ```x``` ` or multi-line.
-    if right.starts_with("```") {
-        let after_bt = &right[3..];
-        if after_bt.ends_with("```") && after_bt.len() > 3 {
-            let inline_val = &after_bt[..after_bt.len() - 3];
-            return push(serde_json::Value::String(inline_val.to_string()), single_line_span, start + 1);
-        }
-        let (unescaped, next) = collect_heredoc_value(lines, start + 1, after_bt);
-        return push(serde_json::Value::String(unescaped), Some(multi_line_span(lines, start + 1, next)), next);
-    }
-    // Multi-line JSON `= { ... }` / `= [ ... ]`.
-    if let Some((collected, balanced, next)) = collect_multiline_json(lines, start + 1, start, right) {
-        if !balanced {
-            errors.push(CompileError {
-                line: start + 1,
-                message: format!("Broken JSON for '{}.{}': brackets not balanced", scoped_target, target_port),
-            });
-            return Some(next);
-        }
-        let value = serde_json::from_str::<serde_json::Value>(&collected)
-            .unwrap_or(serde_json::Value::String(collected));
-        return push(value, Some(multi_line_span(lines, start + 1, next)), next);
-    }
-    None
-}
-
-fn try_parse_connection_with_inline(
-    lines: &[&str],
-    start: usize,
-    errors: &mut Vec<CompileError>,
-    inline_scope: &mut InlineScope,
-) -> ParseConnectionResult {
-    let line = lines[start];
-    let trimmed = line.trim();
-    let eq_pos = match trimmed.find('=') { Some(p) => p, None => return ParseConnectionResult::NotAConnection };
-    let left = trimmed[..eq_pos].trim();
-    let right = trimmed[eq_pos + 1..].trim();
-    if !left.contains('.') { return ParseConnectionResult::NotAConnection; }
-    let (target_id, target_port) = match parse_dotted(left) {
-        Some(pair) => pair,
-        None => return ParseConnectionResult::NotAConnection,
-    };
-
-    if looks_like_inline_start(right) {
-        let eq_byte_pos = match line.find('=') { Some(p) => p, None => return ParseConnectionResult::NotAConnection };
-        let start_col = eq_byte_pos + 1;
-        let next_i = match try_parse_inline_expression(
-            lines, start, start_col, &target_id, &target_port, inline_scope, errors,
-        ) {
-            Some(n) => n,
-            None => return ParseConnectionResult::NotAConnection,
-        };
-        let conn = match inline_scope.connections.pop() {
-            Some(c) => c,
-            None => return ParseConnectionResult::NotAConnection,
-        };
-        return ParseConnectionResult::Edge(conn, next_i);
-    }
-
-    // Dotted-ref source: standard edge.
-    if let Some((source_id, source_port)) = parse_dotted(right) {
-        return ParseConnectionResult::Edge(
-            ParsedConnection {
-                source_id,
-                source_port,
-                target_id,
-                target_port,
-                span: Some(Span::single_line(start + 1, 0, line.len())),
-            },
-            start + 1,
-        );
-    }
-
-    // Config-fill RHS (@file / literal / heredoc / multi-line JSON): shared
-    // with the group-body parser. Top-level target is unscoped.
-    match push_config_fill_rhs(lines, start, &target_id, &target_port, right, errors, inline_scope) {
-        Some(next) => ParseConnectionResult::ConfigFill(next),
-        None => ParseConnectionResult::NotAConnection,
-    }
-}
-
-enum ParseConnectionResult {
-    NotAConnection,
-    Edge(ParsedConnection, usize),
-    ConfigFill(usize),
-}
-
-/// Write a connection-line literal into the target node's config map.
-/// Later writes override earlier ones for the same key. If the target node
-/// isn't found, the fill is silently dropped; enrichment's edge validation
-/// catches the bad target separately.
-fn apply_config_fill(nodes: &mut Vec<ParsedNode>, fill: ConfigFill) {
-    if let Some(node) = nodes.iter_mut().find(|n| n.id == fill.target_id) {
-        if let Some(span) = fill.span {
-            node.config_spans.insert(fill.target_port.clone(), ConfigFieldSpan::connection(span));
-        }
-        node.config.insert(fill.target_port, fill.value);
-    }
-}
-
-/// Parse a literal RHS value (quoted string, number, bool, JSON array/object)
-/// into a serde JSON value. Returns None if the input doesn't match any
-/// literal form (caller falls through to the next interpretation).
-fn try_parse_literal(s: &str) -> Option<serde_json::Value> {
-    let raw = s.trim();
-    if raw.is_empty() { return None; }
-    if raw == "true" { return Some(serde_json::Value::Bool(true)); }
-    if raw == "false" { return Some(serde_json::Value::Bool(false)); }
-    // Numbers (integer or float, negative allowed).
-    if raw.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-') {
-        if !raw.contains('.') {
-            if let Ok(n) = raw.parse::<i64>() {
-                return Some(serde_json::json!(n));
-            }
-        }
-        if let Ok(n) = raw.parse::<f64>() {
-            return Some(serde_json::json!(n));
-        }
-    }
-    // Quoted string.
-    if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-        return Some(serde_json::Value::String(unescape(&raw[1..raw.len() - 1])));
-    }
-    // JSON array or object.
-    if raw.starts_with('[') || raw.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-/// Group-body connection parser with inline RHS support. Mirrors
-/// `try_parse_connection_with_inline` but uses `try_parse_group_connection`
-/// for the simple path.
-fn try_parse_group_connection_with_inline(
-    lines: &[&str],
-    start: usize,
-    line_num: usize,
-    group_id: &str,
-    errors: &mut Vec<CompileError>,
-    inline_scope: &mut InlineScope,
-) -> ParseConnectionResult {
-    let line = lines[start];
-    let trimmed = line.trim();
-    let eq_pos = match trimmed.find('=') { Some(p) => p, None => return ParseConnectionResult::NotAConnection };
-    let right = trimmed[eq_pos + 1..].trim();
-
-    if looks_like_inline_start(right) {
-        let left = trimmed[..eq_pos].trim();
-        if !left.contains('.') { return ParseConnectionResult::NotAConnection; }
-        let (target_id_local, target_port) = match parse_dotted(left) {
-            Some(p) => p,
-            None => return ParseConnectionResult::NotAConnection,
-        };
-        let (parent_id_local, field_key) = if left.starts_with("self.") {
-            ("self".to_string(), target_port.clone())
-        } else {
-            (target_id_local.clone(), target_port.clone())
-        };
-
-        let eq_byte_pos = match line.find('=') { Some(p) => p, None => return ParseConnectionResult::NotAConnection };
-        let start_col = eq_byte_pos + 1;
-        let next_i = match try_parse_inline_expression(
-            lines, start, start_col, &parent_id_local, &field_key, inline_scope, errors,
-        ) {
-            Some(n) => n,
-            None => return ParseConnectionResult::NotAConnection,
-        };
-
-        let mut conn = match inline_scope.connections.pop() {
-            Some(c) => c,
-            None => return ParseConnectionResult::NotAConnection,
-        };
-        let _ = target_id_local;
-        conn.source_id = format!("{}.{}", group_id, conn.source_id);
-        if left.starts_with("self.") {
-            conn.target_id = format!("{}__out", group_id);
-        } else {
-            conn.target_id = format!("{}.{}", group_id, parent_id_local);
-        }
-        return ParseConnectionResult::Edge(conn, next_i);
-    }
-
-    // Config-fill RHS (@file / literal / heredoc / multi-line JSON) for a
-    // `child.port = ...` inside a group body, scoped under the group. Shared
-    // with the top-level parser (so `@file` works in both). `self.port = lit`
-    // is nonsensical (self is the group's output, driven by a child not a
-    // literal), so skip it and let the edge parser handle/reject it.
-    let left = trimmed[..eq_pos].trim();
-    if !left.starts_with("self.") {
-        if let Some((target_id_local, target_port)) = parse_dotted(left) {
-            let scoped_target = format!("{}.{}", group_id, target_id_local);
-            if let Some(next) = push_config_fill_rhs(lines, start, &scoped_target, &target_port, right, errors, inline_scope) {
-                return ParseConnectionResult::ConfigFill(next);
-            }
-        }
-    }
-
-    // Simple case: delegate to the existing group connection parser.
-    match try_parse_group_connection(trimmed, line_num, group_id, errors) {
-        Some(c) => ParseConnectionResult::Edge(c, start + 1),
-        None => ParseConnectionResult::NotAConnection,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_anonymous_group_header;
-
-    #[test]
-    fn anonymous_group_header_detection() {
-        // The anonymous include-group form: Group followed by a signature,
-        // body, output arrow, or end of line (optional whitespace).
-        assert!(is_anonymous_group_header("Group(raw: String) -> (out: String) {"));
-        assert!(is_anonymous_group_header("Group -> (out: String) {"));
-        assert!(is_anonymous_group_header("Group {"));
-        assert!(is_anonymous_group_header("Group"));
-        assert!(is_anonymous_group_header("Group ("));
-
-        // NOT anonymous-group headers: an `=` after `Group` is a declaration
-        // (`id = Type`), and an identifier merely prefixed by "Group" is its
-        // own name. These must fall through to the normal declaration path.
-        assert!(!is_anonymous_group_header("Group = Text { value: \"x\" }"));
-        assert!(!is_anonymous_group_header("Group = Group(in: String) { }"));
-        assert!(!is_anonymous_group_header("GroupThing = Llm"));
-        assert!(!is_anonymous_group_header("grouped = Text"));
-    }
-}
 

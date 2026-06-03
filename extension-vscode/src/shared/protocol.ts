@@ -2,10 +2,10 @@
 // this file so any change propagates.
 
 export interface Span {
-  start_line: number;
-  start_col: number;
-  end_line: number;
-  end_col: number;
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
 }
 
 export interface PortDefinition {
@@ -73,7 +73,7 @@ export interface NodeDefinition {
   requiresInfra?: boolean;
   entry: unknown[];
   span?: Span;
-  header_span?: Span;
+  headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
   fileRefs?: Record<string, FileRef>;
   /// Set on an opaque `@include` node: the included `.weft` file path. The
@@ -105,8 +105,9 @@ export interface GroupDefinition {
 
 export interface ProjectDefinition {
   id: string;
-  name: string;
-  description: string | null;
+  // The parsed graph carries no name/description: a project's name comes from
+  // the manifest (`weft.toml` `[package] name`), and descriptions are per-group
+  // (`# Description:` first body line). The Rust `ProjectDefinition` mirrors this.
   nodes: NodeDefinition[];
   edges: Edge[];
   groups: GroupDefinition[];
@@ -115,8 +116,13 @@ export interface ProjectDefinition {
 export type Severity = 'error' | 'warning' | 'info' | 'hint';
 
 export interface Diagnostic {
+  // 1-based start line, 0-based start char column.
   line: number;
   column: number;
+  // End of the culprit's range (1-based line, 0-based char column, exclusive).
+  // Optional for back-compat with older payloads; absent => a 1-char caret.
+  endLine?: number;
+  endColumn?: number;
   severity: Severity;
   message: string;
   code?: string;
@@ -727,7 +733,10 @@ export type EditOp =
   | { op: 'moveGroupScope'; group: string; targetGroup: string | null }
   | { op: 'updateNodePorts'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
   | { op: 'updateGroupPorts'; group: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
-  | { op: 'setProjectMeta'; name: string | null; description: string | null };
+  // A group's description is the `# Description:` comment on its first body line
+  // (the single description concept; the old single-file `# Project:` header is
+  // dropped, a file's identity is its filename). `description: null` clears it.
+  | { op: 'setGroupDescription'; group: string; description: string | null };
 
 export interface EditPortSig {
   name: string;

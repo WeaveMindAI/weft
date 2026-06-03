@@ -1151,8 +1151,16 @@ export class GraphViewController {
       });
       this.post({ kind: 'editApplied', requestId, ok: true, inverse: result });
     } catch (err) {
+      // An edit being REJECTED (e.g. a duplicate id, a cross-scope wire) is not a
+      // parse failure: the source on disk is unchanged (the write above never ran),
+      // so the currently-rendered graph is still valid. Roll back the webview's
+      // optimistic state via `editApplied {ok:false}` and surface the reason as a
+      // non-blocking toast, NOT a `parseError` (which would blank the whole view
+      // for a perfectly renderable project).
       this.post({ kind: 'editApplied', requestId, ok: false });
-      this.post({ kind: 'parseError', error: err instanceof Error ? err.message : String(err) });
+      void vscode.window.showErrorMessage(
+        `Weft: edit rejected: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

@@ -196,7 +196,8 @@
 	function handleResizeEnd(_event: unknown, params: ResizeParams) {
 		if (data.onUpdate) {
 			data.onUpdate({
-				config: { ...data.config, width: params.width, height: params.height }
+				config: { ...data.config, width: params.width, height: params.height },
+				resized: true,
 			});
 		}
 	}

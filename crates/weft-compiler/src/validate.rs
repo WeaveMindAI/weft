@@ -9,7 +9,7 @@
 use weft_core::node::{
     Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
 };
-use weft_core::project::NodeDefinition;
+use weft_core::project::{NodeDefinition, Span};
 use weft_core::ProjectDefinition;
 
 use crate::{Diagnostic, Severity};
@@ -69,23 +69,23 @@ fn check_reserved_names(
     // `grp.Llm`, but the ambiguous reference written in source is the local
     // `Llm.port`, and `grp.Llm` would never match a catalog entry. The local
     // segment is what collides with a type name.
-    let mut flag = |id: &str, line: usize| {
+    let mut flag = |id: &str, span: Option<weft_core::project::Span>| {
         let local = id.rsplit('.').next().unwrap_or(id);
         if catalog.lookup(local).is_some() {
-            out.push(Diagnostic {
-                line,
-                column: 0,
-                severity: Severity::Error,
-                message: format!("'{local}' is a node type name and cannot be used as a node or group name (a reference like '{local}.port' would parse as an inline node)"),
-                code: Some("reserved-name".into()),
-            });
+            let span = span.unwrap_or_default();
+            out.push(Diagnostic::at(
+                span,
+                Severity::Error,
+                "reserved-name",
+                format!("'{local}' is a node type name and cannot be used as a node or group name (a reference like '{local}.port' would parse as an inline node)"),
+            ));
         }
     };
     for node in &project.nodes {
-        flag(&node.id, node.header_span.map(|s| s.start_line).unwrap_or(0));
+        flag(&node.id, node.header_span);
     }
     for group in &project.groups {
-        flag(&group.id, group.header_span.map(|s| s.start_line).unwrap_or(0));
+        flag(&group.id, group.header_span);
     }
 }
 
@@ -149,8 +149,12 @@ fn eval_condition(cond: &Condition, node: &NodeDefinition, project: &ProjectDefi
             .config
             .get(field)
             .and_then(|v| v.as_str())
+            // Absent/non-string field -> false (not satisfied), like every sibling
+            // ConfigX condition. A malformed regex (a metadata-authoring bug) also
+            // yields false: it can't match, so the condition fails CLOSED rather
+            // than silently evaluating true and suppressing/forcing a diagnostic.
             .and_then(|s| regex::Regex::new(regex).ok().map(|r| r.is_match(s)))
-            .unwrap_or(true),
+            .unwrap_or(false),
         Condition::All { of } => of.iter().all(|c| eval_condition(c, node, project)),
         Condition::Any { of } => of.iter().any(|c| eval_condition(c, node, project)),
         Condition::Not { of } => !eval_condition(of, node, project),
@@ -198,7 +202,7 @@ fn is_nonempty(v: Option<&serde_json::Value>) -> bool {
 }
 
 fn emit_rule_diagnostic(node: &NodeDefinition, rule: &ValidationRule, out: &mut Vec<Diagnostic>) {
-    let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+    let span = node.header_span_or_default();
     let severity = match rule.then.severity {
         RuleSeverity::Error => Severity::Error,
         RuleSeverity::Warning => Severity::Warning,
@@ -206,16 +210,11 @@ fn emit_rule_diagnostic(node: &NodeDefinition, rule: &ValidationRule, out: &mut 
         RuleSeverity::Hint => Severity::Hint,
     };
     let message = interpolate(&rule.then.message, node, &rule.then);
-    out.push(Diagnostic {
-        line,
-        column: 0,
-        severity,
-        message,
-        code: Some(match rule.then.level {
-            ValidationLevel::Structural => "rule-structural".into(),
-            ValidationLevel::Runtime => "rule-runtime".into(),
-        }),
-    });
+    let code = match rule.then.level {
+        ValidationLevel::Structural => "rule-structural",
+        ValidationLevel::Runtime => "rule-runtime",
+    };
+    out.push(Diagnostic::at(span, severity, code, message));
 }
 
 /// Replace `{id}`, `{port}`, `{field}` placeholders in the rule
@@ -233,18 +232,15 @@ fn interpolate(template: &str, node: &NodeDefinition, diag: &RuleDiagnostic) -> 
 
 fn push(
     d: &mut Vec<Diagnostic>,
-    line: usize,
+    span: Span,
     severity: Severity,
     code: &str,
     message: impl Into<String>,
 ) {
-    d.push(Diagnostic {
-        line,
-        column: 0,
-        severity,
-        message: message.into(),
-        code: Some(code.to_string()),
-    });
+    // One construction path: a span -> the four Diagnostic position fields. The
+    // span is the offending node/edge/field's own range (its full extent), so
+    // validate diagnostics get the same ranged underlines the parse layer does.
+    d.push(Diagnostic::at(span, severity, code, message));
 }
 
 // ─── group 1: structural integrity ──────────────────────────────────────────
@@ -259,11 +255,11 @@ fn push(
 fn check_duplicates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     let mut seen: std::collections::HashMap<&str, usize> = Default::default();
     for node in &project.nodes {
-        let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+        let span = node.header_span_or_default();
         match seen.get(node.id.as_str()) {
             Some(first_line) => push(
                 d,
-                line,
+                span,
                 Severity::Error,
                 "duplicate-node-id",
                 format!(
@@ -272,7 +268,7 @@ fn check_duplicates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 ),
             ),
             None => {
-                seen.insert(&node.id, line);
+                seen.insert(&node.id, span.start_line);
             }
         }
     }
@@ -286,11 +282,11 @@ fn check_edge_node_refs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     let ids: std::collections::HashSet<&str> =
         project.nodes.iter().map(|n| n.id.as_str()).collect();
     for edge in &project.edges {
-        let line = edge.span.map(|s| s.start_line).unwrap_or(0);
+        let span = edge.span.unwrap_or_default();
         if !ids.contains(edge.source.as_str()) {
             push(
                 d,
-                line,
+                span,
                 Severity::Error,
                 "unknown-source-node",
                 format!("edge references unknown source node '{}'", edge.source),
@@ -299,7 +295,7 @@ fn check_edge_node_refs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if !ids.contains(edge.target.as_str()) {
             push(
                 d,
-                line,
+                span,
                 Severity::Error,
                 "unknown-target-node",
                 format!("edge references unknown target node '{}'", edge.target),
@@ -336,10 +332,10 @@ fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>
         if src.scope == tgt.scope {
             continue;
         }
-        let line = edge.span.map(|s| s.start_line).unwrap_or(0);
+        let span = edge.span.unwrap_or_default();
         push(
             d,
-            line,
+            span,
             Severity::Error,
             "scope-reachability",
             format!(
@@ -366,7 +362,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     for edge in &project.edges {
-        let line = edge.span.map(|s| s.start_line).unwrap_or(0);
+        let span = edge.span.unwrap_or_default();
         let Some(src) = by_id.get(edge.source.as_str()) else { continue };
         let Some(tgt) = by_id.get(edge.target.as_str()) else { continue };
 
@@ -386,7 +382,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                         names.join(", ")
                     ),
                 };
-                push(d, line, Severity::Error, "unknown-source-port", msg);
+                push(d, span, Severity::Error, "unknown-source-port", msg);
             }
         }
 
@@ -406,7 +402,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                         names.join(", ")
                     ),
                 };
-                push(d, line, Severity::Error, "unknown-target-port", msg);
+                push(d, span, Severity::Error, "unknown-target-port", msg);
             }
         }
     }
@@ -418,11 +414,11 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     for edge in &project.edges {
         let Some(handle) = edge.target_handle.as_deref() else { continue };
         let key = (edge.target.clone(), handle.to_string());
-        let line = edge.span.map(|s| s.start_line).unwrap_or(0);
+        let span = edge.span.unwrap_or_default();
         if let Some(first) = seen.get(&key) {
             push(
                 d,
-                line,
+                span,
                 Severity::Error,
                 "duplicate-input-port",
                 format!(
@@ -431,7 +427,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 ),
             );
         } else {
-            seen.insert(key, line);
+            seen.insert(key, span.start_line);
         }
     }
 }
@@ -491,7 +487,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     for edge in &project.edges {
-        let line = edge.span.map(|s| s.start_line).unwrap_or(0);
+        let span = edge.span.unwrap_or_default();
         let Some(src) = by_id.get(edge.source.as_str()) else { continue };
         let Some(tgt) = by_id.get(edge.target.as_str()) else { continue };
         let Some(src_port) = src
@@ -506,7 +502,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         else { continue };
 
         if src_port.port_type.is_must_override() {
-            push(d, line, Severity::Error, "must-override-unmet",
+            push(d, span, Severity::Error, "must-override-unmet",
                 format!(
                     "source port '{}.{}' is MustOverride. Declare a concrete type in weft source.",
                     edge.source, src_port.name,
@@ -514,7 +510,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             continue;
         }
         if tgt_port.port_type.is_must_override() {
-            push(d, line, Severity::Error, "must-override-unmet",
+            push(d, span, Severity::Error, "must-override-unmet",
                 format!(
                     "target port '{}.{}' is MustOverride. Declare a concrete type in weft source.",
                     edge.target, tgt_port.name,
@@ -523,7 +519,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
 
         if matches!(&src_port.port_type, weft_core::weft_type::WeftType::TypeVar(_)) {
-            push(d, line, Severity::Error, "unresolved-typevar",
+            push(d, span, Severity::Error, "unresolved-typevar",
                 format!(
                     "source port '{}.{}' type '{}' unresolved; connect it to something concrete or declare the type",
                     edge.source, src_port.name, src_port.port_type,
@@ -531,7 +527,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             continue;
         }
         if matches!(&tgt_port.port_type, weft_core::weft_type::WeftType::TypeVar(_)) {
-            push(d, line, Severity::Error, "unresolved-typevar",
+            push(d, span, Severity::Error, "unresolved-typevar",
                 format!(
                     "target port '{}.{}' type '{}' unresolved; connect it to something concrete or declare the type",
                     edge.target, tgt_port.name, tgt_port.port_type,
@@ -540,7 +536,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
 
         if !weft_core::weft_type::WeftType::is_edge_compatible(&src_port.port_type, &tgt_port.port_type) {
-            push(d, line, Severity::Error, "type-mismatch",
+            push(d, span, Severity::Error, "type-mismatch",
                 format!(
                     "cannot connect '{}.{}: {}' to '{}.{}: {}'",
                     edge.source, src_port.name, src_port.port_type,
@@ -558,11 +554,13 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         for (key, value) in obj {
             let Some(port) = node.inputs.iter().find(|p| p.name == *key) else { continue };
             if !port.configurable { continue }
-            let line = node.config_spans.get(key).map(|s| s.span.start_line)
-                .or_else(|| node.header_span.map(|s| s.start_line)).unwrap_or(0);
+            // The culprit is the config field itself; fall back to the node
+            // header if the field span is missing.
+            let span = node.config_spans.get(key).map(|s| s.span)
+                .or(node.header_span).unwrap_or_default();
             let inferred = weft_core::weft_type::WeftType::infer(value);
             if !weft_core::weft_type::WeftType::is_compatible(&inferred, &port.port_type) {
-                push(d, line, Severity::Error, "config-type-mismatch",
+                push(d, span, Severity::Error, "config-type-mismatch",
                     format!(
                         "config '{}.{}: {}' incompatible with port type '{}'",
                         node.id, key, inferred, port.port_type,
@@ -600,7 +598,7 @@ fn check_port_coverage(
         if node.node_type == "Passthrough" {
             continue;
         }
-        let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+        let span = node.header_span_or_default();
 
         for port in &node.inputs {
             let has_edge = driven.contains(&(node.id.clone(), port.name.clone()));
@@ -613,7 +611,7 @@ fn check_port_coverage(
             if port.required && !has_edge && !has_config {
                 push(
                     d,
-                    line,
+                    span,
                     Severity::Error,
                     "required-port-unmet",
                     format!(
@@ -626,7 +624,7 @@ fn check_port_coverage(
             if has_config && !port.configurable {
                 push(
                     d,
-                    line,
+                    span,
                     Severity::Error,
                     "wired-only-port-config",
                     format!(
@@ -654,7 +652,7 @@ fn check_port_coverage(
             if !any_met {
                 push(
                     d,
-                    line,
+                    span,
                     Severity::Error,
                     "require-one-of-unmet",
                     format!(
@@ -698,7 +696,7 @@ fn check_port_coverage(
                 }
                 push(
                     d,
-                    node.config_spans.get(key).map(|s| s.span.start_line).unwrap_or(line),
+                    node.config_spans.get(key).map(|s| s.span).unwrap_or(span),
                     Severity::Error,
                     "undeclared-port-no-custom",
                     format!(
@@ -728,7 +726,7 @@ fn check_port_coverage(
                     if !seen.insert(port.name.as_str()) {
                         push(
                             d,
-                            line,
+                            span,
                             Severity::Error,
                             "form-field-conflict",
                             format!(
@@ -743,10 +741,9 @@ fn check_port_coverage(
     }
 
     // Note: literal-to-output-port from the v1 audit is enforced at
-    // parse time: `out.port = "literal"` syntax is routed through
-    // try_parse_literal and becomes a ConfigFill, which the parser
-    // rejects when the target port is output-only. No extra check
-    // needed at validate.
+    // parse time: a `node.port = "literal"` line is lowered to a config
+    // field on the node (not an edge), which the port checks reject when
+    // the target port is output-only. No extra check needed at validate.
 }
 
 // ─── group 5: lane mechanics ────────────────────────────────────────────────
@@ -765,7 +762,7 @@ fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     for edge in &project.edges {
-        let line = edge.span.map(|s| s.start_line).unwrap_or(0);
+        let span = edge.span.unwrap_or_default();
         let Some(src) = by_id.get(edge.source.as_str()) else { continue };
         let Some(tgt) = by_id.get(edge.target.as_str()) else { continue };
         let Some(src_port) = src
@@ -792,7 +789,7 @@ fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 
         if src_depth > tgt_depth {
             if !user_typed_both {
-                push(d, line, Severity::Warning, "implicit-expand",
+                push(d, span, Severity::Warning, "implicit-expand",
                     format!(
                         "implicit expand on '{}.{} -> {}.{}' (source has {} more List level(s))",
                         edge.source, src_port.name, edge.target, tgt_port.name,
@@ -801,7 +798,7 @@ fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             }
         } else if tgt_depth > src_depth {
             if !user_typed_both {
-                push(d, line, Severity::Warning, "implicit-gather",
+                push(d, span, Severity::Warning, "implicit-gather",
                     format!(
                         "implicit gather on '{}.{} -> {}.{}' (target has {} more List level(s))",
                         edge.source, src_port.name, edge.target, tgt_port.name,
@@ -816,7 +813,7 @@ fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             // warn, user_typed or not.
             if let Some(inner) = innermost(&tgt_port.port_type) {
                 if !admits_null(inner) {
-                    push(d, line, Severity::Warning, "gather-null-warning",
+                    push(d, span, Severity::Warning, "gather-null-warning",
                         format!(
                             "gather target '{}.{}: {}' doesn't admit Null; upstream null values may be silently dropped",
                             edge.target, tgt_port.name, tgt_port.port_type,
@@ -838,7 +835,7 @@ fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         {
             let available = tgt_depth.saturating_sub(src_depth);
             if declared_lane > available.max(1) {
-                push(d, line, Severity::Error, "gather-insufficient-depth",
+                push(d, span, Severity::Error, "gather-insufficient-depth",
                     format!(
                         "gather at '{}.{}' requests depth {} but only {} List level(s) between source and target",
                         edge.target, tgt_port.name, declared_lane, available,
@@ -900,14 +897,14 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if node.node_type == "Passthrough" {
             continue;
         }
-        let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+        let span = node.header_span_or_default();
 
         // orphan-outputs: only flag when the node has outputs at all.
         // Nodes like Debug (no outputs) are terminal and exempt.
         if !node.outputs.is_empty() && !source_nodes.contains(node.id.as_str()) {
             push(
                 d,
-                line,
+                span,
                 Severity::Warning,
                 "orphan-outputs",
                 format!(
@@ -929,7 +926,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         {
             push(
                 d,
-                line,
+                span,
                 Severity::Warning,
                 "no-required-skip",
                 format!(
@@ -946,7 +943,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 if v.is_null() {
                     push(
                         d,
-                        node.config_spans.get(key).map(|s| s.span.start_line).unwrap_or(line),
+                        node.config_spans.get(key).map(|s| s.span).unwrap_or(span),
                         Severity::Warning,
                         "config-null-literal",
                         format!(
@@ -999,9 +996,11 @@ fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic
     };
 
     if outputs.is_empty() {
+        // Project-level diagnostic (no single culprit): a default span renders
+        // it as a file-level problem.
         push(
             d,
-            0,
+            Span::default(),
             Severity::Error,
             "no-output-node",
             "project has no output node (Debug, or any node with `is_output: true`). \
@@ -1037,10 +1036,10 @@ fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic
             continue;
         }
         if !reached.contains(node.id.as_str()) {
-            let line = node.header_span.map(|s| s.start_line).unwrap_or(0);
+            let span = node.header_span_or_default();
             push(
                 d,
-                line,
+                span,
                 Severity::Warning,
                 "unreachable-from-output",
                 format!(

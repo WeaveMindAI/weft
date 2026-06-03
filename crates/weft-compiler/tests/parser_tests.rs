@@ -19,8 +19,9 @@ llm = Llm {
 llm.config = config.value
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
-    assert_eq!(result.name, "Test");
-    assert_eq!(result.description, Some("A test project".to_string()));
+    // `# Project:` / file-level `# Description:` are ordinary comments: the
+    // parsed definition carries no name/description (identity is the manifest
+    // filename; descriptions are per-group).
     assert_eq!(result.nodes.len(), 2);
     assert_eq!(result.edges.len(), 1);
     // Connection direction: left = target input, right = source output
@@ -191,14 +192,14 @@ self = Debug {}
 
 #[test]
 fn test_reserved_type_keyword_as_name() {
-    // Naming a group after the `Group` keyword must fail loudly ON the
+    // Naming a group with the reserved `Group` keyword must fail loudly ON the
     // declaration line (line 3 here), not only cryptically where it's later
-    // referenced. Regression: the palette used to seed groups as "Group".
+    // referenced.
     let source = "# Project: Reserved\n\nGroup = Group() -> (test: MustOverride?) {\n}\n";
     let errors = compile(source, uuid::Uuid::new_v4(), None).unwrap_err();
     let reserved = errors.iter().find(|e| e.message.contains("reserved type keyword"));
     assert!(reserved.is_some(), "expected a reserved-keyword error, got {errors:?}");
-    assert_eq!(reserved.unwrap().line, 3, "error must point at the declaration line");
+    assert_eq!(reserved.unwrap().line(), 3, "error must point at the declaration line");
 }
 
 #[test]
@@ -743,19 +744,20 @@ node = Llm {
 }
 
 #[test]
-fn test_post_config_output_ports_with_blank_lines() {
-    let source = r#"
-# Project: PostConfigBlank
-node = Llm {
-    temperature: 0.7
-}
-
--> (result: String)
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile post-config with blank lines before ->");
-    let node = &result.nodes[0];
-    assert_eq!(node.outputs.len(), 1);
-    assert_eq!(node.outputs[0].name, "result");
+fn test_blank_line_terminates_decl_before_post_sig() {
+    // A decl is one contiguous block: a BLANK line between `}` and a post-body
+    // `-> (out)` ends the decl, so the dangling `-> (...)` is a separate,
+    // malformed statement (loud error), NOT the node's output signature. The
+    // post-sig must sit on the immediately-following line (see the multiline +
+    // separate-line tests below for the accepted forms).
+    let source = "node = Llm {\n    temperature: 0.7\n}\n\n-> (result: String)\n";
+    let errors = compile(source, uuid::Uuid::new_v4(), None).unwrap_err();
+    // The dangling `-> (...)` is unparseable content (a separate statement), so
+    // it surfaces as a loud "Unexpected content" error, not a silent output port.
+    assert!(
+        errors.iter().any(|e| e.message.contains("Unexpected content")),
+        "blank line before -> must be a loud error: {errors:?}"
+    );
 }
 
 #[test]
@@ -940,16 +942,90 @@ node = ExecPython {
 }
 
 #[test]
-fn test_config_bare_string() {
-    let source = r#"
-# Project: Bare
-node = ExecPython {
-    mode: streaming
+fn bare_unquoted_value_is_loud() {
+    // An UNQUOTED scalar (`mode: streaming`) is not a valid value: a string
+    // literal must be quoted, a port reference must be dotted (`node.port`), and
+    // a type expression is not assignable. A bare identifier was silently coerced
+    // into the string `"streaming"` (and a bare port name like `text = raw` into
+    // the string `"raw"`, dropping the intended wire). It must fail loud.
+    let source = "# Project: Bare\nnode = ExecPython {\n    mode: streaming\n}\n";
+    let errs = compile(source, uuid::Uuid::new_v4(), None).unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.message.contains("has an invalid value `streaming`")),
+        "bare unquoted value must be a loud error: {errs:?}"
+    );
+    // The quoted form is the valid way to write the same literal.
+    let quoted = "# Project: Bare\nnode = ExecPython {\n    mode: \"streaming\"\n}\n";
+    let p = compile(quoted, uuid::Uuid::new_v4(), None).expect("quoted value compiles");
+    assert_eq!(p.nodes[0].config.get("mode").unwrap().as_str().unwrap(), "streaming");
 }
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile bare string");
-    let node = &result.nodes[0];
-    assert_eq!(node.config.get("mode").unwrap().as_str().unwrap(), "streaming");
+
+#[test]
+fn non_file_marker_value_is_loud() {
+    // `@file(...)` is the ONLY marker valid as a config value. Any other `@...`
+    // (a typo, `@include`, `@require_one_of`, a bare `@`) used to be silently
+    // stored as a literal string; now it fails loud.
+    let bare = |v: &str| {
+        let src = format!("u = Text {{\n  value: {v}\n}}\n");
+        compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None).1
+    };
+    for v in ["@bogus(x)", "@include(\"x.weft\")", "@require_one_of(a, b)", "@x"] {
+        let errs = bare(v);
+        assert!(errs.iter().any(|e| e.message.contains("invalid marker value")), "`{v}` must be loud: {errs:?}");
+    }
+}
+
+#[test]
+fn malformed_json_value_is_loud() {
+    // A `[`/`{`-leading value that isn't valid JSON used to be silently coerced
+    // to a string (hiding `[a, b]`-style wiring typos). Now it fails loud, while
+    // valid JSON still parses.
+    let errs = |v: &str| {
+        let src = format!("u = Text {{\n  value: {v}\n}}\n");
+        compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None).1
+    };
+    for v in ["{bad}", "[a, b]", "{\"k\": }", "[1, 2,]"] {
+        assert!(errs(v).iter().any(|e| e.message.contains("invalid JSON value")), "`{v}` must be loud: {:?}", errs(v));
+    }
+    // Valid JSON parses with no error.
+    for v in ["[1, 2, 3]", "{\"k\": \"v\"}", "[]", "{\"a\": [1, {\"b\": 2}]}"] {
+        assert!(errs(v).is_empty(), "`{v}` is valid JSON: {:?}", errs(v));
+    }
+}
+
+#[test]
+fn out_of_range_number_is_loud_not_null() {
+    // A numeric value whose magnitude overflows f64 to infinity has NO finite JSON
+    // representation. `serde_json::json!(f64::INFINITY)` silently yields `null`, so
+    // it must fail loud instead of storing a `null` the user never wrote.
+    let nines = "9".repeat(320);
+    let src = format!("u = Text {{\n  value: {nines}\n}}\n");
+    let (project, errs) = compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.iter().any(|e| e.message.contains("out-of-range numeric value")), "huge number must be loud: {errs:?}");
+    // And it must NOT have been stored as a null in the node's config.
+    if let Some(n) = project.nodes.iter().find(|n| n.id == "u") {
+        assert!(!n.config.get("value").is_some_and(|v| v.is_null()), "out-of-range number must never become a silent null: {:?}", n.config.get("value"));
+    }
+    // A normal number still parses fine (regression guard for the happy path).
+    let (_, ok) = compile_lenient("u = Text {\n  value: 42\n}\n", uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(ok.is_empty(), "normal integer parses: {ok:?}");
+}
+
+#[test]
+fn label_must_be_a_quoted_string_or_heredoc() {
+    // A `_label` is a STRING; bare/non-string labels fail loud, quoted and heredoc
+    // forms are valid. (The label path used to bypass the value gate entirely.)
+    let errs = |label: &str| {
+        let src = format!("u = Text {{\n  _label: {label}\n  value: \"x\"\n}}\n");
+        compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None).1
+    };
+    assert!(errs("raw").iter().any(|e| e.message.contains("'_label' has an invalid value")), "bare label loud: {:?}", errs("raw"));
+    assert!(errs("42").iter().any(|e| e.message.contains("'_label' has an invalid value")), "numeric label loud: {:?}", errs("42"));
+    assert!(errs("\"Name\"").is_empty(), "quoted label valid: {:?}", errs("\"Name\""));
+    // Heredoc label is valid (the editor emits one for a multiline label).
+    let (p, herr) = compile_lenient("u = Text {\n  _label: ```\nMulti\nLine\n```\n  value: \"x\"\n}\n", uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(herr.is_empty(), "heredoc label valid: {herr:?}");
+    assert_eq!(p.nodes.iter().find(|n| n.id == "u").and_then(|n| n.label.as_deref()), Some("Multi\nLine"));
 }
 
 #[test]
@@ -982,17 +1058,57 @@ node = ExecPython {
 }
 
 #[test]
-fn test_label_unquoted() {
-    let source = r#"
-# Project: LabelBare
-node = ExecPython {
-    _label: Worker
-    code: "return {}"
+fn unquoted_label_is_loud() {
+    // A label is a STRING: it must be quoted. A bare `_label: Worker` used to be
+    // silently coerced to the string "Worker"; now it fails loud like any other
+    // unquoted value.
+    let bare = "# Project: LabelBare\nnode = ExecPython {\n    _label: Worker\n    code: \"return {}\"\n}\n";
+    let errs = compile(bare, uuid::Uuid::new_v4(), None).unwrap_err();
+    assert!(errs.iter().any(|e| e.message.contains("'_label' has an invalid value")), "bare label must be loud: {errs:?}");
+
+    // The quoted form is valid.
+    let quoted = "# Project: LabelBare\nnode = ExecPython {\n    _label: \"Worker\"\n    code: \"return {}\"\n}\n";
+    let p = compile(quoted, uuid::Uuid::new_v4(), None).expect("quoted label compiles");
+    assert_eq!(p.nodes[0].label.as_deref(), Some("Worker"));
 }
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile unquoted label");
-    let node = &result.nodes[0];
-    assert_eq!(node.label.as_deref(), Some("Worker"));
+
+#[test]
+fn label_has_one_home_and_one_syntax() {
+    // `_label` is the node's LABEL (stored in `node.label`), set ONLY via the body
+    // `_label: "..."` field. Two regressions: (1) two body `_label`s silently kept
+    // the last (the label path bypassed the dup gate); (2) a connection-origin
+    // `n._label = "x"` silently landed in `config["_label"]` (where nothing reads
+    // it) while `node.label` stayed empty. Both must fail loud.
+    let dup = "n = Text {\n  _label: \"a\"\n  _label: \"b\"\n}\n";
+    let (_p, errs) = compile_lenient(dup, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.iter().any(|e| e.message.contains("duplicate '_label'")), "dup label loud: {errs:?}");
+
+    let conn = "n = Text {}\nn._label = \"viaconn\"\n";
+    let (p2, errs2) = compile_lenient(conn, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs2.iter().any(|e| e.message.contains("a node's label is set with a body field")), "conn-origin label loud: {errs2:?}");
+    // And it did NOT silently land in config.
+    let n = p2.nodes.iter().find(|n| n.id == "n").expect("node n");
+    assert!(n.config.get("_label").is_none(), "no silent config['_label']: {:?}", n.config);
+}
+
+#[test]
+fn flatten_never_ships_duplicate_node_ids() {
+    // A node-id collision is a loud parse error, but the LENIENT render path
+    // always returns a project. Without a node dedup it would hand the renderer
+    // two `NodeDefinition`s with one id (here an include alias `c` colliding with
+    // a sibling group `c` -> two `root.c__in`/`root.c__out`). flatten dedups nodes
+    // (keeping the first) like it dedups edges, so the rendered set has unique ids.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("coll.weft"),
+        "Group(x: String) -> (y: String) {\n  m = Text { value: \"v\" }\n  self.y = m.value\n}\n").unwrap();
+    let src = "root = Group() {\n  c = @include(\"coll.weft\")\n  c = Group() -> (z: String) {}\n}\n";
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Full, None);
+    // The collision IS reported loudly.
+    assert!(errs.iter().any(|e| e.message.contains("Duplicate id")), "collision reported: {errs:?}");
+    // But the rendered node set has NO duplicate id.
+    let mut ids: Vec<&str> = p.nodes.iter().map(|n| n.id.as_str()).collect();
+    ids.sort();
+    assert!(ids.windows(2).all(|w| w[0] != w[1]), "no duplicate node id in the rendered set: {ids:?}");
 }
 
 #[test]
@@ -1191,7 +1307,6 @@ node2 = Text { value: "hi" }
 fn test_empty_source() {
     let source = "";
     let result = compile(source, uuid::Uuid::new_v4(), None).expect("empty project should compile");
-    assert_eq!(result.name, "Untitled Project");
     assert_eq!(result.nodes.len(), 0);
 }
 
@@ -1205,18 +1320,9 @@ fn test_comments_only() {
 # More comments
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
-    assert_eq!(result.name, "CommentsOnly");
+    // `# Project:` is now an ordinary comment, not a name source.
     assert_eq!(result.nodes.len(), 0);
     assert_eq!(result.edges.len(), 0);
-}
-
-#[test]
-fn test_no_project_name_uses_default() {
-    let source = r#"
-node = Text { value: "hi" }
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile without project name");
-    assert_eq!(result.name, "Untitled Project");
 }
 
 // ─── Multiline Port Signatures ─────────────────────────────────────────────
@@ -1588,8 +1694,6 @@ output = Debug {}
 output.data = llm.response
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile full workflow");
-    assert_eq!(result.name, "Full Workflow");
-    assert_eq!(result.description, Some("Small end-to-end test".to_string()));
     // input + processor__in + processor__out + processor.trimmer + llm + output = 6
     assert_eq!(result.nodes.len(), 6);
     // input->processor__in, processor__in->trimmer, trimmer->processor__out,
@@ -1990,6 +2094,30 @@ c = @include("cleaner.weft")
     assert!(project.nodes.iter().any(|n| n.id == "c.strip"));
 }
 
+/// An included file with INTERNAL nesting (a nested group + an inline-expr) must
+/// scope every id under the call-site alias in ONE pass (no `rescope_group`
+/// string surgery). Pins the include-reshape: the included file is parsed with
+/// the alias as its anon-root id, so internals are `{alias}.*` directly.
+#[test]
+fn include_with_nested_group_scopes_under_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("comp.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n  sub = Group(i: String) -> (o: String) {\n    inner = Text { value: \"y\" }\n    self.o = inner.value\n  }\n  pick = Text { value: Upper { text: \"z\" }.out }\n  self.cleaned = sub.o\n}\n",
+    ).unwrap();
+    let project = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let ids: std::collections::HashSet<&str> = project.nodes.iter().map(|n| n.id.as_str()).collect();
+    // Boundary passthroughs of the included root and the nested sub-group, all
+    // scoped under the alias `c` in one pass.
+    assert!(ids.contains("c__in") && ids.contains("c__out"), "root boundaries: {ids:?}");
+    assert!(ids.contains("c.sub__in") && ids.contains("c.sub__out"), "nested-group boundaries: {ids:?}");
+    assert!(ids.contains("c.sub.inner"), "deep child: {ids:?}");
+    // The inline-expr anon node is scoped under the alias too (`c.pick__value`).
+    assert!(ids.contains("c.pick__value"), "inline anon under alias: {ids:?}");
+    // No id leaked the included file's own derived id (`Comp`) or stayed unscoped.
+    assert!(!ids.iter().any(|i| i.starts_with("Comp")), "no leaked source id: {ids:?}");
+}
+
 #[test]
 fn include_interface_emits_opaque_node() {
     use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode, INCLUDE_NODE_TYPE};
@@ -2000,7 +2128,7 @@ fn include_interface_emits_opaque_node() {
 c = @include("cleaner.weft")
 "#;
     // Interface mode (editor): one opaque node carrying the group's ports.
-    let project = compile_with_mode(source, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface)
+    let project = compile_with_mode(source, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface, None)
         .expect("compile");
     let c = project.nodes.iter().find(|n| n.id == "c").expect("opaque include node");
     assert_eq!(c.node_type, INCLUDE_NODE_TYPE);
@@ -2027,20 +2155,20 @@ g = Group -> (out: String) {
     self.out = inc.cleaned
 }
 "#;
-    let project = compile_with_mode(source, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface)
+    let project = compile_with_mode(source, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface, None)
         .expect("compile (sibling edge into opaque include must stay in-scope)");
     let inc = project.nodes.iter().find(|n| n.id == "g.inc").expect("g.inc opaque node");
     assert_eq!(inc.scope, vec!["g".to_string()]);
 }
 
 #[test]
-fn relabel_anonymous_root_scrubs_sentinel_completely() {
-    // A standalone anonymous component flattens under the __include_root__
-    // sentinel. relabel_anonymous_root must rewrite it to the given name
-    // across EVERY id-bearing field, at EVERY nesting depth: no sentinel may
-    // survive anywhere (a nested child group whose label defaults to its id
-    // is the case round-2 missed).
-    use weft_compiler::weft_compiler::{compile_with_mode, relabel_anonymous_root, IncludeMode};
+fn anonymous_root_takes_source_id_at_every_depth() {
+    // A standalone anonymous component takes its id DIRECTLY from the source
+    // name (`source_name` passed to the compiler), at parse/flatten time. The
+    // id must reach EVERY id-bearing field at EVERY nesting depth, with no
+    // sentinel and no rename pass: the root group, its boundary passthroughs,
+    // nested child groups (whose label defaults to their id), and edge ids.
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
     let source = r#"
 Group(raw: String) -> (cleaned: String) {
     strip = Text { value: "x" }
@@ -2052,21 +2180,53 @@ Group(raw: String) -> (cleaned: String) {
     self.cleaned = sub.out
 }
 "#;
-    let mut project = compile_with_mode(source, uuid::Uuid::new_v4(), None, IncludeMode::Interface)
+    let project = compile_with_mode(source, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Cleaner"))
         .expect("compile");
-    relabel_anonymous_root(&mut project, "Cleaner", "My Cleaner");
 
     let blob = serde_json::to_string(&project).unwrap();
-    assert!(!blob.contains("__include_root__"), "sentinel survived: {blob}");
-    let root = project.groups.iter().find(|g| g.id == "Cleaner").expect("renamed root group");
-    assert_eq!(root.label.as_deref(), Some("My Cleaner"));
-    // The nested child group's id AND its (id-derived) label are scrubbed.
-    let child = project.groups.iter().find(|g| g.id == "Cleaner.sub").expect("renamed child group");
+    assert!(!blob.contains("__include_root__"), "no sentinel anywhere: {blob}");
+    let root = project.groups.iter().find(|g| g.id == "Cleaner").expect("root group named from source");
+    // The anonymous root's label defaults to its id (the filename humanization
+    // for display is the CLI/editor's concern, not the flatten's).
+    assert_eq!(root.label.as_deref(), Some("Cleaner"));
+    // The nested child group's id AND its (id-derived) label use the source id.
+    let child = project.groups.iter().find(|g| g.id == "Cleaner.sub").expect("child group under root");
     assert_eq!(child.label.as_deref(), Some("Cleaner.sub"));
     assert!(project.nodes.iter().any(|n| n.id == "Cleaner.sub.inner"));
     assert!(project.nodes.iter().any(|n| n.id == "Cleaner__out"));
-    // Edge ids recomputed from mapped endpoints (not string-replaced).
-    assert!(project.edges.iter().all(|e| !e.id.contains("__include_root__")));
+}
+
+/// `__` is reserved for compiler-generated ids (`{group}__in`/`__out` boundary
+/// passthroughs, `{host}__{field}` inline anon nodes). A user name containing
+/// `__` would collide with those at flatten into a SILENT duplicate id (e.g. a
+/// node `foo__in` beside a group `foo` -> two `g.foo__in`). It must be rejected
+/// loudly at the source for nodes, groups, AND include aliases.
+#[test]
+fn double_underscore_user_names_rejected_loud() {
+    let needs = |src: &str, what: &str| {
+        let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+        assert!(
+            errs.iter().any(|e| e.message.contains("reserved for compiler-generated ids")),
+            "{what}: must reject `__` loudly: {errs:?}"
+        );
+        // And no duplicate flattened id slips through.
+        let mut ids: Vec<_> = p.nodes.iter().map(|n| n.id.clone()).collect();
+        ids.sort();
+        assert!(ids.windows(2).all(|w| w[0] != w[1]), "{what}: no duplicate id: {ids:?}");
+    };
+    // A node named `foo__in` beside a group `foo` (the original silent-collision).
+    needs(
+        "g = Group(x: String) -> (y: String) {\n  foo__in = Text { value: \"v\" }\n  foo = Group(p: String) -> (q: String) {\n    inner = Text { value: \"i\" }\n    self.q = inner.value\n  }\n  foo.p = foo__in.value\n  self.y = foo.q\n}\n",
+        "node-vs-group-boundary",
+    );
+    // A group named with `__`.
+    needs("bad__name = Group() -> () {\n  n = Debug\n}\n", "group-name");
+    // A node named with `__`.
+    needs("a__b = Debug\n", "node-name");
+
+    // A plausible legit name WITHOUT `__` still compiles fine (no false positive).
+    let (_p, errs) = compile_lenient("my_node = Debug\n", uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "single underscore is fine: {errs:?}");
 }
 
 #[test]
@@ -2093,6 +2253,96 @@ fn include_rejects_loose_nodes() {
 }
 
 #[test]
+fn include_rejects_loose_top_level_connection() {
+    // An included file's only top-level content may be the one anonymous Group.
+    // A loose top-level connection alongside it is silently DROPPED (only the
+    // group is consumed), so the gate must reject it loudly. Regression: the
+    // `single_anon` check didn't look at `connections`.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("comp.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\nlost_src.out = lost_tgt.in\n",
+    ).unwrap();
+    let errs = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    assert!(errs.iter().any(|e| e.message.contains("anonymous top-level Group")), "loose connection must be rejected: {errs:?}");
+}
+
+#[test]
+fn duplicate_config_key_is_loud() {
+    // A config key set twice on one node (a body field AND a connection-origin
+    // field, or two body fields) is a LOUD error, not silent last-write-wins.
+    // Last-write-wins let the editor's per-key SetConfig/RemoveConfig touch only
+    // one of the two values and strand the other.
+    let body_then_conn = "t = Text {\n  value: \"a\"\n}\nt.value = \"b\"\n";
+    let (_p, errs) = compile_lenient(body_then_conn, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.iter().any(|e| e.message.contains("duplicate config field 'value'")), "body+conn dup: {errs:?}");
+
+    let two_body = "t = Text {\n  value: \"a\"\n  value: \"b\"\n}\n";
+    let (_p2, errs2) = compile_lenient(two_body, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs2.iter().any(|e| e.message.contains("duplicate config field 'value'")), "two body fields dup: {errs2:?}");
+}
+
+#[test]
+fn literal_to_non_node_port_is_loud() {
+    // A literal is the "visual config" sugar that only a NODE has. Assigning one
+    // to a port with no node config behind it is meaningless and previously
+    // produced a phantom edge with an EMPTY source and no diagnostic. All such
+    // targets must fail loud: a group boundary (`self.out`), and a group/include
+    // alias port (`c.raw`). A node config fill (`n.port = "v"`) and an inline
+    // node (`c.raw = Text{...}.value`) are still valid.
+    let assert_loud = |src: &str, base: Option<&std::path::Path>, what: &str| {
+        let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), base, IncludeMode::Interface, None);
+        assert!(
+            errs.iter().any(|e| e.message.contains("only a node's own port takes a literal config value")),
+            "{what}: literal to a non-node port must be loud: {errs:?}"
+        );
+        assert!(!p.edges.iter().any(|e| e.source.is_empty()), "{what}: no empty-source edge: {:?}", p.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>());
+    };
+    // Literal to a group's own boundary output.
+    assert_loud("g = Group() -> (out: String) {\n  self.out = \"lit\"\n}\n", None, "self-boundary");
+    // Literal to an @include alias's input port (a group has no visual config).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("comp.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\n").unwrap();
+    assert_loud("c = @include(\"comp.weft\")\nc.raw = \"hi\"\n", Some(dir.path()), "include-alias-port");
+
+    // BUT an inline node driving the include port is still valid (it's wiring,
+    // not a literal): a real node is synthesized and wired, no error.
+    let (_p, errs) = compile_lenient(
+        "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n",
+        uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface, None,
+    );
+    assert!(!errs.iter().any(|e| e.message.contains("only a node's own port takes")), "inline node to a group port is valid: {errs:?}");
+}
+
+#[test]
+fn bare_port_name_reference_is_loud_not_a_literal() {
+    // To wire a group's own input port `raw` into a node, the form is
+    // `u.text = self.raw`. Writing `u.text = raw` (bare port name) used to be
+    // SILENTLY coerced to the literal string `"raw"` (config `text: "raw"`), so
+    // the group input was left unwired and the user's intent vanished with no
+    // diagnostic. A bare identifier RHS must now fail loud.
+    let bare = "g = Group(raw: String) -> (o: String) {\n  u = Upper {}\n  u.text = raw\n  self.o = u.out\n}\n";
+    let (p, errs) = compile_lenient(bare, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Top"));
+    assert!(
+        errs.iter().any(|e| e.message.contains("has an invalid value `raw`")),
+        "bare port-name reference must be a loud error: {errs:?}"
+    );
+    // It must NOT have silently become the literal string "raw" on the node.
+    let u = p.nodes.iter().find(|n| n.id == "g.u").expect("node g.u");
+    assert!(u.config.get("text").is_none(), "no silent literal `text: \"raw\"`: {:?}", u.config);
+
+    // The correct `self.raw` form wires the group input boundary into the node.
+    let wired = "g = Group(raw: String) -> (o: String) {\n  u = Upper {}\n  u.text = self.raw\n  self.o = u.out\n}\n";
+    let (p2, errs2) = compile_lenient(wired, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Top"));
+    assert!(!errs2.iter().any(|e| e.message.contains("invalid value")), "self.raw is valid: {errs2:?}");
+    assert!(
+        p2.edges.iter().any(|e| e.source == "g__in" && e.target == "g.u"),
+        "self.raw wires the group input into u: {:?}", p2.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn duplicate_id_across_kinds_is_error() {
     // An include alias then a node reusing the alias (and vice versa) is a
     // duplicate id regardless of declaration order: nodes, groups, and include
@@ -2110,8 +2360,9 @@ fn duplicate_id_across_kinds_is_error() {
 
 #[test]
 fn include_two_anonymous_groups_reports_shape_not_sentinel() {
-    // Two anonymous top-level groups collide on the sentinel id; the error
-    // must explain the real cause, never leak the `__include_root__` sentinel.
+    // Two anonymous top-level groups in one file is illegal (a file is exactly
+    // one interface); the error must explain the real cause. The legacy
+    // `__include_root__` sentinel is gone, but assert it never resurfaces.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("two.weft"),
@@ -2259,8 +2510,267 @@ fn lenient_parse_keeps_valid_nodes_around_a_bad_line() {
     // around it still parse, the bad line is just an error. (compile_lenient +
     // IncludeMode come from the `use weft_compiler::weft_compiler::*` glob.)
     let src = "a = Text {\n  value: \"hi\"\n}\nb = Debug\nb.data = a.value\ndebug\n";
-    let (project, errors) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface);
+    let (project, errors) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
     let ids: Vec<&str> = project.nodes.iter().map(|n| n.id.as_str()).collect();
     assert!(ids.contains(&"a") && ids.contains(&"b"), "valid nodes survive: {ids:?}");
-    assert!(errors.iter().any(|e| e.line == 6), "bad line reported: {errors:?}");
+    assert!(errors.iter().any(|e| e.line() == 6), "bad line reported: {errors:?}");
 }
+
+
+
+#[test]
+fn literal_config_to_undeclared_node_fails_loud() {
+    // Regression: `ghost.temperature = 0.7` with no `ghost` node must be a loud
+    // error, never a phantom edge with an empty source that discards the value.
+    let src = "ghost.temperature = 0.7\nn = Llm { model: \"x\" }\n";
+    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.iter().any(|e| e.message.contains("ghost.temperature")), "loud error: {errs:?}");
+    assert!(!proj.edges.iter().any(|e| e.source.is_empty()), "no empty-source phantom edge: {:?}", proj.edges);
+}
+
+#[test]
+fn literal_config_to_group_or_include_port_is_not_an_error() {
+    // A literal to a GROUP's input port (resolved downstream) is legitimate, not
+    // the undeclared-node error above.
+    let src = "g = Group(inp: String) -> () {\n  d = Debug\n  d.data = self.inp\n}\ng.inp = \"hi\"\n";
+    let (_proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(!errs.iter().any(|e| e.message.contains("is not a declared node")), "group port config must not error: {errs:?}");
+}
+
+#[test]
+fn include_alias_colliding_with_sibling_in_group_is_duplicate() {
+    // Regression: an @include alias colliding with a sibling node name inside a
+    // group body must be flagged duplicate (nodes/groups/include-aliases share
+    // one id namespace).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sub.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n s = Text { value: \"x\" }\n self.cleaned = s.value\n}\n").unwrap();
+    let src = "g = Group() -> () {\n  a = Llm { model: \"x\" }\n  a = @include(\"sub.weft\")\n}\n";
+    let errs = compile(src, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    assert!(errs.iter().any(|e| e.message.contains("Duplicate id 'a'") || e.message.contains("Duplicate id 'g.a'")), "errs: {errs:?}");
+}
+
+// ── round-3: parser-B strictness + inline-expr-in-group regressions ─────────
+
+/// Every malformed statement that fits no accepted form is a loud error AND
+/// still round-trips (the CST keeps a byte-covering error span).
+#[test]
+fn strict_classifier_rejects_malformed_forms() {
+    use weft_compiler::cst::parse;
+    for src in [
+        "a.b.c = d\n",                  // 3-segment LHS
+        "=\n",                          // bare =
+        "= foo\n",                      // no LHS ident
+        "n = @file(\"x\")\n",           // marker (non-include) as a node RHS
+        "x = @includes_other(\"a\")\n", // include-prefix marker, not @include
+    ] {
+        assert_eq!(parse(src).to_string(), src, "must round-trip: {src:?}");
+        let (_p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+        assert!(!errs.is_empty(), "must be a loud error: {src:?} -> {errs:?}");
+    }
+}
+
+/// `} -> (out)` same-line and `}\n-> (out)` single-newline are valid; a blank
+/// line terminates the decl (the post-sig becomes a separate error statement).
+#[test]
+fn post_body_output_sig_newline_rules() {
+    // valid: arrow on the line after `}`
+    let ok = "n = Llm {\n  temperature: 0.7\n}\n-> (out: String)\n";
+    let p = compile(ok, uuid::Uuid::new_v4(), None).expect("single-newline post-sig is valid");
+    assert!(p.nodes[0].outputs.iter().any(|o| o.name == "out"));
+    // valid: `} -> (` same line, ports span multiple lines inside the parens
+    let ml = "n = Llm {\n  temperature: 0.7\n} -> (\n  out: String\n)\n";
+    assert!(compile(ml, uuid::Uuid::new_v4(), None).is_ok(), "same-line arrow + multiline ports valid");
+    // invalid: a blank line before `->`
+    let bad = "n = Llm {\n  temperature: 0.7\n}\n\n-> (out: String)\n";
+    assert!(compile(bad, uuid::Uuid::new_v4(), None).is_err(), "blank line before -> errors");
+}
+
+/// A connection-RHS inline expr INSIDE a group synthesizes an anon node whose id
+/// matches the edge endpoint that names it (no dangling edge).
+#[test]
+fn inline_expr_in_group_has_no_dangling_edge() {
+    let src = "g = Group() -> () {\n  b = Debug\n  b.data = Other { foo: \"y\" }.out\n}\n";
+    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "no errors: {errs:?}");
+    let ids: std::collections::HashSet<&str> = proj.nodes.iter().map(|n| n.id.as_str()).collect();
+    for e in &proj.edges {
+        assert!(ids.contains(e.source.as_str()) || e.source.ends_with("__in") || e.source.ends_with("__out"),
+            "edge source '{}' must reference an existing node: nodes={ids:?}", e.source);
+    }
+    assert!(ids.contains("g.b__data"), "anon node scoped into the group: {ids:?}");
+}
+
+/// The synthesized inline-expr node's `scope` must MATCH its group-scoped id:
+/// id `g.<x>__field` means "in group g", so scope must be `["g"]`, not `[]`.
+/// Regression: the node id was scoped into the group but `parent_id` stayed
+/// None, so its scope array was empty and a sibling edge tripped the
+/// scope-reachability check. Covers BOTH synthesis paths (config-field value
+/// and connection-RHS) since they share `lower_inline_expr`.
+#[test]
+fn inline_expr_node_scope_matches_its_id() {
+    // config-field path: `key: Type{}.port` and connection path: `b.in = Type{}.port`
+    let src = "g = Group() -> () {\n  b = Sink { data: Make { x: \"1\" }.out }\n  c = Debug\n  c.data = Other { y: \"2\" }.out\n}\n";
+    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "no errors: {errs:?}");
+    for anon in ["g.b__data", "g.c__data"] {
+        let node = proj.nodes.iter().find(|n| n.id == anon).unwrap_or_else(|| panic!("missing {anon}: {:?}", proj.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()));
+        assert_eq!(node.scope, vec!["g".to_string()], "{anon} scope must match its group-scoped id");
+    }
+}
+
+/// Two inline exprs on the same parent.field, or a user node colliding with the
+/// synthesized id, is a loud error (not a silent drop / mis-wire).
+#[test]
+fn inline_expr_id_collision_is_loud() {
+    let dup = "n = Foo {\n  x: Bar { k: 1 }.out\n}\nn.x = Baz { k: 2 }.out\n";
+    let (_p, e) = compile_lenient(dup, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(e.iter().any(|d| d.message.contains("duplicate id")), "dup inline loud: {e:?}");
+}
+
+/// A malformed numeric (`1.2.3`, `--`, `3.`) is an ERROR token, not a NUMBER.
+#[test]
+fn malformed_numeric_is_not_a_number() {
+    use weft_compiler::cst::{parse, SyntaxKind};
+    for src in ["1.2.3", "--", "3.", "1-2"] {
+        let has_error = parse(src).descendants_with_tokens().any(|e| e.kind() == SyntaxKind::ERROR);
+        assert!(has_error, "{src:?} must lex to an ERROR token, not a clean NUMBER");
+        assert_eq!(parse(src).to_string(), src, "{src:?} round-trips");
+    }
+}
+
+// ── round-4 regression tests ────────────────────────────────────────────────
+
+/// The error span must BOUND the culprit (start AND end columns), not just the
+/// line, this pins the localization feature that previously shipped untested.
+#[test]
+fn error_span_bounds_the_culprit() {
+    // `ghost.temperature` (cols 0..17 on line 1) is the undeclared config target.
+    let src = "ghost.temperature = 0.7\nn = Llm { model: \"x\" }\n";
+    let (_p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let e = errs.iter().find(|e| e.message.contains("ghost.temperature")).expect("the error");
+    assert_eq!(e.span.start_line, 1);
+    assert_eq!(e.span.start_column, 0, "starts at the culprit, not the line");
+    assert_eq!(e.span.end_line, 1);
+    assert_eq!(e.span.end_column, "ghost.temperature".chars().count(), "ends at the culprit's end, not the whole line");
+}
+
+/// A child named the same as its enclosing group must NOT double-scope (the
+/// round-4 regression): `pipe` inside group `pipe` is `pipe.pipe`, not
+/// `pipe.pipe.pipe`, and an internal edge stays consistent (no dangling).
+#[test]
+fn child_named_like_group_not_double_scoped() {
+    let src = "g = Group() -> () {\n  g = Debug\n  other = Debug\n  other.in = g.out\n}\n";
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "no errors: {errs:?}");
+    let ids: std::collections::HashSet<&str> = p.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains("g.g") && ids.contains("g.other"), "single-scoped: {ids:?}");
+    assert!(!ids.iter().any(|i| i.contains("g.g.g")), "no double-scope: {ids:?}");
+    for e in &p.edges {
+        assert!(ids.contains(e.source.as_str()) || e.source.ends_with("__in") || e.source.ends_with("__out"),
+            "edge source '{}' references an existing node: {ids:?}", e.source);
+    }
+}
+
+/// `Group` followed by anything other than `(`/`->`/`{`/EOL is malformed, ONE
+/// error node, not a phantom group decl.
+#[test]
+fn group_keyword_misuse_is_one_error() {
+    use weft_compiler::cst::{parse, SyntaxKind};
+    for src in ["Group.x = y\n", "Group: v\n"] {
+        let t = parse(src);
+        assert_eq!(t.to_string(), src, "round-trips: {src:?}");
+        let decls = t.children().filter(|c| matches!(c.kind(), SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL)).count();
+        assert_eq!(decls, 0, "{src:?} must not produce a phantom decl");
+        assert!(t.children().any(|c| c.kind() == SyntaxKind::ERROR), "{src:?} is one ERROR");
+    }
+    // valid anon-group forms still parse as a group
+    for src in ["Group() {\n  a = Debug\n}\n", "Group -> (o: String) {}\n"] {
+        let t = parse(src);
+        assert!(t.children().any(|c| c.kind() == SyntaxKind::GROUP_DECL), "{src:?} is a group");
+    }
+}
+
+/// `@require_one_of (a, b)` with a space before `(` must FAIL LOUD, never
+/// silently drop the constraint. The lexer only folds `(...)` into the marker
+/// token when it abuts `@name`, so the space splits the args off; the lowering's
+/// one validity gate then reports a precise, actionable error. The well-formed
+/// `@require_one_of(a, b)` (no space) still parses and carries the constraint.
+#[test]
+fn require_one_of_with_space_before_paren_fails_loud() {
+    let with_space = "g = Group(a: String, b: String) -> () {\n  @require_one_of (a, b)\n  n = Debug\n  n.data = self.a\n}\n";
+    let (_p, errs) = compile_lenient(with_space, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(
+        errs.iter().any(|e| e.message.contains("@require_one_of needs a parenthesized port list")),
+        "space before `(` must be a loud, actionable error: {errs:?}"
+    );
+    // And never the misleading "missing closing parenthesis" (the parens exist).
+    assert!(
+        !errs.iter().any(|e| e.message.contains("missing closing parenthesis")),
+        "must not misreport the spaced form as unbalanced parens: {errs:?}"
+    );
+
+    // The well-formed form carries the constraint with no errors.
+    let no_space = "g = Group(a: String, b: String) -> () {\n  @require_one_of(a, b)\n  n = Debug\n  n.data = self.a\n}\n";
+    let (p2, errs2) = compile_lenient(no_space, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs2.is_empty(), "well-formed @require_one_of has no errors: {errs2:?}");
+    let g = p2.groups.iter().find(|g| g.id == "g").expect("group g");
+    assert_eq!(g.one_of_required, vec![vec!["a".to_string(), "b".to_string()]], "constraint carried");
+
+    // An empty `@require_one_of()` is also a loud error (not a silent no-op).
+    let empty = "g = Group(a: String) -> () {\n  @require_one_of()\n  n = Debug\n  n.data = self.a\n}\n";
+    let (_p3, errs3) = compile_lenient(empty, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(
+        errs3.iter().any(|e| e.message.contains("@require_one_of needs a parenthesized port list")),
+        "empty @require_one_of() must fail loud: {errs3:?}"
+    );
+}
+
+/// A NESTED anonymous `Group(){}` is meaningless (a file has exactly one
+/// interface, the top-level group). It must fail LOUD, not silently invent a
+/// `{source_id}.{source_id}` group. Only the file's top-level group may be anon.
+#[test]
+fn nested_anonymous_group_fails_loud() {
+    let src = "Group(a: String) -> (o: String) {\n  Group(b: String) -> (p: String) {\n    n = Debug\n    self.p = n.data\n  }\n  self.o = a\n}\n";
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Root"));
+    assert!(
+        errs.iter().any(|e| e.message.contains("nested group must be named")),
+        "nested anonymous group must be a loud error: {errs:?}"
+    );
+    // And it must NOT have silently produced a `Root.Root` group.
+    assert!(
+        !p.groups.iter().any(|g| g.id == "Root.Root"),
+        "no silently-invented nested-anon group: {:?}",
+        p.groups.iter().map(|g| &g.id).collect::<Vec<_>>()
+    );
+    // The top-level anonymous group is still fine on its own.
+    let solo = "Group(a: String) -> (o: String) {\n  n = Debug\n  self.o = n.data\n}\n";
+    let (_p2, errs2) = compile_lenient(solo, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Root"));
+    assert!(errs2.is_empty(), "top-level anon group is valid: {errs2:?}");
+}
+
+/// A child node whose local id SHADOWS its enclosing group's name (`g` inside
+/// group `g`) with an inline-expr config must NOT double-scope. Regression: the
+/// synthesized anon node + edge were briefly pre-scoped, so when the host local
+/// matched the group name the rescope pass prefixed it twice (`g.g` -> `g.g.g`).
+/// Anon ids stay raw until ONE scope pass, so this resolves to exactly `g.g`.
+#[test]
+fn inline_expr_host_shadowing_group_name_no_double_scope() {
+    let src = "g = Group() -> () {\n  g = Sink { data: Make { x: \"1\" }.out }\n}\n";
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "no errors: {errs:?}");
+    // The child node is `g.g`; its inline anon is `g.g__data`, both scoped ONCE.
+    assert!(p.nodes.iter().any(|n| n.id == "g.g" && n.scope == ["g"]), "child scoped once: {:?}", p.nodes.iter().map(|n| (&n.id, &n.scope)).collect::<Vec<_>>());
+    assert!(p.nodes.iter().any(|n| n.id == "g.g__data" && n.scope == ["g"]), "anon scoped once: {:?}", p.nodes.iter().map(|n| (&n.id, &n.scope)).collect::<Vec<_>>());
+    // The edge wires `g.g__data.out -> g.g.data`, NOT `g.g.g__data -> g.g.g`.
+    assert!(
+        p.edges.iter().any(|e| e.source == "g.g__data" && e.target == "g.g"),
+        "edge scoped once: {:?}", p.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>()
+    );
+    assert!(
+        !p.nodes.iter().any(|n| n.id.contains("g.g.g")) && !p.edges.iter().any(|e| e.source.contains("g.g.g") || e.target.contains("g.g.g")),
+        "nothing triple-scoped"
+    );
+}
+
+

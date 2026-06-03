@@ -92,15 +92,37 @@ impl NodeInput {
 
 /// Validation diagnostic. Emitted by the generic validate pass and
 /// per-node validators. Mirrored by the VS Code extension's
-/// Diagnostic type; wire format matches.
+/// Diagnostic type; wire format matches. `line`/`column` are the START of the
+/// culprit (1-based line, 0-based char column); `end_line`/`end_column` bound
+/// its end (exclusive) so the editor underlines the exact range, not just a
+/// caret. End defaults to start when a producer only knows a point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub line: usize,
     pub column: usize,
+    #[serde(default, rename = "endLine")]
+    pub end_line: usize,
+    #[serde(default, rename = "endColumn")]
+    pub end_column: usize,
     pub severity: Severity,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+impl Diagnostic {
+    /// A diagnostic bounded to a source `Span` (the culprit's exact range).
+    pub fn at(span: crate::project::Span, severity: Severity, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            line: span.start_line,
+            column: span.start_column,
+            end_line: span.end_line,
+            end_column: span.end_column,
+            severity,
+            message: message.into(),
+            code: Some(code.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,9 +299,10 @@ pub enum Condition {
     ConfigEquals { field: String, equals: Value },
     /// Config field's string value is in a whitelist.
     ConfigInSet { field: String, values: Vec<String> },
-    /// Config field's string value matches a regex. Vacuously true
-    /// if the field is absent or non-string; pair with
-    /// `config_present` when absence itself should fail.
+    /// Config field's string value matches a regex. Fail-closed: false if the
+    /// field is absent, non-string, or the regex is malformed (matching every
+    /// sibling ConfigX condition, which all treat an absent field as not-present).
+    /// Wrap in `not` to assert a non-match.
     ConfigMatches { field: String, regex: String },
     /// All sub-conditions must hold.
     All { of: Vec<Condition> },
@@ -530,5 +553,36 @@ impl NodeOutput {
 
     pub fn get(&self, port: &str) -> Option<&Value> {
         self.outputs.get(port)
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_wire_tests {
+    use super::*;
+    use crate::project::Span;
+
+    /// Layer-2 wire-shape: `Diagnostic` crosses the CLI->editor boundary as JSON
+    /// and the VS Code extension reads `endLine`/`endColumn` (camelCase, the
+    /// editor's range-underline bounds). Pin those renamed keys AND a full
+    /// round-trip so a `#[serde(rename)]` drift fails here, not in the editor.
+    #[test]
+    fn diagnostic_wire_keys() {
+        let d = Diagnostic::at(Span::single_line(3, 4, 10), Severity::Error, "parse", "boom");
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["line"], 3);
+        assert_eq!(v["column"], 4);
+        assert!(v.get("endLine").is_some(), "endLine key (camelCase): {v}");
+        assert!(v.get("endColumn").is_some(), "endColumn key (camelCase): {v}");
+        assert!(v.get("end_line").is_none() && v.get("end_column").is_none(), "no snake_case leak: {v}");
+        assert_eq!(v["severity"], "error", "severity is lowercase");
+        // Round-trip survives, and an OLD diagnostic with no end bounds still
+        // loads (the fields default to 0, a point span at the start).
+        let back: Diagnostic = serde_json::from_value(v).expect("round-trip");
+        assert_eq!(back.end_line, 3);
+        assert_eq!(back.end_column, 10);
+        let pointy: Diagnostic = serde_json::from_value(serde_json::json!({
+            "line": 1, "column": 0, "severity": "warning", "message": "m"
+        })).expect("diagnostic without end bounds still deserializes");
+        assert_eq!(pointy.end_line, 0, "absent endLine defaults to 0");
     }
 }

@@ -62,19 +62,22 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
     // error. `Structural` (not `Runtime`) because a project may build
     // without every secret filled; runtime-rule gaps surface at run.
     let catalog = build_project_catalog(&project.root)?;
-    let mut definition = compile_checked(
+    let definition = compile_checked(
         &source,
         project.id(),
         Some(&project.root),
         &catalog,
         ValidationMode::Structural,
     )?;
-    definition.name = project.manifest.package.name.clone();
+    // The crate/binary name is a project-identity property owned by the
+    // manifest (`weft.toml` `[package] name`), not a parse-time property of the
+    // graph. The parsed `ProjectDefinition` carries no name.
+    let crate_name = project.manifest.package.name.clone();
 
     let crate_root = project_root.join(".weft").join("target").join("build");
     let referenced_nodes = codegen::collect_node_types(&definition);
-    codegen::emit(&definition, project_root, &crate_root, &catalog)?;
-    let binary_name = sanitize_crate_name(&definition.name);
+    codegen::emit(&definition, project_root, &crate_root, &catalog, &crate_name)?;
+    let binary_name = sanitize_crate_name(&crate_name);
 
     let dockerfile_summary = worker_image::emit(
         &project.manifest.build.worker,

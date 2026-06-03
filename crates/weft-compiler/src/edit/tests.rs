@@ -1,21 +1,137 @@
 //! Layer-1 tests for the structured editor. Each applies an op (or batch) to
-//! source and asserts the new source. These replace the old TS weft-editor
-//! suites: same coverage, against the real grammar.
+//! source and asserts the new source, against the real grammar.
 
 use super::*;
+use crate::cst::kind::SyntaxKind;
+use crate::cst::nodes::WeftFile;
+use crate::cst::parse;
 
 fn apply(source: &str, ops: Vec<EditOp>) -> String {
-    apply_edits(source, None, &ops).expect("edits apply").0
+    apply_edits(source, None, "Untitled", &ops).expect("edits apply").0
 }
 
+/// Assert the source re-parses into a well-formed tree: it round-trips (lossless
+/// guarantee), has no ERROR nodes, and no header carries a second `=` (the
+/// signature of a corrupt rewrite like `n = Text(x) = Text {...}` which this
+/// lenient grammar would otherwise parse clean). A node/group header has exactly
+/// one `=` (`id = Type`); two means a decl got spliced into another.
 fn parse_ok(source: &str) {
-    structure(source, None).expect("parses");
+    let tree = parse(source);
+    assert_eq!(tree.to_string(), source, "edited source must round-trip");
+    let has_error = tree.descendants().any(|n| n.kind() == SyntaxKind::ERROR);
+    assert!(!has_error, "edited source must parse without ERROR nodes:\n{source}");
+    // Brace balance: the cheap catch-all for the "an edit left a body unclosed"
+    // class (e.g. a comment first-line swallowing the close brace into itself).
+    // The lenient parser tolerates an unclosed body at EOF with no ERROR node, so
+    // round-trip alone misses it; a `{`/`}` count mismatch catches it.
+    let count = |k| tree.descendants_with_tokens().filter(|e| e.kind() == k).count();
+    assert_eq!(count(SyntaxKind::L_BRACE), count(SyntaxKind::R_BRACE), "unbalanced braces after edit (a body was left unclosed):\n{source}");
+    for header in tree.descendants().filter(|n| n.kind() == SyntaxKind::HEADER) {
+        let eqs = header
+            .children_with_tokens()
+            .filter(|e| e.kind() == SyntaxKind::EQ)
+            .count();
+        assert!(eqs <= 1, "header has {eqs} `=` (corrupt rewrite):\n{source}");
+    }
+    // Universal structural invariants a correct edit must preserve, the cheap
+    // catch-all for "valid-but-wrong" corruption a lenient round-trip misses:
+    //  (1) scoped node ids are unique (no decl spliced into a colliding scope);
+    //  (2) no edge dangles, resolved by Weft's SAME-SCOPE rule (mirroring
+    //      flatten/`endpoint_resolves_to`): an endpoint `{scope}.x` resolves to
+    //      that node if it exists, else to a TOP-LEVEL `x`; `self` is a boundary.
+    //      A bare-name-matches-anywhere fallback would miss cross-scope dangles.
+    let s = structure(source);
+    let ids: std::collections::HashSet<&str> = s.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ids.len(), s.nodes.len(), "duplicate scoped node id after edit:\n{source}");
+    let id_set: std::collections::HashSet<String> = s.nodes.iter().map(|n| n.id.clone()).collect();
+    let resolves = |scoped_ep: &str| {
+        let bare = scoped_ep.rsplit('.').next().unwrap_or(scoped_ep);
+        // `self`/boundary; the exact scoped node; or a same-scope fall-through to
+        // a TOP-LEVEL node of the bare name (a top-level id has no `.`).
+        bare == "self" || id_set.contains(scoped_ep) || id_set.contains(bare)
+    };
+    for e in &s.edges {
+        for (which, ep) in [("source", &e.source), ("target", &e.target)] {
+            if !ep.is_empty() {
+                assert!(resolves(ep), "edge {which} '{ep}' dangles (no such node) after edit:\n{source}");
+            }
+        }
+    }
+}
+
+/// A CST-derived structural view for test assertions, replacing the old
+/// `ProjectDefinition`-based `structure()`. Exposes scoped node ids and
+/// scoped connection endpoints, which is what the assertions check.
+struct Structure {
+    nodes: Vec<NodeView>,
+    edges: Vec<EdgeView>,
+}
+struct NodeView {
+    id: String,
+}
+struct EdgeView {
+    source: String,
+    target: String,
+}
+
+/// Build the structural view by walking the CST: every decl's scoped id, and
+/// every connection's scoped (source, target) endpoint ids. Scoped means the
+/// dot-joined enclosing group labels, mirroring flatten.
+fn structure(source: &str) -> Structure {
+    let file = WeftFile::cast(parse(source)).expect("root is a weft file");
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    walk(file.syntax(), &mut Vec::new(), &mut nodes, &mut edges);
+    Structure { nodes, edges }
+}
+
+fn walk(parent: &crate::cst::SyntaxNode, prefix: &mut Vec<String>, nodes: &mut Vec<NodeView>, edges: &mut Vec<EdgeView>) {
+    let scoped = |prefix: &[String], local: &str| -> String {
+        if prefix.is_empty() { local.to_string() } else { format!("{}.{}", prefix.join("."), local) }
+    };
+    for node in parent.children() {
+        match node.kind() {
+            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::INCLUDE_DECL => {
+                if let Some(d) = crate::cst::nodes::Decl::cast(node.clone()) {
+                    let local = d.local_id().unwrap_or_default();
+                    nodes.push(NodeView { id: scoped(prefix, &local) });
+                    if let crate::cst::nodes::Decl::Group(g) = &d {
+                        if let Some(body) = g.body() {
+                            prefix.push(local);
+                            walk(body.syntax(), prefix, nodes, edges);
+                            prefix.pop();
+                        }
+                    }
+                }
+            }
+            SyntaxKind::CONNECTION => {
+                let ep = |nth: usize| -> String {
+                    node.children()
+                        .filter(|n| n.kind() == SyntaxKind::ENDPOINT)
+                        .nth(nth)
+                        .map(|ep| {
+                            let id = ep
+                                .children_with_tokens()
+                                .filter_map(|e| e.into_token())
+                                .find(|t| t.kind() == SyntaxKind::IDENT)
+                                .map(|t| t.text().to_string())
+                                .unwrap_or_default();
+                            scoped(prefix, &id)
+                        })
+                        .unwrap_or_default()
+                };
+                // connection is `target = source`: endpoint 0 = target, 1 = source
+                edges.push(EdgeView { target: ep(0), source: ep(1) });
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Apply ops, then apply the returned inverse edit: the original source must
 /// come back byte-for-byte (the reversible-action / undo contract).
 fn assert_reversible(source: &str, ops: Vec<EditOp>) {
-    let (new_source, inverse) = apply_edits(source, None, &ops).expect("edits apply");
+    let (new_source, inverse) = apply_edits(source, None, "Untitled", &ops).expect("edits apply");
     assert_ne!(new_source, source, "op should change source");
     let restored = apply_text_edit(&new_source, &inverse).expect("inverse applies");
     assert_eq!(restored, source, "inverse edit must restore the original exactly");
@@ -50,6 +166,52 @@ fn inverse_edit_restores_original_for_each_op() {
         "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n",
         vec![EditOp::RemoveGroup { group: "grp".into() }],
     );
+    // Every remaining op also has a byte-exact inverse (the undo contract is for
+    // ALL ops, not the four above).
+    assert_reversible(
+        "t = Text {\n  value: \"x\"\n  style: \"bold\"\n}\n",
+        vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into() }],
+    );
+    assert_reversible(
+        "t = Text {\n  value: \"x\"\n}\n",
+        vec![EditOp::SetLabel { node: "t".into(), label: Some("Hi".into()) }],
+    );
+    assert_reversible(
+        "a = Text { value: \"x\" }\nb = Debug\n",
+        vec![EditOp::AddEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None }],
+    );
+    assert_reversible(
+        "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value\n",
+        vec![EditOp::RemoveEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None }],
+    );
+    assert_reversible(
+        "t = Text { value: \"x\" }\n",
+        vec![EditOp::AddGroup { label: "grp".into(), parent_group: None }],
+    );
+    assert_reversible(
+        "grp = Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\nd = Debug\nd.data = grp.outp\n",
+        vec![EditOp::RenameGroup { old_label: "grp".into(), new_label: "proc".into() }],
+    );
+    assert_reversible(
+        "grp = Group() -> () {\n  x = Text { value: \"a\" }\n}\nt = Text { value: \"b\" }\n",
+        vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }],
+    );
+    assert_reversible(
+        "outer = Group() -> () {\n  x = Debug\n}\ng = Group() -> () {\n  y = Debug\n}\n",
+        vec![EditOp::MoveGroupScope { group: "g".into(), target_group: Some("outer".into()) }],
+    );
+    assert_reversible(
+        "n = Text {\n  value: \"x\"\n}\n",
+        vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }], outputs: vec![] }],
+    );
+    assert_reversible(
+        "g = Group() -> () {\n  x = Debug\n}\n",
+        vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }], outputs: vec![PortSig { name: "outp".into(), required: true, port_type: Some("String".into()) }] }],
+    );
+    assert_reversible(
+        "g = Group() -> () {\n  x = Debug\n}\n",
+        vec![EditOp::SetGroupDescription { group: "g".into(), description: Some("does things".into()) }],
+    );
 }
 
 #[test]
@@ -60,7 +222,7 @@ fn inverse_edit_preserves_file_marker() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("sys.txt"), "you are helpful").unwrap();
     let src = "# Project: T\n\nt = Text {\n  value: @file(\"sys.txt\")\n}\n";
-    let (new_source, inverse) = apply_edits(src, Some(dir.path()), &[
+    let (new_source, inverse) = apply_edits(src, Some(dir.path()), "Untitled", &[
         EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"replaced\"".into() },
     ]).expect("edits apply");
     assert!(new_source.contains("value: \"replaced\""), "{new_source}");
@@ -146,7 +308,7 @@ fn remove_scoped_node_keeps_same_local_name_edge_in_another_scope() {
     assert!(out.contains("b.data = a.value"), "top-level edge survives: {out}");
     assert!(out.contains("a = Text { value: \"x\" }"), "top-level a survives: {out}");
     // grp.a is gone (the group is now empty but present).
-    let p = structure(&out, None).unwrap();
+    let p = structure(&out);
     assert!(!p.nodes.iter().any(|n| n.id == "grp.a"), "grp.a removed: {out}");
 }
 
@@ -171,29 +333,29 @@ fn remove_edge_is_scope_disambiguated() {
     let out = apply(src, vec![EditOp::RemoveEdge {
         source: "t".into(), source_port: "value".into(), target: "d".into(), target_port: "data".into(), scope_group: Some("g1".into()),
     }]);
-    let p = structure(&out, None).unwrap();
+    let p = structure(&out);
     // g1's edge gone, g2's edge kept.
     assert!(!p.edges.iter().any(|e| e.source == "g1.t" && e.target == "g1.d"), "g1 edge removed: {out}");
     assert!(p.edges.iter().any(|e| e.source == "g2.t" && e.target == "g2.d"), "g2 edge kept: {out}");
 }
 
 #[test]
-fn remove_edge_into_group_port_resolves_boundary() {
-    // An edge wired to a group's port is stored against `{grp}__in`/`__out`.
-    // removeEdge must resolve the `grp` ref to that boundary, not `grp`.
+fn remove_edge_into_group_port() {
+    // An edge into a group's port is written `grp.inp = a.value`; removeEdge
+    // matches that connection by its as-written endpoints and drops it.
     let src = "# Project: T\n\na = Text { value: \"x\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
     let out = apply(src, vec![EditOp::RemoveEdge {
         source: "a".into(), source_port: "value".into(), target: "grp".into(), target_port: "inp".into(), scope_group: None,
     }]);
     assert!(!out.contains("grp.inp = a.value"), "edge into group port removed: {out}");
-    structure(&out, None).expect("parses");
+    { parse_ok(&out); structure(&out) };
 }
 
 #[test]
 fn add_edge_into_group_input_replaces_driver_no_double() {
     // Reconnecting a group input must replace the existing driver (single-
-    // driver), not append a second line. The old driver edge is stored against
-    // `grp__in`, so remove_existing_driver must resolve `grp` -> `grp__in`.
+    // driver), not append a second line. The existing `grp.inp = a.value` line
+    // is matched by its as-written endpoints and rewritten in place.
     let src = "# Project: T\n\na = Text { value: \"x\" }\nc = Text { value: \"y\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
     let out = apply(src, vec![EditOp::AddEdge {
         source: "c".into(), source_port: "value".into(), target: "grp".into(), target_port: "inp".into(), scope_group: None,
@@ -224,11 +386,33 @@ fn rename_group_updates_header_and_refs() {
 }
 
 #[test]
-fn set_project_meta_inserts_description() {
-    let src = "# Project: T\n\nt = Text { value: \"x\" }\n";
-    let out = apply(src, vec![EditOp::SetProjectMeta { name: Some("Renamed".into()), description: Some("hi".into()) }]);
-    assert!(out.contains("# Project: Renamed"), "{out}");
-    assert!(out.contains("# Description: hi"), "{out}");
+fn set_group_description_inserts_as_first_body_line() {
+    // A group's description is a `# Description:` comment as its first body line.
+    let src = "g = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
+    let out = apply(src, vec![EditOp::SetGroupDescription { group: "g".into(), description: Some("does things".into()) }]);
+    assert!(out.contains("# Description: does things"), "{out}");
+    parse_ok(&out);
+    // it is the FIRST body line (before the child)
+    let desc_pos = out.find("# Description:").unwrap();
+    let child_pos = out.find("t = Text").unwrap();
+    assert!(desc_pos < child_pos, "description precedes the first child: {out}");
+}
+
+#[test]
+fn set_group_description_on_inline_body_does_not_swallow_close_brace() {
+    // Regression: adding a description to an inline `{}` group (the exact shape
+    // AddGroup produces) inserted `# Description: ...` after the `{` but left the
+    // `}` on the comment line, so the comment SWALLOWED the brace
+    // (`# Description: hello}`) and the group was left unclosed. The body must be
+    // opened so the `}` drops to its own line.
+    let out = apply("g = Group() -> () {}\n",
+        vec![EditOp::SetGroupDescription { group: "g".into(), description: Some("hello".into()) }]);
+    assert!(out.contains("# Description: hello"), "{out}");
+    parse_ok(&out); // brace-balance check would fail on the swallowed `}`
+    // A follow-up edit into the now-well-formed body works.
+    let out2 = apply(&out, vec![EditOp::AddNode { id: "n".into(), node_type: "Debug".into(), parent_group: Some("g".into()) }]);
+    parse_ok(&out2);
+    assert!(out2.contains("n = Debug"), "child added into the group: {out2}");
 }
 
 #[test]
@@ -268,8 +452,41 @@ fn move_node_into_group_then_out() {
     let moved_in = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved_in);
     // t now lives inside grp (the grp.t scoped id exists after re-parse).
-    let p = structure(&moved_in, None).unwrap();
+    let p = structure(&moved_in);
     assert!(p.nodes.iter().any(|n| n.id == "grp.t"), "t moved into grp: {moved_in}");
+}
+
+#[test]
+fn move_into_current_scope_is_a_noop_not_a_self_collision() {
+    // Regression: dragging a decl and dropping it inside the scope it ALREADY lives
+    // in emitted a MoveScope into its own parent. `reject_if_taken` then saw the
+    // decl's own scoped id and reported `DuplicateId` (which white-screened the
+    // editor). A move into the current scope is a no-op: the source is unchanged
+    // and no error is raised. Covered for a nested group and a top-level node.
+    let nested = apply(
+        "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n",
+        vec![EditOp::MoveGroupScope { group: "MyGroup_2.MyGroup".into(), target_group: Some("MyGroup_2".into()) }],
+    );
+    assert_eq!(nested, "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n", "no-op move leaves source unchanged: {nested:?}");
+    parse_ok(&nested);
+
+    let root = apply(
+        "a = Debug {}\nb = Debug {}\n",
+        vec![EditOp::MoveNodeScope { node: "a".into(), target_group: None }],
+    );
+    assert_eq!(root, "a = Debug {}\nb = Debug {}\n", "no-op move to current (root) scope unchanged: {root:?}");
+    parse_ok(&root);
+
+    // A GENUINE collision (a DIFFERENT decl with the same local id already in the
+    // target) must still fail loud, not be swallowed as a no-op.
+    let err = apply_edits(
+        "g = Group() -> () {\n  d = Debug {}\n}\nd = Debug {}\n",
+        None,
+        "Untitled",
+        &[EditOp::MoveNodeScope { node: "d".into(), target_group: Some("g".into()) }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::DuplicateId(_)), "real same-id collision still errors: {err:?}");
 }
 
 #[test]
@@ -281,7 +498,7 @@ fn move_node_into_single_line_empty_group() {
     let src = "# Project: T\n\ngrp = Group() -> () {}\nt = Text { value: \"b\" }\n";
     let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved);
-    let p = structure(&moved, None).unwrap();
+    let p = structure(&moved);
     assert!(p.nodes.iter().any(|n| n.id == "grp.t"), "t must nest inside grp: {moved}");
     // The node must not survive at top level (that would be the orphan bug).
     assert!(!p.nodes.iter().any(|n| n.id == "t"), "no top-level orphan t: {moved}");
@@ -297,7 +514,7 @@ fn move_node_into_group_with_post_body_output_ports() {
     let src = "# Project: T\n\ngrp = Group() {\n  x = Text { value: \"a\" }\n} -> (out: String)\nt = Text { value: \"b\" }\n";
     let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved);
-    let p = structure(&moved, None).unwrap();
+    let p = structure(&moved);
     assert!(p.nodes.iter().any(|n| n.id == "grp.t"), "t must nest inside grp: {moved}");
     assert!(!p.nodes.iter().any(|n| n.id == "t"), "no top-level orphan t: {moved}");
 }
@@ -312,7 +529,7 @@ fn move_node_into_group_with_separate_line_output_ports() {
     let src = "# Project: T\n\ngrp = Group() {\n  x = Text { value: \"a\" }\n}\n-> (out: String)\nt = Text { value: \"b\" }\n";
     let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved);
-    let p = structure(&moved, None).unwrap();
+    let p = structure(&moved);
     assert!(p.nodes.iter().any(|n| n.id == "grp.t"), "t must nest inside grp: {moved}");
     assert!(!p.nodes.iter().any(|n| n.id == "t"), "no top-level orphan t: {moved}");
 }
@@ -328,7 +545,7 @@ fn remove_group_with_separate_line_output_ports() {
     parse_ok(&removed);
     assert!(!removed.contains("Group("), "group declaration gone: {removed}");
     assert!(!removed.contains("-> (out"), "post-body output ports gone: {removed}");
-    let p = structure(&removed, None).unwrap();
+    let p = structure(&removed);
     assert!(p.nodes.iter().any(|n| n.id == "x"), "child x survives at top level: {removed}");
 }
 
@@ -340,7 +557,7 @@ fn move_node_into_group_with_multiline_signature() {
     let src = "# Project: T\n\ngrp = Group(\n  a: String\n) -> () {}\nt = Text { value: \"b\" }\n";
     let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved);
-    let p = structure(&moved, None).unwrap();
+    let p = structure(&moved);
     assert!(p.nodes.iter().any(|n| n.id == "grp.t"), "t must nest inside grp: {moved}");
     assert!(!p.nodes.iter().any(|n| n.id == "t"), "no top-level orphan t: {moved}");
 }
@@ -358,12 +575,179 @@ fn update_node_ports_rewrites_signature() {
 }
 
 #[test]
+fn update_node_ports_on_node_with_body_preserves_body() {
+    // Regression: rewriting a NODE's ports must replace the signature in place
+    // and keep the body, not prepend a second `id = Type` (which parsed clean as
+    // two nodes and shipped corrupted source). parse_ok now asserts no header
+    // carries two `=`.
+    let src = "n = Text {\n  value: \"x\"\n}\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![],
+    }]);
+    assert!(out.contains("n = Text(inp: String)"), "signature rewritten: {out}");
+    assert!(out.contains("value: \"x\""), "body preserved: {out}");
+    assert_eq!(out.matches("Text").count(), 1, "no duplicated Type head: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_group_ports_normalizes_post_body_outputs() {
+    // A group with post-body outputs (`} -> (out)`): UpdateGroupPorts rewrites
+    // the whole signature, normalizing outputs into the pre-body position. The
+    // post-body clause is dropped and outputs are NOT duplicated or lost.
+    let src = "g = Group(a: String) {\n  x = Debug\n} -> (out: String)\n";
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![PortSig { name: "out".into(), required: true, port_type: Some("String".into()) }],
+    }]);
+    assert!(out.contains("g = Group(a: String) -> (out: String)"), "outputs pre-body: {out}");
+    assert_eq!(out.matches("out: String").count(), 1, "no duplicate output: {out}");
+    assert!(!out.contains("} -> ("), "post-body clause dropped: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn remove_node_drops_edges_in_other_scopes() {
+    // Regression: RemoveNode must drop edges referencing the node in ANY scope,
+    // including a child group's body, not only the node's own scope.
+    let src = "a = Text { value: \"x\" }\ng = Group() -> () {\n  b = Debug\n  b.data = a.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "a".into() }]);
+    assert!(!out.contains("b.data = a.value"), "cross-scope edge to removed node dropped: {out}");
+    assert!(!out.contains("a = Text"), "{out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn remove_scoped_node_spares_same_name_other_scope_edges() {
+    // Regression: scope-aware matching. Removing `grp.a` must drop only grp.a's
+    // edge, never a same-named top-level `a`'s edge.
+    let src = "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value\ngrp = Group() -> () {\n  a = Text { value: \"y\" }\n  c = Debug\n  c.data = a.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "grp.a".into() }]);
+    assert!(out.contains("b.data = a.value"), "top-level a's edge survives: {out}");
+    assert!(!out.contains("c.data = a.value"), "grp.a's edge removed: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn rename_group_to_taken_id_fails_loud() {
+    // Regression: renaming onto an existing id would make two same-id decls and
+    // self-referential edges. Must fail loud instead.
+    let src = "d = Debug\ngrp = Group() -> (o: String) {\n  t = Text { value: \"x\" }\n  self.o = t.value\n}\nd.data = grp.o\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { old_label: "grp".into(), new_label: "d".into() }]).unwrap_err();
+    assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
+}
+
+#[test]
+fn move_node_preserves_heredoc_content() {
+    // Regression: moving a node with a heredoc must NOT re-indent the heredoc's
+    // literal body (only the decl's own layout shifts).
+    let src = "g = Group() -> () {}\nt = Code {\n  src: ```\nline1\n  indented\n```\n}\n";
+    let out = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("g".into()) }]);
+    assert!(out.contains("\nline1\n"), "heredoc line 'line1' not re-indented: {out}");
+    assert!(out.contains("\n  indented\n"), "heredoc line '  indented' unchanged: {out}");
+    parse_ok(&out);
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "g.t"), "node moved into g: {out}");
+}
+
+#[test]
 fn unparseable_edit_fails_loud_not_silent() {
     // Targeting a node that doesn't exist is a hard error, never a silent no-op
     // that loses the user's intent.
     let src = "# Project: T\n\nt = Text { value: \"x\" }\n";
-    let err = apply_edits(src, None, &[EditOp::RemoveNode { node: "nope".into() }]).unwrap_err();
+    let err = apply_edits(src, None, "Untitled", &[EditOp::RemoveNode { node: "nope".into() }]).unwrap_err();
     assert!(matches!(err, EditError::NodeNotFound(_)), "{err:?}");
+}
+
+#[test]
+fn set_config_must_not_clobber_a_wiring_edge() {
+    // Regression: a configurable input port can be driven by EITHER a config
+    // value (`b.data = "lit"`, one endpoint) OR a real edge (`b.data = a.value`,
+    // two endpoints). SetConfig/RemoveConfig only edit the one-endpoint
+    // config-origin form; a real edge into the same port must be left intact, not
+    // rewritten into a literal or deleted. The bug was a missing one-endpoint
+    // guard in `find_connection_origin_field` (it matched the edge by target).
+    let src = "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value\n";
+    // SetConfig on the wired port must ADD a config field, never touch the edge.
+    let (out, _) = apply_edits(src, None, "Untitled",
+        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into() }]).expect("set config");
+    assert!(out.contains("b.data = a.value"), "wiring edge survives SetConfig: {out}");
+    parse_ok(&out);
+    // RemoveConfig on the wired port must NOT delete the edge.
+    let (out2, _) = apply_edits(src, None, "Untitled",
+        &[EditOp::RemoveConfig { node: "b".into(), key: "data".into() }]).expect("remove config");
+    assert!(out2.contains("b.data = a.value"), "wiring edge survives RemoveConfig: {out2}");
+    parse_ok(&out2);
+
+    // The genuine config-origin form (one endpoint) is still edited in place.
+    let cfg = "b = Debug\nb.data = \"old\"\n";
+    let (out3, _) = apply_edits(cfg, None, "Untitled",
+        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"new\"".into() }]).expect("set config-origin");
+    assert!(out3.contains("b.data = \"new\"") && !out3.contains("\"old\""), "config-origin edited in place: {out3}");
+    parse_ok(&out3);
+}
+
+#[test]
+fn set_config_must_not_clobber_an_inline_expression() {
+    // An inline-expr RHS (`b.data = Upper{...}.out`) is a node+edge SYNTHESIS, not
+    // a config field: the lowering makes a real `Upper` node and wires it. It has
+    // exactly ONE endpoint (the inline-expr is a node, not a 2nd endpoint), so the
+    // old one-endpoint guard misclassified it as a config field and SetConfig/
+    // RemoveConfig destroyed the subgraph. The shared `connection_is_config_origin`
+    // (mirroring the lowering's `literal_config_fill`) now rejects an inline-expr
+    // RHS, so the wiring survives.
+    let src = "b = Debug\nb.data = Upper { text: \"hi\" }.out\n";
+    // SetConfig adds a separate config field; the inline-expr wiring is untouched.
+    let (out, _) = apply_edits(src, None, "Untitled",
+        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into() }]).expect("set config");
+    assert!(out.contains("Upper { text: \"hi\" }.out"), "inline-expr subgraph survives SetConfig: {out}");
+    parse_ok(&out);
+    // RemoveConfig must NOT delete the inline-expr wiring.
+    let (out2, _) = apply_edits(src, None, "Untitled",
+        &[EditOp::RemoveConfig { node: "b".into(), key: "data".into() }]).expect("remove config");
+    assert!(out2.contains("Upper { text: \"hi\" }.out"), "inline-expr subgraph survives RemoveConfig: {out2}");
+    parse_ok(&out2);
+}
+
+#[test]
+fn edit_inside_anonymous_root_resolves_by_source_id() {
+    // Regression (the bug that motivated dropping the relabel pass): a standalone
+    // anonymous component file is rendered with its members scoped under the
+    // FILENAME-derived id (`MyCleaner.child`). An edit targeting that scoped id
+    // must resolve, because the editor resolves against the SAME source id the
+    // render used. Before, render renamed `__include_root__` -> `MyCleaner` but
+    // the edit path kept the sentinel, so `MyCleaner.child` was "node not found".
+    //
+    // Two same-local `strip` nodes (one at root, one in a nested group) make the
+    // bare local AMBIGUOUS, so resolution can only succeed via the exact scoped
+    // id, which proves the source-id prefix is load-bearing (not bare-local luck).
+    let src = "Group(raw: String) -> (cleaned: String) {\n  strip = Text { value: \"x\" }\n  sub = Group() -> (o: String) {\n    strip = Text { value: \"z\" }\n    self.o = strip.value\n  }\n  self.cleaned = strip.value\n}\n";
+    // Edit the ROOT child by its source-id-scoped id, the form the editor sends.
+    let (out, _) = apply_edits(
+        src,
+        None,
+        "MyCleaner",
+        &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into() }],
+    )
+    .expect("edit by source-id-scoped id resolves");
+    assert!(out.contains("value: \"y\""), "root child config updated: {out}");
+    assert!(out.contains("value: \"z\""), "nested same-local child untouched: {out}");
+    parse_ok(&out);
+
+    // The SAME scoped id under the wrong source id must NOT resolve: `MyCleaner`
+    // isn't the root prefix, and the bare local `strip` is ambiguous, so it's a
+    // hard not-found rather than a silent guess.
+    let err = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into() }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::AmbiguousId(_) | EditError::NodeNotFound(_)), "{err:?}");
 }
 
 #[test]
@@ -378,25 +762,116 @@ fn remove_group_ungroups_children_up_one_scope() {
 }
 
 #[test]
+fn remove_group_keeps_inner_edge_when_child_shadows_group_name() {
+    // Regression: ungroup classified a connection as boundary wiring if any
+    // endpoint id equalled the GROUP's local name. But inside the body that name
+    // resolves to a CHILD of the same name, so a real wire between two children
+    // (`d.data = g.value`, where a child is also named `g`) was wrongly dropped.
+    // Only `self.*` is internal boundary wiring; the child-to-child edge survives.
+    let src = "g = Group() -> () {\n  g = Text { value: \"x\" }\n  d = Debug\n  d.data = g.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveGroup { group: "g".into() }]);
+    assert!(out.contains("d.data = g.value"), "inner child-to-child edge survives ungroup: {out}");
+    assert!(out.contains("g = Text"), "child `g` survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn remove_nested_group_reindents_every_surviving_child() {
+    // Regression: ungroup de-indented children by swapping the inner indent for the
+    // group's, but a child's `to_string()` has NO indent on its first line (it's a
+    // sibling trivia token), so only the FIRST surviving child (which inherits the
+    // splice point's whitespace) landed right; every later child fell to column 0.
+    // `parse_ok` can't catch it (whitespace is trivia), so we assert exact layout:
+    // every surviving child sits at the group's own indent (2 spaces here).
+    let src = "outer = Group() -> () {\n  mid = Group() -> () {\n    a = Text {}\n    b = Debug\n    c = Debug\n  }\n}\n";
+    let out = apply(src, vec![EditOp::RemoveGroup { group: "outer.mid".into() }]);
+    assert_eq!(out, "outer = Group() -> () {\n  a = Text {}\n  b = Debug\n  c = Debug\n}\n", "every ungrouped child re-indented to the group's level: {out:?}");
+    parse_ok(&out);
+}
+
+#[test]
+fn remove_nested_group_preserves_multiline_heredoc_child() {
+    // A surviving child carrying a MULTI-LINE heredoc must not have its body lines
+    // re-indented (literal content) AND the heredoc must not desync the per-line
+    // indent of the children below it. Both are handled in one heredoc-aware pass.
+    let src = "outer = Group() -> () {\n  mid = Group() -> () {\n    a = Text { value: ```\nl1\nl2\n``` }\n    b = Debug\n  }\n}\n";
+    let out = apply(src, vec![EditOp::RemoveGroup { group: "outer.mid".into() }]);
+    assert_eq!(out, "outer = Group() -> () {\n  a = Text { value: ```\nl1\nl2\n``` }\n  b = Debug\n}\n", "heredoc body verbatim, sibling below at group indent: {out:?}");
+    parse_ok(&out);
+}
+
+#[test]
+fn remove_empty_group_leaves_no_dangling_blank_line() {
+    // Ungrouping a group with no surviving children (empty, or only boundary
+    // wiring) must collapse the slot cleanly, not leave a whitespace-only indented
+    // line where the group used to be. `parse_ok` can't catch this (the stray line
+    // is trivia), so we assert exact bytes.
+    let nested = apply(
+        "outer = Group() -> () {\n  mid = Group() -> () {}\n}\n",
+        vec![EditOp::RemoveGroup { group: "outer.mid".into() }],
+    );
+    assert_eq!(nested, "outer = Group() -> () {\n}\n", "no dangling indented blank line: {nested:?}");
+    parse_ok(&nested);
+
+    // Deleting the only top-level group collapses to the file's trailing newline.
+    // (`detach_with_leading_ws` removes the decl and any leading whitespace; the
+    // decl's trailing line terminator is a separate root token that stays. A lone
+    // newline is a clean empty-ish file, NOT the indented-blank-line corruption
+    // the nested case had.)
+    let toplevel = apply(
+        "g = Group() -> () {}\n",
+        vec![EditOp::RemoveGroup { group: "g".into() }],
+    );
+    assert_eq!(toplevel, "\n", "top-level empty ungroup leaves only the trailing newline: {toplevel:?}");
+    parse_ok(&toplevel);
+}
+
+#[test]
+fn remove_top_level_group_with_preceding_sibling_keeps_separators() {
+    // Regression: a top-level group's leading newline is the group node's OWN first
+    // child (not a sibling), so splicing the group out removed that newline and the
+    // ungrouped children glued onto the PRECEDING decl (`d = Debugx = Text...`).
+    // The fix re-emits the group's leading line break and indents every child, so
+    // the children land on their own lines. `parse_ok` can't catch the glue (it's
+    // whitespace), so assert exact bytes. The earlier tests all used a `# Project:`
+    // prefix, which made the group the first child and masked the bug.
+    let after_decl = apply(
+        "d = Debug\ng = Group() -> (out: String) {\n  x = Text { value: \"x\" }\n  self.out = x.value\n}\n",
+        vec![EditOp::RemoveGroup { group: "g".into() }],
+    );
+    assert_eq!(after_decl, "d = Debug\nx = Text { value: \"x\" }\n", "ungrouped child sits on its own line after the preceding decl: {after_decl:?}");
+    parse_ok(&after_decl);
+
+    // Ungrouping the SECOND of two top-level groups: the first group's `}` must not
+    // glue onto the surviving child.
+    let second_of_two = apply(
+        "a = Group() -> () {\n  p = Debug\n}\nb = Group() -> () {\n  q = Debug\n}\n",
+        vec![EditOp::RemoveGroup { group: "b".into() }],
+    );
+    assert_eq!(second_of_two, "a = Group() -> () {\n  p = Debug\n}\nq = Debug\n", "second group's child on its own line: {second_of_two:?}");
+    parse_ok(&second_of_two);
+}
+
+#[test]
 fn ambiguous_bare_id_fails_loud() {
     // Two `t` in different groups: a bare `t` op must error, never guess + splice
     // the wrong node.
     let src = "# Project: T\n\ng1 = Group() -> () {\n  t = Text { value: \"a\" }\n}\ng2 = Group() -> () {\n  t = Text { value: \"b\" }\n}\n";
-    let err = apply_edits(src, None, &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"z\"".into() }]).unwrap_err();
+    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"z\"".into() }]).unwrap_err();
     assert!(matches!(err, EditError::AmbiguousId(_)), "{err:?}");
 }
 
 #[test]
 fn add_duplicate_id_fails_loud() {
     let src = "# Project: T\n\nt = Text { value: \"x\" }\n";
-    let err = apply_edits(src, None, &[EditOp::AddNode { id: "t".into(), node_type: "Debug".into(), parent_group: None }]).unwrap_err();
+    let err = apply_edits(src, None, "Untitled", &[EditOp::AddNode { id: "t".into(), node_type: "Debug".into(), parent_group: None }]).unwrap_err();
     assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
 }
 
 #[test]
 fn add_edge_to_missing_endpoint_fails_loud() {
     let src = "# Project: T\n\nb = Debug\n";
-    let err = apply_edits(src, None, &[EditOp::AddEdge {
+    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
         source: "ghost".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
     }]).unwrap_err();
     assert!(matches!(err, EditError::NodeNotFound(_)), "{err:?}");
@@ -405,16 +880,374 @@ fn add_edge_to_missing_endpoint_fails_loud() {
 #[test]
 fn rename_group_to_empty_fails_loud() {
     let src = "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
-    let err = apply_edits(src, None, &[EditOp::RenameGroup { old_label: "grp".into(), new_label: "".into() }]).unwrap_err();
+    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { old_label: "grp".into(), new_label: "".into() }]).unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
 }
 
 #[test]
-fn set_project_meta_inserts_header_when_absent() {
-    // No `# Project:` line: meta must be inserted, not silently dropped.
-    let src = "t = Text { value: \"x\" }\n";
-    let out = apply(src, vec![EditOp::SetProjectMeta { name: Some("New".into()), description: Some("desc".into()) }]);
-    assert!(out.contains("# Project: New"), "{out}");
-    assert!(out.contains("# Description: desc"), "{out}");
+fn set_group_description_replaces_and_clears() {
+    // Replace an existing description, then clear it (None removes the line).
+    let src = "g = Group() {\n  # Description: old\n  t = Text {}\n}\n";
+    let replaced = apply(src, vec![EditOp::SetGroupDescription { group: "g".into(), description: Some("new".into()) }]);
+    assert!(replaced.contains("# Description: new"), "{replaced}");
+    assert!(!replaced.contains("# Description: old"), "{replaced}");
+    parse_ok(&replaced);
+    let cleared = apply(&replaced, vec![EditOp::SetGroupDescription { group: "g".into(), description: None }]);
+    assert!(!cleared.contains("# Description:"), "description cleared: {cleared}");
+    parse_ok(&cleared);
+}
+
+// ── formatting / comment / error-line preservation guarantees ───────────────
+// Formatting, comment, and error-line preservation, the group-layout matrix,
+// and an edit-level soak: the proof that the corruption bug class is
+// structurally impossible.
+
+#[test]
+fn editing_one_node_leaves_other_bytes_identical() {
+    // A user's hand-alignment, blank-line sections, and comments OUTSIDE the
+    // edited region must come back byte-for-byte: minimal-span re-serialization
+    // re-emits only the changed subtree and leaves every other byte untouched.
+    let src = "\
+# a header comment
+
+a   =   Text {
+  value:   \"keep my spacing\"
+}
+
+
+# a section divider, two blank lines above
+
+b = Debug {
+  data: \"target\"
+}
+";
+    let out = apply(src, vec![EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"changed\"".into() }]);
+    // Everything before `b`'s body is byte-identical.
+    let untouched_prefix = src.split("b = Debug").next().unwrap();
+    assert!(out.starts_with(untouched_prefix), "bytes before the edit are identical:\n{out}");
+    assert!(out.contains("value:   \"keep my spacing\""), "hand-alignment preserved: {out}");
+    assert!(out.contains("# a section divider, two blank lines above"), "comment preserved: {out}");
+    assert!(out.contains("data: \"changed\""), "the edit landed: {out}");
+}
+
+#[test]
+fn error_line_numbers_outside_edit_are_stable() {
+    // An edit to a later line must not shift the line count of earlier lines.
+    // We assert by line position: the line index of an early marker is unchanged.
+    let src = "a = Text {\n  value: \"x\"\n}\nb = Debug {\n  data: \"y\"\n}\n";
+    let a_line_before = src.lines().position(|l| l.contains("a = Text")).unwrap();
+    let out = apply(src, vec![EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"z\"".into() }]);
+    let a_line_after = out.lines().position(|l| l.contains("a = Text")).unwrap();
+    assert_eq!(a_line_before, a_line_after, "earlier line numbers unchanged by a later edit:\n{out}");
+}
+
+#[test]
+fn comment_adjacent_to_edit_survives() {
+    // A comment immediately above and a trailing comment on the edited node both
+    // survive the edit (trivia attachment is structural, not luck).
+    let src = "# documents t\nt = Text {\n  value: \"x\"  # inline note\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"y\"".into() }]);
+    assert!(out.contains("# documents t"), "leading comment survives: {out}");
+    assert!(out.contains("# inline note"), "trailing inline comment survives: {out}");
+    assert!(out.contains("value: \"y\""), "{out}");
+}
+
+#[test]
+fn every_group_layout_handles_add_child_without_corruption() {
+    // Every group layout (inline `{}`, multi-line, same-line and separate-line
+    // post-body output ports, multi-line signature) must accept a new child
+    // INSIDE the body and reparse cleanly with the child nested.
+    let layouts = [
+        "g = Group() -> () {}\n",                              // inline empty
+        "g = Group() {\n  x = Text {}\n}\n",                  // multi-line bare close
+        "g = Group() {\n  x = Text {}\n} -> (out: String)\n", // same-line post ports
+        "g = Group() {\n  x = Text {}\n}\n-> (out: String)\n",// separate-line post ports
+        "g = Group(\n  a: String\n) -> () {}\n",             // multi-line signature
+    ];
+    for layout in layouts {
+        let out = apply(layout, vec![EditOp::AddNode {
+            id: "added".into(), node_type: "Debug".into(), parent_group: Some("g".into()),
+        }]);
+        parse_ok(&out);
+        let p = structure(&out);
+        assert!(p.nodes.iter().any(|n| n.id == "g.added"), "child nested in g for layout {layout:?}:\n{out}");
+        assert!(!p.nodes.iter().any(|n| n.id == "added"), "no top-level orphan for layout {layout:?}:\n{out}");
+    }
+}
+
+#[test]
+fn every_group_layout_handles_remove_child_and_ungroup() {
+    let layouts = [
+        "g = Group() {\n  x = Text {}\n}\n",
+        "g = Group() {\n  x = Text {}\n} -> (out: String)\n",
+        "g = Group() {\n  x = Text {}\n}\n-> (out: String)\n",
+    ];
+    for layout in layouts {
+        let out = apply(layout, vec![EditOp::RemoveGroup { group: "g".into() }]);
+        parse_ok(&out);
+        assert!(!out.contains("Group("), "group declaration gone for {layout:?}:\n{out}");
+        let p = structure(&out);
+        assert!(p.nodes.iter().any(|n| n.id == "x"), "child survives ungroup for {layout:?}:\n{out}");
+    }
+}
+
+#[test]
+fn edit_soak_never_corrupts() {
+    // Apply random edit sequences to varied shapes; every result must reparse
+    // cleanly (no ERROR nodes) and round-trip. This is the corruption-impossible
+    // guarantee at the EDIT level (the parse-level soak lives in cst::parser).
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let bases = [
+        "a = Text { value: \"x\" }\nb = Debug\n",
+        "g = Group() -> (out: String) {\n  x = Text {}\n  self.out = x.value\n}\n",
+        "g = Group() {\n  x = Text {}\n} -> (out: String)\n",
+        "a = Text {}\nb = Debug\nb.data = a.value\n",
+        // a node with a heredoc + a group with a nested group (gnarly shapes)
+        "n = Code {\n  src: ```\nline\n  indented\n```\n}\n",
+        "outer = Group() -> () {\n  inner = Group() -> () {\n    y = Debug\n  }\n}\nz = Text {}\n",
+    ];
+    // Targets drawn from the ids the bases actually contain (top-level + scoped).
+    let targets = ["a", "b", "x", "z", "g", "g.x", "outer", "outer.inner", "outer.inner.y"];
+    let pick = |n: u64, slice: &[&str]| slice[(n as usize) % slice.len()].to_string();
+    for _ in 0..600 {
+        let mut src = bases[(next() as usize) % bases.len()].to_string();
+        for _ in 0..4 {
+            let op = match next() % 15 {
+                0 => EditOp::AddNode { id: format!("n{}", next() % 1000), node_type: "Debug".into(), parent_group: None },
+                1 => EditOp::SetConfig { node: pick(next(), &targets), key: "value".into(), value: format!("\"{}\"", next() % 100) },
+                2 => EditOp::AddGroup { label: format!("grp{}", next() % 1000), parent_group: None },
+                3 => EditOp::RemoveNode { node: pick(next(), &targets) },
+                4 => EditOp::SetLabel { node: pick(next(), &targets), label: Some(format!("L{}", next() % 100)) },
+                5 => EditOp::AddEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
+                6 => EditOp::RemoveEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
+                7 => EditOp::RemoveConfig { node: pick(next(), &targets), key: "value".into() },
+                8 => EditOp::RemoveGroup { group: pick(next(), &targets) },
+                9 => EditOp::RenameGroup { old_label: pick(next(), &targets), new_label: format!("r{}", next() % 1000) },
+                10 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
+                11 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: None },
+                12 => EditOp::MoveGroupScope { group: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
+                13 => EditOp::UpdateNodePorts { node: pick(next(), &targets), inputs: vec![PortSig { name: "i".into(), required: true, port_type: Some("String".into()) }], outputs: vec![] },
+                _ => EditOp::SetGroupDescription { group: pick(next(), &targets), description: Some(format!("d{}", next() % 100)) },
+            };
+            // Ops that legitimately error (bad target, collision, ...) are skipped;
+            // every SUCCESSFUL edit must satisfy the full structural invariants.
+            if let Ok((new_src, _)) = apply_edits(&src, None, "Untitled", &[op]) {
+                parse_ok(&new_src);
+                src = new_src;
+            }
+        }
+    }
+}
+
+// ── Layer-2 wire-shape: EditOp serde round-trip ─────────────────────────────
+// The editor (TS) emits EditOps as JSON with a camelCase `op` tag + camelCase
+// fields. A renamed variant/field silently breaks that contract; these pin it.
+
+#[test]
+fn editop_wire_shape_round_trips() {
+    use serde_json::json;
+    // (json the TS side emits, expected variant predicate)
+    let cases: Vec<serde_json::Value> = vec![
+        json!({"op":"setConfig","node":"n","key":"k","value":"\"v\""}),
+        json!({"op":"removeConfig","node":"n","key":"k"}),
+        json!({"op":"setLabel","node":"n","label":"L"}),
+        json!({"op":"setLabel","node":"n","label":null}),
+        json!({"op":"addNode","id":"n","nodeType":"Debug","parentGroup":null}),
+        json!({"op":"removeNode","node":"n"}),
+        json!({"op":"addEdge","source":"a","sourcePort":"value","target":"b","targetPort":"data","scopeGroup":null}),
+        json!({"op":"removeEdge","source":"a","sourcePort":"value","target":"b","targetPort":"data","scopeGroup":"g"}),
+        json!({"op":"addGroup","label":"g","parentGroup":null}),
+        json!({"op":"removeGroup","group":"g"}),
+        json!({"op":"renameGroup","oldLabel":"a","newLabel":"b"}),
+        json!({"op":"moveNodeScope","node":"n","targetGroup":"g"}),
+        json!({"op":"moveGroupScope","group":"g","targetGroup":null}),
+        json!({"op":"updateNodePorts","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[]}),
+        json!({"op":"updateGroupPorts","group":"g","inputs":[],"outputs":[]}),
+        json!({"op":"setGroupDescription","group":"g","description":"d"}),
+    ];
+    for c in cases {
+        let op: EditOp = serde_json::from_value(c.clone()).unwrap_or_else(|e| panic!("deserialize {c}: {e}"));
+        // FULL round-trip: the re-serialized JSON must equal the input exactly,
+        // so a renamed field/tag (the wire contract with the TS extension) fails
+        // here, not silently as a defaulted-None.
+        let back = serde_json::to_value(&op).unwrap();
+        assert_eq!(back, c, "wire shape changed on round-trip");
+    }
+    // The deleted variant must NOT deserialize (guards against its return).
+    assert!(serde_json::from_value::<EditOp>(serde_json::json!({"op":"setProjectMeta","name":"x","description":null})).is_err());
+}
+
+// ── round-2 regression tests: exact output, one per fixed bug ───────────────
+
+#[test]
+fn set_config_does_not_double_indent_or_compound() {
+    // Replacing a field must swap only the value, not re-emit leading indent
+    // (which doubled it, compounding on every edit).
+    let src = "n = Text {\n  value: \"x\"\n}\n";
+    let o1 = apply(src, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"y\"".into() }]);
+    assert_eq!(o1, "n = Text {\n  value: \"y\"\n}\n");
+    let o2 = apply(&o1, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"z\"".into() }]);
+    assert_eq!(o2, "n = Text {\n  value: \"z\"\n}\n", "indent must not compound");
+}
+
+#[test]
+fn set_config_preserves_trailing_comment() {
+    let src = "n = Text {\n  value: \"x\"  # keep me\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"y\"".into() }]);
+    assert_eq!(out, "n = Text {\n  value: \"y\"  # keep me\n}\n");
+}
+
+#[test]
+fn set_config_connection_origin_keeps_newline() {
+    // Editing `t.style = "a"` must not eat the leading newline.
+    let src = "t = Text { value: \"x\" }\nt.style = \"a\"\n";
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into() }]);
+    assert_eq!(out, "t = Text { value: \"x\" }\nt.style = \"b\"\n");
+}
+
+#[test]
+fn move_group_into_group_nests_and_reparses() {
+    let src = "outer = Group() -> () {\n  x = Debug\n}\ng = Group() -> () {\n  y = Debug\n}\n";
+    let out = apply(src, vec![EditOp::MoveGroupScope { group: "g".into(), target_group: Some("outer".into()) }]);
+    parse_ok(&out);
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "outer.g"), "g nested under outer: {out}");
+    assert!(p.nodes.iter().any(|n| n.id == "outer.g.y"), "g's child re-scoped: {out}");
+    assert!(!p.nodes.iter().any(|n| n.id == "g"), "no top-level orphan g: {out}");
+}
+
+#[test]
+fn set_label_rejects_triple_backtick_value() {
+    // A multi-line label containing ``` can't be encoded as a heredoc (no fence
+    // escape), so it's a loud error, not silently-corrupt source.
+    let src = "n = Text { value: \"x\" }\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::SetLabel { node: "n".into(), label: Some("a\n```\nb".into()) }]).unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn insert_and_replace_config_value_agree_on_containment() {
+    // Symmetry: a value that would break out of its field (an unbalanced `}`)
+    // must be rejected by BOTH paths. Before, only the in-place REPLACE path was
+    // gated; the INSERT path (a new field with no prior value) re-parsed the line
+    // and a stray `}` closed the node body early, silently corrupting the tree.
+    let bad = "}}}";
+    // INSERT path: the key doesn't exist yet -> insert_field.
+    let insert_err = apply_edits("n = Text {}\n", None, "Untitled",
+        &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into() }]).unwrap_err();
+    assert!(matches!(insert_err, EditError::InvalidArgument(_)), "insert must reject uncontained value: {insert_err:?}");
+    // REPLACE path: the key already exists -> replace_value_after.
+    let replace_err = apply_edits("n = Text { k: \"old\" }\n", None, "Untitled",
+        &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into() }]).unwrap_err();
+    assert!(matches!(replace_err, EditError::InvalidArgument(_)), "replace must reject uncontained value: {replace_err:?}");
+
+    // And BOTH accept a well-formed multi-line heredoc value (its newlines live
+    // inside one opaque token, so they don't break containment).
+    let (inserted, _) = apply_edits("n = Text {}\n", None, "Untitled",
+        &[EditOp::SetLabel { node: "n".into(), label: Some("line1\nline2".into()) }]).expect("insert heredoc label");
+    parse_ok(&inserted);
+    assert!(inserted.contains("line1\nline2"), "heredoc body present: {inserted}");
+    let (replaced, _) = apply_edits("n = Text { _label: \"old\"\n  value: \"x\" }\n", None, "Untitled",
+        &[EditOp::SetLabel { node: "n".into(), label: Some("line1\nline2".into()) }]).expect("replace heredoc label");
+    parse_ok(&replaced);
+    assert!(replaced.contains("line1\nline2"), "heredoc body present: {replaced}");
+}
+
+// ── round-3 regression tests ────────────────────────────────────────────────
+
+#[test]
+fn set_config_empty_value_does_not_collapse_brace() {
+    // `value:` with no value: editing it must produce a clean field, not pull
+    // the `}` onto the value line.
+    let out = apply("n = Text {\n  value:\n}\n", vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"x\"".into() }]);
+    assert_eq!(out, "n = Text {\n  value: \"x\"\n}\n");
+}
+
+#[test]
+fn set_config_oneliner_inline_value_keeps_space_before_brace() {
+    let out = apply("g = Template { template: Upper { text: \"hi\" }.out }\n",
+        vec![EditOp::SetConfig { node: "g".into(), key: "template".into(), value: "\"plain\"".into() }]);
+    assert_eq!(out, "g = Template { template: \"plain\" }\n");
+}
+
+#[test]
+fn set_config_rejects_value_that_breaks_containment() {
+    // The value gate forbids content that would ESCAPE the field and corrupt the
+    // tree: an unbalanced closing brace (would close the body early) and a raw
+    // newline (would split the line). Lossless content that stays in value
+    // position (an operator like `|` in a type expr, even an NBSP) is allowed:
+    // it round-trips and the compiler flags an invalid value downstream.
+    let src = "n = Text { value: \"x\" }\n";
+    let reject = |v: &str| apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: v.into() }]);
+    assert!(matches!(reject("}"), Err(EditError::InvalidArgument(_))), "bare close brace");
+    assert!(matches!(reject("a\nb"), Err(EditError::InvalidArgument(_))), "raw newline");
+    // A union type expression is legitimate value content, NOT rejected.
+    assert!(reject("String | Number").is_ok(), "union type value must be accepted");
+}
+
+#[test]
+fn add_node_with_free_local_in_target_scope_succeeds() {
+    // `c` is free in `a.b` even though a top-level `c` exists (exact-scoped
+    // membership, not bare-local-anywhere).
+    let out = apply("c = Text {}\na = Group() -> () {\n  b = Group() -> () {}\n}\n",
+        vec![EditOp::AddNode { id: "c".into(), node_type: "Debug".into(), parent_group: Some("a.b".into()) }]);
+    parse_ok(&out);
+    assert!(structure(&out).nodes.iter().any(|n| n.id == "a.b.c"));
+}
+
+#[test]
+fn move_node_into_occupied_scope_fails_loud() {
+    let src = "g = Group() -> () {\n  x = Debug\n}\nx = Text { value: \"a\" }\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]).unwrap_err();
+    assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
+}
+
+#[test]
+fn move_node_takes_its_connection_origin_config() {
+    // `x.style = "bold"` is x's config (written as a connection); moving x takes
+    // it along, not stranded in the old scope.
+    let out = apply("g = Group() -> () {}\nx = Text { value: \"a\" }\nx.style = \"bold\"\n",
+        vec![EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]);
+    parse_ok(&out);
+    assert!(out.contains("x.style = \"bold\""), "config travelled: {out}");
+    // and it's now INSIDE the group (after the moved node), not at top level
+    let after_open = out.split_once('{').map(|(_, r)| r).unwrap_or("");
+    assert!(after_open.contains("x.style"), "config is inside the group: {out}");
+}
+
+// ── round-4 edit regressions ────────────────────────────────────────────────
+
+#[test]
+fn move_node_wired_across_scope_refused() {
+    // x is wired by a top-level edge; moving it into g would dangle that edge
+    // (same-scope-only), so the move is refused loudly (matches the graph view's
+    // pre-move guard).
+    let src = "g = Group() -> () {}\nx = Text { value: \"a\" }\ny = Debug\ny.data = x.value\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]).unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn move_node_into_inline_empty_group_no_glue() {
+    // Moving into an inline `{}` group opens the body cleanly, no glued brace line.
+    let out = apply("g = Group() -> () {}\nx = Text { value: \"a\" }\n",
+        vec![EditOp::MoveNodeScope { node: "x".into(), target_group: Some("g".into()) }]);
+    assert_eq!(out, "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\n");
     parse_ok(&out);
 }
+
+#[test]
+fn add_node_into_inline_empty_group_no_glue() {
+    let out = apply("g = Group() -> () {}\n",
+        vec![EditOp::AddNode { id: "x".into(), node_type: "Debug".into(), parent_group: Some("g".into()) }]);
+    parse_ok(&out);
+    assert!(out.contains("{\n"), "body opened on its own line: {out:?}");
+    assert!(!out.contains("{  "), "no glue onto the open brace: {out:?}");
+}
+

@@ -13,7 +13,9 @@
 //! 6. `build::invoke_cargo` runs cargo to produce the binary.
 
 pub mod project;
+pub mod source_name;
 pub mod weft_compiler;
+pub mod cst;
 pub mod edit;
 pub mod file_ref;
 pub mod enrich;
@@ -32,6 +34,7 @@ use weft_core::{MetadataCatalog, ProjectDefinition};
 // Re-export weft_core's Diagnostic/Severity so downstream callers
 // keep using weft_compiler::Diagnostic without touching node impls.
 pub use weft_core::node::{Diagnostic, Severity};
+use weft_core::project::Span;
 
 /// Fast-path parse for interactive editing (IDE, live preview). Runs
 /// lex + parse + flatten + lenient enrich. Does NOT run validation:
@@ -45,7 +48,7 @@ pub fn parse_only(
     project_id: Uuid,
     base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
-    component_name: Option<(&str, &str)>,
+    source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
@@ -53,34 +56,24 @@ pub fn parse_only(
     // diagnostic; every valid node/edge around it still renders (the editor
     // must keep showing the graph mid-edit, never blank out on one typo).
     // Interface mode for @include: opaque nodes the editor navigates into.
+    // `source_name` is the file's identity (e.g. `MyCleaner`); an anonymous
+    // top-level group takes it as its id, so the file's root carries the same
+    // id at parse, edit, and render with no sentinel to rename later.
     let (mut project, parse_errors) = weft_compiler::compile_lenient(
         source,
         project_id,
         base_dir,
         weft_compiler::IncludeMode::Interface,
+        source_name,
     );
     for e in parse_errors {
-        diagnostics.push(Diagnostic {
-            line: e.line,
-            column: 0,
-            severity: Severity::Error,
-            message: e.message,
-            code: Some("parse".into()),
-        });
+        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "parse", e.message));
     }
-
-    apply_component_name(&mut project, component_name);
 
     // Stage 3: enrich (lenient). Unknown types / catalog misses become
     // empty-port placeholders, not aborts.
     if let Err(e) = enrich::enrich_with_policy(&mut project, catalog, enrich::EnrichPolicy::Lenient) {
-        diagnostics.push(Diagnostic {
-            line: 0,
-            column: 0,
-            severity: Severity::Warning,
-            message: format!("{e}"),
-            code: Some("enrich".into()),
-        });
+        diagnostics.push(Diagnostic::at(Span::default(), Severity::Warning, "enrich", format!("{e}")));
     }
 
     // Surface unknown node types as warnings so the IDE can paint a
@@ -93,17 +86,12 @@ pub fn parse_only(
             continue;
         }
         if catalog.lookup(&node.node_type).is_none() {
-            let line = node
-                .header_span
-                .map(|s| s.start_line)
-                .unwrap_or(0);
-            diagnostics.push(Diagnostic {
-                line,
-                column: 0,
-                severity: Severity::Warning,
-                message: format!("unknown node type '{}'", node.node_type),
-                code: Some("unknown-type".into()),
-            });
+            diagnostics.push(Diagnostic::at(
+                node.header_span_or_default(),
+                Severity::Warning,
+                "unknown-type",
+                format!("unknown node type '{}'", node.node_type),
+            ));
         }
     }
 
@@ -142,10 +130,10 @@ pub fn compile_strict(
     base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
     mode: validate::ValidationMode,
-    component_name: Option<(&str, &str)>,
+    source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
     let (project, mut diagnostics) =
-        compile_and_enrich(source, project_id, base_dir, catalog, component_name);
+        compile_and_enrich(source, project_id, base_dir, catalog, source_name);
     diagnostics.extend(validate::validate_with_mode(&project, catalog, mode));
     (project, diagnostics)
 }
@@ -161,8 +149,8 @@ pub fn compile_checked(
     catalog: &dyn MetadataCatalog,
     mode: validate::ValidationMode,
 ) -> CompileResult<ProjectDefinition> {
-    // Build path: compiles a real project (no anonymous component root), so no
-    // component relabel.
+    // Build path: a real project with a named main group (no anonymous root), so
+    // the source name is irrelevant; `None` falls back to `Untitled`, unused.
     let (project, diagnostics) = compile_strict(source, project_id, base_dir, catalog, mode, None);
     bail_on_errors(diagnostics)?;
     Ok(project)
@@ -179,7 +167,8 @@ pub fn compile_enriched(
     base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
 ) -> CompileResult<ProjectDefinition> {
-    // Topology/hash path: a real project, no anonymous component relabel.
+    // Topology/hash path: a real project with a named main group (no anonymous
+    // root), so the source name is unused; `None` falls back to `Untitled`.
     let (project, diagnostics) = compile_and_enrich(source, project_id, base_dir, catalog, None);
     bail_on_errors(diagnostics)?;
     Ok(project)
@@ -196,33 +185,26 @@ fn compile_and_enrich(
     project_id: Uuid,
     base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
-    component_name: Option<(&str, &str)>,
+    source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
-    let mut project = match weft_compiler::compile(source, project_id, base_dir) {
+    let mut project = match weft_compiler::compile_with_mode(
+        source,
+        project_id,
+        base_dir,
+        weft_compiler::IncludeMode::Full,
+        source_name,
+    ) {
         Ok(p) => p,
         Err(errors) => {
             for e in errors {
-                diagnostics.push(Diagnostic {
-                    line: e.line,
-                    column: 0,
-                    severity: Severity::Error,
-                    message: e.message,
-                    code: Some("parse".into()),
-                });
+                diagnostics.push(Diagnostic::at(e.span, Severity::Error, "parse", e.message));
             }
             return (empty_project(project_id), diagnostics);
         }
     };
-    apply_component_name(&mut project, component_name);
     if let Err(e) = enrich::enrich(&mut project, catalog) {
-        diagnostics.push(Diagnostic {
-            line: 0,
-            column: 0,
-            severity: Severity::Error,
-            message: format!("{e}"),
-            code: Some("enrich".into()),
-        });
+        diagnostics.push(Diagnostic::at(Span::default(), Severity::Error, "enrich", format!("{e}")));
     }
     (project, diagnostics)
 }
@@ -230,17 +212,6 @@ fn compile_and_enrich(
 /// Turn an `Error`-severity diagnostic set into a single loud
 /// `CompileError`; `Ok(())` when only warnings (or nothing) remain.
 /// One place so every aborting entry formats failures identically.
-/// Apply a standalone component's caller-supplied (id, label) by relabeling
-/// the internal `__include_root__` sentinel. The single call site shared by
-/// every pipeline front (parse_only + compile_and_enrich) so the editor's
-/// parse and validate paths can't drift on whether the sentinel is scrubbed.
-/// No-op when `component_name` is `None` (a normal project / build).
-fn apply_component_name(project: &mut ProjectDefinition, component_name: Option<(&str, &str)>) {
-    if let Some((id, label)) = component_name {
-        weft_compiler::relabel_anonymous_root(project, id, label);
-    }
-}
-
 fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> CompileResult<()> {
     let msg = diagnostics
         .iter()
@@ -258,8 +229,6 @@ fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> CompileResult<()> {
 fn empty_project(project_id: Uuid) -> ProjectDefinition {
     ProjectDefinition {
         id: project_id,
-        name: String::new(),
-        description: None,
         nodes: Vec::new(),
         edges: Vec::new(),
         groups: Vec::new(),

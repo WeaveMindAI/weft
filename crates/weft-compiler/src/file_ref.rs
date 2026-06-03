@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use weft_core::project::{ConfigFieldSpan, FileRef};
+use weft_core::project::{ConfigFieldSpan, FileRef, Span};
 use weft_core::WeftType;
 
 use crate::weft_compiler::CompileError;
@@ -32,17 +32,13 @@ use crate::weft_compiler::CompileError;
 /// declarations use; when omitted the type is `String`.
 pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
     let trimmed = raw.trim();
-    // `@file` then (optional whitespace) `(`, mirroring how `@include` tolerates
-    // a space. A `@file` not followed by `(` fails loudly rather than silently
-    // passing through as an ordinary string value.
-    let after_file = trimmed.strip_prefix("@file")?;
-    let after_paren = after_file.trim_start();
-    let Some(inner) = after_paren.strip_prefix('(') else {
+    // Exactly the `@file` directive (not `@filesystem`); the marker module is the
+    // single home for directive/arg extraction and tolerates a space before `(`.
+    if crate::cst::marker::directive(trimmed) != "file" {
+        return None;
+    }
+    let Some(inner) = crate::cst::marker::args_raw(trimmed) else {
         return Some(Err("@file must be followed by (\"path\")".into()));
-    };
-    let inner = match inner.strip_suffix(')') {
-        Some(i) => i.trim(),
-        None => return Some(Err("@file is missing its closing parenthesis".into())),
     };
 
     // Split into the quoted path and an optional type, on the first
@@ -113,13 +109,23 @@ fn unquote(s: &str) -> Option<String> {
 
 /// Resolve a single `@file` marker against the project root: read the file
 /// and cast its content to the declared type. The path is resolved relative
-/// to `project_root` and must stay inside it (no escaping the project).
+/// to `project_root` and must stay inside it.
+///
+/// Threat model: the project tree is TRUSTED (this runs at build time on the
+/// user's own project; referenced files are part of the project, like infra
+/// specs). The containment check guards against an accidental `../` typo leaking
+/// a host file into the build, not a hostile tree. It is robust for that:
+/// `canonicalize` resolves `..` and follows symlinks before the prefix check, so
+/// any path (including via a symlink) that lands outside the root is rejected.
+/// The only residual gap is the canonicalize→read TOCTOU window, which is
+/// irrelevant for a trusted local tree. If `@file` ever resolves UNTRUSTED input,
+/// switch to O_NOFOLLOW / per-component symlink rejection to close that window.
 pub fn resolve(file_ref: &FileRef, project_root: &Path) -> Result<serde_json::Value, String> {
     let joined = project_root.join(&file_ref.path);
 
     // Reject path escape: the resolved canonical path must live under the
-    // project root. Mirrors the namespace-escape posture for infra specs:
-    // a node's referenced files are part of the project, not the host.
+    // project root (canonicalize resolves `..` and symlinks, so an escaping
+    // target fails the prefix check). Trusted-tree typo guard, see fn doc.
     let canonical_root = project_root
         .canonicalize()
         .map_err(|e| format!("project root {project_root:?} is unreadable: {e}"))?;
@@ -151,7 +157,7 @@ pub(crate) fn resolve_node_file_refs(
     config: &mut serde_json::Map<String, serde_json::Value>,
     config_spans: &std::collections::BTreeMap<String, ConfigFieldSpan>,
     file_refs: &mut std::collections::BTreeMap<String, FileRef>,
-    node_line: usize,
+    node_span: Span,
     base_dir: Option<&Path>,
     errors: &mut Vec<CompileError>,
 ) {
@@ -164,29 +170,20 @@ pub(crate) fn resolve_node_file_refs(
             Some(m) => m,
             None => continue, // ordinary value, leave it
         };
-        // Prefer the field's own span; fall back to the node's declaration line.
-        let line = config_spans
-            .get(key)
-            .map(|s| s.span.start_line)
-            .filter(|&l| l != 0)
-            .unwrap_or(node_line);
+        // The culprit is the field that carries the marker; fall back to the
+        // node's declaration span only if the field span is missing.
+        let span = config_spans.get(key).map(|s| s.span).unwrap_or(node_span);
         let file_ref = match marker {
             Ok(fr) => fr,
             Err(msg) => {
-                errors.push(CompileError { line, message: msg });
+                errors.push(CompileError::at(span, msg));
                 continue;
             }
         };
         let root = match base_dir {
             Some(r) => r,
             None => {
-                errors.push(CompileError {
-                    line,
-                    message: format!(
-                        "@file({:?}) cannot be resolved outside a project",
-                        file_ref.path
-                    ),
-                });
+                errors.push(CompileError::at(span, format!("@file({:?}) cannot be resolved outside a project", file_ref.path)));
                 continue;
             }
         };
@@ -195,7 +192,7 @@ pub(crate) fn resolve_node_file_refs(
                 *value = resolved;
                 file_refs.insert(key.clone(), file_ref);
             }
-            Err(msg) => errors.push(CompileError { line, message: msg }),
+            Err(msg) => errors.push(CompileError::at(span, msg)),
         }
     }
 }

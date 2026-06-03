@@ -188,8 +188,6 @@ export function translateProject(
 
   return {
     id: host.id,
-    name: host.name,
-    description: host.description,
     weftCode,
     layoutCode,
     nodes: structuralNodes,
