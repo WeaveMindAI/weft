@@ -10,11 +10,11 @@
 	import CustomEdge from "./CustomEdge.svelte";
 	import ActionBar from "./ActionBar.svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "$lib/nodes";
-	import type { ProjectDefinition, PortDefinition, NodeFeatures } from "$lib/types";
+	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "$lib/types";
 	import type { EditOp, TextEdit } from "../../../../shared/protocol";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "$lib/constants/colors";
 	import { autoOrganize } from "$lib/auto-organize";
-	import { updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutPrefix, applyLayoutOps, diffLayoutOps, type LayoutOp } from "$lib/layout";
+	import { updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutSubtree, applyLayoutOps, diffLayoutOps, type LayoutOp } from "$lib/layout";
 	import { formatConfigValue } from "$lib/value-format";
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "$lib/utils/infra-subgraph";
@@ -189,19 +189,20 @@
 	}
 
 	/** Move a node or group to a different scope: emit the move intent (Rust
-	 *  rewrites the source) and rename its layoutCode entry to the new scoped id.
-	 *  targetGroupLabel is the target group's label (undefined = top level);
-	 *  targetGroupId is its scoped id (e.g. "Outer.Inner") for the layout key.
+	 *  rewrites the source) and re-key its layout entries (the moved decl AND, for
+	 *  a group, its whole subtree) to the new scoped address, then set the moved
+	 *  decl's new position. `targetGroupLabel` is the target group's label (undefined
+	 *  = top level); `targetGroupId` is its scoped id for the layout key.
 	 *
-	 *  PRECONDITION: `node` must be the node's state BEFORE its `parentId` was
-	 *  reparented (so `getLayoutKey(node)` yields the OLD key). All callers (the
-	 *  drag capture handlers) pass the pre-mutation reference; if a future caller
-	 *  re-fetches the node post-reparent, oldKey would equal newKey and the
-	 *  old-scope entry would orphan. The new POSITION, however, is read from the
-	 *  live `nodes` array (the caller already wrote the reparented coords there):
-	 *  the moved decl's stored coords are now relative to its new parent, so
-	 *  carrying the OLD entry's x/y would render it at its pre-move spot (outside
-	 *  the new group) until a full ELK pass corrected it. */
+	 *  Layout view-state is the single source of truth for positions/sizes; the
+	 *  re-key here is the ONLY layout change a move makes, and `commit` runs it
+	 *  before the source round-trip so the pure-merge re-render reads it. No
+	 *  carry/remap is needed: the freshly-parsed nodes come back at the new scoped
+	 *  ids and the merge finds their (re-keyed) layout entries directly.
+	 *
+	 *  PRECONDITION: `node` is the node's state BEFORE its `parentId` was reparented,
+	 *  so `getLayoutKey(node)` yields the OLD key. The new POSITION is read from the
+	 *  live `nodes` array (the caller already wrote the reparented coords there). */
 	function weftMoveScopeAny(node: Node, targetGroupLabel: string | undefined, targetGroupId?: string) {
 		const oldKey = getLayoutKey(node);
 		const isGroup = node.type === 'group' || node.type === 'groupCollapsed';
@@ -211,25 +212,15 @@
 		const localId = isGroup ? (node.data.label as string) : node.id.split('.').pop()!;
 		const newKey = scopedLayoutKey(localId, targetGroupId || targetGroupLabel);
 		// The reparented (relative-to-new-parent) position the caller just committed.
-		const moved = nodes.find(n => n.id === node.id);
-		const pos = moved?.position ?? node.position;
-		// Record the subtree's scoped-id prefix rewrite so the post-edit re-render
-		// carries every moved node's live position across the rename (the moved
-		// node AND, for a group, all its descendants). `oldKey`/`newKey` are the
-		// scoped ids of the moved decl, i.e. the exact prefix each descendant id
-		// also shifts by.
-		if (oldKey !== newKey) pendingMovePrefixes.push({ from: oldKey, to: newKey });
+		const pos = (nodes.find(n => n.id === node.id) ?? node).position;
 		recordEdit([op], () => {
 			if (oldKey === newKey) return;
-			const entry = parseLayoutCode(layoutCode)[oldKey];
-			if (isGroup) {
-				// Rename the group + all its children, then overwrite the group's
-				// OWN entry with its new position (children keep their relative coords).
-				layoutCode = renameLayoutPrefix(layoutCode, oldKey, newKey);
-			} else {
-				layoutCode = removeLayoutEntry(layoutCode, oldKey);
-			}
-			layoutCode = updateLayoutEntry(layoutCode, newKey, pos.x, pos.y, entry?.w, entry?.h, entry?.expanded);
+			// Re-key the moved subtree's layout entries to the new address (exact, not
+			// a regex prefix-sweep), then set the moved decl's own new position.
+			// Descendants keep their (parent-relative) coords under their re-keyed ids.
+			layoutCode = renameLayoutSubtree(layoutCode, oldKey, newKey);
+			const entry = parseLayoutCode(layoutCode)[newKey];
+			layoutCode = updateLayoutEntry(layoutCode, newKey, pos.x, pos.y, entry?.w, entry?.h, entry?.expanded ?? null);
 		});
 	}
 
@@ -454,10 +445,7 @@
 	}
 
 	function createNodeUpdateHandler(nodeId: string) {
-		return (updates: { label?: string | null; config?: Record<string, unknown>; inputs?: PortDefinition[]; outputs?: PortDefinition[] }) => {
-			if ('config' in updates && 'expanded' in (updates.config || {})) {
-				console.debug(`[nodeUpdateHandler] node=${nodeId} expanded=${updates.config!.expanded} incomingConfigKeys=${Object.keys(updates.config || {}).join(',')}`);
-			}
+		return (updates: NodeDataUpdates) => {
 			// A collapse/expand TOGGLE is `expanded` actually CHANGING value, not
 			// merely present. Resize senders spread the whole config (which always
 			// carries the node's current `expanded`), so a key-presence test would
@@ -468,11 +456,6 @@
 			const priorExpanded = (nodes.find(n => n.id === nodeId)?.data.config as Record<string, boolean> | undefined)?.expanded;
 			const nextExpanded = (updates.config as Record<string, boolean> | undefined)?.expanded;
 			const isExpandToggle = nextExpanded !== undefined && nextExpanded !== priorExpanded;
-			if (isExpandToggle) {
-				const priorEntry = parseLayoutCode(layoutCode)[nodeId];
-				console.log('[exp] toggle node=', nodeId, '-> expanded=', nextExpanded,
-					'| had layout entry?', !!priorEntry, priorEntry ? JSON.stringify(priorEntry) : '(none)');
-			}
 
 			// Capture old group label BEFORE updating (for rename in weft code)
 			const oldGroupLabel = ('label' in updates) ? nodes.find(n => n.id === nodeId)?.data.label as string | undefined : undefined;
@@ -620,11 +603,13 @@
 				const isGroup = node?.type === 'group' || node?.type === 'groupCollapsed';
 				if (isGroup && oldGroupLabel && updates.label) {
 					ops.push({ op: 'renameGroup', oldLabel: oldGroupLabel, newLabel: updates.label as string });
-					// Rename layout entries: old scoped id (node.id) + children.
+					// Re-key the group's layout subtree (its own entry + descendants) from
+					// the old scoped address to the new one. Same exact, non-compounding
+					// re-key a move uses; a rename only changes the last path segment.
 					const parts = nodeId.split('.');
 					parts[parts.length - 1] = updates.label as string;
 					const newPrefix = parts.join('.');
-					mutateLayout = () => { layoutCode = renameLayoutPrefix(layoutCode, nodeId, newPrefix); };
+					mutateLayout = () => { layoutCode = renameLayoutSubtree(layoutCode, nodeId, newPrefix); };
 					hasLayout = true;
 				} else {
 					ops.push({ op: 'setLabel', node: nodeId, label: (updates.label as string | null) ?? null });
@@ -738,6 +723,23 @@
 	const SPECIAL_NODE_TYPES = new Set(['Group', 'Annotation', 'IncludedGroup']);
 
 	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean }>): Node[] {
+		// Pure merge step: overlay each node's layout entry (width/height/expanded)
+		// onto its config UP FRONT, so the structural parse (which carries none of
+		// this view-state) plus the layout file produce one merged node list. The
+		// rest of buildNodes (visibility walk, sizing, the returned config) reads the
+		// merged config, and the ancestor-collapse walk sees merged `expanded` too.
+		// Position is applied per-node below (also from the layout entry).
+		if (layoutMap) {
+			projectNodes = projectNodes.map(n => {
+				const e = layoutMap[n.id];
+				if (!e) return n;
+				const cfg = { ...(n.config as Record<string, unknown>) };
+				if (e.w !== undefined) cfg.width = e.w;
+				if (e.h !== undefined) cfg.height = e.h;
+				if (e.expanded !== undefined) cfg.expanded = e.expanded;
+				return { ...n, config: cfg };
+			}) as typeof projectNodes;
+		}
 		// Unknown node types are already handled by the parser as opaque blocks
 		// (they never reach project.nodes), so we only need to filter for known types.
 		const validNodes = projectNodes.filter(n =>
@@ -817,10 +819,16 @@
 				nestingDepth,
 			});
 
+			// Position is layout's job: the merge places a node at its saved layout
+			// entry when present, else at the node's own position (the structural
+			// parse emits 0,0; a just-typed node with no layout falls to the caller's
+			// placement). This is what makes buildNodes(project, layout) a pure merge.
+			const position = layoutEntry ? { x: layoutEntry.x, y: layoutEntry.y } : n.position;
+
 			return {
 				id: n.id,
 				type: sizing.type,
-				position: n.position,
+				position,
 				zIndex: sizing.zIndex,
 				...(sizing.width !== undefined ? { width: sizing.width } : {}),
 				...(sizing.height !== undefined ? { height: sizing.height } : {}),
@@ -1143,36 +1151,45 @@
 	
 	let preDragPositions = new Map<string, { x: number; y: number }>();
 
-	// Scoped-id prefix rewrites performed by reparent moves since the last
-	// re-render. A reparent renames every id in the moved subtree
-	// (`MyGroup` + `MyGroup.debug_4` -> `MyGroup_2.MyGroup` + `MyGroup_2.MyGroup.debug_4`),
-	// and the post-edit `patchFromProject` carries each surviving node's LIVE
-	// on-screen position across that rename via this exact map (oldPrefix ->
-	// newPrefix), so a structural re-parse never needs to consult the (possibly
-	// not-yet-persisted) layout file to keep a moved node, or its children, in
-	// place. Consumed (cleared) by `patchFromProject`.
-	let pendingMovePrefixes: Array<{ from: string; to: string }> = [];
-
-	// Commit one reversible action: mutate layout (sync, the existing inline
-	// layoutCode edits) and/or apply a source change, then return the INVERSE
-	// action. The layout inverse is a diff of layoutCode after-vs-before (so
-	// every existing layout-mutation line is captured with zero changes to it);
-	// the source inverse is the text edit the edit-server returns. This single
-	// primitive backs new edits (recordEdit) and undo/redo replay (applyAction).
+	// Commit one reversible action: mutate layout (the in-memory layoutCode edits)
+	// and apply a source change, then return the INVERSE action. The layout inverse
+	// is a diff of layoutCode after-vs-before; the source inverse is the text edit
+	// the edit-server returns. Backs new edits (recordEdit) and undo/redo replay.
+	//
+	// Layout is applied BEFORE the source round-trip, not after. The round-trip's
+	// re-parse re-renders the graph as a pure merge of (parsed source, layoutCode);
+	// it reads the IN-MEMORY layoutCode, so a move's layout re-key must already be
+	// in place or the moved node would render at a stale position for a frame (the
+	// old source-first ordering, plus carry/remap compensations, was exactly this
+	// race). Failure safety is kept by snapshotting layoutCode and rolling it back
+	// if the source op throws, so a rejected edit never strands a layout entry.
 	async function commit(
 		applySource: () => Promise<TextEdit | null>,
 		mutateLayout: () => void,
 	): Promise<ReversibleAction> {
-		// Source first: it's the fallible/async half. Only mutate layout once the
-		// source change landed, so a failed source op can't leave an orphan
-		// layout entry (e.g. a position for a node that was never added).
-		const source = (await applySource()) ?? undefined;
 		const layoutBefore = layoutCode;
 		mutateLayout();
+		// While a GUI edit is in flight, the webview's in-memory layoutCode is the
+		// authoritative copy (it already holds this edit's re-key). The round-trip's
+		// parseResult echoes the host's disk layout, which lags; `applyExternalSource`
+		// checks this flag and keeps our copy instead of clobbering it.
+		editInFlight++;
+		let source: TextEdit | undefined;
+		try {
+			source = (await applySource()) ?? undefined;
+		} catch (err) {
+			layoutCode = layoutBefore; // roll back the optimistic layout on a rejected source op
+			throw err;
+		} finally {
+			editInFlight--;
+		}
 		if (layoutCode !== layoutBefore) saveLayout();
 		const layout = diffLayoutOps(layoutCode, layoutBefore); // ops: after -> before
 		return { source, layout: layout.length > 0 ? layout : undefined };
 	}
+	// >0 while a GUI edit round-trip is in flight (see `commit`). Guards layout
+	// ownership in `applyExternalSource`.
+	let editInFlight = 0;
 
 	// All graph mutations (new edits + undo/redo replay) run through this one
 	// queue. They share mutable state (layoutCode, the undo/redo stacks) and each
@@ -1503,8 +1520,6 @@
 					layoutUpdateAny(n);
 				}
 			});
-			console.log('[exp] after runAutoOrganize: layoutCode entries=', Object.keys(parseLayoutCode(layoutCode)).length,
-				'| sample expanded states=', JSON.stringify(Object.fromEntries(Object.entries(parseLayoutCode(layoutCode)).map(([k,v])=>[k,v.expanded]))));
 			if (andFitView) setTimeout(() => doFitView(), 50);
 		});
 	}
@@ -1520,14 +1535,22 @@
 	 *  not-yet-flushed edit, so we drop any echo that differs from our working
 	 *  copy while a flush is pending; the round-trip after the flush reconciles. */
 	export function applyExternalSource(newProject: ProjectDefinition, newWeftCode: string, newLayoutCode: string): void {
-		if (newLayoutCode !== layoutCode) layoutCode = newLayoutCode;
 		if (saveProjectTimer !== null && newWeftCode !== weftCode) {
 			return;
 		}
-		// Fast path: the source text didn't change, but the compiler may have
-		// re-inferred port metadata not captured in the text (laneMode for
-		// implicit Gather/Expand, concrete portTypes from edges). Patch those in
-		// place without rebuilding the node list or re-running ELK.
+		// Layout ownership: the webview owns layout view-state. During a GUI edit
+		// round-trip (`editInFlight > 0`) our in-memory layoutCode already holds this
+		// edit's re-key, while the host's echoed copy is read from disk and lags, so
+		// we keep ours. We adopt the host's layout only for a genuinely external
+		// change (a direct `.weft`/`.layout` edit with no GUI edit in flight), where
+		// the host is authoritative. This is what lets a move's re-key survive the
+		// round-trip without any carry/remap compensation.
+		if (editInFlight === 0 && newLayoutCode !== layoutCode) {
+			layoutCode = newLayoutCode;
+		}
+		// Fast path: source text unchanged, but the compiler may have re-inferred
+		// port metadata (laneMode for implicit Gather/Expand, concrete portTypes).
+		// Patch ports in place without rebuilding the node list or re-running ELK.
 		if (newWeftCode === weftCode) {
 			mergeInferredPortMetadata(newProject);
 			return;
@@ -1580,58 +1603,24 @@
 	/// (resize, expand/collapse) or the toolbar Auto-organize button, which
 	/// call `runAutoOrganize` directly. Fresh-mount layout is the mount $effect.
 	export async function patchFromProject(newProject: ProjectDefinition): Promise<void> {
-		// Carry every surviving node's LIVE on-screen VIEW STATE (position AND size)
-		// across the round-trip. A structural re-parse changes graph STRUCTURE (which
-		// nodes exist, their ports, their parent), never position or size: those move
-		// only via a drag/resize or an explicit ELK pass. Carrying size matters as
-		// much as position: a group rebuilt without its height comes back at height 0,
-		// which trips its min-height auto-enforce and (before this) spuriously
-		// relayout. Keyed by id, so it survives regardless of the layout file timing.
-		const liveView = new Map(nodes.map(n => [n.id, { position: n.position, config: n.data.config as Record<string, unknown> | undefined }]));
-		// A reparent RENAMES every id in the moved subtree by a known prefix rewrite
-		// (recorded in `pendingMovePrefixes`). Translate each freshly-parsed id back
-		// to the id it had on screen BEFORE the move, so the moved node AND all its
-		// descendants resolve to their live view state. Exact (not a suffix guess):
-		// the prefixes are the same oldKey->newKey the move op itself used.
-		const prefixes = pendingMovePrefixes;
-		pendingMovePrefixes = [];
-		const liveIdOf = (newId: string): string => {
-			for (const { from, to } of prefixes) {
-				if (newId === to) return from;
-				if (newId.startsWith(to + '.')) return from + newId.slice(to.length);
-			}
-			return newId;
-		};
+		// Pure merge: the rendered graph is a function of (parsed source, layout).
+		// `buildNodes` already merges each node with its layout entry (position,
+		// size, expanded) by scoped id. Because a move re-keys the layout to the new
+		// scoped address BEFORE this runs (commit applies layout, then the source
+		// round-trip), every freshly-parsed node finds its layout entry directly.
+		// No state is carried across the re-parse, so there is nothing to reconcile,
+		// no id-remap, no size-hack: the merge IS the truth. A node with no layout
+		// entry (e.g. one just typed into the code panel) is placed below existing
+		// content so it's visible without an ELK pass shuffling everything.
 		const layoutMap = parseLayoutCode(layoutCode);
-
-		// A node keeps its live view state (translated across any reparent rename) or
-		// its saved `.layout` entry (e.g. a just-placed node). A node with neither
-		// (e.g. added by typing in the code panel) is placed below existing content
-		// so it's visible without an ELK pass shuffling everything.
 		let nextFreeY = 0;
 		for (const n of nodes) nextFreeY = Math.max(nextFreeY, n.position.y + (n.measured?.height ?? 100) + 40);
-		const newNodes = buildNodes(newProject.nodes, newProject.edges, layoutMap).map(n => {
-			const live = liveView.get(liveIdOf(n.id));
-			if (live) {
-				// Restore the live SIZE (width/height/expanded only, never the rest of
-				// config: the freshly-parsed config is authoritative for everything
-				// else) so a group doesn't reappear at height 0 and trip its min-height
-				// auto-enforce. Then restore the live position.
-				const lc = live.config ?? {};
-				const cfg = { ...(n.data.config as Record<string, unknown>) };
-				for (const k of ['width', 'height', 'expanded'] as const) {
-					if (lc[k] !== undefined) cfg[k] = lc[k];
-				}
-				const carried = applyNodeSizing(n, { ...n.data, config: cfg });
-				return { ...carried, position: live.position };
-			}
-			const layoutEntry = layoutMap[n.id];
-			if (layoutEntry) return { ...n, position: { x: layoutEntry.x, y: layoutEntry.y } };
+		nodes = buildNodes(newProject.nodes, newProject.edges, layoutMap).map(n => {
+			if (layoutMap[n.id]) return n; // buildNodes already applied the layout entry
 			const pos = { x: 0, y: nextFreeY };
 			nextFreeY += 140;
 			return { ...n, position: pos };
 		});
-		nodes = newNodes;
 
 		const currentEdgeIds = new Set(edges.map(e => e.id));
 		edges = buildEdges(newProject.edges, newProject.nodes).map(e =>

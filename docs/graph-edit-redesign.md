@@ -60,6 +60,37 @@ the **structural representation the editor and edit-ops work against is a tree**
 `children: Vec<NodeRef>`, a node knows its parent. A move is a single re-parent (detach from
 one children list, attach to another) plus a position write. No string rewrite anywhere.
 
+## Scope correction after mapping the blast radius
+
+A full-codebase map (core, lowering, edit-ops, cst-nodes, wire, dispatcher, TS) found that the
+flat dotted id is the **runtime/execution address** at ~62 sites: the pulse table, the node
+execution table, the journal events, the infra-node Postgres key, the edge index, the
+validator's node index. That usage is CORRECT: the runtime executes a *flattened* graph and a
+worker has no tree, it needs a flat stable address. Ripping flat ids out of the runtime would
+be huge, risky, and unrelated to the graph-editing bug.
+
+So the redesign is **surgical, not total**, and lands on the right boundary:
+
+- The flat dotted id STAYS as the runtime/wire address. Lowering produces it from the tree on
+  every parse (it already does this correctly via `scoped()`/`prefix_node_ids`). The runtime,
+  journal, infra DB, edges, validator: untouched.
+- The disease is purely that the **editor + layout** treat that runtime address as a node's
+  IDENTITY, so a move rewrites it with regex prefix surgery (`renameLayoutPrefix`) and the
+  render tries to carry view-state across the rewrite. That is what corrupts and shuffles.
+
+Honest constraint we accept: because identity encodes scope, and a move changes scope, a move
+MUST re-key the moved subtree's layout entries. The fix is to make that an EXACT structural
+re-key (a known set of oldKey->newKey for the moved nodes, derived from the structural delta),
+NOT a regex prefix-sweep over the whole file (which compounds: `A.B.A.B...`). And to make
+render a pure merge so nothing is carried across the re-parse. A scope-independent key (a
+per-node uuid) would make a move touch zero layout, but that needs identity stored in the text
+(not invisible) or in memory (does not survive a re-parse), both ruled out. Exact structural
+re-key is the correct best given the constraints.
+
+Net: this is a **TS-editor + layout-keying redesign**. No core/wire/runtime change needed; the
+wire already sends `scope: string[]` and the flat `id`, from which the editor derives the
+structural identity `(scope, localId)`.
+
 ## Target shapes
 
 ### Core (`weft-core`, `weft-compiler`)

@@ -20,7 +20,6 @@ import type {
   PortDefinition as V1Port,
   LaneMode,
 } from './lib/types';
-import { parseLayoutCode } from './lib/layout';
 
 function toV1Port(p: HostPort): V1Port {
   return {
@@ -171,21 +170,11 @@ export function translateProject(
   }
   const edges = host.edges.map((e) => toV1Edge(e, groupIds));
 
-  // The Rust ProjectDefinition always emits position=(0,0); persistent
-  // positions live in the companion `.layout` file. Apply them here so the
-  // graph opens where the user last saved it instead of a stack at the origin.
-  if (layoutCode) {
-    const layoutMap = parseLayoutCode(layoutCode);
-    for (const n of structuralNodes) {
-      const entry = layoutMap[n.id];
-      if (!entry) continue;
-      n.position = { x: entry.x, y: entry.y };
-      if (entry.w !== undefined) (n.config as Record<string, unknown>).width = entry.w;
-      if (entry.h !== undefined) (n.config as Record<string, unknown>).height = entry.h;
-      if (entry.expanded !== undefined) (n.config as Record<string, unknown>).expanded = entry.expanded;
-    }
-  }
-
+  // Position/size/expanded are NOT applied here. The Rust ProjectDefinition emits
+  // position=(0,0) and carries no view-state; the companion `.layout` file owns it.
+  // The merge of (structural nodes, layout) is done in ONE place, `buildNodes` in
+  // ProjectEditorInner, so the initial render and every post-edit re-render share
+  // the same pure merge and cannot drift.
   return {
     id: host.id,
     weftCode,

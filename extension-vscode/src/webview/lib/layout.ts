@@ -90,23 +90,28 @@ function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?
   return s;
 }
 
-/** Rename a scoped-id prefix in layoutCode (when a group is renamed, its own
- *  entry and all `prefix.child` entries shift). */
-export function renameLayoutPrefix(layoutCode: string, oldScopedId: string, newScopedId: string): string {
-  if (!layoutCode || oldScopedId === newScopedId) return layoutCode;
-  return layoutCode
-    .split('\n')
-    .map((line) => {
-      const t = line.trim();
-      if (t.startsWith(oldScopedId + ' @layout') || t.startsWith(oldScopedId + '\t@layout')) {
-        return newScopedId + t.slice(oldScopedId.length);
-      }
-      if (t.startsWith(oldScopedId + '.')) {
-        return newScopedId + t.slice(oldScopedId.length);
-      }
-      return line;
-    })
-    .join('\n');
+/** Re-key a whole subtree's layout entries when its scoped address changes (a
+ *  move that reparents `oldKey` to `newKey`, or a group rename). Operates on the
+ *  PARSED entry map, not a text regex: the moved node is `oldKey`, its
+ *  descendants are `oldKey + '.' + rest`, and each becomes `newKey[/.rest]`.
+ *
+ *  Parsing to a map first is what makes this exact and non-compounding: a regex
+ *  prefix-sweep over raw text could match an already-rewritten line and stack
+ *  the prefix again (`A.B.A.B...`). Here every source entry is rewritten exactly
+ *  once from its parsed key. Entries outside the subtree are untouched. */
+export function renameLayoutSubtree(layoutCode: string, oldKey: string, newKey: string): string {
+  if (!layoutCode || oldKey === newKey) return layoutCode;
+  const map = parseLayoutCode(layoutCode);
+  let code = layoutCode;
+  for (const [key, entry] of Object.entries(map)) {
+    let nextKey: string | null = null;
+    if (key === oldKey) nextKey = newKey;
+    else if (key.startsWith(oldKey + '.')) nextKey = newKey + key.slice(oldKey.length);
+    if (nextKey === null) continue;
+    code = removeLayoutEntry(code, key);
+    code = updateLayoutEntry(code, nextKey, entry.x, entry.y, entry.w, entry.h, entry.expanded ?? null);
+  }
+  return code;
 }
 
 // ── Reversible layout edits ──────────────────────────────────────────────
