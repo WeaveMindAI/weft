@@ -193,7 +193,7 @@ fn inverse_edit_restores_original_for_each_op() {
     );
     assert_reversible(
         "grp = Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\nd = Debug\nd.data = grp.outp\n",
-        vec![EditOp::RenameGroup { old_label: "grp".into(), new_label: "proc".into() }],
+        vec![EditOp::RenameGroup { group: "grp".into(), new_label: "proc".into() }],
     );
     assert_reversible(
         "grp = Group() -> () {\n  x = Text { value: \"a\" }\n}\nt = Text { value: \"b\" }\n",
@@ -382,10 +382,41 @@ fn add_edge_replaces_existing_driver() {
 #[test]
 fn rename_group_updates_header_and_refs() {
     let src = "# Project: T\n\ngrp = Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\nd = Debug\nd.data = grp.outp\n";
-    let out = apply(src, vec![EditOp::RenameGroup { old_label: "grp".into(), new_label: "proc".into() }]);
+    let out = apply(src, vec![EditOp::RenameGroup { group: "grp".into(), new_label: "proc".into() }]);
     assert!(out.contains("proc = Group"), "header renamed: {out}");
     assert!(out.contains("d.data = proc.outp"), "ref renamed: {out}");
     assert!(!out.contains("grp"), "no stale grp: {out}");
+}
+
+#[test]
+fn rename_group_by_scoped_id_disambiguates_same_local_label() {
+    // CONTRACT: RenameGroup carries the group's SCOPED id, so a group is identified
+    // unambiguously even when two groups share a local label in different scopes.
+    // Here `Inner` exists under both `A` and `B`; renaming A.Inner must rename ONLY
+    // that one (the old bare-label op would have hit AmbiguousId and refused).
+    let src = "A = Group() -> () {\n  Inner = Group() -> () {\n    d = Debug {}\n  }\n}\nB = Group() -> () {\n  Inner = Group() -> () {\n    e = Debug {}\n  }\n}\n";
+    let out = apply(src, vec![EditOp::RenameGroup { group: "A.Inner".into(), new_label: "Renamed".into() }]);
+    parse_ok(&out);
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "A.Renamed"), "A.Inner renamed to A.Renamed: {out}");
+    assert!(p.nodes.iter().any(|n| n.id == "B.Inner"), "B.Inner untouched: {out}");
+    assert!(!p.nodes.iter().any(|n| n.id == "A.Inner"), "no stale A.Inner: {out}");
+}
+
+#[test]
+fn update_group_ports_by_scoped_id_disambiguates_same_local_label() {
+    // Same scoped-id contract for UpdateGroupPorts: editing ports on A.Inner when a
+    // B.Inner also exists must resolve to exactly A.Inner, not error as ambiguous.
+    let src = "A = Group() -> () {\n  Inner = Group() -> () {\n    d = Debug {}\n  }\n}\nB = Group() -> () {\n  Inner = Group() -> () {\n    e = Debug {}\n  }\n}\n";
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "A.Inner".into(),
+        inputs: vec![PortSig { name: "x".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![],
+    }]);
+    parse_ok(&out);
+    // A.Inner's header gained the input at its OWN (2-space) indent; B.Inner empty.
+    // (No `-> ()` is emitted for an empty output clause.)
+    assert_eq!(out, "A = Group() -> () {\n  Inner = Group(x: String) {\n    d = Debug {}\n  }\n}\nB = Group() -> () {\n  Inner = Group() -> () {\n    e = Debug {}\n  }\n}\n", "A.Inner got the port at its own indent, B.Inner untouched: {out}");
 }
 
 #[test]
@@ -461,11 +492,12 @@ fn move_node_into_group_then_out() {
 
 #[test]
 fn move_into_current_scope_is_a_noop_not_a_self_collision() {
-    // Regression: dragging a decl and dropping it inside the scope it ALREADY lives
-    // in emitted a MoveScope into its own parent. `reject_if_taken` then saw the
-    // decl's own scoped id and reported `DuplicateId` (which white-screened the
-    // editor). A move into the current scope is a no-op: the source is unchanged
-    // and no error is raised. Covered for a nested group and a top-level node.
+    // CONTRACT: the editor identifies both the moved decl and the target group by
+    // their SCOPED id (never a bare label). A move into the scope a decl already
+    // lives in is a no-op: source unchanged, no error. (The old label-based op made
+    // the no-op guard compare a bare target against a scoped parent path, so at
+    // nesting depth >= 2 the guard misfired and the no-op move ran destructively,
+    // see `move_into_current_scope_depth2_is_a_clean_noop` below.)
     let nested = apply(
         "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n",
         vec![EditOp::MoveGroupScope { group: "MyGroup_2.MyGroup".into(), target_group: Some("MyGroup_2".into()) }],
@@ -490,6 +522,32 @@ fn move_into_current_scope_is_a_noop_not_a_self_collision() {
     )
     .unwrap_err();
     assert!(matches!(err, EditError::DuplicateId(_)), "real same-id collision still errors: {err:?}");
+}
+
+#[test]
+fn move_into_current_scope_depth2_is_a_clean_noop() {
+    // Regression for the depth-2 corruption: a node TWO levels deep, "moved" into
+    // the scope it already lives in (target = the SCOPED id of its current parent).
+    // The old bare-label op compared "MyGroup" (bare) against "MyGroup_2.MyGroup"
+    // (scoped parent), never matched, and the no-op move ran, mangling indentation
+    // and braces. With scoped-id targets the no-op guard matches exactly: unchanged.
+    let src = "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n";
+    let out = apply(src, vec![EditOp::MoveNodeScope { node: "MyGroup_2.MyGroup.debug_4".into(), target_group: Some("MyGroup_2.MyGroup".into()) }]);
+    assert_eq!(out, src, "depth-2 no-op must leave source byte-identical (no indent/brace corruption): {out:?}");
+    parse_ok(&out);
+}
+
+#[test]
+fn move_node_out_one_level_at_depth2() {
+    // A real depth-2 move: debug_4 from MyGroup_2.MyGroup out to MyGroup_2 (target
+    // = the scoped id of MyGroup_2). Confirms the scoped-target contract relocates
+    // correctly, not just no-ops.
+    let src = "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n";
+    let out = apply(src, vec![EditOp::MoveNodeScope { node: "MyGroup_2.MyGroup.debug_4".into(), target_group: Some("MyGroup_2".into()) }]);
+    parse_ok(&out);
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "MyGroup_2.debug_4"), "debug_4 moved up to MyGroup_2: {out}");
+    assert!(!p.nodes.iter().any(|n| n.id == "MyGroup_2.MyGroup.debug_4"), "no longer in inner group: {out}");
 }
 
 #[test]
@@ -579,7 +637,7 @@ fn rename_group_to_taken_id_fails_loud() {
     // Regression: renaming onto an existing id would make two same-id decls and
     // self-referential edges. Must fail loud instead.
     let src = "d = Debug\ngrp = Group() -> (o: String) {\n  t = Text { value: \"x\" }\n  self.o = t.value\n}\nd.data = grp.o\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { old_label: "grp".into(), new_label: "d".into() }]).unwrap_err();
+    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { group: "grp".into(), new_label: "d".into() }]).unwrap_err();
     assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
 }
 
@@ -823,7 +881,7 @@ fn add_edge_to_missing_endpoint_fails_loud() {
 #[test]
 fn rename_group_to_empty_fails_loud() {
     let src = "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { old_label: "grp".into(), new_label: "".into() }]).unwrap_err();
+    let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { group: "grp".into(), new_label: "".into() }]).unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
 }
 
@@ -987,7 +1045,7 @@ fn edit_soak_never_corrupts() {
                 6 => EditOp::RemoveEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
                 7 => EditOp::RemoveConfig { node: pick(next(), &targets), key: "value".into() },
                 8 => EditOp::RemoveGroup { group: pick(next(), &targets) },
-                9 => EditOp::RenameGroup { old_label: pick(next(), &targets), new_label: format!("r{}", next() % 1000) },
+                9 => EditOp::RenameGroup { group: pick(next(), &targets), new_label: format!("r{}", next() % 1000) },
                 10 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 11 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: None },
                 12 => EditOp::MoveGroupScope { group: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
@@ -1000,7 +1058,7 @@ fn edit_soak_never_corrupts() {
                 // cover.
                 15 => EditOp::AddLoop { label: format!("lp{}", next() % 1000), parent_group: None },
                 16 => EditOp::RemoveLoop { loop_id: pick(next(), &targets) },
-                17 => EditOp::RenameLoop { old_label: pick(next(), &targets), new_label: format!("lr{}", next() % 1000) },
+                17 => EditOp::RenameLoop { loop_id: pick(next(), &targets), new_label: format!("lr{}", next() % 1000) },
                 18 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 19 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: None },
                 20 => EditOp::UpdateLoopPorts { loop_id: pick(next(), &targets), inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[String]".into()) }], outputs: vec![PortSig { name: "results".into(), required: true, port_type: Some("List[String | Null]".into()) }] },
@@ -1036,7 +1094,7 @@ fn editop_wire_shape_round_trips() {
         json!({"op":"removeEdge","source":"a","sourcePort":"value","target":"b","targetPort":"data","scopeGroup":"g"}),
         json!({"op":"addGroup","label":"g","parentGroup":null}),
         json!({"op":"removeGroup","group":"g"}),
-        json!({"op":"renameGroup","oldLabel":"a","newLabel":"b"}),
+        json!({"op":"renameGroup","group":"a","newLabel":"b"}),
         json!({"op":"moveNodeScope","node":"n","targetGroup":"g"}),
         json!({"op":"moveGroupScope","group":"g","targetGroup":null}),
         json!({"op":"updateNodePorts","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[]}),
@@ -1046,7 +1104,7 @@ fn editop_wire_shape_round_trips() {
         // ops above. A serde rename here breaks the webview silently.
         json!({"op":"addLoop","label":"l","parentGroup":null}),
         json!({"op":"removeLoop","loopId":"l"}),
-        json!({"op":"renameLoop","oldLabel":"a","newLabel":"b"}),
+        json!({"op":"renameLoop","loopId":"a","newLabel":"b"}),
         json!({"op":"moveLoopScope","loopId":"l","targetGroup":"g"}),
         json!({"op":"moveLoopScope","loopId":"l","targetGroup":null}),
         json!({"op":"updateLoopPorts","loopId":"l","inputs":[{"name":"i","required":true,"portType":"List[String]"}],"outputs":[{"name":"o","required":true,"portType":"List[String | Null]"}]}),
@@ -1233,6 +1291,17 @@ fn add_node_into_inline_empty_group_no_glue() {
     assert!(!out.contains("{  "), "no glue onto the open brace: {out:?}");
 }
 
+#[test]
+fn add_node_into_nested_inline_empty_group_indents_close_brace() {
+    // Opening a NESTED single-line body must drop its `}` to the GROUP's own
+    // indent, not to column 0. The old `insert_before_close` only prepended a
+    // newline, so `C`'s close brace landed at column 0 (valid-but-corrupt source
+    // that compounds on later edits). Byte-exact to pin the indentation.
+    let src = "A = Group() -> () {\n  C = Group() -> () {}\n}\n";
+    let out = apply(src, vec![EditOp::AddNode { id: "d".into(), node_type: "Debug".into(), parent_group: Some("A.C".into()) }]);
+    assert_eq!(out, "A = Group() -> () {\n  C = Group() -> () {\n    d = Debug {}\n  }\n}\n", "C's close brace at its own 2-space indent: {out:?}");
+    parse_ok(&out);
+}
 
 // ─── Loop edit op tests ─────────────────────────────────────────────────────
 
@@ -1280,7 +1349,7 @@ fn remove_loop_ungroups_children() {
 fn rename_loop_rewrites_header_and_outside_refs() {
     let src = "my = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n}\nd = Debug\nd.data = my.results\n";
     let out = apply(src, vec![EditOp::RenameLoop {
-        old_label: "my".into(),
+        loop_id: "my".into(),
         new_label: "renamed".into(),
     }]);
     parse_ok(&out);
@@ -1294,6 +1363,23 @@ fn rename_loop_rewrites_header_and_outside_refs() {
     );
     assert!(!out.contains("my ="), "old header gone: {out}");
     assert!(!out.contains("my.results"), "old reference gone: {out}");
+}
+
+#[test]
+fn rename_loop_scoped_id_disambiguates_same_local_label() {
+    // CONTRACT: RenameLoop carries the loop's SCOPED id (mirror of RenameGroup),
+    // so a loop is identified unambiguously even when two loops share a local
+    // label in different scopes. Here `Inner` is a Loop under both `A` and `B`;
+    // renaming A.Inner must rename ONLY that one (a bare-label op would hit
+    // AmbiguousId and refuse). This is the depth>=2 case the scoped-id upgrade
+    // unlocked.
+    let src = "A = Group() -> () {\n  Inner = Loop() -> () {\n    d = Debug {}\n  }\n}\nB = Group() -> () {\n  Inner = Loop() -> () {\n    e = Debug {}\n  }\n}\n";
+    let out = apply(src, vec![EditOp::RenameLoop { loop_id: "A.Inner".into(), new_label: "Renamed".into() }]);
+    parse_ok(&out);
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "A.Renamed"), "A.Inner loop renamed to A.Renamed: {out}");
+    assert!(p.nodes.iter().any(|n| n.id == "B.Inner"), "B.Inner loop untouched: {out}");
+    assert!(!p.nodes.iter().any(|n| n.id == "A.Inner"), "no stale A.Inner: {out}");
 }
 
 /// `is_err()` alone is too permissive: a regression that errored for
@@ -1324,7 +1410,7 @@ fn rename_group_rejects_loop_target() {
         None,
         "Untitled",
         &[EditOp::RenameGroup {
-            old_label: "my".into(),
+            group: "my".into(),
             new_label: "newname".into(),
         }],
     );
@@ -1362,7 +1448,7 @@ fn rename_loop_rejects_group_target() {
         None,
         "Untitled",
         &[EditOp::RenameLoop {
-            old_label: "g".into(),
+            loop_id: "g".into(),
             new_label: "other".into(),
         }],
     );
@@ -1377,7 +1463,7 @@ fn rename_loop_rejects_node_target() {
         None,
         "Untitled",
         &[EditOp::RenameLoop {
-            old_label: "n".into(),
+            loop_id: "n".into(),
             new_label: "other".into(),
         }],
     );

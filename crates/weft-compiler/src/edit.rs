@@ -51,8 +51,9 @@ pub enum EditOp {
     AddGroup { label: String, parent_group: Option<String> },
     /// Remove a group; its body moves up one scope (ungroup).
     RemoveGroup { group: String },
-    /// Rename a group and rewrite references to its ports.
-    RenameGroup { old_label: String, new_label: String },
+    /// Rename a group and rewrite references to its ports. `group` is the group's
+    /// SCOPED id (e.g. `Outer.Inner`); `new_label` is the new bare local name.
+    RenameGroup { group: String, new_label: String },
     /// Move a node into a group (top level when `target_group` is None).
     MoveNodeScope { node: String, target_group: Option<String> },
     /// Move a group into another group (top level when None).
@@ -71,10 +72,12 @@ pub enum EditOp {
     AddLoop { label: String, parent_group: Option<String> },
     /// Remove a loop; its body moves up one scope (un-loop).
     RemoveLoop { loop_id: String },
-    /// Rename a loop. Loop-only mirror of `RenameGroup`; the dispatch
-    /// refuses a Group target and vice versa so the webview routing
-    /// stays honest.
-    RenameLoop { old_label: String, new_label: String },
+    /// Rename a loop. Loop-only mirror of `RenameGroup`; `loop_id` is the
+    /// loop's SCOPED id (same contract as `RenameGroup`'s `group`), so a
+    /// rename is unambiguous when two loops share a local label in
+    /// different scopes. The dispatch refuses a Group target and vice
+    /// versa so the webview routing stays honest.
+    RenameLoop { loop_id: String, new_label: String },
     /// Move a loop into another container (top level when None).
     /// Loop-only mirror of `MoveGroupScope`.
     MoveLoopScope { loop_id: String, target_group: Option<String> },

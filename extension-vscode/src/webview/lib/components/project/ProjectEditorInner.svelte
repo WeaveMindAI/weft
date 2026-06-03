@@ -37,6 +37,12 @@
 	const MAX_HISTORY = 100;
 	let undoStack = $state<ReversibleAction[]>([]);
 	let redoStack = $state<ReversibleAction[]>([]);
+	// Bumped every time a NEW forward edit is recorded (pushAction). An undo's
+	// redo-push is async (the inverse comes from the source round-trip), so it
+	// captures this epoch when it starts and skips the redo-push if a new forward
+	// edit was recorded in the meantime: that forward edit already branched history
+	// and cleared redo, so repopulating it would resurrect a dead branch.
+	let redoEpoch = 0;
 
 	let {
 		project,
@@ -149,6 +155,12 @@
 	// The editor owns these after init; saves flow outward via onSave.
 	let weftCode = $state(untrack(() => project.weftCode) ?? '');
 	let layoutCode = $state(untrack(() => project.layoutCode) ?? '');
+	// The last structural project the editor accepted and rendered (matches the
+	// current `weftCode`). It is the editor's local "source of truth" graph. A
+	// refused GUI edit rebuilds nodes/edges from this so the optimistic structural
+	// mutation is discarded without a host round-trip (the source on disk never
+	// changed, so this still describes reality). Stashed on every accepted render.
+	let lastRenderedProject = $state.raw<ProjectDefinition>(untrack(() => project));
 	// Child ProjectNodes register their field-editor flushes here so
 	// flushAllPendingSaves can commit in-progress typing on teardown.
 	const fieldEditorRegistry = provideFieldEditorRegistry();
@@ -188,8 +200,15 @@
 	/** Move a node or group to a different scope: emit the move intent (Rust
 	 *  rewrites the source) and re-key its layout entries (the moved decl AND, for
 	 *  a group, its whole subtree) to the new scoped address, then set the moved
-	 *  decl's new position. `targetGroupLabel` is the target group's label (undefined
-	 *  = top level); `targetGroupId` is its scoped id for the layout key.
+	 *  decl's new position. `targetGroupId` is the target group's SCOPED id
+	 *  (undefined = top level).
+	 *
+	 *  Both the moved decl and the target are identified to Rust by their SCOPED id
+	 *  (`node.id`, `targetGroupId`), never a bare label. A bare label is ambiguous
+	 *  across scopes and, crucially, can't be compared against a scoped parent path:
+	 *  the old label-based op made the Rust no-op guard misfire at nesting depth >= 2
+	 *  (a no-op move was applied destructively). Scoped-id everywhere makes the
+	 *  resolve and the no-op comparison exact at any depth.
 	 *
 	 *  Layout view-state is the single source of truth for positions/sizes; the
 	 *  re-key here is the ONLY layout change a move makes, and `commit` runs it
@@ -200,18 +219,20 @@
 	 *  PRECONDITION: `node` is the node's state BEFORE its `parentId` was reparented,
 	 *  so `getLayoutKey(node)` yields the OLD key. The new POSITION is read from the
 	 *  live `nodes` array (the caller already wrote the reparented coords there). */
-	function weftMoveScopeAny(node: Node, targetGroupLabel: string | undefined, targetGroupId?: string) {
+	function weftMoveScopeAny(node: Node, targetGroupId: string | undefined) {
 		const oldKey = getLayoutKey(node);
 		const isContainer = node.type === 'group' || node.type === 'groupCollapsed';
-		// Group/Loop have distinct move ops; the Rust side rejects a
-		// mismatched-kind move loudly. The kind check has to happen
-		// in this function (callers already reparented the visual)
-		// so an unset kind is a return-and-warn (no source op) rather
-		// than a throw mid-handler. The visual reparent is left in
-		// place; the user can re-trigger the move once the node tag
-		// re-hydrates.
+		// Group and Loop have distinct move ops; the Rust side rejects a
+		// mismatched-kind move loudly. The kind check has to happen in this
+		// function (callers already reparented the visual) so an unset kind
+		// is a return-and-warn (no source op) rather than a throw mid-handler.
+		// The visual reparent is left in place; the user can re-trigger the
+		// move once the node tag re-hydrates. Both ops carry the SCOPED id
+		// (node.id / targetGroupId), never a bare label: a bare label is
+		// ambiguous across scopes and made the Rust no-op guard misfire at
+		// nesting depth >= 2 (a no-op move applied destructively).
 		let op: EditOp;
-		if (isContainer && node.data.label) {
+		if (isContainer) {
 			const kind = containerKindOf(node.data?.nodeType);
 			if (kind === null) {
 				console.warn(
@@ -221,13 +242,13 @@
 				return;
 			}
 			op = kind === 'Loop'
-				? { op: 'moveLoopScope', loopId: node.data.label as string, targetGroup: targetGroupLabel ?? null }
-				: { op: 'moveGroupScope', group: node.data.label as string, targetGroup: targetGroupLabel ?? null };
+				? { op: 'moveLoopScope', loopId: node.id, targetGroup: targetGroupId ?? null }
+				: { op: 'moveGroupScope', group: node.id, targetGroup: targetGroupId ?? null };
 		} else {
-			op = { op: 'moveNodeScope', node: node.id, targetGroup: targetGroupLabel ?? null };
+			op = { op: 'moveNodeScope', node: node.id, targetGroup: targetGroupId ?? null };
 		}
-		const localId = isContainer ? (node.data.label as string) : node.id.split('.').pop()!;
-		const newKey = scopedLayoutKey(localId, targetGroupId || targetGroupLabel);
+		const localId = node.id.split('.').pop()!;
+		const newKey = scopedLayoutKey(localId, targetGroupId);
 		// The reparented (relative-to-new-parent) position the caller just committed.
 		const pos = (nodes.find(n => n.id === node.id) ?? node).position;
 		recordEdit([op], () => {
@@ -521,7 +542,12 @@
 
 				const newData = { ...n.data };
 				if ('label' in updates) newData.label = updates.label;
-				if ('config' in updates) newData.config = updates.config;
+				// MERGE config (don't replace): an update may carry a PARTIAL config
+				// (e.g. the min-height auto-enforce sends only `{height}`); replacing
+				// would wipe the node's other config keys. Full-config updates (field
+				// edits send `{...data.config, [key]: value}`) are unaffected since
+				// merging a superset is identity.
+				if ('config' in updates) newData.config = { ...(n.data.config as Record<string, unknown>), ...updates.config };
 				if ('inputs' in updates) newData.inputs = updates.inputs;
 				if ('outputs' in updates) newData.outputs = updates.outputs;
 				return applyNodeSizing(n, newData);
@@ -642,17 +668,16 @@
 				const node = nodes.find(n => n.id === nodeId);
 				const isContainer = node?.type === 'group' || node?.type === 'groupCollapsed';
 				if (isContainer && oldGroupLabel && updates.label) {
-					// Group/Loop have distinct rename ops. The Rust side
-					// rejects RenameGroup on a Loop (and vice versa) loudly;
-					// routing by container kind is required, not just nicer.
-					// Precondition (above) already verified kind is set;
-					// `containerKindOf` returns non-null here.
+					// Group and Loop have distinct rename ops (the Rust dispatch
+					// rejects a kind mismatch loudly), but both carry the SCOPED id
+					// (`nodeId`), so a rename is unambiguous when two containers share a
+					// local label in different scopes; Rust derives the old bare label
+					// from the resolved decl. Identical shape, so route by kind into one
+					// push.
 					const kind = containerKindOf(node?.data?.nodeType);
-					if (kind === 'Loop') {
-						ops.push({ op: 'renameLoop', oldLabel: oldGroupLabel, newLabel: updates.label as string });
-					} else {
-						ops.push({ op: 'renameGroup', oldLabel: oldGroupLabel, newLabel: updates.label as string });
-					}
+					ops.push(kind === 'Loop'
+						? { op: 'renameLoop', loopId: nodeId, newLabel: updates.label as string }
+						: { op: 'renameGroup', group: nodeId, newLabel: updates.label as string });
 					// Re-key the group's layout subtree (its own entry + descendants) from
 					// the old scoped address to the new one. Same exact, non-compounding
 					// re-key a move uses; a rename only changes the last path segment.
@@ -667,23 +692,58 @@
 			}
 			if ('config' in updates) {
 				const cfg = updates.config!;
+				// `needsLayout` means a layout key (width/height/expanded) actually
+				// CHANGED vs what's persisted, not merely that it's present. A field
+				// edit re-sends the full config including the UNCHANGED dims; treating
+				// mere presence as a change would churn the layout file (and history)
+				// on every keystroke. We compare against the PERSISTED layout entry
+				// (the source of truth for dims) so a bundled config+ops update can
+				// safely persist its layout part only when the dims really moved,
+				// closing the "layout dropped when bundled with ops" gap.
+				// Look up by the node's live SCOPED layout key (the exact key the writer
+				// `layoutUpdateAny` uses), not the raw `nodeId`: the two diverge for one
+				// frame after a drag reparents a node, and keying off `nodeId` there would
+				// miss the entry (read undefined -> every dim looks "changed" -> a spurious
+				// layout write + history churn on a keystroke).
+				const liveNode = nodes.find(n => n.id === nodeId);
+				const layoutEntry = liveNode ? parseLayoutCode(layoutCode)[getLayoutKey(liveNode)] : undefined;
+				const persistedDim = (key: string): unknown =>
+					key === 'width' ? layoutEntry?.w
+						: key === 'height' ? layoutEntry?.h
+						: key === 'configCollapsed' ? layoutEntry?.configCollapsed
+						: layoutEntry?.expanded;
+				// A Loop's config fields (`parallel`, `over`, `carry`, ...) live in the
+				// loop config block, not a node config block, so they route to the
+				// loop-specific ops; the Rust dispatch rejects a generic SetConfig /
+				// RemoveConfig against a Loop decl. Both carry the SCOPED id (`nodeId`).
+				const isLoopConfig = containerKindOf(liveNode?.data?.nodeType) === 'Loop';
 				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
 					if (['parentId', 'textareaHeights', '_opaqueChildren'].includes(key)) continue;
 					if (['width', 'height', 'expanded', 'configCollapsed'].includes(key)) {
-						needsLayout = true;
+						// Only a CHANGED layout key needs a layout write: a field edit
+						// re-sends the full config including unchanged dims, and treating
+						// mere presence as a change churns the layout file + history on a
+						// keystroke. `configCollapsed` (the loop config strip) is a layout
+						// key too, so it rides the same changed-not-present gate.
+						if (value !== persistedDim(key)) needsLayout = true;
 						continue;
 					}
 					if (value === undefined || value === null) {
-						ops.push({ op: 'removeConfig', node: nodeId, key });
+						ops.push(isLoopConfig ? { op: 'removeLoopConfig', loopId: nodeId, key } : { op: 'removeConfig', node: nodeId, key });
 					} else {
-						ops.push({ op: 'setConfig', node: nodeId, key, value: formatConfigValue(value) });
+						ops.push(isLoopConfig ? { op: 'setLoopConfig', loopId: nodeId, key, value: formatConfigValue(value) } : { op: 'setConfig', node: nodeId, key, value: formatConfigValue(value) });
 					}
 				}
 				if (needsLayout) {
+					// The node in `nodes` was already updated (merged config + new
+					// dims) by the synchronous map above, so persist its live state
+					// directly. (Previously this overrode config with the update's
+					// `cfg`, which is fine for a full-config update but wrong for a
+					// partial one like `{height}` now that config merges.)
 					mutateLayout = () => {
 						const n = nodes.find(nd => nd.id === nodeId);
-						if (n) layoutUpdateAny({ ...n, data: { ...n.data, config: cfg } });
+						if (n) layoutUpdateAny(n);
 					};
 					hasLayout = true;
 				}
@@ -694,17 +754,16 @@
 					const inputs = toPortSigs((updates.inputs ?? node.data.inputs) as PortLike[]);
 					const outputs = toPortSigs((updates.outputs ?? node.data.outputs) as PortLike[]);
 					const isContainer = node.type === 'group' || node.type === 'groupCollapsed';
-					if (isContainer && node.data.label) {
-						// Group/Loop have distinct port-update ops to keep the
-						// protocol surface symmetric with rename/remove (the
-						// Rust impls share a generic helper but the dispatch
-						// validates the decl kind matches the op). Precondition
-						// at handler entry already verified kind is set.
+					if (isContainer) {
+						// Group and Loop have distinct port-update ops (the Rust dispatch
+						// validates the decl kind matches the op). Both carry the SCOPED id
+						// (`nodeId`), not the bare label, so ports resolve unambiguously
+						// even when two containers share a local label in different scopes.
 						const kind = containerKindOf(node.data.nodeType);
 						if (kind === 'Loop') {
-							ops.push({ op: 'updateLoopPorts', loopId: node.data.label as string, inputs, outputs });
+							ops.push({ op: 'updateLoopPorts', loopId: nodeId, inputs, outputs });
 						} else {
-							ops.push({ op: 'updateGroupPorts', group: node.data.label as string, inputs, outputs });
+							ops.push({ op: 'updateGroupPorts', group: nodeId, inputs, outputs });
 						}
 					} else {
 						ops.push({ op: 'updateNodePorts', node: nodeId, inputs, outputs });
@@ -725,30 +784,41 @@
 			// reshuffle the graph. Gate on the explicit flag, never on key-presence.
 			const isResize = !!updates.resized && !isExpandToggle;
 
+			// Dispatch. `hasLayout` now means a layout dim ACTUALLY changed (not just
+			// present), so the only thing that should debounce is pure config-value
+			// typing: source `config` ops, no structural ports/label, no real layout
+			// change. Everything else (structural ops, a real layout change, or a
+			// bundle of both like add-port-which-grows-the-group) commits immediately
+			// with BOTH its source ops and its layout mutation, so the layout part is
+			// never dropped regardless of how the update is bundled.
+			const isPureConfigTyping = 'config' in updates && ops.length > 0 && !hasLayout
+				&& !('inputs' in updates) && !('outputs' in updates) && !('label' in updates);
 			if (isExpandToggle) {
-				// Layout (incl. the toggled `expanded` flag) is recorded by the
-				// isExpandToggle block's ELK pass. Only flush any text ops that
-				// rode along (rare).
+				// Collapse/expand: the ELK pass below records layout incl. the toggled
+				// flag. Flush any source ops that rode along (rare: a config typed in
+				// the same frame as a toggle).
 				if (ops.length > 0) { flushPendingConfigOps(); recordEdit(ops); }
 			} else if (isResize) {
-				// Resize: a new footprint means neighbours should make room, so
-				// re-run ELK (no viewport pin); runAutoOrganize records the layout.
+				// User resize: a new footprint means neighbours reflow, so re-run ELK
+				// (no viewport pin); runAutoOrganize records the layout.
 				void runAutoOrganize(false);
-			} else if ('config' in updates) {
-				// Text config typing: accumulate ops across keystrokes and flush as
-				// one atomic batch (one undo unit) once typing pauses. The buffer
-				// survives handler calls so edits to different fields aren't lost.
-				if (ops.length > 0) {
-					pendingConfigOps.push(...ops);
-					if (saveProjectTimer) clearTimeout(saveProjectTimer);
-					saveProjectTimer = setTimeout(() => {
-						saveProjectTimer = null;
-						flushPendingConfigOps();
-					}, SAVE_DEBOUNCE_MS);
-				}
+			} else if (isPureConfigTyping) {
+				// Config-value typing: accumulate ops across keystrokes and flush as one
+				// atomic batch (one undo unit) when typing pauses. The buffer survives
+				// handler calls so edits to different fields aren't lost.
+				pendingConfigOps.push(...ops);
+				if (saveProjectTimer) clearTimeout(saveProjectTimer);
+				saveProjectTimer = setTimeout(() => {
+					saveProjectTimer = null;
+					flushPendingConfigOps();
+				}, SAVE_DEBOUNCE_MS);
 			} else if (ops.length > 0 || hasLayout) {
-				// Ports/label (structural): flush pending typing first (order), then
-				// apply as one reversible action with its layout part.
+				// Structural (ports/label) ops, and/or a LAYOUT-only change with no
+				// source ops (the min-height auto-enforce sends just `{height}`). Both
+				// persist immediately as one reversible action; flush pending typing
+				// first for ordering. (The old chain dropped the layout mutation when
+				// it had no `ops` because the `'config' in updates` branch above only
+				// handled `ops`.)
 				flushPendingConfigOps();
 				recordEdit(ops, mutateLayout);
 			}
@@ -825,7 +895,21 @@
 		}
 		for (const g of groupNodes) visitGroup(g);
 		const sortedNodes = [...sortedGroups, ...otherNodes];
-		
+
+		// Placement for nodes with NO layout entry (e.g. just typed into the code
+		// panel, or a fresh file before ELK): stack them BELOW the laid-out content
+		// so they're visible without overlapping at the origin, instead of all
+		// landing at (0,0). This is the ONE placement rule, shared by the initial
+		// mount and every post-edit re-render (both go through buildNodes), so the
+		// two paths can't diverge (mount used to leave such nodes stacked at 0,0).
+		// Top-level only: a child with no entry stays at its own (parent-relative)
+		// position, which a later ELK/auto-organize resolves.
+		let nextFreeY = 0;
+		for (const n of sortedNodes) {
+			const e = layoutMap?.[n.id];
+			if (e) nextFreeY = Math.max(nextFreeY, e.y + (e.h ?? 120) + 40);
+		}
+
 		return sortedNodes.map((n) => {
 			const isGroup = isContainerNodeType(n.nodeType);
 			const isAnnotation = n.nodeType === 'Annotation';
@@ -881,10 +965,20 @@
 			});
 
 			// Position is layout's job: the merge places a node at its saved layout
-			// entry when present, else at the node's own position (the structural
-			// parse emits 0,0; a just-typed node with no layout falls to the caller's
-			// placement). This is what makes buildNodes(project, layout) a pure merge.
-			const position = layoutEntry ? { x: layoutEntry.x, y: layoutEntry.y } : n.position;
+			// entry when present. A node with NO entry (just typed, fresh file) is
+			// placed below existing laid-out content (top-level) so it's visible, not
+			// stacked at the origin; a child with no entry keeps its parent-relative
+			// position. This single placement rule lives here so mount and re-render
+			// agree. (`n.position` is the structural parse's 0,0.)
+			let position: { x: number; y: number };
+			if (layoutEntry) {
+				position = { x: layoutEntry.x, y: layoutEntry.y };
+			} else if (!rawParentId) {
+				position = { x: 0, y: nextFreeY };
+				nextFreeY += 140;
+			} else {
+				position = n.position;
+			}
 
 			return {
 				id: n.id,
@@ -1318,7 +1412,9 @@
 	async function commit(
 		applySource: () => Promise<TextEdit | null>,
 		mutateLayout: () => void,
+		seq: number,
 	): Promise<ReversibleAction> {
+		if (seq > 0) renderEditSeq = seq; // this structural action's round-trip render belongs to `seq`
 		const layoutBefore = layoutCode;
 		mutateLayout();
 		// While a GUI edit is in flight, the webview's in-memory layoutCode is the
@@ -1327,21 +1423,53 @@
 		// checks this flag and keeps our copy instead of clobbering it.
 		editInFlight++;
 		let source: TextEdit | undefined;
+		let rejected = false;
 		try {
 			source = (await applySource()) ?? undefined;
 		} catch (err) {
-			layoutCode = layoutBefore; // roll back the optimistic layout on a rejected source op
+			// The source op was REFUSED by Rust (the disk source is unchanged). Roll
+			// back the optimistic layout re-key, and (after editInFlight is cleared)
+			// rebuild nodes/edges from the last accepted project so the optimistic
+			// STRUCTURAL mutation is discarded too. The graph returns to exactly the
+			// last-rendered truth, no host round-trip needed.
+			layoutCode = layoutBefore;
+			rejected = true;
 			throw err;
 		} finally {
 			editInFlight--;
+			// Rebuild AFTER editInFlight is cleared so the rollback render isn't itself
+			// dropped by any in-flight guard, and against the rolled-back layoutCode.
+			if (rejected) void patchFromProject(lastRenderedProject);
 		}
 		if (layoutCode !== layoutBefore) saveLayout();
 		const layout = diffLayoutOps(layoutCode, layoutBefore); // ops: after -> before
 		return { source, layout: layout.length > 0 ? layout : undefined };
 	}
+
+	// Reserve a stale-render sequence number for an action ABOUT to be enqueued.
+	// Structural actions (those that round-trip a source change and thus produce a
+	// parseResult render) advance `latestEditSeq` synchronously here, so that by the
+	// time any queued task runs, `latestEditSeq` already reflects every structural
+	// action queued so far. The returned seq is later handed to `commit`, which
+	// stamps `renderEditSeq` when the action actually runs. Layout-only actions
+	// return 0 and never participate (they produce no render and don't supersede
+	// one). Used by BOTH new edits (`pushAction`) and undo/redo replay
+	// (`applyAction`), so the two paths share one accounting and can't drift.
+	function reserveEditSeq(isStructural: boolean): number {
+		return isStructural ? ++latestEditSeq : 0;
+	}
 	// >0 while a GUI edit round-trip is in flight (see `commit`). Guards layout
 	// ownership in `applyExternalSource`.
 	let editInFlight = 0;
+	// Monotonic sequence over STRUCTURAL edits only, for stale-render rejection
+	// (see `pushAction`). `latestEditSeq` is the last structural edit enqueued
+	// (bumped synchronously at edit time); `renderEditSeq` is the structural edit
+	// whose round-trip render is currently firing. A render is stale (drop it) when
+	// a newer STRUCTURAL edit was enqueued after its own. Layout-only edits (drag,
+	// resize, collapse) do NOT advance these: they don't supersede a structural
+	// render (the pure merge reads their layout) and produce no render of their own.
+	let latestEditSeq = 0;
+	let renderEditSeq = 0;
 
 	// All graph mutations (new edits + undo/redo replay) run through this one
 	// queue. They share mutable state (layoutCode, the undo/redo stacks) and each
@@ -1383,18 +1511,66 @@
 	}
 
 	function pushAction(ops: EditOp[], mutateLayout: () => void): void {
+		// Stale-render protection. A STRUCTURAL edit (ops.length > 0) round-trips
+		// through Rust and re-renders the graph from the edit's project. If a NEWER
+		// structural edit is enqueued behind it, the older edit's render is stale
+		// (its project lacks the newer change) and must be dropped so it can't
+		// rebuild `nodes` from the outdated project. `applyExternalSource` drops a
+		// render whose `renderEditSeq < latestEditSeq`.
+		//
+		// Only STRUCTURAL edits advance `latestEditSeq`. A layout-only edit (a drag,
+		// resize, collapse: ops empty) does NOT supersede a pending structural
+		// render: it mutates only `layoutCode` (+ optimistic node view-state), and
+		// the structural render is a PURE MERGE that reads the live `layoutCode`, so
+		// it already reflects the layout edit. Advancing the seq for layout-only
+		// edits would wrongly drop the structural render (which then never repaints,
+		// since the layout-only edit produces no render of its own) and the
+		// structural change would silently vanish until the next structural edit.
+		const isStructural = ops.length > 0;
+		const seq = reserveEditSeq(isStructural);
+		// A new forward action branches history, so it invalidates the redo stack.
+		// Clear it SYNCHRONOUSLY here at record time, not inside the async task:
+		// `undo`/`redo` pop the stacks synchronously, so a redo pressed after this
+		// action is recorded but before its task runs must already see an empty redo
+		// stack. Otherwise a stale redo replays (worst case a source text edit against
+		// a source this action already changed). Every `pushAction` is a user-initiated
+		// forward action (undo/redo replay goes through `applyAction`, never here), so a
+		// successful forward action drops the redo branch, exactly like a text editor.
+		// Bump the epoch so any in-flight undo whose async redo-push hasn't run yet
+		// won't resurrect the dead branch. BUT a REFUSED edit changes nothing (commit
+		// rolls back), so it must NOT branch history: snapshot the redo stack and
+		// restore it if commit throws (epoch-guarded, so a later successful forward
+		// edit that legitimately re-cleared redo isn't resurrected). Same restore-on-
+		// failure discipline as undo/redo.
+		const savedRedo = redoStack;
+		redoStack = [];
+		redoEpoch++;
+		const epoch = redoEpoch;
 		enqueue(async () => {
-			const undoAction = await commit(() => (ops.length > 0 ? onApplyEdits(ops) : Promise.resolve(null)), mutateLayout);
-			if (undoAction.source || undoAction.layout) {
-				undoStack = [...undoStack, undoAction].slice(-MAX_HISTORY);
-				redoStack = [];
+			try {
+				const undoAction = await commit(() => (isStructural ? onApplyEdits(ops) : Promise.resolve(null)), mutateLayout, seq);
+				if (undoAction.source || undoAction.layout) {
+					undoStack = [...undoStack, undoAction].slice(-MAX_HISTORY);
+				}
+			} catch {
+				// Edit refused: commit already rolled back the graph + layout. It branched
+				// nothing, so restore the redo stack it cleared (unless a later forward
+				// edit has since branched, advancing the epoch). Swallow here so a
+				// terminal refused edit doesn't leave an unhandled chain rejection.
+				if (redoEpoch === epoch) redoStack = savedRedo;
 			}
 		});
 	}
 
 	// Replay a stored action (undo/redo): source half is a text edit replayed
-	// through the edit-server, layout half is layout ops applied locally.
-	function applyAction(a: ReversibleAction): Promise<ReversibleAction> {
+	// through the edit-server, layout half is layout ops applied locally. An action
+	// with a `source` is STRUCTURAL (it round-trips and renders), so it must take a
+	// reserved `seq` exactly like a new structural edit; otherwise its render would
+	// be wrongly dropped by the stale-render guard when a concurrent new edit
+	// advanced `latestEditSeq` (and conversely it must advance the seq so it can
+	// supersede an older pending render). The caller reserves `seq` synchronously
+	// before enqueuing, mirroring `pushAction`.
+	function applyAction(a: ReversibleAction, seq: number): Promise<ReversibleAction> {
 		return commit(
 			() => (a.source ? onApplyTextEdit(a.source) : Promise.resolve(null)),
 			() => {
@@ -1404,6 +1580,7 @@
 				// layoutCode onto the live node positions/sizes.
 				reconcileNodesFromLayout();
 			},
+			seq,
 		);
 	}
 
@@ -1504,22 +1681,43 @@
 		});
 	}
 
+	// Undo/redo POP synchronously (not inside the task) so that: (a) a rapid second
+	// undo sees the already-shortened stack and targets the next action, and (b) we
+	// know the exact action here and can reserve its stale-render seq accurately
+	// (structural iff it carries a source edit) before enqueuing, so a new edit
+	// queued right after orders correctly against it. On replay failure the action
+	// is pushed back so the stacks stay correct.
 	function undo() {
+		const a = undoStack[undoStack.length - 1];
+		if (!a) return;
+		undoStack = undoStack.slice(0, -1);
+		const seq = reserveEditSeq(!!a.source);
+		const epoch = redoEpoch;
 		enqueue(async () => {
-			const a = undoStack[undoStack.length - 1];
-			if (!a) return;
-			const inverse = await applyAction(a); // may throw; swap stacks only on success
-			undoStack = undoStack.slice(0, -1);
-			redoStack = [...redoStack, inverse];
+			try {
+				const inverse = await applyAction(a, seq);
+				// Only repopulate redo if no new forward edit branched history meanwhile
+				// (which would have cleared redo and bumped the epoch).
+				if (redoEpoch === epoch) redoStack = [...redoStack, inverse];
+			} catch (e) {
+				undoStack = [...undoStack, a]; // replay failed: restore the action
+				throw e;
+			}
 		});
 	}
 	function redo() {
+		const a = redoStack[redoStack.length - 1];
+		if (!a) return;
+		redoStack = redoStack.slice(0, -1);
+		const seq = reserveEditSeq(!!a.source);
 		enqueue(async () => {
-			const a = redoStack[redoStack.length - 1];
-			if (!a) return;
-			const inverse = await applyAction(a);
-			redoStack = redoStack.slice(0, -1);
-			undoStack = [...undoStack, inverse];
+			try {
+				const inverse = await applyAction(a, seq);
+				undoStack = [...undoStack, inverse];
+			} catch (e) {
+				redoStack = [...redoStack, a]; // replay failed: restore the action
+				throw e;
+			}
 		});
 	}
 
@@ -1687,9 +1885,21 @@
 	 *  not-yet-flushed edit, so we drop any echo that differs from our working
 	 *  copy while a flush is pending; the round-trip after the flush reconciles. */
 	export function applyExternalSource(newProject: ProjectDefinition, newWeftCode: string, newLayoutCode: string): void {
+		// Stale-render guard: this is a GUI edit's round-trip render (editInFlight>0)
+		// but a NEWER edit was enqueued after it (latestEditSeq advanced). Applying it
+		// would rebuild `nodes` from the older edit's project and clobber the newer
+		// edit's optimistic state (the `change1 -> render1 -> change2` race). Drop it;
+		// the newer edit's own render will be authoritative.
+		if (editInFlight > 0 && renderEditSeq < latestEditSeq) {
+			return;
+		}
 		if (saveProjectTimer !== null && newWeftCode !== weftCode) {
 			return;
 		}
+		// This render is accepted (passed the stale + pending-flush guards), so it is
+		// the new local truth. Stash it for refused-edit rollback BEFORE the fast/patch
+		// branch, so both paths keep it current.
+		lastRenderedProject = newProject;
 		// Layout ownership: the webview owns layout view-state. During a GUI edit
 		// round-trip (`editInFlight > 0`) our in-memory layoutCode already holds this
 		// edit's re-key, while the host's echoed copy is read from disk and lags, so
@@ -1760,18 +1970,10 @@
 		// scoped address BEFORE this runs (commit applies layout, then the source
 		// round-trip), every freshly-parsed node finds its layout entry directly.
 		// No state is carried across the re-parse, so there is nothing to reconcile,
-		// no id-remap, no size-hack: the merge IS the truth. A node with no layout
-		// entry (e.g. one just typed into the code panel) is placed below existing
-		// content so it's visible without an ELK pass shuffling everything.
-		const layoutMap = parseLayoutCode(layoutCode);
-		let nextFreeY = 0;
-		for (const n of nodes) nextFreeY = Math.max(nextFreeY, n.position.y + (n.measured?.height ?? 100) + 40);
-		nodes = buildNodes(newProject.nodes, newProject.edges, layoutMap).map(n => {
-			if (layoutMap[n.id]) return n; // buildNodes already applied the layout entry
-			const pos = { x: 0, y: nextFreeY };
-			nextFreeY += 140;
-			return { ...n, position: pos };
-		});
+		// no id-remap, no size-hack: the merge IS the truth. `buildNodes` also owns
+		// placement for nodes with no layout entry (below existing content), so mount
+		// and re-render share that one rule (no separate placement here).
+		nodes = buildNodes(newProject.nodes, newProject.edges, parseLayoutCode(layoutCode));
 
 		const currentEdgeIds = new Set(edges.map(e => e.id));
 		edges = buildEdges(newProject.edges, newProject.nodes).map(e =>
@@ -2388,6 +2590,24 @@
 		};
 	}
 
+	/** Is `node`'s CENTRE inside `group`'s box? The ONE containment test shared by
+	 *  every drag in/out decision (leave-group, captured-by-group, group-captures).
+	 *  Keying on the node's centre (not its top-left corner) makes "leaves" and
+	 *  "enters" symmetric about the same boundary: a node leaves exactly when its
+	 *  centre exits and is captured exactly when its centre enters. The old
+	 *  top-left-corner tests disagreed by the node's own width/height, so a node
+	 *  could be dragged visually out of (or into) a group without its corner
+	 *  crossing the edge, and no move op was emitted (a silent non-move). */
+	function nodeCentreInGroup(node: Node, group: Node): boolean {
+		const nodeAbs = getAbsolutePosition(node);
+		const nodeDims = getNodeRect(node);
+		const cx = nodeAbs.x + nodeDims.width / 2;
+		const cy = nodeAbs.y + nodeDims.height / 2;
+		const groupAbs = getAbsolutePosition(group);
+		const { width: gw, height: gh } = getGroupDimensions(group);
+		return cx >= groupAbs.x && cx <= groupAbs.x + gw && cy >= groupAbs.y && cy <= groupAbs.y + gh;
+	}
+
 	function onNodeDragStart({ targetNode, nodes: draggedNodes }: { targetNode: Node | null; event: MouseEvent | TouchEvent; nodes: Node[] }) {
 		// Store pre-drag positions for all dragged nodes (for scope-blocked revert)
 		preDragPositions.clear();
@@ -2407,20 +2627,17 @@
 		// One reversible action for the whole gesture: any reparent (move ops
 		// from the capture checks) + the final positions are committed together,
 		// so a single undo reverts the entire drag, not piece by piece.
+		const draggedIds = new Set(draggedNodes.map(dn => dn.id));
 		transaction(() => {
-			// Re-read from current nodes state after each step to avoid stale refs.
+			// One net scope change for the dragged node (subsumes leave + captured-by),
+			// then, if it's a group, let it capture stationary nodes. Re-read after the
+			// first step so the group-captures pass sees post-reparent state.
 			let currentNode = nodes.find(n => n.id === targetNode.id);
 			if (currentNode) {
-				if (currentNode.parentId) {
-					checkNodeLeavesGroup(currentNode);
-					currentNode = nodes.find(n => n.id === targetNode.id);
-				}
-				if (currentNode) {
-					checkNodeCapturedByGroup(currentNode);
-					currentNode = nodes.find(n => n.id === targetNode.id);
-				}
+				applyNodeScopeChange(currentNode);
+				currentNode = nodes.find(n => n.id === targetNode.id);
 				if (currentNode?.type === 'group' || currentNode?.type === 'groupCollapsed') {
-					checkGroupCapturesNodes(currentNode);
+					checkGroupCapturesNodes(currentNode, draggedIds);
 				}
 			}
 			recordEdit([], () => {
@@ -2435,20 +2652,15 @@
 	function onSelectionDragStop(_event: MouseEvent, selectedNodes: Node[]) {
 		// One reversible action for the whole multi-select drag (reparents + the
 		// final positions), so a single undo reverts the entire gesture.
+		const draggedIds = new Set(selectedNodes.map(sn => sn.id));
 		transaction(() => {
 			for (const selectedNode of selectedNodes) {
 				let node = nodes.find(n => n.id === selectedNode.id);
 				if (!node) continue;
-				if (node.parentId) {
-					checkNodeLeavesGroup(node);
-					node = nodes.find(n => n.id === selectedNode.id);
-				}
-				if (node) {
-					checkNodeCapturedByGroup(node);
-					node = nodes.find(n => n.id === selectedNode.id);
-				}
+				applyNodeScopeChange(node);
+				node = nodes.find(n => n.id === selectedNode.id);
 				if (node && (node.type === 'group' || node.type === 'groupCollapsed')) {
-					checkGroupCapturesNodes(node);
+					checkGroupCapturesNodes(node, draggedIds);
 				}
 			}
 			recordEdit([], () => {
@@ -2485,47 +2697,77 @@
 		return false;
 	}
 
-	function checkNodeLeavesGroup(node: Node) {
-		const parentGroup = nodes.find(n => n.id === node.parentId);
-		if (!parentGroup) return;
-		
-		const { width: groupWidth, height: groupHeight } = getGroupDimensions(parentGroup);
-		
-		const stillInGroup = 
-			node.position.x >= 0 &&
-			node.position.x <= groupWidth &&
-			node.position.y >= 0 &&
-			node.position.y <= groupHeight;
-		
-		if (!stillInGroup) {
-			if (nodeHasConnectionsInScope(node.id, node.parentId)) {
-				// Revert to pre-drag position
-				const savedPos = preDragPositions.get(node.id);
-				if (savedPos) {
-					nodes = nodes.map(n => n.id === node.id ? { ...n, position: { ...savedPos } } : n);
-				}
-				showScopeBlockedToast();
-				return;
+	/** The group a dragged node should END UP in, given where its centre landed:
+	 *  the deepest, then smallest, EXPANDED, visible group whose box contains the
+	 *  centre (excluding the node itself and its own descendants), or `undefined`
+	 *  for top level. This single resolver subsumes both "leaves its group" (the
+	 *  centre escaped the parent, so the parent is no longer the best container)
+	 *  and "captured by a group" (the centre entered one). Computing the NET
+	 *  destination once is what lets a drag emit exactly one move instead of a
+	 *  leave-then-enter pair whose second op referenced the node's stale id. */
+	function resolveDropGroup(node: Node): string | undefined {
+		let bestGroup: Node | undefined;
+		let bestDepth = -1;
+		let bestArea = Infinity;
+		for (const group of nodes) {
+			if (group.type !== 'group') continue; // expanded groups only (collapsed = 'groupCollapsed')
+			if (group.id === node.id) continue;
+			if (isDescendantOf(group.id, node.id)) continue;
+			if (group.style?.includes('display: none')) continue;
+			if (!nodeCentreInGroup(node, group)) continue;
+			const { width: gw, height: gh } = getGroupDimensions(group);
+			const depth = getGroupDepth(group);
+			const area = gw * gh;
+			if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
+				bestDepth = depth;
+				bestArea = area;
+				bestGroup = group;
 			}
-
-			const parentAbs = getAbsolutePosition(parentGroup);
-			const absoluteX = parentAbs.x + node.position.x;
-			const absoluteY = parentAbs.y + node.position.y;
-			
-			nodes = nodes.map(n => {
-				if (n.id !== node.id) return n;
-				const newConfig = { ...(n.data.config as Record<string, unknown>) };
-				delete newConfig.parentId;
-				return {
-					...n,
-					position: { x: absoluteX, y: absoluteY },
-					parentId: undefined,
-					extent: undefined,
-					data: { ...n.data, config: newConfig },
-				};
-			});
-			weftMoveScopeAny(node, undefined);
 		}
+		return bestGroup?.id;
+	}
+
+	/** Apply the net scope change for a single dragged node: reparent it to the
+	 *  group its centre landed in (or top level), then emit ONE move op. A move
+	 *  blocked by an in-scope wire reverts the node to its pre-drag spot. This
+	 *  replaces the old leave + captured-by pair (which could emit two ops, the
+	 *  second keyed on a now-stale id). `node` is the PRE-reparent ref so
+	 *  `weftMoveScopeAny` reads the OLD layout key. */
+	function applyNodeScopeChange(node: Node) {
+		const targetGroupId = resolveDropGroup(node);
+		const currentParentId = node.parentId ?? undefined;
+		if (targetGroupId === currentParentId) return; // net scope unchanged
+
+		if (nodeHasConnectionsInScope(node.id, node.parentId)) {
+			const savedPos = preDragPositions.get(node.id);
+			if (savedPos) {
+				nodes = nodes.map(n => n.id === node.id ? { ...n, position: { ...savedPos } } : n);
+			}
+			showScopeBlockedToast();
+			return;
+		}
+
+		// New position: relative to the new parent when entering a group, absolute
+		// when moving to top level. Computed from the node's current absolute spot.
+		const nodeAbs = getAbsolutePosition(node);
+		const targetGroup = targetGroupId ? nodes.find(n => n.id === targetGroupId) : undefined;
+		const groupAbs = targetGroup ? getAbsolutePosition(targetGroup) : { x: 0, y: 0 };
+		const newPos = { x: nodeAbs.x - groupAbs.x, y: nodeAbs.y - groupAbs.y };
+
+		nodes = nodes.map(n => {
+			if (n.id !== node.id) return n;
+			const newConfig = { ...(n.data.config as Record<string, unknown>) };
+			if (targetGroupId) newConfig.parentId = targetGroupId; else delete newConfig.parentId;
+			return {
+				...n,
+				position: newPos,
+				parentId: targetGroupId,
+				extent: targetGroupId ? n.extent : undefined,
+				data: { ...n.data, config: newConfig },
+			};
+		});
+		weftMoveScopeAny(node, targetGroupId);
+		ensureParentBeforeChild();
 	}
 
 	function getAbsolutePosition(n: Node): { x: number; y: number } {
@@ -2553,75 +2795,6 @@
 			current = nodes.find(n => n.id === current!.parentId);
 		}
 		return depth;
-	}
-
-	function checkNodeCapturedByGroup(node: Node) {
-		const nodeAbs = getAbsolutePosition(node);
-
-		let bestGroup: Node | null = null;
-		let bestDepth = -1;
-		let bestArea = Infinity;
-
-		for (const group of nodes) {
-			if (group.type !== 'group') continue;
-			if (group.id === node.id) continue;
-			if (isDescendantOf(group.id, node.id)) continue;
-			// Only expanded groups can capture nodes
-			if (!((group.data.config as Record<string, unknown>)?.expanded ?? true)) continue;
-			// Skip hidden nodes (children of collapsed ancestors)
-			if (group.style?.includes('display: none')) continue;
-
-			const groupAbs = getAbsolutePosition(group);
-			const { width: groupWidth, height: groupHeight } = getGroupDimensions(group);
-
-			const nodeInGroup =
-				nodeAbs.x >= groupAbs.x &&
-				nodeAbs.x <= groupAbs.x + groupWidth &&
-				nodeAbs.y >= groupAbs.y &&
-				nodeAbs.y <= groupAbs.y + groupHeight;
-
-			if (nodeInGroup) {
-				const depth = getGroupDepth(group);
-				const area = groupWidth * groupHeight;
-				// Prefer deepest nesting, break ties by smallest area
-				if (depth > bestDepth || (depth === bestDepth && area < bestArea)) {
-					bestDepth = depth;
-					bestArea = area;
-					bestGroup = group;
-				}
-			}
-		}
-
-		if (!bestGroup) return;
-
-		// Already in this group, nothing to do
-		if (bestGroup.id === node.parentId) return;
-
-		if (nodeHasConnectionsInScope(node.id, node.parentId)) {
-			const savedPos = preDragPositions.get(node.id);
-			if (savedPos) {
-				nodes = nodes.map(n => n.id === node.id ? { ...n, position: { ...savedPos } } : n);
-			}
-			showScopeBlockedToast();
-			return;
-		}
-
-		const groupAbs = getAbsolutePosition(bestGroup);
-		const relativeX = nodeAbs.x - groupAbs.x;
-		const relativeY = nodeAbs.y - groupAbs.y;
-
-		nodes = nodes.map(n => {
-			if (n.id !== node.id) return n;
-			const existingConfig = (n.data.config as Record<string, unknown>) || {};
-			return {
-				...n,
-				position: { x: relativeX, y: relativeY },
-				parentId: bestGroup!.id,
-				data: { ...n.data, config: { ...existingConfig, parentId: bestGroup!.id } },
-			};
-		});
-		weftMoveScopeAny(node, bestGroup!.data.label as string, bestGroup!.id);
-		ensureParentBeforeChild();
 	}
 
 	function ensureParentBeforeChild() {
@@ -2655,31 +2828,37 @@
 		nodes = sorted;
 	}
 
-	function checkGroupCapturesNodes(group: Node) {
+	/** A dragged GROUP swallows stationary top-level nodes its box now covers.
+	 *  `draggedIds` are the nodes in the SAME drag gesture; they must be excluded:
+	 *  a co-dragged node is going to its OWN drop target (handled by its own
+	 *  `applyNodeScopeChange`), so letting the group passively capture it would
+	 *  steal it into the wrong scope. */
+	function checkGroupCapturesNodes(group: Node, draggedIds: Set<string> = new Set()) {
 		// Collapsed groups don't capture nodes
 		if (!((group.data.config as Record<string, unknown>)?.expanded ?? true)) return;
 
 		const groupAbs = getAbsolutePosition(group);
-		const { width: groupWidth, height: groupHeight } = getGroupDimensions(group);
 
 		let blocked = false;
-		const capturedNodeIds: string[] = [];
+		// Capture the PRE-mutation node objects (the `n` the map sees BEFORE reparent),
+		// not their ids. `weftMoveScopeAny`'s precondition is that it gets the node's
+		// state before `config.parentId` was changed, so `getLayoutKey` yields the OLD
+		// scoped key and the layout re-key fires. Re-fetching from `nodes` after the
+		// map returned the POST-mutation node, making oldKey == newKey, so the re-key
+		// was skipped and the captured node's saved position was orphaned (the node
+		// jumped). `applyNodeScopeChange` follows the same pre-mutation-ref discipline.
+		const captured: Node[] = [];
 		nodes = nodes.map(n => {
 			if (n.parentId || n.type === 'group' || n.type === 'groupCollapsed' || n.id === group.id) return n;
+			if (draggedIds.has(n.id)) return n; // co-dragged: goes to its own drop target, not swallowed
 
-			const nodeAbs = getAbsolutePosition(n);
-			const nodeInGroup =
-				nodeAbs.x >= groupAbs.x &&
-				nodeAbs.x <= groupAbs.x + groupWidth &&
-				nodeAbs.y >= groupAbs.y &&
-				nodeAbs.y <= groupAbs.y + groupHeight;
-
-			if (nodeInGroup) {
+			if (nodeCentreInGroup(n, group)) {
 				if (nodeHasConnectionsInScope(n.id, n.parentId)) {
 					blocked = true;
 					return n;
 				}
-				capturedNodeIds.push(n.id);
+				captured.push(n); // pre-mutation ref
+				const nodeAbs = getAbsolutePosition(n);
 				const existingConfig = (n.data.config as Record<string, unknown>) || {};
 				return {
 					...n,
@@ -2690,12 +2869,8 @@
 			}
 			return n;
 		});
-		const groupLabel = group.data.label as string;
-		for (const id of capturedNodeIds) {
-			const capturedNode = nodes.find(n => n.id === id);
-			if (capturedNode) {
-				weftMoveScopeAny(capturedNode, groupLabel, group.id);
-			}
+		for (const preNode of captured) {
+			weftMoveScopeAny(preNode, group.id);
 		}
 		if (blocked) showScopeBlockedToast();
 		ensureParentBeforeChild();

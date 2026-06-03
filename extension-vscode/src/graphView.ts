@@ -264,13 +264,16 @@ export class GraphViewController {
       this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg)),
       this.panel.onDidDispose(() => this.onDispose()),
       vscode.workspace.onDidChangeTextDocument((e) => {
-        // Skip our OWN write to this path (the shared writer is mid-edit);
-        // path-scoped so an unrelated concurrent write can't unsuppress us.
-        if (this.writingPaths.has(e.document.uri.fsPath)) return;
         if (this.watchedDoc && e.document === this.watchedDoc) {
+          // Skip when the doc already matches what we rendered: our own edit write,
+          // the save pipeline's trim/newline follow-ups, and an undo back to the
+          // rendered text all leave the text == lastRenderedSource and need no
+          // reparse (the graph isn't stale). A genuine edit differs and reparses.
+          if (e.document.getText() === this.lastRenderedSource) return;
           this.scheduleParse();
           return;
         }
+        const key = e.document.uri.fsPath;
         // A referenced @file target edited in its own editor tab (even
         // unsaved): reship contents so the graph field updates live.
         const rel = nodePath.relative(this.fileBaseDir, e.document.uri.fsPath);
@@ -522,6 +525,16 @@ export class GraphViewController {
     // (file reads) and lands AFTER parseResult; file-backed fields briefly show
     // "loading…" and the late-arrival $effect in the webview reconciles them.
     this.watchReferencedFiles(response);
+    // Record the watched doc's SETTLED text (post-save: trim / final-newline
+    // participants have already run by the time we render, both on the edit path
+    // (writeTextRaw awaited save before this) and the parse path (source IS
+    // doc.getText())). The change handler skips a reparse when the doc still equals
+    // this. Using the live doc text rather than the rendered `source` (the parser's
+    // re-emit, which is pre-trim on the edit path) is what makes the skip match the
+    // doc's post-trim change event, so a GUI edit on a file that trim-on-save
+    // mutates doesn't fire one spurious reparse. (The graph is identical for
+    // whitespace-only differences, so skipping is correct.)
+    this.lastRenderedSource = this.watchedDoc?.getText() ?? source;
     this.post({ kind: 'parseResult', response, source, layoutCode, freshMount: this.freshMount });
     this.freshMount = false;
     this.syncInfraLivePollers(response);
@@ -1099,11 +1112,17 @@ export class GraphViewController {
   /// `Promise<unknown>`: a transaction can resolve to any type (a write is
   /// void, but an edit transaction is free to return its own value).
   private pendingWrites = new Map<string, Promise<unknown>>();
-  /// Paths whose open document we are actively editing right now. The
-  /// onDidChangeTextDocument handler skips the self-reparse for these, scoped
-  /// exactly to our own edit (no shared boolean that overlapping writes can
-  /// clobber).
-  private writingPaths = new Set<string>();
+  /// The source text the host last PARSED and rendered for the watched doc. The
+  /// onDidChangeTextDocument handler skips the self-reparse when the changed doc's
+  /// text already equals this: the rendered graph is not stale, so there is nothing
+  /// to reparse. This is the timing-independent invariant ("reparse iff the render
+  /// is stale"), which subsumes every self-write case without enumerating the save
+  /// pipeline's intermediate texts: our own edit write, the save pipeline's
+  /// trim-trailing-whitespace / insert-final-newline follow-ups, a format-on-save
+  /// participant, and an undo back to the rendered text all leave the text equal to
+  /// what we rendered and are correctly skipped; a genuine edit differs and reparses.
+  /// (The old time-window flag missed late save-pipeline change events and flickered.)
+  private lastRenderedSource: string | null = null;
 
   /// Replace a document's entire text with `text`, persisted to disk,
   /// serialized per path. If the file is open in an editor its document is
@@ -1139,14 +1158,8 @@ export class GraphViewController {
       const end = openDoc.lineAt(openDoc.lineCount - 1).range.end;
       const edit = new vscode.WorkspaceEdit();
       edit.replace(uri, new vscode.Range(0, 0, end.line, end.character), text);
-      // Suppress the self-reparse for exactly this edit (scoped to the path).
-      this.writingPaths.add(key);
-      try {
-        await vscode.workspace.applyEdit(edit);
-        await openDoc.save();
-      } finally {
-        this.writingPaths.delete(key);
-      }
+      await vscode.workspace.applyEdit(edit);
+      await openDoc.save();
     } else {
       await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(text));
     }
@@ -1201,11 +1214,13 @@ export class GraphViewController {
       this.post({ kind: 'editApplied', requestId, ok: true, inverse: result });
     } catch (err) {
       // An edit being REJECTED (e.g. a duplicate id, a cross-scope wire) is not a
-      // parse failure: the source on disk is unchanged (the write above never ran),
-      // so the currently-rendered graph is still valid. Roll back the webview's
-      // optimistic state via `editApplied {ok:false}` and surface the reason as a
-      // non-blocking toast, NOT a `parseError` (which would blank the whole view
-      // for a perfectly renderable project).
+      // parse failure: the source on disk is unchanged (the write above never ran).
+      // `editApplied {ok:false}` REJECTS the webview's edit RPC, which makes the
+      // editor's `commit` roll back its optimistic layout AND rebuild nodes/edges
+      // from its last-rendered project (discarding the optimistic structural
+      // change). The webview owns its optimistic state, so it owns the rollback;
+      // the host just reports the refusal. This is NOT a `parseError` (which would
+      // blank a perfectly renderable project), just a non-blocking toast.
       this.post({ kind: 'editApplied', requestId, ok: false });
       void vscode.window.showErrorMessage(
         `Weft: edit rejected: ${err instanceof Error ? err.message : String(err)}`,
@@ -1240,23 +1255,35 @@ export class GraphViewController {
     return vscode.Uri.file(nodePath.join(root, 'layouts', rel));
   }
 
+  /// Read the companion `.layout` file. Serialized on the layout path chain, so a
+  /// read started while a `saveLayoutCode` for the same file is still in flight
+  /// waits for that write to land instead of reading a stale (pre-save) copy. The
+  /// webview is the layout source of truth; the host echoes layout back on parse,
+  /// and a read racing an unflushed write would echo old positions and snap a
+  /// just-moved node back. Routing both read and write through one chain (the same
+  /// discipline as the `.weft` source path) closes that race.
   private async readLayoutCode(doc: vscode.TextDocument): Promise<string> {
-    try {
-      const data = await vscode.workspace.fs.readFile(this.layoutUriFor(doc));
-      return new TextDecoder().decode(data);
-    } catch {
-      return '';
-    }
+    const uri = this.layoutUriFor(doc);
+    return this.serializeOnPath(uri.fsPath, async () => {
+      try {
+        const data = await vscode.workspace.fs.readFile(uri);
+        return new TextDecoder().decode(data);
+      } catch {
+        return '';
+      }
+    });
   }
 
   private async saveLayoutCode(layoutCode: string): Promise<void> {
     if (!this.watchedDoc) return;
     const uri = this.layoutUriFor(this.watchedDoc);
-    // The layouts/ mirror tree may not exist yet; fs.writeFile won't create
-    // parent dirs, so ensure them first.
-    const dir = vscode.Uri.file(nodePath.dirname(uri.fsPath));
-    await vscode.workspace.fs.createDirectory(dir);
-    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(layoutCode));
+    await this.serializeOnPath(uri.fsPath, async () => {
+      // The layouts/ mirror tree may not exist yet; fs.writeFile won't create
+      // parent dirs, so ensure them first.
+      const dir = vscode.Uri.file(nodePath.dirname(uri.fsPath));
+      await vscode.workspace.fs.createDirectory(dir);
+      await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(layoutCode));
+    });
   }
 
   /// Write-back for a file-backed config field (`@file("path", Type)`). The

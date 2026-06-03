@@ -117,7 +117,13 @@
 			(isLoop ? (configCollapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX) : 0),
 	);
 
-	// Auto-enforce minimum height when ports change or on load
+	// Auto-enforce minimum height when ports change or on load. This is a LAYOUT
+	// change only: send just the `height` key, NOT the whole spread config. The
+	// host update handler turns width/height/expanded into a layout-file write and
+	// every OTHER config key into a source edit op; spreading the full config here
+	// would emit a no-op `setConfig` for every existing value (needless source
+	// churn) and split this into a source+layout action. A bare `{height}` is a
+	// clean layout-only update that persists through the layout path.
 	let lastEnforcedMinH = 0;
 	$effect(() => {
 		if (!isExpanded || !data.onUpdate) return;
@@ -125,7 +131,7 @@
 		const minH = minExpandedHeight;
 		if (currentH < minH && minH !== lastEnforcedMinH) {
 			lastEnforcedMinH = minH;
-			data.onUpdate({ config: { ...data.config, height: minH } });
+			data.onUpdate({ config: { height: minH } });
 		}
 	});
 
@@ -373,13 +379,13 @@
 			}
 			currentOutputs.push({ name: trimmed, portType: 'MustOverride', required: false });
 		}
-		const minH = computeMinHeight(currentInputs.length, currentOutputs.length);
-		const currentH = (data.config?.height as number) || 300;
-		const updates: NodeDataUpdates = { inputs: currentInputs, outputs: currentOutputs };
-		if (currentH < minH) {
-			updates.config = { ...data.config, height: minH };
-		}
-		data.onUpdate(updates);
+		// Send the port change alone. If the extra port grows the group past its
+		// current height, the min-height `$effect` above fires right after this
+		// update re-renders the node and enforces the new height as its own clean
+		// bare `{height}` layout write. Bundling height in here would re-spread the
+		// whole config (emitting no-op source ops) and mix a layout change into a
+		// structural op; keeping them separate reuses the one min-height mechanism.
+		data.onUpdate({ inputs: currentInputs, outputs: currentOutputs });
 	}
 
 	function removePort(side: 'input' | 'output', name: string) {

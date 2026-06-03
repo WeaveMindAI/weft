@@ -98,28 +98,49 @@ function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?
   return s;
 }
 
+/** Serialize a layout map back to layoutCode (one line per entry). Entry order
+ *  follows insertion order of the map. The inverse of `parseLayoutCode`. */
+export function serializeLayoutMap(map: Record<string, LayoutEntry>): string {
+  return Object.entries(map)
+    .map(([id, e]) => `${id} ${formatLayoutStr(e.x, e.y, e.w, e.h, e.expanded ?? undefined)}`)
+    .join('\n');
+}
+
 /** Re-key a whole subtree's layout entries when its scoped address changes (a
- *  move that reparents `oldKey` to `newKey`, or a group rename). Operates on the
- *  PARSED entry map, not a text regex: the moved node is `oldKey`, its
- *  descendants are `oldKey + '.' + rest`, and each becomes `newKey[/.rest]`.
+ *  move that reparents `oldKey` to `newKey`, or a group rename). The moved node
+ *  is `oldKey`, its descendants are `oldKey + '.' + rest`, and each becomes
+ *  `newKey[.rest]`. Entries outside the subtree are untouched.
  *
- *  Parsing to a map first is what makes this exact and non-compounding: a regex
- *  prefix-sweep over raw text could match an already-rewritten line and stack
- *  the prefix again (`A.B.A.B...`). Here every source entry is rewritten exactly
- *  once from its parsed key. Entries outside the subtree are untouched. */
+ *  This is a PURE map rebuild: parse once, rewrite each source entry's key
+ *  EXACTLY ONCE into a fresh map, serialize once. It never mutates the text
+ *  incrementally, so it can't (a) re-match an already-rewritten line and stack
+ *  the prefix (`A.B.A.B...`), nor (b) let a rewritten key collide with a
+ *  not-yet-processed source line and silently drop/overwrite the wrong entry
+ *  (the failure mode of the old remove-then-insert-over-mutating-text loop).
+ *
+ *  Key collisions: if a rewritten key lands on an existing key, the MOVED-SUBTREE
+ *  entry wins (it overwrites). That is correct because layout is view-state
+ *  subordinate to source: after the rename the source has exactly one decl at the
+ *  new id, so at most one layout entry should describe it; the displaced entry is
+ *  obsolete. (A rename/move that would manufacture a real duplicate id is refused
+ *  by the Rust edit, which rolls the layout back wholesale, so a collision here is
+ *  always either a legitimate overwrite or about to be discarded.) Determinism:
+ *  unchanged entries are written first, then the re-keyed ones, so the winner is
+ *  always the moved entry regardless of original line order. */
 export function renameLayoutSubtree(layoutCode: string, oldKey: string, newKey: string): string {
   if (!layoutCode || oldKey === newKey) return layoutCode;
   const map = parseLayoutCode(layoutCode);
-  let code = layoutCode;
+  const rebuilt: Record<string, LayoutEntry> = {};
+  const reKeyed: Array<[string, LayoutEntry]> = [];
   for (const [key, entry] of Object.entries(map)) {
-    let nextKey: string | null = null;
-    if (key === oldKey) nextKey = newKey;
-    else if (key.startsWith(oldKey + '.')) nextKey = newKey + key.slice(oldKey.length);
-    if (nextKey === null) continue;
-    code = removeLayoutEntry(code, key);
-    code = updateLayoutEntry(code, nextKey, entry.x, entry.y, entry.w, entry.h, entry.expanded ?? null, entry.configCollapsed ?? null);
+    if (key === oldKey) reKeyed.push([newKey, entry]);
+    else if (key.startsWith(oldKey + '.')) reKeyed.push([newKey + key.slice(oldKey.length), entry]);
+    else rebuilt[key] = entry; // outside the subtree: keep as-is
   }
-  return code;
+  // Re-keyed entries last so the moved subtree wins any collision with an entry
+  // outside it (the displaced entry's view-state is obsolete after the rename).
+  for (const [k, entry] of reKeyed) rebuilt[k] = entry;
+  return serializeLayoutMap(rebuilt);
 }
 
 // ── Reversible layout edits ──────────────────────────────────────────────

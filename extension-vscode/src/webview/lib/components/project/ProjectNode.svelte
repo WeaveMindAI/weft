@@ -658,8 +658,6 @@
 		if (!hasExpandableContent) return;
 		
 		const currentExpanded = (data.config?.expanded as boolean) ?? false;
-		console.debug(`[toggleExpand] node=${id} currentExpanded=${currentExpanded} hasOnUpdate=${!!data.onUpdate} configKeys=${Object.keys(data.config || {}).join(',')}`);
-		
 		if (data.onUpdate) {
 			if (currentExpanded) {
 				// Collapsing - save current dimensions before collapsing (if node has been resized)

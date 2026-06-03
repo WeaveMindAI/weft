@@ -22,11 +22,17 @@
   // `editApplied` reply (correlated by id) carrying the inverse text edit the
   // editor stores for undo. The webview owns the undo stack.
   let nextEditRequestId = 0;
-  const pendingEdits = new Map<number, (inverse: TextEdit | null) => void>();
+  // A pending edit resolves with the inverse (or null for a successful edit that
+  // has no inverse, e.g. a layout-only round-trip) and REJECTS when the host
+  // reports the edit was refused by Rust. Resolve-vs-reject is the success/failure
+  // channel: a refused edit must surface as a thrown error so the editor's `commit`
+  // rolls back its optimistic layout/node state, never as a `null` that looks like
+  // a no-inverse success (that conflation left rejected edits applied on screen).
+  const pendingEdits = new Map<number, { resolve: (inverse: TextEdit | null) => void; reject: (err: Error) => void }>();
   function requestEdit(make: (requestId: number) => void): Promise<TextEdit | null> {
     const requestId = nextEditRequestId++;
-    return new Promise((resolve) => {
-      pendingEdits.set(requestId, resolve);
+    return new Promise((resolve, reject) => {
+      pendingEdits.set(requestId, { resolve, reject });
       make(requestId);
     });
   }
@@ -150,13 +156,15 @@
     window.addEventListener('weft-signal-action', onSignalAction as EventListener);
     const unsub = onMessage((msg) => {
       if (msg.kind === 'editApplied') {
-        // Reply to applyEdits/applyTextEdit: resolve the pending RPC with the
-        // inverse text edit (or null on failure) so the editor's undo stack can
-        // record the reversible action.
+        // Reply to applyEdits/applyTextEdit. Success resolves with the inverse
+        // text edit (or null if the edit has no inverse); a refusal REJECTS so the
+        // editor rolls back its optimistic state instead of treating it as a
+        // no-inverse success.
         const pending = pendingEdits.get(msg.requestId);
         if (pending) {
           pendingEdits.delete(msg.requestId);
-          pending(msg.ok ? (msg.inverse ?? null) : null);
+          if (msg.ok) pending.resolve(msg.inverse ?? null);
+          else pending.reject(new Error('edit refused'));
         }
         return;
       }

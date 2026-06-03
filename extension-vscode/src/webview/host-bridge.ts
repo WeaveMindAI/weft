@@ -106,24 +106,34 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     throw new Error(`host-bridge: unknown container kind '${String(g.kind)}' for id '${g.id}'`);
   }
   const isLoop = g.kind === 'loop';
+  const parentId = g.parentGroupId ?? undefined;
   return {
     id: g.id,
     // Distinct nodeType per container so the renderer can pick a
     // loop-flavored xyflow type vs a group-flavored one. The lowering
     // (LoopIn/LoopOut boundary nodes) is unaffected by this.
     nodeType: isLoop ? 'Loop' : 'Group',
-    label: localName(g.id, g.parentGroupId ?? undefined),
-    config: isLoop && g.loopConfig
-      ? (g.loopConfig as Record<string, unknown>)
-      : {},
+    label: localName(g.id, parentId),
+    // The webview reads the parent group from `config.parentId` (buildNodes,
+    // getLayoutKey, edge scoping, the ancestor-collapse walk all read it there),
+    // so the structural parent MUST be mirrored into config on every parse. Before
+    // this it lived only on the top-level `parentId` field, so a re-parse left
+    // `config.parentId` undefined: the node's scoped `id` said it was nested but
+    // the graph thought it was top-level, and the next move op read the wrong
+    // scope (the "every other move is a no-op" desync). A loop carries its loop
+    // config too; both a group and a loop need parentId mirrored for nesting.
+    config: {
+      ...(isLoop && g.loopConfig ? (g.loopConfig as Record<string, unknown>) : {}),
+      ...(parentId ? { parentId } : {}),
+    },
     position: { x: 0, y: 0 },
-    parentId: g.parentGroupId ?? undefined,
+    parentId,
     inputs: g.inPorts.map(toV1Port),
     outputs: g.outPorts.map(toV1Port),
     features: {
       oneOfRequired: g.oneOfRequired,
     },
-    scope: g.parentGroupId ? [g.parentGroupId] : [],
+    scope: parentId ? [parentId] : [],
   };
 }
 
@@ -145,13 +155,18 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
       cleanConfig[key] = { __weftFileRef: { path: ref.path, type: ref.type } };
     }
   }
+  const parentId = resolveParentGroup(n, groupIds);
+  // Mirror the structural parent into config.parentId, which is where the webview
+  // reads it (see groupToNodeInstance for why). Without this a re-parse resets the
+  // node's perceived scope to top-level while its scoped id stays nested.
+  if (parentId) cleanConfig.parentId = parentId; else delete cleanConfig.parentId;
   return {
     id: n.id,
     nodeType: n.nodeType,
     label: n.label,
     config: cleanConfig,
     position: n.position,
-    parentId: resolveParentGroup(n, groupIds),
+    parentId,
     inputs: n.inputs.map(toV1Port),
     outputs: n.outputs.map(toV1Port),
     features: n.features,

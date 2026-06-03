@@ -934,7 +934,7 @@ export type EditOp =
   | { op: 'removeEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
   | { op: 'addGroup'; label: string; parentGroup: string | null }
   | { op: 'removeGroup'; group: string }
-  | { op: 'renameGroup'; oldLabel: string; newLabel: string }
+  | { op: 'renameGroup'; group: string; newLabel: string }
   | { op: 'moveNodeScope'; node: string; targetGroup: string | null }
   | { op: 'moveGroupScope'; group: string; targetGroup: string | null }
   | { op: 'updateNodePorts'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
@@ -946,7 +946,7 @@ export type EditOp =
   // Loop ops mirror the Rust EditOp variants.
   | { op: 'addLoop'; label: string; parentGroup: string | null }
   | { op: 'removeLoop'; loopId: string }
-  | { op: 'renameLoop'; oldLabel: string; newLabel: string }
+  | { op: 'renameLoop'; loopId: string; newLabel: string }
   | { op: 'moveLoopScope'; loopId: string; targetGroup: string | null }
   | { op: 'updateLoopPorts'; loopId: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
   | { op: 'setLoopConfig'; loopId: string; key: string; value: string }

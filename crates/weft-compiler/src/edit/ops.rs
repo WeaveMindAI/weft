@@ -53,7 +53,7 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
             add_decl(view, parent_group.as_deref(), label, &format!("{label} = Group() -> () {{}}"))
         }
         RemoveGroup { group } => remove_group(view, group),
-        RenameGroup { old_label, new_label } => rename_container(view, old_label, new_label, ContainerKind::Group),
+        RenameGroup { group, new_label } => rename_container(view, group, new_label, ContainerKind::Group),
         MoveNodeScope { node, target_group } => move_scope(view, node, target_group.as_deref(), ContainerKind::Node),
         MoveGroupScope { group, target_group } => move_scope(view, group, target_group.as_deref(), ContainerKind::Group),
         UpdateNodePorts { node, inputs, outputs } => update_ports(view, node, inputs, outputs, ContainerKind::Node),
@@ -67,7 +67,7 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
             &format!("{label} = Loop() -> () {{}}"),
         ),
         RemoveLoop { loop_id } => remove_loop(view, loop_id),
-        RenameLoop { old_label, new_label } => rename_container(view, old_label, new_label, ContainerKind::Loop),
+        RenameLoop { loop_id, new_label } => rename_container(view, loop_id, new_label, ContainerKind::Loop),
         MoveLoopScope { loop_id, target_group } => move_scope(view, loop_id, target_group.as_deref(), ContainerKind::Loop),
         UpdateLoopPorts { loop_id, inputs, outputs } => update_ports(view, loop_id, inputs, outputs, ContainerKind::Loop),
         SetLoopConfig { loop_id, key, value } => set_loop_config(view, loop_id, key, value),
@@ -293,14 +293,37 @@ fn insert_before_close(body: &Body, elements: Vec<SyntaxElement>) -> Result<(), 
         .close_brace()
         .ok_or_else(|| EditError::Unparseable("group body has no closing brace".into()))?;
     let at = brace.index();
-    let mut elems = if body_is_single_line(body) {
-        raw_token_elements(&[(SyntaxKind::WHITESPACE, "\n")])
-    } else {
-        Vec::new()
-    };
+    // A single-line body (`{}`, `{ x }`) has its content + close brace on the
+    // open-brace line, so the inserted content (which carries its own leading
+    // indent + trailing newline) would glue onto it. Open the body: prepend a
+    // newline before the content so it sits on its own indented line, and (because
+    // the inserted content's trailing newline would otherwise drop `}` to COLUMN 0)
+    // append the group's own indent before `}` so the close brace lines up with its
+    // header. For a top-level group that indent is empty; for a NESTED group it is
+    // the header's indent, which the old code omitted (close brace landed at col 0).
+    let mut elems = Vec::new();
+    if body_is_single_line(body) {
+        elems.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, "\n")]));
+    }
     elems.extend(elements);
+    if body_is_single_line(body) {
+        let group_indent = body_owner_indent(body);
+        if !group_indent.is_empty() {
+            elems.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, &group_indent)]));
+        }
+    }
     body.syntax().splice_children(at..at, elems);
     Ok(())
+}
+
+/// The indent of the decl that owns `body` (its group header's leading indent).
+/// This is the column the body's close brace `}` should sit at. The body's parent
+/// in the CST is the owning group decl.
+fn body_owner_indent(body: &Body) -> String {
+    body.syntax()
+        .parent()
+        .map(|owner| leading_indent(&owner))
+        .unwrap_or_default()
 }
 
 /// Append `elements` at the end of the file root (after the last child).
@@ -781,8 +804,10 @@ fn set_group_description(view: &FileView, group_id: &str, desc: Option<&str>) ->
             // comment first-line would SWALLOW it (`# Description: d}` is one
             // comment). Append a newline + the group's own indent after the
             // description so the `}` drops to its own line. A multi-line body
-            // already has structure.
-            let group_indent = leading_indent(group.syntax());
+            // already has structure. `body_owner_indent` is the ONE definition of
+            // "the column a body's close brace sits at" (also used by
+            // `insert_before_close`), so the two never drift.
+            let group_indent = body_owner_indent(&body);
             let snippet = if body_is_single_line(&body) {
                 format!("\n{indent}# Description: {d}\n{group_indent}")
             } else {
@@ -943,48 +968,65 @@ impl ContainerKind {
 /// every endpoint that resolved to this decl (in any scope). The body
 /// and the lowered LoopIn/LoopOut / Passthrough boundary ids are
 /// reconstructed on the next re-flatten, so renaming the source-level
-/// label is sufficient. `expected` says which op the caller used so
-/// the function can fail loud on a kind mismatch (RenameGroup against
-/// a Loop, or vice versa) instead of silently routing through.
+/// label is sufficient.
+///
+/// `id` is the container's SCOPED id (e.g. `Outer.Inner`), the same
+/// scoped-id contract `MoveGroupScope` uses, so it is identified
+/// unambiguously even when two containers share a local label in
+/// different scopes; the old BARE local segment is derived from the
+/// resolved decl (endpoint IDENTs hold local segments, not scoped ids).
+/// `expected` says which op the caller used so the function fails loud
+/// on a kind mismatch (RenameGroup against a Loop, or vice versa).
 fn rename_container(
     view: &FileView,
-    old_label: &str,
+    id: &str,
     new_label: &str,
     expected: ContainerKind,
 ) -> Result<(), EditError> {
     if new_label.is_empty() {
         return Err(EditError::InvalidArgument("rename to empty label".into()));
     }
-    if old_label == new_label {
-        return Ok(());
-    }
-    let decl = resolve(view, old_label)?;
+    let decl = resolve(view, id)?;
     if !expected.matches(&decl) {
         return Err(kind_mismatch(
             &format!("Rename{}", expected.op_name()),
-            old_label,
+            id,
             expected.op_name(),
             &decl,
         ));
     }
+    let old_local = decl
+        .local_id()
+        .ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
+    if old_local == new_label {
+        return Ok(());
+    }
     // Reject a rename that collides with an existing member of the
-    // container's own scope (would manufacture two same-id decls).
+    // container's own scope (would manufacture two same-id decls +
+    // ambiguous references). The parent scope is everything before the
+    // container's last id segment.
     let scoped = view.scoped_id_of(&decl)
-        .ok_or_else(|| EditError::ContainerNotFound(old_label.to_string()))?;
+        .ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
     let parent_scope = scoped.rsplit_once('.').map(|(p, _)| p);
     reject_if_taken(view, parent_scope, new_label)?;
+    // Rewrite the header's leading IDENT token.
     let header = match &decl {
         Decl::Group(g) => g.header(),
         Decl::Loop(l) => l.header(),
         _ => None,
     }
-    .ok_or_else(|| EditError::ContainerNotFound(old_label.to_string()))?;
+    .ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
     let id_tok = header
         .syntax()
         .children_with_tokens()
         .filter_map(|e| e.into_token())
         .find(|t| t.kind() == SyntaxKind::IDENT)
-        .ok_or_else(|| EditError::ContainerNotFound(old_label.to_string()))?;
+        .ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
+    // Rewrite every reference to the container, in ANY scope, via the same
+    // scope-aware query RemoveNode uses (so rename and remove agree on what
+    // "references this decl" means). An endpoint resolving to the container
+    // has its head IDENT (the old LOCAL label) replaced. Collect the
+    // connection handles first (resolve-then-mutate), then rewrite.
     let refs = view.connections_referencing(&decl);
     replace_token_text(&id_tok, new_label);
     for c in refs {
@@ -992,7 +1034,7 @@ fn rename_container(
             if let Some(t) = ep
                 .children_with_tokens()
                 .filter_map(|e| e.into_token())
-                .find(|t| t.kind() == SyntaxKind::IDENT && t.text() == old_label)
+                .find(|t| t.kind() == SyntaxKind::IDENT && t.text() == old_local.as_str())
             {
                 replace_token_text(&t, new_label);
             }
@@ -1269,47 +1311,44 @@ fn update_ports(
 /// still-parented elements across trees (which corrupts a `splice_children`),
 /// and the result is structurally identical to a freshly-parsed decl.
 fn rebuild_decl(decl: &Decl, new_header: &str) -> Result<(), EditError> {
-    // The decl's leading whitespace (newline + indent) is preserved by
-    // splice_decl: we pass header+body with NO leading indent here, and the
-    // splice re-injects the original leading-WS token. Including the indent
-    // in the rebuilt text would either double the indent (when the leading
-    // WS is a prev-sibling token at body scope) or be silently lost.
+    // The decl's leading whitespace (newline + indent) lives in ONE of two
+    // places (the parser is inconsistent): inside a group body it is the decl's
+    // PREVIOUS SIBLING token (survives the splice, so the rebuilt text must NOT
+    // prepend it or it would DOUBLE it); at file root it is the decl's OWN FIRST
+    // CHILD token (replaced by the splice, so the rebuilt text must reprovide the
+    // FULL leading WS, newline included, or the new decl glues onto the previous
+    // line). Prepend the full leading WS only when it isn't carried by a
+    // surviving sibling.
+    let lead = if has_leading_ws_sibling(decl.syntax()) {
+        String::new()
+    } else {
+        leading_ws(decl.syntax()).map(|t| t.text().to_string()).unwrap_or_default()
+    };
     let rebuilt = match decl.body() {
-        Some(body) => format!("{} {}", new_header.trim(), body.syntax().to_string()),
-        None => new_header.trim().to_string(),
+        Some(body) => format!("{lead}{} {}", new_header.trim(), body.syntax().to_string()),
+        None => format!("{lead}{}", new_header.trim()),
     };
     splice_decl(decl, &rebuilt)
 }
 
-/// Replace `decl`'s subtree with the decl parsed from `text`. Preserves the
-/// decl's leading whitespace (newline + indent) regardless of whether the
-/// parser attached it as a prev-sibling token (body scope) or as the decl's
-/// own first child (file root): captures the text upfront and re-injects it
-/// as a single WHITESPACE token before the new elements. Without this, a
-/// root-scope splice would lose the leading newline and glue the new decl
-/// onto whatever sits before it.
+/// True if `node`'s leading whitespace (newline+indent) is its PREVIOUS SIBLING
+/// (group-body decls) rather than its own first child (file-root decls). Mirrors
+/// the two-location lookup in `leading_ws`.
+fn has_leading_ws_sibling(node: &SyntaxNode) -> bool {
+    matches!(node.prev_sibling_or_token(), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE)
+}
+
+/// Replace `decl`'s subtree with the decl parsed from `text` (which already
+/// carries the decl's own leading indent). One splice of the decl node, no
+/// element lifting.
 fn splice_decl(decl: &Decl, text: &str) -> Result<(), EditError> {
-    let leading = leading_ws(decl.syntax()).map(|t| t.text().to_string());
+    let elements = snippet_elements(text);
+    let idx = decl.syntax().index();
     let parent = decl
         .syntax()
         .parent()
         .ok_or_else(|| EditError::Unparseable("decl has no parent".into()))?;
-    // If the leading WS was a prev-sibling token it survives the splice
-    // (we only delete the decl). To keep exactly one copy of the leading
-    // WS, detach the sibling first; if the leading WS lived as the decl's
-    // own first child instead, it goes away with the decl on splice.
-    if let Some(NodeOrToken::Token(t)) = decl.syntax().prev_sibling_or_token() {
-        if t.kind() == SyntaxKind::WHITESPACE {
-            t.detach();
-        }
-    }
-    let mut to_splice = Vec::new();
-    if let Some(ws) = leading {
-        to_splice.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, &ws)]));
-    }
-    to_splice.extend(snippet_elements(text));
-    let idx = decl.syntax().index();
-    parent.splice_children(idx..idx + 1, to_splice);
+    parent.splice_children(idx..idx + 1, elements);
     Ok(())
 }
 
