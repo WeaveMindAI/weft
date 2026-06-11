@@ -12,10 +12,13 @@ export interface PortDefinition {
   name: string;
   portType: string;
   required: boolean;
-  laneMode: 'Single' | 'Expand' | 'Gather';
-  laneDepth: number;
   configurable: boolean;
   description?: string;
+  /// True iff this port was auto-synthesized by the loop-lowering pass
+  /// (the input side of a carry port). The editor renders it as a ghost
+  /// mirror of the matching carry output. Never user-editable; the user
+  /// changes the output's role to remove the synthesized input.
+  synthesizedFromCarry?: boolean;
 }
 
 /// Source span of one config field plus how it was written. `origin` tells
@@ -41,6 +44,26 @@ export interface FileRef {
 /// field is always file-backed; if the file can't be read it fails loudly.
 export type FileContent = { content: string } | { error: string };
 
+// SYNC: NodeFeaturesWire <-> crates/weft-core/src/node.rs NodeFeatures
+// A field that appears in one side but not the other will silently
+// round-trip as undefined (Rust serde drops unknown metadata fields;
+// JS reads missing fields as undefined). See the sync comment
+// over NodeFeatures in node.rs for the full checklist.
+export interface NodeFeaturesWire {
+  oneOfRequired?: string[][];
+  canAddInputPorts?: boolean;
+  canAddOutputPorts?: boolean;
+  hasFormSchema?: boolean;
+  isTrigger?: boolean;
+  showDebugPreview?: boolean;
+  isOutputDefault?: boolean;
+  /// Names the endpoint serving the node's `/live` HTTP route the
+  /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
+  /// so the panel doesn't show a broken eye.
+  liveEndpoint?: string;
+  hidden?: boolean;
+}
+
 export interface NodeDefinition {
   id: string;
   nodeType: string;
@@ -51,25 +74,7 @@ export interface NodeDefinition {
   groupBoundary: { groupId: string; role: 'In' | 'Out' } | null;
   inputs: PortDefinition[];
   outputs: PortDefinition[];
-  // KEEP IN SYNC with `NodeFeatures` in
-  // `weft/crates/weft-core/src/node.rs`. A field that appears in
-  // one side but not the other will silently round-trip as
-  // undefined (Rust serde drops unknown metadata fields;
-  // JS reads missing fields as undefined). See the sync comment
-  // over NodeFeatures in node.rs for the full checklist.
-  features: {
-    oneOfRequired: string[][];
-    canAddInputPorts: boolean;
-    canAddOutputPorts: boolean;
-    hasFormSchema: boolean;
-    isTrigger?: boolean;
-    showDebugPreview?: boolean;
-    isOutputDefault?: boolean;
-    /// Names the endpoint serving the node's `/live` HTTP route the
-    /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
-    /// so the panel doesn't show a broken eye.
-    liveEndpoint?: string;
-  };
+  features: NodeFeaturesWire;
   requiresInfra?: boolean;
   entry: unknown[];
   span?: Span;
@@ -90,8 +95,19 @@ export interface Edge {
   span?: Span;
 }
 
+// SYNC: GroupDefinition (kind + loopConfig) <-> crates/weft-core/src/project.rs GroupKind
 export interface GroupDefinition {
   id: string;
+  /// `group` or `loop`. The visual editor renders a loop differently
+  /// (distinct color/glyph + carry-port double rendering) even
+  /// though both flatten through the same boundary-pair shape.
+  /// On the Rust side `kind` + `loopConfig` are ONE flattened tagged
+  /// enum (GroupKind), so a loop always carries its config and a
+  /// payload missing `kind` fails Rust deserialization.
+  kind: 'group' | 'loop';
+  /// Loop config fields (parallel/over/carry/max_iters/trim_on_mismatch).
+  /// Always present when `kind === 'loop'`, never for `group`.
+  loopConfig?: Record<string, unknown> | null;
   label: string | null;
   inPorts: PortDefinition[];
   outPorts: PortDefinition[];
@@ -199,18 +215,7 @@ export interface CatalogEntry {
   fields: FieldDef[];
   entry: unknown[];
   requires_infra?: boolean;
-  // KEEP IN SYNC with `NodeFeatures` in
-  // `weft/crates/weft-core/src/node.rs`.
-  features?: {
-    oneOfRequired?: string[][];
-    canAddInputPorts?: boolean;
-    canAddOutputPorts?: boolean;
-    hasFormSchema?: boolean;
-    isTrigger?: boolean;
-    showDebugPreview?: boolean;
-    liveEndpoint?: string;
-    hidden?: boolean;
-  };
+  features?: NodeFeaturesWire;
   /** Form-field vocabulary for nodes whose `features.hasFormSchema`
    *  is true. Empty/undefined for everything else. `weft describe-nodes`
    *  inlines this from each node's `form_field_specs.json` so the
@@ -235,10 +240,10 @@ export interface FormFieldPortWire {
   portType: string;
 }
 
-/** Wire shape of one `FormFieldSpec`. Mirrors `weft-core::node::
- *  FormFieldSpec` (camelCase). The webview narrows this further
- *  via its own `FormFieldSpec` interface in
+/** Wire shape of one `FormFieldSpec` (camelCase). The webview narrows
+ *  this further via its own `FormFieldSpec` interface in
  *  `lib/utils/form-field-specs`. */
+// SYNC: FormFieldSpecWire <-> crates/weft-core/src/node.rs FormFieldSpec
 export interface FormFieldSpecWire {
   fieldType: string;
   label: string;
@@ -255,20 +260,20 @@ export interface ParseResponse {
   diagnostics: Diagnostic[];
 }
 
+// SYNC: NodeExecutionStatus <-> crates/weft-core/src/exec/execution.rs NodeExecutionStatus
+/// Adding a state requires adding it on both sides; the UI lookup
+/// tables in `webview/lib/utils/status.ts` exhaust this union so
+/// drift compiles as an error. The earlier shape had ghost variants
+/// (`pending` / `suspended` / `accumulating`) the dispatcher never
+/// emitted; they painted states the engine could not produce and
+/// `suspended` doubled-up with the real `waiting_for_input` event.
 export type NodeExecutionStatus =
-  | 'pending'
   | 'running'
   | 'waiting_for_input'
-  | 'accumulating'
   | 'completed'
   | 'skipped'
   | 'failed'
   | 'cancelled';
-
-export interface LaneFrame {
-  count: number;
-  index: number;
-}
 
 // Minimal shape the webview needs to paint node state. Richer
 // journal fields (cost_usd, pulse_id) flow directly in follow-up
@@ -279,26 +284,135 @@ export interface LaneFrame {
 // inspector renders them as JSON trees; without these filled in
 // it falls back to "(none)" for every node, even when the
 // execution actually moved data.
+
+/// Frame stack identifying which iteration of which (nested) loop this
+/// firing belongs to. Empty for firings outside any loop.
+// SYNC: LoopIteration <-> crates/weft-core/src/frames.rs LoopIteration
+export interface LoopIteration {
+  index: number;
+}
+
 export interface NodeExecEvent {
   nodeId: string;
-  state: NodeExecutionStatus | 'started' | 'running' | 'suspended' | 'cancelled';
-  /// Lane identity from the dispatcher's NodeStarted /
-  /// NodeCompleted events. Stringified JSON of the lane stack
-  /// (e.g. `[{"count":5,"index":2}]`). The webview uses this to
-  /// match a `completed` event to the SAME lane's `running`
-  /// row, so parallel fan-outs don't cross-correlate inputs to
-  /// outputs.
-  lane: string;
+  state: NodeExecutionStatus;
+  /// Frame stack: empty when the firing is not inside any loop;
+  /// `[{index:2}]` when inside iteration 2 of a single loop; nested
+  /// loops extend the array. Used as part of the execution-card key so
+  /// parallel iterations don't cross-correlate.
+  frames: LoopIteration[];
   error?: string;
   input?: unknown;
+  /// Wired input ports that arrived as CLOSURE markers for this firing
+  /// (the upstream frame stack terminated without firing them). Disjoint from
+  /// the keys present in `input`; the inspector renders these as
+  /// "(closed)" to distinguish them from user-emitted nulls. Present
+  /// only on `running` (NodeStarted) and `skipped` (NodeSkipped)
+  /// events; other state transitions don't carry the per-port closed
+  /// info because it's the same set the firing started with.
+  closedPorts?: string[];
   output?: unknown;
-  /// Wake-signal token. Set on Suspended/Resumed.
-  token?: string;
-  /// Delivered value. Set on Resumed.
-  resumeValue?: unknown;
-  /// Reason. Set on Retried.
-  retryReason?: string;
 }
+
+/// Live loop event surfaced through the dispatcher SSE stream. Mirrors
+/// the four `LoopInstantiated` / `LoopIterationLaunched` / `LoopOutFired`
+/// / `LoopTerminated` journal events. The inspector groups by `groupId`
+/// + `parentFrames` so nested loops and parallel sibling iterations
+/// each render under their own card.
+// SYNC: LoopTerminationReason <-> crates/weft-core/src/primitive.rs LoopTerminationReason
+export type LoopTerminationReason =
+  | 'over_exhausted'
+  | 'done_voted'
+  | 'max_iters_reached'
+  | 'cancelled'
+  | 'failed';
+
+export type LoopInspectorEvent =
+  | {
+      kind: 'instantiated';
+      groupId: string;
+      parentFrames: LoopIteration[];
+      iterCount: number;
+      parallel: boolean;
+    }
+  | {
+      kind: 'iteration_launched';
+      groupId: string;
+      parentFrames: LoopIteration[];
+      index: number;
+    }
+  | {
+      kind: 'out_fired';
+      groupId: string;
+      parentFrames: LoopIteration[];
+      index: number;
+      doneVote?: boolean | null;
+    }
+  | {
+      kind: 'terminated';
+      groupId: string;
+      parentFrames: LoopIteration[];
+      reason: LoopTerminationReason;
+    };
+
+/// One line in a node's bus inspector panel. IRC-shaped: `joined` /
+/// `left` render as `* name joined` / `* name left`; `message`
+/// renders as `from: <payload-pretty>` for journaled buses or
+/// `from sent <kind> of <size> bytes [hash: <hex>]` for ephemeral
+/// buses (where `payload` is null). `closed` renders an explicit
+/// `* the bus closed here` marker. `busId` groups lines by channel
+/// so a node attached to multiple buses gets one scrollable section
+/// per bus. Replay orders lines by arrival from the SSE stream (the
+/// dispatcher already orders them by journal row id server-side).
+// SYNC: BusPayload <-> crates/weft-core/src/primitive.rs BusPayload
+/// Tagged payload. Default `Option<Value>` would collapse `Some(Value::Null)` with
+/// `None` at the JSON boundary; the tag preserves the distinction
+/// so a journaled bus that sends literal `null` doesn't render as
+/// if it were ephemeral.
+export type BusPayload =
+  | { kind: 'journaled'; value: unknown }
+  | { kind: 'ephemeral' };
+
+export type BusInspectorEvent =
+  | { kind: 'joined'; busId: string; offset: number; name: string; atUnix: number }
+  | { kind: 'left'; busId: string; offset: number; name: string; atUnix: number }
+  | {
+      kind: 'message';
+      busId: string;
+      offset: number;
+      from: string;
+      msgKind: string;
+      payload: BusPayload;
+      payloadByteSize: number;
+      payloadSha256Prefix: string;
+      atUnix: number;
+    }
+  | { kind: 'closed'; busId: string; offset: number; atUnix: number };
+
+/// Per-bus metadata derived dispatcher-side from the bus marker JSON
+/// (`{"__weft_bus__": {"id":..., "mode":"journaled"|"ephemeral"}}`).
+/// The dispatcher attaches `ephemeral` to every `BusParticipant` edge
+/// it derives from a `PulseEmitted`, so the webview learns mode the
+/// same time it learns about the bus. Stored keyed by `busId`.
+export interface BusMeta {
+  ephemeral: boolean;
+}
+
+// SYNC: CorruptionSite <-> crates/weft-core/src/primitive.rs CorruptionSite
+/// Names the fold step that rejected a journal row.
+/// Kept as a closed union so the inspector renders a stable label;
+/// adding a fold branch that can fail requires adding a variant
+/// both here and on the Rust side.
+export type CorruptionSite =
+  | 'PulseEmitted'
+  | 'NodeStarted'
+  | 'NodeResumed'
+  | 'LoopIterationLaunched'
+  | 'LoopOutFired'
+  | 'LoopTerminated'
+  | 'NodeCompleted'
+  | 'NodeFailed'
+  | 'NodeSkipped'
+  | 'NodeCancelled';
 
 /// One item rendered in a node's body panel. Two distinct feeds
 /// produce items: infra `/live` (infra-pod telemetry) and signal
@@ -362,10 +476,18 @@ export type NodeFeedState =
 export interface ActionAvailability {
   /// Verbs the dispatcher will currently accept.
   availableActions: ActionVerb[];
-  /// Drift bits. Lit independently; resolved by Upgrade and Resync
-  /// respectively.
+  /// Drift bits. Lit independently; each resolved by its own verb.
+  /// - `binaryDrift`: worker binary inputs changed (engine, node
+  ///   implementations, node-type set, `weft.toml` build section).
+  ///   Resolved by Rebuild + a fresh worker spawn.
+  /// - `definitionDrift`: runtime project shape changed (topology,
+  ///   per-node configs). Resolved by Resync (a new project_definition
+  ///   row + pointer advance; the running worker keeps the old
+  ///   shape, the next execution picks up the new).
+  /// - `infraDrift`: infra-closure changed. Resolved by Upgrade.
+  binaryDrift: boolean;
+  definitionDrift: boolean;
   infraDrift: boolean;
-  sourceDrift: boolean;
   /// Project lifecycle status: registered | activating | active |
   /// deactivating | inactive. Drives action-bar primary slot
   /// ("Activate" vs "Activating + Cancel" vs "Deactivate" vs
@@ -502,8 +624,60 @@ export interface CliEvent {
 export type ActionBarState = {
   backend: BackendSnapshot;
   overlay: ActionBarOverlay;
-  error?: { verb: ActionVerb; message: string };
+  error?: ActionBarError;
 };
+
+/// Verbs that can carry an error to the action bar. Includes every
+/// CLI verb the user can click PLUS the system-side error sources
+/// (parse / catalog) that the graph view raises without any user
+/// click. Surfaced as a wider union than `ActionVerb` so the modal
+/// renders an honest headline ("Parse failed", "Catalog failed")
+/// instead of pretending a CLI verb crashed when none did.
+export type ErrorVerb = ActionVerb | 'parse' | 'catalog';
+
+/// User-visible failure for the action bar. The banner shows `message`
+/// (one-line); clicking the banner opens a modal that renders `details`
+/// in full. Keep `details` optional so legacy paths that haven't been
+/// migrated still produce a usable (if sparse) modal.
+export interface ActionBarError {
+  verb: ErrorVerb;
+  message: string;
+  details?: ActionErrorDetails;
+}
+
+export interface ActionErrorDetails {
+  /// One-line description of what was being attempted. Plain English.
+  /// "Running project 'foo'" / "Compiling main.weft" / "Applying edit".
+  what: string;
+  /// Stage where the failure happened. Drives the modal's icon and
+  /// helps the user understand which subsystem reported the error.
+  /// "compile" | "spawn" | "runtime" | "dispatch" | "edit" | "parse"
+  /// | "catalog" | "cli" | "unknown"
+  stage: string;
+  /// Per-diagnostic items. A compile failure fans out into many; an
+  /// exit-code failure produces one item with the stderr blob in raw.
+  diagnostics: ActionErrorDiagnostic[];
+  /// Free-form text the modal renders inside a collapsible `<pre>`.
+  /// Stderr / stdout / log dump.
+  raw?: string;
+  /// Process exit code, when available.
+  exitCode?: number;
+  /// The shell command that was run, when available.
+  /// "weft --json run --color foo".
+  command?: string;
+}
+
+export interface ActionErrorDiagnostic {
+  severity: 'error' | 'warning' | 'info';
+  /// Diagnostic code like `loop-parallel-not-boolean`. Optional.
+  code?: string;
+  message: string;
+  /// Optional source location. The modal renders "main.weft:12:5"
+  /// and offers click-to-jump.
+  location?: { file: string; line: number; column: number };
+  /// Optional extended explanation shown below the message.
+  hint?: string;
+}
 
 export type BackendSnapshot = {
   /// Verbs the dispatcher will currently accept. Inherited from
@@ -578,6 +752,28 @@ export type HostMessage =
   /// failures when the catalog loaded but some nodes were skipped.
   | { kind: 'catalogError'; error?: string; warnings?: string[] }
   | { kind: 'execEvent'; event: NodeExecEvent }
+  /// One bus event (live or replay). Carries only what the bus layer
+  /// recorded: join / left / message / closed keyed by `busId`.
+  /// Routing to node inspector panels is a SEPARATE signal,
+  /// `busParticipant`, because participation is a property of the
+  /// graph, not of the live bus stream.
+  | { kind: 'busEvent'; event: BusInspectorEvent }
+  /// One loop event (live or replay). Routes by groupId + parentFrames
+  /// so the inspector card for each LoopOut node groups its
+  /// iterations together.
+  | { kind: 'loopEvent'; event: LoopInspectorEvent }
+  /// "Node N participates in bus B." Derived dispatcher-side from
+  /// PulseEmitted events whose value carries a bus marker. The
+  /// webview unions these into a per-bus participant set; the
+  /// inspector for each participant node renders the bus's IRC log.
+  | { kind: 'busParticipant'; busId: string; nodeId: string; meta: BusMeta }
+  /// One journal row the dispatcher could not apply during fold
+  /// (replay-time corruption check). The inspector aggregates these
+  /// into a muted "N journal rows corrupted" line; not alarming,
+  /// not red, just visible if the user looks. Per-execution; the
+  /// webview groups by execution color and renders the list
+  /// behind a collapsed disclosure.
+  | { kind: 'journalCorruption'; site: CorruptionSite; reason: string }
   /// Infra `/live` poll result for one infra node. Routed to
   /// the node's body panel iff the node has `requiresInfra: true`.
   | ({ kind: 'infraLive'; nodeId: string } & NodeFeedState)
@@ -585,6 +781,15 @@ export type HostMessage =
   /// to the node's body panel iff `features.isTrigger: true`.
   | ({ kind: 'signalDisplay'; nodeId: string } & NodeFeedState)
   | { kind: 'followStatus'; status: FollowStatus }
+  /// The live execution SSE stream ended or broke before the
+  /// execution reached a terminal state. `reason` is 'closed' (server
+  /// cleanly ended the stream) or 'error' (connection/read failure).
+  /// The webview stops presenting the execution as live (so it isn't
+  /// stuck showing "running" forever) WITHOUT falsely marking nodes
+  /// completed: the per-node rows keep their last known state, the
+  /// run is just no longer being followed. Distinct from execTerminal
+  /// (which IS the run finishing) and from execReset (a fresh follow).
+  | { kind: 'followLost'; color: string; reason: 'closed' | 'error' }
   | { kind: 'execReset' }
   /// Whether the watched .weft source is currently visible in
   /// some editor tab. The webview uses this to swap the "Source"
@@ -714,8 +919,9 @@ export type WebviewMessage =
   /// to read them.
   | { kind: 'dismissError' };
 
-/// A structured edit intent. Mirrors the Rust `EditOp` enum (serde tag `op`,
-/// camelCase fields). The frontend emits these; the Rust edit-server applies
+// SYNC: EditOp <-> crates/weft-compiler/src/edit.rs EditOp
+/// A structured edit intent (serde tag `op`, camelCase fields).
+/// The frontend emits these; the Rust edit-server applies
 /// them to the source. All graph edits go through `applyEdits` so the language
 /// logic lives in Rust only, reusable by any frontend.
 export type EditOp =
@@ -736,7 +942,15 @@ export type EditOp =
   // A group's description is the `# Description:` comment on its first body line
   // (the single description concept; the old single-file `# Project:` header is
   // dropped, a file's identity is its filename). `description: null` clears it.
-  | { op: 'setGroupDescription'; group: string; description: string | null };
+  | { op: 'setGroupDescription'; group: string; description: string | null }
+  // Loop ops mirror the Rust EditOp variants.
+  | { op: 'addLoop'; label: string; parentGroup: string | null }
+  | { op: 'removeLoop'; loopId: string }
+  | { op: 'renameLoop'; oldLabel: string; newLabel: string }
+  | { op: 'moveLoopScope'; loopId: string; targetGroup: string | null }
+  | { op: 'updateLoopPorts'; loopId: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
+  | { op: 'setLoopConfig'; loopId: string; key: string; value: string }
+  | { op: 'removeLoopConfig'; loopId: string; key: string };
 
 export interface EditPortSig {
   name: string;

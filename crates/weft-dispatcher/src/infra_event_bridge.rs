@@ -122,10 +122,13 @@ pub(crate) fn to_dispatcher_event(
         InfraEvent::Flaky(p) => Some(DispatcherEvent::InfraFlaky {
             project_id: pid,
             node_id: require_node_id(ev)?,
-            reason: p
-                .reason
-                .clone()
-                .unwrap_or_else(|| format!("desired={} ready={}", p.desired, p.ready)),
+            // User-string field: cap at 4 KB before NOTIFY fan-out.
+            reason: weft_core::truncate_user_string(
+                &p.reason
+                    .clone()
+                    .unwrap_or_else(|| format!("desired={} ready={}", p.desired, p.ready)),
+                4096,
+            ),
         }),
         InfraEvent::Recovered => Some(DispatcherEvent::InfraRecovered {
             project_id: pid,
@@ -153,7 +156,10 @@ pub(crate) fn to_dispatcher_event(
         InfraEvent::Notify(_) => None,
         InfraEvent::ProtocolConfigError(p) => Some(DispatcherEvent::InfraConfigError {
             project_id: pid,
-            error: p.error.clone(),
+            // User-string field: cap before NOTIFY fan-out so a
+            // multi-kB serde error from a deeply-nested protocol
+            // config can't blow the 7800-byte channel cap.
+            error: weft_core::truncate_user_string(&p.error, 4096),
         }),
     }
 }
@@ -164,7 +170,12 @@ pub(crate) fn to_dispatcher_event(
 /// empty string on the wire.
 fn require_node_id(ev: &crate::infra_event::InfraEventRow) -> Option<String> {
     match ev.node_id.clone() {
-        Some(s) if !s.is_empty() => Some(s),
+        // `node_id` is user-authored (from the project definition) and
+        // unbounded; bound it here, the single choke point feeding every
+        // node-scoped infra DispatcherEvent, so a long id can't push a
+        // publish-path NOTIFY payload over the 8000-byte cap and make
+        // sibling pods silently miss the event.
+        Some(s) if !s.is_empty() => Some(weft_core::truncate_user_string(&s, 4096)),
         _ => {
             tracing::warn!(
                 target: "weft_dispatcher::infra_event_bridge",

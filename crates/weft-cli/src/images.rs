@@ -11,40 +11,67 @@ use anyhow::Result;
 use tokio::process::Command;
 
 
+/// Ensure the shared pre-built worker builder base image exists.
+/// Returns its tag (`weft-builder-base:<short-hash>`). The tag is
+/// content-addressed so an engine / toolchain bump produces a fresh
+/// tag and per-project worker Dockerfiles automatically pick it up
+/// via their `FROM {{builder_base_image}}` line.
+///
+/// The base image bakes debian + rustup + the workspace's pinned
+/// toolchain, plus the engine workspace at `/weft/`. Per-project
+/// worker builds FROM this image and skip the apt + rustup install
+/// cycle, paying only per-project costs (per-node apt packages,
+/// cargo fetch + compile inside the shared BuildKit cache mounts).
+pub async fn ensure_worker_builder_base() -> Result<String> {
+    let root = weft_compiler::build::resolve_weft_root()
+        .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+    let hash = crate::hash::compute_builder_base_hash(&root)?;
+    let short = hash.chars().take(16).collect::<String>();
+    let tag = weft_compiler::worker_image::builder_base_tag(&short);
+    let dockerfile = root.join(crate::hash::BUILDER_BASE_DOCKERFILE);
+    // The tag is content-addressed (the hash covers every input the
+    // build context reads, via `compute_builder_base_hash`), so a
+    // present tag IS the right content: no stamp file needed.
+    if !image_present(&tag).await? {
+        build_image(&tag, &dockerfile, &root).await?;
+    }
+    // Builder-base images are large (~1GB+: debian + rustup +
+    // staged workspace). Earlier shape GC'd every prior tag after a
+    // fresh ensure, but that races with in-flight per-project
+    // builds: a docker build referencing `FROM weft-builder-base:<old>`
+    // sees the tag yanked mid-build. Disk-pressure cleanup is an
+    // explicit `weft clean --images` operation, not an implicit
+    // side-effect of every `weft run`.
+    Ok(tag)
+}
+
 /// Build (if stale) a system image from `deploy/docker/<dockerfile_name>`.
-/// All four system images (dispatcher / listener / broker /
-/// infra-supervisor) share the same build inputs (workspace
-/// manifests + every crate + the catalog); the only per-image
-/// difference is which Dockerfile drives the build. Adding a
-/// build input is a one-line change here, not four. Returns `true`
-/// if a rebuild actually happened, `false` on a cache hit.
+/// The input set is the shared workspace source list plus the
+/// image's own Dockerfile plus `extra_input_rels` (paths relative to
+/// the weft root the image additionally stages: the dispatcher
+/// bundles `catalog/` for its describe / compile endpoints, the
+/// others stage nothing extra, so a catalog-only edit doesn't
+/// invalidate them).
+/// Returns `true` if a rebuild actually happened, `false` on a cache hit.
 pub async fn ensure_system_image(
     tag: &str,
     dockerfile_name: &str,
+    extra_input_rels: &[&str],
     rebuild: bool,
 ) -> Result<bool> {
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let dockerfile = root.join("deploy/docker").join(dockerfile_name);
-    let inputs = vec![
-        root.join("Cargo.toml"),
-        root.join("Cargo.lock"),
-        root.join("rust-toolchain.toml"),
-        dockerfile.clone(),
-        root.join("crates"),
-        root.join("catalog"),
-    ];
-    ensure_image(tag, &dockerfile, &root, &inputs, rebuild).await
-}
+    let mut inputs = crate::hash::workspace_source_inputs(&root);
+    inputs.push((dockerfile_name.to_string(), dockerfile.clone()));
+    for rel in extra_input_rels {
+        inputs.push((rel.to_string(), root.join(rel)));
+    }
 
-async fn ensure_image(
-    tag: &str,
-    dockerfile: &Path,
-    context: &Path,
-    inputs: &[PathBuf],
-    rebuild: bool,
-) -> Result<bool> {
-    let want_hash = hash_inputs(inputs)?;
+    // System images use static `:local` tags, so tag presence says
+    // nothing about content; a stamp file holding the input hash of
+    // the last successful build decides staleness.
+    let want_hash = hash_inputs(&inputs)?;
     let stamp_path = stamp_path_for(tag);
     let have_hash = std::fs::read_to_string(&stamp_path).ok().map(|s| s.trim().to_string());
     let image_exists = image_present(tag).await?;
@@ -55,11 +82,42 @@ async fn ensure_image(
         return Ok(false);
     }
 
+    build_image(tag, &dockerfile, &root).await?;
+    if let Some(parent) = stamp_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "warning: could not create stamp dir {} ({e}); \
+                 the next ensure will rebuild {tag} even when unchanged",
+                parent.display()
+            );
+        }
+    }
+    if let Err(e) = std::fs::write(&stamp_path, want_hash) {
+        eprintln!(
+            "warning: could not write image stamp {} ({e}); \
+             the next ensure will rebuild {tag} even when unchanged",
+            stamp_path.display()
+        );
+    }
+    Ok(true)
+}
+
+/// One `docker build` invocation, BuildKit on. Used by both the
+/// content-addressed builder base and the stamp-gated system images;
+/// staleness decisions live in the callers.
+async fn build_image(tag: &str, dockerfile: &Path, context: &Path) -> Result<()> {
     println!(
         "building image {tag} (this may take several minutes on first run; \
          subsequent builds are incremental)"
     );
+    // We DO want docker's layer cache: combined with the buildkit
+    // cargo cache mounts the Dockerfiles declare, an unchanged crate
+    // set short-circuits to seconds. Deeper source changes are
+    // caught by cargo's own fingerprinting inside the cache mount;
+    // the callers' staleness gates handle the OUTER correctness (we
+    // never reach this RUN when nothing changed).
     let status = Command::new("docker")
+        .env("DOCKER_BUILDKIT", "1")
         .args(["build", "-t", tag, "-f"])
         .arg(dockerfile)
         .arg(context)
@@ -68,11 +126,7 @@ async fn ensure_image(
     if !status.success() {
         anyhow::bail!("docker build {tag} failed with {status}");
     }
-    if let Some(parent) = stamp_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&stamp_path, want_hash);
-    Ok(true)
+    Ok(())
 }
 
 /// Stable per-tag stamp file. `weft-dispatcher:local` ->
@@ -86,16 +140,17 @@ fn stamp_path_for(tag: &str) -> PathBuf {
     base.join(format!("{safe_tag}.hash"))
 }
 
-/// Hash every regular file under each input path. Shares framing
-/// rules with the project source-hash function (`hash::hash_path`)
-/// so the two hashers can't drift; both use SHA-256 with explicit
-/// `file:` / `path:` / `missing:` prefixes. Returns a 16-char hex
+/// Hash every regular file under each labeled input path. Shares
+/// framing rules with the project source-hash function
+/// (`hash::hash_path`) so the two hashers can't drift; both use
+/// SHA-256 with explicit `file:` / `dir:` / `path:` / `missing:`
+/// prefixes over machine-independent labels. Returns a 16-char hex
 /// prefix (64 bits) which is plenty for image-stamp cache identity.
-fn hash_inputs(inputs: &[PathBuf]) -> Result<String> {
+fn hash_inputs(inputs: &[(String, PathBuf)]) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for input in inputs {
-        crate::hash::hash_path(&mut hasher, input)?;
+    for (label, path) in inputs {
+        crate::hash::hash_path(&mut hasher, label, path)?;
     }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(16);
@@ -137,16 +192,29 @@ pub async fn image_present(tag: &str) -> Result<bool> {
 /// Load a locally-built image into the named kind cluster so its
 /// Pods can pull it without a registry.
 ///
-/// Skip when the tag is already present on the node: worker/infra tags
-/// are content-addressed (the tag suffix is the source/image hash), so
-/// the same tag is the same content by construction. There is no
-/// "tag present but content diverged" case to guard, a content change
-/// produces a new tag. We deliberately do NOT compare image IDs across
-/// the docker/containerd boundary: the two runtimes digest the same
-/// image differently (docker's config blob vs containerd's), so an
-/// ID comparison never matches and would re-load every run.
+/// Content-addressed tags (worker / infra: `<repo>:<hash>`) can short-
+/// circuit when the tag is already present on the node, because the
+/// hash IS in the tag, so a present tag is the right content. Static
+/// tags (`:local` for the four system images: dispatcher / listener
+/// / broker / supervisor) CANNOT short-circuit on tag presence: the
+/// tag is reused across builds, so "present" tells us nothing about
+/// content. The caller distinguishes via `content_addressed_tag`.
+///
+/// We never compare image IDs across the docker/containerd boundary:
+/// the two runtimes digest the same image differently (docker's config
+/// blob vs containerd's), so an ID comparison never matches.
 pub async fn kind_load(cluster: &str, tag: &str) -> Result<()> {
-    if kind_node_has_tag(cluster, tag).await {
+    kind_load_inner(cluster, tag, true).await
+}
+
+/// `kind_load` variant for static (reused) tags. Always re-loads,
+/// because tag presence does not imply matching content for these.
+pub async fn kind_load_force(cluster: &str, tag: &str) -> Result<()> {
+    kind_load_inner(cluster, tag, false).await
+}
+
+async fn kind_load_inner(cluster: &str, tag: &str, allow_tag_skip: bool) -> Result<()> {
+    if allow_tag_skip && kind_node_has_tag(cluster, tag).await {
         return Ok(());
     }
     let status = Command::new("kind")

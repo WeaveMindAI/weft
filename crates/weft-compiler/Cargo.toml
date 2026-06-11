@@ -18,6 +18,7 @@ regex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+filetime = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }

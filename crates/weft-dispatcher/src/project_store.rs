@@ -22,16 +22,31 @@ use tokio::sync::RwLock;
 /// - `MockProjectStore` (tests, behind `test-helpers`).
 #[async_trait]
 pub trait ProjectStoreOps: Send + Sync {
-    /// Insert a freshly registered project. `project_namespace` is
-    /// required (NOT NULL in the schema) so the row is born with the
-    /// k8s placement decided. Callers compute it via
-    /// `NamespaceMapper::project_namespace_for(...)`.
-    async fn register(
+    /// Atomic register-and-hash-advance. Wraps every write of the
+    /// register path (project row insert, project_definition history
+    /// insert, running-hash pointer advance) in a single transaction
+    /// so a pod crash mid-sequence can't leave the project row
+    /// partially advanced (the earlier shape ran each write
+    /// standalone; a crash between the history insert and the
+    /// pointer advance left the history row written but the pointer
+    /// unmoved, and a `/run` between the two would have seen the OLD
+    /// definition_hash with a fresh row already landed). All writes
+    /// commit together or none do.
+    ///
+    /// `binary_hash`, `definition_hash`, and `infra_hash` are
+    /// optional: a register with only some hashes set leaves the
+    /// others unchanged. `project_namespace` is required (NOT NULL in
+    /// the schema) so the row is born with the k8s placement decided;
+    /// callers compute it via `NamespaceMapper::project_namespace_for`.
+    async fn register_with_hashes(
         &self,
         project: ProjectDefinition,
         name: &str,
         tenant_id: &str,
         project_namespace: &str,
+        binary_hash: Option<&str>,
+        definition_hash: Option<&str>,
+        infra_hash: Option<&str>,
     ) -> anyhow::Result<StoredProjectSummary>;
 
     // Every reader returns `Result<Option<T>>` or `Result<Vec<T>>`:
@@ -50,34 +65,61 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>>;
 
-    /// Persist the source hash the user just built. Doubles as the
-    /// worker docker image tag suffix (k8s manifest builder reads
-    /// it back on spawn) AND as the resync drift signal (status
-    /// compares it against the CLI's freshly-computed source hash).
+    /// Persist the running-hash pointers the user just built, in ONE
+    /// ATOMIC write (a single UPDATE). `None` leaves a pointer
+    /// untouched. The hashes:
     ///
-    /// Returns `Err` on DB failure. `Ok(())` even if the row didn't
-    /// exist; sync writes hash before the project row is guaranteed
-    /// to exist in the dispatcher's view (the broker is the source
-    /// of truth for "does this project exist at all").
-    async fn set_running_source_hash(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<()>;
+    /// - binary: the worker docker image tag suffix (k8s manifest
+    ///   builder reads it back on spawn). Flips only when something
+    ///   binary-affecting changes (engine, node implementations,
+    ///   node-type set, `weft.toml` build config).
+    /// - definition: identifies the runtime project shape (topology +
+    ///   configs). Workers fetch the definition by `(project_id,
+    ///   definition_hash)`, so the row must already exist in the
+    ///   `project_definition` history: setting a definition hash with
+    ///   no history row is REFUSED loudly (the project must be
+    ///   registered with that definition first; registering is the
+    ///   only writer of history rows).
+    /// - infra: drives the upgrade drift signal.
+    ///
+    /// Atomicity is the point: writing the trio as separate UPDATEs
+    /// opens a window where a crash (or a sibling Pod's `/run`
+    /// between two writes) observes a new binary hash paired with an
+    /// old definition hash, i.e. a worker image whose node-type set
+    /// may not match the definition the execution journals.
+    async fn set_running_hashes(
+        &self,
+        id: uuid::Uuid,
+        binary_hash: Option<&str>,
+        definition_hash: Option<&str>,
+        infra_hash: Option<&str>,
+    ) -> anyhow::Result<()>;
 
-    /// Read the stored source hash. `Ok(None)` if never set
+    /// Read the stored binary hash. `Ok(None)` if never set
     /// (project registered but never built / activated /
     /// infra-started). `Err` ONLY on DB failure: a transient hiccup
     /// must NOT be observed as "no hash" (which would trigger an
     /// unnecessary stale-worker kill in `replace_stale_worker_if_needed`).
-    async fn running_source_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
+    async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
-    /// Persist the infra hash the user just built. Drives the
-    /// upgrade drift signal: status compares this against the
-    /// CLI's freshly-computed infra hash. Set only by paths that
-    /// touch infra (infra/start, infra/upgrade) plus register /
-    /// activate / resync, which all carry it for completeness.
-    /// Same Result contract as `set_running_source_hash`.
-    async fn set_running_infra_hash(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<()>;
+    /// Read the stored definition hash. Same Result contract as
+    /// `running_binary_hash`.
+    async fn running_definition_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
+
+    /// Look up a definition by hash. Returns `Ok(None)` when no
+    /// version with that hash was recorded. Used by the broker's
+    /// `fetch_definition` handler: workers and listeners pass
+    /// `(project_id, expected_hash)` and get back the exact JSON
+    /// that was registered under that hash, regardless of what the
+    /// project row's current `running_definition_hash` says.
+    async fn definition_for_hash(
+        &self,
+        id: uuid::Uuid,
+        hash: &str,
+    ) -> anyhow::Result<Option<String>>;
 
     /// Read the stored infra hash. Same Result contract as
-    /// `running_source_hash`.
+    /// `running_binary_hash`.
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
     /// Read the project's full lifecycle: status + the three
@@ -394,9 +436,17 @@ impl PostgresProjectStore {
         //                    Journal bridge CASes status to
         //                    inactive once the running set empties.
         //
-        // running_source_hash / running_infra_hash drive drift
-        // detection + image tagging (worker docker tag suffix +
-        // resync compare against the CLI's freshly-computed hash).
+        // running_binary_hash / running_definition_hash /
+        // running_infra_hash drive drift detection + image tagging:
+        //   - running_binary_hash: worker docker image tag suffix.
+        //     Flips on engine / node-impl / node-type-set / weft.toml
+        //     edits; selects the image when spawning a fresh pod.
+        //   - running_definition_hash: identifies the runtime project
+        //     shape (topology + configs). Workers fetch the
+        //     definition at execution claim time keyed by
+        //     `(project_id, definition_hash)`.
+        //   - running_infra_hash: drives the Upgrade button when the
+        //     CLI's freshly-computed infra hash drifts.
         //
         // tenant_id pins each project to its isolation namespace.
         // The broker uses it for scoping every user-pod-issued
@@ -410,7 +460,8 @@ impl PostgresProjectStore {
                 status TEXT NOT NULL,
                 project_json TEXT NOT NULL,
                 updated_at BIGINT NOT NULL,
-                running_source_hash TEXT,
+                running_binary_hash TEXT,
+                running_definition_hash TEXT,
                 running_infra_hash TEXT,
                 accepting_fires BOOLEAN NOT NULL DEFAULT TRUE,
                 fires_visible_to_consumers BOOLEAN NOT NULL DEFAULT TRUE,
@@ -452,6 +503,26 @@ impl PostgresProjectStore {
             .execute(&pool)
             .await?;
 
+        // Append-only definition-version history. Workers fetch by
+        // (project_id, definition_hash) so a suspended execution
+        // can always resume on the EXACT shape it was started on,
+        // even after the user has edited and re-registered. Without
+        // this, the `project.project_json` column would only carry
+        // the LATEST shape and a resume after edit would run the
+        // wrong topology against the journal's old state.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS project_definition (
+                project_id UUID NOT NULL,
+                definition_hash TEXT NOT NULL,
+                project_json TEXT NOT NULL,
+                recorded_at_unix BIGINT NOT NULL,
+                PRIMARY KEY (project_id, definition_hash),
+                FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
+            )"#,
+        )
+        .execute(&pool)
+        .await?;
+
         // Downgrade in-flight rows on dispatcher restart so every
         // project is cleanly re-activatable on the new pod:
         // - `active`: trigger-setup must re-bootstrap (only `/activate`
@@ -480,20 +551,84 @@ impl PostgresProjectStore {
     }
 }
 
+/// THE running-hash pointer advance: ONE atomic UPDATE of the trio
+/// with the definition-history EXISTS guard. Both writers go
+/// through here: `set_running_hashes` on a pool connection,
+/// `register_with_hashes` inside its transaction (after the history
+/// INSERT, which the same-snapshot EXISTS check then sees). `None`
+/// leaves a pointer untouched. Zero rows updated fails loudly:
+/// either the project row is missing, or the definition hash has no
+/// history row (the project must be registered with that definition
+/// first; registering is the only writer of history rows).
+async fn advance_running_hashes(
+    conn: &mut sqlx::PgConnection,
+    id: uuid::Uuid,
+    binary_hash: Option<&str>,
+    definition_hash: Option<&str>,
+    infra_hash: Option<&str>,
+) -> anyhow::Result<()> {
+    if binary_hash.is_none() && definition_hash.is_none() && infra_hash.is_none() {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "UPDATE project SET \
+             running_binary_hash     = COALESCE($1, running_binary_hash), \
+             running_definition_hash = COALESCE($2, running_definition_hash), \
+             running_infra_hash      = COALESCE($3, running_infra_hash), \
+             updated_at = $4 \
+         WHERE id = $5 AND ($2 IS NULL OR EXISTS ( \
+             SELECT 1 FROM project_definition \
+             WHERE project_id = $5 AND definition_hash = $2 \
+         ))",
+    )
+    .bind(binary_hash)
+    .bind(definition_hash)
+    .bind(infra_hash)
+    .bind(crate::lease::now_unix())
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    if rows.rows_affected() == 0 {
+        let (project_exists,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM project WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await?;
+        if !project_exists {
+            anyhow::bail!("advance_running_hashes: project {id} not found");
+        }
+        anyhow::bail!(
+            "refuse to set running_definition_hash to {hash} for project {id}: \
+             no project_definition history row exists for that hash; \
+             register the project with this definition first",
+            hash = definition_hash.unwrap_or("<none>"),
+        );
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ProjectStoreOps for PostgresProjectStore {
-    /// Register (or update) a project. Idempotent on id.
-    async fn register(
+    async fn register_with_hashes(
         &self,
         project: ProjectDefinition,
         name: &str,
         tenant_id: &str,
         project_namespace: &str,
+        binary_hash: Option<&str>,
+        definition_hash: Option<&str>,
+        infra_hash: Option<&str>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name = name.to_string();
         let project_json = serde_json::to_string(&project)?;
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let now = crate::lease::now_unix();
+        // The conflict arm deliberately does NOT touch `status`: an
+        // Active project stays active through a re-register.
+        // RETURNING the (possibly preserved) status keeps the summary
+        // honest instead of hardcoding "registered".
+        let (status_str,): (String,) = sqlx::query_as(
             "INSERT INTO project \
                 (id, name, status, project_json, updated_at, \
                  tenant_id, project_namespace) \
@@ -503,20 +638,41 @@ impl ProjectStoreOps for PostgresProjectStore {
                 project_json = EXCLUDED.project_json, \
                 updated_at = EXCLUDED.updated_at, \
                 tenant_id = EXCLUDED.tenant_id, \
-                project_namespace = EXCLUDED.project_namespace",
+                project_namespace = EXCLUDED.project_namespace \
+             RETURNING status",
         )
         .bind(id)
         .bind(&name)
         .bind(&project_json)
-        .bind(crate::lease::now_unix())
+        .bind(now)
         .bind(tenant_id)
         .bind(project_namespace)
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        if let Some(hash) = definition_hash {
+            // History row FIRST (idempotent on (project_id, hash)),
+            // then pointer advance. Inside the transaction the FK
+            // precondition is satisfied as of the same snapshot, so
+            // the pointer-setter's existence check sees the freshly
+            // inserted history row.
+            sqlx::query(
+                "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (project_id, definition_hash) DO NOTHING",
+            )
+            .bind(id)
+            .bind(hash)
+            .bind(&project_json)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        advance_running_hashes(&mut *tx, id, binary_hash, definition_hash, infra_hash).await?;
+        tx.commit().await?;
         Ok(StoredProjectSummary {
             id,
             name,
-            status: ProjectStatus::Registered,
+            status: project_status_from_str(&status_str)?,
         })
     }
 
@@ -572,21 +728,25 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn set_running_source_hash(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE project SET running_source_hash = $1, updated_at = $2 WHERE id = $3",
-        )
-        .bind(hash)
-        .bind(crate::lease::now_unix())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    async fn set_running_hashes(
+        &self,
+        id: uuid::Uuid,
+        binary_hash: Option<&str>,
+        definition_hash: Option<&str>,
+        infra_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // ONE UPDATE = atomic trio: a crash (or a sibling Pod's /run
+        // between statements) can never observe a half-advanced
+        // pointer set. The definition-history precondition and the
+        // loud zero-rows failure live in `advance_running_hashes`,
+        // shared with `register_with_hashes`' transaction.
+        let mut conn = self.pool.acquire().await?;
+        advance_running_hashes(&mut *conn, id, binary_hash, definition_hash, infra_hash).await
     }
 
-    async fn running_source_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+    async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT running_source_hash FROM project WHERE id = $1",
+            "SELECT running_binary_hash FROM project WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -594,16 +754,30 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.and_then(|(h,)| h))
     }
 
-    async fn set_running_infra_hash(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE project SET running_infra_hash = $1, updated_at = $2 WHERE id = $3",
+    async fn running_definition_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT running_definition_hash FROM project WHERE id = $1",
         )
-        .bind(hash)
-        .bind(crate::lease::now_unix())
         .bind(id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.and_then(|(h,)| h))
+    }
+
+    async fn definition_for_hash(
+        &self,
+        id: uuid::Uuid,
+        hash: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT project_json FROM project_definition \
+             WHERE project_id = $1 AND definition_hash = $2",
+        )
+        .bind(id)
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(j,)| j))
     }
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -910,8 +1084,13 @@ impl ProjectStoreOps for PostgresProjectStore {
 #[cfg(any(test, feature = "test-helpers"))]
 pub struct MockProjectStore {
     inner: RwLock<HashMap<uuid::Uuid, (String, ProjectStatus, ProjectDefinition)>>,
-    source_hashes: RwLock<HashMap<uuid::Uuid, String>>,
+    binary_hashes: RwLock<HashMap<uuid::Uuid, String>>,
+    definition_hashes: RwLock<HashMap<uuid::Uuid, String>>,
     infra_hashes: RwLock<HashMap<uuid::Uuid, String>>,
+    /// In-memory mirror of the `project_definition` history table:
+    /// keyed by `(project_id, definition_hash)`, value is the
+    /// `project_json` registered under that hash.
+    definition_versions: RwLock<HashMap<(uuid::Uuid, String), String>>,
     lifecycles: RwLock<HashMap<uuid::Uuid, ProjectLifecycle>>,
     tenants: RwLock<HashMap<uuid::Uuid, String>>,
     namespaces: RwLock<HashMap<uuid::Uuid, String>>,
@@ -923,8 +1102,10 @@ impl MockProjectStore {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            source_hashes: RwLock::new(HashMap::new()),
+            binary_hashes: RwLock::new(HashMap::new()),
+            definition_hashes: RwLock::new(HashMap::new()),
             infra_hashes: RwLock::new(HashMap::new()),
+            definition_versions: RwLock::new(HashMap::new()),
             lifecycles: RwLock::new(HashMap::new()),
             tenants: RwLock::new(HashMap::new()),
             namespaces: RwLock::new(HashMap::new()),
@@ -943,28 +1124,76 @@ impl Default for MockProjectStore {
 #[cfg(any(test, feature = "test-helpers"))]
 #[async_trait]
 impl ProjectStoreOps for MockProjectStore {
-    async fn register(
+    async fn register_with_hashes(
         &self,
         project: ProjectDefinition,
         name: &str,
         tenant_id: &str,
         project_namespace: &str,
+        binary_hash: Option<&str>,
+        definition_hash: Option<&str>,
+        infra_hash: Option<&str>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
-        let name = name.to_string();
-        self.inner
-            .write()
-            .await
-            .insert(id, (name.clone(), ProjectStatus::Registered, project));
+        let name_owned = name.to_string();
+        // Serialize for the history row before moving `project`.
+        let project_json = serde_json::to_string(&project)?;
+        // Mirror Postgres exactly: the upsert's conflict arm does NOT
+        // touch `status` (an Active project stays active through a
+        // re-register), and a FRESH row gets the column defaults the
+        // lifecycle CAS methods read (status='registered',
+        // accepting/visible true). Without the seeding, mock-backed
+        // register -> activate tests would 409 where production
+        // activates; without the preservation, the mock's status
+        // mirror and `lifecycles` would disagree after a re-register.
+        let status = {
+            let mut inner = self.inner.write().await;
+            let preserved = inner.get(&id).map(|(_, s, _)| *s);
+            let status = preserved.unwrap_or(ProjectStatus::Registered);
+            inner.insert(id, (name_owned.clone(), status, project));
+            status
+        };
+        {
+            let mut lifecycles = self.lifecycles.write().await;
+            lifecycles.entry(id).or_insert(ProjectLifecycle {
+                status: ProjectStatus::Registered,
+                accepting_fires: true,
+                fires_visible_to_consumers: true,
+                fires_deadline_unix: None,
+                deactivated_by_health: false,
+            });
+        }
         self.tenants.write().await.insert(id, tenant_id.to_string());
         self.namespaces
             .write()
             .await
             .insert(id, project_namespace.to_string());
+        if let Some(h) = binary_hash {
+            self.binary_hashes.write().await.insert(id, h.to_string());
+        }
+        if let Some(h) = definition_hash {
+            // Record history row first, then advance the pointer.
+            // The mock cannot truly atomicize the five `RwLock` writes
+            // (they're independent locks taken in sequence); the
+            // ordering invariant is preserved so a fold in any test
+            // sees the history row before the pointer, matching the
+            // production Postgres transaction's visibility, but a
+            // panic mid-sequence would leave partial state. Tests
+            // that need true atomicity should exercise the Postgres
+            // path directly.
+            self.definition_versions
+                .write()
+                .await
+                .insert((id, h.to_string()), project_json.clone());
+            self.definition_hashes.write().await.insert(id, h.to_string());
+        }
+        if let Some(h) = infra_hash {
+            self.infra_hashes.write().await.insert(id, h.to_string());
+        }
         Ok(StoredProjectSummary {
             id,
-            name,
-            status: ProjectStatus::Registered,
+            name: name_owned,
+            status,
         })
     }
 
@@ -1000,7 +1229,23 @@ impl ProjectStoreOps for MockProjectStore {
     }
 
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
-        Ok(self.inner.write().await.remove(&id).is_some())
+        // Mirror Postgres FK CASCADE: removing a project clears every
+        // per-id side-map (binary/definition/infra hashes,
+        // definition_versions history, lifecycles, tenants,
+        // namespaces, sync_in_flight). Without this the mock diverges
+        // from production: a test that re-registers under the same
+        // id, or asserts cleanup, would see ghost state Postgres
+        // does not have.
+        let was_present = self.inner.write().await.remove(&id).is_some();
+        self.binary_hashes.write().await.remove(&id);
+        self.definition_hashes.write().await.remove(&id);
+        self.infra_hashes.write().await.remove(&id);
+        self.definition_versions.write().await.retain(|(p, _), _| *p != id);
+        self.lifecycles.write().await.remove(&id);
+        self.tenants.write().await.remove(&id);
+        self.namespaces.write().await.remove(&id);
+        self.sync_in_flight.write().await.remove(&id);
+        Ok(was_present)
     }
 
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>> {
@@ -1012,18 +1257,66 @@ impl ProjectStoreOps for MockProjectStore {
             .map(|(_, _, project)| project.clone()))
     }
 
-    async fn set_running_source_hash(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<()> {
-        self.source_hashes.write().await.insert(id, hash.to_string());
+    async fn set_running_hashes(
+        &self,
+        id: uuid::Uuid,
+        binary_hash: Option<&str>,
+        definition_hash: Option<&str>,
+        infra_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !self.inner.read().await.contains_key(&id) {
+            anyhow::bail!("set_running_hashes: project {id} not found");
+        }
+        // Mirror the Postgres precondition BEFORE any write: refuse to
+        // advance the pointer to a hash with no history row, leaving
+        // the trio untouched (the production statement is one atomic
+        // UPDATE, so a refused definition also never advances binary /
+        // infra).
+        if let Some(hash) = definition_hash {
+            if !self
+                .definition_versions
+                .read()
+                .await
+                .contains_key(&(id, hash.to_string()))
+            {
+                anyhow::bail!(
+                    "refuse to set running_definition_hash to {hash} for project {id}: \
+                     no project_definition history row exists for that hash; \
+                     register the project with this definition first"
+                );
+            }
+        }
+        if let Some(h) = binary_hash {
+            self.binary_hashes.write().await.insert(id, h.to_string());
+        }
+        if let Some(h) = definition_hash {
+            self.definition_hashes.write().await.insert(id, h.to_string());
+        }
+        if let Some(h) = infra_hash {
+            self.infra_hashes.write().await.insert(id, h.to_string());
+        }
         Ok(())
     }
 
-    async fn running_source_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
-        Ok(self.source_hashes.read().await.get(&id).cloned())
+    async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+        Ok(self.binary_hashes.read().await.get(&id).cloned())
     }
 
-    async fn set_running_infra_hash(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<()> {
-        self.infra_hashes.write().await.insert(id, hash.to_string());
-        Ok(())
+    async fn running_definition_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
+        Ok(self.definition_hashes.read().await.get(&id).cloned())
+    }
+
+    async fn definition_for_hash(
+        &self,
+        id: uuid::Uuid,
+        hash: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .definition_versions
+            .read()
+            .await
+            .get(&(id, hash.to_string()))
+            .cloned())
     }
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {

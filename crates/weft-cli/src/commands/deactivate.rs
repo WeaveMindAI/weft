@@ -8,6 +8,7 @@
 //! trigger deactivation means improvements propagate everywhere.
 
 use super::Ctx;
+use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
 use crate::progress::ActionVerb;
 
 /// Default hibernate grace window when the user picks hibernate
@@ -61,15 +62,14 @@ pub fn prompt_trigger_deactivation(
 
     // Running-policy: wait by default for preservation modes; wipe
     // forces cancel because waiting before wiping is contradictory.
-    let running_policy = match running_policy {
-        Some(p) if p == "wait" || p == "cancel" => p.to_string(),
-        Some(other) => anyhow::bail!(
-            "invalid running-policy '{other}'; must be wait|cancel"
-        ),
-        None if mode == "wipe" => "cancel".to_string(),
-        None => "wait".to_string(),
+    // Parse through the shared `RunningPolicy` so the accepted set
+    // can't drift from the other verbs.
+    let running_policy = match parse_running_policy_flag(running_policy)? {
+        Some(p) => p,
+        None if mode == "wipe" => RunningPolicy::Cancel,
+        None => RunningPolicy::Wait,
     };
-    if mode == "wipe" && running_policy == "wait" {
+    if mode == "wipe" && running_policy == RunningPolicy::Wait {
         anyhow::bail!(
             "wipe requires running-policy=cancel; waiting before wiping is contradictory"
         );

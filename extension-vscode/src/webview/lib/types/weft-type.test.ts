@@ -549,24 +549,14 @@ describe('isWeftTypeCompatible', () => {
 		expect(isWeftTypeCompatible('String', 'MustOverride')).toBe(true);
 	});
 
-	// Expand/Gather wire types
-	it('List into expand element compatible (wire is List)', () => {
-		// Source: List[String], Target expand declares String → wire expects List[String]
-		expect(isWeftTypeCompatible('List[String]', 'List[String]')).toBe(true);
-	});
-
-	it('non-list into expand incompatible', () => {
-		// Source: String, Target expand declares String → wire expects List[String]
+	// List compatibility. ('List into matching List' and 'element into
+	// element' were exact duplicates of earlier cases (lines ~525 and
+	// ~490) after a rename, deleted; these two are unique.)
+	it('non-list into list incompatible', () => {
 		expect(isWeftTypeCompatible('String', 'List[String]')).toBe(false);
 	});
 
-	it('element into gather element compatible (wire is element)', () => {
-		// Source: String, Gather declares List[String] → wire expects String
-		expect(isWeftTypeCompatible('String', 'String')).toBe(true);
-	});
-
-	it('wrong element into gather incompatible', () => {
-		// Source: Number, Gather declares List[String] → wire expects String
+	it('wrong primitive types incompatible', () => {
 		expect(isWeftTypeCompatible('Number', 'String')).toBe(false);
 	});
 });

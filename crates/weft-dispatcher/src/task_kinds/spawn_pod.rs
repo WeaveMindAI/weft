@@ -32,13 +32,16 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: SpawnPodPayload = serde_json::from_value(task.payload.clone())?;
 
-        // Resolve source_hash at spawn time (not enqueue time) so the
+        // Resolve binary_hash at spawn time (not enqueue time) so the
         // most recent hash is used even when the build finished after
-        // the task was queued.
+        // the task was queued. The binary_hash is the worker image
+        // tag suffix; the definition_hash (runtime project shape)
+        // reaches the worker via its per-execution broker fetch, not
+        // via this image-selection path.
         let project_uuid: uuid::Uuid = payload.project_id.parse().map_err(|e| {
             anyhow::anyhow!("spawn_pod: bad project_id {}: {e}", payload.project_id)
         })?;
-        // `None` here means "no source hash recorded for this
+        // `None` here means "no binary hash recorded for this
         // project yet" (sync hasn't landed). spawn_pod is enqueued
         // by sync AFTER it writes the hash; a None means the
         // ordering invariant is broken. Fail loud instead of
@@ -46,11 +49,11 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
         // image hash and pass any hash-equality check trivially).
         let want_hash = state
             .projects
-            .running_source_hash(project_uuid)
+            .running_binary_hash(project_uuid)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "spawn_pod: no running_source_hash for project {project_uuid}; \
+                    "spawn_pod: no running_binary_hash for project {project_uuid}; \
                      sync ordering invariant broken"
                 )
             })?;
@@ -93,7 +96,7 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
             tenant: payload.tenant,
             namespace: payload.namespace.clone(),
             owner_dispatcher: payload.owner_dispatcher.clone(),
-            source_hash: Some(want_hash),
+            binary_hash: Some(want_hash),
         };
         let handle = state.workers.spawn_pod(&pod_name, spec).await?;
         Ok(serde_json::to_value(SpawnPodResult {

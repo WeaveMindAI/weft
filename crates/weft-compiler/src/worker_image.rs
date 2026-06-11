@@ -55,6 +55,14 @@ pub struct WorkerDockerfile {
     /// Union of `[build.env]` across referenced nodes, already
     /// substituted for `{{catalog_path}}`.
     pub build_env: std::collections::BTreeMap<String, String>,
+    /// Builder-base image tag the rendered Dockerfile references.
+    /// `Some(tag)` whenever the CHOSEN template (built-in prebuilt OR
+    /// a user-supplied custom template) contains the
+    /// `{{builder_base_image}}` token, so the CLI ensures the named
+    /// image exists before invoking `docker build`; `None` when the
+    /// rendered Dockerfile never FROMs it (the from-scratch template,
+    /// or a custom template that builds its own toolchain).
+    pub builder_base: Option<String>,
 }
 
 /// Parsed base-image metadata. `manager` drives the install
@@ -114,6 +122,22 @@ pub const WEFT_MOUNT: &str = "/weft";
 /// place node source comes from: the project owns all its nodes.
 pub const NODES_MOUNT: &str = "/weft/project-nodes";
 
+/// Image repo for the shared pre-built builder base. Tagged by a
+/// short hash of the engine workspace (`crates/`, `Cargo.toml`,
+/// `Cargo.lock`, `rust-toolchain.toml`), so an engine bump produces
+/// a fresh tag. The CLI builds + tags this image; per-project worker
+/// Dockerfiles `FROM weft-builder-base:<hash>` in their builder
+/// stage.
+pub const BUILDER_BASE_REPO: &str = "weft-builder-base";
+
+/// Compose the builder-base image tag from a workspace hash. The
+/// hash is computed by the CLI (it knows the on-disk weft workspace
+/// layout); the compiler stamps the tag into the generated
+/// Dockerfile.
+pub fn builder_base_tag(short_hash: &str) -> String {
+    format!("{BUILDER_BASE_REPO}:{short_hash}")
+}
+
 /// Emit the Dockerfile for a project's worker image.
 ///
 /// `project_root` is only used to resolve a relative
@@ -124,12 +148,26 @@ pub const NODES_MOUNT: &str = "/weft/project-nodes";
 /// `referenced_package_roots` lists the catalog subdirectories
 /// the build context must include (the codegen's `#[path]`
 /// includes point at these).
+///
+/// `builder_base_tag` is the shared pre-built builder-base image
+/// tag (`weft-builder-base:<hash>`). The CLI computes it from the
+/// engine workspace hash and ensures the image exists. When the
+/// user's runtime base is debian-family and they haven't supplied a
+/// custom Dockerfile template, the builder stage `FROM`s this image
+/// instead of re-installing rustup / build packages / re-fetching
+/// the cargo registry per project. When no custom template is supplied
+/// AND the runtime base is non-debian, we use the from-scratch template
+/// instead (the builder must match the runtime ABI: glibc base vs musl
+/// base). A user-supplied custom template is used verbatim and bypasses
+/// both built-in templates.
 pub fn emit(
     build: &WorkerBuildSection,
     project_root: &Path,
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
     binary_name: &str,
+    lock_key: &str,
+    builder_base_tag: &str,
 ) -> CompileResult<WorkerDockerfile> {
     let base_image_str = build
         .base_image
@@ -143,6 +181,16 @@ pub fn emit(
         collect_stage_packages(catalog, referenced, &base, BuildStage::Runtime)?;
     let build_env = collect_build_env(catalog, referenced, project_root)?;
 
+    // The pre-built base shortcuts the "install rustup + apt
+    // build-essential" cycle. It only fits a debian-family runtime
+    // base (glibc ABI match: a debian-built worker binary runs in a
+    // debian runtime, not an alpine/musl one) and never applies to a
+    // custom Dockerfile template (the Some arm below), which may not
+    // respect our base layout. Otherwise fall back to the
+    // from-scratch template that installs everything inside the
+    // builder stage.
+    let use_prebuilt_base = base.manager == PackageManager::Apt;
+
     let template = match &build.dockerfile_template {
         Some(rel) => {
             let path = project_root.join(rel);
@@ -154,11 +202,26 @@ pub fn emit(
                 ))
             })?
         }
-        None => default_template().to_string(),
+        None => {
+            if use_prebuilt_base {
+                prebuilt_base_template()
+            } else {
+                default_template()
+            }
+        }
     };
+
+    // The CLI's "ensure the builder base exists" step keys off actual
+    // USAGE: whichever template was chosen (built-in or custom), if it
+    // references `{{builder_base_image}}` the rendered Dockerfile will
+    // FROM that tag and the image must exist before `docker build`.
+    let builder_base_out = template
+        .contains("{{builder_base_image}}")
+        .then(|| builder_base_tag.to_string());
 
     let body = template
         .replace("{{base_image}}", &base.raw)
+        .replace("{{builder_base_image}}", builder_base_tag)
         .replace(
             "{{install_builder_base}}",
             &render_builder_base(base.manager),
@@ -177,6 +240,7 @@ pub fn emit(
         )
         .replace("{{build_env_lines}}", &render_build_env_lines(&build_env))
         .replace("{{binary_name}}", binary_name)
+        .replace("{{lock_key}}", lock_key)
         .replace("{{weft_mount}}", WEFT_MOUNT)
         .replace("{{nodes_mount}}", NODES_MOUNT);
 
@@ -186,6 +250,7 @@ pub fn emit(
         build_packages,
         runtime_packages,
         build_env,
+        builder_base: builder_base_out,
     })
 }
 
@@ -512,61 +577,146 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
     None
 }
 
-/// Built-in multi-stage template.
+/// The `cargo build` RUN block shared by both built-in templates.
+///
+/// The two `--mount=type=cache` lines carry EXPLICIT `id=` values so
+/// BuildKit reuses cache volumes across builds. Without an explicit
+/// id, BuildKit auto-generates an id scoped to the build context, so
+/// each build sees a fresh empty cache, cargo re-fetches the
+/// registry index, and the entire project crate compiles from
+/// scratch. The partitioning is deliberate per mount:
+///
+/// - The REGISTRY cache (`weft-worker-cargo-registry`) is shared by
+///   every project: crates.io artifacts are immutable per
+///   version+features, so cross-project sharing is safe and saves
+///   the fetch.
+/// - The TARGET cache is PER PROJECT
+///   (`weft-worker-target-{{lock_key}}`). Sharing it would let cargo
+///   link one project's compiled rlib into another's worker: two
+///   projects carrying a same-named node package at the same
+///   in-container path, with the build staging preserving host
+///   mtimes, make cargo's mtime-based freshness check declare
+///   project B's crate "fresh" against project A's fingerprint and
+///   silently reuse A's code. Per-project incremental rebuilds (the
+///   actual ~5s win for a single-node edit) are preserved; only
+///   cross-project dep-compile sharing is given up, and correctness
+///   beats that.
+///
+/// The Cargo.lock save/restore trick: the codegen emits per-build
+/// the worker `Cargo.toml` + per-package `Cargo.toml` but never a
+/// `Cargo.lock`. Without one, cargo re-resolves all 322+ deps
+/// every build and writes a fresh `Cargo.lock`; that lock's mtime
+/// flips every package crate's fingerprint dirty, so cargo
+/// recompiles everything. We dodge that by stashing the lock
+/// inside the persistent cache mount at
+/// `/work/target/locks/<lock_key>.lock`. `lock_key` is the project
+/// UUID, NOT the user-controlled `binary_name`: project UUIDs are
+/// unique by construction, so both the lock file and the target
+/// volume stay correctly partitioned.
+const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
+    "RUN --mount=type=cache,id=weft-worker-cargo-registry,target=/root/.cargo/registry,sharing=locked \\\n",
+    "    --mount=type=cache,id=weft-worker-target-{{lock_key}},target=/work/target,sharing=locked \\\n",
+    "    mkdir -p /work/target/locks \\\n",
+    "    && if [ -f /work/target/locks/{{lock_key}}.lock ]; then cp /work/target/locks/{{lock_key}}.lock /work/Cargo.lock; fi \\\n",
+    "    && cargo build --release \\\n",
+    "    && cp /work/Cargo.lock /work/target/locks/{{lock_key}}.lock \\\n",
+    "    && cp target/release/{{binary_name}} /worker\n",
+);
+
+/// The runtime stage shared by both built-in templates: install
+/// runtime-only packages onto the user's base image, copy the
+/// compiled binary from the builder.
+const RUNTIME_STAGE_FRAGMENT: &str = concat!(
+    "FROM {{base_image}}\n",
+    "\n",
+    "{{install_runtime_base}}",
+    "{{install_runtime_system_packages}}",
+    "\n",
+    "COPY --from=builder /worker /usr/local/bin/worker\n",
+    "ENTRYPOINT [\"/usr/local/bin/worker\"]\n",
+);
+
+/// Built-in multi-stage template. Used when no custom template is
+/// supplied AND the runtime base is non-debian (so the builder ABI must
+/// match). Installs rustup + build tools inside the builder stage.
 ///
 /// Stage 1 (`builder`): installs build-time packages + rust via
 /// rustup, copies the generated crate + referenced catalog
 /// subfolders, runs `cargo build --release`, writes the binary
 /// to `/worker`.
 ///
-/// Stage 2 (runtime): installs runtime-only packages, copies the
-/// binary from the builder.
-///
-/// `--mount=type=cache` on cargo's registry and the target dir
-/// keeps repeat builds fast: first build is slow (fetch + compile
-/// ~200 crates), subsequent builds reuse the cache. Requires
-/// BuildKit (the Docker default since 23.0).
-fn default_template() -> &'static str {
-    concat!(
-        "# syntax=docker/dockerfile:1.6\n",
+/// Stage 2 (runtime): `RUNTIME_STAGE_FRAGMENT`.
+fn default_template() -> String {
+    [
+        concat!(
+            "# syntax=docker/dockerfile:1.6\n",
+            "\n",
+            "FROM {{base_image}} AS builder\n",
+            "\n",
+            "# Always-present builder toolchain: every cargo build needs\n",
+            "# a C compiler, linker, and curl/ca-certificates to fetch\n",
+            "# rustup. Node-specific build packages get appended below.\n",
+            "{{install_builder_base}}",
+            "{{install_build_system_packages}}",
+            "\n",
+            "# Install rustup with NO default toolchain: the generated\n",
+            "# crate carries a `rust-toolchain.toml` (copied from the weft\n",
+            "# workspace root, the single source of truth), so the first\n",
+            "# cargo invocation in /work auto-installs + selects the pinned\n",
+            "# toolchain. Nothing here names a version.\n",
+            "RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\\n",
+            "    | sh -s -- -y --default-toolchain none --profile minimal\n",
+            "ENV PATH=\"/root/.cargo/bin:${PATH}\"\n",
+            "\n",
+            "WORKDIR /work\n",
+            "COPY build/ /work/\n",
+            "COPY weft/ {{weft_mount}}/\n",
+            "COPY project-nodes/ {{nodes_mount}}/\n",
+            "\n",
+            "{{build_env_lines}}",
+            "\n",
+        ),
+        CARGO_BUILD_RUN_FRAGMENT,
         "\n",
-        "FROM {{base_image}} AS builder\n",
+        RUNTIME_STAGE_FRAGMENT,
+    ]
+    .concat()
+}
+
+/// Multi-stage template that FROMs the shared pre-built builder
+/// base. The base image already has debian build packages, rustup
+/// (with the workspace's pinned toolchain materialized), and the
+/// cargo registry warmed against the workspace's `Cargo.lock`. The
+/// builder stage here adds only what's project-specific: per-node
+/// system build packages, the generated worker crate, and the
+/// project's `nodes/` source tree. The base's `/weft/` directory
+/// provides the engine workspace via path deps; no per-project
+/// COPY of the workspace. Cache-mount and Cargo.lock mechanics are
+/// documented on `CARGO_BUILD_RUN_FRAGMENT`.
+fn prebuilt_base_template() -> String {
+    [
+        concat!(
+            "# syntax=docker/dockerfile:1.6\n",
+            "\n",
+            "FROM {{builder_base_image}} AS builder\n",
+            "\n",
+            "# Node-specific build packages. Base packages (build-essential,\n",
+            "# ca-certificates, curl, pkg-config) are baked into the\n",
+            "# builder base; only the per-node extras get installed here.\n",
+            "{{install_build_system_packages}}",
+            "\n",
+            "WORKDIR /work\n",
+            "COPY build/ /work/\n",
+            "COPY project-nodes/ {{nodes_mount}}/\n",
+            "\n",
+            "{{build_env_lines}}",
+            "\n",
+        ),
+        CARGO_BUILD_RUN_FRAGMENT,
         "\n",
-        "# Always-present builder toolchain: every cargo build needs\n",
-        "# a C compiler, linker, and curl/ca-certificates to fetch\n",
-        "# rustup. Node-specific build packages get appended below.\n",
-        "{{install_builder_base}}",
-        "{{install_build_system_packages}}",
-        "\n",
-        "# Install rustup with NO default toolchain: the generated\n",
-        "# crate carries a `rust-toolchain.toml` (copied from the weft\n",
-        "# workspace root, the single source of truth), so the first\n",
-        "# cargo invocation in /work auto-installs + selects the pinned\n",
-        "# toolchain. Nothing here names a version.\n",
-        "RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\\n",
-        "    | sh -s -- -y --default-toolchain none --profile minimal\n",
-        "ENV PATH=\"/root/.cargo/bin:${PATH}\"\n",
-        "\n",
-        "WORKDIR /work\n",
-        "COPY build/ /work/\n",
-        "COPY weft/ {{weft_mount}}/\n",
-        "COPY project-nodes/ {{nodes_mount}}/\n",
-        "\n",
-        "{{build_env_lines}}",
-        "\n",
-        "RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \\\n",
-        "    --mount=type=cache,target=/work/target,sharing=locked \\\n",
-        "    cargo build --release \\\n",
-        "    && cp target/release/{{binary_name}} /worker\n",
-        "\n",
-        "FROM {{base_image}}\n",
-        "\n",
-        "{{install_runtime_base}}",
-        "{{install_runtime_system_packages}}",
-        "\n",
-        "COPY --from=builder /worker /usr/local/bin/worker\n",
-        "ENTRYPOINT [\"/usr/local/bin/worker\"]\n",
-    )
+        RUNTIME_STAGE_FRAGMENT,
+    ]
+    .concat()
 }
 
 /// Render `ENV K=V` lines for the builder stage. One per entry,
@@ -747,5 +897,174 @@ mod tests {
     fn build_env_lines_empty_when_no_entries() {
         let env = std::collections::BTreeMap::new();
         assert_eq!(render_build_env_lines(&env), "");
+    }
+
+    /// The default + debian-family runtime resolves to the prebuilt
+    /// template: builder stage FROMs `weft-builder-base:<tag>`, does
+    /// NOT install rustup, does NOT COPY weft/, builds with the
+    /// cargo cache mount.
+    #[test]
+    fn prebuilt_base_template_skips_rustup_and_weft_copy() {
+        let body = prebuilt_base_template();
+        assert!(
+            body.contains("FROM {{builder_base_image}} AS builder"),
+            "builder FROMs the prebuilt base: {body}"
+        );
+        assert!(
+            !body.contains("curl --proto"),
+            "prebuilt template must not re-install rustup: {body}"
+        );
+        assert!(
+            !body.contains("COPY weft/"),
+            "prebuilt template must not COPY weft/ (base ships it): {body}"
+        );
+        assert!(body.contains("COPY build/ /work/"));
+        assert!(body.contains("COPY project-nodes/"));
+    }
+
+    /// Non-debian runtime (alpine) bypasses the prebuilt base
+    /// because the worker binary's ABI has to match the runtime: a
+    /// glibc-built binary doesn't run on a musl runtime. Fall back
+    /// to the from-scratch template that installs rustup inside
+    /// the user's chosen base.
+    #[test]
+    fn non_debian_runtime_falls_back_to_from_scratch_template() {
+        use crate::project::WorkerBuildSection;
+        let build = WorkerBuildSection {
+            base_image: Some("alpine:3.19".into()),
+            dockerfile_template: None,
+        };
+        let project_root = std::path::Path::new("/tmp");
+        let catalog = weft_catalog::FsCatalog::empty();
+        let referenced = std::collections::BTreeSet::new();
+        let out = emit(
+            &build,
+            project_root,
+            &catalog,
+            &referenced,
+            "worker_test",
+            "lock-key-test",
+            "weft-builder-base:irrelevant",
+        )
+        .expect("emit");
+        assert!(
+            out.builder_base.is_none(),
+            "non-debian runtime opts out of the prebuilt base"
+        );
+        assert!(
+            out.body.contains("sh.rustup.rs"),
+            "fallback template installs rustup: {}",
+            out.body
+        );
+        // The fallback (non-debian / custom-template) path must also
+        // use the lock_key for Cargo.lock save/restore. Two alpine
+        // projects whose `weft.toml` set the same `binary_name`
+        // would otherwise clobber each other in the shared cache
+        // mount, the exact bug the prebuilt-template fix addressed.
+        assert!(
+            out.body.contains("/work/target/locks/lock-key-test.lock"),
+            "fallback template lock path uses lock_key, not binary_name: {}",
+            out.body
+        );
+        assert!(
+            !out.body.contains("/work/target/locks/worker_test.lock"),
+            "fallback template must not embed the binary_name in the lock path: {}",
+            out.body
+        );
+    }
+
+    /// A CUSTOM template that references `{{builder_base_image}}`
+    /// must report `builder_base = Some(tag)`: the rendered
+    /// Dockerfile FROMs that tag, so the CLI has to ensure the image
+    /// exists. The ensure step keys off actual token usage, not off
+    /// which template branch was taken.
+    #[test]
+    fn custom_template_using_builder_base_token_reports_the_tag() {
+        use crate::project::WorkerBuildSection;
+        let dir = std::env::temp_dir().join(format!(
+            "weft-worker-image-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("Dockerfile.tpl"),
+            "FROM {{builder_base_image}} AS builder\nFROM {{base_image}}\n",
+        )
+        .expect("write template");
+        let build = WorkerBuildSection {
+            base_image: None,
+            dockerfile_template: Some("Dockerfile.tpl".into()),
+        };
+        let catalog = weft_catalog::FsCatalog::empty();
+        let referenced = std::collections::BTreeSet::new();
+        let out = emit(
+            &build,
+            &dir,
+            &catalog,
+            &referenced,
+            "worker_test",
+            "lock-key-test",
+            "weft-builder-base:cafebabe",
+        )
+        .expect("emit");
+        assert_eq!(
+            out.builder_base.as_deref(),
+            Some("weft-builder-base:cafebabe"),
+            "custom template using the token must report the tag for the CLI ensure step"
+        );
+        assert!(out.body.contains("FROM weft-builder-base:cafebabe AS builder"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Default debian runtime + no custom template: prebuilt base
+    /// kicks in, `builder_base` is reported back to the CLI so it
+    /// can ensure the named image exists, and the rendered body
+    /// FROMs the tag we passed in.
+    #[test]
+    fn default_debian_runtime_uses_prebuilt_base() {
+        use crate::project::WorkerBuildSection;
+        let build = WorkerBuildSection {
+            base_image: None,
+            dockerfile_template: None,
+        };
+        let project_root = std::path::Path::new("/tmp");
+        let catalog = weft_catalog::FsCatalog::empty();
+        let referenced = std::collections::BTreeSet::new();
+        let out = emit(
+            &build,
+            project_root,
+            &catalog,
+            &referenced,
+            "worker_test",
+            "00000000-0000-0000-0000-000000000001",
+            "weft-builder-base:abcdef0123456789",
+        )
+        .expect("emit");
+        assert_eq!(
+            out.builder_base.as_deref(),
+            Some("weft-builder-base:abcdef0123456789"),
+            "default debian path returns the base tag"
+        );
+        assert!(
+            out.body.contains("FROM weft-builder-base:abcdef0123456789 AS builder"),
+            "rendered body FROMs the tag: {}",
+            out.body
+        );
+        assert!(
+            !out.body.contains("COPY weft/"),
+            "prebuilt path does NOT COPY weft/: {}",
+            out.body
+        );
+        // Lock file is keyed by project UUID, NOT the binary_name.
+        assert!(
+            out.body.contains("/work/target/locks/00000000-0000-0000-0000-000000000001.lock"),
+            "lock path uses project_id (lock_key), not binary_name: {}",
+            out.body
+        );
+        assert!(
+            !out.body.contains("/work/target/locks/worker_test.lock"),
+            "lock path must not embed the user-controlled binary_name: {}",
+            out.body
+        );
     }
 }

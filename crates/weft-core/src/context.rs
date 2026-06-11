@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::cancellation::CancellationFlag;
 use crate::error::{WeftError, WeftResult};
-use crate::lane::Lane;
+use crate::frames::LoopFrames;
 use crate::primitive::{CostReport, SignalSpec};
 use crate::Color;
 
@@ -67,7 +67,7 @@ pub struct ExecutionContext {
     /// node_id or omit the label entirely.
     pub node_label: Option<String>,
     pub color: Color,
-    pub lane: Lane,
+    pub frames: LoopFrames,
     pub config: ConfigBag,
     pub input: InputBag,
     /// Which lifecycle phase this invocation belongs to. Mirrors
@@ -79,6 +79,7 @@ pub struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_id: String,
         project_id: String,
@@ -86,18 +87,21 @@ impl ExecutionContext {
         node_type: String,
         node_label: Option<String>,
         color: Color,
-        lane: Lane,
+        frames: LoopFrames,
         config: ConfigBag,
         input: InputBag,
         phase: Phase,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
-        Self { execution_id, project_id, node_id, node_type, node_label, color, lane, config, input, phase, handle }
+        Self {
+            execution_id, project_id, node_id, node_type, node_label, color, frames,
+            config, input, phase, handle,
+        }
     }
 
     // ----- Wait-and-resume primitive ---------------------------------
 
-    /// Stop executing this lane until the given wake signal fires.
+    /// Stop executing this firing until the given wake signal fires.
     ///
     /// Use when the node needs an answer mid-flow that comes from
     /// outside (a HumanQuery form, a timer, a webhook callback). The
@@ -127,7 +131,7 @@ impl ExecutionContext {
     /// user-facing URL (if the kind mints one) and the worker keeps
     /// executing. Each subsequent fire spawns a brand new execution
     /// of the project; this signal is NOT bound to the current
-    /// execution's lane. Called from `Phase::TriggerSetup`.
+    /// firing. Called from `Phase::TriggerSetup`.
     ///
     /// This is the entry path; pair with `await_signal` for mid-flow
     /// waits.
@@ -163,7 +167,7 @@ impl ExecutionContext {
     /// ```
     ///
     /// The closure runs at most once across all replays of this
-    /// (node, lane). On every subsequent replay the journaled
+    /// (node, frames). On every subsequent replay the journaled
     /// output is returned directly without invoking the closure.
     /// `name` is author-supplied for log traceability; the
     /// runtime keys on call_index ordering, not on the name.
@@ -184,6 +188,130 @@ impl ExecutionContext {
         let value = work().await?;
         self.handle.run_record(name, call_index, &value).await?;
         Ok(value)
+    }
+
+    // ----- Downstream emission ---------------------------------------
+
+    /// Fire downstream with `output`. The ONLY way a node emits values.
+    /// Call it once at the end (the common case), or early then keep
+    /// running (a co-alive node releasing one port before finishing),
+    /// or several times with DISJOINT ports (release ports incrementally).
+    /// Each output port can be emitted AT MOST ONCE per firing; a second
+    /// emission on the same port errors loud. Ports the node never
+    /// mentions, neither here nor via `close_port`, get a CLOSURE marker
+    /// at termination so downstream consumers learn nothing's coming.
+    pub async fn pulse_downstream(&self, output: crate::node::NodeOutput) -> WeftResult<()> {
+        self.handle.pulse_downstream(output).await
+    }
+
+    /// The output ports this node declared in its metadata. A node
+    /// fanning a dynamic object onto ports (an LLM JSON response, a
+    /// forwarded HTTP body) intersects its keys with this set so it
+    /// emits only declared ports, instead of tripping the
+    /// undeclared-port error AFTER a paid / irreversible call. See
+    /// [`crate::node::NodeOutput::extend_from_declared`].
+    pub fn declared_output_ports(&self) -> &HashSet<String> {
+        self.handle.declared_output_ports()
+    }
+
+    /// Close an output port mid-firing. The downstream subgraph attached
+    /// to `port` receives a CLOSURE pulse (structural "nothing's coming")
+    /// at the firing's own frame stack, same shape as the
+    /// termination-time sweep. Use this when a node releases a port
+    /// early but keeps running on other work (e.g. a chat host that
+    /// closes `channel` the moment the conversation ends but is still
+    /// finishing bookkeeping). Counts as the firing's one allowed
+    /// mention of `port`: any later `pulse_downstream` or `close_port`
+    /// on the same port errors loud.
+    pub async fn close_port(&self, port: &str) -> WeftResult<()> {
+        self.handle.close_port(port).await
+    }
+
+    // ----- Bus primitive ---------------------------------------------
+
+    /// Mint a fresh bus for this execution and return `(handle, marker)`.
+    /// Put `marker` on an output port via `NodeOutput::set(port, marker)`;
+    /// downstream nodes resolve it back to a handle via [`Self::bus`].
+    /// The bus IS the marker: a `Bus`-typed value flowing through a
+    /// loop, a dict, a passthrough is the same JSON marker, just
+    /// like a String. There is no per-port "bus registration" on the
+    /// producer.
+    ///
+    /// `opts` picks the mode (journaled vs ephemeral) and any per-bus
+    /// tuning. `BusOptions::default()` is the journaled-mode shape; use
+    /// `BusOptions { ephemeral: true, .. }` for video / high-rate
+    /// streams where dropping old payloads under load is preferable to
+    /// growing the journal unboundedly.
+    pub fn create_bus(
+        &self,
+        opts: crate::bus::BusOptions,
+    ) -> WeftResult<(crate::bus::BusHandle, Value)> {
+        self.handle.create_bus(opts)
+    }
+
+    /// Resolve a Bus-marker JSON value to a fresh handle on the live
+    /// channel. The value typically comes from an input port:
+    /// `let marker = ctx.input.get::<Value>("ch")?; let bus = ctx.bus(&marker)?;`.
+    /// Errors loud if the value is not a marker, the uuid is malformed,
+    /// or no bus with that id is live (creator gone / wrong execution).
+    pub fn bus(&self, marker: &Value) -> WeftResult<crate::bus::BusHandle> {
+        self.handle.bus(marker)
+    }
+
+    /// Wake payload for THIS firing. `Some(value)` only when the engine
+    /// dispatched this node as the firing trigger of a fresh execution
+    /// (the HTTP body for a webhook, the SSE event JSON for an external
+    /// feed, the form submission, the timer info for a scheduled tick).
+    /// `None` everywhere else: trigger setup, infra setup, non-trigger
+    /// nodes, replays after the kick was consumed. A trigger that REQUIRES
+    /// a payload should `ok_or_else` with a clear error; the language
+    /// doesn't impose a payload contract.
+    pub fn wake_payload(&self) -> Option<&Value> {
+        self.handle.wake_payload()
+    }
+
+    /// Wake payload typed-accessor: same as [`Self::wake_payload`] but
+    /// erroring loud when the payload is absent OR not a JSON object.
+    /// Convenience for trigger nodes that have chosen an object-shaped
+    /// wake contract; nodes wanting raw bytes, a scalar, or an array
+    /// keep calling [`Self::wake_payload`] and impose their own shape.
+    pub fn wake_payload_object(&self) -> WeftResult<&Value> {
+        let payload = self
+            .handle
+            .wake_payload()
+            .ok_or_else(|| WeftError::NodeExecution(
+                "Fire: no wake payload (the dispatcher/listener delivered nothing)".into(),
+            ))?;
+        if !payload.is_object() {
+            // Truncate the rendered payload: a malformed multi-MB body
+            // would otherwise produce a multi-MB error string that
+            // floods logs and the inspector. 512 bytes is enough to
+            // diagnose shape (the first {} or [] tells the author the
+            // top-level mismatch).
+            // `truncate_user_string` walks back to a char boundary: a
+            // raw `&rendered[..512]` slice panics when a multi-byte
+            // character straddles byte 512, inside the very path whose
+            // job is producing a clean error.
+            let preview = crate::truncate_user_string(&payload.to_string(), 512);
+            return Err(WeftError::NodeExecution(format!(
+                "Fire: wake payload must be a JSON object, got {preview}"
+            )));
+        }
+        Ok(payload)
+    }
+
+    /// Convenience: read input `port` and resolve it to a bus handle in
+    /// one call. Equivalent to `ctx.bus(&ctx.input.get(port)?)` but with a
+    /// clearer error message naming the port.
+    pub fn bus_from_input(&self, port: &str) -> WeftResult<crate::bus::BusHandle> {
+        let value = self
+            .input
+            .values
+            .get(port)
+            .ok_or_else(|| WeftError::Input(format!("no value on input port '{port}'")))?;
+        self.handle.bus(value).map_err(|e| {
+            WeftError::Input(format!("input port '{port}' is not a live bus: {e}"))
+        })
     }
 
     // ----- Infra primitive ----------------------------------------
@@ -298,7 +426,7 @@ impl ConfigBag {
 }
 
 /// Typed input access. Inputs are the resolved incoming-edge values
-/// for this node's invocation, matched to this color+lane.
+/// for this node's invocation, matched to this color+frames.
 #[derive(Debug, Clone, Default)]
 pub struct InputBag {
     pub values: HashMap<String, Value>,
@@ -325,6 +453,28 @@ impl InputBag {
 
     pub fn raw(&self, port: &str) -> Option<&Value> {
         self.values.get(port)
+    }
+
+    /// Read `port` as a non-empty string. Errors loud, distinguishing
+    /// the three failure modes (absent / not a string / empty) so the
+    /// caller's inspector message names the actual fault.
+    pub fn required_str(&self, port: &str, what: &str) -> WeftResult<String> {
+        let Some(value) = self.values.get(port) else {
+            return Err(WeftError::Input(format!(
+                "missing required {what} on port '{port}'"
+            )));
+        };
+        let Some(s) = value.as_str() else {
+            return Err(WeftError::Input(format!(
+                "{what} on port '{port}' must be a string, got {value}"
+            )));
+        };
+        if s.is_empty() {
+            return Err(WeftError::Input(format!(
+                "{what} on port '{port}' is an empty string"
+            )));
+        }
+        Ok(s.to_string())
     }
 
     /// Iterate over every input port (name + raw value). Used by
@@ -431,4 +581,83 @@ pub trait ContextHandle: Send + Sync {
     async fn report_cost(&self, report: CostReport) -> WeftResult<()>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
+
+    /// The output port names this node declares in its metadata.
+    /// The runtime already rejects emits on undeclared ports loudly;
+    /// this exposes the declared set so a node that fans a dynamic
+    /// object onto ports (an LLM JSON response, a forwarded HTTP
+    /// body) can INTERSECT its keys with what it declared, emitting
+    /// only the declared subset instead of tripping the
+    /// undeclared-port error AFTER a paid/irreversible call. Generic
+    /// surface: any node can read it; no node-specific knowledge in
+    /// the engine.
+    fn declared_output_ports(&self) -> &HashSet<String>;
+
+    /// Fire downstream with `output`. The engine turns each mentioned
+    /// output port into pulses on its outgoing edges, at the firing's
+    /// own frame stack. Each port can be emitted AT MOST ONCE per firing; a
+    /// second emission errors loud. Bus values are carried as plain
+    /// JSON markers (`{"__weft_bus__": {"id": "<uuid>", "mode":
+    /// "journaled" | "ephemeral"}}`); the live channel is resolved
+    /// per-consumer via the per-execution `BusRegistry`.
+    async fn pulse_downstream(&self, output: crate::node::NodeOutput) -> WeftResult<()>;
+
+    /// Emit a CLOSURE on `port` at the firing's own frame stack.
+    /// Same one-emission-per-port rule as `pulse_downstream`: a port
+    /// already emitted (whether via `pulse_downstream` or a prior
+    /// `close_port`) errors loud. Ports never mentioned through either
+    /// API get closed automatically at firing termination, so calling
+    /// this is only necessary when a node wants to release downstream
+    /// early while it keeps running on other work.
+    async fn close_port(&self, port: &str) -> WeftResult<()>;
+
+    /// Mint a fresh bus and register it in this execution's
+    /// `BusRegistry`. Returns `(creator-handle, marker-json)`. The
+    /// marker is what the producer puts on its output port; consumers
+    /// resolve the marker back to a fresh handle via [`Self::bus`].
+    fn create_bus(
+        &self,
+        opts: crate::bus::BusOptions,
+    ) -> WeftResult<(crate::bus::BusHandle, Value)>;
+
+    /// Resolve a Bus-marker JSON value to a fresh consumer handle on the
+    /// live channel. Errors loud on every failure mode (not a marker,
+    /// malformed uuid, no live bus with that id).
+    fn bus(&self, marker: &Value) -> WeftResult<crate::bus::BusHandle>;
+
+    /// The wake event's payload for this firing. `Some(value)` only
+    /// when the engine dispatched this node as the FIRING TRIGGER of
+    /// a fresh execution (the HTTP body for a webhook, the SSE event
+    /// JSON for an external feed, the form submission, the timer info
+    /// for a scheduled tick). `None` everywhere else: non-trigger
+    /// nodes, trigger setup phase, trigger nodes that weren't the one
+    /// the listener routed this fire to, every dispatch after the
+    /// kick is consumed. Node bodies that REQUIRE a payload should
+    /// `ok_or_else` with a clear error; the language doesn't impose a
+    /// payload contract.
+    fn wake_payload(&self) -> Option<&Value>;
+}
+
+#[cfg(test)]
+mod input_bag_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn bag(values: serde_json::Value) -> InputBag {
+        InputBag {
+            values: values.as_object().unwrap().clone().into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn required_str_distinguishes_the_three_failure_modes() {
+        let b = bag(json!({"num": 7, "empty": "", "ok": "v"}));
+        assert_eq!(b.required_str("ok", "thing").unwrap(), "v");
+        let absent = b.required_str("missing", "thing").unwrap_err().to_string();
+        assert!(absent.contains("missing required thing"), "{absent}");
+        let wrong = b.required_str("num", "thing").unwrap_err().to_string();
+        assert!(wrong.contains("must be a string"), "{wrong}");
+        let empty = b.required_str("empty", "thing").unwrap_err().to_string();
+        assert!(empty.contains("empty string"), "{empty}");
+    }
 }

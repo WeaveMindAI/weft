@@ -74,28 +74,69 @@ impl HttpCore {
         self.post_with(path, body, &client).await
     }
 
+    /// Single POST core: build the request (url join, bearer token,
+    /// JSON body), send, hand back the raw response. Status
+    /// interpretation lives in the thin wrappers (`post_with` =
+    /// 2xx-or-error, `post_or_404` = 404 is "no row", `post_or_raced`
+    /// = 410 is `WriteOutcome::Raced`) so the build/send body exists
+    /// exactly once.
+    async fn post_raw<Req: Serialize>(
+        &self,
+        path: &str,
+        body: &Req,
+        client: &reqwest::Client,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let bearer = self.token.read().await.context("read SA token")?;
+        client
+            .post(&url)
+            .bearer_auth(bearer)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))
+    }
+
+    /// Shared 2xx gate + JSON parse for the status-interpreting
+    /// wrappers.
+    async fn parse_success<Res: for<'de> serde::Deserialize<'de>>(
+        resp: reqwest::Response,
+        path: &str,
+    ) -> Result<Res> {
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            anyhow::bail!("broker {path} returned {code}: {txt}");
+        }
+        resp.json().await.with_context(|| format!("parse {path}"))
+    }
+
     async fn post_with<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
         path: &str,
         body: &Req,
         client: &reqwest::Client,
     ) -> Result<Res> {
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let bearer = self.token.read().await.context("read SA token")?;
-        let resp = client
-            .post(&url)
-            .bearer_auth(bearer)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {path}"))?;
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let txt = resp.text().await.unwrap_or_default();
-            anyhow::bail!("broker {path} returned {code}: {txt}");
+        let resp = self.post_raw(path, body, client).await?;
+        Self::parse_success(resp, path).await
+    }
+
+    /// Variant of `post` for content-addressed reads where 404 means
+    /// "no row exists for this key" (a real "not found", NOT a race).
+    /// Returns `Ok(None)` on 404 and `Ok(Some(_))` on 2xx; any other
+    /// non-2xx is an error. Distinct from `post_or_raced` because a
+    /// content-addressed read CANNOT race: the row either exists
+    /// under the requested key or it doesn't.
+    pub async fn post_or_404<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<Option<Res>> {
+        let resp = self.post_raw(path, body, &self.client).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
-        let parsed: Res = resp.json().await.with_context(|| format!("parse {path}"))?;
-        Ok(parsed)
+        Ok(Some(Self::parse_success(resp, path).await?))
     }
 
     /// Variant of `post` that converts HTTP 410 Gone into
@@ -109,25 +150,11 @@ impl HttpCore {
         path: &str,
         body: &Req,
     ) -> Result<WriteOutcome<Res>> {
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let bearer = self.token.read().await.context("read SA token")?;
-        let resp = self.client
-            .post(&url)
-            .bearer_auth(bearer)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {path}"))?;
+        let resp = self.post_raw(path, body, &self.client).await?;
         if resp.status() == reqwest::StatusCode::GONE {
             return Ok(WriteOutcome::Raced);
         }
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let txt = resp.text().await.unwrap_or_default();
-            anyhow::bail!("broker {path} returned {code}: {txt}");
-        }
-        let parsed: Res = resp.json().await.with_context(|| format!("parse {path}"))?;
-        Ok(WriteOutcome::Applied(parsed))
+        Ok(WriteOutcome::Applied(Self::parse_success(resp, path).await?))
     }
 }
 
@@ -404,6 +431,48 @@ impl InfraReader for BrokerInfraClient {
         let resp: InfraEndpointUrlResponse =
             self.http.post("/v1/infra/endpoint_url", &req).await?;
         Ok(resp.endpoint_url)
+    }
+}
+
+// ---------- Project (worker fetches own definition) ----------
+
+/// Worker-side client for `/v1/project/fetch_definition`. Used at
+/// execution claim time to pull the runtime `ProjectDefinition`
+/// keyed by `(project_id, expected_hash)`. The lookup is content-
+/// addressed against the append-only `project_definition` history
+/// table: the row either exists for the requested hash (200), or it
+/// does not (404). There is no "raced" case for this endpoint
+/// because the read does not contend with any writer.
+pub struct BrokerProjectClient {
+    http: HttpCore,
+}
+
+impl BrokerProjectClient {
+    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
+        Arc::new(Self {
+            http: HttpCore::new(base_url, token),
+        })
+    }
+
+    /// Fetch the project's `ProjectDefinition` JSON keyed by hash.
+    /// Returns `Some(resp)` on 200, `None` on 404 (no row for the
+    /// requested key, a real "not found"), `Err` on every other
+    /// failure (5xx, IO, parse). Callers turn `None` into a loud
+    /// error: the dispatcher should never enqueue a task with a
+    /// hash that has no history row, so a 404 here is a real bug
+    /// upstream, not a recoverable race.
+    pub async fn fetch_definition(
+        &self,
+        project_id: &str,
+        expected_hash: &str,
+    ) -> Result<Option<ProjectFetchDefinitionResponse>> {
+        let req = ProjectFetchDefinitionRequest {
+            project_id: project_id.to_string(),
+            expected_hash: expected_hash.to_string(),
+        };
+        self.http
+            .post_or_404("/v1/project/fetch_definition", &req)
+            .await
     }
 }
 

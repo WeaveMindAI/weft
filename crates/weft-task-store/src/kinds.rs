@@ -76,6 +76,18 @@ impl From<TaskKind> for String {
 pub struct ExecutionPayload {
     pub project_id: String,
     pub color: String,
+    /// `running_definition_hash` snapshotted at enqueue time (same
+    /// value the journal's `ExecutionStarted` carries). The worker
+    /// passes it as `expected_hash` to the broker's
+    /// `project_fetch_definition`, which looks the shape up in the
+    /// APPEND-ONLY `project_definition` history keyed by
+    /// `(project_id, hash)`: the execution always runs on the shape
+    /// the user clicked Run against, even when a later edit advances
+    /// the project row's hash before the worker claims the task. A
+    /// missing history row is a hard 404 (the worker fails the
+    /// execution loudly); there is no race semantics on this path,
+    /// the hash IS the lookup key.
+    pub definition_hash: String,
 }
 
 /// Payload for `TaskKind::FireSignal`. Producer = listener; consumer =

@@ -29,7 +29,7 @@ import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/proje
 import { ExecutionsProvider, ExecutionNode, type ExecutionSummary } from './sidebar/executions';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
-import type { ActionVerb, CliEvent } from './shared/protocol';
+import type { ActionVerb, ActionErrorDetails, CliEvent } from './shared/protocol';
 
 export function activate(context: vscode.ExtensionContext) {
   const dispatcher = new DispatcherClient(getDispatcherUrl());
@@ -158,6 +158,14 @@ export function activate(context: vscode.ExtensionContext) {
   graphView.setDismissErrorHandler(() => {
     if (pinnedProject) actionBar.clearError(pinnedProject.id);
   });
+  graphView.setReportErrorHandler((verb, message, details) => {
+    if (!pinnedProject) return;
+    actionBar.setError(pinnedProject.id, verb, message, details);
+  });
+  graphView.setResolveErrorHandler((verb) => {
+    if (!pinnedProject) return;
+    actionBar.clearErrorIfVerb(pinnedProject.id, verb);
+  });
 
   async function pinProject(project: WeftProject): Promise<void> {
     // Drop the cached snapshot from whatever was previously
@@ -237,7 +245,8 @@ export function activate(context: vscode.ExtensionContext) {
         actionBar.cliKilled(projectId);
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        actionBar.cliCrashed(projectId, verbTag, message);
+        const details = (err as { details?: ActionErrorDetails } | undefined)?.details;
+        actionBar.cliCrashed(projectId, verbTag, message, details);
       }
     } finally {
       cliTracking.delete(projectId);
@@ -458,8 +467,9 @@ export function activate(context: vscode.ExtensionContext) {
       return {
         snapshot: {
           availableActions: ['run', 'activate', 'infra_start'],
+          binaryDrift: false,
+          definitionDrift: false,
           infraDrift: false,
-          sourceDrift: false,
           projectStatus: 'unknown',
           mode: 'unknown',
           runningCount: 0,
@@ -526,8 +536,9 @@ export function activate(context: vscode.ExtensionContext) {
       return {
         snapshot: {
           availableActions: Array.isArray(json?.available_actions) ? json.available_actions : [],
+          binaryDrift: !!drift.binary_drift,
+          definitionDrift: !!drift.definition_drift,
           infraDrift: !!drift.infra_drift,
-          sourceDrift: !!drift.source_drift,
           projectStatus,
           mode,
           ...(firesDeadlineUnix !== undefined ? { firesDeadlineUnix } : {}),
@@ -629,7 +640,8 @@ export function activate(context: vscode.ExtensionContext) {
   ): Promise<void> {
     const channel = getWeftOutputChannel();
     const fullArgs = ['--json', ...args];
-    channel.appendLine(`> weft ${fullArgs.join(' ')}  (${cwd})`);
+    const command = `weft ${fullArgs.join(' ')}`;
+    channel.appendLine(`> ${command}  (${cwd})`);
     return new Promise((resolve, reject) => {
       const child = spawn('weft', fullArgs, {
         cwd,
@@ -638,7 +650,24 @@ export function activate(context: vscode.ExtensionContext) {
       });
       cliTracking.set(projectId, { child, userKilled: false });
 
+      // Capture stderr so a non-zero exit can include the failure
+      // explanation in the rejection, not just "exit code N".
+      let stderrBuf = '';
+      // Capture stdout text that didn't parse as a JSON CliEvent: still
+      // useful for the modal when the CLI fell back to plain text.
+      let nonJsonStdout = '';
       let buffer = '';
+      // Long-running CLIs (cargo --verbose, docker build with many
+      // layers) can spew megabytes of stderr; the only consumer is
+      // the modal showing the last few lines on failure. Cap both
+      // accumulators at 64 KB and keep the TAIL (where the cause
+      // lives), not the head.
+      const STREAM_BUF_CAP = 64 * 1024;
+      const appendCapped = (buf: string, text: string): string => {
+        const combined = buf + text;
+        if (combined.length <= STREAM_BUF_CAP) return combined;
+        return combined.slice(combined.length - STREAM_BUF_CAP);
+      };
       const handleLine = (line: string) => {
         const trimmed = line.trim();
         if (!trimmed) return;
@@ -647,9 +676,9 @@ export function activate(context: vscode.ExtensionContext) {
           onEvent(ev);
         } catch {
           channel.appendLine(`[non-json stdout] ${trimmed}`);
+          nonJsonStdout = appendCapped(nonJsonStdout, trimmed + '\n');
         }
       };
-
       child.stdout?.on('data', (chunk: Buffer) => {
         buffer += chunk.toString();
         let nl;
@@ -659,21 +688,160 @@ export function activate(context: vscode.ExtensionContext) {
           handleLine(line);
         }
       });
-      child.stderr?.on('data', (chunk: Buffer) =>
-        channel.append(chunk.toString()),
-      );
+      child.stderr?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString();
+        stderrBuf = appendCapped(stderrBuf, text);
+        channel.append(text);
+      });
       child.on('error', (err) => reject(err));
       child.on('close', (code, signal) => {
         if (buffer.length > 0) handleLine(buffer);
         if (code === 0) {
           resolve();
-        } else if (signal) {
-          reject(new Error(`weft ${args.join(' ')} terminated by ${signal}`));
-        } else {
-          reject(new Error(`weft ${args.join(' ')} exited ${code}`));
+          return;
         }
+        const raw = [stderrBuf.trim(), nonJsonStdout.trim()]
+          .filter(Boolean)
+          .join('\n\n');
+        const head = extractErrorHeadline(stderrBuf)
+          ?? extractErrorHeadline(nonJsonStdout);
+        const message = head
+          ? truncate(head, 200)
+          : (signal
+              ? `weft ${args.join(' ')} terminated by ${signal}`
+              : `weft ${args.join(' ')} exited ${code}`);
+        const details: ActionErrorDetails = {
+          what: `Running '${args.join(' ')}'`,
+          stage: 'cli',
+          diagnostics: head
+            ? [{ severity: 'error', message: head }]
+            : [],
+          ...(raw ? { raw } : {}),
+          ...(typeof code === 'number' ? { exitCode: code } : {}),
+          command,
+        };
+        const err = new Error(message) as Error & { details?: ActionErrorDetails };
+        err.details = details;
+        reject(err);
       });
     });
+  }
+
+  /// Pick a one-line headline from a stderr/stdout dump. CLI tools
+  /// that drive docker/buildkit/cargo flood stderr with progress
+  /// (`#0 building...`, `Compiling foo`, `[2/8] downloading`) and
+  /// emit the real failure as a final summary line. Strategy:
+  ///   1. Prefer the LAST line matching `error:` / `Error:` /
+  ///      `ERROR:` / `Caused by:` patterns. That's almost always the
+  ///      root cause in chained anyhow / cargo / docker output.
+  ///   2. Otherwise, prefer the LAST non-progress non-empty line.
+  ///      A progress line is one starting with `#`, `[`, or any of
+  ///      the docker buildkit step markers.
+  ///   3. Fall back to the first non-empty line so we always show
+  ///      SOMETHING.
+  function extractErrorHeadline(s: string): string | undefined {
+    if (!s) return undefined;
+    // Keep RAW lines (untrimmed) for the anyhow scan below: indentation
+    // is what distinguishes a cause's continuation from the end of the
+    // chain. The trimmed/filtered view is used by the later passes.
+    const rawLines = s.split('\n');
+    const lines = rawLines.map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length === 0) return undefined;
+
+    // Pass 1: a numbered anyhow chain. anyhow prints a multi-cause
+    // chain as `Caused by:` then INDENTED `    0: ...`, `    1: ...`,
+    // ... where the HIGHEST number is the ROOT cause. The scan is GATED
+    // to the indented block right after `Caused by:`: bare `N: ...`
+    // lines elsewhere (docker `2: Pulling fs layer`, a port
+    // `8080: bind failed`, a `Stack backtrace:` block's own numbered
+    // frames) are NOT anyhow causes and must not hijack the headline.
+    //
+    // Continuation handling: a cause whose Display wraps prints its
+    // extra lines INDENTED (deeper than the `N:` entries), so within
+    // the region an indented non-`N:` line is a continuation (ignore,
+    // keep scanning) while a line at COLUMN 0 (not indented) ENDS the
+    // region (it's the blank/next section after the chain). This keeps
+    // wrapped causes inside the block AND closes it before trailing
+    // numbered noise, which a "never reset" scan would wrongly capture.
+    let inCausedBy = false;
+    let deepestNum = -1;
+    let deepestLine: string | undefined;
+    for (const raw of rawLines) {
+      const line = raw.trim();
+      if (/^caused by:/i.test(line)) {
+        // A fresh `Caused by:` opens a new chain. Reset the
+        // accumulator so that among MULTIPLE anyhow chains in one
+        // buffer (a retried op that failed twice) the LAST chain's
+        // root wins, not the first. (Edge: if the final error is plain
+        // non-anyhow with no `Caused by:`, an earlier chain still wins
+        // here; the user sees a real cause either way, just possibly
+        // the earlier one.)
+        inCausedBy = true;
+        deepestNum = -1;
+        deepestLine = undefined;
+        continue;
+      }
+      if (!inCausedBy) continue;
+      const indented = /^\s/.test(raw);
+      const m = /^(\d+):\s*(.+)$/.exec(line);
+      if (m && indented) {
+        const n = Number(m[1]);
+        if (n >= deepestNum) {
+          deepestNum = n;
+          deepestLine = m[2];
+        }
+      } else if (line.length > 0 && !indented) {
+        // A COLUMN-0 non-empty line ends the indented Caused-by block
+        // (the next section: `Stack backtrace:`, more tool output,
+        // etc). Close the region so its numbered frames can't leak in.
+        // A BLANK line does NOT close: anyhow can emit blank lines
+        // inside a multi-paragraph cause Display, and closing on those
+        // would cut the chain short and return a shallower cause.
+        inCausedBy = false;
+      }
+      // else: a blank line, or an indented non-`N:` line (continuation
+      // of the current cause) inside the chain; ignore and keep
+      // scanning within the region.
+    }
+    if (deepestLine !== undefined) return deepestLine;
+    // Single-cause chain (a `Caused by:` followed by a plain, non-
+    // numbered line): the root is the line right after `Caused by:`.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/^caused by:/i.test(lines[i]) && i + 1 < lines.length) {
+        return lines[i + 1];
+      }
+    }
+    // Pass 2: last explicit error-prefixed line. Require the colon
+    // (cargo emits `error:` and `error[E0277]:`; buildkit's
+    // `ERROR: cancelled` shutdown banner also lands here, but it
+    // SHOULD: it's a real signal and the user can see the cause
+    // underneath in the modal's raw section. The earlier shape
+    // also matched bare `ERROR` (no colon), which picked up
+    // unrelated lines like `error count: 3` from test runners.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/^(error(\[[a-z0-9]+\])?|err|fatal):\s/i.test(lines[i])) {
+        return lines[i];
+      }
+    }
+    // Pass 3: last non-progress line. Progress lines start with `#`
+    // (docker buildkit), `[`, or are pure numeric "step n/m" markers.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (isProgressLine(lines[i])) continue;
+      return lines[i];
+    }
+    // Pass 4: total fallback. Even progress is better than nothing.
+    return lines[0];
+  }
+
+  function isProgressLine(line: string): boolean {
+    if (line.startsWith('#')) return true;        // buildkit step header
+    if (line.startsWith('[')) return true;        // cargo / many tools
+    if (/^\s*\d+\.\d+s/.test(line)) return true;  // buildkit timing
+    return false;
+  }
+
+  function truncate(s: string, max: number): string {
+    return s.length <= max ? s : s.slice(0, max - 1) + '…';
   }
 
   let weftOutputChannel: vscode.OutputChannel | undefined;

@@ -4,6 +4,22 @@
  * This is the single source of truth for all types.
  */
 
+import type {
+	BusInspectorEvent,
+	BusMeta,
+	CorruptionSite,
+	LoopInspectorEvent,
+	LoopIteration,
+	NodeExecutionStatus,
+	NodeFeaturesWire as NodeFeatures,
+} from '../../../shared/protocol';
+// Node feature flags ARE the wire type `NodeFeaturesWire`, aliased to
+// `NodeFeatures` and re-exported under the `$lib/types` alias so webview
+// imports stay uniform and there is one definition of the concept (not a
+// webview-local copy that drifts from the wire shape).
+export type { NodeExecutionStatus };
+export type { NodeFeaturesWire as NodeFeatures } from '../../../shared/protocol';
+
 // =============================================================================
 // PORT TYPE SYSTEM
 //
@@ -16,10 +32,9 @@
 // Type variables: T, T1, T2..., node-scoped, same T on input and output = same type
 // MustOverride:   Node can't know the type, user/AI must declare it in Weft code
 //
-// Port types describe what the node sees post-operation:
-//   Expand input (<): type is the element type T. Compiler validates List[T] arrives.
-//   Gather input (>): type is List[T] (collected). Compiler validates stack context.
-//   Stack depth tracked by compiler, not in the type system.
+// Port types describe what the node sees on its boundary. A port
+// declared `List[T]` carries the list verbatim; to process elements
+// one by one, wrap the call site in a `Loop(over: [...])`.
 //
 // USING PORT TYPES IN NODE DEFINITIONS (frontend.ts):
 //   portType: 'String'
@@ -54,6 +69,10 @@ export type WeftType =
 	| { kind: 'list'; inner: WeftType }
 	| { kind: 'dict'; key: WeftType; value: WeftType }
 	| { kind: 'json_dict' }
+	// A message-bus handle: an in-process channel between co-alive nodes.
+	// A Bus output connects only to a Bus input; the payloads are not
+	// type-checked. Wired-only (a live runtime handle, never configurable).
+	| { kind: 'bus' }
 	| { kind: 'union'; types: WeftType[] }
 	| { kind: 'typevar'; name: string }
 	| { kind: 'must_override' };
@@ -109,6 +128,7 @@ function parseSingleType(s: string): WeftType | null {
 		};
 	}
 	if (s === 'JsonDict') return { kind: 'json_dict' };
+	if (s === 'Bus') return { kind: 'bus' };
 	if (s === 'MustOverride') return { kind: 'must_override' };
 
 	// Parameterized: List[...], Dict[...]
@@ -187,6 +207,7 @@ export function weftTypeToString(t: WeftType): string {
 		case 'list': return `List[${weftTypeToString(t.inner)}]`;
 		case 'dict': return `Dict[${weftTypeToString(t.key)}, ${weftTypeToString(t.value)}]`;
 		case 'json_dict': return 'JsonDict';
+		case 'bus': return 'Bus';
 		case 'union': return t.types.map(weftTypeToString).join(' | ');
 		case 'typevar': return t.name;
 		case 'must_override': return 'MustOverride';
@@ -200,6 +221,7 @@ export function extractPrimitives(t: WeftType): WeftPrimitive[] {
 		case 'list': return extractPrimitives(t.inner);
 		case 'dict': return [...extractPrimitives(t.key), ...extractPrimitives(t.value)];
 		case 'json_dict': return [];
+		case 'bus': return [];
 		case 'union': return t.types.flatMap(extractPrimitives);
 		case 'typevar': return [];
 		case 'must_override': return [];
@@ -238,6 +260,8 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	if (source.kind === 'dict' && target.kind === 'dict') {
 		return isCompatible(source.key, target.key) && isCompatible(source.value, target.value);
 	}
+	// A bus connects only to a bus; payloads are not type-checked.
+	if (source.kind === 'bus' && target.kind === 'bus') return true;
 	// Both unions: every source variant must match at least one target variant
 	if (source.kind === 'union' && target.kind === 'union') {
 		return source.types.every(s => target.types.some(t => isCompatible(s, t)));
@@ -309,6 +333,9 @@ export function isDefaultConfigurable(t: WeftType): boolean {
 			return t.types.every(isDefaultConfigurable);
 		case 'json_dict':
 			return true;
+		case 'bus':
+			// A bus is a live runtime handle, never configurable.
+			return false;
 		case 'typevar':
 			return false;
 		case 'must_override':
@@ -337,25 +364,20 @@ function unifyTypes(types: WeftType[]): WeftType {
 	return unique.length === 1 ? unique[0] : { kind: 'union', types: unique };
 }
 
-/** How a port interacts with the lane/stack system.
- * - "Single" (default): normal, one value per lane
- * - "Expand": this port carries a list that expands into N lanes downstream
- * - "Gather": this port collects values from all N lanes into a single list */
-export type LaneMode = "Single" | "Expand" | "Gather";
-
 export interface PortDefinition {
 	name: string;
 	portType: PortType;
 	required: boolean;
 	description?: string;
-	laneMode?: LaneMode;
-	/** Number of List[] levels to expand/gather. Default 1. */
-	laneDepth?: number;
 	/** Whether this port can be filled by a same-named config field on the
 	 *  node (in addition to being wired by an edge). Defaults to true unless
 	 *  the type is a Media type or otherwise non-configurable. Catalog
 	 *  authors opt out per port. Edge wins over config when both are present. */
 	configurable?: boolean;
+	/** True iff this is the auto-synthesized input half of a loop carry port.
+	 *  The editor renders it as a ghost mirror of the carry output; the user
+	 *  edits the output's role to remove or rename it, never this side. */
+	synthesizedFromCarry?: boolean;
 }
 
 // =============================================================================
@@ -390,13 +412,9 @@ export interface FieldDefinition {
 
 export type NodeCategory = "Triggers" | "AI" | "Data" | "Flow" | "Utility" | "Debug" | "Infrastructure";
 
-/** Status of a single node execution. `suspended` is a real runtime state
- *  (the protocol's NodeExecutionStarted state union + status.ts + the node UI
- *  all handle it); it was missing from this type, so the UI's `=== 'suspended'`
- *  checks were dead branches the (never-run) webview typecheck flagged. */
-export type NodeExecutionStatus = 'running' | 'completed' | 'failed' | 'waiting_for_input' | 'suspended' | 'skipped' | 'cancelled';
-
-/** Record of a single execution of a node. */
+/** Record of a single execution of a node. The `NodeExecutionStatus`
+ *  alias re-exported at the top of the file lets the wire and the UI
+ *  share one source of truth and never drift on which states exist. */
 export interface NodeExecution {
 	id: string;
 	nodeId: string;
@@ -408,19 +426,61 @@ export interface NodeExecution {
 	startedAt: number;
 	completedAt?: number;
 	input?: unknown;
+	/// Wired input ports that arrived as CLOSURE markers for this
+	/// firing (the upstream frame stack terminated without firing them).
+	/// Disjoint from the keys of `input`; the inspector renders these
+	/// as "(closed)" so a user-emitted null is not visually confused
+	/// with a structural close.
+	closedPorts?: string[];
 	output?: unknown;
 	costUsd: number;
 	logs: unknown[];
 	color: string;
-	lane: Array<{ count: number; index: number }>;
-	/// Stringified lane stack used to correlate completion
-	/// events to the right running row when several lanes run
-	/// in parallel. Empty for non-parallel runs.
-	laneKey?: string;
+	frames: LoopIteration[];
+	/// Frame stack serialized as JSON, used to correlate completion
+	/// events to the right running row when several firings run
+	/// in parallel. `[]` at root (outside any loop).
+	framesKey: string;
 }
 
 /** Node executions keyed by node ID. */
 export type NodeExecutionTable = Record<string, NodeExecution[]>;
+
+/** Live execution state the webview maintains from the extension
+ *  host's SSE stream. Single source of truth: lifted here so
+ *  `App.svelte` (which owns the state) and the editor components
+ *  (which consume it) cannot drift on field shape. Webview-internal
+ *  only: `Set<string>` does not survive the wire, so this type never
+ *  appears in a `HostMessage`.
+ */
+export interface ExecutionState {
+	isRunning: boolean;
+	nodeOutputs: Record<string, unknown>;
+	nodeExecutions: NodeExecutionTable;
+	/** Full bus log per `busId` (in arrival order). The inspector
+	 *  renders one IRC-style panel per bus a node participates in. */
+	busLogByBus: Record<string, BusInspectorEvent[]>;
+	/** Per-bus metadata (mode), seeded from the first BusParticipant
+	 *  edge the dispatcher derives from the bus marker JSON. */
+	busMetaByBus: Record<string, BusMeta>;
+	/** Participant set per `busId`. A node N gets a bus panel iff
+	 *  `N` appears in the set for that bus. */
+	busParticipantsByBus: Record<string, Set<string>>;
+	/** Journal rows the dispatcher could not apply during fold.
+	 *  Empty in the normal case; populated on replay if any row of
+	 *  the journal was malformed. The inspector renders a muted
+	 *  "N journal rows corrupted" collapsed disclosure when this
+	 *  is non-empty, so the signal is visible without being
+	 *  alarming. */
+	journalCorruptions: Array<{
+		site: CorruptionSite;
+		reason: string;
+	}>;
+	/** Full ordered log of LoopInspectorEvents per loop group. Key is
+	 *  the loop's `groupId`; the parentFrames stack lives on each
+	 *  event so a card can split by nesting/sibling iteration. */
+	loopEventsByGroup: Record<string, LoopInspectorEvent[]>;
+}
 
 /** A typed data item shown on a node's body-panel feed. The
  *  authoritative definition lives in `shared/protocol.ts`; this
@@ -430,23 +490,6 @@ export type NodeExecutionTable = Record<string, NodeExecution[]>;
  */
 export type { LiveDataItem } from '../../../shared/protocol';
 
-export interface NodeFeatures {
-	isTrigger?: boolean;
-	canAddInputPorts?: boolean;
-	canAddOutputPorts?: boolean;
-	hidden?: boolean;
-	showRunLocationSelector?: boolean;
-	showDebugPreview?: boolean;
-	/** Node has a dynamic form schema. Ports are derived from config.fields via the node's formFieldSpecs. */
-	hasFormSchema?: boolean;
-	/** Names the endpoint serving the node's `/live` HTTP route the
-	 * body panel polls. Unset for TCP-only infra (Postgres, Redis). */
-	liveEndpoint?: string;
-	/** Groups of ports where at least one must be non-null for the node to execute.
-	 * If all ports in a group are null/missing, the node is skipped.
-	 * e.g. [['text', 'media']] = at least one of text/media must be non-null. */
-	oneOfRequired?: string[][];
-}
 
 /**
  * Validation levels:
@@ -624,3 +667,28 @@ export interface ProjectValidationResult {
 	nodeErrors: Map<string, ValidationError[]>;
 }
 
+
+/** Resolve a container node's kind. Returns null for non-containers.
+ *  The single source of truth for "is this a container, and which
+ *  one": the two boolean helpers below are expressed through it so
+ *  the kind set (Group, Loop) lives in exactly one place. Callers
+ *  handle the null case (bail before mutating visual state). */
+export function containerKindOf(nodeType: unknown): 'Group' | 'Loop' | null {
+	if (nodeType === 'Group') return 'Group';
+	if (nodeType === 'Loop') return 'Loop';
+	return null;
+}
+
+/** A node whose `nodeType` is one of the language's structural
+ *  containers (Group, Loop). Containers nest children; the visual
+ *  editor treats them uniformly for layout, parent linking, and
+ *  collapse/expand. The renderer picks distinct visuals per kind. */
+export function isContainerNodeType(nodeType: unknown): boolean {
+	return containerKindOf(nodeType) !== null;
+}
+
+/** True iff a node is a Loop container (used by renderer + visual
+ *  differentiation; for structural checks prefer `isContainerNodeType`). */
+export function isLoopNodeType(nodeType: unknown): boolean {
+	return containerKindOf(nodeType) === 'Loop';
+}

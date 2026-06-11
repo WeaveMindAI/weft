@@ -1,15 +1,16 @@
 //! Per-dispatch execution record. A `NodeExecution` is created every
-//! time a node fires; multiple fires (parallel lanes, loop iterations)
-//! produce multiple entries keyed by node id.
+//! time a node fires; multiple fires (parallel loop iterations) produce
+//! multiple entries keyed by node id.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::lane::Lane;
+use crate::frames::LoopFrames;
 use crate::Color;
 
+// SYNC: NodeExecutionStatus <-> extension-vscode/src/shared/protocol.ts NodeExecutionStatus
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeExecutionStatus {
@@ -41,17 +42,15 @@ impl NodeExecutionStatus {
     }
 }
 
-/// Record of one node-lane execution. Pulses stay pure data
+/// Record of one node-firing execution. Pulses stay pure data
 /// carriers; every bit of execution metadata (status, input,
 /// output, cost, logs, timing) lives here.
 ///
 /// Suspend-then-resume keeps the same record. The `status`
 /// transitions through Running ↔ WaitingForInput on the same
-/// record without churning new entries. Retries (future feature)
-/// snapshot the closed attempt into `prior_attempts` and reset
-/// the live fields for the new attempt. So the table has exactly
-/// one row per (node, lane) regardless of how many times the
-/// engine had to dispatch it.
+/// record without churning new entries. So the table has exactly
+/// one row per (node, frames) regardless of how many times
+/// the engine had to dispatch it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeExecution {
     pub id: uuid::Uuid,
@@ -72,24 +71,7 @@ pub struct NodeExecution {
     pub cost_usd: f64,
     pub logs: Vec<Value>,
     pub color: Color,
-    pub lane: Lane,
-    /// Closed-out previous attempts on this same (node, lane).
-    /// Empty for the common single-attempt case; grows when a
-    /// retry policy reopens the record after a failure.
-    #[serde(default)]
-    pub prior_attempts: Vec<NodeAttempt>,
-}
-
-/// A closed-out attempt's outcome. Captured into
-/// `NodeExecution.prior_attempts` when a retry opens a new live
-/// attempt, so the modal can show the full failure history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeAttempt {
-    pub status: NodeExecutionStatus,
-    pub started_at: u64,
-    pub completed_at: Option<u64>,
-    pub error: Option<String>,
-    pub output: Option<Value>,
+    pub frames: LoopFrames,
 }
 
 /// One entry per node, growing as each dispatch records its lifecycle.

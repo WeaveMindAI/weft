@@ -16,6 +16,8 @@ use anyhow::Result;
 use super::Ctx;
 use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::images;
+use anyhow::Context;
+
 use crate::progress::{ActionVerb, Progress};
 
 #[derive(Clone)]
@@ -141,7 +143,7 @@ async fn infra_node_verb(
     // up means the node never reaches "stopped", so the command
     // outcome is the honest done signal (and a force-stop completing
     // is what we actually want to wait for).
-    wait_for_command(&client, &project_id, command_id, verb).await?;
+    wait_for_command(progress, &client, &project_id, command_id, verb).await?;
     if !ctx.json() {
         let final_resp: serde_json::Value = client
             .get_json(&format!("/projects/{project_id}/infra/status"))
@@ -158,9 +160,62 @@ async fn infra_sync(
     action: InfraAction,
     opts: InfraOpts,
 ) -> Result<()> {
-    let handle = super::ensure::ensure_registered(ctx, progress).await?;
+    use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
+
+    // The same `--running-policy` the user gave for the trigger
+    // deactivation also pre-answers the stale-binary build gate:
+    // both ask "what to do with running executions," so a single
+    // flag answers both for an infra sync.
+    let build_gate_policy = parse_running_policy_flag(opts.running_policy.as_deref())?;
+
+    // Reject an EXPLICIT `--running-policy wait --mode wipe` up front,
+    // BEFORE the build gate (which on `wait` can block UNBOUNDED in
+    // `wait_for_drain`). The combination is contradictory (you can't
+    // wait for executions you're about to wipe) and statically known
+    // the instant both flags are parsed, so catching it after a
+    // potentially-hours-long drain is the wrong moment. (A build-gate
+    // wait that wasn't explicitly paired with wipe is handled later
+    // via `trigger_policy`, which never forces wait into a wipe.)
+    if build_gate_policy == Some(RunningPolicy::Wait)
+        && opts.mode.as_deref() == Some("wipe")
+    {
+        anyhow::bail!(
+            "`--running-policy wait` contradicts `--mode wipe`: waiting for executions \
+             you're about to wipe is nonsensical. Use `--running-policy cancel` with wipe"
+        );
+    }
+
+    // reactivates_after_gate=false: infra verbs do NOT auto-reactivate
+    // (the user clicks Activate when ready). If the gate parked an active
+    // project to drain, the post-gate `project_is_active` check below
+    // sees it inactive and skips its own trigger-deactivation (already
+    // done); ensure_registered warns the user to `weft activate`.
+    let handle =
+        super::ensure::ensure_registered(ctx, progress, build_gate_policy, false).await?;
     let image_tags = build_infra_images(progress, &handle.project, &handle.id).await?;
     let verb_label = action_verb_label(&action);
+
+    // The build gate and the trigger-deactivation both decide what to
+    // do with running executions. Reuse the build gate's resolved
+    // CANCEL so a user who chose cancel at the gate doesn't see the
+    // executions un-cancelled by a defaulted wait. We do NOT carry a
+    // build-gate WAIT forward, for two reasons: (1) `prompt_trigger_
+    // deactivation` does NOT re-prompt for the running policy (it
+    // DEFAULTS it: wait for hibernate/park, cancel for wipe), so there
+    // is no double-prompt to avoid on the wait axis; (2) forcing a
+    // build-gate `wait` into a `--mode wipe` would hit that helper's
+    // "wipe requires cancel" bail AFTER the build already ran. Letting
+    // wait fall through to the per-mode default keeps the phases
+    // consistent (preservation modes default to wait anyway) without
+    // the post-build abort. An EXPLICIT `--running-policy wait --mode
+    // wipe` is already rejected up front (before the build), so it
+    // can't reach here.
+    let trigger_policy = match handle.resolved_running_policy {
+        Some(p @ RunningPolicy::Cancel) => Some(p.as_str().to_string()),
+        // Some(Wait) or None: let the deactivation mode's own default
+        // (or an explicit flag) decide; see above.
+        _ => opts.running_policy.clone(),
+    };
 
     // Only Upgrade against an Active project actually needs the
     // trigger-deactivation choice. Start / Restart fire when infra
@@ -173,7 +228,7 @@ async fn infra_sync(
             &format!("infra {verb_label}"),
             opts.mode.as_deref(),
             opts.grace,
-            opts.running_policy.as_deref(),
+            trigger_policy.as_deref(),
         )?)
     } else {
         None
@@ -185,8 +240,7 @@ async fn infra_sync(
     // governs HOW triggers come down during the stop).
 
     let mut body = serde_json::Map::new();
-    body.insert("sourceHash".into(), serde_json::json!(handle.source_hash));
-    body.insert("infraHash".into(), serde_json::json!(handle.infra_hash));
+    handle.inject_hash_fields(&mut body);
     body.insert("imageHashes".into(), serde_json::to_value(&image_tags)?);
     if let Some(td) = trigger_deactivation {
         body.insert("triggerDeactivation".into(), td);
@@ -270,7 +324,7 @@ async fn infra_destroy(
         .get("command_id")
         .and_then(|v| v.as_i64())
         .ok_or_else(|| anyhow::anyhow!("infra {verb}: response missing command_id"))?;
-    wait_for_command(&client, &id, command_id, verb).await?;
+    wait_for_command(progress, &client, &id, command_id, verb).await?;
     if !ctx.json() {
         let final_resp: serde_json::Value = client
             .get_json(&format!("/projects/{id}/infra/status"))
@@ -284,30 +338,61 @@ async fn infra_destroy(
 /// Poll the command-status endpoint until the supervisor marks the
 /// command complete. Fails loud on a `failed` outcome; `cancelled`
 /// (e.g. the node was already gone) is treated as success ("no longer
-/// applicable"). 300s deadline.
+/// applicable"). UNBOUNDED: an infra command (stop / terminate / start)
+/// can depend on draining in-flight executions, which is a user-facing
+/// wait that may legitimately last hours; a hard deadline would turn a
+/// correct slow operation into a spurious failure (same rule as
+/// `wait_for_drain`). The wait stays legible via an `InfraWait`
+/// breadcrumb; Ctrl+C is the recovery. Status-endpoint errors still
+/// bubble loudly.
 async fn wait_for_command(
+    progress: &Progress,
     client: &crate::client::DispatcherClient,
     project_id: &str,
     command_id: i64,
     verb: &str,
 ) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let interval = std::time::Duration::from_millis(500);
+    let breadcrumb_every = std::time::Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let mut next_breadcrumb = start + breadcrumb_every;
     loop {
         let resp: serde_json::Value = client
             .get_json(&format!("/projects/{project_id}/infra/commands/{command_id}"))
-            .await?;
-        if resp.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let outcome = resp.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+            .await
+            .with_context(|| format!("polling infra {verb} command {command_id}"))?;
+        // No `unwrap_or` on the contract fields: a missing `done` must
+        // NOT be silently read as "not done" (now an UNBOUNDED wait, it
+        // would loop forever), and a missing `outcome` must not be read
+        // as success. A wire-contract violation fails loud with the
+        // version-mismatch recovery, same posture as the drain wait.
+        let done = resp.get("done").and_then(|v| v.as_bool()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "infra {verb}: command-status response missing or non-bool `done`; a wire \
+                 contract violation between this CLI and the dispatcher. Recovery: upgrade the \
+                 dispatcher (or this CLI) so the versions match"
+            )
+        })?;
+        if done {
+            let outcome = resp.get("outcome").and_then(|v| v.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "infra {verb}: command marked done but the response is missing or has a \
+                     non-string `outcome`; wire contract violation, treating it as success would \
+                     hide a failed command. Recovery: upgrade the dispatcher or this CLI"
+                )
+            })?;
             if outcome == "failed" {
                 let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
                 anyhow::bail!("infra {verb} failed: {msg}");
             }
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("infra {verb} did not complete within 300s");
+        let now = std::time::Instant::now();
+        if now >= next_breadcrumb {
+            progress.infra_wait(verb, (now - start).as_secs());
+            next_breadcrumb = now + breadcrumb_every;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(interval).await;
     }
 }
 

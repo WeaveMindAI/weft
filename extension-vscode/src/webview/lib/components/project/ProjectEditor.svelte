@@ -89,12 +89,7 @@
 		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string; failureStage?: string; failureMessage?: string }>;
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
-		executionState?: {
-			isRunning: boolean;
-			nodeOutputs: Record<string, unknown>;
-			nodeStatuses: Record<string, string>;
-			nodeExecutions: import('$lib/types').NodeExecutionTable;
-		};
+		executionState?: import('$lib/types').ExecutionState;
 		autoOrganizeOnMount?: boolean;
 		/// Per-node infra /live tick state. Only consumed for nodes
 		/// with `requiresInfra: true`.

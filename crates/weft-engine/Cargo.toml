@@ -21,3 +21,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+# Consumed by the `stress_test!` macro (exported from weft-core) at
+# tests' macro-expansion sites: needs `FutureExt::catch_unwind` to
+# convert a panic in any stress iteration into a clean failure with
+# iteration index.
+futures = { workspace = true }

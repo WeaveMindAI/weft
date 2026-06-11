@@ -20,8 +20,8 @@ impl Node for TextNode {
         serde_json::from_str(METADATA_JSON).expect("Text metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let value: String = ctx.config.get("value")?;
-        Ok(NodeOutput::with("value", Value::String(value)))
+        ctx.pulse_downstream(NodeOutput::with("value", Value::String(value))).await
     }
 }

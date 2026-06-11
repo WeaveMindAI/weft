@@ -4,18 +4,32 @@
 use anyhow::Context;
 
 use super::Ctx;
+use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
 use crate::progress::ActionVerb;
 
-pub async fn run(ctx: Ctx, detach: bool) -> anyhow::Result<()> {
+pub async fn run(
+    ctx: Ctx,
+    detach: bool,
+    running_policy: Option<String>,
+) -> anyhow::Result<()> {
+    let parsed_policy = parse_running_policy_flag(running_policy.as_deref())?;
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Run, |progress| async move {
-        run_inner(&ctx_inner, &progress, detach).await
+        run_inner(&ctx_inner, &progress, detach, parsed_policy).await
     })
     .await
 }
 
-async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, detach: bool) -> anyhow::Result<()> {
-    let handle = super::ensure::ensure_registered(ctx, progress).await?;
+async fn run_inner(
+    ctx: &Ctx,
+    progress: &crate::progress::Progress,
+    detach: bool,
+    running_policy: Option<RunningPolicy>,
+) -> anyhow::Result<()> {
+    // reactivates_after_gate=false: `run` fires a one-off execution and
+    // never re-enables triggers, so if the gate parked an active project
+    // to drain, ensure_registered warns the user to `weft activate`.
+    let handle = super::ensure::ensure_registered(ctx, progress, running_policy, false).await?;
     if !ctx.json() {
         println!("registered {} ({})", handle.name, handle.id);
     }

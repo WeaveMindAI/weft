@@ -46,7 +46,7 @@ pub fn validate_with_mode(
     check_port_resolution(project, &mut d);
     check_type_compat(project, &mut d);
     check_port_coverage(project, catalog, &mut d);
-    check_lane_mechanics(project, &mut d);
+    check_loop_config(project, &mut d);
     check_warnings(project, &mut d);
     check_output_reachability(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
@@ -326,7 +326,9 @@ fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>
         let Some(tgt) = by_id.get(edge.target.as_str()) else {
             continue;
         };
-        if src.node_type == "Passthrough" || tgt.node_type == "Passthrough" {
+        if matches!(src.node_type.as_str(), "Passthrough" | "LoopIn" | "LoopOut")
+            || matches!(tgt.node_type.as_str(), "Passthrough" | "LoopIn" | "LoopOut")
+        {
             continue;
         }
         if src.scope == tgt.scope {
@@ -339,7 +341,7 @@ fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>
             Severity::Error,
             "scope-reachability",
             format!(
-                "edge '{}.{} -> {}.{}' crosses scope boundaries without a passthrough",
+                "edge '{}.{} -> {}.{}' crosses scope boundaries without a group or loop boundary",
                 edge.source,
                 edge.source_handle.as_deref().unwrap_or("?"),
                 edge.target,
@@ -535,7 +537,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             continue;
         }
 
-        if !weft_core::weft_type::WeftType::is_edge_compatible(&src_port.port_type, &tgt_port.port_type) {
+        if !weft_core::weft_type::WeftType::is_compatible(&src_port.port_type, &tgt_port.port_type) {
             push(d, span, Severity::Error, "type-mismatch",
                 format!(
                     "cannot connect '{}.{}: {}' to '{}.{}: {}'",
@@ -746,130 +748,262 @@ fn check_port_coverage(
     // the target port is output-only. No extra check needed at validate.
 }
 
-// ─── group 5: lane mechanics ────────────────────────────────────────────────
+// ─── group 5: loop config validation ─────────────────────────────────────────
 
-/// gather-insufficient-depth: a Gather-laned target port has a type
-///   List[L1]..[Ln] but the edge source has fewer than n List levels.
-/// implicit-expand: source is List[T], target is T, automatic expand.
-/// implicit-gather: source is T, target is List[T], automatic gather.
-/// gather-null-warning: Gather target type excludes Null, but the
-///   pipeline may propagate null into it.
-///
-/// v1 refs: 3710-3722 (expand/gather implicit), 3828-3849 (gather
-/// underflow), 4004-4009 (gather null warning).
-fn check_lane_mechanics(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    let by_id: std::collections::HashMap<&str, &weft_core::project::NodeDefinition> =
-        project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+/// Validate the config block on each `Loop` decl (via its `LoopIn` /
+/// `LoopOut` boundary nodes). Rules per the plan:
+///  - `parallel` defaults to false (sequential) when omitted.
+///  - `over` / `carry` reference declared ports.
+///  - `parallel: true` AND `carry` non-empty → `parallel-with-carry`.
+///  - `parallel: true` AND `over` empty → `parallel-without-over`.
+///  - `parallel: true` AND `self.done = ...` in body → `parallel-with-done`.
+///  - Port in both `over` and `carry` → `over-and-carry-overlap`.
+///  - Reserved port names `index` (input) / `done` (output) → `reserved-port-name`.
+///  - Gather output declared as `List[T]` instead of `List[T | Null]` →
+///    `gather-output-must-be-nullable`.
+///  - Boundary unpaired → `loop-boundary-unpaired`.
+fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    use std::collections::{HashMap, HashSet};
 
-    for edge in &project.edges {
-        let span = edge.span.unwrap_or_default();
-        let Some(src) = by_id.get(edge.source.as_str()) else { continue };
-        let Some(tgt) = by_id.get(edge.target.as_str()) else { continue };
-        let Some(src_port) = src
-            .outputs
-            .iter()
-            .find(|p| Some(p.name.as_str()) == edge.source_handle.as_deref())
-        else { continue };
-        let Some(tgt_port) = tgt
-            .inputs
-            .iter()
-            .find(|p| Some(p.name.as_str()) == edge.target_handle.as_deref())
-        else { continue };
+    // Collect LoopIn / LoopOut node pairs keyed by their shared group id.
+    let mut ins: HashMap<&str, &NodeDefinition> = HashMap::new();
+    let mut outs: HashMap<&str, &NodeDefinition> = HashMap::new();
+    for n in &project.nodes {
+        let Some(gb) = &n.group_boundary else { continue };
+        match n.node_type.as_str() {
+            "LoopIn" => { ins.insert(gb.group_id.as_str(), n); }
+            "LoopOut" => { outs.insert(gb.group_id.as_str(), n); }
+            _ => {}
+        }
+    }
+    for (gid, in_node) in &ins {
+        if !outs.contains_key(gid) {
+            push(d, in_node.header_span_or_default(), Severity::Error, "loop-boundary-unpaired",
+                format!("loop '{gid}' has LoopIn but no matching LoopOut"));
+        }
+    }
+    for (gid, out_node) in &outs {
+        if !ins.contains_key(gid) {
+            push(d, out_node.header_span_or_default(), Severity::Error, "loop-boundary-unpaired",
+                format!("loop '{gid}' has LoopOut but no matching LoopIn"));
+        }
+    }
 
-        let src_depth = list_depth(&src_port.port_type);
-        let tgt_depth = list_depth(&tgt_port.port_type);
+    for (gid, in_node) in &ins {
+        let Some(out_node) = outs.get(gid).copied() else { continue };
+        let cfg = &in_node.config;
+        let span = in_node.header_span_or_default();
+        let span_for = |key: &str| -> weft_core::project::Span {
+            in_node
+                .config_spans
+                .get(key)
+                .map(|cs| cs.span.clone())
+                .unwrap_or_else(|| span.clone())
+        };
 
-        // implicit-expand / implicit-gather: noisy only when the
-        // user didn't write the types. If both sides are
-        // user-typed in the .weft source, the depth difference is
-        // an explicit contract; staying silent. If either side
-        // came from catalog metadata, warn so the user knows the
-        // language inferred a lane mechanic.
-        let user_typed_both = src_port.user_typed && tgt_port.user_typed;
-
-        if src_depth > tgt_depth {
-            if !user_typed_both {
-                push(d, span, Severity::Warning, "implicit-expand",
-                    format!(
-                        "implicit expand on '{}.{} -> {}.{}' (source has {} more List level(s))",
-                        edge.source, src_port.name, edge.target, tgt_port.name,
-                        src_depth - tgt_depth,
-                    ));
-            }
-        } else if tgt_depth > src_depth {
-            if !user_typed_both {
-                push(d, span, Severity::Warning, "implicit-gather",
-                    format!(
-                        "implicit gather on '{}.{} -> {}.{}' (target has {} more List level(s))",
-                        edge.source, src_port.name, edge.target, tgt_port.name,
-                        tgt_depth - src_depth,
-                    ));
-            }
-
-            // gather-null-warning is a real semantic concern
-            // independent of who declared the types: a gathered
-            // List of `Number` swallows null upstream pulses
-            // because the inner type doesn't admit them. Always
-            // warn, user_typed or not.
-            if let Some(inner) = innermost(&tgt_port.port_type) {
-                if !admits_null(inner) {
-                    push(d, span, Severity::Warning, "gather-null-warning",
+        // Unknown config keys are rejected loudly: a typo'd knob
+        // (`max_itres: 10`) silently running the loop uncapped is
+        // exactly the masked-bug class the language forbids.
+        // `parentId` is the compiler-internal boundary pointer merged
+        // in at flatten time, never a user key (lowering rejects a
+        // user-written `parentId` before the merge).
+        const KNOWN_LOOP_KEYS: &[&str] =
+            &["parentId", "parallel", "over", "carry", "max_iters", "trim_on_mismatch"];
+        if let Some(obj) = cfg.as_object() {
+            for key in obj.keys() {
+                if !KNOWN_LOOP_KEYS.contains(&key.as_str()) {
+                    push(d, span_for(key), Severity::Error, "loop-unknown-config-field",
                         format!(
-                            "gather target '{}.{}: {}' doesn't admit Null; upstream null values may be silently dropped",
-                            edge.target, tgt_port.name, tgt_port.port_type,
+                            "loop '{gid}': unknown config field '{key}' (known: parallel, \
+                             over, carry, max_iters, trim_on_mismatch)"
                         ));
                 }
             }
         }
 
-        // gather-insufficient-depth: the target's declared gather
-        // depth must match the structural difference. Implicit
-        // gather means `tgt_depth > src_depth` and the depth is
-        // `tgt_depth - src_depth`. Explicit gather on a same-depth
-        // edge is the v1 pattern where a node declares an output as
-        // gathered regardless of upstream type. Both cases: the
-        // delta must match declared_lane when declared_lane > 0.
-        let declared_lane = tgt_port.lane_depth as usize;
-        if tgt_port.lane_mode == weft_core::project::LaneMode::Gather
-            && declared_lane > 0
-        {
-            let available = tgt_depth.saturating_sub(src_depth);
-            if declared_lane > available.max(1) {
-                push(d, span, Severity::Error, "gather-insufficient-depth",
+        // `parallel` defaults to false (sequential, the safer mode:
+        // carry / self.done work, no ordering surprises); the flatten
+        // step materializes the default, so it is always present
+        // here. A wrong-typed value (`parallel: "true"`) is an ERROR,
+        // never a coercion: silently running sequential would also
+        // silently skip every parallel-interplay rule below.
+        let parallel: bool = match cfg.get("parallel") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(other) => {
+                push(d, span_for("parallel"), Severity::Error, "loop-parallel-not-boolean",
+                    format!("loop '{gid}': `parallel` must be a boolean literal (got {other})"));
+                continue;
+            }
+            // Absent means the flatten step did NOT materialize the
+            // default into the LoopIn config. The default lives in ONE
+            // place (flatten); validate verifies it is there rather than
+            // re-defaulting here, because a silent default would also
+            // silently skip every parallel-interplay rule below.
+            None => {
+                push(d, span_for("parallel"), Severity::Error, "loop-config-missing-parallel",
+                    format!("loop '{gid}': internal invariant broken: flatten did not materialize `parallel` into the LoopIn config"));
+                continue;
+            }
+        };
+
+        // `max_iters`: non-negative integer literal when present
+        // (`max_iters: 0` is a legal zero-iteration cap).
+        if let Some(v) = cfg.get("max_iters") {
+            if v.as_u64().is_none() {
+                push(d, span_for("max_iters"), Severity::Error, "loop-max-iters-not-integer",
+                    format!("loop '{gid}': `max_iters` must be a non-negative integer literal (got {v})"));
+            }
+        }
+        // `trim_on_mismatch`: boolean literal when present.
+        if let Some(v) = cfg.get("trim_on_mismatch") {
+            if !v.is_boolean() {
+                push(d, span_for("trim_on_mismatch"), Severity::Error, "loop-trim-not-boolean",
+                    format!("loop '{gid}': `trim_on_mismatch` must be a boolean literal (got {v})"));
+            }
+        }
+
+        // Non-string entries in over / carry are already rejected at
+        // lowering time (`read_loop_port_list` pushes a CompileError);
+        // here we just read the post-lowering values, which validate
+        // can trust are strings.
+        let read_port_list = |key: &str| -> Vec<String> {
+            cfg.get(key).and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        let over: Vec<String> = read_port_list("over");
+        let carry: Vec<String> = read_port_list("carry");
+
+        if parallel && !carry.is_empty() {
+            push(d, span_for("carry"), Severity::Error, "parallel-with-carry",
+                format!("loop '{gid}': parallel: true forbids carry ports (carry implies sequential)"));
+        }
+        if parallel && over.is_empty() {
+            push(d, span_for("parallel"), Severity::Error, "parallel-without-over",
+                format!("loop '{gid}': parallel: true requires a non-empty 'over' list"));
+        }
+
+        // `self.done = ...` writes are detectable here: lowering maps
+        // them to an edge whose target is `{loop_id}__out` on port
+        // `done`, so a scope-local scan reduces to "any edge whose
+        // target is this loop's LoopOut id and target port is `done`".
+        // A `self.done` write inside a nested loop's body targets that
+        // nested loop's `__out`, never this one, so the check is
+        // naturally scope-local.
+        let loop_out_id = format!("{gid}__out");
+        let done_wired = project.edges.iter().any(|e| {
+            e.target == loop_out_id && e.target_handle.as_deref() == Some("done")
+        });
+
+        // parallel-with-done: in parallel mode, any `self.done` write
+        // inside THIS loop's body is rejected.
+        if parallel && done_wired {
+            push(d, span, Severity::Error, "parallel-with-done",
+                format!("loop '{gid}': parallel: true forbids `self.done = ...` connections in the body"));
+        }
+
+        // loop-unbounded-no-termination: a SEQUENTIAL loop with no
+        // `over` (nothing to exhaust), no `max_iters` (no cap), and no
+        // `self.done` write (no vote to stop) is provably infinite.
+        // Reject at compile time. A loop that has ANY of the three is
+        // the user's own program: trusted, unbounded by the runtime.
+        if !parallel && over.is_empty() && cfg.get("max_iters").is_none() && !done_wired {
+            push(d, span, Severity::Error, "loop-unbounded-no-termination",
+                format!(
+                    "loop '{gid}': sequential loop declares no 'over', no 'max_iters', and \
+                     never writes `self.done`; it can never terminate. Iterate a list with \
+                     `over: [...]`, cap it with `max_iters`, or wire `self.done = ...` in the body."
+                ));
+        }
+
+        let carry_set: HashSet<&String> = carry.iter().collect();
+        for p in &over {
+            if carry_set.contains(p) {
+                push(d, span_for("over"), Severity::Error, "over-and-carry-overlap",
+                    format!("loop '{gid}': port '{p}' listed in both 'over' and 'carry'"));
+            }
+        }
+
+        // Reserved port names: 'index' as user input, 'done' as user output.
+        for port in &in_node.inputs {
+            if port.name == "index" {
+                push(d, span, Severity::Error, "reserved-port-name",
+                    format!("loop '{gid}': 'index' is reserved (the implicit per-iteration index port)"));
+            }
+        }
+        for port in &out_node.outputs {
+            if port.name == "done" {
+                push(d, span, Severity::Error, "reserved-port-name",
+                    format!("loop '{gid}': 'done' is reserved (the implicit done-vote port)"));
+            }
+        }
+
+        // Gather outputs must be declared `List[T | Null]`. The
+        // reserved name `done` already errored above; flagging its
+        // nullability too would double-report one mistake.
+        for port in &out_node.outputs {
+            if carry_set.contains(&port.name) || port.name == "done" {
+                continue;
+            }
+            if !is_list_of_nullable(&port.port_type) {
+                push(d, span, Severity::Error, "gather-output-must-be-nullable",
                     format!(
-                        "gather at '{}.{}' requests depth {} but only {} List level(s) between source and target",
-                        edge.target, tgt_port.name, declared_lane, available,
+                        "loop '{gid}': gather output '{}' must be declared as List[T | Null] (was {}); per-iteration body failures produce null slots",
+                        port.name, port.port_type,
+                    ));
+            }
+        }
+
+        // over ports must exist on LoopIn and be List[T].
+        for p in &over {
+            match in_node.inputs.iter().find(|x| &x.name == p) {
+                None => {
+                    push(d, span_for("over"), Severity::Error, "loop-over-unknown-port",
+                        format!("loop '{gid}': 'over' references unknown input port '{p}'"));
+                }
+                Some(port) => {
+                    if !matches!(port.port_type, weft_core::weft_type::WeftType::List(_)) {
+                        push(d, span_for("over"), Severity::Error, "over-not-a-list",
+                            format!("loop '{gid}': 'over' port '{p}' must be List[T], got {}", port.port_type));
+                    }
+                }
+            }
+        }
+        // Carry ports: the output side is the source of truth; the
+        // input side (synthesized by lowering when not user-declared)
+        // must mirror it. The single home for carry semantics:
+        // lowering only synthesizes, validate reports.
+        for p in &carry {
+            let Some(out_port) = out_node.outputs.iter().find(|x| &x.name == p) else {
+                push(d, span_for("carry"), Severity::Error, "loop-carry-unknown-port",
+                    format!("loop '{gid}': 'carry' references unknown output port '{p}'"));
+                continue;
+            };
+            let Some(in_port) = in_node.inputs.iter().find(|x| &x.name == p) else {
+                // Unreachable when lowering synthesized the input;
+                // reachable if the flattened shape drifted.
+                push(d, span_for("carry"), Severity::Error, "loop-carry-unknown-port",
+                    format!("loop '{gid}': carry port '{p}' has no matching input on the loop"));
+                continue;
+            };
+            if in_port.port_type != out_port.port_type {
+                push(d, span_for("carry"), Severity::Error, "carry-port-type-mismatch",
+                    format!(
+                        "loop '{gid}': carry port '{p}' declared with mismatched types \
+                         (input: {}, output: {}); both sides of a carry port must be the same type",
+                        in_port.port_type, out_port.port_type,
                     ));
             }
         }
     }
 }
 
-fn list_depth(t: &weft_core::weft_type::WeftType) -> usize {
-    let mut depth = 0;
-    let mut cur = t;
-    while let weft_core::weft_type::WeftType::List(inner) = cur {
-        depth += 1;
-        cur = inner;
-    }
-    depth
-}
-
-fn innermost(t: &weft_core::weft_type::WeftType) -> Option<&weft_core::weft_type::WeftType> {
-    let mut cur = t;
-    loop {
-        match cur {
-            weft_core::weft_type::WeftType::List(inner) => cur = inner,
-            other => return Some(other),
-        }
-    }
-}
-
-fn admits_null(t: &weft_core::weft_type::WeftType) -> bool {
+fn is_list_of_nullable(ty: &weft_core::weft_type::WeftType) -> bool {
     use weft_core::weft_type::{WeftPrimitive, WeftType};
-    match t {
+    let WeftType::List(inner) = ty else { return false };
+    match inner.as_ref() {
+        WeftType::Union(members) => members.iter().any(|m| matches!(m, WeftType::Primitive(WeftPrimitive::Null))),
         WeftType::Primitive(WeftPrimitive::Null) => true,
-        WeftType::Union(members) => members.iter().any(admits_null),
         _ => false,
     }
 }

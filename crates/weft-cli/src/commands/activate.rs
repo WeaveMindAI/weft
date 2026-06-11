@@ -8,17 +8,22 @@
 //! sent in the activate body (`reactivateChoice`); the dispatcher's
 //! activate handler decides whether to drain/wipe/keep based on it.
 
+use std::io::{BufRead, Write};
+
 use super::Ctx;
+use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
 use crate::progress::ActionVerb;
 
 pub async fn run(
     ctx: Ctx,
     project: Option<String>,
     reactivate_choice_flag: Option<String>,
+    running_policy: Option<String>,
 ) -> anyhow::Result<()> {
+    let policy = parse_running_policy_flag(running_policy.as_deref())?;
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Activate, |progress| async move {
-        run_inner(&ctx_inner, &progress, project, reactivate_choice_flag).await
+        run_inner(&ctx_inner, &progress, project, reactivate_choice_flag, policy).await
     })
     .await
 }
@@ -28,16 +33,24 @@ async fn run_inner(
     progress: &crate::progress::Progress,
     project: Option<String>,
     reactivate_choice_flag: Option<String>,
+    running_policy: Option<RunningPolicy>,
 ) -> anyhow::Result<()> {
-    let (client, id, name, source_hash, infra_hash) = match project {
-        Some(id) => (ctx.client(), id.clone(), id, None, None),
+    let (client, id, name, binary_hash, definition_hash, infra_hash) = match project {
+        // Activate-by-id skips the build/discover step entirely, so
+        // there's no build gate and the policy can't apply.
+        Some(id) => (ctx.client(), id.clone(), id, None, None, None),
         None => {
-            let handle = super::ensure::ensure_registered(ctx, progress).await?;
+            // reactivates_after_gate=true: the activate POST below
+            // re-enables triggers and replays any parked fires, so a
+            // gate-park needs no user warning.
+            let handle =
+                super::ensure::ensure_registered(ctx, progress, running_policy, true).await?;
             (
                 handle.client,
                 handle.id,
                 handle.name,
-                Some(handle.source_hash),
+                Some(handle.binary_hash),
+                Some(handle.definition_hash),
                 Some(handle.infra_hash),
             )
         }
@@ -62,14 +75,14 @@ async fn run_inner(
     // Only forward hashes when we actually computed them. The
     // "activate by id" path skips the build/discover step and has
     // no hashes to send; posting `null` here would overwrite the
-    // dispatcher's stored `running_source_hash` / `running_infra_hash`
-    // and silently flip drift state to "Resync needed".
-    if let Some(h) = source_hash {
-        body.insert("sourceHash".into(), serde_json::Value::String(h));
-    }
-    if let Some(h) = infra_hash {
-        body.insert("infraHash".into(), serde_json::Value::String(h));
-    }
+    // dispatcher's stored running hashes and silently flip drift
+    // state to "Resync needed".
+    super::ensure::inject_hash_fields_opt(
+        &mut body,
+        binary_hash.as_deref(),
+        definition_hash.as_deref(),
+        infra_hash.as_deref(),
+    );
     if let Some(choice) = reactivate_choice {
         body.insert("reactivateChoice".into(), serde_json::Value::String(choice));
     }
@@ -162,9 +175,8 @@ async fn prompt_reactivate_choice(
     println!("  2) keep_suspended_only            drop parked, keep suspensions");
     println!("  3) wipe_all                       drop everything, fresh start");
     print!("> ");
-    use std::io::{self, BufRead, Write};
-    io::stdout().flush().ok();
-    let stdin = io::stdin();
+    std::io::stdout().flush().ok();
+    let stdin = std::io::stdin();
     let mut line = String::new();
     stdin.lock().read_line(&mut line)?;
     let trimmed = line.trim();

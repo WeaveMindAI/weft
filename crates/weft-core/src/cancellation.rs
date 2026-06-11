@@ -52,19 +52,66 @@ impl CancellationFlag {
     /// Future that resolves the moment the flag is set. Resolves
     /// immediately if already set. Use in `tokio::select!` arms to
     /// race long-running work against cancellation.
+    ///
+    /// Race-safe via `tokio::pin!` + `Notified::enable()`: the
+    /// `notify.notified()` future does NOT register as a waiter until
+    /// it is first polled, and `notify_waiters` stores no permit, so a
+    /// `cancel()` that fires between `notified()` and the await would be
+    /// lost without registration. `enable()` registers synchronously
+    /// before the re-check; any `cancel()` that lands after registration
+    /// wakes the future, any `cancel()` that landed before is caught by
+    /// the post-enable flag read.
     pub async fn cancelled(&self) {
         if self.is_cancelled() {
             return;
         }
-        // Race-free wait: register the notify slot before
-        // re-checking the flag. `notify.notified()` returns a
-        // future that holds a permit slot the moment it's awaited,
-        // so a `cancel()` between the check and the await still
-        // wakes us.
         let waiter = self.notify.notified();
+        tokio::pin!(waiter);
+        waiter.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
         waiter.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for the `Notify::notified()` arm-then-check race under a
+    // multi-threaded tokio runtime: spawn many `cancelled()` waiters and
+    // `cancel()`s in pairs, where each `cancel()` happens AFTER the
+    // waiter is spawned but BEFORE the waiter's underlying `Notified`
+    // future is first polled. With the broken pattern (future created
+    // then awaited without `enable()`, `notify_waiters` storing no
+    // permit), the wait deadlocks. With `pin!` + `enable()` the wait
+    // completes promptly. Stress-looped to surface any future regression
+    // on the first failing CI run rather than waiting for the flake.
+    crate::stress_test!(
+        name: cancelled_does_not_miss_notify_under_multi_thread,
+        runs: 64,
+        worker_threads: 4,
+        async fn body() {
+            for _ in 0..200 {
+                let flag = Arc::new(CancellationFlag::new());
+                let f2 = flag.clone();
+                let wait = tokio::spawn(async move { f2.cancelled().await });
+                let cancel = tokio::spawn(async move { flag.cancel() });
+                let result = tokio::time::timeout(std::time::Duration::from_millis(500), wait)
+                    .await
+                    .expect("cancelled() must not hang under multi-threaded runtime");
+                result.expect("join ok");
+                let _ = cancel.await;
+            }
+        }
+    );
+
+    /// `cancelled()` resolves immediately if the flag is already set.
+    #[tokio::test]
+    async fn cancelled_returns_immediately_when_already_set() {
+        let flag = CancellationFlag::new();
+        flag.cancel();
+        flag.cancelled().await;
     }
 }

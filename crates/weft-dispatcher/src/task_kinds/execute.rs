@@ -11,13 +11,28 @@ use weft_task_store::{CancelExecutionPayload, ExecutionPayload, TaskKind};
 
 /// Enqueue an `execute` task scoped to (project_id, color). Dedup on
 /// color so racing `/run` calls converge.
+///
+/// `definition_hash` is the project row's `running_definition_hash`
+/// at enqueue time; the worker uses it as the broker's
+/// `expected_hash` so the execution runs on the project shape the
+/// user clicked Run against, even when a later edit changes the
+/// hash before the worker claims.
 pub async fn enqueue_execute(
     pool: &sqlx::PgPool,
     project_id: &str,
     color: weft_core::Color,
+    definition_hash: &str,
     tenant_id: Option<&str>,
 ) -> Result<()> {
-    enqueue_execution(pool, TaskKind::Execute, project_id, color, tenant_id).await
+    enqueue_execution(
+        pool,
+        TaskKind::Execute,
+        project_id,
+        color,
+        definition_hash,
+        tenant_id,
+    )
+    .await
 }
 
 /// Enqueue a `resume` task for `color`. Dedup key is `{color}:resume`
@@ -35,9 +50,18 @@ pub async fn enqueue_resume(
     pool: &sqlx::PgPool,
     project_id: &str,
     color: weft_core::Color,
+    definition_hash: &str,
     tenant_id: Option<&str>,
 ) -> Result<()> {
-    enqueue_execution(pool, TaskKind::Resume, project_id, color, tenant_id).await
+    enqueue_execution(
+        pool,
+        TaskKind::Resume,
+        project_id,
+        color,
+        definition_hash,
+        tenant_id,
+    )
+    .await
 }
 
 async fn enqueue_execution(
@@ -45,12 +69,14 @@ async fn enqueue_execution(
     kind: TaskKind,
     project_id: &str,
     color: weft_core::Color,
+    definition_hash: &str,
     tenant_id: Option<&str>,
 ) -> Result<()> {
     let color_str = color.to_string();
     let payload = ExecutionPayload {
         project_id: project_id.to_string(),
         color: color_str.clone(),
+        definition_hash: definition_hash.to_string(),
     };
     let dedup = format!("{color_str}:{}", kind.as_str());
     enqueue_dedup(

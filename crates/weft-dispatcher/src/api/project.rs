@@ -4,16 +4,36 @@
 
 use std::collections::HashSet;
 
-use axum::{extract::{Path, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use weft_core::project::EdgeIndex;
 use weft_core::ProjectDefinition;
 
-use weft_core::primitive::RootSeed;
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
+
+/// One root node that needs to be "kicked into life" at the start of
+/// an execution: a node with no wired inputs in the active subgraph
+/// (a firing trigger, a manual-run entry, an InfraSetup root). The
+/// dispatcher journals one `ExecEvent::NodeKicked` per `Kick`; the
+/// worker's fold turns these into the `kicked` set the scheduler
+/// dispatches at frames=[].
+///
+/// `payload` is the wake event's data (HTTP body, SSE message JSON,
+/// form submission, timer info) ONLY for the firing trigger. Every
+/// other kicked root has `payload: None`.
+#[derive(Debug, Clone)]
+pub struct Kick {
+    pub node_id: String,
+    pub payload: Option<Value>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectSummary {
@@ -54,17 +74,27 @@ pub struct RegisterRequest {
     pub id: uuid::Uuid,
     pub name: String,
     pub definition: ProjectDefinition,
-    /// Source hash of the worker image. CLI computes from project
-    /// source + workspace; dispatcher persists on the project row
-    /// (used as worker docker tag suffix AND as the resync drift
-    /// signal). Optional in tests; production paths always set it.
-    #[serde(default, rename = "sourceHash", alias = "source_hash")]
-    pub source_hash: Option<String>,
+    /// Binary hash of the worker image. CLI computes from engine
+    /// workspace + node-type set + node impls + weft.toml; dispatcher
+    /// persists on the project row (used as worker docker tag
+    /// suffix). Flips on engine / node-impl / type-set changes, NOT
+    /// on per-node config or topology edits. Optional in tests;
+    /// production paths always set it.
+    #[serde(default, rename = "binaryHash")]
+    pub binary_hash: Option<String>,
+    /// Definition hash. CLI computes from the canonical
+    /// `ProjectDefinition` (topology + configs); dispatcher persists
+    /// as the runtime-shape identity. Used as the broker fetch key
+    /// (worker reads it back at execution claim time so the engine
+    /// is guaranteed to run on the version the user clicked Run
+    /// against). Optional in tests; production paths always set it.
+    #[serde(default, rename = "definitionHash")]
+    pub definition_hash: Option<String>,
     /// Infra hash. CLI computes from infra-closure source +
     /// workspace; dispatcher persists for the upgrade drift signal.
     /// Optional in tests; production paths set it whenever they set
-    /// `source_hash` so both signals stay in sync.
-    #[serde(default, rename = "infraHash", alias = "infra_hash")]
+    /// `binary_hash` so all three signals stay in sync.
+    #[serde(default, rename = "infraHash")]
     pub infra_hash: Option<String>,
 }
 
@@ -155,37 +185,39 @@ pub async fn register(
                 }),
             )
         })?;
+    // Single atomic write: project row + history row + three
+    // running-hash pointers commit together (Postgres transaction;
+    // mock simulates in-mem). A pod crash mid-sequence can no longer
+    // leave the project row half-advanced (e.g. binary_hash set but
+    // definition_hash not).
     let summary = state
         .projects
-        .register(project, &name, tenant.as_str(), &project_namespace)
+        .register_with_hashes(
+            project,
+            &name,
+            tenant.as_str(),
+            &project_namespace,
+            req.binary_hash.as_deref(),
+            req.definition_hash.as_deref(),
+            req.infra_hash.as_deref(),
+        )
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(RegisterError {
-                    error: format!("register: {e}"),
+                    error: format!("register_with_hashes: {e}"),
                 }),
             )
         })?;
-    if let Some(hash) = req.source_hash.as_deref() {
-        state
-            .projects
-            .set_running_source_hash(summary.id, hash)
-            .await
-            .map_err(|e| register_internal_error(format!("set_running_source_hash: {e}")))?;
-    }
-    if let Some(hash) = req.infra_hash.as_deref() {
-        state
-            .projects
-            .set_running_infra_hash(summary.id, hash)
-            .await
-            .map_err(|e| register_internal_error(format!("set_running_infra_hash: {e}")))?;
-    }
     state
         .events
         .publish(DispatcherEvent::ProjectRegistered {
             project_id: summary.id.to_string(),
-            name: summary.name.clone(),
+            // User string on a NOTIFY-path event: bound at
+            // construction so the 7800-byte channel cap can't drop
+            // the whole event for sibling pods.
+            name: weft_core::truncate_user_string(&summary.name, 4096),
         })
         .await;
     Ok(Json(ProjectSummary {
@@ -276,11 +308,65 @@ pub struct RunResponse {
     pub color: String,
 }
 
+/// The project's CURRENT definition as one coherent (hash, shape)
+/// pair: read `running_definition_hash` once, then fetch the
+/// definition recorded under THAT hash. Every execution-starting path
+/// MUST use this instead of pairing a live `project_json` read with a
+/// separate hash read: a concurrent re-register between two separate
+/// reads would journal hash B while the kick set was computed from
+/// shape A, and the worker (which fetches the definition BY the
+/// journaled hash) would fold kicks that may not exist in the shape
+/// it actually runs.
+pub(crate) async fn coherent_definition(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+) -> Result<(String, ProjectDefinition), (StatusCode, String)> {
+    let hash = state
+        .projects
+        .running_definition_hash(id)
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("running_definition_hash: {e}"))
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::PRECONDITION_FAILED,
+                format!(
+                    "project {id} has no definition_hash; register the project before \
+                     starting an execution"
+                ),
+            )
+        })?;
+    let json = state
+        .projects
+        .definition_for_hash(id, &hash)
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("definition_for_hash: {e}"))
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "project {id} has no recorded definition for hash {hash}; the \
+                     definition history must cover the running hash"
+                ),
+            )
+        })?;
+    let project: ProjectDefinition = serde_json::from_str(&json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("parse recorded definition {hash}: {e}"),
+        )
+    })?;
+    Ok((hash, project))
+}
+
 /// Start a fresh execution for a registered project.
 ///
 /// Manual-run semantics (see docs/v2-design.md 3.0): collect every
 /// node with `is_output: true`, compute the union of their upstream
-/// subgraphs, find the roots, seed each root with a null-valued pulse.
+/// subgraphs, find the roots, kick each root with a null-valued pulse.
 /// If `body.entry_node` is set, that node's roots are used as a
 /// single-entry override instead (used for debugging a specific
 /// subgraph).
@@ -290,12 +376,7 @@ pub async fn run(
     Json(body): Json<RunRequest>,
 ) -> Result<Json<RunResponse>, (StatusCode, String)> {
     let id = id.parse::<uuid::Uuid>().map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
-    let project = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "project definition missing".into()))?;
+    let (definition_hash, project) = coherent_definition(&state, id).await?;
     let project_id = id.to_string();
 
     // Pre-flight: every `requires_infra` node must be Running. The
@@ -343,8 +424,8 @@ pub async fn run(
         ));
     }
 
-    let seeds = compute_root_seeds(&project, &targets, &body.payload);
-    if seeds.is_empty() {
+    let kicks = compute_root_kicks(&project, &targets, &body.payload);
+    if kicks.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "computed subgraph has no roots; graph may be cyclic or malformed".into(),
@@ -354,12 +435,22 @@ pub async fn run(
     let color = uuid::Uuid::new_v4();
 
     // ExecutionStarted carries a single `entry_node`. When the
-    // subgraph has many roots the first seed's node wins; the
-    // PulseSeeded events below carry the full root set anyway.
-    let entry_node_for_journal = seeds[0].node_id.clone();
+    // subgraph has many roots, the first kick's node wins for display
+    // purposes; the NodeKicked events below carry the full root set.
+    let entry_node_for_journal = kicks[0].node_id.clone();
 
-    // Event-sourced log: execution started + one PulseSeeded event
-    // per root. Replay rebuilds the initial pulse table from these.
+    // Event-sourced log: ExecutionStarted + one NodeKicked per root.
+    // The worker's journal fold turns these into the kicked set the
+    // scheduler dispatches at frames=[].
+    //
+    // `definition_hash` is snapshotted on ExecutionStarted AND on
+    // the enqueued task payload (same value, from the same
+    // `coherent_definition` pair the kicks were computed from). The
+    // journal field is the load-bearing one: a resume task enqueued
+    // LATER (after the user has edited and re-registered) reads the
+    // hash from the journal's ExecutionStarted, NOT from the project
+    // row, so a suspended execution is always resumed against the
+    // shape it was started on.
     let now = crate::lease::now_unix() as u64;
     state
         .journal
@@ -368,38 +459,23 @@ pub async fn run(
             project_id: id.to_string(),
             entry_node: entry_node_for_journal.clone(),
             phase: weft_core::context::Phase::Fire,
+            definition_hash: definition_hash.clone(),
             at_unix: now,
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-    // Mint a pulse_id per seed. Both the journaled `PulseSeeded`
-    // event and the `RootSeed` shipped to the worker carry the
-    // same UUID, so a fresh worker's fold reconstructs the seed
-    // pulse with the same identity the live worker used.
-    let core_seeds: Vec<weft_core::primitive::RootSeed> = seeds
-        .into_iter()
-        .map(|s| weft_core::primitive::RootSeed {
-            node_id: s.node_id,
-            pulse_id: uuid::Uuid::new_v4().to_string(),
-            value: s.value,
-        })
-        .collect();
-    for seed in &core_seeds {
+    for kick in &kicks {
         state
             .journal
-            .record_event(&weft_journal::ExecEvent::PulseSeeded {
+            .record_event(&weft_journal::ExecEvent::NodeKicked {
                 color,
-                pulse_id: seed.pulse_id.clone(),
-                node_id: seed.node_id.clone(),
-                port: "__seed__".to_string(),
-                lane: Vec::new(),
-                value: seed.value.clone(),
+                node_id: kick.node_id.clone(),
+                payload: kick.payload.clone(),
                 at_unix: now,
             })
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     }
-    // The journal already has ExecutionStarted + PulseSeeded above.
     // Enqueue an `execute` task targeted at the worker pool; the
     // cold-start trigger spawns a Pod for this project if none is
     // alive, and the worker's claim loop folds the journal and runs.
@@ -408,6 +484,7 @@ pub async fn run(
         &state.pg_pool,
         &id.to_string(),
         color,
+        &definition_hash,
         Some(tenant.as_str()),
     )
     .await
@@ -417,7 +494,9 @@ pub async fn run(
         .events
         .publish(DispatcherEvent::ExecutionStarted {
             color,
-            entry_node: entry_node_for_journal,
+            // User string on a NOTIFY-path event: bound at
+            // construction (node ids are user-authored).
+            entry_node: weft_core::truncate_user_string(&entry_node_for_journal, 4096),
             project_id: id.to_string(),
         })
         .await;
@@ -425,27 +504,33 @@ pub async fn run(
     Ok(Json(RunResponse { color: color.to_string() }))
 }
 
-/// Compute the set of seed pulses for a manual run. Walks upstream
-/// from each target, collects the nodes in the subgraph, picks the
-/// ones with no incoming edge inside the subgraph as roots, and
-/// returns one seed per root.
+/// Compute the kicks for a manual run. Walks upstream from each
+/// target, collects the subgraph nodes, picks the ones with no
+/// incoming edge inside the subgraph as roots, and returns one `Kick`
+/// per root.
 ///
-/// The `payload` is attached to every seed as-is. Per-trigger mocks
-/// will attach different payloads per root once the mock file format
-/// lands; the seed shape already supports it.
-fn compute_root_seeds(
+/// `payload` lands on every kicked root. Manual runs typically pass
+/// `Value::Null` (no wake payload, just "kick alive"); per-target
+/// mocks may pass a real payload to kick specific roots.
+fn compute_root_kicks(
     project: &ProjectDefinition,
     targets: &[String],
     payload: &Value,
-) -> Vec<RootSeed> {
+) -> Vec<Kick> {
     let edge_idx = EdgeIndex::build(project);
     let in_subgraph = upstream_closure(project, &edge_idx, targets);
     roots_of(project, &edge_idx, &in_subgraph)
         .into_iter()
-        .map(|id| RootSeed {
+        .map(|id| Kick {
             node_id: id,
-            pulse_id: uuid::Uuid::new_v4().to_string(),
-            value: payload.clone(),
+            // Manual-run callers pass `Value::Null` when there's no
+            // payload; convert to `None` so the kick semantics ("no
+            // wake payload") match the journal model.
+            payload: if payload.is_null() {
+                None
+            } else {
+                Some(payload.clone())
+            },
         })
         .collect()
 }
@@ -458,9 +543,9 @@ fn compute_root_seeds(
 /// (supervisor_trigger_deps) need it; one definition, no clones.
 pub use weft_core::project::compute_trigger_deps;
 
-/// Mirror of [`compute_trigger_setup_seeds`] for `Phase::InfraSetup`.
+/// Mirror of [`compute_trigger_setup_kicks`] for `Phase::InfraSetup`.
 ///
-/// Seeds are the roots of the upstream closure of every
+/// Kicks are the roots of the upstream closure of every
 /// `requires_infra` node : NOT the infra nodes themselves. Without
 /// this, "text → compute_url → provision_infra" graphs would skip the
 /// text/compute_url path, and the infra node's `provision()` body
@@ -468,7 +553,7 @@ pub use weft_core::project::compute_trigger_deps;
 ///
 /// Returns an empty vec if the project has no infra nodes (the
 /// caller short-circuits : no InfraSetup execution needed).
-pub fn compute_infra_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
+pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
     let edge_idx = EdgeIndex::build(project);
     let infra: Vec<String> = project
         .nodes
@@ -482,15 +567,14 @@ pub fn compute_infra_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
     let in_subgraph = upstream_closure(project, &edge_idx, &infra);
     roots_of(project, &edge_idx, &in_subgraph)
         .into_iter()
-        .map(|id| RootSeed {
+        .map(|id| Kick {
             node_id: id,
-            pulse_id: uuid::Uuid::new_v4().to_string(),
-            value: Value::Null,
+            payload: None,
         })
         .collect()
 }
 
-/// Seeds for a TriggerSetup-phase sub-execution.
+/// Kicks for a TriggerSetup-phase sub-execution.
 ///
 /// Target set = every trigger node. Walk upstream (no terminators);
 /// every node in the closure runs. Triggers call `ctx.register_signal`
@@ -499,7 +583,7 @@ pub fn compute_infra_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
 ///
 /// Returns an empty vec if the project has no triggers (activate is
 /// a no-op in that case).
-pub fn compute_trigger_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed> {
+pub fn compute_trigger_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
     let edge_idx = EdgeIndex::build(project);
 
     // A node counts as a trigger iff its metadata sets
@@ -519,57 +603,51 @@ pub fn compute_trigger_setup_seeds(project: &ProjectDefinition) -> Vec<RootSeed>
     let in_subgraph = upstream_closure(project, &edge_idx, &triggers);
     roots_of(project, &edge_idx, &in_subgraph)
         .into_iter()
-        .map(|id| RootSeed {
+        .map(|id| Kick {
             node_id: id,
-            pulse_id: uuid::Uuid::new_v4().to_string(),
-            value: Value::Null,
+            payload: None,
         })
         .collect()
 }
 
 /// Spawn a worker to run the InfraSetup sub-execution for every
 /// `requires_infra` node in the project and wait for it to complete.
-/// Seeds the upstream-closure roots so programmatic-infra patterns
+/// Kicks the upstream-closure roots so programmatic-infra patterns
 /// (text → compute → infra) flow values into the infra body.
 pub async fn run_infra_setup(
     state: &DispatcherState,
     project_id_uuid: uuid::Uuid,
 ) -> Result<(), (StatusCode, String)> {
-    let project = state
-        .projects
-        .project(project_id_uuid)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let seeds = compute_infra_setup_seeds(&project);
-    if seeds.is_empty() {
+    // One coherent (hash, shape) pair: the kicks below and the
+    // journaled/enqueued hash must come from the SAME definition (see
+    // `coherent_definition`).
+    let (definition_hash, project) = coherent_definition(state, project_id_uuid).await?;
+    let kicks = compute_infra_setup_kicks(&project);
+    if kicks.is_empty() {
         return Ok(());
     }
     let project_id = project_id_uuid.to_string();
     let color = uuid::Uuid::new_v4();
     let now = crate::lease::now_unix() as u64;
-
     state
         .journal
         .record_event(&weft_journal::ExecEvent::ExecutionStarted {
             color,
             project_id: project_id.clone(),
-            entry_node: seeds[0].node_id.clone(),
+            entry_node: kicks[0].node_id.clone(),
             phase: weft_core::context::Phase::InfraSetup,
+            definition_hash: definition_hash.clone(),
             at_unix: now,
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-    for seed in &seeds {
+    for kick in &kicks {
         state
             .journal
-            .record_event(&weft_journal::ExecEvent::PulseSeeded {
+            .record_event(&weft_journal::ExecEvent::NodeKicked {
                 color,
-                pulse_id: seed.pulse_id.clone(),
-                node_id: seed.node_id.clone(),
-                port: "__seed__".to_string(),
-                lane: Vec::new(),
-                value: seed.value.clone(),
+                node_id: kick.node_id.clone(),
+                payload: kick.payload.clone(),
                 at_unix: now,
             })
             .await
@@ -583,18 +661,34 @@ pub async fn run_infra_setup(
         &state.pg_pool,
         &project_id,
         color,
+        &definition_hash,
         Some(tenant.as_str()),
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue execute: {e}")))?;
 
-    // Wait for completion. The broadcast channel returns Err on
-    // lag or close; treat both as transient and keep waiting (the
-    // deadline backstops runaway work).
-    let deadline = tokio::time::sleep(std::time::Duration::from_secs(300));
-    tokio::pin!(deadline);
+    // Wait for completion. NO deadline: the InfraSetup execution runs
+    // user-authored upstream nodes (text -> compute -> infra), and
+    // user code may legitimately be slow; a hard cap would refuse
+    // legitimate provisioning. Instead, a periodic breadcrumb keeps
+    // the stuck-state legible in the dispatcher logs, and the user
+    // can always cancel the execution (`weft stop`) to unblock.
+    let started = std::time::Instant::now();
+    let mut breadcrumb = tokio::time::interval(std::time::Duration::from_secs(30));
+    breadcrumb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    breadcrumb.tick().await; // the first tick fires immediately; skip it
     loop {
         tokio::select! {
+            _ = breadcrumb.tick() => {
+                tracing::info!(
+                    target: "weft_dispatcher::infra_setup",
+                    project_id = %project_id,
+                    color = %color,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "infra setup still running; waiting on the InfraSetup execution \
+                     (cancel it with `weft stop` to unblock)"
+                );
+            }
             res = events.recv() => {
                 match res {
                     Ok(crate::events::DispatcherEvent::ExecutionCompleted { color: c, .. })
@@ -640,22 +734,16 @@ pub async fn run_infra_setup(
                     }
                 }
             }
-            _ = &mut deadline => {
-                return Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "infra setup timed out after 300s".into(),
-                ));
-            }
         }
     }
 }
 
-/// Seeds for a trigger fire.
+/// Kicks for a trigger fire.
 ///
 /// Rule: walk upstream from every output node, but treat trigger
 /// nodes as terminators. A node ends up in the fire-time subgraph
 /// iff it is reachable upstream from some output WITHOUT passing
-/// through a trigger. Triggers themselves are included as seeds
+/// through a trigger. Triggers themselves are included as kicks
 /// (the firing trigger carries the payload; other triggers reachable
 /// in the subgraph carry null).
 ///
@@ -667,11 +755,11 @@ pub async fn run_infra_setup(
 ///
 /// Returns an empty vec if no output is reachable via a non-trigger
 /// path; the caller treats that as "nothing to run."
-pub fn compute_trigger_seeds(
+pub fn compute_trigger_kicks(
     project: &ProjectDefinition,
     firing_node_id: &str,
     payload: &Value,
-) -> Vec<RootSeed> {
+) -> Vec<Kick> {
     let edge_idx = EdgeIndex::build(project);
 
     // Set of trigger nodes (`features.is_trigger`). All trigger
@@ -716,16 +804,15 @@ pub fn compute_trigger_seeds(
     roots_of_with_forced(project, &edge_idx, &in_subgraph, &triggers)
         .into_iter()
         .map(|id| {
-            let value = if id == firing_node_id {
-                payload.clone()
+            // Only the firing trigger carries a wake payload. Other
+            // roots get `None`: they're "kick alive" entries with no
+            // wake event of their own.
+            let payload = if id == firing_node_id {
+                Some(payload.clone())
             } else {
-                Value::Null
+                None
             };
-            RootSeed {
-                node_id: id,
-                pulse_id: uuid::Uuid::new_v4().to_string(),
-                value,
-            }
+            Kick { node_id: id, payload }
         })
         .collect()
 }
@@ -742,7 +829,7 @@ fn upstream_closure(
 
 /// BFS upstream from `targets`, but do not walk through any node in
 /// `stop_at`. Stopped nodes are still included in the returned set
-/// (so they can be seeded as roots), but their incoming edges are
+/// (so they can be kicked as roots), but their incoming edges are
 /// not followed. Used by the fire-time subgraph so triggers act as
 /// terminators.
 fn upstream_closure_stop_at(
@@ -770,7 +857,7 @@ fn upstream_closure_stop_at(
 }
 
 /// Nodes of `in_subgraph` whose incoming edges all come from
-/// outside the subgraph. These are the pulse-seed points for a
+/// outside the subgraph. These are the pulse-kick points for a
 /// fresh run.
 fn roots_of(
     project: &ProjectDefinition,
@@ -783,7 +870,7 @@ fn roots_of(
 /// Like `roots_of`, but nodes in `force_roots` are always treated
 /// as roots regardless of their in-subgraph parents. Used at fire
 /// time so triggers (which are terminators, not computed from their
-/// inputs at fire time) always end up as seed roots.
+/// inputs at fire time) always end up as kick roots.
 fn roots_of_with_forced(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
@@ -894,10 +981,18 @@ pub struct ProjectDrift {
     /// "Infra is stale relative to source." Drives the Upgrade
     /// button. Computed from desired_infra_hash != running_infra_hash.
     pub infra_drift: bool,
-    /// "Worker source is stale relative to running deployment."
-    /// Drives the Resync button. Computed from desired_source_hash
-    /// != running_source_hash.
-    pub source_drift: bool,
+    /// "Worker BINARY needs rebuilding." Computed from
+    /// desired_binary_hash != running_binary_hash. Flips on engine /
+    /// node-impl / type-set / weft.toml edits; the dialog before
+    /// running asks the user about killing running executions when
+    /// this drift is non-zero.
+    pub binary_drift: bool,
+    /// "Project SHAPE has changed." Computed from
+    /// desired_definition_hash != running_definition_hash. A pure
+    /// config / topology edit flips this without flipping
+    /// `binary_drift`; the next execution picks up the new
+    /// definition via the worker's broker fetch.
+    pub definition_drift: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -925,15 +1020,22 @@ pub struct ProjectExecutionsSummary {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct StatusQuery {
-    /// Source hash the CLI computed for the current project source.
-    /// Compared against `project.running_source_hash` for the resync
-    /// drift signal.
-    #[serde(default, rename = "desiredSourceHash", alias = "desired_source_hash")]
-    pub desired_source_hash: Option<String>,
+    /// Binary hash the CLI computed for the current build inputs.
+    /// Compared against `project.running_binary_hash` to surface
+    /// "the worker image needs rebuilding" drift.
+    #[serde(default, rename = "desiredBinaryHash")]
+    pub desired_binary_hash: Option<String>,
+    /// Definition hash the CLI computed for the current canonical
+    /// `ProjectDefinition`. Compared against
+    /// `project.running_definition_hash` to surface "the project
+    /// shape has changed" drift (a config / topology edit that
+    /// hasn't been resynced into the running deployment).
+    #[serde(default, rename = "desiredDefinitionHash")]
+    pub desired_definition_hash: Option<String>,
     /// Infra hash the CLI computed for the current infra closure.
     /// Compared against `project.running_infra_hash` for the upgrade
     /// drift signal.
-    #[serde(default, rename = "desiredInfraHash", alias = "desired_infra_hash")]
+    #[serde(default, rename = "desiredInfraHash")]
     pub desired_infra_hash: Option<String>,
 }
 
@@ -942,26 +1044,65 @@ pub struct StatusQuery {
 /// executions, drift signals (when desired hashes are passed in
 /// query params), and the list of currently-valid action verbs.
 /// One response, no stitching required by the CLI.
+/// Error envelope for the `status` handler. Most arms are a plain
+/// `(StatusCode, String)` (via `From`, so existing `.map_err`
+/// closures are unchanged); the one special case is `ProjectMissing`,
+/// which renders a 404 carrying the `x-weft-not-found: project`
+/// marker header. The CLI's build gate keys on that header to tell a
+/// genuine never-registered project (safe to skip the gate, no
+/// running executions on the old image) apart from a bare routing
+/// 404 from a version-skewed dispatcher (which must bubble, not
+/// silently bypass the gate).
+pub enum StatusError {
+    /// The project row genuinely does not exist. Marker header set.
+    ProjectMissing,
+    /// Any other failure: status + body, no marker.
+    Other(StatusCode, String),
+}
+
+impl From<(StatusCode, String)> for StatusError {
+    fn from((code, msg): (StatusCode, String)) -> Self {
+        StatusError::Other(code, msg)
+    }
+}
+
+impl IntoResponse for StatusError {
+    fn into_response(self) -> Response {
+        match self {
+            StatusError::ProjectMissing => (
+                StatusCode::NOT_FOUND,
+                [("x-weft-not-found", "project")],
+                "project not found",
+            )
+                .into_response(),
+            StatusError::Other(code, msg) => (code, msg).into_response(),
+        }
+    }
+}
+
 pub async fn status(
     State(state): State<DispatcherState>,
     Path(id_str): Path<String>,
     axum::extract::Query(query): axum::extract::Query<StatusQuery>,
-) -> Result<Json<ProjectStatusResponse>, (StatusCode, String)> {
+) -> Result<Json<ProjectStatusResponse>, StatusError> {
     let id = id_str
         .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".to_string()))?;
     let summary = state
         .projects
         .get(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+        .ok_or(StatusError::ProjectMissing)?;
     let project = state
         .projects
         .project(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project definition missing".into()))?;
+        // A registered project missing its definition is a real
+        // inconsistency, NOT "no such project": Other (no marker), so
+        // the CLI bubbles it loudly instead of skipping the gate.
+        .ok_or((StatusCode::NOT_FOUND, "project definition missing".to_string()))?;
     let project_id = id.to_string();
     let tenant = state.tenant_router.tenant_for_project(&project_id);
     let listener_running = state
@@ -1087,17 +1228,27 @@ pub async fn status(
         last_status: last.map(|l| l.status.clone()),
     };
 
-    let source_hash = state
+    let binary_hash = state
         .projects
-        .running_source_hash(id)
+        .running_binary_hash(id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_source_hash: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_binary_hash: {e}")))?;
+    let definition_hash = state
+        .projects
+        .running_definition_hash(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_definition_hash: {e}")))?;
     let infra_hash = state
         .projects
         .running_infra_hash(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_infra_hash: {e}")))?;
-    let drift = compute_drift(&query, source_hash.as_deref(), infra_hash.as_deref());
+    let drift = compute_drift(
+        &query,
+        binary_hash.as_deref(),
+        definition_hash.as_deref(),
+        infra_hash.as_deref(),
+    );
     let lifecycle = state
         .projects
         .lifecycle(id)
@@ -1107,7 +1258,7 @@ pub async fn status(
     let preservation = preservation_counts(&state, &project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("preservation_counts: {e}")))?;
-    let running_now = running_count(&state, &project_id)
+    let running_now = running_count(&state, &project_id, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}")))?;
     let available_actions = compute_available_actions(
@@ -1133,7 +1284,8 @@ pub async fn status(
         infra_rollup,
         drift: ProjectDrift {
             infra_drift: drift.infra_drift,
-            source_drift: drift.source_drift,
+            binary_drift: drift.binary_drift,
+            definition_drift: drift.definition_drift,
         },
         available_actions,
         preservation,
@@ -1169,13 +1321,21 @@ async fn preservation_counts(
 /// comparison is a string equality check.
 fn compute_drift(
     query: &StatusQuery,
-    running_source_hash: Option<&str>,
+    running_binary_hash: Option<&str>,
+    running_definition_hash: Option<&str>,
     running_infra_hash: Option<&str>,
 ) -> DriftBits {
-    // Source drift: only meaningful when both sides have a hash.
-    // No running hash means the project was never built/activated;
-    // the action bar shouldn't surface resync drift then.
-    let source_drift = match (query.desired_source_hash.as_deref(), running_source_hash) {
+    // Each drift bit is only meaningful when both sides have a
+    // hash. No running hash means the project was never built /
+    // activated; the action bar shouldn't surface drift then.
+    let binary_drift = match (query.desired_binary_hash.as_deref(), running_binary_hash) {
+        (Some(want), Some(have)) => want != have,
+        _ => false,
+    };
+    let definition_drift = match (
+        query.desired_definition_hash.as_deref(),
+        running_definition_hash,
+    ) {
         (Some(want), Some(have)) => want != have,
         _ => false,
     };
@@ -1183,13 +1343,18 @@ fn compute_drift(
         (Some(want), Some(have)) => want != have,
         _ => false,
     };
-    DriftBits { infra_drift, source_drift }
+    DriftBits {
+        infra_drift,
+        binary_drift,
+        definition_drift,
+    }
 }
 
 #[derive(Default, Clone, Copy)]
-struct DriftBits {
-    infra_drift: bool,
-    source_drift: bool,
+pub(crate) struct DriftBits {
+    pub infra_drift: bool,
+    pub binary_drift: bool,
+    pub definition_drift: bool,
 }
 
 /// Build the action list from the project's full lifecycle. Each
@@ -1246,7 +1411,12 @@ fn compute_available_actions(
     match lifecycle.status {
         ProjectStatus::Active => {
             out.push("deactivate".to_string());
-            if drift.source_drift {
+            // Resync if the project's RUNTIME shape drifted (config
+            // / topology edit). Binary drift alone does NOT light
+            // resync: a binary-only change rebuilds the image but
+            // doesn't need the user to re-register triggers; the
+            // next `weft run` picks up the new image.
+            if drift.definition_drift {
                 out.push("resync".to_string());
             }
         }
@@ -1338,7 +1508,7 @@ fn compute_available_actions(
     out
 }
 
-/// Body for `POST /projects/{id}/activate`. Optional `sourceHash`
+/// Body for `POST /projects/{id}/activate`. Optional `binaryHash`
 /// refreshes the running image-tag for the next worker spawn.
 ///
 /// `reactivateChoice` matters only when there's preserved state
@@ -1364,11 +1534,13 @@ fn compute_available_actions(
 /// activate is a fresh boot.
 #[derive(Debug, Default, Deserialize)]
 pub struct ActivateRequest {
-    #[serde(default, rename = "sourceHash", alias = "source_hash")]
-    pub source_hash: Option<String>,
-    #[serde(default, rename = "infraHash", alias = "infra_hash")]
+    #[serde(default, rename = "binaryHash")]
+    pub binary_hash: Option<String>,
+    #[serde(default, rename = "definitionHash")]
+    pub definition_hash: Option<String>,
+    #[serde(default, rename = "infraHash")]
     pub infra_hash: Option<String>,
-    #[serde(default, rename = "reactivateChoice", alias = "reactivate_choice")]
+    #[serde(default, rename = "reactivateChoice")]
     pub reactivate_choice: Option<String>,
 }
 
@@ -1380,11 +1552,24 @@ pub async fn activate(
     let id = id_str
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
-    let (source_hash, infra_hash, reactivate_choice) = match body {
-        Some(Json(b)) => (b.source_hash, b.infra_hash, b.reactivate_choice),
-        None => (None, None, None),
+    let (binary_hash, definition_hash, infra_hash, reactivate_choice) = match body {
+        Some(Json(b)) => (
+            b.binary_hash,
+            b.definition_hash,
+            b.infra_hash,
+            b.reactivate_choice,
+        ),
+        None => (None, None, None, None),
     };
-    activate_inner(&state, id, source_hash, infra_hash, reactivate_choice).await
+    activate_inner(
+        &state,
+        id,
+        binary_hash,
+        definition_hash,
+        infra_hash,
+        reactivate_choice,
+    )
+    .await
 }
 
 /// How `activate_inner` must roll back a failed Activating-window.
@@ -1432,6 +1617,7 @@ async fn activate_trigger_setup_window(
     namespace: &str,
     choice: &str,
     project: &ProjectDefinition,
+    definition_hash: &str,
 ) -> Result<(), ActivateWindowError> {
     // Failures up to (not including) run_trigger_setup haven't touched
     // signal state, so they only need the status un-stuck.
@@ -1466,11 +1652,15 @@ async fn activate_trigger_setup_window(
     // node_id), so existing rows from before a deactivate get
     // spec/mount/auth refreshed in place; the token survives, so
     // parked_fires still attached drain cleanly later.
-    let seeds = compute_trigger_setup_seeds(project);
-    if !seeds.is_empty() {
-        run_trigger_setup(state, id, seeds).await.map_err(|(status, msg, ts_color)| {
-            ActivateWindowError { status, msg, rollback: ActivateRollback::WipeSignals { ts_color } }
-        })?;
+    let kicks = compute_trigger_setup_kicks(project);
+    if !kicks.is_empty() {
+        run_trigger_setup(state, id, kicks, definition_hash).await.map_err(
+            |(status, msg, ts_color)| ActivateWindowError {
+                status,
+                msg,
+                rollback: ActivateRollback::WipeSignals { ts_color },
+            },
+        )?;
     }
 
     // From here trigger-setup succeeded but signals are registered, so
@@ -1538,31 +1728,27 @@ async fn activate_trigger_setup_window(
 pub async fn activate_inner(
     state: &DispatcherState,
     id: uuid::Uuid,
-    source_hash: Option<String>,
+    binary_hash: Option<String>,
+    definition_hash: Option<String>,
     infra_hash: Option<String>,
     reactivate_choice: Option<String>,
 ) -> Result<Json<ActivateResponse>, (StatusCode, String)> {
-    if let Some(hash) = source_hash.as_deref() {
-        state
-            .projects
-            .set_running_source_hash(id, hash)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_source_hash: {e}")))?;
-    }
-    if let Some(hash) = infra_hash.as_deref() {
-        state
-            .projects
-            .set_running_infra_hash(id, hash)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_infra_hash: {e}")))?;
-    }
-
-    let project = state
+    state
         .projects
-        .project(id)
+        .set_running_hashes(
+            id,
+            binary_hash.as_deref(),
+            definition_hash.as_deref(),
+            infra_hash.as_deref(),
+        )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_hashes: {e}")))?;
+
+    // One coherent (hash, shape) pair for everything below: the
+    // trigger checks here AND the kicks the activate window computes
+    // must come from the definition recorded under the hash that
+    // trigger-setup will journal (see `coherent_definition`).
+    let (running_definition_hash, project) = coherent_definition(state, id).await?;
     let project_id = id.to_string();
 
     // Activate is the trigger-setup verb. A project without any
@@ -1607,10 +1793,10 @@ pub async fn activate_inner(
         ));
     }
 
-    // A source-hash change must kill the stale-image worker before
+    // A binary-hash change must kill the stale-image worker before
     // the activate's TriggerSetup exec runs, otherwise it's
     // dispatched against a worker that doesn't know about the new
-    // trigger nodes. Idempotent (kill-by-source-hash + respawn), so
+    // trigger nodes. Idempotent (kill-by-binary-hash + respawn), so
     // it's safe before the single-flight CAS: two concurrent
     // activates both calling it is harmless, and keeping it before
     // the CAS means its failure leaves the project in its original
@@ -1679,6 +1865,7 @@ pub async fn activate_inner(
     // can't forget the un-stick.
     let setup = activate_trigger_setup_window(
         &state, id, &project_id, &tenant, &namespace, choice, &project,
+        &running_definition_hash,
     )
     .await;
     if let Err(ActivateWindowError { status, msg, rollback }) = setup {
@@ -1725,8 +1912,11 @@ pub async fn activate_inner(
             .events
             .publish(DispatcherEvent::TriggerUrlChanged {
                 project_id: project_id.clone(),
-                node_id: url.node_id.clone(),
-                url: url.url.clone(),
+                // User strings on a NOTIFY-path event: node ids are
+                // user-authored and the url embeds the user's mount
+                // path. Bound at construction.
+                node_id: weft_core::truncate_user_string(&url.node_id, 4096),
+                url: weft_core::truncate_user_string(&url.url, 4096),
             })
             .await;
     }
@@ -1845,7 +2035,7 @@ async fn drain_parked_fires(
 /// established the row has fires and is unclaimed. Idempotent under
 /// retry: if the row's queue becomes empty mid-loop (e.g. another
 /// drain raced; or our pop sequence finished), we exit cleanly.
-async fn drain_one_token(
+pub(crate) async fn drain_one_token(
     state: &DispatcherState,
     project_id: &str,
     token: &str,
@@ -1907,6 +2097,9 @@ async fn drain_one_token(
             serde_json::from_value(head).map_err(|e| {
                 anyhow::anyhow!("malformed parked_fires element for token {token}: {e}")
             })?;
+        // Keep the id: the dispatch moves `fire.payload`, and we need the
+        // id afterward to remove this exact element by id.
+        let fire_id = fire.id.clone();
 
         match crate::api::signal::dispatch_listener_outcome(
             state,
@@ -1918,23 +2111,24 @@ async fn drain_one_token(
         .await
         {
             Ok(_) => {
-                // Pop the head, FENCED on our claim nonce. `- 0::int`
-                // is the unambiguous form of `jsonb_array - integer_index`
-                // (plain `- 0` is ambiguous with `jsonb_object - text_key`
-                // under some inference paths). If `drain_claimed_by` is
-                // no longer ours, a sibling took over after a stale-claim
-                // sweep: 0 rows affected -> abort without popping (the
-                // element we just dispatched dedups at the task table via
-                // ParkedFire.id, and the new owner re-drives from head).
-                let popped = sqlx::query(
-                    "UPDATE signal SET parked_fires = parked_fires - 0::int \
-                     WHERE token = $1 AND drain_claimed_by = $2",
+                // Remove the element we just dispatched BY ID (not by
+                // array index), FENCED on our claim nonce. By-id removal
+                // commutes with a concurrent success-path removal of a
+                // different fire, so a sibling removing the head out from
+                // under us can't make us delete the wrong element (the
+                // old index-0 pop assumed a head-stable array, which the
+                // route_entry success-path removal breaks). If our claim
+                // was taken over (0 rows), abort: the dispatched element
+                // dedups at the task table via its fire id, and the new
+                // owner re-drives.
+                let removed = crate::api::signal::remove_parked_fire(
+                    &state.pg_pool,
+                    token,
+                    &fire_id,
+                    Some(&owner),
                 )
-                .bind(token)
-                .bind(&owner)
-                .execute(&state.pg_pool)
                 .await?;
-                if popped.rows_affected() == 0 {
+                if removed == 0 {
                     break Ok(());
                 }
             }
@@ -2314,11 +2508,12 @@ pub async fn resync(
 /// User-initiated deactivates use the parameterized variant via
 /// the API handler.
 /// Replace the project's alive worker pod when its baked-in
-/// source_hash no longer matches the project's current
-/// `running_source_hash`. The worker binary embeds the project
-/// definition at compile time (codegen bakes `project.json` into the
-/// binary), so a worker spawned before the user added a node will
-/// never see that node.
+/// binary_hash no longer matches the project's current
+/// `running_binary_hash`. The worker binary embeds the engine +
+/// node implementations at compile time, so a worker spawned before
+/// a node-impl edit or engine bump runs the old code. Pure
+/// definition edits (config / topology) do NOT trigger this: the
+/// worker re-fetches the definition per execution claim.
 ///
 /// Order matters here. If we killed the old pod first and then waited
 /// for cold_start to spawn a replacement, the next enqueued worker
@@ -2331,7 +2526,7 @@ pub async fn resync(
 /// killing the stale pod once the new one is alive.
 ///
 /// Idempotent: a no-op when hashes match or no pod is alive. Safe to
-/// call from every path that updates `running_source_hash`.
+/// call from every path that updates `running_binary_hash`.
 pub async fn replace_stale_worker_if_needed(
     state: &DispatcherState,
     project_id: &str,
@@ -2346,7 +2541,7 @@ pub async fn replace_stale_worker_if_needed(
     // pod (false negative). `Ok(None)` is fine ("never set"); the
     // hash comparison treats it as empty.
     // No live worker: nothing to compare against. Skip without
-    // consulting the source hash: a None hash with no live worker
+    // consulting the binary hash: a None hash with no live worker
     // is a legitimate "project just registered, no sync run yet"
     // state (sync writes the hash before any task that would
     // spawn). With a live worker, we need a hash to decide whether
@@ -2359,12 +2554,12 @@ pub async fn replace_stale_worker_if_needed(
     };
     let want_hash = state
         .projects
-        .running_source_hash(project_uuid)
+        .running_binary_hash(project_uuid)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "replace_stale_worker: project {project_id} has a live worker but no \
-                 running_source_hash; sync ordering invariant broken"
+                 running_binary_hash; sync ordering invariant broken"
             )
         })?;
     if have_hash == want_hash {
@@ -2376,7 +2571,7 @@ pub async fn replace_stale_worker_if_needed(
         stale_pod = %stale_pod_name,
         have_hash = %have_hash,
         want_hash = %want_hash,
-        "replacing stale-image worker pod after source_hash change"
+        "replacing stale-image worker pod after binary_hash change"
     );
 
     // Step 1: kill the stale pod ourselves. The `spawn_pod` task
@@ -2597,7 +2792,7 @@ pub async fn deactivate_project_with_mode(
         // Wait mode: if there's actually nothing running, fast-path
         // the CAS to Inactive so the user doesn't see a transient
         // Deactivating that's already done.
-        let running_now = running_count(state, &project_id)
+        let running_now = running_count(state, &project_id, None)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}")))?;
         if running_policy == RunningPolicy::Wait
@@ -2731,21 +2926,60 @@ async fn suspended_color_set(
 }
 
 /// Count how many non-settled non-suspended executions a project
-/// has right now. `0` means deactivate-with-wait can flip status to
-/// Inactive immediately.
+/// has right now, PLUS in-flight task rows that are about to become
+/// one. `0` means deactivate-with-wait can flip status to Inactive
+/// immediately.
+///
+/// The task rows matter for the lifecycle CAS: a `route_entry` task
+/// is a fire that passed the gate but has not journaled
+/// `ExecutionStarted` yet, and a pending `resume` task belongs to a
+/// color the suspended-set still excludes. Counting only the
+/// journal would let the CAS flip a project Inactive while such a
+/// fire is mid-route. Colors are unioned (a journaled color with a
+/// live execute task counts once); colorless `route_entry` rows add
+/// one each (each will mint a distinct color).
+///
+/// `exclude_task`: discount one still-claimed task row; see
+/// `journal_bridge::try_finish_drain`.
 pub(crate) async fn running_count(
     state: &DispatcherState,
     project_id: &str,
+    exclude_task: Option<uuid::Uuid>,
 ) -> anyhow::Result<usize> {
     let suspended_colors = suspended_color_set(state, project_id).await?;
     let colors = state
         .journal
         .list_non_terminal_colors_for_project(project_id)
         .await?;
-    Ok(colors
+    let mut running: std::collections::HashSet<weft_core::Color> = colors
         .into_iter()
         .filter(|c| !suspended_colors.contains(c))
-        .count())
+        .collect();
+    let task_rows: Vec<(uuid::Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, color FROM task \
+         WHERE project_id = $1 \
+           AND kind IN ('route_entry', 'execute', 'resume') \
+           AND status IN ('pending', 'claimed')",
+    )
+    .bind(project_id)
+    .fetch_all(&state.pg_pool)
+    .await?;
+    let mut colorless = 0usize;
+    for (task_id, color) in task_rows {
+        if Some(task_id) == exclude_task {
+            continue;
+        }
+        match color {
+            Some(c) => {
+                let parsed: weft_core::Color = c
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("corrupt task.color '{c}': {e}"))?;
+                running.insert(parsed);
+            }
+            None => colorless += 1,
+        }
+    }
+    Ok(running.len() + colorless)
 }
 
 /// Spawn a worker for the TriggerSetup sub-execution and block
@@ -2755,33 +2989,35 @@ pub(crate) async fn running_count(
 async fn run_trigger_setup(
     state: &DispatcherState,
     project_id_uuid: uuid::Uuid,
-    seeds: Vec<RootSeed>,
+    kicks: Vec<Kick>,
+    // The hash of the SAME definition the caller computed `kicks`
+    // from (one `coherent_definition` pair). Reading the project
+    // row's hash here instead would race a concurrent re-register:
+    // kicks from shape A journaled under hash B.
+    definition_hash: &str,
 ) -> Result<(), (StatusCode, String, Option<weft_core::Color>)> {
     let project_id = project_id_uuid.to_string();
     let color = uuid::Uuid::new_v4();
     let now = crate::lease::now_unix() as u64;
-
     state
         .journal
         .record_event(&weft_journal::ExecEvent::ExecutionStarted {
             color,
             project_id: project_id.clone(),
-            entry_node: seeds[0].node_id.clone(),
+            entry_node: kicks[0].node_id.clone(),
             phase: weft_core::context::Phase::TriggerSetup,
+            definition_hash: definition_hash.to_string(),
             at_unix: now,
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}"), Some(color)))?;
-    for seed in &seeds {
+    for kick in &kicks {
         state
             .journal
-            .record_event(&weft_journal::ExecEvent::PulseSeeded {
+            .record_event(&weft_journal::ExecEvent::NodeKicked {
                 color,
-                pulse_id: seed.pulse_id.clone(),
-                node_id: seed.node_id.clone(),
-                port: "__seed__".to_string(),
-                lane: Vec::new(),
-                value: seed.value.clone(),
+                node_id: kick.node_id.clone(),
+                payload: kick.payload.clone(),
                 at_unix: now,
             })
             .await
@@ -2797,6 +3033,7 @@ async fn run_trigger_setup(
         &state.pg_pool,
         &project_id,
         color,
+        &definition_hash,
         Some(tenant.as_str()),
     )
     .await
@@ -2902,7 +3139,7 @@ async fn collect_listener_urls(
 // `crate::lease::now_unix` is the canonical wall-clock reader.
 
 #[cfg(test)]
-mod trigger_seed_tests {
+mod trigger_kick_tests {
     use super::*;
 
     /// Build a minimal ProjectDefinition from a JSON spec. Tests
@@ -2944,8 +3181,8 @@ mod trigger_seed_tests {
         serde_json::from_value(body).expect("valid test project")
     }
 
-    fn ids(seeds: &[RootSeed]) -> Vec<String> {
-        let mut v: Vec<String> = seeds.iter().map(|s| s.node_id.clone()).collect();
+    fn ids(kicks: &[Kick]) -> Vec<String> {
+        let mut v: Vec<String> = kicks.iter().map(|k| k.node_id.clone()).collect();
         v.sort();
         v
     }
@@ -2964,13 +3201,13 @@ mod trigger_seed_tests {
             ],
             &[("a", "trigger_x"), ("trigger_x", "b"), ("b", "out")],
         );
-        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::String("payload".into()));
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()));
         assert_eq!(
-            ids(&seeds),
+            ids(&kicks),
             vec!["trigger_x".to_string()],
-            "only the firing trigger should be a seed"
+            "only the firing trigger should be a kick"
         );
-        assert_eq!(seeds[0].value, Value::String("payload".into()));
+        assert_eq!(kicks[0].payload, Some(Value::String("payload".into())));
     }
 
     #[test]
@@ -2996,25 +3233,25 @@ mod trigger_seed_tests {
                 ("b", "out"),
             ],
         );
-        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::String("payload".into()));
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()));
         assert_eq!(
-            ids(&seeds),
+            ids(&kicks),
             vec!["a".to_string(), "trigger_x".to_string()],
             "A must run via its non-trigger path; trigger carries payload"
         );
-        for s in &seeds {
-            if s.node_id == "trigger_x" {
-                assert_eq!(s.value, Value::String("payload".into()));
+        for k in &kicks {
+            if k.node_id == "trigger_x" {
+                assert_eq!(k.payload, Some(Value::String("payload".into())));
             } else {
-                assert_eq!(s.value, Value::Null);
+                assert_eq!(k.payload, None);
             }
         }
     }
 
     #[test]
-    fn non_firing_triggers_in_subgraph_get_null() {
+    fn non_firing_triggers_in_subgraph_get_no_payload() {
         // TriggerX ──► Out ◄── TriggerY
-        // Firing TriggerX: TriggerY still gets seeded (with null)
+        // Firing TriggerX: TriggerY still gets kicked (without payload)
         // because it's reachable upstream from Out.
         let p = project(
             &[
@@ -3024,14 +3261,14 @@ mod trigger_seed_tests {
             ],
             &[("trigger_x", "out"), ("trigger_y", "out")],
         );
-        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::String("fire".into()));
-        let sorted = ids(&seeds);
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("fire".into()));
+        let sorted = ids(&kicks);
         assert_eq!(sorted, vec!["trigger_x".to_string(), "trigger_y".to_string()]);
-        for s in &seeds {
-            if s.node_id == "trigger_x" {
-                assert_eq!(s.value, Value::String("fire".into()));
+        for k in &kicks {
+            if k.node_id == "trigger_x" {
+                assert_eq!(k.payload, Some(Value::String("fire".into())));
             } else {
-                assert_eq!(s.value, Value::Null);
+                assert_eq!(k.payload, None);
             }
         }
     }
@@ -3043,25 +3280,25 @@ mod trigger_seed_tests {
             &[("trigger_x", true, false), ("dead_end", false, false)],
             &[("trigger_x", "dead_end")],
         );
-        let seeds = compute_trigger_seeds(&p, "trigger_x", &Value::Null);
-        assert!(seeds.is_empty());
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::Null);
+        assert!(kicks.is_empty());
     }
 
     #[test]
     fn firing_non_trigger_returns_empty() {
         // Defensive: caller must never pass a non-trigger id. We
-        // return empty rather than silently fabricating seeds.
+        // return empty rather than silently fabricating kicks.
         let p = project(
             &[("a", false, false), ("out", false, true)],
             &[("a", "out")],
         );
-        let seeds = compute_trigger_seeds(&p, "a", &Value::Null);
-        assert!(seeds.is_empty());
+        let kicks = compute_trigger_kicks(&p, "a", &Value::Null);
+        assert!(kicks.is_empty());
     }
 }
 
 #[cfg(test)]
-mod infra_seed_and_dep_tests {
+mod infra_kick_and_dep_tests {
     use super::*;
 
     /// (id, is_trigger, requires_infra)
@@ -3101,26 +3338,26 @@ mod infra_seed_and_dep_tests {
         serde_json::from_value(body).expect("valid test project")
     }
 
-    fn seed_ids(seeds: &[RootSeed]) -> Vec<String> {
-        let mut v: Vec<String> = seeds.iter().map(|s| s.node_id.clone()).collect();
+    fn kick_ids(kicks: &[Kick]) -> Vec<String> {
+        let mut v: Vec<String> = kicks.iter().map(|k| k.node_id.clone()).collect();
         v.sort();
         v
     }
 
     #[test]
-    fn infra_seeds_are_upstream_roots_not_infra_nodes() {
+    fn infra_kicks_are_upstream_roots_not_infra_nodes() {
         // text → compute → infra
         let p = project(
             &[("text", false, false), ("compute", false, false), ("infra", false, true)],
             &[("text", "compute"), ("compute", "infra")],
         );
-        let seeds = compute_infra_setup_seeds(&p);
-        // The seed is the upstream root (text), NOT the infra node.
-        assert_eq!(seed_ids(&seeds), vec!["text".to_string()]);
+        let kicks = compute_infra_setup_kicks(&p);
+        // The kick is the upstream root (text), NOT the infra node.
+        assert_eq!(kick_ids(&kicks), vec!["text".to_string()]);
     }
 
     #[test]
-    fn infra_seeds_skip_unreachable_branches() {
+    fn infra_kicks_skip_unreachable_branches() {
         // unrelated standalone node + a real text → infra chain.
         let p = project(
             &[
@@ -3130,35 +3367,35 @@ mod infra_seed_and_dep_tests {
             ],
             &[("text", "infra")],
         );
-        let seeds = compute_infra_setup_seeds(&p);
-        assert_eq!(seed_ids(&seeds), vec!["text".to_string()]);
+        let kicks = compute_infra_setup_kicks(&p);
+        assert_eq!(kick_ids(&kicks), vec!["text".to_string()]);
     }
 
     #[test]
-    fn infra_node_with_no_upstream_seeds_itself() {
+    fn infra_node_with_no_upstream_kicks_itself() {
         // A parameterless infra node (no upstream edges) IS its own
-        // root : has to seed something to fire.
+        // root: has to kick something to fire.
         let p = project(&[("infra", false, true)], &[]);
-        let seeds = compute_infra_setup_seeds(&p);
-        assert_eq!(seed_ids(&seeds), vec!["infra".to_string()]);
+        let kicks = compute_infra_setup_kicks(&p);
+        assert_eq!(kick_ids(&kicks), vec!["infra".to_string()]);
     }
 
     #[test]
-    fn infra_seeds_empty_when_no_infra_nodes() {
+    fn infra_kicks_empty_when_no_infra_nodes() {
         let p = project(&[("a", false, false), ("b", false, false)], &[("a", "b")]);
-        assert!(compute_infra_setup_seeds(&p).is_empty());
+        assert!(compute_infra_setup_kicks(&p).is_empty());
     }
 
     #[test]
-    fn infra_seeds_handle_multiple_infra_nodes_with_shared_root() {
+    fn infra_kicks_handle_multiple_infra_nodes_with_shared_root() {
         // text → infraA ; text → infraB
         let p = project(
             &[("text", false, false), ("infraA", false, true), ("infraB", false, true)],
             &[("text", "infraA"), ("text", "infraB")],
         );
-        let seeds = compute_infra_setup_seeds(&p);
+        let kicks = compute_infra_setup_kicks(&p);
         // text is the only root reaching both.
-        assert_eq!(seed_ids(&seeds), vec!["text".to_string()]);
+        assert_eq!(kick_ids(&kicks), vec!["text".to_string()]);
     }
 
     #[test]
@@ -3254,5 +3491,52 @@ mod infra_seed_and_dep_tests {
         // includes both text AND infra. Deps should include infra.
         let deps = compute_trigger_deps(&p);
         assert_eq!(deps, vec![("infra".to_string(), "trigger".to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod status_query_wire_shape_tests {
+    use super::*;
+
+    /// `StatusQuery`'s wire shape is the contract with the CLI's URL
+    /// builder (and any future direct caller from the extension).
+    /// A typo in one of the three `rename = "desiredXyzHash"`
+    /// attributes silently sets the field to `None`, the drift
+    /// comparison bypasses, and no compile error fires. Pin the
+    /// camelCase wire shape here so a rename is loud.
+    ///
+    /// Tested via the JSON serde shape because Query at runtime
+    /// flows through `serde_urlencoded` (transitive dep of axum,
+    /// not directly in the dispatcher's dev-dep set). The `rename`
+    /// attribute applies to BOTH formats, so a JSON round-trip is
+    /// enough to catch a typo in the rename string.
+    #[test]
+    fn status_query_round_trips_camelcase_keys() {
+        let json = serde_json::json!({
+            "desiredBinaryHash": "abc",
+            "desiredDefinitionHash": "def",
+            "desiredInfraHash": "ghi",
+        });
+        let q: StatusQuery = serde_json::from_value(json)
+            .expect("camelCase keys must deserialize");
+        assert_eq!(q.desired_binary_hash.as_deref(), Some("abc"));
+        assert_eq!(q.desired_definition_hash.as_deref(), Some("def"));
+        assert_eq!(q.desired_infra_hash.as_deref(), Some("ghi"));
+    }
+
+    /// Snake_case used to be accepted via `alias`. The Round 4
+    /// alias-drop removed that compatibility; pin it as not-aliased
+    /// so a future regression that re-adds the alias is loud.
+    #[test]
+    fn status_query_ignores_snake_case_keys() {
+        let json = serde_json::json!({
+            "desired_binary_hash": "abc",
+        });
+        let q: StatusQuery = serde_json::from_value(json)
+            .expect("deserialize never fails on optional-only fields");
+        // The snake_case key is unknown; the camelCase field stays
+        // None. If anyone re-adds `alias = "desired_binary_hash"`,
+        // this flips to Some("abc") and the test fails.
+        assert_eq!(q.desired_binary_hash, None);
     }
 }

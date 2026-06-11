@@ -1,12 +1,8 @@
-//! Gate: route a value based on a pass signal. v1 semantics.
+//! Gate: route a value based on a pass signal.
 //!
-//! `pass` null or false → output value is null (cuts downstream flow
-//! via null propagation).
-//! `pass` non-null non-false → output = value.
-//!
-//! Pairs with the Human node's approve_reject field:
-//! approve_reject emits true/null → Gate.pass. The Gate forwards
-//! `value` only on the active path.
+//! `pass` null or false closes the `value` output (downstream learns
+//! "no value at this frame stack"). `pass` non-null non-false emits
+//! `value`. Pairs with the Human node's approve/reject branches.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -28,15 +24,24 @@ impl Node for GateNode {
         serde_json::from_str(METADATA_JSON).expect("Gate metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
-        let pass = ctx.input.raw("pass").cloned().unwrap_or(Value::Null);
-        let value = ctx.input.raw("value").cloned().unwrap_or(Value::Null);
-
-        let output = match pass {
-            Value::Null | Value::Bool(false) => Value::Null,
-            _ => value,
-        };
-
-        Ok(NodeOutput::empty().set("value", output))
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // `pass` and `value` are BOTH required inputs: the engine only
+        // fires this node once they're present, so a missing one is an
+        // engine bug. Read them loudly (`get` errors on absent/wrong
+        // type) instead of defaulting to Null, which would mask the
+        // bug as a legitimate "cut flow" and silently drop the value.
+        let pass: bool = ctx.input.get("pass")?;
+        if pass {
+            let value = ctx.input.raw("value").cloned().ok_or_else(|| {
+                weft_core::error::WeftError::NodeExecution(
+                    "Gate: required input `value` missing while `pass` is true".into(),
+                )
+            })?;
+            ctx.pulse_downstream(NodeOutput::empty().set("value", value)).await
+        } else {
+            // pass == false: cut the flow (downstream learns "no value
+            // at this frame stack" via the closure).
+            ctx.close_port("value").await
+        }
     }
 }

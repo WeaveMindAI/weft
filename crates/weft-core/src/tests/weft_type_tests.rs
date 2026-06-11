@@ -172,8 +172,8 @@ use super::*;
   #[test]
   fn runtime_check_media_image_matches() {
       let media = WeftType::parse("Media").unwrap();
-      assert!(check(&media, &serde_json::json!({"url": "https://x.com/i.png", "mimeType": "image/png"})));
-      assert!(check(&media, &serde_json::json!({"url": "https://x.com/v.mp4", "mimeType": "video/mp4"})));
+      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
+      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}})));
       assert!(!check(&media, &serde_json::json!("just a string")));
       assert!(!check(&media, &serde_json::json!(42)));
   }
@@ -182,11 +182,11 @@ use super::*;
   fn runtime_check_list_media_or_string() {
       let t = WeftType::parse("List[Media | String]").unwrap();
       assert!(check(&t, &serde_json::json!([
-          {"url": "https://x.com/i.png", "mimeType": "image/png"},
+          {"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}},
           "hello"
       ])));
       assert!(!check(&t, &serde_json::json!([
-          {"url": "https://x.com/i.png", "mimeType": "image/png"},
+          {"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}},
           42
       ])));
   }
@@ -195,8 +195,8 @@ use super::*;
   fn runtime_check_dict_string_media() {
       let t = WeftType::parse("Dict[String, Media]").unwrap();
       assert!(check(&t, &serde_json::json!({
-          "photo": {"url": "https://x.com/i.png", "mimeType": "image/png"},
-          "clip": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}
+          "photo": {"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}},
+          "clip": {"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}}
       })));
       assert!(!check(&t, &serde_json::json!({
           "photo": "not a media object"
@@ -506,9 +506,9 @@ use super::*;
 
   #[test]
   fn infer_media() {
-      let img = serde_json::json!({"url": "https://x.com/i.png", "mimeType": "image/png"});
+      let img = serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}});
       assert_eq!(WeftType::infer(&img), WeftType::primitive(WeftPrimitive::Image));
-      let vid = serde_json::json!({"url": "https://x.com/v.mp4", "mimeType": "video/mp4"});
+      let vid = serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}});
       assert_eq!(WeftType::infer(&vid), WeftType::primitive(WeftPrimitive::Video));
   }
 
@@ -548,43 +548,43 @@ use super::*;
   #[test]
   fn runtime_check_image() {
       let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &serde_json::json!({"url": "https://example.com/img.png", "mimeType": "image/png"})));
-      assert!(!check(&img, &serde_json::json!({"url": "https://example.com/vid.mp4", "mimeType": "video/mp4"})));
+      assert!(check(&img, &serde_json::json!({"__weft_media__": {"url": "https://example.com/img.png", "mimeType": "image/png"}})));
+      assert!(!check(&img, &serde_json::json!({"__weft_media__": {"url": "https://example.com/vid.mp4", "mimeType": "video/mp4"}})));
       assert!(!check(&img, &serde_json::json!("just a string")));
-      assert!(!check(&img, &serde_json::json!({"url": "https://example.com/img.png"}))); // no mimeType
+      assert!(!check(&img, &serde_json::json!({"__weft_media__": {"url": "https://example.com/img.png"}}))); // no mimeType
   }
 
   #[test]
   fn runtime_check_video() {
       let vid = WeftType::primitive(WeftPrimitive::Video);
-      assert!(check(&vid, &serde_json::json!({"url": "https://x.com/v.mp4", "mimeType": "video/mp4"})));
-      assert!(!check(&vid, &serde_json::json!({"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"})));
+      assert!(check(&vid, &serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}})));
+      assert!(!check(&vid, &serde_json::json!({"__weft_media__": {"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"}})));
   }
 
   #[test]
   fn runtime_check_audio() {
       let aud = WeftType::primitive(WeftPrimitive::Audio);
-      assert!(check(&aud, &serde_json::json!({"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"})));
-      assert!(!check(&aud, &serde_json::json!({"url": "https://x.com/i.png", "mimeType": "image/png"})));
+      assert!(check(&aud, &serde_json::json!({"__weft_media__": {"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"}})));
+      assert!(!check(&aud, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
   }
 
   #[test]
   fn runtime_check_document() {
       let doc = WeftType::primitive(WeftPrimitive::Document);
-      assert!(check(&doc, &serde_json::json!({"url": "https://x.com/f.pdf", "mimeType": "application/pdf"})));
+      assert!(check(&doc, &serde_json::json!({"__weft_media__": {"url": "https://x.com/f.pdf", "mimeType": "application/pdf"}})));
       // image/video/audio are NOT documents
-      assert!(!check(&doc, &serde_json::json!({"url": "https://x.com/i.png", "mimeType": "image/png"})));
+      assert!(!check(&doc, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
       // missing url
-      assert!(!check(&doc, &serde_json::json!({"mimeType": "application/pdf"})));
+      assert!(!check(&doc, &serde_json::json!({"__weft_media__": {"mimeType": "application/pdf"}})));
   }
 
   #[test]
   fn runtime_check_media_alias() {
       let media = WeftType::media(); // Image | Video | Audio | Document
-      assert!(check(&media, &serde_json::json!({"url": "https://x.com/i.png", "mimeType": "image/png"})));
-      assert!(check(&media, &serde_json::json!({"url": "https://x.com/v.mp4", "mimeType": "video/mp4"})));
-      assert!(check(&media, &serde_json::json!({"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"})));
-      assert!(check(&media, &serde_json::json!({"url": "https://x.com/f.pdf", "mimeType": "application/pdf"})));
+      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
+      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}})));
+      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"}})));
+      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/f.pdf", "mimeType": "application/pdf"}})));
       assert!(!check(&media, &serde_json::json!("just a string")));
       assert!(!check(&media, &serde_json::json!(42)));
   }
@@ -593,14 +593,14 @@ use super::*;
   fn runtime_check_media_with_mimetype_lowercase() {
       // Some nodes use lowercase "mimetype" instead of "mimeType"
       let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &serde_json::json!({"url": "https://x.com/i.png", "mimetype": "image/png"})));
+      assert!(check(&img, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimetype": "image/png"}})));
   }
 
   #[test]
   fn runtime_check_media_with_data_field() {
       // Some media uses "data" instead of "url"
       let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &serde_json::json!({"data": "base64...", "mimeType": "image/png"})));
+      assert!(check(&img, &serde_json::json!({"__weft_media__": {"data": "base64...", "mimeType": "image/png"}})));
   }
 
   // ── Runtime check: unions ───────────────────────────────────────────
@@ -624,7 +624,7 @@ use super::*;
           WeftType::primitive(WeftPrimitive::Image),
       ]);
       assert!(check(&sm, &serde_json::json!("hello")));
-      assert!(check(&sm, &serde_json::json!({"url": "https://x.com/i.png", "mimeType": "image/png"})));
+      assert!(check(&sm, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
       assert!(!check(&sm, &serde_json::json!(42)));
   }
 
@@ -964,13 +964,13 @@ use super::*;
       // List[Image] : all elements must be images
       let t = WeftType::list(WeftType::primitive(WeftPrimitive::Image));
       assert!(check(&t, &serde_json::json!([
-          {"url": "https://x.com/a.png", "mimeType": "image/png"},
-          {"url": "https://x.com/b.jpg", "mimeType": "image/jpeg"}
+          {"__weft_media__": {"url": "https://x.com/a.png", "mimeType": "image/png"}},
+          {"__weft_media__": {"url": "https://x.com/b.jpg", "mimeType": "image/jpeg"}}
       ])));
       // One element is a video, not an image
       assert!(!check(&t, &serde_json::json!([
-          {"url": "https://x.com/a.png", "mimeType": "image/png"},
-          {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}
+          {"__weft_media__": {"url": "https://x.com/a.png", "mimeType": "image/png"}},
+          {"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}}
       ])));
   }
 
@@ -1425,4 +1425,38 @@ use super::*;
           let err = ty(t).cast_text("\u{0089}PNG binary").unwrap_err();
           assert!(err.contains("media is referenced by URL"), "{t}: {err}");
       }
+  }
+
+  #[test]
+  fn zero_value_per_type() {
+      use serde_json::json;
+      assert_eq!(ty("Number").zero_value(), json!(0));
+      assert_eq!(ty("String").zero_value(), json!(""));
+      assert_eq!(ty("Boolean").zero_value(), json!(false));
+      assert_eq!(ty("List[Number]").zero_value(), json!([]));
+      assert_eq!(ty("Dict[String, Number]").zero_value(), json!({}));
+      // Media / bus / null have no literal default: JSON null.
+      assert_eq!(ty("Image").zero_value(), json!(null));
+  }
+
+  #[test]
+  fn zero_value_of_nullable_union_is_the_non_null_variant() {
+      use serde_json::json;
+      // The `?` optional marker lives on the PORT (the `required` flag),
+      // not inside the type, so a carry port of `Number?` has the plain
+      // `Number` type and already zeroes to 0. A type can still be an
+      // explicit nullable union; its zero value is the first non-null
+      // variant, order-independent.
+      let num_or_null = WeftType::union(vec![
+          WeftType::Primitive(WeftPrimitive::Number),
+          WeftType::Primitive(WeftPrimitive::Null),
+      ]);
+      assert_eq!(num_or_null.zero_value(), json!(0));
+      let null_or_str = WeftType::union(vec![
+          WeftType::Primitive(WeftPrimitive::Null),
+          WeftType::Primitive(WeftPrimitive::String),
+      ]);
+      assert_eq!(null_or_str.zero_value(), json!(""));
+      // A purely-nullish type zeroes to null.
+      assert_eq!(WeftType::Primitive(WeftPrimitive::Null).zero_value(), json!(null));
   }

@@ -4,7 +4,6 @@
 
 use async_trait::async_trait;
 
-use weft_core::node::NodeOutput;
 use weft_core::signal::{Form, FormSchema};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
@@ -26,7 +25,7 @@ impl Node for HumanQueryNode {
         serde_json::from_str(METADATA_JSON).expect("HumanQuery metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let raw_fields = parse_form_fields(&ctx.config.values);
         let specs = human_form_field_specs();
 
@@ -70,6 +69,6 @@ impl Node for HumanQueryNode {
                 consumer_kind: Some("human_in_the_loop".into()),
             })
             .await?;
-        Ok(map_response_to_ports(&submission, &raw_fields, specs))
+        ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)).await
     }
 }

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, InputBag};
 use crate::error::{WeftError, WeftResult};
 use crate::infra::{InfraProvisionContext, InfraSpec};
 use crate::weft_type::WeftType;
@@ -42,7 +42,7 @@ pub trait Node: Send + Sync {
     async fn provision(
         &self,
         _ctx: InfraProvisionContext,
-        _input: NodeInput,
+        _input: InputBag,
     ) -> WeftResult<InfraSpec> {
         Err(WeftError::Config(format!(
             "node '{}' declared requires_infra=true but did not implement Node::provision",
@@ -51,43 +51,19 @@ pub trait Node: Send + Sync {
     }
 
     /// Run this node. `ctx` provides language primitives
-    /// (`await_signal`, `report_cost`, `log`, `endpoint`). Input
-    /// values are pre-resolved on ctx.
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput>;
-}
-
-/// Input bag handed to `provision` (mirrors what `execute` reads from
-/// `ExecutionContext::input`). Same wire format; separate type so the
-/// trait signature doesn't drag an ExecutionContext through the
-/// pre-apply call site.
-#[derive(Debug, Clone, Default)]
-pub struct NodeInput {
-    pub values: std::collections::HashMap<String, Value>,
-}
-
-impl NodeInput {
-    pub fn get<T: serde::de::DeserializeOwned>(&self, port: &str) -> WeftResult<T> {
-        let v = self
-            .values
-            .get(port)
-            .ok_or_else(|| WeftError::Input(format!("missing input on port: {port}")))?;
-        serde_json::from_value(v.clone())
-            .map_err(|e| WeftError::Input(format!("port {port}: {e}")))
-    }
-
-    pub fn get_optional<T: serde::de::DeserializeOwned>(&self, port: &str) -> WeftResult<Option<T>> {
-        match self.values.get(port) {
-            None => Ok(None),
-            Some(v) if v.is_null() => Ok(None),
-            Some(v) => serde_json::from_value(v.clone())
-                .map(Some)
-                .map_err(|e| WeftError::Input(format!("port {port}: {e}"))),
-        }
-    }
-
-    pub fn raw(&self, port: &str) -> Option<&Value> {
-        self.values.get(port)
-    }
+    /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
+    /// `report_cost`, `log`, `endpoint`). Input values are pre-resolved
+    /// on ctx.
+    ///
+    /// The ONLY way to fire downstream is `ctx.pulse_downstream(output)`.
+    /// Returning does NOT emit anything by itself. A node typically calls
+    /// `pulse_downstream` once at the end (the common case); a co-alive
+    /// node emits a bus early (releasing downstream) and keeps running;
+    /// a node may emit on disjoint ports across several calls (release
+    /// incrementally). A port the node never mentions gets a CLOSURE
+    /// pulse at termination so downstream consumers learn nothing is
+    /// coming for that port.
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
 }
 
 /// Validation diagnostic. Emitted by the generic validate pass and
@@ -314,17 +290,14 @@ pub enum Condition {
 
 /// Node-level semantic constraints. All optional; empty by default.
 ///
-/// KEEP IN SYNC with the TypeScript `NodeDefinition.features` shape
-/// in `extension-vscode/src/shared/protocol.ts`. Serde silently drops
-/// unknown fields from node metadata.json when this struct doesn't
-/// declare them, so a field that only exists in TS (or only in
-/// metadata.json) will be invisible to the dispatcher and lost on
-/// the wire back to the webview. If you add a feature here, also:
-///   1. Add the matching camelCase field to `NodeDefinition.features`
-///      in protocol.ts.
+/// Serde silently drops unknown fields from node metadata.json when
+/// this struct doesn't declare them, so a field that only exists in TS
+/// (or only in metadata.json) will be invisible to the dispatcher and
+/// lost on the wire back to the webview. If you add a feature here, also:
+///   1. Add the matching camelCase field to `NodeFeaturesWire` in
+///      protocol.ts.
 ///   2. Update any webview code that switches on the new feature.
-/// TODO(codegen): replace with ts-rs or specta so TS mirrors Rust
-/// automatically.
+// SYNC: NodeFeatures <-> extension-vscode/src/shared/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeFeatures {
     /// Each inner list is a port group where at least ONE port must
@@ -369,11 +342,12 @@ pub struct NodeFeatures {
     /// endpoint, so the two can't drift out of sync.
     #[serde(default, rename = "liveEndpoint", skip_serializing_if = "Option::is_none")]
     pub live_endpoint: Option<String>,
-    /// Hidden from node picker and describe-nodes output. Used for
-    /// compiler-internal node types (Passthrough) that are real
-    /// executing nodes but must not appear in user-facing tooling.
-    /// Users cannot declare hidden node types in source; the parser
-    /// rejects them with a dedicated error.
+    /// Hidden from the node picker and describe-nodes output. For a
+    /// catalog node type that executes but must not appear in
+    /// user-facing tooling. Users cannot declare a hidden node type
+    /// in source; the parser rejects them with a dedicated error.
+    /// (Group/Loop boundary lowering does NOT use this: those are
+    /// not catalog nodes, they're inline-dispatched in the engine.)
     #[serde(default, rename = "hidden")]
     pub hidden: bool,
 }
@@ -383,6 +357,7 @@ pub struct NodeFeatures {
 /// `has_form_schema` (HumanQuery, runner triggers). The enrich pass
 /// reads this, iterates the configured fields, and materializes
 /// inputs/outputs on the NodeDefinition.
+// SYNC: FormFieldSpec <-> extension-vscode/src/shared/protocol.ts FormFieldSpecWire
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormFieldSpec {
     /// Value of the field's `field_type` (or `field_type.kind`)
@@ -482,8 +457,6 @@ pub trait NodeCatalog: Send + Sync {
     }
 }
 
-use crate::project::LaneMode;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortDef {
     pub name: String,
@@ -491,8 +464,6 @@ pub struct PortDef {
     pub port_type: WeftType,
     #[serde(default)]
     pub required: bool,
-    #[serde(default)]
-    pub lane_mode: LaneMode,
     /// Whether this port can be filled with a config default (no
     /// incoming edge). `wired_only` ports must come from upstream.
     #[serde(default)]
@@ -551,8 +522,153 @@ impl NodeOutput {
         self
     }
 
+    /// Fan every top-level key of a JSON object onto a same-named
+    /// output port, preserving the field value. Useful for nodes that
+    /// forward an upstream payload verbatim (trigger seeds, bridge
+    /// `/outputs` responses, LLM `parseJson` object responses). Keys
+    /// in `exclude` are skipped. Returns `self` unchanged if the
+    /// value isn't an object.
+    ///
+    /// **Precedence rule: last-write-wins, chain order = precedence.**
+    /// `.set(k, x).extend_from_object({k: y})` ends up with `k = y` (the
+    /// helper overwrites the prior set). `.extend_from_object({k: y}).set(k, x)`
+    /// ends up with `k = x` (the explicit set overrides the merge). Both
+    /// orderings are pinned by tests in `node_output_tests`.
+    pub fn extend_from_object(mut self, source: &Value, exclude: &[&str]) -> Self {
+        if let Value::Object(map) = source {
+            for (k, v) in map {
+                if exclude.contains(&k.as_str()) {
+                    continue;
+                }
+                self.outputs.insert(k.clone(), v.clone());
+            }
+        }
+        self
+    }
+
+    /// Like [`Self::extend_from_object`], but fans ONLY the keys that
+    /// the node actually declared as output ports (`declared`). A key
+    /// present in the object but not declared is silently skipped:
+    /// the node promised those ports, the dynamic payload may carry
+    /// extras, and emitting an undeclared port would trip the
+    /// runtime's loud rejection AFTER a paid / irreversible call (an
+    /// LLM completion, an HTTP POST already sent). Intersecting here
+    /// is the honest contract: "emit the declared fields I have."
+    ///
+    /// `exclude` is still honored (e.g. the primary full-object port
+    /// shouldn't be re-fanned). Same last-write-wins precedence as
+    /// `extend_from_object`.
+    pub fn extend_from_declared(
+        mut self,
+        source: &Value,
+        declared: &std::collections::HashSet<String>,
+        exclude: &[&str],
+    ) -> Self {
+        if let Value::Object(map) = source {
+            for (k, v) in map {
+                if exclude.contains(&k.as_str()) || !declared.contains(k) {
+                    continue;
+                }
+                self.outputs.insert(k.clone(), v.clone());
+            }
+        }
+        self
+    }
+
     pub fn get(&self, port: &str) -> Option<&Value> {
         self.outputs.get(port)
+    }
+}
+
+#[cfg(test)]
+mod node_output_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extend_from_object_fans_keys_onto_ports() {
+        let src = json!({"a": 1, "b": "two", "c": null});
+        let out = NodeOutput::empty().extend_from_object(&src, &[]);
+        assert_eq!(out.outputs.len(), 3);
+        assert_eq!(out.outputs.get("a"), Some(&json!(1)));
+        assert_eq!(out.outputs.get("c"), Some(&Value::Null), "user-emitted null is data; engine doesn't strip it");
+    }
+
+    #[test]
+    fn extend_from_object_honors_exclude() {
+        let src = json!({"keep": 1, "skip_me": 2, "also_keep": 3});
+        let out = NodeOutput::empty().extend_from_object(&src, &["skip_me"]);
+        assert_eq!(out.outputs.len(), 2);
+        assert!(out.outputs.contains_key("keep"));
+        assert!(out.outputs.contains_key("also_keep"));
+        assert!(!out.outputs.contains_key("skip_me"));
+    }
+
+    #[test]
+    fn extend_from_declared_only_fans_declared_keys() {
+        let src = json!({"sentiment": "positive", "score": 0.9, "extra": "ignored"});
+        let declared: std::collections::HashSet<String> =
+            ["sentiment".to_string(), "score".to_string(), "response".to_string()]
+                .into_iter()
+                .collect();
+        let out = NodeOutput::empty().extend_from_declared(&src, &declared, &[]);
+        assert_eq!(out.outputs.len(), 2, "only declared keys present in the object are fanned");
+        assert!(out.outputs.contains_key("sentiment"));
+        assert!(out.outputs.contains_key("score"));
+        assert!(
+            !out.outputs.contains_key("extra"),
+            "an undeclared model key is dropped, not emitted (would trip the undeclared-port error)"
+        );
+    }
+
+    #[test]
+    fn extend_from_declared_honors_exclude() {
+        let src = json!({"response": "full", "field": "x"});
+        let declared: std::collections::HashSet<String> =
+            ["response".to_string(), "field".to_string()].into_iter().collect();
+        let out = NodeOutput::empty()
+            .set("response", json!("full-object"))
+            .extend_from_declared(&src, &declared, &["response"]);
+        // `response` excluded from the fan, so the earlier `set` stands.
+        assert_eq!(out.outputs.get("response"), Some(&json!("full-object")));
+        assert_eq!(out.outputs.get("field"), Some(&json!("x")));
+    }
+
+    #[test]
+    fn extend_from_object_no_op_on_non_object() {
+        for src in [json!(null), json!(42), json!("string"), json!([1, 2, 3])] {
+            let out = NodeOutput::empty().extend_from_object(&src, &[]);
+            assert!(out.outputs.is_empty(), "non-object: helper leaves outputs untouched");
+        }
+    }
+
+    #[test]
+    fn extend_from_object_does_not_overwrite_prior_set_unless_key_matches() {
+        let src = json!({"a": "new"});
+        let out = NodeOutput::empty()
+            .set("a", json!("prior"))
+            .extend_from_object(&src, &[]);
+        // Same key: the helper DOES overwrite. Document this for users
+        // who want to chain `extend_from_object` then `set` to keep
+        // their override (or vice versa).
+        assert_eq!(out.outputs.get("a"), Some(&json!("new")));
+    }
+
+    /// Mirror of the prior test in the opposite order: `extend_from_object`
+    /// FIRST, `set` SECOND. The later `set` wins. Both orderings are
+    /// pinned because catalog callers rely on each:
+    ///   - `whatsapp/bridge` and `triggers/api/post` chain `.extend_from_object(...).set(...)`
+    ///     so a sender-supplied key can't override the locally-known truth.
+    ///   - `llm/inference` chains `.set(PRIMARY, ...).extend_from_object(..., &[PRIMARY])`
+    ///     so a returned object key colliding with the primary port doesn't double-fire.
+    /// Last-write-wins is the contract; the chain order is the precedence.
+    #[test]
+    fn extend_from_object_then_set_lets_set_win() {
+        let src = json!({"a": "from_object"});
+        let out = NodeOutput::empty()
+            .extend_from_object(&src, &[])
+            .set("a", json!("from_set"));
+        assert_eq!(out.outputs.get("a"), Some(&json!("from_set")));
     }
 }
 
@@ -586,3 +702,4 @@ mod diagnostic_wire_tests {
         assert_eq!(pointy.end_line, 0, "absent endLine defaults to 0");
     }
 }
+

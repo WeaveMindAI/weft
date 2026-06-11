@@ -24,6 +24,7 @@ use crate::cst::nodes::WeftFile;
 use crate::cst::parse;
 
 /// A structured edit intent. `serde` tag `op` matches the parse-server wire.
+// SYNC: EditOp <-> extension-vscode/src/shared/protocol.ts EditOp
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum EditOp {
@@ -63,6 +64,29 @@ pub enum EditOp {
     /// Set (or clear) a group's description: the `# Description:` comment that is
     /// the first body line of the group. `description: None`/empty removes it.
     SetGroupDescription { group: String, description: Option<String> },
+    /// Add an empty loop `name = Loop() -> () {}` at the end of the
+    /// scope (top level when `parent_group` is None). `parallel`
+    /// defaults to the validator's default (sequential); the editor
+    /// surfaces the field in the config strip for the user to set.
+    AddLoop { label: String, parent_group: Option<String> },
+    /// Remove a loop; its body moves up one scope (un-loop).
+    RemoveLoop { loop_id: String },
+    /// Rename a loop. Loop-only mirror of `RenameGroup`; the dispatch
+    /// refuses a Group target and vice versa so the webview routing
+    /// stays honest.
+    RenameLoop { old_label: String, new_label: String },
+    /// Move a loop into another container (top level when None).
+    /// Loop-only mirror of `MoveGroupScope`.
+    MoveLoopScope { loop_id: String, target_group: Option<String> },
+    /// Rewrite a loop's port signature. Same shape as UpdateGroupPorts.
+    UpdateLoopPorts { loop_id: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
+    /// Set a single loop config field (`parallel`, `over`, `carry`,
+    /// `max_iters`, `trim_on_mismatch`). The value is a pre-formatted
+    /// source token: `true`, `["a","b"]`, `100`, etc. Inserts the field
+    /// if missing, replaces it if present.
+    SetLoopConfig { loop_id: String, key: String, value: String },
+    /// Remove a loop config field.
+    RemoveLoopConfig { loop_id: String, key: String },
 }
 
 /// A port in a signature rewrite. `required: false` renders `name: Type?`.
@@ -84,8 +108,13 @@ fn default_true() -> bool {
 pub enum EditError {
     #[error("node not found: {0}")]
     NodeNotFound(String),
-    #[error("group not found: {0}")]
-    GroupNotFound(String),
+    /// Group or Loop (or expected-container) not found. Named
+    /// `ContainerNotFound` because both kinds of container ops
+    /// (Group AND Loop variants) route through the same resolution
+    /// failure path; spelling it `GroupNotFound` misled the Loop
+    /// callers about which decl kind the id was looked up against.
+    #[error("container not found: {0}")]
+    ContainerNotFound(String),
     #[error("id is ambiguous (matches multiple): {0}")]
     AmbiguousId(String),
     #[error("id already exists in scope: {0}")]

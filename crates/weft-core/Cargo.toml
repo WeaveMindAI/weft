@@ -18,3 +18,10 @@ tracing = { workspace = true }
 inventory = { workspace = true }
 cron = "0.12"
 sha2 = { workspace = true }
+
+[dev-dependencies]
+# Used by the `stress_test!` macro (test-only). Provides
+# `FutureExt::catch_unwind` so a panic in any stress iteration is
+# captured and reported as a clean test failure with the iteration
+# index, rather than poisoning the runtime.
+futures = { workspace = true }

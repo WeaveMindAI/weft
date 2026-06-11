@@ -45,7 +45,7 @@ use crate::primitive::SignalSpec;
 ///     human-in-the-loop) override to surface it.
 ///
 /// `is_resume` is NOT on the trait. Whether a registration is a
-/// fresh entry or a paused-lane resume is decided by which
+/// fresh entry or a paused-firing resume is decided by which
 /// `ExecutionContext` method the author called.
 pub trait Signal: Serialize + DeserializeOwned + Sized {
     /// Kind tag stored on the wire (`"webhook"`, `"timer"`, ...).

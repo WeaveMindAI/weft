@@ -36,6 +36,80 @@ pub(crate) struct ParkedFire {
     pub received_at_unix: i64,
 }
 
+/// THE one append onto `signal.parked_fires`. Every park site (the
+/// lifecycle gate on external fires, the route_entry executor's
+/// authoritative re-check) goes through here so the queue-element
+/// shape and the append guards live in one place. Guards, both in
+/// one atomic UPDATE (no read-then-write race):
+///   - resume cap: resume signals append iff the queue is empty
+///     (one submission answers one suspension; later ones are
+///     duplicates). Entry signals append on every fire.
+///   - id dedup: an element with the same `ParkedFire.id` already
+///     queued matches zero rows, so a retry of the same park (task
+///     re-run after a crash) collapses instead of double-queueing.
+/// Returns the number of rows updated (0 = guard refused or the
+/// signal row is gone; the caller decides what that means).
+pub(crate) async fn append_parked_fire(
+    pool: &sqlx::PgPool,
+    token: &str,
+    entry: &ParkedFire,
+) -> anyhow::Result<u64> {
+    let entry_json = serde_json::to_value(entry)?;
+    // `@>` containment on `[{"id": ...}]` matches any element
+    // carrying that id, regardless of its other fields.
+    let dedup_probe = serde_json::json!([{ "id": entry.id }]);
+    // `is_resume` is read from the TARGETED ROW (not a caller arg) so a
+    // caller that could not first fetch the signal row (a transient read
+    // error before re-parking) can still park correctly: a resume signal
+    // caps `parked_fires` at one element, an entry signal does not.
+    let updated = sqlx::query(
+        "UPDATE signal \
+         SET parked_fires = parked_fires || $1::jsonb \
+         WHERE token = $2 \
+           AND (is_resume = FALSE OR jsonb_array_length(parked_fires) = 0) \
+           AND NOT (parked_fires @> $3::jsonb)",
+    )
+    .bind(&entry_json)
+    .bind(token)
+    .bind(&dedup_probe)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected())
+}
+
+/// THE one removal from `parked_fires` (mirror of `append_parked_fire`).
+/// Removes the element whose `id` equals `fire_id` BY ID, not by array
+/// index, so concurrent removals of different fires commute and a drain
+/// pop can never delete the wrong element after a sibling removed the
+/// head out from under it (an index-based pop assumed a head-stable
+/// array, which a success-path removal breaks). `fence` is the drain's
+/// claim nonce: when `Some`, the removal only applies while we still own
+/// the drain claim (a sibling takeover yields 0 rows, preserving the
+/// drain's abort-on-takeover semantics); the success path passes `None`.
+/// Returns rows affected (0 = row gone, or not our claim).
+pub(crate) async fn remove_parked_fire(
+    pool: &sqlx::PgPool,
+    token: &str,
+    fire_id: &str,
+    fence: Option<&str>,
+) -> anyhow::Result<u64> {
+    let updated = sqlx::query(
+        "UPDATE signal \
+         SET parked_fires = COALESCE( \
+             (SELECT jsonb_agg(elem ORDER BY ord) \
+              FROM jsonb_array_elements(parked_fires) WITH ORDINALITY AS t(elem, ord) \
+              WHERE elem ->> 'id' <> $2), '[]'::jsonb) \
+         WHERE token = $1 \
+           AND ($3::text IS NULL OR drain_claimed_by = $3)",
+    )
+    .bind(token)
+    .bind(fire_id)
+    .bind(fence)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected())
+}
+
 /// Diagnostic: per-tenant `signal` row count alongside the
 /// listener's own registry contents. Drift between them means the
 /// cleanup pipeline went wrong somewhere; an operator can compare
@@ -108,9 +182,9 @@ pub async fn fire_signal(
     fire_signal_inner(&state, &token, payload).await
 }
 
-/// `POST /signal/{token}/skip`. Resume the suspended lane with a
-/// null payload. Sibling lanes of the same color keep going; the
-/// skipped lane wakes, downstream null-propagation decides what
+/// `POST /signal/{token}/skip`. Resume the suspended firing with a
+/// null payload. Sibling firings of the same color keep going; the
+/// skipped firing wakes, downstream null-propagation decides what
 /// happens (most nodes auto-skip on null inputs).
 ///
 /// Auth: signal token alone (knowing it = permission to skip).
@@ -214,29 +288,14 @@ async fn apply_lifecycle_gate(
             payload,
             received_at_unix: crate::lease::now_unix(),
         };
-        let entry_json = serde_json::to_value(&entry).map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("park serialize: {e}"))
-        })?;
-        // Entry signals: unconditional append.
-        // Resume signals: append iff queue is empty. Single atomic
-        // UPDATE so there's no read-then-write race. A resume signal
-        // with a non-empty queue matches zero rows; we surface that
-        // as 409 Conflict so the consumer knows the suspension was
-        // already answered, not silently dropped under a 200.
-        // `jsonb_array_length` returns 0 for '[]'.
-        let updated = sqlx::query(
-            "UPDATE signal \
-             SET parked_fires = parked_fires || $1::jsonb \
-             WHERE token = $2 \
-               AND ($3::bool = FALSE OR jsonb_array_length(parked_fires) = 0)",
-        )
-        .bind(&entry_json)
-        .bind(token)
-        .bind(routing.is_resume)
-        .execute(&state.pg_pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?;
-        if updated.rows_affected() == 0 && routing.is_resume {
+        // A resume signal with a non-empty queue matches zero rows
+        // in the shared append; we surface that as 409 Conflict so
+        // the consumer knows the suspension was already answered,
+        // not silently dropped under a 200.
+        let updated = append_parked_fire(&state.pg_pool, token, &entry)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?;
+        if updated == 0 && routing.is_resume {
             return Err((
                 StatusCode::CONFLICT,
                 "suspension already answered; duplicate submission ignored".into(),
@@ -398,10 +457,40 @@ pub(crate) async fn dispatch_listener_outcome(
                                 &format!("suspension_resolved:{token_owned}"),
                             )
                             .await?;
+                        // CRITICAL: pull definition_hash from the
+                        // journal's ExecutionStarted event for THIS
+                        // color, NOT from the project row's current
+                        // hash. If the user edited and re-registered
+                        // between when this color suspended and now,
+                        // the project row holds the NEW hash but the
+                        // suspended execution must resume on the
+                        // SAME shape it was started with (the
+                        // journal state is bound to that shape).
+                        // Falling back to the row's hash would run
+                        // the fold on the OLD state then execute
+                        // against the NEW topology, which is
+                        // undefined behavior.
+                        let definition_hash = match state
+                            .journal
+                            .execution_definition_hash(color)
+                            .await?
+                        {
+                            crate::journal::ColorLookup::Found(h) => h,
+                            crate::journal::ColorLookup::NotFound => anyhow::bail!(
+                                "no ExecutionStarted event for color {color}; \
+                                 cannot determine the definition_hash to \
+                                 resume against"
+                            ),
+                            crate::journal::ColorLookup::Corrupt => anyhow::bail!(
+                                "journal row for color {color} is corrupt; \
+                                 see dispatcher logs"
+                            ),
+                        };
                         crate::task_kinds::execute::enqueue_resume(
                             &state.pg_pool,
                             &project_owned,
                             color,
+                            &definition_hash,
                             Some(&tenant_str),
                         )
                         .await?;
@@ -409,46 +498,46 @@ pub(crate) async fn dispatch_listener_outcome(
                         Ok(StatusCode::OK)
                     }
                     ProcessTarget::Entry { .. } => {
+                        // Every fire gets a STABLE fire id: a drain pop
+                        // already carries one (the ParkedFire id, passed
+                        // as the dedup nonce); a live fire mints a fresh
+                        // one. It is the RouteEntry dedup key, the
+                        // execution color seed, and the ParkedFire id if
+                        // the fire is later re-parked, so one fire can
+                        // never spawn two executions across a park /
+                        // drain / lease-rescue interleaving. ALWAYS
+                        // enqueue_dedup (live fires too): the re-park path
+                        // IS a re-insert path, so a non-deduped live task
+                        // and its re-parked twin would otherwise both run.
+                        let fire_id = dedup_nonce_owned
+                            .clone()
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                         let task_payload = serde_json::json!({
                             "token": token_owned,
+                            "fire_id": fire_id,
                             "payload": outcome.value,
                             "tenant_id": tenant_str,
                         });
-                        // With a nonce (drain pop, FireSignal task
-                        // retry): enqueue_dedup so a retry collapses
-                        // on the per-fire dedup key.
-                        // Without a nonce (live fire): plain enqueue
-                        // because there is no retry path that could
-                        // re-insert.
-                        let new_task = |dedup_key: Option<String>| {
+                        let key = format!("entry:{token_owned}:{fire_id}");
+                        weft_task_store::tasks::enqueue_dedup(
+                            &state.pg_pool,
                             weft_task_store::tasks::NewTask {
                                 kind: weft_task_store::TaskKind::RouteEntry,
                                 target: weft_task_store::tasks::TaskTarget::Dispatcher,
-                                project_id: None,
-                                dedup_key,
+                                // Stamped so `running_count` can see
+                                // routed-but-unjournaled fires: the
+                                // deactivate fast-path CAS and the
+                                // drain-watcher must not flip a project
+                                // Inactive while one of these is in flight.
+                                project_id: Some(project_owned.clone()),
+                                dedup_key: Some(key),
                                 color: None,
                                 tenant_id: Some(tenant_str.clone()),
                                 target_pod_name: None,
                                 payload: task_payload,
-                            }
-                        };
-                        match dedup_nonce_owned.as_deref() {
-                            Some(nonce) => {
-                                let key = format!("entry:{token_owned}:{nonce}");
-                                weft_task_store::tasks::enqueue_dedup(
-                                    &state.pg_pool,
-                                    new_task(Some(key)),
-                                )
-                                .await?;
-                            }
-                            None => {
-                                weft_task_store::tasks::enqueue(
-                                    &state.pg_pool,
-                                    new_task(None),
-                                )
-                                .await?;
-                            }
-                        }
+                            },
+                        )
+                        .await?;
                         Ok(StatusCode::OK)
                     }
                     ProcessTarget::Drop { reason } => {
@@ -1067,7 +1156,7 @@ async fn lookup_signal_token_for_node(
 ) -> Result<String, (StatusCode, String)> {
     // Pick the most recent signal for this (project, node). For
     // entry triggers there's only one; for resumes there could be
-    // many across lanes but inspector use is per-trigger today, so
+    // many across firings but inspector use is per-trigger today, so
     // first match is fine.
     let row = sqlx::query("SELECT token FROM signal WHERE project_id = $1 AND node_id = $2 ORDER BY created_at DESC LIMIT 1")
         .bind(project_id)

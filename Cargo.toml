@@ -67,6 +67,7 @@ sha2 = "0.10"
 tempfile = "3"
 parking_lot = "0.12"
 ipnet = "2"
+filetime = "0.2"
 
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }

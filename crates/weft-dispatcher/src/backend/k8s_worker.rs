@@ -70,9 +70,9 @@ impl WorkerBackend for K8sWorkerBackend {
         // Hash-tagged tags are the only path. If the CLI never set
         // a hash (e.g. someone POSTed /run before /projects), fail
         // loudly instead of falling back to `:latest`.
-        let hash = spec.source_hash.as_ref().ok_or_else(|| {
+        let hash = spec.binary_hash.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "spawn_pod for project {}: no running_source_hash set; \
+                "spawn_pod for project {}: no running_binary_hash set; \
                  register the project via the CLI (which builds + sets the hash) before \
                  calling /run, /activate, or /infra/start",
                 spec.project_id,
@@ -204,7 +204,7 @@ mod tests {
             tenant: "t1".into(),
             namespace: "wm-p1".into(),
             owner_dispatcher: "disp-0".into(),
-            source_hash: Some("abc123".into()),
+            binary_hash: Some("abc123".into()),
         }
     }
 
@@ -240,9 +240,9 @@ mod tests {
         );
     }
 
-    /// No source_hash → fail loud (don't fall back to :latest).
+    /// No binary_hash → fail loud (don't fall back to :latest).
     #[tokio::test]
-    async fn spawn_fails_without_source_hash() {
+    async fn spawn_fails_without_binary_hash() {
         let kube = FakeKube::new();
         let backend = K8sWorkerBackend::new(
             "http://broker".into(),
@@ -250,8 +250,8 @@ mod tests {
             FakeClock::new(),
         );
         let mut s = spec();
-        s.source_hash = None;
+        s.binary_hash = None;
         let err = backend.spawn_pod("wp-1", s).await.unwrap_err();
-        assert!(err.to_string().contains("no running_source_hash"), "got: {err}");
+        assert!(err.to_string().contains("no running_binary_hash"), "got: {err}");
     }
 }

@@ -85,12 +85,20 @@ pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Resu
         .await;
 
     let project_id = match state.journal.execution_project(color).await? {
-        Some(p) => p,
-        None => {
+        crate::journal::ColorLookup::Found(p) => p,
+        crate::journal::ColorLookup::NotFound => {
             tracing::warn!(
                 target: "weft_dispatcher::cancel",
                 color = %color,
                 "no project_id for color; nothing to do"
+            );
+            return Ok(());
+        }
+        crate::journal::ColorLookup::Corrupt => {
+            tracing::warn!(
+                target: "weft_dispatcher::cancel",
+                color = %color,
+                "journal row for color is corrupt; cannot resolve project; nothing to do"
             );
             return Ok(());
         }
@@ -163,6 +171,11 @@ async fn journal_cancel_terminals(state: &DispatcherState, color: Color) -> anyh
     // stuck on "running".
     let events = state.journal.events_log(color).await?;
     let snapshot = weft_journal::fold_to_snapshot(color, &events);
+    // `snapshot.corruptions` is intentionally not consumed here. The
+    // cancel handler only needs the executions map to know which
+    // nodes are still non-terminal. The inspector's `/replay` path
+    // is the user-visible surface for corruptions; `report_corruption`
+    // already logged each row at `error!` level for ops.
     let mut wrote_node_count = 0usize;
     for (node_id, execs) in &snapshot.executions {
         for e in execs {
@@ -172,8 +185,12 @@ async fn journal_cancel_terminals(state: &DispatcherState, color: Color) -> anyh
             let event = ExecEvent::NodeCancelled {
                 color,
                 node_id: node_id.clone(),
-                lane: e.lane.clone(),
+                frames: e.frames.clone(),
                 reason: "Cancelled by user".to_string(),
+                // Dispatcher-side catch-up cancel only flips records
+                // terminal; the closure cascade is the worker/cleanup's
+                // job, so no per-node closures ride here.
+                closure_emissions: Vec::new(),
                 at_unix: now,
             };
             state.journal.record_event(&event).await?;
@@ -284,147 +301,74 @@ pub async fn list_logs(
     ))
 }
 
-/// Replay a past execution: returns journaled node events shaped
-/// as `DispatcherEvent` so the webview's live-SSE handler can
-/// process them with the same code path.
+/// Replay a past execution: returns every journaled event the SSE
+/// stream would have emitted live, shaped as `DispatcherEvent` so the
+/// webview's live-SSE handler can process them with the same code
+/// path. Bus events (joined/left/message) ride along too, so the
+/// inspector's IRC log renders on replay exactly as it did live.
 ///
-/// We also surface the terminal execution_completed /
-/// execution_failed event at the end when the summary row tells
-/// us the run settled. Without that, the extension's ActionBar
-/// can't flip its `isRunning` flag off and the Stop Execution
-/// button stays visible.
+/// Terminal events (`ExecutionCompleted` / `ExecutionFailed` /
+/// `ExecutionCancelled`) are NOT synthesized from the execution
+/// summary. They are already in the journal log when the execution
+/// settled (the summary's status is itself derived from the presence
+/// of that journal row), and `to_dispatcher_events` projects them
+/// faithfully (carrying the real outputs / error / reason). Synthesizing
+/// a duplicate from the summary would emit a lossy second terminal
+/// (empty payloads) that overrides the real one on the receiving
+/// side. A still-running execution has no terminal in the log; the
+/// live SSE delivers it when it lands.
 pub async fn replay(
     State(state): State<DispatcherState>,
     Path(color_str): Path<String>,
 ) -> Result<Json<Vec<DispatcherEvent>>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    // `execution_project` errors propagate as 500. `Ok(None)` (no
-    // such execution) is also fatal here: replaying events for a
-    // color we can't attribute to a project would emit them on the
-    // empty-string project bucket, which no SSE subscriber listens
-    // to. Surface as 404.
-    let project_id = state
+    // `execution_project` errors propagate as 500. An unknown color
+    // is also fatal here: replaying events for a color we can't
+    // attribute to a project would emit them on the empty-string
+    // project bucket, which no SSE subscriber listens to. Surface
+    // NotFound as 404; a corrupt journal row (already logged loud at
+    // the decode site) is a server-side defect, so 500.
+    let project_id = match state
         .journal
         .execution_project(color)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    {
+        crate::journal::ColorLookup::Found(p) => p,
+        crate::journal::ColorLookup::NotFound => return Err(StatusCode::NOT_FOUND),
+        crate::journal::ColorLookup::Corrupt => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    // Use the full ExecEvent log so bus events ride along with node
+    // lifecycle events. The same `to_dispatcher_events` mapper the
+    // live `journal_bridge` uses runs over the log; replay and live
+    // share the projection so they can't drift.
     let raw_events = state
         .journal
-        .events_for(color)
+        .events_log(color)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Fold once for corruption detection. The fold is otherwise
+    // unused here (the replay sends raw ExecEvent projections, not
+    // snapshot state), but it's cheap relative to the network round-
+    // trip and gives the inspector a one-shot list of any rows that
+    // could not be applied. The same fold runs in the engine resume
+    // path and the cancel handler; this is the inspector's window.
+    let snapshot = weft_journal::fold_to_snapshot(color, &raw_events);
     let mut out: Vec<DispatcherEvent> = raw_events
         .into_iter()
-        .map(|e| node_event_to_dispatcher(e, project_id.clone()))
+        .flat_map(|e| {
+            crate::journal_bridge::to_dispatcher_events(&e, project_id.clone())
+        })
         .collect();
-
-    // Infer the terminal state from the execution summary so the
-    // UI sees ExecutionCompleted / ExecutionFailed and flips out
-    // of "running" mode. A still-running exec (no terminal yet)
-    // returns only node events; the live SSE will deliver the
-    // terminal event when it happens.
-    // Propagate DB errors instead of silently degrading. Without
-    // this, a transient list_executions failure would skip terminal-
-    // status synthesis and leave the UI showing "Running" forever
-    // for an execution that already terminated.
-    let summary = state
-        .journal
-        .list_executions(500)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .into_iter()
-        .find(|s| s.color == color);
-    if let Some(summary) = summary
-    {
-        match summary.status.to_ascii_lowercase().as_str() {
-            "completed" => out.push(DispatcherEvent::ExecutionCompleted {
-                color,
-                project_id: project_id.clone(),
-                outputs: serde_json::Value::Null,
-            }),
-            "failed" => out.push(DispatcherEvent::ExecutionFailed {
-                color,
-                project_id: project_id.clone(),
-                // Per-node errors are already in the stream; the
-                // summary doesn't carry one so we leave it empty.
-                error: String::new(),
-            }),
-            "cancelled" => out.push(DispatcherEvent::ExecutionCancelled {
-                color,
-                project_id: project_id.clone(),
-                reason: "Cancelled by user".to_string(),
-            }),
-            _ => {}
-        }
+    for c in snapshot.corruptions {
+        out.push(DispatcherEvent::JournalCorruption {
+            color,
+            project_id: project_id.clone(),
+            site: c.site,
+            reason: c.reason,
+        });
     }
     Ok(Json(out))
-}
-
-/// Translate a journaled per-node event into the SSE-shaped
-/// `DispatcherEvent` the extension's apply handler expects. Same
-/// field names live wire uses (`node`, `lane`, `project_id`).
-fn node_event_to_dispatcher(
-    e: crate::journal::NodeExecEvent,
-    project_id: String,
-) -> DispatcherEvent {
-    use crate::journal::NodeExecKind;
-    match e.kind {
-        NodeExecKind::Started => DispatcherEvent::NodeStarted {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            input: e.input.unwrap_or(serde_json::Value::Null),
-            project_id,
-        },
-        // Per the journal schema, Suspended/Resumed carry a token,
-        // Cancelled carries a reason, Failed carries an error. A
-        // NULL column on any of these is a schema-drift bug; surface
-        // a visible sentinel so the UI doesn't render a blank
-        // diagnostic and the broken row is obvious in logs.
-        NodeExecKind::Suspended => DispatcherEvent::NodeSuspended {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            token: e.token.unwrap_or_else(|| "<missing token column>".into()),
-            project_id,
-        },
-        NodeExecKind::Resumed => DispatcherEvent::NodeResumed {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            token: e.token.unwrap_or_else(|| "<missing token column>".into()),
-            value: e.value.unwrap_or(serde_json::Value::Null),
-            project_id,
-        },
-        NodeExecKind::Cancelled => DispatcherEvent::NodeCancelled {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            reason: e.reason.unwrap_or_else(|| "<missing reason column>".into()),
-            project_id,
-        },
-        NodeExecKind::Completed => DispatcherEvent::NodeCompleted {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            output: e.output.unwrap_or(serde_json::Value::Null),
-            project_id,
-        },
-        NodeExecKind::Failed => DispatcherEvent::NodeFailed {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            error: e.error.unwrap_or_else(|| "<missing error column>".into()),
-            project_id,
-        },
-        NodeExecKind::Skipped => DispatcherEvent::NodeSkipped {
-            color: e.color,
-            node: e.node_id,
-            lane: e.lane,
-            project_id,
-        },
-    }
 }
 
 pub async fn list_executions(

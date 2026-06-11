@@ -1,9 +1,15 @@
+# syntax=docker/dockerfile:1.6
 # Multi-stage build for weft-infra-supervisor.
 #
 # Per-tenant pod that owns runtime infra lifecycle: claims
 # infra_lifecycle_command rows from the broker, executes them via
 # kubectl, polls k8s for replica state, evaluates HealthProtocols,
 # emits infra_event rows.
+#
+# The supervisor does NOT read the node catalog at runtime, so the
+# build context never stages `catalog/` and a catalog edit doesn't
+# invalidate this image. Cargo cache mounts keep the cargo build
+# incremental across edits.
 
 # Builder uses a plain base + rustup so the toolchain is read from
 # `rust-toolchain.toml` (the single source of truth for the whole
@@ -25,9 +31,13 @@ WORKDIR /build
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY catalog ./catalog
 
-RUN cargo build --release -p weft-infra-supervisor --bin weft-infra-supervisor
+# sharing=locked: see listener.Dockerfile (parallel system builds vs
+# cargo's registry lock living outside the mount).
+RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=weft-cargo-target-supervisor,target=/build/target,sharing=locked \
+    cargo build --release -p weft-infra-supervisor --bin weft-infra-supervisor \
+    && cp /build/target/release/weft-infra-supervisor /usr/local/bin/weft-infra-supervisor
 
 # ---
 
@@ -43,6 +53,6 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/weft-infra-supervisor /usr/local/bin/weft-infra-supervisor
+COPY --from=builder /usr/local/bin/weft-infra-supervisor /usr/local/bin/weft-infra-supervisor
 
 CMD ["weft-infra-supervisor"]

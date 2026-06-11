@@ -91,16 +91,19 @@ fn walk(parent: &crate::cst::SyntaxNode, prefix: &mut Vec<String>, nodes: &mut V
     };
     for node in parent.children() {
         match node.kind() {
-            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::INCLUDE_DECL => {
+            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL | SyntaxKind::INCLUDE_DECL => {
                 if let Some(d) = crate::cst::nodes::Decl::cast(node.clone()) {
                     let local = d.local_id().unwrap_or_default();
                     nodes.push(NodeView { id: scoped(prefix, &local) });
-                    if let crate::cst::nodes::Decl::Group(g) = &d {
-                        if let Some(body) = g.body() {
-                            prefix.push(local);
-                            walk(body.syntax(), prefix, nodes, edges);
-                            prefix.pop();
-                        }
+                    let body = match &d {
+                        crate::cst::nodes::Decl::Group(g) => g.body(),
+                        crate::cst::nodes::Decl::Loop(l)  => l.body(),
+                        _ => None,
+                    };
+                    if let Some(body) = body {
+                        prefix.push(local);
+                        walk(body.syntax(), prefix, nodes, edges);
+                        prefix.pop();
                     }
                 }
             }
@@ -504,50 +507,6 @@ fn move_node_into_single_line_empty_group() {
     assert!(!p.nodes.iter().any(|n| n.id == "t"), "no top-level orphan t: {moved}");
 }
 
-#[test]
-fn move_node_into_group_with_post_body_output_ports() {
-    // A group can carry output ports AFTER its body: `} -> (out: ...)`. The
-    // group's last source line is then `} -> (...)`, not a bare `}`. Inserting a
-    // child must still go INSIDE the body (before that closing line), not try to
-    // split a non-existent inline brace. Regression: a `== "}"` text check missed
-    // this shape and panicked on the absent `{`.
-    let src = "# Project: T\n\ngrp = Group() {\n  x = Text { value: \"a\" }\n} -> (out: String)\nt = Text { value: \"b\" }\n";
-    let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
-    parse_ok(&moved);
-    let p = structure(&moved);
-    assert!(p.nodes.iter().any(|n| n.id == "grp.t"), "t must nest inside grp: {moved}");
-    assert!(!p.nodes.iter().any(|n| n.id == "t"), "no top-level orphan t: {moved}");
-}
-
-#[test]
-fn move_node_into_group_with_separate_line_output_ports() {
-    // Post-body output ports can sit on their OWN line after the `}`. The
-    // parser's span.end_line then points at the `-> (...)` line, not the `}`.
-    // Insertion must still nest the child inside the body (before the real `}`),
-    // not after it. Regression: trusting span.end_line spliced the child after
-    // the brace and produced unparseable source written straight to disk.
-    let src = "# Project: T\n\ngrp = Group() {\n  x = Text { value: \"a\" }\n}\n-> (out: String)\nt = Text { value: \"b\" }\n";
-    let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
-    parse_ok(&moved);
-    let p = structure(&moved);
-    assert!(p.nodes.iter().any(|n| n.id == "grp.t"), "t must nest inside grp: {moved}");
-    assert!(!p.nodes.iter().any(|n| n.id == "t"), "no top-level orphan t: {moved}");
-}
-
-#[test]
-fn remove_group_with_separate_line_output_ports() {
-    // Ungrouping a group whose output ports sit on their own line after `}` must
-    // drop the header, the `}`, AND the `-> (...)` line (all part of the group
-    // declaration), keeping the de-indented child. Regression: trusting
-    // span.end_line dropped the arrow line and orphaned the real `}`.
-    let src = "# Project: T\n\ngrp = Group() {\n  x = Text { value: \"a\" }\n}\n-> (out: String)\n";
-    let removed = apply(src, vec![EditOp::RemoveGroup { group: "grp".into() }]);
-    parse_ok(&removed);
-    assert!(!removed.contains("Group("), "group declaration gone: {removed}");
-    assert!(!removed.contains("-> (out"), "post-body output ports gone: {removed}");
-    let p = structure(&removed);
-    assert!(p.nodes.iter().any(|n| n.id == "x"), "child x survives at top level: {removed}");
-}
 
 #[test]
 fn move_node_into_group_with_multiline_signature() {
@@ -592,22 +551,6 @@ fn update_node_ports_on_node_with_body_preserves_body() {
     parse_ok(&out);
 }
 
-#[test]
-fn update_group_ports_normalizes_post_body_outputs() {
-    // A group with post-body outputs (`} -> (out)`): UpdateGroupPorts rewrites
-    // the whole signature, normalizing outputs into the pre-body position. The
-    // post-body clause is dropped and outputs are NOT duplicated or lost.
-    let src = "g = Group(a: String) {\n  x = Debug\n} -> (out: String)\n";
-    let out = apply(src, vec![EditOp::UpdateGroupPorts {
-        group: "g".into(),
-        inputs: vec![PortSig { name: "a".into(), required: true, port_type: Some("String".into()) }],
-        outputs: vec![PortSig { name: "out".into(), required: true, port_type: Some("String".into()) }],
-    }]);
-    assert!(out.contains("g = Group(a: String) -> (out: String)"), "outputs pre-body: {out}");
-    assert_eq!(out.matches("out: String").count(), 1, "no duplicate output: {out}");
-    assert!(!out.contains("} -> ("), "post-body clause dropped: {out}");
-    parse_ok(&out);
-}
 
 #[test]
 fn remove_node_drops_edges_in_other_scopes() {
@@ -885,6 +828,16 @@ fn rename_group_to_empty_fails_loud() {
 }
 
 #[test]
+fn set_label_on_group_fails_loud() {
+    // A setLabel targeting a container would write a `_label` field into
+    // the group body, which the lowering rejects as a compile error.
+    // The edit must fail at edit time with a kind mismatch instead.
+    let src = "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::SetLabel { node: "grp".into(), label: Some("Hi".into()) }]).unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
 fn set_group_description_replaces_and_clears() {
     // Replace an existing description, then clear it (None removes the line).
     let src = "g = Group() {\n  # Description: old\n  t = Text {}\n}\n";
@@ -960,8 +913,6 @@ fn every_group_layout_handles_add_child_without_corruption() {
     let layouts = [
         "g = Group() -> () {}\n",                              // inline empty
         "g = Group() {\n  x = Text {}\n}\n",                  // multi-line bare close
-        "g = Group() {\n  x = Text {}\n} -> (out: String)\n", // same-line post ports
-        "g = Group() {\n  x = Text {}\n}\n-> (out: String)\n",// separate-line post ports
         "g = Group(\n  a: String\n) -> () {}\n",             // multi-line signature
     ];
     for layout in layouts {
@@ -979,8 +930,6 @@ fn every_group_layout_handles_add_child_without_corruption() {
 fn every_group_layout_handles_remove_child_and_ungroup() {
     let layouts = [
         "g = Group() {\n  x = Text {}\n}\n",
-        "g = Group() {\n  x = Text {}\n} -> (out: String)\n",
-        "g = Group() {\n  x = Text {}\n}\n-> (out: String)\n",
     ];
     for layout in layouts {
         let out = apply(layout, vec![EditOp::RemoveGroup { group: "g".into() }]);
@@ -1006,19 +955,29 @@ fn edit_soak_never_corrupts() {
     let bases = [
         "a = Text { value: \"x\" }\nb = Debug\n",
         "g = Group() -> (out: String) {\n  x = Text {}\n  self.out = x.value\n}\n",
-        "g = Group() {\n  x = Text {}\n} -> (out: String)\n",
         "a = Text {}\nb = Debug\nb.data = a.value\n",
         // a node with a heredoc + a group with a nested group (gnarly shapes)
         "n = Code {\n  src: ```\nline\n  indented\n```\n}\n",
         "outer = Group() -> () {\n  inner = Group() -> () {\n    y = Debug\n  }\n}\nz = Text {}\n",
+        // Loop base: forces the fuzzer through the Loop-specific
+        // edit paths (rename/remove/move + config fields in the
+        // body). Without a loop in the bases, the seven Loop edit
+        // ops are exercised but always target a Group/Node id and
+        // are silently rejected by the ContainerKind check.
+        "myloop = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n  body = Text {}\n}\n",
+        // Mixed Group+Loop base. The earlier loop-only base has no
+        // Group target, so MoveLoopScope { Some(target) } never
+        // lands successfully. This base gives the fuzzer a real
+        // target for the move-into-container path.
+        "container = Group() -> () {\n}\nmyloop = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n}\n",
     ];
     // Targets drawn from the ids the bases actually contain (top-level + scoped).
-    let targets = ["a", "b", "x", "z", "g", "g.x", "outer", "outer.inner", "outer.inner.y"];
+    let targets = ["a", "b", "x", "z", "g", "g.x", "outer", "outer.inner", "outer.inner.y", "myloop", "myloop.body", "container"];
     let pick = |n: u64, slice: &[&str]| slice[(n as usize) % slice.len()].to_string();
     for _ in 0..600 {
         let mut src = bases[(next() as usize) % bases.len()].to_string();
         for _ in 0..4 {
-            let op = match next() % 15 {
+            let op = match next() % 23 {
                 0 => EditOp::AddNode { id: format!("n{}", next() % 1000), node_type: "Debug".into(), parent_group: None },
                 1 => EditOp::SetConfig { node: pick(next(), &targets), key: "value".into(), value: format!("\"{}\"", next() % 100) },
                 2 => EditOp::AddGroup { label: format!("grp{}", next() % 1000), parent_group: None },
@@ -1033,7 +992,20 @@ fn edit_soak_never_corrupts() {
                 11 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: None },
                 12 => EditOp::MoveGroupScope { group: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 13 => EditOp::UpdateNodePorts { node: pick(next(), &targets), inputs: vec![PortSig { name: "i".into(), required: true, port_type: Some("String".into()) }], outputs: vec![] },
-                _ => EditOp::SetGroupDescription { group: pick(next(), &targets), description: Some(format!("d{}", next() % 100)) },
+                14 => EditOp::SetGroupDescription { group: pick(next(), &targets), description: Some(format!("d{}", next() % 100)) },
+                // Loop ops. Some will fail kind-mismatch checks (the
+                // Group-targeted RenameGroup at arm 9 etc. already do
+                // the same); successful Loop edits exercise the
+                // body-with-config-fields paths the Group ops don't
+                // cover.
+                15 => EditOp::AddLoop { label: format!("lp{}", next() % 1000), parent_group: None },
+                16 => EditOp::RemoveLoop { loop_id: pick(next(), &targets) },
+                17 => EditOp::RenameLoop { old_label: pick(next(), &targets), new_label: format!("lr{}", next() % 1000) },
+                18 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
+                19 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: None },
+                20 => EditOp::UpdateLoopPorts { loop_id: pick(next(), &targets), inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[String]".into()) }], outputs: vec![PortSig { name: "results".into(), required: true, port_type: Some("List[String | Null]".into()) }] },
+                21 => EditOp::SetLoopConfig { loop_id: pick(next(), &targets), key: "max_iters".into(), value: format!("{}", next() % 100) },
+                _ => EditOp::RemoveLoopConfig { loop_id: pick(next(), &targets), key: "max_iters".into() },
             };
             // Ops that legitimately error (bad target, collision, ...) are skipped;
             // every SUCCESSFUL edit must satisfy the full structural invariants.
@@ -1070,6 +1042,16 @@ fn editop_wire_shape_round_trips() {
         json!({"op":"updateNodePorts","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[]}),
         json!({"op":"updateGroupPorts","group":"g","inputs":[],"outputs":[]}),
         json!({"op":"setGroupDescription","group":"g","description":"d"}),
+        // Loop ops: same wire-contract guarantee as the Group/Node
+        // ops above. A serde rename here breaks the webview silently.
+        json!({"op":"addLoop","label":"l","parentGroup":null}),
+        json!({"op":"removeLoop","loopId":"l"}),
+        json!({"op":"renameLoop","oldLabel":"a","newLabel":"b"}),
+        json!({"op":"moveLoopScope","loopId":"l","targetGroup":"g"}),
+        json!({"op":"moveLoopScope","loopId":"l","targetGroup":null}),
+        json!({"op":"updateLoopPorts","loopId":"l","inputs":[{"name":"i","required":true,"portType":"List[String]"}],"outputs":[{"name":"o","required":true,"portType":"List[String | Null]"}]}),
+        json!({"op":"setLoopConfig","loopId":"l","key":"parallel","value":"true"}),
+        json!({"op":"removeLoopConfig","loopId":"l","key":"max_iters"}),
     ];
     for c in cases {
         let op: EditOp = serde_json::from_value(c.clone()).unwrap_or_else(|e| panic!("deserialize {c}: {e}"));
@@ -1251,3 +1233,573 @@ fn add_node_into_inline_empty_group_no_glue() {
     assert!(!out.contains("{  "), "no glue onto the open brace: {out:?}");
 }
 
+
+// ─── Loop edit op tests ─────────────────────────────────────────────────────
+
+#[test]
+fn add_loop_at_top_level() {
+    let src = "x = Text { value: \"a\" }\n";
+    let out = apply(src, vec![EditOp::AddLoop { label: "my_loop".into(), parent_group: None }]);
+    parse_ok(&out);
+    assert!(out.contains("my_loop = Loop() -> () {"), "loop added: {out:?}");
+    // Default body is empty: parallel defaults to false (sequential).
+    assert!(!out.contains("parallel:"), "default config is empty: {out:?}");
+}
+
+#[test]
+fn add_loop_inside_group() {
+    let src = "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\n";
+    let out = apply(src, vec![EditOp::AddLoop { label: "inner".into(), parent_group: Some("g".into()) }]);
+    parse_ok(&out);
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "g.inner"), "inner loop nested in g: {out}");
+}
+
+#[test]
+fn add_node_inside_loop() {
+    let src = "my = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n}\n";
+    let out = apply(src, vec![EditOp::AddNode { id: "p".into(), node_type: "Text".into(), parent_group: Some("my".into()) }]);
+    parse_ok(&out);
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "my.p"), "p nested in my loop: {out}");
+}
+
+#[test]
+fn remove_loop_ungroups_children() {
+    let src = "my = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n  body = Text {}\n}\n";
+    let out = apply(src, vec![EditOp::RemoveLoop { loop_id: "my".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("Loop("), "loop declaration gone: {out:?}");
+    let p = structure(&out);
+    assert!(p.nodes.iter().any(|n| n.id == "body"), "child body survives ungroup: {out:?}");
+    // The config fields are gone (they belong to the loop).
+    assert!(!out.contains("parallel:"), "config field removed: {out:?}");
+}
+
+#[test]
+fn rename_loop_rewrites_header_and_outside_refs() {
+    let src = "my = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n}\nd = Debug\nd.data = my.results\n";
+    let out = apply(src, vec![EditOp::RenameLoop {
+        old_label: "my".into(),
+        new_label: "renamed".into(),
+    }]);
+    parse_ok(&out);
+    assert!(
+        out.contains("renamed = Loop(items: List[String]) -> (results: List[String | Null])"),
+        "header renamed: {out}",
+    );
+    assert!(
+        out.contains("d.data = renamed.results"),
+        "external reference rewritten: {out}",
+    );
+    assert!(!out.contains("my ="), "old header gone: {out}");
+    assert!(!out.contains("my.results"), "old reference gone: {out}");
+}
+
+/// `is_err()` alone is too permissive: a regression that errored for
+/// the WRONG reason (parse failure, NodeNotFound from a name
+/// collision) would pass. Assert the specific kind-mismatch error
+/// message so the ContainerKind tightening is locked in.
+fn assert_kind_mismatch<T: std::fmt::Debug>(
+    result: Result<T, EditError>,
+    expected_kind: &str,
+    actual_kind: &str,
+) {
+    let err = result.expect_err("expected kind-mismatch error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&format!("a {actual_kind} decl")) && msg.contains(&format!("not a {expected_kind}")),
+        "expected kind-mismatch error citing {expected_kind} vs {actual_kind}, got: {msg}"
+    );
+}
+
+#[test]
+fn rename_group_rejects_loop_target() {
+    // RenameGroup is Group-only; routing a loop rename through it is
+    // a caller bug, not a fallback we silently absorb. The webview
+    // must emit RenameLoop for loops.
+    let src = "my = Loop() -> () {\n  parallel: true\n}\n";
+    let result = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::RenameGroup {
+            old_label: "my".into(),
+            new_label: "newname".into(),
+        }],
+    );
+    assert_kind_mismatch(result, "Group", "Loop");
+}
+
+#[test]
+fn remove_group_rejects_loop_target() {
+    // RemoveGroup is Group-only; same rationale as the rename pair.
+    let src = "my = Loop() -> () {\n  parallel: true\n  body = Text {}\n}\n";
+    let result = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::RemoveGroup { group: "my".into() }],
+    );
+    // The honest kind-mismatch shape: the id EXISTS but is a Loop.
+    // A "not found" here would send the user hunting for a typo in
+    // an id that is perfectly fine.
+    let err = result.expect_err("RemoveGroup on a Loop must error");
+    let msg = format!("{err}");
+    assert!(msg.contains("my"), "error must name the offending id: {msg}");
+    assert!(
+        msg.contains("is a Loop decl, not a Group"),
+        "error must name the kind mismatch, not claim the container is missing: {msg}"
+    );
+}
+
+#[test]
+fn rename_loop_rejects_group_target() {
+    // Symmetric: RenameLoop is Loop-only.
+    let src = "g = Group() -> () {\n}\n";
+    let result = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::RenameLoop {
+            old_label: "g".into(),
+            new_label: "other".into(),
+        }],
+    );
+    assert_kind_mismatch(result, "Loop", "Group");
+}
+
+#[test]
+fn rename_loop_rejects_node_target() {
+    let src = "n = Text { value: \"x\" }\n";
+    let result = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::RenameLoop {
+            old_label: "n".into(),
+            new_label: "other".into(),
+        }],
+    );
+    assert_kind_mismatch(result, "Loop", "Node");
+}
+
+#[test]
+fn update_loop_ports_rewrites_signature() {
+    let src = "my = Loop() -> () {\n  parallel: true\n}\n";
+    let out = apply(src, vec![EditOp::UpdateLoopPorts {
+        loop_id: "my".into(),
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[String]".into()) }],
+        outputs: vec![PortSig { name: "results".into(), required: true, port_type: Some("List[String | Null]".into()) }],
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("my = Loop(items: List[String]) -> (results: List[String | Null])"), "{out}");
+    assert!(out.contains("parallel: true"), "config preserved: {out}");
+}
+
+#[test]
+fn set_loop_config_inserts_field() {
+    let src = "my = Loop() -> () {\n  parallel: true\n}\n";
+    let out = apply(src, vec![EditOp::SetLoopConfig {
+        loop_id: "my".into(),
+        key: "max_iters".into(),
+        value: "100".into(),
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("max_iters: 100"), "max_iters inserted: {out}");
+    assert!(out.contains("parallel: true"), "existing config kept: {out}");
+}
+
+#[test]
+fn set_loop_config_replaces_field_in_place() {
+    let src = "my = Loop() -> () {\n  parallel: true\n  max_iters: 10\n}\n";
+    let out = apply(src, vec![EditOp::SetLoopConfig {
+        loop_id: "my".into(),
+        key: "max_iters".into(),
+        value: "999".into(),
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("max_iters: 999"), "value replaced: {out}");
+    assert!(!out.contains("max_iters: 10"), "old value gone: {out}");
+}
+
+#[test]
+fn remove_loop_config_field() {
+    let src = "my = Loop() -> () {\n  parallel: true\n  max_iters: 10\n}\n";
+    let out = apply(src, vec![EditOp::RemoveLoopConfig { loop_id: "my".into(), key: "max_iters".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("max_iters"), "field removed: {out}");
+    assert!(out.contains("parallel: true"), "siblings kept: {out}");
+}
+
+#[test]
+fn move_node_into_loop_works() {
+    let src = "p = Text { value: \"a\" }\nmy = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n}\n";
+    let out = apply(src, vec![EditOp::MoveNodeScope { node: "p".into(), target_group: Some("my".into()) }]);
+    parse_ok(&out);
+    let pp = structure(&out);
+    assert!(pp.nodes.iter().any(|n| n.id == "my.p"), "p moved into loop: {out:?}");
+    assert!(!pp.nodes.iter().any(|n| n.id == "p"), "no top-level orphan p: {out:?}");
+}
+
+#[test]
+fn move_loop_scope_relocates_loop_into_group() {
+    let src = "outer = Group() -> () {\n}\nmy = Loop() -> () {\n  parallel: true\n}\n";
+    let out = apply(src, vec![EditOp::MoveLoopScope {
+        loop_id: "my".into(),
+        target_group: Some("outer".into()),
+    }]);
+    parse_ok(&out);
+    // The loop's source-level decl now lives inside outer's body.
+    // The lowered boundary nodes get scoped ids `outer.my__in` /
+    // `outer.my__out` via flatten; here we just check the source
+    // shape (the round-trip through structure() is exercised by the
+    // group-move tests already).
+    assert!(out.contains("outer = Group"), "outer survives: {out:?}");
+    assert!(out.contains("my = Loop"), "my still present: {out:?}");
+    assert!(out.contains("  my = Loop"), "my is indented under outer: {out:?}");
+    assert!(!out.contains("\nmy = Loop"), "no top-level `my = Loop`: {out:?}");
+    // Body content must travel with the loop. A regression where
+    // move_scope rebuilt only the header would drop this.
+    assert!(out.contains("parallel: true"), "loop config preserved across move: {out:?}");
+}
+
+#[test]
+fn move_loop_scope_blocks_when_wired_across_scope() {
+    // Symmetric with MoveGroupScope: Weft is same-scope-only, so a
+    // move that would leave external wires referencing the loop
+    // across the new scope boundary bails loudly. Exercises the
+    // `connections_referencing` path for loops, which the basic
+    // relocate test doesn't touch.
+    let src = "outer = Group() -> () {\n}\nmy = Loop(items: List[String]) -> (results: List[String | Null]) {\n  parallel: true\n  over: [\"items\"]\n}\nd = Debug\nd.data = my.results\n";
+    let result = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::MoveLoopScope {
+            loop_id: "my".into(),
+            target_group: Some("outer".into()),
+        }],
+    );
+    let err = result.expect_err("move with cross-scope wiring must bail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("connection") || msg.contains("scope"),
+        "error must explain the scope-boundary block: {msg}"
+    );
+}
+
+#[test]
+fn move_group_scope_rejects_loop_target() {
+    // MoveGroupScope is Group-only; webview must emit MoveLoopScope
+    // for loops. Mirrors the rename/remove tightening.
+    let src = "outer = Group() -> () {\n}\nmy = Loop() -> () {\n  parallel: true\n}\n";
+    let result = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::MoveGroupScope {
+            group: "my".into(),
+            target_group: Some("outer".into()),
+        }],
+    );
+    assert_kind_mismatch(result, "Group", "Loop");
+}
+
+#[test]
+fn move_loop_scope_rejects_group_target() {
+    let src = "outer = Group() -> () {\n}\ng = Group() -> () {\n}\n";
+    let result = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::MoveLoopScope {
+            loop_id: "g".into(),
+            target_group: Some("outer".into()),
+        }],
+    );
+    assert_kind_mismatch(result, "Loop", "Group");
+}
+
+#[test]
+fn set_config_multiline_array_replaces_in_place() {
+    let src = "my = Loop(test: MustOverride?) {\n  parallel: true\n  over: []\n  carry: []\n}\n";
+    let out = apply(src, vec![EditOp::SetLoopConfig {
+        loop_id: "my".into(),
+        key: "carry".into(),
+        value: "[\n  \"test\"\n]".into(),
+    }]);
+    parse_ok(&out);
+    assert_eq!(out.matches("carry:").count(), 1, "carry should appear once: {out}");
+
+    let out2 = apply(&out, vec![EditOp::SetLoopConfig {
+        loop_id: "my".into(),
+        key: "carry".into(),
+        value: "[\n  \"test\",\n  \"foo\"\n]".into(),
+    }]);
+    parse_ok(&out2);
+    assert_eq!(out2.matches("carry:").count(), 1, "second set still one carry: {out2}");
+}
+
+#[test]
+fn set_config_batched_multiple_keys_replace_in_place() {
+    // Simulate what the webview does: one click sends an update containing
+    // ALL keys in data.config (because the optimistic update is `{...data.config, [key]: value}`).
+    // createNodeUpdateHandler emits one setConfig per key. None should duplicate.
+    let src = "my = Loop() -> () {\n  parallel: true\n}\n";
+    let out = apply(src, vec![
+        EditOp::SetLoopConfig { loop_id: "my".into(), key: "parallel".into(), value: "true".into() },
+        EditOp::SetLoopConfig { loop_id: "my".into(), key: "carry".into(), value: "[\n  \"a\"\n]".into() },
+    ]);
+    parse_ok(&out);
+    assert_eq!(out.matches("carry:").count(), 1);
+    assert_eq!(out.matches("parallel:").count(), 1);
+
+    let out2 = apply(&out, vec![
+        EditOp::SetLoopConfig { loop_id: "my".into(), key: "parallel".into(), value: "true".into() },
+        EditOp::SetLoopConfig { loop_id: "my".into(), key: "carry".into(), value: "[\n  \"a\",\n  \"b\"\n]".into() },
+    ]);
+    parse_ok(&out2);
+    assert_eq!(out2.matches("carry:").count(), 1);
+    assert_eq!(out2.matches("parallel:").count(), 1);
+}
+
+#[test]
+fn set_config_collapses_existing_duplicates() {
+    // If the source already contains multiple fields with the same key (a
+    // legacy file or a state recovered from an earlier bug), set_config
+    // edits the first AND removes any duplicates so the next round-trip
+    // is clean.
+    let src = "my = Loop() -> () {\n  parallel: true\n  carry: []\n  carry: [\"a\"]\n}\n";
+    let out = apply(src, vec![
+        EditOp::SetLoopConfig { loop_id: "my".into(), key: "carry".into(), value: "[\n  \"b\"\n]".into() },
+    ]);
+    parse_ok(&out);
+    assert_eq!(out.matches("carry:").count(), 1, "duplicates collapsed: {out}");
+}
+
+#[test]
+fn set_config_same_key_twice_in_batch() {
+    // Two setConfig ops for the same key in one batch (two clicks within
+    // debounce). The second must REPLACE the value the first set, not
+    // append a second field.
+    let src = "my = Loop() -> () {\n  parallel: true\n}\n";
+    let out = apply(src, vec![
+        EditOp::SetLoopConfig { loop_id: "my".into(), key: "carry".into(), value: "[\"a\"]".into() },
+        EditOp::SetLoopConfig { loop_id: "my".into(), key: "carry".into(), value: "[\"a\", \"b\"]".into() },
+    ]);
+    parse_ok(&out);
+    assert_eq!(out.matches("carry:").count(), 1, "same-key batch should leave one: {out}");
+}
+
+#[test]
+fn set_config_node_same_key_twice_in_batch() {
+    let src = "t = Text {\n  value: \"x\"\n}\n";
+    let out = apply(src, vec![
+        EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"a\"".into() },
+        EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into() },
+    ]);
+    parse_ok(&out);
+    assert_eq!(out.matches("style:").count(), 1, "same-key batch should leave one: {out}");
+}
+
+#[test]
+fn end_to_end_recover_broken_loop_file() {
+    // The broken file Quentin saw: duplicate over/carry from a pre-fix
+    // race. A single setConfig per key collapses its duplicates.
+    let src = "MyLoop = Loop(test: MustOverride?) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
+    let out = apply(src, vec![
+        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "carry".into(), value: "[\n  \"test\"\n]".into() },
+    ]);
+    parse_ok(&out);
+    assert_eq!(out.matches("carry:").count(), 1, "carry collapsed: {out}");
+    // over still duplicated until the user edits it; the next edit on over
+    // collapses those too.
+    let out2 = apply(&out, vec![
+        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "over".into(), value: "[]".into() },
+    ]);
+    parse_ok(&out2);
+    assert_eq!(out2.matches("over:").count(), 1, "over collapsed: {out2}");
+}
+
+#[test]
+fn set_config_does_not_accumulate_blank_lines() {
+    // Each setConfig must layout the inserted field cleanly: one newline
+    // between the previous decl's last token and the new one, never more.
+    // Without the explicit-layout helper, every iteration leaked an extra
+    // blank line into the body (snippet trailing + body trailing).
+    let src0 = "MyLoop = Loop() -> () {\n  parallel: true\n}\n";
+    let src1 = apply(src0, vec![
+        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "over".into(), value: "[\n  \"test\"\n]".into() },
+    ]);
+    let src2 = apply(&src1, vec![
+        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "carry".into(), value: "[]".into() },
+    ]);
+    let src3 = apply(&src2, vec![
+        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "over".into(), value: "[\n  \"test2\"\n]".into() },
+    ]);
+    parse_ok(&src3);
+    // No three-in-a-row newlines: that pattern is the symptom of a leaked
+    // blank line between two adjacent decls.
+    assert!(!src3.contains("\n\n\n"), "no triple-newline run: {src3}");
+    assert!(!src3.contains("\n\n  parallel"), "no blank before parallel: {src3}");
+    assert!(!src3.contains("\n\n  over"), "no blank before over: {src3}");
+    assert!(!src3.contains("\n\n  carry"), "no blank before carry: {src3}");
+}
+
+
+#[test]
+fn update_ports_inside_loop_body_keeps_layout() {
+    // Editing a port on a decl that lives inside a loop body must not touch
+    // the surrounding decls or the loop's config layout.
+    let src = "MyLoop = Loop(numbers: List[Number]?) -> () {\n  carry: []\n  over: [\"numbers\"]\n  exec_python_1 = ExecPython() {}\n}\n\nrange_1 = Range {\n  from: \"0\"\n}\nMyLoop.numbers = range_1.values\n";
+    let out = apply(src, vec![
+        EditOp::UpdateNodePorts {
+            node: "MyLoop.exec_python_1".into(),
+            inputs: vec![
+                crate::edit::PortSig { name: "number".into(), required: false, port_type: Some("MustOverride".into()) },
+            ],
+            outputs: vec![],
+        },
+    ]);
+    parse_ok(&out);
+    assert!(out.contains("\n  exec_python_1 = ExecPython(number: MustOverride?) {}"), "2-space indent preserved: {out}");
+    assert!(out.ends_with("MyLoop.numbers = range_1.values\n"), "trailing connection intact: {out}");
+}
+
+#[test]
+fn update_ports_at_root_does_not_glue_onto_preceding_connection() {
+    // Bug repro: at file root, the parser attaches a decl's leading
+    // newline as the decl's OWN first child token. splice_decl removes the
+    // whole decl (including that token) on a port edit; if the replacement
+    // doesn't re-inject the newline, the new decl glues onto the previous
+    // CONNECTION line. Quentin saw this produce
+    // `MyLoop.numbers = range_1.valuesexec_python_1 = ExecPython...`.
+    let src = "MyLoop = Loop() -> () {\n  parallel: true\n}\n\nrange_1 = Range {\n  from: \"0\"\n}\nMyLoop.numbers = range_1.values\nexec_python_1 = ExecPython() {}\n";
+    let out = apply(src, vec![
+        EditOp::UpdateNodePorts {
+            node: "exec_python_1".into(),
+            inputs: vec![
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: Some("MustOverride".into()) },
+            ],
+            outputs: vec![],
+        },
+    ]);
+    parse_ok(&out);
+    assert!(!out.contains("range_1.valuesexec_python"), "no glue: {out}");
+    assert!(out.contains("range_1.values\nexec_python_1"), "newline kept between connection and decl: {out}");
+}
+
+#[test]
+fn update_ports_does_not_double_indent() {
+    // Bug repro: rebuild_decl used to prepend the decl's current
+    // leading_indent AND keep the leading-WS sibling token, doubling the
+    // indent on every edit (a 2-space child would become 4, then 8...).
+    let src = "MyLoop = Loop() -> () {\n  parallel: true\n  exec_python_1 = ExecPython() {}\n}\n";
+    let out = apply(src, vec![
+        EditOp::UpdateNodePorts {
+            node: "MyLoop.exec_python_1".into(),
+            inputs: vec![
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: Some("MustOverride".into()) },
+            ],
+            outputs: vec![],
+        },
+    ]);
+    parse_ok(&out);
+    assert!(out.contains("\n  exec_python_1 = ExecPython(test"), "still 2-space: {out}");
+    assert!(!out.contains("\n    exec_python_1 = ExecPython(test"), "no 4-space drift: {out}");
+
+    // Edit again. The indent must remain 2-space.
+    let out2 = apply(&out, vec![
+        EditOp::UpdateNodePorts {
+            node: "MyLoop.exec_python_1".into(),
+            inputs: vec![
+                crate::edit::PortSig { name: "again".into(), required: false, port_type: Some("MustOverride".into()) },
+            ],
+            outputs: vec![],
+        },
+    ]);
+    parse_ok(&out2);
+    assert!(out2.contains("\n  exec_python_1 = ExecPython(again"), "still 2-space after second edit: {out2}");
+    assert!(!out2.contains("\n    exec_python_1"), "no drift on repeat: {out2}");
+}
+
+#[test]
+fn move_scope_into_loop_uses_body_indent() {
+    let src = "MyLoop = Loop(numbers: List[Number]?) -> () {\n  parallel: true\n}\nexec_python_1 = ExecPython() {}\n";
+    let out = apply(src, vec![
+        EditOp::MoveNodeScope {
+            node: "exec_python_1".into(),
+            target_group: Some("MyLoop".into()),
+        },
+    ]);
+    parse_ok(&out);
+    assert!(out.contains("\n  exec_python_1 = ExecPython"), "moved decl gets 2-space indent: {out}");
+}
+
+#[test]
+fn move_scope_into_loop_with_multiline_carry_field() {
+    // The body's last child before `}` is a multi-line JSON value. The
+    // helper that finds the body's content indent must read the body's
+    // first field, not the JSON value's closing line.
+    let src = "MyLoop = Loop(numbers: List[Number]?) -> () {\n  carry: [\n  \"acc\"\n]\n  over: [\n  \"numbers\"\n]\n}\nexec_python_1 = ExecPython() {}\n";
+    let out = apply(src, vec![
+        EditOp::MoveNodeScope {
+            node: "exec_python_1".into(),
+            target_group: Some("MyLoop".into()),
+        },
+    ]);
+    parse_ok(&out);
+    assert!(out.contains("\n  exec_python_1 = ExecPython"), "moved decl gets body's 2-space indent: {out}");
+}
+
+#[test]
+fn set_loop_config_preserves_nested_closing_brace_indent() {
+    // Inserting a config field into a NESTED container used to splice
+    // a bare trailing "\n" before `}`, dropping the brace's own indent
+    // to column 0 (and the misalignment persisted across edits).
+    let src = "g = Group {\n  my = Loop() -> () {\n    parallel: true\n  }\n}\n";
+    let out = apply(src, vec![EditOp::SetLoopConfig {
+        loop_id: "g.my".into(),
+        key: "max_iters".into(),
+        value: "5".into(),
+    }]);
+    parse_ok(&out);
+    assert!(
+        out.contains("max_iters: 5\n  }"),
+        "the loop's closing brace keeps its 2-space indent: {out}"
+    );
+}
+
+#[test]
+fn move_container_into_own_descendant_is_rejected_before_mutating() {
+    // Detach-then-resolve would otherwise fail mid-mutation with a
+    // misleading NodeNotFound for a target that exists (it was
+    // detached along with the moved subtree).
+    let src = "outer = Group {\n  inner = Group {\n    t = Text {}\n  }\n}\n";
+    let err = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::MoveGroupScope { group: "outer".into(), target_group: Some("outer.inner".into()) }],
+    )
+    .expect_err("moving a container into its own descendant must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("itself or its own descendant"),
+        "error names the actual problem: {msg}"
+    );
+
+    let err2 = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::MoveGroupScope { group: "outer".into(), target_group: Some("outer".into()) }],
+    )
+    .expect_err("moving a container into itself must error");
+    let msg2 = format!("{err2}");
+    assert!(
+        msg2.contains("itself or its own descendant"),
+        "error names the actual problem: {msg2}"
+    );
+}

@@ -459,6 +459,58 @@ pub async fn infra_endpoint_url(
     Ok(Json(InfraEndpointUrlResponse { endpoint_url }))
 }
 
+/// Worker fetches a project definition at execution claim time,
+/// keyed by `(project_id, definition_hash)`. The hash makes the
+/// lookup content-addressed: callers always get back the EXACT
+/// shape they asked for, regardless of what the project row's
+/// current `running_definition_hash` says. That's load-bearing for
+/// resumes after re-register: a suspended execution must resume on
+/// the shape it was started on, even if the user has edited and
+/// re-registered the project in the meantime.
+///
+/// The history table `project_definition` (append-only, keyed on
+/// `(project_id, definition_hash)`) is written by the dispatcher's
+/// register handler. A missing row means no register has ever
+/// happened under this hash for this project; that's a 404 (the
+/// caller's expected_hash is genuinely invalid, not just stale).
+pub async fn project_fetch_definition(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<ProjectFetchDefinitionRequest>,
+) -> Resp<ProjectFetchDefinitionResponse> {
+    if !matches!(caller.role, Role::Worker) {
+        return Err((StatusCode::FORBIDDEN, "worker only".into()));
+    }
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+        .await?;
+    let project_uuid: uuid::Uuid = req
+        .project_id
+        .parse()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad project_id: {e}")))?;
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT project_json FROM project_definition \
+         WHERE project_id = $1 AND definition_hash = $2",
+    )
+    .bind(project_uuid)
+    .bind(&req.expected_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
+    let Some((project_json,)) = row else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no project definition for project_id={} hash={}",
+                req.project_id, req.expected_hash
+            ),
+        ));
+    };
+    Ok(Json(ProjectFetchDefinitionResponse {
+        project_json,
+        definition_hash: req.expected_hash,
+    }))
+}
+
 // ---------- Supervisor surface ----------
 
 pub async fn supervisor_projects_for_tenant(

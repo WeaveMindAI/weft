@@ -9,7 +9,7 @@
 //! worker blocks on the task's terminal state and reads the resulting
 //! token from `task.result`.
 //!
-//! Idempotency: dedup keyed on `(color, node_id, lane, is_resume,
+//! Idempotency: dedup keyed on `(color, node_id, frames, is_resume,
 //! call_index)` so a Pod-crash retry converges on the same task. The
 //! task's body is itself idempotent: entry rows reuse a stable token
 //! per `(project_id, node_id)`, resume rows mint per-suspension.
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use weft_core::lane::Lane;
+use weft_core::frames::LoopFrames;
 use weft_core::primitive::SignalSpec;
 use weft_core::signal as core_signal;
 use weft_task_store::executor::TaskExecutor;
@@ -32,16 +32,16 @@ use crate::state::DispatcherState;
 pub struct RegisterSignalPayload {
     pub color: String,
     pub node_id: String,
-    pub lane: Lane,
+    pub frames: LoopFrames,
     pub spec: SignalSpec,
     pub is_resume: bool,
     /// 0-based ordinal of the `await_signal` call within this
-    /// (color, node_id, lane). Set by the worker; the dispatcher
+    /// (color, node_id, frames). Set by the worker; the dispatcher
     /// stamps it on the SuspensionRegistered event so replay can
-    /// rebuild the per-(node, lane) sequence in order. Must not
+    /// rebuild the per-(node, frames) sequence in order. Must not
     /// vary across replays of the same body, so the dedup key
-    /// includes it.
-    #[serde(default)]
+    /// includes it. Required: a missing field would silently default
+    /// to 0 and collide every await on the same frame stack.
     pub call_index: u32,
 }
 
@@ -91,26 +91,29 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         // between spawn and `/register` POST. Token reuse for entry
         // rows keeps the registration stable across reactivates;
         // resume rows always mint fresh.
-        let project_id = state
-            .journal
-            .execution_project(color)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no project for color"))?;
+        let project_id = match state.journal.execution_project(color).await? {
+            crate::journal::ColorLookup::Found(p) => p,
+            crate::journal::ColorLookup::NotFound => {
+                anyhow::bail!("no project for color {color}")
+            }
+            crate::journal::ColorLookup::Corrupt => anyhow::bail!(
+                "journal row for color {color} is corrupt; see dispatcher logs"
+            ),
+        };
         let tenant = state.tenant_router.tenant_for_project(&project_id);
         let namespace = state.namespace_mapper.namespace_for(&tenant);
 
         let token = if payload.is_resume {
             // Derive resume token from the suspension identity so a
             // retry of this task converges on the same token. The
-            // identity (color, node_id, lane, call_index) is what
+            // identity (color, node_id, frames, call_index) is what
             // the engine's fold uses to match resumes.
             let mut hasher = Sha256::new();
             hasher.update(color.to_string().as_bytes());
             hasher.update(b":");
             hasher.update(payload.node_id.as_bytes());
             hasher.update(b":");
-            for frame in &payload.lane {
-                hasher.update(frame.count.to_le_bytes());
+            for frame in &payload.frames {
                 hasher.update(frame.index.to_le_bytes());
             }
             hasher.update(b":");
@@ -334,15 +337,15 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             // worker restart. Sequenced AFTER signal_insert so the
             // signal row exists by the time anything reads the
             // journal entry. Dedup key collapses retries on the
-            // same (color, node_id, lane, call_index); a failure
+            // same (color, node_id, frames, call_index); a failure
             // here triggers the task framework to retry, and
             // signal_insert's UPSERT is idempotent so the second
             // pass converges cleanly.
             let now = crate::lease::now_unix() as u64;
-            let lane_key = payload
-                .lane
+            let frames_key = payload
+                .frames
                 .iter()
-                .map(|f| format!("{}of{}", f.index, f.count))
+                .map(|f| format!("{}", f.index))
                 .collect::<Vec<_>>()
                 .join("/");
             state
@@ -351,14 +354,14 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                     &weft_journal::ExecEvent::SuspensionRegistered {
                         color,
                         node_id: payload.node_id.clone(),
-                        lane: payload.lane.clone(),
+                        frames: payload.frames.clone(),
                         token: token.clone(),
                         spec: payload.spec.clone(),
                         call_index: payload.call_index,
                         at_unix: now,
                     },
                     &format!(
-                        "register_signal:{color}:{node_id}:{lane_key}:{call_index}",
+                        "register_signal:{color}:{node_id}:{frames_key}:{call_index}",
                         color = color,
                         node_id = payload.node_id,
                         call_index = payload.call_index

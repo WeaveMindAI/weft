@@ -53,14 +53,25 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
             add_decl(view, parent_group.as_deref(), label, &format!("{label} = Group() -> () {{}}"))
         }
         RemoveGroup { group } => remove_group(view, group),
-        RenameGroup { old_label, new_label } => rename_group(view, old_label, new_label),
-        MoveNodeScope { node, target_group } => move_scope(view, node, target_group.as_deref()),
-        MoveGroupScope { group, target_group } => move_scope(view, group, target_group.as_deref()),
-        UpdateNodePorts { node, inputs, outputs } => update_ports(view, node, inputs, outputs),
-        UpdateGroupPorts { group, inputs, outputs } => update_ports(view, group, inputs, outputs),
+        RenameGroup { old_label, new_label } => rename_container(view, old_label, new_label, ContainerKind::Group),
+        MoveNodeScope { node, target_group } => move_scope(view, node, target_group.as_deref(), ContainerKind::Node),
+        MoveGroupScope { group, target_group } => move_scope(view, group, target_group.as_deref(), ContainerKind::Group),
+        UpdateNodePorts { node, inputs, outputs } => update_ports(view, node, inputs, outputs, ContainerKind::Node),
+        UpdateGroupPorts { group, inputs, outputs } => update_ports(view, group, inputs, outputs, ContainerKind::Group),
         SetGroupDescription { group, description } => {
             set_group_description(view, group, description.as_deref())
         }
+        AddLoop { label, parent_group } => add_decl(
+            view, parent_group.as_deref(), label,
+            // Body left empty: parallel defaults to false, over/carry empty.
+            &format!("{label} = Loop() -> () {{}}"),
+        ),
+        RemoveLoop { loop_id } => remove_loop(view, loop_id),
+        RenameLoop { old_label, new_label } => rename_container(view, old_label, new_label, ContainerKind::Loop),
+        MoveLoopScope { loop_id, target_group } => move_scope(view, loop_id, target_group.as_deref(), ContainerKind::Loop),
+        UpdateLoopPorts { loop_id, inputs, outputs } => update_ports(view, loop_id, inputs, outputs, ContainerKind::Loop),
+        SetLoopConfig { loop_id, key, value } => set_loop_config(view, loop_id, key, value),
+        RemoveLoopConfig { loop_id, key } => remove_loop_config(view, loop_id, key),
     }
 }
 
@@ -76,26 +87,61 @@ fn resolve(view: &FileView, id: &str) -> Result<Decl, EditError> {
     }
 }
 
+/// The decl's kind name for error messages. The single home for the
+/// kind-mismatch wording every kind-routed op uses.
+fn kind_name(decl: &Decl) -> &'static str {
+    match decl {
+        Decl::Group(_) => "Group",
+        Decl::Loop(_) => "Loop",
+        Decl::Node(_) => "Node",
+        Decl::Include(_) => "Include",
+    }
+}
+
+/// The honest kind-mismatch error: the id EXISTS but is the wrong
+/// kind of decl for the op. Distinct from ContainerNotFound, which
+/// would send the user hunting for a typo in an id that is fine.
+fn kind_mismatch(op: &str, id: &str, expected: &str, actual: &Decl) -> EditError {
+    EditError::InvalidArgument(format!(
+        "{op} called on '{id}' which is a {} decl, not a {expected}",
+        kind_name(actual),
+    ))
+}
+
 /// Resolve specifically to a group decl.
 fn resolve_group(view: &FileView, id: &str) -> Result<crate::cst::nodes::GroupDecl, EditError> {
     match resolve(view, id)? {
         Decl::Group(g) => Ok(g),
-        _ => Err(EditError::GroupNotFound(id.to_string())),
+        other => Err(kind_mismatch("a Group op", id, "Group", &other)),
     }
 }
 
-/// The body to insert into for a given parent-group ref: the group's BODY (None
-/// = the file root). Splits an inline `{}` body open isn't needed: an empty body
-/// already has an `R_BRACE` to splice before.
+/// Resolve specifically to a loop decl.
+fn resolve_loop(view: &FileView, id: &str) -> Result<crate::cst::nodes::LoopDecl, EditError> {
+    match resolve(view, id)? {
+        Decl::Loop(l) => Ok(l),
+        other => Err(kind_mismatch("a Loop op", id, "Loop", &other)),
+    }
+}
+
+/// The body to insert into for a given parent ref. Accepts groups AND
+/// loops as containers. None = the file root.
 fn target_body(view: &FileView, parent_group: Option<&str>) -> Result<InsertTarget, EditError> {
     match parent_group {
         None => Ok(InsertTarget::FileRoot(view.file().clone())),
         Some(g) => {
-            let group = resolve_group(view, g)?;
-            let body = group
-                .body()
-                .ok_or_else(|| EditError::GroupNotFound(g.to_string()))?;
-            Ok(InsertTarget::GroupBody { body, indent: group_body_indent(&group) })
+            let decl = resolve(view, g)?;
+            match &decl {
+                Decl::Group(grp) => {
+                    let body = grp.body().ok_or_else(|| EditError::ContainerNotFound(g.to_string()))?;
+                    Ok(InsertTarget::GroupBody { body, indent: group_body_indent_decl(&decl) })
+                }
+                Decl::Loop(lp) => {
+                    let body = lp.body().ok_or_else(|| EditError::ContainerNotFound(g.to_string()))?;
+                    Ok(InsertTarget::GroupBody { body, indent: group_body_indent_decl(&decl) })
+                }
+                _ => Err(EditError::ContainerNotFound(g.to_string())),
+            }
         }
     }
 }
@@ -114,6 +160,71 @@ fn snippet_elements(snippet: &str) -> Vec<SyntaxElement> {
     parse(snippet).clone_for_update().children_with_tokens().collect()
 }
 
+/// Parse `snippet` as the INSIDE of a body and return the elements that lived
+/// inside the synthetic `{ ... }`. Use this when the snippet is body-grammar
+/// content (a CONFIG_FIELD, a connection) that the file grammar would parse as
+/// an ERROR node. Wrapping in synthetic braces lets the parser use body rules
+/// so the result is a real CONFIG_FIELD / CONNECTION node, which later editor
+/// passes (find_field, ...) can recognize.
+fn snippet_elements_as_body_content(snippet: &str) -> Vec<SyntaxElement> {
+    // Synthesize a wrapper node so the snippet is parsed in body context.
+    // The wrapper `placeholder = X { ... }` ensures the snippet sits inside a
+    // BODY whose children include real CONFIG_FIELD / CONNECTION nodes.
+    let wrapper_src = format!("__edit_wrap_placeholder = X {{\n{snippet}\n}}\n");
+    let root = parse(&wrapper_src).clone_for_update();
+    let file = match WeftFile::cast(root) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+    let decl = match file.syntax().children().next() {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let body = decl
+        .descendants()
+        .find(|n| n.kind() == SyntaxKind::BODY);
+    let body = match body {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    // Drop the wrapping braces and ALL surrounding whitespace (both wrapper-
+    // injected and snippet-author-provided). The caller controls insert
+    // layout via the elements it splices around our result, so leaving any
+    // leading/trailing trivia here doubles newlines when the target body
+    // already has trailing trivia of its own (the classic "blank line
+    // accumulates after every edit" bug). Strip everything: parser will
+    // re-emit clean elements.
+    let mut elems: Vec<SyntaxElement> = body.children_with_tokens().collect();
+    while let Some(first) = elems.first() {
+        match first {
+            NodeOrToken::Token(t)
+                if t.kind() == SyntaxKind::L_BRACE || t.kind() == SyntaxKind::WHITESPACE =>
+            {
+                elems.remove(0);
+            }
+            _ => break,
+        }
+    }
+    while let Some(last) = elems.last() {
+        match last {
+            NodeOrToken::Token(t)
+                if t.kind() == SyntaxKind::R_BRACE || t.kind() == SyntaxKind::WHITESPACE =>
+            {
+                elems.pop();
+            }
+            _ => break,
+        }
+    }
+    // Detach each element so it can be re-spliced into the target tree.
+    for el in &elems {
+        match el {
+            NodeOrToken::Node(n) => n.detach(),
+            NodeOrToken::Token(t) => t.detach(),
+        }
+    }
+    elems
+}
+
 /// True if `body` is a SINGLE-LINE body (`{}` or `{ x }`): no newline token
 /// between its braces. A single-line body must be "opened" (a newline added)
 /// before inserting a line that owns its own layout, or that line would glue onto
@@ -125,17 +236,63 @@ fn body_is_single_line(body: &Body) -> bool {
         .any(|e| e.as_token().map(|t| t.text().contains('\n')).unwrap_or(false))
 }
 
-/// Splice `elements` into `body` immediately before its closing `}`.
+/// Splice `elements` into `body` immediately before its closing `}`, owning
+/// the layout: leading newline+indent before the inserted content, single
+/// newline after it. Any existing trailing whitespace inside the body before
+/// `}` is replaced so repeated inserts don't accumulate blank lines.
+///
+/// `indent` is the body's content indent (decl's leading indent + 2 spaces),
+/// provided by the caller. Snippet-author whitespace is stripped upstream
+/// (snippet_elements_as_body_content), so the caller has full control.
+fn insert_before_close_with_indent(
+    body: &Body,
+    indent: &str,
+    elements: Vec<SyntaxElement>,
+) -> Result<(), EditError> {
+    let brace = body
+        .close_brace()
+        .ok_or_else(|| EditError::Unparseable("group body has no closing brace".into()))?;
+    let at = brace.index();
+    // Detach any trailing WHITESPACE immediately before `}` so we own the
+    // spacing. Without this, the previous sibling's trailing `\n` (or worse,
+    // an accumulated `\n  \n  `) sits between us and `}` and we get blank
+    // lines that grow over repeated edits.
+    if at > 0 {
+        if let Some(NodeOrToken::Token(t)) = body.syntax().children_with_tokens().nth(at - 1) {
+            if t.kind() == SyntaxKind::WHITESPACE {
+                t.detach();
+            }
+        }
+    }
+    let at = body
+        .close_brace()
+        .map(|b| b.index())
+        .ok_or_else(|| EditError::Unparseable("close brace gone after detach".into()))?;
+    let mut elems: Vec<SyntaxElement> =
+        raw_token_elements(&[(SyntaxKind::WHITESPACE, &format!("\n{indent}"))]);
+    elems.extend(elements);
+    // The detached trailing whitespace carried the closing brace's own
+    // indent; restore it (the content indent minus the 2-space body
+    // step, see `group_body_indent_decl`) so a nested container's `}`
+    // doesn't land at column 0 after the edit.
+    let brace_indent = indent.strip_suffix("  ").unwrap_or("");
+    elems.extend(raw_token_elements(&[(
+        SyntaxKind::WHITESPACE,
+        &format!("\n{brace_indent}"),
+    )]));
+    body.syntax().splice_children(at..at, elems);
+    Ok(())
+}
+
+/// Splice `elements` into `body` immediately before its closing `}`. Used
+/// by callers that have already authored the surrounding whitespace into
+/// `elements` themselves. Prefer `insert_before_close_with_indent` for any
+/// new caller so layout stays uniform across repeated edits.
 fn insert_before_close(body: &Body, elements: Vec<SyntaxElement>) -> Result<(), EditError> {
     let brace = body
         .close_brace()
         .ok_or_else(|| EditError::Unparseable("group body has no closing brace".into()))?;
     let at = brace.index();
-    // A single-line body (`{}`, `{ x }`) has its content + close brace on the
-    // open-brace line, so the inserted content (which carries its own leading
-    // indent + trailing newline) would glue onto it. Open the body by prepending
-    // a newline: the content sits on its own indented line and its trailing
-    // newline drops `}` to the start of the next line.
     let mut elems = if body_is_single_line(body) {
         raw_token_elements(&[(SyntaxKind::WHITESPACE, "\n")])
     } else {
@@ -168,10 +325,10 @@ fn detach_with_leading_ws(node: &SyntaxNode) {
 
 // ── indentation ─────────────────────────────────────────────────────────────
 
-/// The body indent for children of a group: the group header's own indent + 2
-/// spaces. Read from the group decl's leading whitespace.
-fn group_body_indent(group: &crate::cst::nodes::GroupDecl) -> String {
-    format!("{}  ", leading_indent(group.syntax()))
+/// Body indent for any container decl (group or loop): the header's own indent
+/// + 2 spaces. Read from the decl's leading whitespace.
+fn group_body_indent_decl(decl: &Decl) -> String {
+    format!("{}  ", leading_indent(decl.syntax()))
 }
 
 /// The whitespace that precedes `node` in source order, wherever the parser
@@ -261,27 +418,36 @@ fn ep_parts(ep: &SyntaxNode) -> (Option<String>, Option<String>) {
 }
 
 /// Remove a group by UNGROUPING it: header + close brace + boundary wiring go,
-/// children move up one scope (de-indented).
+/// children move up one scope (de-indented). Group-only: routing a
+/// Loop through this op is a caller bug (the webview emits
+/// `RemoveLoop` for loops). Fail loud instead of silently absorbing.
 fn remove_group(view: &FileView, group_id: &str) -> Result<(), EditError> {
     let group = resolve_group(view, group_id)?;
-    let local = group.local_id().unwrap_or_default();
-    let body = group.body().ok_or_else(|| EditError::GroupNotFound(group_id.to_string()))?;
+    remove_container(view, Decl::Group(group), group_id)
+}
 
-    // The decls + connections inside the body that are NOT boundary wiring move
-    // up. Boundary wiring is a connection with a `self.*` endpoint or an endpoint
-    // referencing the group's own local id from outside.
-    let group_indent = leading_indent(group.syntax());
+/// Loop-only mirror of `remove_group`. The un-loop shape is identical
+/// to ungrouping (header + close brace gone, children de-indented
+/// into the parent scope, boundary wiring dropped; config fields
+/// inside the loop body are also dropped since they have no meaning
+/// outside a loop).
+fn remove_loop(view: &FileView, loop_id: &str) -> Result<(), EditError> {
+    let lp = resolve_loop(view, loop_id)?;
+    remove_container(view, Decl::Loop(lp), loop_id)
+}
+
+fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditError> {
+    let local = decl.local_id().unwrap_or_default();
+    let body = decl.body().ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
+    let decl_syntax = decl.syntax();
+
+    let group_indent = leading_indent(decl_syntax);
     let inner_indent = format!("{group_indent}  ");
 
-    // Collect the surviving inner elements (decls + non-boundary connections),
-    // each de-indented from the body's inner indent down to column 0, as source
-    // text we re-parse. This is simpler and safer than element surgery for the
-    // ungroup case. The block is reassembled into self-contained source below; we
-    // dedent to 0 here so the re-indent owns ALL indentation uniformly.
     let mut moved_src = String::new();
     for child in body.syntax().children() {
         match child.kind() {
-            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::INCLUDE_DECL => {
+            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL | SyntaxKind::INCLUDE_DECL => {
                 moved_src.push_str(&dedent_block(&child.to_string(), &inner_indent));
                 moved_src.push('\n');
             }
@@ -291,12 +457,12 @@ fn remove_group(view: &FileView, group_id: &str) -> Result<(), EditError> {
                     moved_src.push('\n');
                 }
             }
+            // CONFIG_FIELD inside a loop body: dropped on ungroup
+            // (loop config has no meaning at file/group scope).
             _ => {}
         }
     }
-    // External connections to the group's ports (in the parent scope) are
-    // boundary wiring too: drop them.
-    let parent = group.syntax().parent().unwrap_or_else(|| view.file().syntax().clone());
+    let parent = decl_syntax.parent().unwrap_or_else(|| view.file().syntax().clone());
     let external: Vec<SyntaxNode> = parent
         .children()
         .filter(|n| n.kind() == SyntaxKind::CONNECTION && connection_touches_local(n, &local))
@@ -320,13 +486,11 @@ fn remove_group(view: &FileView, group_id: &str) -> Result<(), EditError> {
     // (empty group, or one with only boundary wiring), there is no block: the
     // ungroup is a pure deletion.
     let moved_src = indent_block(moved_src.trim_end_matches('\n'), &group_indent);
-    let lead = leading_ws(group.syntax()).map(|t| t.text().to_string()).unwrap_or_default();
+    let lead = leading_ws(decl_syntax).map(|t| t.text().to_string()).unwrap_or_default();
     let lead_breaks = lead.rfind('\n').map(|p| lead[..=p].to_string()).unwrap_or_default();
-    // `start` is the slot the group (plus a leading-ws sibling, if any) occupied;
-    // after detaching both, the block is inserted there.
-    let sibling_ws = matches!(group.syntax().prev_sibling_or_token(), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE);
-    let start = if sibling_ws { group.syntax().index() - 1 } else { group.syntax().index() };
-    detach_with_leading_ws(group.syntax());
+    let sibling_ws = matches!(decl_syntax.prev_sibling_or_token(), Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE);
+    let start = if sibling_ws { decl_syntax.index() - 1 } else { decl_syntax.index() };
+    detach_with_leading_ws(decl_syntax);
     if !moved_src.is_empty() {
         parent.splice_children(start..start, snippet_elements(&format!("{lead_breaks}{moved_src}")));
     }
@@ -364,6 +528,13 @@ fn dedent_block(block: &str, from: &str) -> String {
 
 fn set_config(view: &FileView, node_id: &str, key: &str, value: Option<&str>) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
+    // NODE-only, same kind-honesty discipline as rename/move/ports:
+    // loop config rides `SetLoopConfig` / `RemoveLoopConfig` (groups
+    // take no config at all). Silently accepting a container here
+    // would fork one operation across two op families.
+    if !matches!(decl, Decl::Node(_)) {
+        return Err(kind_mismatch("SetConfig/RemoveConfig", node_id, "Node", &decl));
+    }
     // A connection-origin field is written `node.key = value` (a CONNECTION),
     // not `key: value` inside the body. If one exists, edit IT (keeping the
     // `node.key = ` form), rather than adding a duplicate body field.
@@ -460,19 +631,32 @@ fn replace_value_after(node: &SyntaxNode, sep: SyntaxKind, value: &str) -> Resul
 
 fn set_label(view: &FileView, node_id: &str, label: Option<&str>) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
+    // A `_label` field is only valid on a Node. The merged group/loop
+    // lowering rejects a label field in a container body as a compile
+    // error, so a setLabel targeting a Group/Loop would author an
+    // uncompilable file. Fail at edit time with the honest kind error
+    // instead (containers are renamed via renameGroup / renameLoop).
+    if !matches!(decl, Decl::Node(_)) {
+        return Err(kind_mismatch("setLabel", node_id, "Node", &decl));
+    }
     match label.filter(|l| !l.is_empty()) {
         Some(l) => set_or_insert_field(&decl, "_label", &format_string(l)?),
         None => { remove_field(&decl, "_label"); Ok(()) }
     }
 }
 
-/// Find the CONFIG_FIELD/LABEL_FIELD with key `key` in the decl's body.
-fn find_field(decl: &Decl, key: &str) -> Option<SyntaxNode> {
-    let body = decl.body()?;
-    body.syntax().children().find(|n| {
-        matches!(n.kind(), SyntaxKind::CONFIG_FIELD | SyntaxKind::LABEL_FIELD)
-            && field_key(n).as_deref() == Some(key)
-    })
+/// Every CONFIG_FIELD / LABEL_FIELD child of `decl`'s body whose key matches.
+/// Returned in source order. Used to collapse duplicates: edit the first,
+/// detach the rest.
+fn find_fields(decl: &Decl, key: &str) -> Vec<SyntaxNode> {
+    let Some(body) = decl.body() else { return Vec::new(); };
+    body.syntax()
+        .children()
+        .filter(|n| {
+            matches!(n.kind(), SyntaxKind::CONFIG_FIELD | SyntaxKind::LABEL_FIELD)
+                && field_key(n).as_deref() == Some(key)
+        })
+        .collect()
 }
 
 /// The key IDENT of a CONFIG_FIELD/LABEL_FIELD node.
@@ -486,10 +670,18 @@ fn field_key(field: &SyntaxNode) -> Option<String> {
 
 /// Set (replace) or insert a config field `key: value`.
 fn set_or_insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
-    if let Some(existing) = find_field(decl, key) {
-        // Replace only the value tokens (after `:`) in place, leaving the field's
-        // leading indent, `key:`, and any trailing comment byte-identical.
-        return replace_value_after(&existing, SyntaxKind::COLON, value);
+    let existing = find_fields(decl, key);
+    if let Some(first) = existing.first() {
+        // Replace only the value tokens (after `:`) on the first match.
+        replace_value_after(first, SyntaxKind::COLON, value)?;
+        // Detach any duplicates so subsequent reads see a single source of truth.
+        // Duplicates can exist when an earlier set_config ran against a stale tree
+        // (e.g. a batched op sequence) or after a hand edit. Collapse them here so
+        // the tree is self-healing.
+        for dup in existing.iter().skip(1) {
+            detach_with_leading_ws(dup);
+        }
+        return Ok(());
     }
     // No existing field: insert before the body's close brace. The node must
     // have a body; a bare node gets one synthesized.
@@ -512,7 +704,11 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
     match decl.body() {
         // Has a body: splice the new field before its close brace, in place.
         Some(body) => {
-            insert_before_close(&body, snippet_elements(&format!("{body_indent}{key}: {value}\n")))
+            // Snippet carries just the `key: value` content; the helper owns
+            // surrounding whitespace so repeated edits don't accumulate
+            // blank lines.
+            let snippet = format!("{key}: {value}");
+            insert_before_close_with_indent(&body, &body_indent, snippet_elements_as_body_content(&snippet))
         }
         // No body: synthesize one with the single field.
         None => {
@@ -531,21 +727,39 @@ fn decl_header_text(decl: &Decl) -> String {
     match decl {
         Decl::Node(n) => n.header().map(|h| h.syntax().to_string()).unwrap_or_default(),
         Decl::Group(g) => g.header().map(|h| h.syntax().to_string()).unwrap_or_default(),
+        Decl::Loop(l) => l.header().map(|h| h.syntax().to_string()).unwrap_or_default(),
         Decl::Include(i) => i.syntax().to_string(),
     }
 }
 
-/// Remove a config field by key. Idempotent (no field = no-op).
+/// Remove a config field by key. Idempotent (no field = no-op). Removes ALL
+/// occurrences so accumulated duplicates are cleaned by a single RemoveConfig.
 fn remove_field(decl: &Decl, key: &str) {
-    if let Some(field) = find_field(decl, key) {
+    for field in find_fields(decl, key) {
         detach_with_leading_ws(&field);
     }
+}
+
+/// Set or insert a loop config field (`parallel: true`, `over: [...]`,
+/// `carry: [...]`, `max_iters: 100`, `trim_on_mismatch: false`). The
+/// value is a pre-formatted source token. Replaces in place if present.
+fn set_loop_config(view: &FileView, loop_id: &str, key: &str, value: &str) -> Result<(), EditError> {
+    let lp = resolve_loop(view, loop_id)?;
+    let decl = Decl::Loop(lp);
+    set_or_insert_field(&decl, key, value)
+}
+
+/// Remove a loop config field by key. Idempotent.
+fn remove_loop_config(view: &FileView, loop_id: &str, key: &str) -> Result<(), EditError> {
+    let lp = resolve_loop(view, loop_id)?;
+    remove_field(&Decl::Loop(lp), key);
+    Ok(())
 }
 
 /// Set/replace/remove a group's first-body-line `# Description:`.
 fn set_group_description(view: &FileView, group_id: &str, desc: Option<&str>) -> Result<(), EditError> {
     let group = resolve_group(view, group_id)?;
-    let body = group.body().ok_or_else(|| EditError::GroupNotFound(group_id.to_string()))?;
+    let body = group.body().ok_or_else(|| EditError::ContainerNotFound(group_id.to_string()))?;
     let indent = format!("{}  ", leading_indent(group.syntax()));
     let existing = group.description().map(|d| d.syntax().clone());
     match (existing, desc.filter(|d| !d.is_empty())) {
@@ -659,7 +873,7 @@ fn find_connection(
         None => view.file().syntax().clone(),
         Some(g) => resolve_group(view, g)?
             .body()
-            .ok_or_else(|| EditError::GroupNotFound(g.to_string()))?
+            .ok_or_else(|| EditError::ContainerNotFound(g.to_string()))?
             .syntax()
             .clone(),
     };
@@ -694,37 +908,84 @@ fn endpoint_parts(conn: &SyntaxNode, nth: usize) -> (Option<String>, Option<Stri
 
 // ── ops: rename / move / ports ────────────────────────────────────────────────
 
-/// Rename a group: rewrite its header id and every `oldLabel.port` reference in
-/// the same scope (boundary edges referencing the group from outside).
-fn rename_group(view: &FileView, old_label: &str, new_label: &str) -> Result<(), EditError> {
+/// Which decl kind an op targets. Used by the rename / remove /
+/// update-ports / move-scope dispatch to fail loud if the webview
+/// emits a Group-flavored op against a Loop (or vice versa), instead
+/// of silently routing through a shared helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerKind {
+    Group,
+    Loop,
+    Node,
+}
+
+impl ContainerKind {
+    fn op_name(self) -> &'static str {
+        match self {
+            ContainerKind::Group => "Group",
+            ContainerKind::Loop => "Loop",
+            ContainerKind::Node => "Node",
+        }
+    }
+
+    fn matches(self, decl: &Decl) -> bool {
+        matches!(
+            (self, decl),
+            (ContainerKind::Group, Decl::Group(_))
+                | (ContainerKind::Loop, Decl::Loop(_))
+                | (ContainerKind::Node, Decl::Node(_)),
+        )
+    }
+}
+
+/// Rename a container (Group or Loop). The two cases share the same
+/// mechanics: rewrite the header's leading IDENT token, then rewrite
+/// every endpoint that resolved to this decl (in any scope). The body
+/// and the lowered LoopIn/LoopOut / Passthrough boundary ids are
+/// reconstructed on the next re-flatten, so renaming the source-level
+/// label is sufficient. `expected` says which op the caller used so
+/// the function can fail loud on a kind mismatch (RenameGroup against
+/// a Loop, or vice versa) instead of silently routing through.
+fn rename_container(
+    view: &FileView,
+    old_label: &str,
+    new_label: &str,
+    expected: ContainerKind,
+) -> Result<(), EditError> {
     if new_label.is_empty() {
         return Err(EditError::InvalidArgument("rename to empty label".into()));
     }
     if old_label == new_label {
         return Ok(());
     }
-    let group = resolve_group(view, old_label)?;
-    // Reject a rename that collides with an existing member of the group's own
-    // scope (would manufacture two same-id decls + ambiguous references). The
-    // parent scope is everything before the group's last id segment.
-    let scoped = view.scoped_id_of(&Decl::Group(group.clone()))
-        .ok_or_else(|| EditError::GroupNotFound(old_label.to_string()))?;
+    let decl = resolve(view, old_label)?;
+    if !expected.matches(&decl) {
+        return Err(kind_mismatch(
+            &format!("Rename{}", expected.op_name()),
+            old_label,
+            expected.op_name(),
+            &decl,
+        ));
+    }
+    // Reject a rename that collides with an existing member of the
+    // container's own scope (would manufacture two same-id decls).
+    let scoped = view.scoped_id_of(&decl)
+        .ok_or_else(|| EditError::ContainerNotFound(old_label.to_string()))?;
     let parent_scope = scoped.rsplit_once('.').map(|(p, _)| p);
     reject_if_taken(view, parent_scope, new_label)?;
-    // Rewrite the header's leading IDENT token.
-    let header = group.header().ok_or_else(|| EditError::GroupNotFound(old_label.to_string()))?;
+    let header = match &decl {
+        Decl::Group(g) => g.header(),
+        Decl::Loop(l) => l.header(),
+        _ => None,
+    }
+    .ok_or_else(|| EditError::ContainerNotFound(old_label.to_string()))?;
     let id_tok = header
         .syntax()
         .children_with_tokens()
         .filter_map(|e| e.into_token())
         .find(|t| t.kind() == SyntaxKind::IDENT)
-        .ok_or_else(|| EditError::GroupNotFound(old_label.to_string()))?;
-    // Rewrite every reference to the group, in ANY scope, via the same
-    // scope-aware query RemoveNode uses (so rename and remove agree on what
-    // "references this decl" means). An endpoint resolving to the group has its
-    // head IDENT (the old label) replaced. Collect the connection handles first
-    // (resolve-then-mutate), then rewrite.
-    let refs = view.connections_referencing(&Decl::Group(group.clone()));
+        .ok_or_else(|| EditError::ContainerNotFound(old_label.to_string()))?;
+    let refs = view.connections_referencing(&decl);
     replace_token_text(&id_tok, new_label);
     for c in refs {
         for ep in c.children().filter(|n| n.kind() == SyntaxKind::ENDPOINT) {
@@ -828,18 +1089,45 @@ fn value_elements(value: &str) -> Result<Vec<SyntaxElement>, EditError> {
 
 /// Move a node/group into a target scope (None = file root). Detach the decl's
 /// subtree (as text, re-indented) and re-insert it in the target.
-fn move_scope(view: &FileView, id: &str, target_group: Option<&str>) -> Result<(), EditError> {
+fn move_scope(
+    view: &FileView,
+    id: &str,
+    target_group: Option<&str>,
+    expected: ContainerKind,
+) -> Result<(), EditError> {
     let decl = resolve(view, id)?;
+    if !expected.matches(&decl) {
+        return Err(kind_mismatch(
+            &format!("Move{}Scope", expected.op_name()),
+            id,
+            expected.op_name(),
+            &decl,
+        ));
+    }
     let local = decl.local_id().ok_or_else(|| EditError::InvalidArgument("cannot move an unnamed decl".into()))?;
+    let scoped = view.scoped_id_of(&decl);
     // A move into the scope the decl ALREADY lives in is a no-op (the graph view
     // can emit it when a drag ends inside the same parent). Detect it up front and
     // succeed silently: otherwise `reject_if_taken` below would see the decl's own
     // scoped id and wrongly report it as a duplicate of itself.
-    let current_parent = view
-        .scoped_id_of(&decl)
-        .and_then(|scoped| scoped.rsplit_once('.').map(|(parent, _)| parent.to_string()));
+    let current_parent = scoped
+        .as_deref()
+        .and_then(|s| s.rsplit_once('.').map(|(parent, _)| parent.to_string()));
     if current_parent.as_deref() == target_group {
         return Ok(());
+    }
+    // Reject moving a container into itself or its own descendant
+    // BEFORE mutating: the detach-then-resolve order below would
+    // otherwise fail with a misleading "target not found" (the target
+    // detached along with the moved subtree), leaving correctness to
+    // rest on `apply_edits` discarding the tree on op failure.
+    if let (Some(target), Some(scoped)) = (target_group, scoped.as_deref()) {
+        if target == scoped || target.starts_with(&format!("{scoped}.")) {
+            return Err(EditError::InvalidArgument(format!(
+                "cannot move '{id}' into '{target}': a container cannot move into \
+                 itself or its own descendant"
+            )));
+        }
     }
     // Reject a move into a scope that already has a member with this local id
     // (would make two same-id decls), before mutating anything.
@@ -950,16 +1238,23 @@ fn map_lines_outside_heredoc(block: &str, f: impl Fn(&str) -> String) -> String 
 }
 
 /// Rewrite a node/group's COMPLETE port signature: rebuild the decl with
-/// `id = Type` + the new signature as its header, preserving the body verbatim.
-/// The new signature is the single source of the decl's ports, so any post-body
-/// output ports (`} -> (out)`) are normalized into the pre-body signature and
-/// the post-body clause is dropped (its outputs, if still wanted, are passed in
-/// `outputs` and re-emitted pre-body; this is why `rebuild_decl` reconstructs
-/// only `header + body` and omits the post-body sibling).
-fn update_ports(view: &FileView, id: &str, inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), EditError> {
+/// `id = Type` + the new signature as its header, preserving the body
+/// verbatim. The new signature is the single source of the decl's ports.
+fn update_ports(
+    view: &FileView,
+    id: &str,
+    inputs: &[PortSig],
+    outputs: &[PortSig],
+    expected: ContainerKind,
+) -> Result<(), EditError> {
     let decl = resolve(view, id)?;
-    if let Decl::Include(_) = decl {
-        return Err(EditError::InvalidArgument("cannot set ports on an include".into()));
+    if !expected.matches(&decl) {
+        return Err(kind_mismatch(
+            &format!("Update{}Ports", expected.op_name()),
+            id,
+            expected.op_name(),
+            &decl,
+        ));
     }
     let header = decl_header_text(&decl);
     // head = `id = Type` (everything up to the first `(` or `->`).
@@ -974,25 +1269,47 @@ fn update_ports(view: &FileView, id: &str, inputs: &[PortSig], outputs: &[PortSi
 /// still-parented elements across trees (which corrupts a `splice_children`),
 /// and the result is structurally identical to a freshly-parsed decl.
 fn rebuild_decl(decl: &Decl, new_header: &str) -> Result<(), EditError> {
-    let indent = leading_indent(decl.syntax());
+    // The decl's leading whitespace (newline + indent) is preserved by
+    // splice_decl: we pass header+body with NO leading indent here, and the
+    // splice re-injects the original leading-WS token. Including the indent
+    // in the rebuilt text would either double the indent (when the leading
+    // WS is a prev-sibling token at body scope) or be silently lost.
     let rebuilt = match decl.body() {
-        Some(body) => format!("{indent}{} {}", new_header.trim(), body.syntax().to_string()),
-        None => format!("{indent}{}", new_header.trim()),
+        Some(body) => format!("{} {}", new_header.trim(), body.syntax().to_string()),
+        None => new_header.trim().to_string(),
     };
     splice_decl(decl, &rebuilt)
 }
 
-/// Replace `decl`'s subtree with the decl parsed from `text` (which already
-/// carries the decl's own leading indent). One splice of the decl node, no
-/// element lifting.
+/// Replace `decl`'s subtree with the decl parsed from `text`. Preserves the
+/// decl's leading whitespace (newline + indent) regardless of whether the
+/// parser attached it as a prev-sibling token (body scope) or as the decl's
+/// own first child (file root): captures the text upfront and re-injects it
+/// as a single WHITESPACE token before the new elements. Without this, a
+/// root-scope splice would lose the leading newline and glue the new decl
+/// onto whatever sits before it.
 fn splice_decl(decl: &Decl, text: &str) -> Result<(), EditError> {
-    let elements = snippet_elements(text);
-    let idx = decl.syntax().index();
+    let leading = leading_ws(decl.syntax()).map(|t| t.text().to_string());
     let parent = decl
         .syntax()
         .parent()
         .ok_or_else(|| EditError::Unparseable("decl has no parent".into()))?;
-    parent.splice_children(idx..idx + 1, elements);
+    // If the leading WS was a prev-sibling token it survives the splice
+    // (we only delete the decl). To keep exactly one copy of the leading
+    // WS, detach the sibling first; if the leading WS lived as the decl's
+    // own first child instead, it goes away with the decl on splice.
+    if let Some(NodeOrToken::Token(t)) = decl.syntax().prev_sibling_or_token() {
+        if t.kind() == SyntaxKind::WHITESPACE {
+            t.detach();
+        }
+    }
+    let mut to_splice = Vec::new();
+    if let Some(ws) = leading {
+        to_splice.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, &ws)]));
+    }
+    to_splice.extend(snippet_elements(text));
+    let idx = decl.syntax().index();
+    parent.splice_children(idx..idx + 1, to_splice);
     Ok(())
 }
 

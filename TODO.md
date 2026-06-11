@@ -2,7 +2,147 @@
 
 Larger design work that's been surfaced but deferred. Not bugs (those
 get fixed inline); these are architecture decisions that need design
-before implementation.
+before implementation. An entry that already has a full written plan
+links to a file in `todo_plans/` (the plan holds every detail; the
+entry here is just the pointer + one-paragraph what/why).
+
+## Graph edit pipeline: optimistic projection with unified rollback
+
+**Plan:** [`todo_plans/graph-edit-optimistic-projection.md`](todo_plans/graph-edit-optimistic-projection.md)
+
+**Problem.** In the VS Code graph editor, each edit (drag, connect,
+rename, delete, type a config field) takes ~0.5s to round-trip to the
+`.weft` source. Stacking edits within that window corrupts them: the
+last one silently fails, the visual diverges from the source, the user
+has to reload/undo. There are also ~12 ad-hoc rejection/rollback paths
+(7 preflight + 5 post-flight), each with its own shape, plus a silent
+"parse error after edit = no rollback" gap.
+
+**Direction.** Make the visible graph a pure `derive(truth, pendingOps,
+layoutCode)` projection: gestures apply instantly (optimistic), the
+EditOp goes to the host in the background, and confirm advances truth /
+reject resyncs from the host and re-derives. ONE rollback path for both
+preflight and server rejections. Config typing becomes a pendingOp from
+the first keystroke. Plus a logic-lock (auto + explicit) so graph edits
+can't corrupt in-progress code-tab / AI edits. See the plan for the
+full shape, steps, and test matrix.
+
+**Why deferred.** Big single-delivery reshape of `ProjectEditorInner.
+svelte` + the host edit pipeline; designed but not started. This is the
+"graph<->code interaction" work the feat-bus review round explicitly
+EXCLUDED (the X1 / X-M2 / X-M5 / X-M6 / X-M7 / X-M11 findings all belong
+here, not to that round).
+
+[Update Notice Warning] If we touch the webview edit path
+(`recordEdit`, `applyEdits`/`editApplied`, `applyExternalSource`,
+`pendingConfigOps`, the undo/redo stacks) or `graphView.ts`'s
+`applyEditTransaction`, this plan is the intended shape; revisit it
+before patching those ad hoc.
+
+## Unify journal holes: a missing/corrupt event is a HOLE, fatal only on the resume frontier
+
+### Mental model first (read this, the rest follows from it)
+
+- A live worker runs the whole execution **in RAM**. Pulses flow out of
+  nodes and trigger downstream nodes; the worker holds all of that
+  state in memory.
+- The **journal is a write-as-you-go RECORD of what the in-RAM run
+  did**, NOT the thing driving each live step. The drive loop folds the
+  journal ONCE at boot, then works off the in-RAM snapshot. It only
+  reads the journal back to DRIVE on a **respawn** (a fresh worker
+  rebuilding state after a crash/eviction, or to resume a suspension).
+- So during a live run, every journal write is just "save a checkpoint
+  so a future respawn can rebuild this." A write failing does NOT break
+  the live run; it only leaves a HOLE that a future respawn would have
+  to deal with.
+
+### The problem: two failure paths, both wrong, and they're the same thing
+
+There are two ways a journal event can be bad, handled by two unrelated
+mechanisms today:
+
+1. **Write fails** (saving e.g. `NodeCompleted(B)` is rejected by
+   Postgres / a fencing trigger). The event is now MISSING from disk.
+   Today: `PoisonOnWriteFailure` latches a flag and the drive loop
+   **bails the whole worker** at the next iteration.
+   **Why this is wrong:** in RAM, B finished and already fired
+   downstream; the live run is fine. Killing it because a *save* failed
+   is a sledgehammer. It converts "couldn't save B" into "kill the run,"
+   which forces a respawn that re-folds from the last good prefix and
+   re-runs everything since (including B) anyway.
+
+2. **Read/fold hits a malformed stored row** (the bytes are there but
+   garbage, e.g. a corrupt pulse id). Today: `fold_to_snapshot` SKIPS
+   the row, logs it, adds a `JournalCorruption { site, reason }` to the
+   snapshot (rendered as a corruption marker in the graph), keeps
+   folding. Non-fatal.
+   **Why this is incomplete:** skip-and-continue is correct for DEAD
+   history (a corrupt row in a long-settled branch only degrades the
+   replay view), but the SAME skip runs when the corrupt row is on the
+   RESUME FRONTIER (a `PulseEmitted` feeding a suspended node's input,
+   a `NodeResumed`'s absorbed-pulse list) — there it silently rebuilds
+   the suspended node's state wrong and resumes on garbage.
+
+Both (1) and (2) are the SAME underlying thing: **the journal has a
+HOLE at some position** (a missing event, or an unusable one). The only
+question that matters is WHERE the hole is, not how it got there.
+
+### Direction: one "hole" concept, frontier-aware
+
+- **A failed write becomes a HOLE, not a kill.** When `record_event`
+  fails, record that "an event of kind K for (node, frames) at this
+  point could not be persisted" (a hole marker, the write-time analog
+  of the fold-time corruption marker). Then KEEP RUNNING the live
+  execution on its real in-RAM state. Drop `PoisonOnWriteFailure`'s
+  worker-bail entirely.
+- **A malformed stored row is the same kind of HOLE**, discovered at
+  fold instead of at write. Unify it with the above: one concept ("the
+  journal cannot give a correct event at position P"), two discovery
+  sites (write-time, fold-time).
+- **Fatality is decided by POSITION, not discovery site.** A hole is:
+  - **cosmetic** (current marker behavior) when it's in dead history /
+    off the resume path: replay view degrades, execution/resume
+    unaffected.
+  - **fatal** (fail loud, refuse to resume, surface for inspection)
+    when it intersects the **resume frontier**: the set of
+    {suspended node(s), the resolution of their current token, the
+    pulses their resume will consume}. There, "we lost/corrupted the
+    very thing that drives the resume" → the execution cannot be
+    resumed correctly and must say so loudly, not silently resume on
+    bad state.
+
+### The hard part to design
+
+- **Define the resume frontier precisely at fold time.** Which exact
+  (node, frames) + pulses + token-resolutions does a correct resume
+  depend on? A hole touching that set is fatal; anything else is
+  cosmetic.
+- **The write-time hole marker.** A failed write produces NO row, so
+  there's nothing for the fold to "skip" later. Need a way to PERSIST
+  "there is a hole here" (or reconstruct that a hole exists) so a later
+  respawn's fold knows an event is missing at position P and can decide
+  fatal-vs-cosmetic. Open question: a dedicated hole row, vs detecting
+  the gap structurally (e.g. an in-RAM exec that's Running/Completed
+  with no corresponding journal row), vs something else.
+- **Respawn re-run safety still matters.** Even a cosmetic hole on a
+  completed node B means a respawn re-runs B (double side effect). That
+  at-least-once re-run is the existing crash semantics and is
+  acceptable, but the design should be explicit that "cosmetic hole" =
+  "may re-run on respawn," distinct from "fatal hole" = "cannot resume."
+
+### Why deferred
+
+Real design pass: defining the frontier, the unified hole
+representation, the write-time persistence of a hole, and the
+fatal-vs-cosmetic classifier. Surfaced from the bus+suspension round
+(the resume path made the frontier case concrete). The current
+`PoisonOnWriteFailure` is the placeholder sledgehammer until this
+lands.
+
+[Update Notice Warning] If we touch `PoisonOnWriteFailure`,
+`fold_to_snapshot`'s `report_corruption` path, `CorruptionSite`, or the
+suspension-resume fold (`SuspensionRegistered` / `NodeSuspended` /
+`NodeResumed` / `SuspensionResolved`), revisit this entry.
 
 ## Project-scoped file storage (large-data plane)
 
@@ -320,6 +460,64 @@ enforces, not "we assume they can't".
 [Update Notice Warning] If we touch `compile.rs` extras/namespace
 stamping, `PodOptions`, `project_namespace.rs` policies/RBAC, or the
 supervisor apply path, revisit.
+
+## Sensitive values: encrypt in journal, redact in inspector
+
+**Problem.** A node config field can hold a secret (an LLM `apiKey`, a
+third-party API token typed directly into a node). Today those values
+flow through the journal verbatim (in the `NodeStarted` input/config)
+and show up in the execution inspector in plaintext. A secret must
+SURVIVE resume (the worker re-folds the journal and needs the real
+value to make the call) but must NEVER be readable in logs or the
+inspector. The webhook-trigger API key already solves a NARROWER
+version of this (sha256 on the signal row, plaintext only in the
+listener's in-RAM cache, served via `/display`), but that path is
+specific to listener-minted auth, not to arbitrary node config a user
+types in.
+
+**Direction.** A language-generic "sensitive value" mechanism, NOT an
+LLM-node special case:
+
+- A way for the language to KNOW a value is sensitive. This is the
+  central design fork (pick before building): a `sensitive: true` flag
+  on the metadata field definition, a dedicated `Secret` weft-type, or
+  a naming convention. The flag-on-field-definition shape is the
+  current front-runner (most local, no new type-system surface) but
+  needs deciding.
+- Encrypt-at-journal / decrypt-at-fold: the engine encrypts a sensitive
+  value before it's written to the journal and decrypts after fold, so
+  the worker has the real value to make its call but the at-rest journal
+  row carries only ciphertext.
+- Inspector redaction: the inspector shows `••••` (or similar) for a
+  sensitive value, never the plaintext or the ciphertext.
+
+**Reuse, don't reinvent.** The crypto primitive already exists in the
+old code: `crates-v1/weft-api/src/crypto.rs` is a working AES-256-GCM
+implementation keyed off `CREDENTIAL_ENCRYPTION_KEY` (already present in
+`.env.example`, with a cloud-mode-panics / local-dev-key fallback).
+Port that shape into a v2 home rather than writing new crypto.
+
+**Requirements.**
+- Language-generic: any node config field can be marked sensitive; the
+  engine/journal/inspector handle it uniformly. No per-node code.
+- Survives resume: the decrypt-at-fold path gives the worker the real
+  value on replay.
+- Never readable outside the worker: not in the journal at rest, not in
+  logs, not in the inspector.
+- Key from the environment (`CREDENTIAL_ENCRYPTION_KEY`), cloud-mode
+  panics if unset, local-dev fallback key with a loud warning (the v1
+  policy, kept).
+
+**Why deferred.** It's a real subsystem spanning weft-core (the marker
++ crypto), weft-engine (encrypt-before-journal / decrypt-after-fold),
+weft-journal (the encrypted field), and the extension inspector
+(redaction), and the marker mechanism is itself a design fork. Surfaced
+from the feat-bus review (FORK-2): LLM `apiKey` and similar node-typed
+secrets currently land in the journal and inspector in plaintext.
+
+[Update Notice Warning] If we touch how node config is journaled
+(`NodeStarted`), the metadata field-definition shape, or the inspector's
+config rendering, revisit this entry.
 
 ## Held suspensions (warm-worker model)
 

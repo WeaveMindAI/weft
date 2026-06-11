@@ -49,6 +49,7 @@ macro_rules! typed_node {
 typed_node!(WeftFile, WEFT_FILE);
 typed_node!(NodeDecl, NODE_DECL);
 typed_node!(GroupDecl, GROUP_DECL);
+typed_node!(LoopDecl, LOOP_DECL);
 typed_node!(IncludeDecl, INCLUDE_DECL);
 typed_node!(Header, HEADER);
 typed_node!(Body, BODY);
@@ -84,6 +85,7 @@ impl WeftFile {
 pub enum Decl {
     Node(NodeDecl),
     Group(GroupDecl),
+    Loop(LoopDecl),
     Include(IncludeDecl),
 }
 
@@ -92,6 +94,7 @@ impl Decl {
         match node.kind() {
             SyntaxKind::NODE_DECL => NodeDecl::cast(node).map(Decl::Node),
             SyntaxKind::GROUP_DECL => GroupDecl::cast(node).map(Decl::Group),
+            SyntaxKind::LOOP_DECL => LoopDecl::cast(node).map(Decl::Loop),
             SyntaxKind::INCLUDE_DECL => IncludeDecl::cast(node).map(Decl::Include),
             _ => None,
         }
@@ -101,27 +104,39 @@ impl Decl {
         match self {
             Decl::Node(n) => n.syntax(),
             Decl::Group(g) => g.syntax(),
+            Decl::Loop(l) => l.syntax(),
             Decl::Include(i) => i.syntax(),
         }
     }
 
-    /// The decl's LOCAL id: the leading IDENT of its HEADER (node/group) or of
-    /// the decl itself (include).
     pub fn local_id(&self) -> Option<String> {
         match self {
             Decl::Node(n) => n.local_id(),
             Decl::Group(g) => g.local_id(),
+            Decl::Loop(l) => l.local_id(),
             Decl::Include(i) => first_ident(i.syntax()).map(|t| t.text().to_string()),
         }
     }
 
-    /// The decl's BODY, if it has one (node/group). Include never does.
     pub fn body(&self) -> Option<Body> {
         match self {
             Decl::Node(n) => child(n.syntax(), SyntaxKind::BODY).and_then(Body::cast),
             Decl::Group(g) => child(g.syntax(), SyntaxKind::BODY).and_then(Body::cast),
+            Decl::Loop(l) => child(l.syntax(), SyntaxKind::BODY).and_then(Body::cast),
             Decl::Include(_) => None,
         }
+    }
+}
+
+impl LoopDecl {
+    pub fn header(&self) -> Option<Header> {
+        child(&self.0, SyntaxKind::HEADER).and_then(Header::cast)
+    }
+    pub fn local_id(&self) -> Option<String> {
+        self.header().and_then(|h| first_ident(h.syntax()).map(|t| t.text().to_string()))
+    }
+    pub fn body(&self) -> Option<Body> {
+        child(&self.0, SyntaxKind::BODY).and_then(Body::cast)
     }
 }
 
@@ -391,13 +406,15 @@ impl<'a> FileView<'a> {
     fn walk_scoped(&self, parent: &SyntaxNode, prefix: &mut Vec<String>, f: &mut impl FnMut(&[String], &SyntaxNode)) {
         for node in parent.children() {
             match node.kind() {
-                SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::INCLUDE_DECL => {
+                SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL | SyntaxKind::INCLUDE_DECL => {
                     f(prefix, &node);
-                    if let Some(Decl::Group(g)) = Decl::cast(node.clone()) {
-                        if let Some(body) = g.body() {
-                            prefix.push(self.decl_local(&Decl::Group(g)));
-                            self.walk_scoped(body.syntax(), prefix, f);
-                            prefix.pop();
+                    if let Some(decl) = Decl::cast(node.clone()) {
+                        if let Some(body) = decl.body() {
+                            if matches!(&decl, Decl::Group(_) | Decl::Loop(_)) {
+                                prefix.push(self.decl_local(&decl));
+                                self.walk_scoped(body.syntax(), prefix, f);
+                                prefix.pop();
+                            }
                         }
                     }
                 }

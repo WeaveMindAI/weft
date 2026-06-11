@@ -162,9 +162,10 @@ fn render_needs_input(render: &Value) -> bool {
 ///     `name_template = "{key}"`): the port value is `response[key]`.
 ///   * `approve_reject`-style: two boolean ports
 ///     (`{key}_approved`, `{key}_rejected`). The user response is
-///     `{ key: bool }`; we set the matching port `true` and the
-///     other `null` so downstream required-port propagation cuts
-///     the inactive branch.
+///     `{ key: bool }`; we set the active port `true` and OMIT the
+///     inactive port so the engine emits a structural closure on it
+///     at termination (the inactive branch is cut by the closure
+///     marker, not a `null` data pulse). See `emit_outputs_for_field`.
 ///   * Display-only fields (no outputs): no-op; the port set is
 ///     empty so nothing is emitted.
 ///   * Anything else with a single output: `response[key]` mapped
@@ -201,13 +202,13 @@ pub fn map_response_to_ports(
 /// port-name template (`{key}_approved`, `{key}_rejected`,
 /// `{key}`) drives both the port name and the value picker:
 ///   * Plain `{key}` ports get the raw response value.
-///   * `{key}_<suffix>` ports interpret a boolean response: if
-///     truthy AND suffix matches the truthy convention
-///     (`approved`, `yes`, `true`), the port gets `true`; the
-///     opposite-suffix port gets `null`. This keeps the v1
-///     null-cuts-flow contract while staying generic: any node
-///     can declare `{key}_approved` + `{key}_rejected` paired
-///     ports and the runtime does the split for free.
+///   * `{key}_<suffix>` ports interpret a boolean response: the
+///     active-side port (the one whose suffix matches the response's
+///     truthiness) gets `true`; the inactive-side port is OMITTED
+///     from the output entirely so the engine emits a structural
+///     closure on it at termination. A consumer wired to the
+///     inactive port sees "this branch is structurally dead" via the
+///     closure marker, not a `null` data pulse.
 fn emit_outputs_for_field(
     output: &mut NodeOutput,
     ports: &[FormFieldPort],
@@ -247,18 +248,20 @@ fn emit_outputs_for_field(
         if let Some(suffix) = suffix {
             if truthy_suffixes.contains(&suffix) {
                 handled_split = true;
-                output.outputs.insert(
-                    resolved,
-                    if response_truthy { Value::Bool(true) } else { Value::Null },
-                );
+                if response_truthy {
+                    output.outputs.insert(resolved, Value::Bool(true));
+                }
+                // Else: omit. The engine emits a closure at termination,
+                // signaling "this branch is structurally dead" to the
+                // downstream consumer.
                 continue;
             }
             if falsy_suffixes.contains(&suffix) {
                 handled_split = true;
-                output.outputs.insert(
-                    resolved,
-                    if !response_truthy { Value::Bool(true) } else { Value::Null },
-                );
+                if !response_truthy {
+                    output.outputs.insert(resolved, Value::Bool(true));
+                }
+                // Else: omit, see above.
                 continue;
             }
         }

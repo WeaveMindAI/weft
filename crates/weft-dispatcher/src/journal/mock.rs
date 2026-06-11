@@ -12,7 +12,7 @@ use weft_core::Color;
 
 use weft_journal::ExecEvent;
 use crate::journal::{
-    ApiToken, ExecutionSummary, Journal, LogEntry, NodeExecEvent, NodeExecKind, SignalRegistration,
+    ApiToken, ColorLookup, ExecutionSummary, Journal, LogEntry, SignalRegistration,
 };
 
 #[derive(Default)]
@@ -125,13 +125,41 @@ impl Journal for MockJournal {
         Ok(removed)
     }
 
-    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>> {
-        Ok(self.inner.lock().unwrap().events.iter().find_map(|e| match e {
-            ExecEvent::ExecutionStarted { color: c, project_id, .. } if *c == color => {
-                Some(project_id.clone())
-            }
-            _ => None,
-        }))
+    async fn execution_project(&self, color: Color) -> anyhow::Result<ColorLookup<String>> {
+        // The mock stores typed events, so a row can never be
+        // corrupt; only Found / NotFound occur here.
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .find_map(|e| match e {
+                ExecEvent::ExecutionStarted { color: c, project_id, .. } if *c == color => {
+                    Some(project_id.clone())
+                }
+                _ => None,
+            })
+            .map_or(ColorLookup::NotFound, ColorLookup::Found))
+    }
+
+    async fn execution_definition_hash(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<ColorLookup<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .find_map(|e| match e {
+                ExecEvent::ExecutionStarted { color: c, definition_hash, .. } if *c == color => {
+                    Some(definition_hash.clone())
+                }
+                _ => None,
+            })
+            .map_or(ColorLookup::NotFound, ColorLookup::Found))
     }
 
     async fn logs_for(&self, color: Color, _limit: u32) -> anyhow::Result<Vec<LogEntry>> {
@@ -152,139 +180,6 @@ impl Journal for MockJournal {
                 _ => None,
             })
             .collect())
-    }
-
-    async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>> {
-        let g = self.inner.lock().unwrap();
-        let mut out = Vec::new();
-        for e in g.events.iter() {
-            let conv = match e {
-                ExecEvent::NodeStarted { color: c, node_id, lane, input, at_unix, .. }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-                        kind: NodeExecKind::Started,
-                        input: Some(input.clone()),
-                        output: None,
-                        error: None,
-                        token: None,
-                        value: None,
-                        reason: None,
-                        at_unix: *at_unix,
-                    })
-                }
-                ExecEvent::NodeSuspended { color: c, node_id, lane, token, at_unix }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-                        kind: NodeExecKind::Suspended,
-                        input: None,
-                        output: None,
-                        error: None,
-                        token: Some(token.clone()),
-                        value: None,
-                        reason: None,
-                        at_unix: *at_unix,
-                    })
-                }
-                ExecEvent::NodeResumed { color: c, node_id, lane, token, value, at_unix }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-                        kind: NodeExecKind::Resumed,
-                        input: None,
-                        output: None,
-                        error: None,
-                        token: Some(token.clone()),
-                        value: Some(value.clone()),
-                        reason: None,
-                        at_unix: *at_unix,
-                    })
-                }
-                ExecEvent::NodeCancelled { color: c, node_id, lane, reason, at_unix }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-                        kind: NodeExecKind::Cancelled,
-                        input: None,
-                        output: None,
-                        error: Some(reason.clone()),
-                        token: None,
-                        value: None,
-                        reason: Some(reason.clone()),
-                        at_unix: *at_unix,
-                    })
-                }
-                ExecEvent::NodeCompleted { color: c, node_id, lane, output, at_unix }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-                        kind: NodeExecKind::Completed,
-                        input: None,
-                        output: Some(output.clone()),
-                        error: None,
-                        token: None,
-                        value: None,
-                        reason: None,
-                        at_unix: *at_unix,
-                    })
-                }
-                ExecEvent::NodeFailed { color: c, node_id, lane, error, at_unix }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-                        kind: NodeExecKind::Failed,
-                        input: None,
-                        output: None,
-                        error: Some(error.clone()),
-                        token: None,
-                        value: None,
-                        reason: None,
-                        at_unix: *at_unix,
-                    })
-                }
-                ExecEvent::NodeSkipped { color: c, node_id, lane, at_unix }
-                    if *c == color =>
-                {
-                    Some(NodeExecEvent {
-                        color: *c,
-                        node_id: node_id.clone(),
-                        lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-                        kind: NodeExecKind::Skipped,
-                        input: None,
-                        output: None,
-                        error: None,
-                        token: None,
-                        value: None,
-                        reason: None,
-                        at_unix: *at_unix,
-                    })
-                }
-                _ => None,
-            };
-            if let Some(ne) = conv {
-                out.push(ne);
-            }
-        }
-        Ok(out)
     }
 
     async fn list_executions(&self, _limit: u32) -> anyhow::Result<Vec<ExecutionSummary>> {
@@ -375,10 +270,6 @@ impl Journal for MockJournal {
 
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
         Ok(self.inner.lock().unwrap().signals.get(token).cloned())
-    }
-
-    async fn signal_remove(&self, token: &str) -> anyhow::Result<bool> {
-        Ok(self.inner.lock().unwrap().signals.remove(token).is_some())
     }
 
     async fn signal_remove_many(

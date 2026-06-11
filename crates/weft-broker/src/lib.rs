@@ -64,6 +64,11 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/infra/endpoint_url",
             post(handlers::infra_endpoint_url),
         )
+        // Project (worker fetches its own ProjectDefinition)
+        .route(
+            "/v1/project/fetch_definition",
+            post(handlers::project_fetch_definition),
+        )
         // Signals (listener-only rehydrate read)
         .route(
             "/v1/signal/list_for_tenant",

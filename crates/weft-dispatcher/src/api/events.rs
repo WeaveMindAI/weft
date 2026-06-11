@@ -43,12 +43,18 @@ pub async fn execution_stream(
     let target_color: uuid::Uuid = color
         .parse()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let project_id = state
+    let project_id = match state
         .journal
         .execution_project(target_color)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    {
+        crate::journal::ColorLookup::Found(p) => p,
+        crate::journal::ColorLookup::NotFound => return Err(StatusCode::NOT_FOUND),
+        // Corrupt journal row (logged loud at the decode site): a
+        // server-side defect, not a missing execution.
+        crate::journal::ColorLookup::Corrupt => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
 
     let target_color = Some(target_color);
     let rx = state.events.subscribe_project(&project_id).await;

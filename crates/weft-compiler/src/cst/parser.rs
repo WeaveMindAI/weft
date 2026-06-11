@@ -152,6 +152,7 @@ impl<'a> Parser<'a> {
             LineShape::Node => self.parse_node_decl(),
             LineShape::Group => self.parse_group_decl(false),
             LineShape::AnonGroup => self.parse_group_decl(true),
+            LineShape::Loop => self.parse_loop_decl(),
             LineShape::Include => self.parse_include_decl(),
             LineShape::Connection => self.parse_connection(),
             // Fields/directives are body-only; at top level they're malformed.
@@ -233,6 +234,7 @@ impl<'a> Parser<'a> {
         use SyntaxKind as K;
         match sig.get(op_idx + 1) {
             Some(&(_, K::KW_GROUP)) => LineShape::Group,
+            Some(&(_, K::KW_LOOP)) => LineShape::Loop,
             // An `@include("...")` marker (directive name EXACTLY `include`, not
             // a prefix like `@includes_other`). Any other marker RHS (`@file`,
             // `@require_one_of`) is not a valid decl RHS -> Unknown.
@@ -293,9 +295,6 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.parse_header(false);
         self.maybe_parse_body(false);
-        // A node can also carry post-config output ports: `Type {...} -> (out)`
-        // (the `draft = LlmInference {...} -> (subject, body)` form LLMs emit).
-        self.maybe_parse_post_sig();
         self.bump_trailing_same_line();
         self.builder.finish_node();
     }
@@ -305,9 +304,17 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.parse_header(anon);
         self.maybe_parse_body(true);
-        // Post-body output ports: `-> (...)` after the body close, possibly on a
-        // new line. The R_BRACE already closed BODY; PORT_SIG_POST is a sibling.
-        self.maybe_parse_post_sig();
+        self.bump_trailing_same_line();
+        self.builder.finish_node();
+    }
+
+    fn parse_loop_decl(&mut self) {
+        self.builder.start_node(SyntaxKind::LOOP_DECL.into());
+        self.bump_trivia();
+        self.parse_header(false);
+        // Loop bodies are MIXED: config fields (`key: value`) AND
+        // decls/connections, in any order.
+        self.maybe_parse_body(true);
         self.bump_trailing_same_line();
         self.builder.finish_node();
     }
@@ -331,8 +338,8 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
             self.bump_trivia_inline();
-            // Type name (IDENT or KW_GROUP)
-            if matches!(self.cur(), Some(SyntaxKind::IDENT) | Some(SyntaxKind::KW_GROUP)) {
+            // Type name (IDENT or KW_GROUP or KW_LOOP)
+            if matches!(self.cur(), Some(SyntaxKind::IDENT) | Some(SyntaxKind::KW_GROUP) | Some(SyntaxKind::KW_LOOP)) {
                 self.bump();
             }
         }
@@ -522,6 +529,7 @@ impl<'a> Parser<'a> {
             LineShape::Node => self.parse_node_decl(),
             LineShape::Group => self.parse_group_decl(false),
             LineShape::AnonGroup => self.parse_group_decl(true),
+            LineShape::Loop => self.parse_loop_decl(),
             LineShape::Include => self.parse_include_decl(),
             LineShape::Unknown => self.parse_error_line(),
         }
@@ -720,31 +728,6 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
-    /// Post-body output signature for a group: `-> (...)` appearing after the
-    /// body close brace, possibly after a newline. Wrapped PORT_SIG_POST.
-    fn maybe_parse_post_sig(&mut self) {
-        // The post-body `-> (out)` may sit on the line after `}` (one newline),
-        // but a blank line terminates the decl, so bound the peek like the
-        // header's pre-body arrow.
-        if !self.peek_arrow_within_one_newline() {
-            return;
-        }
-        let off = match self.peek_significant() {
-            Some((off, _)) => off,
-            None => return,
-        };
-        for _ in 0..off {
-            self.bump(); // trivia between `}` and `->`
-        }
-        self.builder.start_node(SyntaxKind::PORT_SIG_POST.into());
-        self.bump(); // ARROW
-        self.bump_trivia_inline();
-        if self.cur() == Some(SyntaxKind::L_PAREN) {
-            self.bump_balanced_parens_as_ports();
-        }
-        self.builder.finish_node();
-    }
-
     /// Lenient fallback: consume the rest of the current logical line as an
     /// ERROR node so a malformed line never blocks parsing the rest.
     fn parse_error_line(&mut self) {
@@ -824,6 +807,8 @@ enum LineShape {
     /// A leading `Group` keyword with no `=` (an included file's sole top-level
     /// group, which has no name).
     AnonGroup,
+    /// `id = Loop ...`.
+    Loop,
     /// `alias = @include("...")` (the RHS marker's directive is exactly `include`).
     Include,
     /// `target.port = ...` (LHS is exactly `IDENT . IDENT`).
@@ -891,9 +876,11 @@ mod tests {
         assert_round_trip("g = Group() -> () {}\n");
         // §4.7 multi-line body bare close
         assert_round_trip("g = Group() {\n  x = Text {}\n}\n");
-        // §4.7 same-line post-body ports
+        // Removed post-body ports syntax: still LOSSLESSLY round-trips
+        // (the `-> (...)` after `}` parses as an ERROR node whose text
+        // is preserved); acceptance is pinned rejected by
+        // `post_body_output_syntax_is_no_longer_accepted`.
         assert_round_trip("g = Group() {\n  x = Text {}\n} -> (out: String)\n");
-        // §4.7 separate-line post-body ports
         assert_round_trip("g = Group() {\n  x = Text {}\n}\n-> (out: String)\n");
         // §4.8 multi-line signature
         assert_round_trip("g = Group(\n  a: String\n) -> () {}\n");

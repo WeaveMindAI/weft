@@ -36,14 +36,104 @@ export interface BuildPortMenuOptions {
 	onToggleRequired: () => void;
 	onSetType: (newType: string) => void;
 	onRemove: () => void;
+	/** Loop-specific role context. Set ONLY when the menu is being built for
+	 *  a port on a Loop container; the strip surfaces the four derived roles
+	 *  (broadcast / iter / gather / carry) and lets the user cycle the port
+	 *  to the legal alternatives. The handlers translate the chosen role to
+	 *  the right cascade of setConfig / updateGroupPorts ops. */
+	loopRole?: LoopPortRoleContext;
+}
+
+export type LoopPortRole =
+	| 'broadcast'
+	| 'iter'
+	| 'gather'
+	| 'carry'
+	| 'synthesized_carry_input'
+	// User-declared input whose name shadows a carry output (or vice versa).
+	// Surfaced with a clear remediation; the user keeps the delete handle
+	// (the prior shape misclassified this as a ghost and stripped Remove).
+	| 'name_collision';
+
+export interface LoopPortRoleContext {
+	/** The role this port currently has, derived from over / carry config. */
+	currentRole: LoopPortRole;
+	/** A blocking reason that prevents toggling the role (e.g. a same-named
+	 *  input with a conflicting type would prevent making an output a carry).
+	 *  When set, the toggle button is disabled and the reason renders as a
+	 *  muted line so the user knows what to fix. */
+	conflictReason?: string;
+	/** Toggle to the other role (broadcast ↔ iter, or gather ↔ carry). Only
+	 *  called when there is no conflictReason. */
+	onToggleRole: () => void;
 }
 
 /** Build the standard port context menu items. Exactly one definition to
  *  keep every port surface (regular node, group expanded, group collapsed)
  *  identical. */
 export function buildPortMenuItems(opts: BuildPortMenuOptions): PortMenuItem[] {
-	const { port, side, isCustom, canAddPorts, onToggleRequired, onSetType, onRemove } = opts;
+	const { port, side, isCustom, canAddPorts, onToggleRequired, onSetType, onRemove, loopRole } = opts;
 	const items: PortMenuItem[] = [];
+
+	// Synthesized carry inputs are ghost mirrors of the carry output. The
+	// user can't edit them directly; the menu just explains and offers a
+	// no-op header.
+	if (loopRole?.currentRole === 'synthesized_carry_input') {
+		items.push({
+			label: `Carry input (auto from output \`${port.name}\`)`,
+			onClick: () => {},
+			color: '#8b5cf6',
+		});
+		items.push({
+			label: 'Edit the carry output to change this port.',
+			onClick: () => {},
+			color: '#71717a',
+		});
+		return items;
+	}
+
+	// Loop role header + cycle button. `name_collision` keeps the Remove
+	// option (handled below) so the user can delete their colliding port;
+	// the header surfaces the conflictReason directly because oppositeRole
+	// returns null and the cycle branch is skipped.
+	if (loopRole) {
+		const roleLabel = humanRole(loopRole.currentRole);
+		items.push({
+			label: `Role: ${roleLabel}`,
+			onClick: () => {},
+			color: '#8b5cf6',
+		});
+		const target = oppositeRole(loopRole.currentRole);
+		if (target) {
+			if (loopRole.conflictReason) {
+				items.push({
+					label: `Cannot switch to ${humanRole(target)}`,
+					onClick: () => {},
+					color: '#71717a',
+				});
+				items.push({
+					label: loopRole.conflictReason,
+					onClick: () => {},
+					color: '#71717a',
+				});
+			} else {
+				items.push({
+					label: `↻ Make ${humanRole(target)}`,
+					onClick: loopRole.onToggleRole,
+				});
+			}
+		} else if (loopRole.conflictReason) {
+			// Roles with no toggle target still surface the reason
+			// (name_collision is the current case): the user needs to
+			// see WHY the port is flagged before they decide to rename
+			// or delete.
+			items.push({
+				label: loopRole.conflictReason,
+				onClick: () => {},
+				color: '#71717a',
+			});
+		}
+	}
 
 	// Required toggle (inputs only; outputs do not have runtime required semantics).
 	if (side === 'input') {
@@ -81,6 +171,32 @@ export function buildPortMenuItems(opts: BuildPortMenuOptions): PortMenuItem[] {
 	}
 
 	return items;
+}
+
+function humanRole(role: LoopPortRole): string {
+	switch (role) {
+		case 'broadcast': return 'Broadcast input';
+		case 'iter': return 'Iter input (List[T])';
+		case 'gather': return 'Gather output (List[T | Null])';
+		case 'carry': return 'Carry port (threaded across iterations)';
+		case 'synthesized_carry_input': return 'Synthesized carry input';
+		case 'name_collision': return 'Name conflict';
+	}
+}
+
+/// The role a port cycles to when the user clicks "Make X". Inputs cycle
+/// between broadcast and iter; outputs cycle between gather and carry.
+/// Returns null for roles with no toggle target (synthesized carry input is
+/// handled by the early-return above).
+function oppositeRole(role: LoopPortRole): LoopPortRole | null {
+	switch (role) {
+		case 'broadcast': return 'iter';
+		case 'iter': return 'broadcast';
+		case 'gather': return 'carry';
+		case 'carry': return 'gather';
+		case 'synthesized_carry_input': return null;
+		case 'name_collision': return null;
+	}
 }
 
 export function createPortContextMenu(

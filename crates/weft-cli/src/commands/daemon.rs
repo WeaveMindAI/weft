@@ -9,6 +9,7 @@
 //! to a managed cluster and images come from a real registry.
 
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -230,14 +231,13 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     require_binary("kubectl").await?;
     require_binary("docker").await?;
 
-    let dispatcher_built = images::ensure_system_image(
-        &cfg.dispatcher_image, "dispatcher.Dockerfile", rebuild).await?;
-    let listener_built = images::ensure_system_image(
-        &cfg.listener_image, "listener.Dockerfile", rebuild).await?;
-    let broker_built = images::ensure_system_image(
-        &cfg.broker_image, "broker.Dockerfile", rebuild).await?;
-    let supervisor_built = images::ensure_system_image(
-        &cfg.supervisor_image, "infra-supervisor.Dockerfile", rebuild).await?;
+    let built = provision_images(cfg, rebuild).await?;
+    let BuiltImages {
+        dispatcher: dispatcher_built,
+        listener: listener_built,
+        broker: broker_built,
+        supervisor: supervisor_built,
+    } = built;
 
     // Re-apply k8s manifests on every restart. NetworkPolicy /
     // ClusterRole / SA-label tweaks land via the manifest files in
@@ -249,10 +249,18 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
 
     if dispatcher_built || listener_built || broker_built || supervisor_built || manifests_changed {
         if cfg.backend == ClusterBackend::Kind {
-            images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
-            images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
-            images::kind_load(&cfg.cluster_name, &cfg.broker_image).await?;
-            images::kind_load(&cfg.cluster_name, &cfg.supervisor_image).await?;
+            // System tags are reused (`:local`), so tag presence on the
+            // kind node DOESN'T imply matching content. Use the _force
+            // variant so a freshly-built image actually replaces the
+            // stale one inside the node. Load all four in parallel:
+            // kind-load is independent per image and the kind node
+            // tolerates concurrent loads.
+            tokio::try_join!(
+                images::kind_load_force(&cfg.cluster_name, &cfg.dispatcher_image),
+                images::kind_load_force(&cfg.cluster_name, &cfg.listener_image),
+                images::kind_load_force(&cfg.cluster_name, &cfg.broker_image),
+                images::kind_load_force(&cfg.cluster_name, &cfg.supervisor_image),
+            )?;
         }
         // Roll the dispatcher pod so it picks up the new image OR
         // the new manifest (e.g. an updated env var or resource
@@ -274,36 +282,135 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         kill_existing_port_forward();
         start_port_forward().await?;
         wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
-        // Also roll every per-tenant listener Deployment when the
-        // listener image rebuilt. The dispatcher creates these
-        // dynamically (named `listener-<tenant>`) and never
-        // restarts them on its own, so without this they stay on
-        // the old image, breaking the dispatcher↔listener wire
-        // contract whenever the SignalSpec / form schema types
-        // shift between releases.
-        if listener_built {
-            roll_listener_deployments(cfg).await?;
-        }
-        if broker_built {
-            let _ = kubectl(&[
-                "-n",
-                &cfg.db_namespace,
-                "rollout",
-                "restart",
-                "deployment/weft-broker",
-            ])
-            .status()
-            .await;
-        }
-        if supervisor_built {
-            roll_supervisor_deployments().await?;
-        }
+        // Once the dispatcher is back up, roll the dependent
+        // deployments concurrently. They are independent rollouts
+        // against different controllers, so wall-clock is bounded
+        // by the slowest:
+        //   - listener: every per-tenant listener Deployment the
+        //     dispatcher created dynamically. Without this they stay
+        //     on the old image and break the dispatcher↔listener
+        //     wire contract.
+        //   - broker: a single Deployment under weft-db.
+        //   - supervisor: every per-tenant supervisor Deployment.
+        let db_namespace = cfg.db_namespace.to_string();
+        let broker_rollout = async move {
+            if broker_built {
+                let _ = kubectl(&[
+                    "-n", &db_namespace, "rollout", "restart", "deployment/weft-broker",
+                ])
+                .status()
+                .await;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let listener_rollout = async {
+            if listener_built {
+                roll_listener_deployments(cfg).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let supervisor_rollout = async {
+            if supervisor_built {
+                roll_supervisor_deployments().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::try_join!(listener_rollout, broker_rollout, supervisor_rollout)?;
         println!("daemon refreshed; new image / manifests rolled out");
     } else {
         println!("daemon already running with the latest images and manifests; nothing to do");
     }
     let _ = ctx;
     Ok(())
+}
+
+/// Which of the four system images were actually rebuilt by a
+/// provisioning pass. Drives the "anything to roll out?" decision.
+struct BuiltImages {
+    dispatcher: bool,
+    listener: bool,
+    broker: bool,
+    supervisor: bool,
+}
+
+/// Build the four daemon system images AND pre-warm the per-project
+/// worker builder base, all concurrently (independent input sets,
+/// per-image buildkit cache mounts). Shared by `start` and `restart`
+/// so the two verbs cannot drift on input lists or failure policy.
+///
+/// Failure policy, split by criticality (not by verb):
+/// - a system image failure fails the command: the daemon cannot run
+///   without them.
+/// - a builder-base failure only warns: it is a pre-warm for future
+///   `weft run`s, which re-ensure the image and surface the real
+///   error with the user present.
+///
+/// `tokio::join!`, NOT `try_join!`: an early bail would drop the
+/// sibling futures while their `docker build` children keep running
+/// detached (orphaned builds churning CPU with nobody reading the
+/// result). join! lets every build finish, then all errors are
+/// aggregated into one loud failure.
+async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltImages> {
+    // Builder-base pre-warm: never errors (warn-and-continue), and
+    // breadcrumbs every 15s in TTY so the long first build on a
+    // clean machine stays legible.
+    let worker_base_prewarm = async {
+        let tty = std::io::stderr().is_terminal();
+        let start = std::time::Instant::now();
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        ticker.tick().await; // consume the immediate first tick
+        let mut build = std::pin::pin!(images::ensure_worker_builder_base());
+        loop {
+            tokio::select! {
+                res = &mut build => {
+                    if let Err(e) = res {
+                        tracing::warn!(
+                            target: "weft_cli::daemon",
+                            error = %e,
+                            "pre-warm of worker builder base failed; next `weft run` will retry"
+                        );
+                    }
+                    break;
+                }
+                _ = ticker.tick() => {
+                    if tty {
+                        let elapsed = start.elapsed().as_secs();
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "still warming worker builder base ({elapsed}s elapsed; first build on a clean machine takes 5-10 min)"
+                        );
+                    }
+                }
+            }
+        }
+    };
+    // Only the dispatcher stages `catalog/` (describe / compile
+    // endpoints); the others must not rebuild on a catalog edit.
+    let (dispatcher, listener, broker, supervisor, ()) = tokio::join!(
+        images::ensure_system_image(&cfg.dispatcher_image, "dispatcher.Dockerfile", &["catalog"], rebuild),
+        images::ensure_system_image(&cfg.listener_image, "listener.Dockerfile", &[], rebuild),
+        images::ensure_system_image(&cfg.broker_image, "broker.Dockerfile", &[], rebuild),
+        images::ensure_system_image(&cfg.supervisor_image, "infra-supervisor.Dockerfile", &[], rebuild),
+        worker_base_prewarm,
+    );
+    let mut failures: Vec<String> = Vec::new();
+    let mut unwrap = |name: &str, res: Result<bool>| match res {
+        Ok(b) => b,
+        Err(e) => {
+            failures.push(format!("{name}: {e:#}"));
+            false
+        }
+    };
+    let built = BuiltImages {
+        dispatcher: unwrap("dispatcher", dispatcher),
+        listener: unwrap("listener", listener),
+        broker: unwrap("broker", broker),
+        supervisor: unwrap("supervisor", supervisor),
+    };
+    if !failures.is_empty() {
+        anyhow::bail!("system image build failed:\n  {}", failures.join("\n  "));
+    }
+    Ok(built)
 }
 
 /// Apply every static manifest in `deploy/k8s`. Returns true iff
@@ -363,15 +470,15 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
         ensure_ingress_controller().await?;
     }
 
-    images::ensure_system_image(&cfg.dispatcher_image, "dispatcher.Dockerfile", rebuild).await?;
-    images::ensure_system_image(&cfg.listener_image, "listener.Dockerfile", rebuild).await?;
-    images::ensure_system_image(&cfg.broker_image, "broker.Dockerfile", rebuild).await?;
-    images::ensure_system_image(&cfg.supervisor_image, "infra-supervisor.Dockerfile", rebuild).await?;
+    provision_images(cfg, rebuild).await?;
     if cfg.backend == ClusterBackend::Kind {
-        images::kind_load(&cfg.cluster_name, &cfg.dispatcher_image).await?;
-        images::kind_load(&cfg.cluster_name, &cfg.listener_image).await?;
-        images::kind_load(&cfg.cluster_name, &cfg.broker_image).await?;
-        images::kind_load(&cfg.cluster_name, &cfg.supervisor_image).await?;
+        // System tags are reused (`:local`), so kind tag presence does
+        // not imply matching content; force-load every time so a
+        // freshly-rebuilt image always lands inside the node.
+        images::kind_load_force(&cfg.cluster_name, &cfg.dispatcher_image).await?;
+        images::kind_load_force(&cfg.cluster_name, &cfg.listener_image).await?;
+        images::kind_load_force(&cfg.cluster_name, &cfg.broker_image).await?;
+        images::kind_load_force(&cfg.cluster_name, &cfg.supervisor_image).await?;
     }
 
     let repo_root = weft_compiler::build::resolve_weft_root()
@@ -619,46 +726,49 @@ async fn roll_listener_deployments(cfg: &ClusterConfig) -> Result<()> {
         return Ok(());
     }
     let names = String::from_utf8_lossy(&out.stdout);
-    let listeners: Vec<&str> = names
+    let listeners: Vec<String> = names
         .split_whitespace()
         .filter(|n| n.starts_with("listener-"))
+        .map(|s| s.to_string())
         .collect();
-    for name in &listeners {
-        let status = kubectl(&[
-            "-n",
-            &cfg.default_user_namespace,
-            "rollout",
-            "restart",
-            &format!("deployment/{name}"),
-        ])
-        .status()
-        .await?;
-        if !status.success() {
-            tracing::warn!(
-                target: "weft_cli::daemon",
-                "rollout restart deployment/{name} failed"
-            );
-            continue;
+    // Roll every tenant's listener concurrently. Each kubectl call is
+    // independent; bounded by the slowest single rollout instead of
+    // the sum across tenants.
+    let ns = cfg.default_user_namespace.to_string();
+    let tasks = listeners.iter().map(|name| {
+        let name = name.clone();
+        let ns = ns.clone();
+        async move {
+            let status = kubectl(&[
+                "-n", &ns, "rollout", "restart", &format!("deployment/{name}"),
+            ])
+            .status()
+            .await?;
+            if !status.success() {
+                tracing::warn!(
+                    target: "weft_cli::daemon",
+                    "rollout restart deployment/{name} failed"
+                );
+                return Ok::<(), anyhow::Error>(());
+            }
+            // Block briefly on each rollout so subsequent register
+            // calls hit the new Pod, not the old one mid-termination.
+            let wait = kubectl(&[
+                "-n", &ns, "rollout", "status", &format!("deployment/{name}"),
+                "--timeout=120s",
+            ])
+            .status()
+            .await?;
+            if !wait.success() {
+                tracing::warn!(
+                    target: "weft_cli::daemon",
+                    "deployment/{name} did not reach Ready within 120s"
+                );
+            }
+            Ok(())
         }
-        // Block briefly on each rollout so subsequent register
-        // calls hit the new Pod, not the old one mid-termination.
-        let wait = kubectl(&[
-            "-n",
-            &cfg.default_user_namespace,
-            "rollout",
-            "status",
-            &format!("deployment/{name}"),
-            "--timeout=120s",
-        ])
-        .status()
-        .await?;
-        if !wait.success() {
-            tracing::warn!(
-                target: "weft_cli::daemon",
-                "deployment/{name} did not reach Ready within 120s"
-            );
-        }
-    }
+    });
+    futures::future::try_join_all(tasks).await?;
     if !listeners.is_empty() {
         println!("rolled {} listener deployment(s)", listeners.len());
     }
@@ -694,24 +804,30 @@ async fn roll_supervisor_deployments() -> Result<()> {
         return Ok(());
     }
     let listing = String::from_utf8_lossy(&out.stdout);
-    let mut rolled = 0;
-    for line in listing.lines() {
-        let Some((ns, name)) = line.trim().split_once(' ') else {
-            continue;
-        };
+    let pairs: Vec<(String, String)> = listing
+        .lines()
+        .filter_map(|line| {
+            line.trim().split_once(' ').map(|(ns, name)| (ns.to_string(), name.to_string()))
+        })
+        .collect();
+    // Roll every per-tenant supervisor in parallel: independent
+    // kubectl calls across different namespaces, no shared state.
+    let tasks = pairs.iter().map(|(ns, name)| async move {
         let status = kubectl(&["-n", ns, "rollout", "restart", &format!("deployment/{name}")])
             .status()
             .await?;
-        if status.success() {
-            rolled += 1;
-        } else {
+        if !status.success() {
             tracing::warn!(
                 target: "weft_cli::daemon",
                 "rollout restart {ns}/{name} failed; tenant may run a stale supervisor \
                  until its pod restarts"
             );
+            return Ok::<bool, anyhow::Error>(false);
         }
-    }
+        Ok(true)
+    });
+    let results = futures::future::try_join_all(tasks).await?;
+    let rolled = results.into_iter().filter(|ok| *ok).count();
     if rolled > 0 {
         println!("rolled {rolled} infra-supervisor deployment(s)");
     }

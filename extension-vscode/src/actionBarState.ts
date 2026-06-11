@@ -27,11 +27,15 @@
 
 import type {
   ActionBarState,
+  ActionBarError,
   ActionBarOverlay,
   ActionAvailability,
+  ActionErrorDetails,
+  ActionErrorDiagnostic,
   ActionVerb,
   BackendSnapshot,
   CliEvent,
+  ErrorVerb,
 } from './shared/protocol';
 
 interface FollowState {
@@ -60,7 +64,7 @@ interface Slot {
     /// as `markExecutionFinished(color)` matches.
     color: string;
   } | undefined;
-  error: { verb: ActionVerb; message: string } | undefined;
+  error: ActionBarError | undefined;
 }
 
 function emptySlot(): Slot {
@@ -179,6 +183,19 @@ export class ActionBarStore {
     this.notifyIfPinned(projectId);
   }
 
+  /// Clear the error ONLY if it was raised by `verb`. A system-side
+  /// source (parse-on-keystroke, catalog load) raises a sticky error
+  /// that the user never dismisses by hand: every half-typed edit fails
+  /// to parse, so the banner must clear itself on that source's next
+  /// SUCCESS. Scoped to the verb so a parse success doesn't wipe an
+  /// unrelated error (a failed run, say) sitting in the same slot.
+  clearErrorIfVerb(projectId: string, verb: ErrorVerb): void {
+    const slot = this.slots.get(projectId);
+    if (!slot || slot.error?.verb !== verb) return;
+    slot.error = undefined;
+    this.notifyIfPinned(projectId);
+  }
+
   /// AutoFollow emitted a follow-state change for projectId.
   /// Mirrors mode + color into the slot so the reducer can compute
   /// the watched-live color.
@@ -204,8 +221,7 @@ export class ActionBarStore {
       return;
     }
     if (ev.phase === 'error') {
-      const msg = (ev.detail?.message as string | undefined) ?? 'unknown error';
-      slot.error = { verb: ev.verb, message: msg };
+      slot.error = errorFromCliEvent(ev);
       slot.cli = undefined;
       this.notifyIfPinned(projectId);
       return;
@@ -214,10 +230,31 @@ export class ActionBarStore {
     this.notifyIfPinned(projectId);
   }
 
-  cliCrashed(projectId: string, verb: ActionVerb, message: string): void {
+  cliCrashed(
+    projectId: string,
+    verb: ActionVerb,
+    message: string,
+    details?: ActionErrorDetails,
+  ): void {
     const slot = this.ensureSlot(projectId);
-    slot.error = { verb, message };
+    slot.error = { verb, message, ...(details ? { details } : {}) };
     slot.cli = undefined;
+    this.notifyIfPinned(projectId);
+  }
+
+  /// Generic error setter for non-CLI failures (edit failures, parse
+  /// failures, anything else that wants to surface a problem to the
+  /// action bar). Same shape as cliCrashed. `verb` is `ErrorVerb`
+  /// (the CLI verb superset) so parse/catalog/etc. land here without
+  /// being forced to pretend they're a 'run'.
+  setError(
+    projectId: string,
+    verb: ErrorVerb,
+    message: string,
+    details?: ActionErrorDetails,
+  ): void {
+    const slot = this.ensureSlot(projectId);
+    slot.error = { verb, message, ...(details ? { details } : {}) };
     this.notifyIfPinned(projectId);
   }
 
@@ -343,4 +380,101 @@ function computeWatchedLiveColor(slot: Slot): string | undefined {
   let last: string | undefined;
   for (const c of slot.runningColors) last = c;
   return last;
+}
+
+/// Truncate a string at `maxLen` characters with an explicit suffix
+/// so the modal can render a wire-drift dump without blowing up on a
+/// runaway diagnostics array.
+function truncateForModal(s: string, maxLen: number): string {
+  return s.length <= maxLen ? s : `${s.slice(0, maxLen)}... [truncated ${s.length - maxLen} chars]`;
+}
+
+/// Build an ActionBarError from a CliEvent error phase. The CLI's
+/// JSON detail field is a free-form record; pull the conventional
+/// fields out and fold anything else into raw. When required fields
+/// (message / what / stage) are missing, fall back to placeholders
+/// AND console.error so wire drift surfaces, and stamp the raw event
+/// into details.raw so the modal shows what actually arrived.
+function errorFromCliEvent(ev: CliEvent): ActionBarError {
+  const d = ev.detail ?? {};
+  const messageRaw = d.message as string | undefined;
+  const whatRaw = d.what as string | undefined;
+  const stageRaw = d.stage as string | undefined;
+  // Only `message` is required by the Rust contract: the plain
+  // `progress.error(message)` path (every ordinary CLI failure) emits
+  // just `message`, while `what`/`stage` come only from the richer
+  // `structured_error` path. So a MISSING `message` is real wire-shape
+  // drift; a missing `what`/`stage` is normal and just falls back to a
+  // sensible default. Treating the latter as drift fired a false alarm
+  // on every ordinary failure.
+  if (!messageRaw) {
+    console.error('errorFromCliEvent: CLI error event missing required `message`', ev);
+  }
+  const message = messageRaw ?? 'unknown error';
+  const what = whatRaw ?? `Running '${ev.verb}'`;
+  const stage = stageRaw ?? 'cli';
+  const rawField = (d.raw as string | undefined) ?? (d.stderr as string | undefined);
+  // Fold the full event into raw ONLY on real drift (missing message)
+  // so the user can see the actual payload. Cap the JSON dump at 4KB
+  // so a runaway diagnostics array can't blow up the modal.
+  const raw = !messageRaw
+    ? `${rawField ? `${rawField}\n\n` : ''}wire-shape drift: full event = ${truncateForModal(JSON.stringify(ev), 4096)}`
+    : rawField;
+  const exitCode = typeof d.exit_code === 'number' ? d.exit_code : undefined;
+  const command = (d.command as string | undefined);
+  const diagnostics = parseDiagnostics(d.diagnostics);
+  const details: ActionErrorDetails = {
+    what,
+    stage,
+    diagnostics,
+    ...(raw ? { raw } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(command ? { command } : {}),
+  };
+  return { verb: ev.verb, message, details };
+}
+
+function parseDiagnostics(value: unknown): ActionErrorDiagnostic[] {
+  if (!Array.isArray(value)) return [];
+  const out: ActionErrorDiagnostic[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') continue;
+    const r = raw as Record<string, unknown>;
+    const message = typeof r.message === 'string' ? r.message : undefined;
+    if (!message) continue;
+    // Closed severity set: warning | info | error. Anything else is
+    // wire drift; log it and keep the unknown string in the message
+    // so it's visible (don't silently relabel as 'error').
+    const severityIn = typeof r.severity === 'string' ? r.severity : 'error';
+    const severity: ActionErrorDiagnostic['severity'] =
+      severityIn === 'warning' || severityIn === 'info' || severityIn === 'error'
+        ? severityIn
+        : 'error';
+    let messageOut = message;
+    if (severity !== severityIn) {
+      console.error('parseDiagnostics: unknown severity coerced to error', severityIn, r);
+      messageOut = `[unknown severity: ${severityIn}] ${message}`;
+    }
+    const code = typeof r.code === 'string' ? r.code : undefined;
+    const hint = typeof r.hint === 'string' ? r.hint : undefined;
+    const locRaw = r.location;
+    let location: ActionErrorDiagnostic['location'] | undefined;
+    if (locRaw && typeof locRaw === 'object') {
+      const lr = locRaw as Record<string, unknown>;
+      const file = typeof lr.file === 'string' ? lr.file : undefined;
+      const line = typeof lr.line === 'number' ? lr.line : undefined;
+      const column = typeof lr.column === 'number' ? lr.column : undefined;
+      if (file && line !== undefined && column !== undefined) {
+        location = { file, line, column };
+      }
+    }
+    out.push({
+      severity,
+      ...(code ? { code } : {}),
+      message: messageOut,
+      ...(hint ? { hint } : {}),
+      ...(location ? { location } : {}),
+    });
+  }
+  return out;
 }

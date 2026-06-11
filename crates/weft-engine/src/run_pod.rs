@@ -32,7 +32,7 @@ use weft_task_store::{
 };
 
 use crate::context::EngineClients;
-use crate::loop_driver::run_one_execution;
+use crate::execution_driver::run_one_execution;
 
 /// How long the worker picker sits idle (no claimable work) before
 /// attempting its guarded self-exit. The grace this gives a burst
@@ -62,9 +62,15 @@ impl weft_task_store::executor::IdleExit for WorkerIdleExit {
 
 /// Per-Pod runtime context for worker task kinds. The registry's
 /// `WorkerTaskKind::handle` impls receive `&WorkerCtx`.
+///
+/// Note: the `ProjectDefinition` is NOT held here. Each execution
+/// claim fetches its own definition from the broker keyed by the
+/// task payload's `definition_hash`. The pod caches by hash in
+/// `project_cache` so two executions of the same shape pay a single
+/// round trip.
 #[derive(Clone)]
 struct WorkerCtx {
-    project: ProjectDefinition,
+    project_id: String,
     catalog: Arc<dyn NodeCatalog>,
     clients: EngineClients,
     pod_name: String,
@@ -75,10 +81,60 @@ struct WorkerCtx {
     /// runtime namespace they're being applied into.
     namespace: String,
     cancel_registry: CancelRegistry,
+    /// Cache of fetched definitions keyed by `definition_hash`.
+    /// Workers fetch each hash they encounter once; consecutive
+    /// claims on the same hash reuse the cached `ProjectDefinition`.
+    /// `Arc<ProjectDefinition>` so handing the value to
+    /// `run_one_execution` is a refcount bump, not a clone of the
+    /// graph. BOUNDED (see `BoundedProjectCache`): every project edit
+    /// mints a new hash, so an unbounded map on a long-lived pod for an
+    /// actively-edited project would accumulate one full graph per edit
+    /// forever. The cache only needs to dedupe consecutive claims of the
+    /// same shape, so a small capacity (latest shape plus a few in-flight
+    /// resume shapes pinning older hashes) is enough.
+    project_cache: ProjectCache,
+}
+
+type ProjectCache = Arc<Mutex<BoundedProjectCache>>;
+
+/// Insertion-ordered cache bounded to `CAP` entries. On overflow it
+/// evicts the oldest-inserted hash. Not a true LRU (no per-get reorder):
+/// the access pattern is "claim a hash, reuse it for the burst of
+/// executions on that shape, move to the next shape," so insertion order
+/// already tracks recency closely enough, and the dumb shape keeps the
+/// hot `get` path a plain map lookup with no bookkeeping.
+struct BoundedProjectCache {
+    map: HashMap<String, Arc<ProjectDefinition>>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl BoundedProjectCache {
+    const CAP: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&self, hash: &str) -> Option<Arc<ProjectDefinition>> {
+        self.map.get(hash).cloned()
+    }
+
+    fn insert(&mut self, hash: String, def: Arc<ProjectDefinition>) {
+        if self.map.insert(hash.clone(), def).is_none() {
+            self.order.push_back(hash);
+            while self.order.len() > Self::CAP {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.map.remove(&evicted);
+                }
+            }
+        }
+    }
 }
 
 pub async fn run_pod(
-    project: ProjectDefinition,
     catalog: Arc<dyn NodeCatalog>,
     clients: EngineClients,
     worker_pods: Arc<dyn WorkerPodClient>,
@@ -101,13 +157,14 @@ pub async fn run_pod(
 
     let picker_tasks = clients.tasks.clone();
     let ctx = WorkerCtx {
-        project,
+        project_id: project_id.clone(),
         catalog,
         clients,
         pod_name: pod_name.clone(),
         tenant_id,
         namespace,
         cancel_registry: cancel_registry.clone(),
+        project_cache: Arc::new(Mutex::new(BoundedProjectCache::new())),
     };
 
     let registry = WorkerTaskRegistry::builder()
@@ -136,9 +193,9 @@ pub async fn run_pod(
     .await;
 
     // Pod-wide shutdown: cancel every in-flight execution. The
-    // loop_driver checks the flag at every iteration top, finishes
-    // its in-flight node tokio tasks, and exits. The picker has
-    // already returned (run_worker_picker observes shutdown above).
+    // execution_driver checks the flag at every iteration top,
+    // finishes its in-flight node tokio tasks, and exits. The picker
+    // has already returned (run_worker_picker observes shutdown above).
     let flags: Vec<_> = {
         let g = cancel_registry.lock().await;
         g.values().cloned().collect()
@@ -229,6 +286,17 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             .parse()
             .map_err(|e| anyhow::anyhow!("bad color: {e}"))?;
 
+        // Per-execution definition fetch with pod-local hash cache.
+        // First claim of a given (project_id, definition_hash) pays
+        // one broker round trip; consecutive claims on the same hash
+        // hand back the cached `Arc<ProjectDefinition>` via the
+        // cache's `get`. A 404 from the broker (no history row for
+        // this hash) is a hard error: the dispatcher should never
+        // enqueue a task for a hash whose history row doesn't exist
+        // (the set_running_definition_hash precondition refuses that),
+        // so a miss here is a real upstream bug.
+        let project = fetch_or_cached_project(ctx, &payload.definition_hash).await?;
+
         let flag = CancellationFlag::new_arc();
         ctx.cancel_registry
             .lock()
@@ -236,7 +304,7 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             .insert(color, flag.clone());
 
         let outcome = run_one_execution(
-            ctx.project.clone(),
+            project,
             ctx.catalog.clone(),
             color,
             ctx.clients.clone(),
@@ -250,6 +318,55 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
         ctx.cancel_registry.lock().await.remove(&color);
 
         outcome.map(|_| ())
+    }
+}
+
+/// Pod-local definition fetch: try the cache first; on miss, call
+/// the broker; on success, populate the cache so the next execution
+/// of the same shape skips the round trip.
+///
+/// The broker reads from the append-only `project_definition`
+/// history table keyed by `(project_id, definition_hash)`, so a
+/// resume task whose `definition_hash` was snapshotted on
+/// `ExecutionStarted` (potentially under a now-old shape) still
+/// gets the EXACT shape it was started on, even after the user has
+/// edited and re-registered the project.
+///
+/// `Ok(None)` would mean the broker doesn't know about this hash
+/// at all (no row was ever registered under it); that's a bug in
+/// either the dispatcher's task production or the register flow,
+/// so we surface it as a hard error.
+async fn fetch_or_cached_project(
+    ctx: &WorkerCtx,
+    definition_hash: &str,
+) -> Result<Arc<ProjectDefinition>> {
+    {
+        let cache = ctx.project_cache.lock().await;
+        if let Some(p) = cache.get(definition_hash) {
+            return Ok(p.clone());
+        }
+    }
+    match ctx
+        .clients
+        .project
+        .fetch_definition(&ctx.project_id, definition_hash)
+        .await?
+    {
+        Some(def) => {
+            let arc = Arc::new(def);
+            ctx.project_cache
+                .lock()
+                .await
+                .insert(definition_hash.to_string(), arc.clone());
+            Ok(arc)
+        }
+        None => Err(anyhow::anyhow!(
+            "no row in project_definition for project {} hash {}; the \
+             dispatcher produced a task for a hash that was never recorded \
+             (upstream bug in the task-producer)",
+            ctx.project_id,
+            definition_hash,
+        )),
     }
 }
 

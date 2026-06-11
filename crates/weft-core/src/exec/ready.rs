@@ -1,10 +1,11 @@
 //! Readiness. Find which nodes have enough pending pulses to fire at
-//! a matching `(color, lane)`, aggregate their inputs, return as
+//! a matching `(color, frames)`, aggregate their inputs, return as
 //! `ReadyGroup`s.
 //!
-//! Expects `preprocess_input` has already run (Expand/Gather
-//! transformations applied), so matching is a simple `color+lane`
-//! join.
+//! Matching is exact-frame: a firing at `(color, frames)` only sees
+//! pulses whose `frames` are exactly the firing's frame stack. Loops
+//! emit broadcast inputs and the implicit `self.index` at the body's
+//! own frame stack directly, one pulse per iteration.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,8 +13,8 @@ use serde_json::{Map, Value};
 
 use crate::exec::skip::check_should_skip;
 use crate::exec::typecheck::runtime_type_check;
-use crate::lane::{Lane, LaneFrame};
-use crate::project::{EdgeIndex, GroupBoundaryRole, LaneMode, NodeDefinition, ProjectDefinition};
+use crate::frames::LoopFrames;
+use crate::project::{EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
 use crate::weft_type::WeftType;
 use crate::Color;
@@ -22,16 +23,65 @@ use crate::Color;
 /// object; `pulse_ids` are the pulses that will be absorbed when the
 /// caller commits the dispatch.
 pub struct ReadyGroup {
-    pub lane: Lane,
+    pub frames: LoopFrames,
     pub color: Color,
     pub input: Value,
+    /// Wired ports whose resolved pulse for this firing was a CLOSURE
+    /// (the upstream terminated without firing the port). Disjoint
+    /// from the keys of `input`: closures carry no data, so they
+    /// never appear there. Surfaces through `NodeStarted` so the
+    /// inspector can render closed ports distinctly from user-emitted
+    /// nulls.
+    pub closed_ports: Vec<String>,
     pub should_skip: bool,
     pub pulse_ids: Vec<uuid::Uuid>,
     pub error: Option<String>,
 }
 
-pub fn find_ready_nodes<'a>(
-    project: &'a ProjectDefinition,
+/// THE single rule for "which pulse does a firing at (color, frames)
+/// see on `port`?". Exact-frame match only: a firing at one frame
+/// stack sees only pulses at the SAME frame stack.
+///
+/// Two-pulse case at the exact key: at most one non-closed pending
+/// data pulse can coexist with one pending closure (the closure was a
+/// pre-emission from a sibling producer whose port terminated, AND a
+/// later sibling emitted real data; per "data outranks
+/// structural-nothing", both stay in the table and this resolver
+/// prefers the non-closed one). `find_groups_for_node` absorbs every
+/// pulse at the firing's exact `(color, frames)` together, so the
+/// closure does not leak across ticks. This shape makes live and
+/// replay agree by construction.
+///
+/// Returns `None` when nothing pending reaches this firing on this port.
+pub(crate) fn resolve_port_value<'a>(
+    pulses: &'a [Pulse],
+    color: Color,
+    frames: &LoopFrames,
+    port: &str,
+) -> Option<&'a Pulse> {
+    let mut winner: Option<&Pulse> = None;
+    for p in pulses
+        .iter()
+        .filter(|p| p.status.is_pending() && p.color == color && p.target_port == port && &p.frames == frames)
+    {
+        winner = Some(match winner {
+            None => p,
+            Some(current) => {
+                if pulse_rank(p) > pulse_rank(current) { p } else { current }
+            }
+        });
+    }
+    winner
+}
+
+/// Higher rank wins. Data (1) > closure (0).
+fn pulse_rank(p: &Pulse) -> u8 {
+    if p.closed { 0 } else { 1 }
+}
+
+
+pub fn find_ready_nodes(
+    project: &ProjectDefinition,
     pulses: &PulseTable,
     edge_idx: &EdgeIndex,
 ) -> Vec<(String, ReadyGroup)> {
@@ -39,20 +89,12 @@ pub fn find_ready_nodes<'a>(
 
     for node in &project.nodes {
         let Some(node_pulses) = pulses.get(&node.id) else {
-            tracing::trace!(target: "weft::exec::ready", node = %node.id, "skip: no pulse bucket");
             continue;
         };
         let pending_count = node_pulses.iter().filter(|p| p.status.is_pending()).count();
         if pending_count == 0 {
-            tracing::trace!(target: "weft::exec::ready", node = %node.id, "skip: no pending pulses");
             continue;
         }
-        tracing::info!(
-            target: "weft::exec::ready",
-            node = %node.id,
-            pending_count,
-            "considering node"
-        );
 
         let incoming = edge_idx.get_incoming(project, &node.id);
         let wired: HashSet<&str> = incoming
@@ -78,23 +120,14 @@ pub fn find_ready_nodes<'a>(
             }
         }
 
-        let groups = find_groups_for_node(node, node_pulses, &required, &wired, &config_filled, has_incoming);
-        tracing::info!(
-            target: "weft::exec::ready",
-            node = %node.id,
-            groups_returned = groups.len(),
-            "find_groups_for_node done"
+        let groups = find_groups_for_node(
+            node, node_pulses, &required, &wired, &config_filled, has_incoming,
         );
         for group in groups {
             result.push((node.id.clone(), group));
         }
     }
 
-    tracing::info!(
-        target: "weft::exec::ready",
-        ready_total = result.len(),
-        "find_ready_nodes summary"
-    );
     result
 }
 
@@ -110,61 +143,26 @@ fn find_groups_for_node(
     config_filled: &HashSet<&str>,
     has_incoming: bool,
 ) -> Vec<ReadyGroup> {
-    let gather_ports: HashSet<&str> = node
-        .inputs
-        .iter()
-        .filter(|p| p.lane_mode == LaneMode::Gather)
-        .map(|p| p.name.as_str())
-        .collect();
-
     let pending: Vec<&Pulse> = node_pulses
         .iter()
         .filter(|p| p.status.is_pending())
-        .filter(|p| !gather_ports.contains(p.target_port.as_str()) || p.gathered)
         .collect();
 
-    // Group pulses by (color, lane).
-    let mut groups: HashMap<(Color, Lane), Vec<&Pulse>> = HashMap::new();
+    // Group pulses by (color, frames). A firing is one exact point in
+    // frame space; matching is exact.
+    let mut groups: HashMap<(Color, LoopFrames), Vec<&Pulse>> = HashMap::new();
     for p in &pending {
-        groups.entry((p.color, p.lane.clone())).or_default().push(p);
+        groups
+            .entry((p.color, p.frames.clone()))
+            .or_default()
+            .push(p);
     }
-
-    // Suppress broadcast lanes when deeper lanes exist for the same
-    // color: deeper lanes mean we're in an expanded context, and the
-    // shallower one would be double-counted.
-    let keys: Vec<(Color, Lane)> = groups.keys().cloned().collect();
-    let suppressed: HashSet<(Color, Lane)> = keys
-        .iter()
-        .filter(|(color_a, lane_a)| {
-            keys.iter().any(|(color_b, lane_b)| {
-                color_a == color_b && lane_a.len() < lane_b.len() && lane_b.starts_with(lane_a)
-            })
-        })
-        .cloned()
-        .collect();
 
     let mut ready = Vec::new();
 
-    for ((color, lane), group_pulses) in &groups {
-        if suppressed.contains(&(*color, lane.clone())) {
-            continue;
-        }
-
+    for ((color, frames), group_pulses) in &groups {
         let all_satisfied = wired.iter().all(|port_name| {
-            if group_pulses.iter().any(|p| p.target_port == *port_name) {
-                return true;
-            }
-            // Broadcast: a shallower-lane pulse counts.
-            if !lane.is_empty() {
-                return node_pulses.iter().any(|p| {
-                    p.status.is_pending()
-                        && p.color == *color
-                        && p.lane.len() < lane.len()
-                        && lane.starts_with(&p.lane)
-                        && p.target_port == *port_name
-                });
-            }
-            false
+            group_pulses.iter().any(|p| p.target_port == *port_name)
         });
 
         if has_incoming && !all_satisfied {
@@ -172,9 +170,9 @@ fn find_groups_for_node(
         }
 
         let mut type_errors = Vec::new();
-        let input = build_input(node, node_pulses, lane, color, &mut type_errors);
+        let input = build_input(node, node_pulses, frames, color, wired, &mut type_errors);
 
-        // Group boundary skip rules: only In-boundary skips; Out
+        // Group/Loop boundary skip rules: only In-boundary skips; Out
         // forwards whatever came through.
         let is_out_boundary = node
             .group_boundary
@@ -184,33 +182,31 @@ fn find_groups_for_node(
         let should_skip = if is_out_boundary || !has_incoming {
             false
         } else {
-            check_should_skip(node, node_pulses, lane, *color, required, wired, config_filled)
+            check_should_skip(node, node_pulses, frames, *color, required, wired, config_filled)
         };
 
-        let pulse_ids: Vec<uuid::Uuid> = group_pulses
+        let pulse_ids: Vec<uuid::Uuid> = group_pulses.iter().map(|p| p.id).collect();
+
+        let mut closed_ports: Vec<String> = wired
             .iter()
-            .filter(|p| &p.lane == lane)
-            .map(|p| p.id)
+            .filter(|port_name| {
+                resolve_port_value(node_pulses, *color, frames, port_name)
+                    .map(|p| p.closed)
+                    .unwrap_or(false)
+            })
+            .map(|p| p.to_string())
             .collect();
+        closed_ports.sort();
 
         ready.push(ReadyGroup {
-            lane: lane.clone(),
+            frames: frames.clone(),
             color: *color,
             input,
+            closed_ports,
             should_skip,
             pulse_ids,
             error: if type_errors.is_empty() { None } else { Some(type_errors.join("; ")) },
         });
-    }
-
-    // Shape mismatch detection: if we produced no ready groups and
-    // there are multiple wired ports with incompatible lane shapes,
-    // emit an error-ready group so the dispatcher can surface it to
-    // the user.
-    if ready.is_empty() && wired.len() > 1 {
-        if let Some(mismatch) = detect_shape_mismatch(&pending, wired, &node.id) {
-            ready.push(mismatch);
-        }
     }
 
     ready
@@ -223,32 +219,36 @@ fn find_groups_for_node(
 fn build_input(
     node: &NodeDefinition,
     node_pulses: &[Pulse],
-    lane: &Lane,
+    frames: &LoopFrames,
     color: &Color,
+    wired: &HashSet<&str>,
     type_errors: &mut Vec<String>,
 ) -> Value {
     let mut obj = Map::new();
 
-    // Collect pulses for this (color, lane) plus broadcast parents.
-    for p in node_pulses.iter().filter(|p| p.status.is_pending() && &p.color == color) {
-        if &p.lane == lane {
-            obj.insert(p.target_port.clone(), p.value.clone());
-        } else if p.lane.len() < lane.len() && lane.starts_with(&p.lane) && !obj.contains_key(&p.target_port) {
-            obj.insert(p.target_port.clone(), p.value.clone());
+    // Per-port value resolution via the shared `resolve_port_value`
+    // (also used by `skip::port_arrived_closed`). Enumerate distinct
+    // ports that have any pending pulse at this exact frame, then
+    // resolve each once. build_input and skip share ONE definition of
+    // "which pulse does this port see" so the two layers can never
+    // disagree on the firing's view.
+    let distinct_ports: HashSet<&str> = node_pulses
+        .iter()
+        .filter(|p| p.status.is_pending() && &p.color == color && &p.frames == frames)
+        .map(|p| p.target_port.as_str())
+        .collect();
+    for port in distinct_ports {
+        if let Some(winner) =
+            resolve_port_value(node_pulses, *color, frames, port)
+        {
+            if winner.closed {
+                continue;
+            }
+            obj.insert(port.to_string(), winner.value.clone());
         }
     }
 
-    // Config fills any unsatisfied configurable port.
-    for port in &node.inputs {
-        if !port.configurable || obj.contains_key(&port.name) {
-            continue;
-        }
-        if let Some(cfg) = node.config.get(&port.name) {
-            if !cfg.is_null() {
-                obj.insert(port.name.clone(), cfg.clone());
-            }
-        }
-    }
+    fill_input_from_config(node, wired, &mut obj);
 
     // Runtime type enforcement on input ports: the single check point
     // (see `check_input`). A mismatch on a required port aggregates
@@ -277,41 +277,66 @@ fn build_input(
 /// Outcome of checking one incoming value against an input port type.
 #[derive(Debug, PartialEq, Eq)]
 enum InputCheck {
-    /// Value matches the port type (or there's nothing to check).
     Ok,
-    /// Type mismatch on an OPTIONAL port: the node didn't get a valid
-    /// value here, but it declared it can do without one, so null the
-    /// port and let the node proceed.
     NullIt,
-    /// Type mismatch on a REQUIRED port: the node cannot proceed.
     Fail(String),
+}
+
+/// Insert each UNWIRED configurable input port's config value into
+/// `obj`. Wires are authoritative: a wired port whose pulse resolved
+/// to a closure stays absent (the closure means upstream produced
+/// nothing; silently substituting the config value would mask the
+/// upstream failure AND contradict the skip layer, whose
+/// `config_filled` set deliberately excludes wired ports). Shared
+/// between the pulse-driven dispatch path (`build_input`) and the
+/// kick-driven dispatch path (`build_kicked_input` below) so the two
+/// paths can't disagree on what counts as "configured".
+pub fn fill_input_from_config(
+    node: &NodeDefinition,
+    wired: &HashSet<&str>,
+    obj: &mut Map<String, Value>,
+) {
+    for port in &node.inputs {
+        if !port.configurable
+            || wired.contains(port.name.as_str())
+            || obj.contains_key(&port.name)
+        {
+            continue;
+        }
+        if let Some(cfg) = node.config.get(&port.name) {
+            if !cfg.is_null() {
+                obj.insert(port.name.clone(), cfg.clone());
+            }
+        }
+    }
+}
+
+/// Build an InputBag for a node firing from a KICK (entry node /
+/// trigger payload), not from upstream pulses. Starts empty and
+/// fills only from the node's config (configurable input ports).
+/// This is what makes a `Range { from: 0, to: 10, step: 2 }` orphan
+/// see its config values at runtime.
+///
+/// Wake payloads from trigger kicks ride a separate channel
+/// (`ctx.wake_payload()`) that the engine wires up at dispatch time,
+/// so they don't need to be merged here.
+pub fn build_kicked_input(node: &NodeDefinition) -> Value {
+    let mut obj = Map::new();
+    // Kicked nodes are entry points: no wired pending inputs by
+    // definition, so the wired set is empty.
+    fill_input_from_config(node, &HashSet::new(), &mut obj);
+    Value::Object(obj)
 }
 
 /// Check one incoming value against its input port type. THE single
 /// place input type enforcement lives.
-///
-/// Uniform across lane modes because port types are POST-TRANSFORM:
-/// by the time a value reaches here the Expand split / Gather collect
-/// already happened, and the port type describes exactly what this
-/// lane carries (Single: `T`; one Expand element: `T`; gathered list:
-/// `List[T]`). So there is no expand/gather branching: every value is
-/// checked against the port type as a whole.
-///
-/// The consequence of a mismatch is decided ONLY by required-vs-
-/// optional, never by where the value came from:
-///   - optional port (not required, or type admits null) -> `NullIt`
-///   - required port -> `Fail`
-///
-/// Null = "no pulse" is never itself a mismatch; an unresolved port
-/// type is never a mismatch (the compiler resolves the types that
-/// matter before dispatch).
 fn check_input(port: &crate::project::PortDefinition, value: &Value) -> InputCheck {
-    if value.is_null() || port.port_type.is_unresolved() || runtime_type_check(&port.port_type, value)
+    if value.is_null()
+        || port.port_type.is_unresolved()
+        || runtime_type_check(&port.port_type, value)
     {
         return InputCheck::Ok;
     }
-    // Optional = not required, or the declared type explicitly admits
-    // null (`T?` / `T | Null`).
     if !port.required || port.port_type.contains_null() {
         return InputCheck::NullIt;
     }
@@ -323,104 +348,80 @@ fn check_input(port: &crate::project::PortDefinition, value: &Value) -> InputChe
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Shape mismatch helper
-// ---------------------------------------------------------------------------
-
-fn detect_shape_mismatch(
-    pending: &[&Pulse],
-    wired: &HashSet<&str>,
-    node_id: &str,
-) -> Option<ReadyGroup> {
-    let mut port_lanes: HashMap<&str, Vec<&Lane>> = HashMap::new();
-    for p in pending {
-        let port = p.target_port.as_str();
-        if wired.contains(port) {
-            port_lanes.entry(port).or_default().push(&p.lane);
-        }
-    }
-    if port_lanes.len() < 2 {
-        return None;
-    }
-
-    let entries: Vec<(&str, &Vec<&Lane>)> = port_lanes.iter().map(|(k, v)| (*k, v)).collect();
-    let mut mismatch = false;
-    'outer: for i in 0..entries.len() {
-        for j in (i + 1)..entries.len() {
-            let compatible = entries[i].1.iter().any(|la| entries[j].1.iter().any(|lb| lanes_compatible(la, lb)));
-            if !compatible {
-                mismatch = true;
-                break 'outer;
-            }
-        }
-    }
-    if !mismatch {
-        return None;
-    }
-
-    let detail: Vec<String> = port_lanes
-        .iter()
-        .map(|(port, lanes)| {
-            let shapes: HashSet<String> = lanes.iter().map(|l| format_lane(l)).collect();
-            format!("{port}: {}", shapes.into_iter().collect::<Vec<_>>().join(" | "))
-        })
-        .collect();
-
-    let msg = format!("shape mismatch: {}", detail.join("; "));
-    tracing::error!(target: "weft::exec::ready", node = %node_id, "{msg}");
-
-    Some(ReadyGroup {
-        lane: Vec::new(),
-        color: pending.first().map(|p| p.color).unwrap_or_else(uuid::Uuid::nil),
-        input: Value::Null,
-        should_skip: false,
-        pulse_ids: pending.iter().map(|p| p.id).collect(),
-        error: Some(msg),
-    })
-}
-
-fn lanes_compatible(a: &Lane, b: &Lane) -> bool {
-    let min = a.len().min(b.len());
-    a.iter().take(min).zip(b.iter()).all(|(x, y)| x.count == y.count)
-}
-
-fn format_lane(lane: &Lane) -> String {
-    if lane.is_empty() {
-        return "scalar".into();
-    }
-    let parts: Vec<String> = lane.iter().map(|f: &LaneFrame| format!("{}:{}", f.count, f.index)).collect();
-    format!("[{}]", parts.join(", "))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{check_input, InputCheck};
-    use crate::project::PortDefinition;
+    use super::{build_kicked_input, check_input, resolve_port_value, InputCheck};
+    use crate::frames::LoopIteration;
+    use crate::project::{NodeDefinition, PortDefinition, Position};
+    use crate::pulse::Pulse;
+    use crate::NodeFeatures;
     use serde_json::json;
 
-    fn port(ty: &str, lane_mode: &str, required: bool) -> PortDefinition {
+    fn frame(i: u32) -> LoopIteration {
+        LoopIteration { index: i }
+    }
+
+    #[test]
+    fn resolve_port_value_exact_frame_only() {
+        let color = uuid::Uuid::nil();
+        let firing_frames = vec![frame(0), frame(1)];
+        let pulses = vec![
+            // Shallower-frame pulses are NOT visible: no prefix
+            // broadcast in the new world.
+            Pulse::new(color, vec![], "n", "p", json!("shallow")),
+            Pulse::new(color, vec![frame(0)], "n", "p", json!("mid")),
+            Pulse::new(color, firing_frames.clone(), "n", "p", json!("exact")),
+        ];
+        let winner = resolve_port_value(&pulses, color, &firing_frames, "p")
+            .expect("exact-frame pulse reaches firing");
+        assert_eq!(winner.value, json!("exact"));
+    }
+
+    #[test]
+    fn resolve_port_value_returns_none_if_no_exact_match() {
+        let color = uuid::Uuid::nil();
+        let firing_frames = vec![frame(0), frame(1)];
+        let pulses = vec![
+            Pulse::new(color, vec![], "n", "p", json!("shallow")),
+        ];
+        assert!(resolve_port_value(&pulses, color, &firing_frames, "p").is_none());
+    }
+
+    #[test]
+    fn resolve_port_value_prefers_data_over_closure_at_same_key() {
+        let color = uuid::Uuid::nil();
+        let frames = vec![];
+        let pulses = vec![
+            Pulse::closure(color, frames.clone(), "n", "p"),
+            Pulse::new(color, frames.clone(), "n", "p", json!(42)),
+        ];
+        let winner = resolve_port_value(&pulses, color, &frames, "p")
+            .expect("a winner");
+        assert_eq!(winner.value, json!(42));
+        assert!(!winner.closed);
+    }
+
+    fn port(ty: &str, required: bool) -> PortDefinition {
         serde_json::from_value(json!({
-            "name": "p", "portType": ty, "required": required, "laneMode": lane_mode
+            "name": "p", "portType": ty, "required": required
         }))
         .expect("port")
     }
 
     #[test]
     fn matching_value_is_ok_regardless_of_required() {
-        assert_eq!(check_input(&port("String", "Single", true), &json!("ok")), InputCheck::Ok);
-        assert_eq!(check_input(&port("String", "Single", false), &json!("ok")), InputCheck::Ok);
+        assert_eq!(check_input(&port("String", true), &json!("ok")), InputCheck::Ok);
+        assert_eq!(check_input(&port("String", false), &json!("ok")), InputCheck::Ok);
     }
 
     #[test]
     fn null_is_ok_no_pulse() {
-        // Null is "no pulse", never itself a mismatch (the skip layer
-        // decides whether a required port being null elides the node).
-        assert_eq!(check_input(&port("String", "Single", true), &json!(null)), InputCheck::Ok);
+        assert_eq!(check_input(&port("String", true), &json!(null)), InputCheck::Ok);
     }
 
     #[test]
     fn mismatch_on_required_fails() {
-        let p = port("String", "Single", true);
+        let p = port("String", true);
         match check_input(&p, &json!(42)) {
             InputCheck::Fail(msg) => assert!(msg.contains("expected")),
             other => panic!("expected Fail, got {other:?}"),
@@ -429,48 +430,111 @@ mod tests {
 
     #[test]
     fn mismatch_on_optional_nulls_it() {
-        // Optional = not required. The node declared it can do without
-        // a valid value here, so a mismatch nulls the port (no fail).
-        assert_eq!(check_input(&port("String", "Single", false), &json!(42)), InputCheck::NullIt);
+        assert_eq!(check_input(&port("String", false), &json!(42)), InputCheck::NullIt);
     }
 
     #[test]
     fn mismatch_on_nullable_required_nulls_it() {
-        // A required port whose TYPE admits null (`String | Null`) is
-        // optional in the "can-do-without" sense: a mismatch nulls it.
         assert_eq!(
-            check_input(&port("String | Null", "Single", true), &json!(42)),
+            check_input(&port("String | Null", true), &json!(42)),
             InputCheck::NullIt
         );
     }
 
-    #[test]
-    fn gather_checks_assembled_list_as_a_whole() {
-        // A gather input is declared `List[T]` (POST-transform), checked
-        // against `List[T]` like any value. No expand/gather special-
-        // casing: same code path as Single.
-        let req = port("List[Number]", "Gather", true);
-        assert_eq!(check_input(&req, &json!([1, 2, 3])), InputCheck::Ok);
-        // A skipped sibling's null makes the list `List[Number|Null]`,
-        // which fails `List[Number]` on a required port.
-        match check_input(&req, &json!([1, null, 3])) {
-            InputCheck::Fail(_) => {}
-            other => panic!("expected Fail, got {other:?}"),
+    fn kicked_node(node_type: &str, inputs: Vec<PortDefinition>, config: serde_json::Value) -> NodeDefinition {
+        NodeDefinition {
+            id: "k".into(),
+            node_type: node_type.into(),
+            label: None,
+            config,
+            position: Position { x: 0.0, y: 0.0 },
+            inputs,
+            outputs: Vec::new(),
+            features: NodeFeatures::default(),
+            scope: Vec::new(),
+            group_boundary: None,
+            requires_infra: false,
+            images: Vec::new(),
+            span: None,
+            header_span: None,
+            config_spans: Default::default(),
+            file_refs: Default::default(),
+            include_path: None,
         }
-        // Same gather, optional port: the bad list nulls instead.
-        let opt = port("List[Number]", "Gather", false);
-        assert_eq!(check_input(&opt, &json!([1, null, 3])), InputCheck::NullIt);
     }
 
+    /// Regression: a kicked orphan node (entry node with no incoming
+    /// edges) used to receive an empty input bag, so a configurable
+    /// port like `Range.to` set via source config (`Range { to: 10 }`)
+    /// arrived at runtime as `missing input on port: to`. The kick
+    /// path now flows through `build_kicked_input` which fills
+    /// configurable ports from `node.config`.
     #[test]
-    fn expand_lane_element_checked_against_element_type() {
-        // After the split, an Expand lane carries one element checked
-        // against the element type T -- the SAME whole-value check.
-        let req = port("Number", "Expand", true);
-        assert_eq!(check_input(&req, &json!(7)), InputCheck::Ok);
-        match check_input(&req, &json!("nan")) {
-            InputCheck::Fail(_) => {}
-            other => panic!("expected Fail, got {other:?}"),
-        }
+    fn build_kicked_input_fills_configurable_ports_from_config() {
+        let inputs = vec![
+            serde_json::from_value(json!({
+                "name": "from", "portType": "Number",
+                "required": false, "configurable": true,
+            })).unwrap(),
+            serde_json::from_value(json!({
+                "name": "to", "portType": "Number",
+                "required": true, "configurable": true,
+            })).unwrap(),
+            serde_json::from_value(json!({
+                "name": "step", "portType": "Number",
+                "required": false, "configurable": true,
+            })).unwrap(),
+        ];
+        let config = json!({ "from": 0, "to": 10, "step": 2 });
+        let node = kicked_node("Range", inputs, config);
+        let input = build_kicked_input(&node);
+        assert_eq!(input, json!({ "from": 0, "to": 10, "step": 2 }));
+    }
+
+    /// A wired-only port (`configurable: false`) must NOT be filled
+    /// from config even if the user accidentally put a value in the
+    /// node's config map: that's the wired-only contract.
+    #[test]
+    fn build_kicked_input_ignores_non_configurable_ports() {
+        let inputs = vec![
+            serde_json::from_value(json!({
+                "name": "in", "portType": "String",
+                "required": true, "configurable": false,
+            })).unwrap(),
+        ];
+        let config = json!({ "in": "should be ignored" });
+        let node = kicked_node("X", inputs, config);
+        let input = build_kicked_input(&node);
+        assert_eq!(input, json!({}));
+    }
+
+    /// Wires are authoritative: a WIRED configurable port whose pulse
+    /// resolved to a closure (so it is absent from the bag) must NOT
+    /// be silently backfilled from config. The closure means upstream
+    /// produced nothing; substituting the config value would mask the
+    /// upstream failure and contradict the skip layer (whose
+    /// `config_filled` set excludes wired ports).
+    #[test]
+    fn fill_input_from_config_skips_wired_ports() {
+        let inputs = vec![
+            serde_json::from_value(json!({
+                "name": "wired_p", "portType": "Number",
+                "required": false, "configurable": true,
+            })).unwrap(),
+            serde_json::from_value(json!({
+                "name": "free_p", "portType": "Number",
+                "required": false, "configurable": true,
+            })).unwrap(),
+        ];
+        let config = json!({ "wired_p": 1, "free_p": 2 });
+        let node = kicked_node("X", inputs, config);
+        let wired: std::collections::HashSet<&str> = ["wired_p"].into_iter().collect();
+        let mut obj = serde_json::Map::new();
+        super::fill_input_from_config(&node, &wired, &mut obj);
+        assert_eq!(
+            serde_json::Value::Object(obj),
+            json!({ "free_p": 2 }),
+            "wired port stays absent; unwired port fills from config"
+        );
     }
 }

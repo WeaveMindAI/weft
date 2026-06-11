@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { toast } from 'svelte-sonner';
   import ProjectEditor from './lib/components/project/ProjectEditor.svelte';
   import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
   import { send, onMessage } from './vscode';
   import { registerCatalog, setCatalog, type CatalogEntry } from '$lib/nodes';
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
-  import type { ProjectDefinition as V1Project, NodeExecution } from './lib/types';
+  import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
   import type { ActionBarState, ActionAvailability, NodeFeedState, TextEdit, EditOp, FileContent } from '../shared/protocol';
 
   let project: V1Project | null = $state(null);
@@ -48,19 +49,39 @@
   let editorRef: any = $state();
 
   // Live execution state fed by the host's exec follower.
-  // nodeStatuses/nodeOutputs snapshot the last-observed values per
-  // node; nodeExecutions tracks the rolling history per node.
-  let executionState = $state<{
-    isRunning: boolean;
-    nodeStatuses: Record<string, string>;
-    nodeOutputs: Record<string, unknown>;
-    nodeExecutions: Record<string, NodeExecution[]>;
-  }>({
+  // nodeOutputs snapshots the last-observed output per node;
+  // nodeExecutions tracks the rolling history per node.
+  //
+  // busLogByBus is the source of truth for bus conversations: every
+  // bus event ever observed (live or replay), keyed by busId. The
+  // inspector for a given node N renders one IRC panel per bus in
+  // `busParticipantsByBus` whose participant set contains N.
+  // `busMetaByBus` carries per-bus header metadata (mode) seeded
+  // from the first BusParticipant edge the dispatcher derives from
+  // the bus marker JSON.
+  let executionState = $state<ExecutionState>({
     isRunning: false,
-    nodeStatuses: {},
     nodeOutputs: {},
     nodeExecutions: {},
+    busLogByBus: {},
+    busMetaByBus: {},
+    busParticipantsByBus: {},
+    journalCorruptions: [],
+    loopEventsByGroup: {},
   });
+
+  // Dedup keys for append-only inspector logs. The execution follower
+  // subscribes to the live SSE stream BEFORE replaying the journal
+  // snapshot, so an event can arrive via BOTH the replay and the live
+  // buffer (the overlap window). Node executions are idempotent (keyed
+  // by (nodeId, framesKey), mutated in place), but bus and loop logs
+  // are append-only, so without dedup the same chat line / loop
+  // iteration would render twice. Bus events carry a per-bus `offset`;
+  // loop events are keyed by (groupId, kind, parentFrames, index).
+  // Reset on execReset (a fresh follow). Kept OUTSIDE `executionState`
+  // ($state) since they're pure bookkeeping, not rendered.
+  let seenBusKeys = new Set<string>();
+  let seenLoopKeys = new Set<string>();
 
   // Per-node body-panel feeds. Each node ID maps to AT MOST ONE
   // feed depending on type:
@@ -163,7 +184,21 @@
         // in-place edit-reconciliation path.
         const freshMount = project === null || msg.freshMount === true;
         layoutCode = msg.layoutCode;
-        const translated = translateProject(msg.response.project, msg.source, msg.layoutCode);
+        // host-bridge's `translateProject` throws on an unknown container
+        // kind (a wire-shape drift the user wants surfaced, not
+        // silently dropped). Catch it and show the inline `error`
+        // banner (the same one parse failures use) rather than freezing
+        // the view on the previous project. (This is the inline banner
+        // only; it does not also push to the action-bar error slot.)
+        let translated;
+        try {
+          translated = translateProject(msg.response.project, msg.source, msg.layoutCode);
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.error('translateProject failed:', errMsg);
+          error = `Project translation failed: ${errMsg}`;
+          return;
+        }
         if (freshMount) {
           // No saved layout (fresh file, or layout absent): auto-organize on
           // mount so the graph isn't a pile at the origin.
@@ -202,27 +237,37 @@
       if (msg.kind === 'execReset') {
         executionState = {
           isRunning: true,
-          nodeStatuses: {},
           nodeOutputs: {},
           nodeExecutions: {},
+          busLogByBus: {},
+          busMetaByBus: {},
+          busParticipantsByBus: {},
+          journalCorruptions: [],
+          loopEventsByGroup: {},
         };
+        seenBusKeys = new Set();
+        seenLoopKeys = new Set();
         return;
       }
       if (msg.kind === 'execTerminal') {
         // The dispatcher reached ExecutionCompleted / ExecutionFailed.
         // Whatever the per-node tally says, the run is over: hide
-        // the Stop button. Also close any node row still in
-        // 'running' (in case a NodeCompleted slipped through SSE).
+        // the Stop button. Close EVERY non-terminal row (in case a
+        // NodeCompleted slipped through SSE, a parallel-loop iteration
+        // left several rows open, or a node was still
+        // `waiting_for_input` when the run was cancelled): only
+        // completed/failed/skipped/cancelled are terminal, so anything
+        // else (running, waiting_for_input) must be force-closed to the
+        // execution's terminal state, not just the last `running` row.
         executionState.isRunning = false;
         const now = Date.now();
+        const isTerminal = (s: NodeExecution['status']) =>
+          s === 'completed' || s === 'failed' || s === 'skipped' || s === 'cancelled';
         const rows = { ...executionState.nodeExecutions };
         for (const [nodeId, history] of Object.entries(rows)) {
-          const last = history[history.length - 1];
-          if (last && last.status === 'running') {
+          if (history.some((r) => !isTerminal(r.status))) {
             rows[nodeId] = history.map((r) =>
-              r.id === last.id
-                ? { ...r, status: msg.state, completedAt: now }
-                : r,
+              isTerminal(r.status) ? r : { ...r, status: msg.state, completedAt: now },
             );
           }
         }
@@ -231,37 +276,33 @@
       }
       if (msg.kind === 'execEvent') {
         const e = msg.event;
-        // 'started' is a Started event from the wire; normalize
-        // for class checks (CSS tests 'running'). Suspended is a
-        // first-class state from the dispatcher's lifecycle.
-        const state = e.state === 'started' ? 'running' : e.state;
-        executionState.nodeStatuses = {
-          ...executionState.nodeStatuses,
-          [e.nodeId]: state,
-        };
-        // One execution row per (nodeId, laneKey). The dispatcher
-        // produces lifecycle events (started/suspended/resumed/
-        // retried/completed/failed/skipped) on the same record;
-        // we mutate the existing row, not append. Failure +
-        // retry will close the live attempt into prior_attempts
-        // and reset the live fields; until that wires up, a
-        // fresh dispatch after a terminal row goes into the same
-        // row's history (one pulse per (node, lane)).
+        const state = e.state;
+        // One execution row per (nodeId, framesKey). The dispatcher
+        // produces state events (running/waiting_for_input/completed/
+        // failed/skipped/cancelled) on the same record; we mutate
+        // the existing row, not append. A fresh dispatch after a
+        // terminal row goes into the same row's history (one pulse
+        // per (node, frames)).
         const now = Date.now();
         const rows = executionState.nodeExecutions[e.nodeId] ?? [];
-        const laneKey = e.lane ?? '';
-        const idx = rows.findIndex((r) => r.laneKey === laneKey);
+        // Key the record by frame stack: each firing
+        // at a distinct frame stack gets its own card so parallel fan-outs
+        // don't cross-correlate. `lane` is a structured array;
+        // serialize for the stable string identity the render layer
+        // needs.
+        const framesKey = JSON.stringify(e.frames);
+        const idx = rows.findIndex((r) => r.framesKey === framesKey);
         let nextRows: NodeExecution[];
         if (idx < 0) {
-          // First event for this (node, lane). Open the record.
+          // First event for this (node, frames). Open the record.
           nextRows = [
             ...rows,
             {
-              id: `${e.nodeId}-${laneKey}-${now}`,
+              id: `${e.nodeId}-${framesKey}-${now}`,
               nodeId: e.nodeId,
               status: state as NodeExecution['status'],
               pulseIdsAbsorbed: [],
-              pulseId: `${e.nodeId}-${laneKey}-${now}`,
+              pulseId: `${e.nodeId}-${framesKey}-${now}`,
               startedAt: now,
               completedAt:
                 state === 'completed' || state === 'failed' || state === 'skipped' || state === 'cancelled'
@@ -271,9 +312,10 @@
               costUsd: 0,
               logs: [],
               color: '',
-              lane: [],
-              laneKey,
+              frames: e.frames,
+              framesKey,
               input: e.input,
+              closedPorts: e.closedPorts,
               output: e.output,
             },
           ];
@@ -289,6 +331,13 @@
             }
             if (state === 'running' && e.input !== undefined && r.input === undefined) {
               updated.input = e.input;
+            }
+            // closedPorts may arrive on node_started (state=running) or
+            // node_skipped (state=skipped); always refresh from the event
+            // if present so the inspector shows the per-port (closed)
+            // labels for skipped firings as well as running ones.
+            if (e.closedPorts !== undefined) {
+              updated.closedPorts = e.closedPorts;
             }
             return updated;
           });
@@ -310,10 +359,110 @@
         }
         return;
       }
+      if (msg.kind === 'busEvent') {
+        // Append the event to the bus's full log. Participation (which
+        // node panels render this bus) is fed by a SEPARATE
+        // `busParticipant` channel; bus events themselves carry only
+        // bus-layer state.
+        const busId = msg.event.busId;
+        // Dedup on (busId, offset): the replay snapshot and the live
+        // stream overlap during a replay follow, so the same offset can
+        // arrive twice. Offsets are unique per bus, so this is exact.
+        const busKey = `${busId}:${msg.event.offset}`;
+        if (seenBusKeys.has(busKey)) return;
+        seenBusKeys.add(busKey);
+        const log = executionState.busLogByBus[busId] ?? [];
+        executionState.busLogByBus = {
+          ...executionState.busLogByBus,
+          [busId]: [...log, msg.event],
+        };
+        return;
+      }
+      if (msg.kind === 'loopEvent') {
+        const gid = msg.event.groupId;
+        // Dedup on (groupId, kind, parentFrames, index): loop events
+        // have no single offset, but this tuple uniquely identifies each
+        // one (instantiated/terminated have no index; the JSON of
+        // parentFrames disambiguates nested + parallel iterations). Same
+        // replay/live overlap as bus events.
+        const idx = 'index' in msg.event ? msg.event.index : '';
+        const loopKey = `${gid}:${msg.event.kind}:${JSON.stringify(msg.event.parentFrames)}:${idx}`;
+        if (seenLoopKeys.has(loopKey)) return;
+        seenLoopKeys.add(loopKey);
+        const log = executionState.loopEventsByGroup[gid] ?? [];
+        executionState.loopEventsByGroup = {
+          ...executionState.loopEventsByGroup,
+          [gid]: [...log, msg.event],
+        };
+        return;
+      }
+      if (msg.kind === 'journalCorruption') {
+        // One-shot at replay: append. The inspector aggregates these
+        // into a muted "N journal rows corrupted" line per execution.
+        // Not alarming; the user only sees it if they look.
+        executionState.journalCorruptions = [
+          ...executionState.journalCorruptions,
+          { site: msg.site, reason: msg.reason },
+        ];
+        return;
+      }
+      if (msg.kind === 'busParticipant') {
+        // Add the (busId, nodeId) edge if new. Idempotent: PulseEmitted
+        // fires once per source/target on a per-pulse basis, so we may
+        // see the same edge multiple times when a producer emits
+        // several values on the same bus port. The first edge for a
+        // bus also seeds `busMetaByBus[busId]` from the dispatcher-
+        // derived mode, so the inspector renders the panel header
+        // badge from the same source as participation.
+        const set = executionState.busParticipantsByBus[msg.busId] ?? new Set<string>();
+        if (!set.has(msg.nodeId)) {
+          const next = new Set(set);
+          next.add(msg.nodeId);
+          executionState.busParticipantsByBus = {
+            ...executionState.busParticipantsByBus,
+            [msg.busId]: next,
+          };
+        }
+        // Bus mode is immutable per bus (the marker carries it from
+        // creation). Pin the first-seen meta: divergence is a
+        // dispatcher / wire bug, so accepting "latest wins" would
+        // silently mutate a known-good state with a known-bad one.
+        // Log loud so the bug is visible in the dev tools without
+        // corrupting the UI.
+        const prevMeta = executionState.busMetaByBus[msg.busId];
+        if (prevMeta) {
+          if (prevMeta.ephemeral !== msg.meta.ephemeral) {
+            console.warn(
+              `bus meta diverged for ${msg.busId}: pinned ephemeral=${prevMeta.ephemeral}, incoming ephemeral=${msg.meta.ephemeral} (kept the first-seen value; the bus marker is the authoritative shape)`,
+            );
+          }
+        } else {
+          executionState.busMetaByBus = {
+            ...executionState.busMetaByBus,
+            [msg.busId]: msg.meta,
+          };
+        }
+        return;
+      }
       if (msg.kind === 'followStatus') {
         followMode = msg.status.mode;
         followColor = msg.status.color;
         followPendingCount = msg.status.pendingCount;
+        return;
+      }
+      if (msg.kind === 'followLost') {
+        // The live SSE link to this execution ended or broke. Stop
+        // presenting the run as live (hide the Stop button) WITHOUT
+        // falsely marking nodes completed: the per-node rows keep
+        // their last known state, we just aren't following anymore.
+        // (execTerminal is the run actually finishing; this is the
+        // link dying with the run possibly still in flight.)
+        executionState.isRunning = false;
+        toast.warning(
+          msg.reason === 'error'
+            ? 'Lost the live connection to this execution. Re-open it to reconnect.'
+            : 'The live execution stream ended. Re-open the execution to reconnect.',
+        );
         return;
       }
       if (msg.kind === 'sourceState') {

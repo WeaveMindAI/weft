@@ -1,6 +1,12 @@
+# syntax=docker/dockerfile:1.6
 # weft-listener: per-tenant event-source daemon. One image serves
 # every tenant; the dispatcher spawns a Deployment per tenant and
 # feeds config (tenant id, dispatcher URL, tokens) via env vars.
+#
+# The listener does NOT read the node catalog at runtime, so the
+# build context never stages `catalog/` and a catalog edit doesn't
+# invalidate this image. Cargo cache mounts keep the cargo build
+# incremental across edits.
 
 # Builder uses a plain base + rustup so the toolchain is read from
 # `rust-toolchain.toml` (the single source of truth for the whole
@@ -22,9 +28,14 @@ WORKDIR /build
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY catalog ./catalog
 
-RUN cargo build --release -p weft-listener --bin weft-listener
+# sharing=locked on the registry: the four system images build in
+# parallel and cargo's own registry lock file lives OUTSIDE the
+# mounted dir, so concurrent unsynchronized writes would corrupt it.
+RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=weft-cargo-target-listener,target=/build/target,sharing=locked \
+    cargo build --release -p weft-listener --bin weft-listener \
+    && cp /build/target/release/weft-listener /usr/local/bin/weft-listener
 
 # ---
 
@@ -34,7 +45,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/weft-listener /usr/local/bin/weft-listener
+COPY --from=builder /usr/local/bin/weft-listener /usr/local/bin/weft-listener
 
 EXPOSE 8080
 

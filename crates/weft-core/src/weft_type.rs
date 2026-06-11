@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 // Type variables: T, T1, T2... : node-scoped, same T on input and output = same type
 // MustOverride:   Node can't know the type, user/AI must declare it in Weft code
 //
-// Port types describe what the node sees post-operation:
-//   Expand input (<): declared type is T (element). Compiler validates List[T] arrives.
-//   Gather input (>): declared type is List[T] (collected). Compiler validates stack context.
-//   Stack depth is tracked by the compiler, NOT in the type system.
+// Port types describe what the node sees: types flow verbatim along
+// edges. A port wired to receive `List[T]` sees `List[T]`; element-by-
+// element iteration is explicit via `Loop(over: [...])`, never inferred
+// from a type difference across an edge.
 //
 // In backend.rs node definitions, types are string literals:
 //   PortDef::new("name", "String", true)
@@ -83,6 +83,12 @@ pub enum WeftType {
     /// Compatible with any Dict[String, V] in both directions.
     /// Use for raw API responses where the shape is unknown or too complex to declare.
     JsonDict,
+    /// A message-bus handle: an in-process channel between co-alive
+    /// nodes. A `Bus` output connects only to a `Bus` input; message
+    /// payloads are not type-checked by the language (the envelope is the
+    /// universal contract). Wired-only: the value is a live runtime
+    /// handle, never a config literal a user types.
+    Bus,
     /// Node-scoped type variable: T, T1, T2, etc.
     /// Same name on different ports of the same node = same type.
     /// Resolved per-node when connections are made.
@@ -188,7 +194,9 @@ impl WeftType {
             WeftType::List(inner) => inner.references_media(),
             WeftType::Dict(_, v) => v.references_media(),
             WeftType::Union(types) => types.iter().any(|t| t.references_media()),
-            WeftType::JsonDict | WeftType::TypeVar(_) | WeftType::MustOverride => false,
+            WeftType::JsonDict | WeftType::Bus | WeftType::TypeVar(_) | WeftType::MustOverride => {
+                false
+            }
         }
     }
 
@@ -205,6 +213,8 @@ impl WeftType {
             WeftType::Dict(_, v) => v.is_default_configurable(),
             WeftType::Union(types) => types.iter().all(|t| t.is_default_configurable()),
             WeftType::JsonDict => true,
+            // A bus is a live runtime handle: never configurable.
+            WeftType::Bus => false,
             WeftType::TypeVar(_) => false,
             WeftType::MustOverride => false,
         }
@@ -220,15 +230,50 @@ impl WeftType {
         }
     }
 
+    /// The canonical zero value for this type: what an unwired,
+    /// unseeded port of this type defaults to. Number -> 0, String ->
+    /// "", Boolean -> false, List -> [], Dict/JsonDict -> {}. Types with
+    /// no literal default (Null/Empty, Media, Bus, and unresolved
+    /// TypeVar/MustOverride) default to JSON null, the universal
+    /// "no value". For a union, the zero value of its first NON-null
+    /// variant (so an optional `Number?` = `Number | Null` zeroes to 0,
+    /// not null, regardless of how the optional marker orders the
+    /// variants); a union that is only nullish zeroes to null.
+    pub fn zero_value(&self) -> serde_json::Value {
+        use serde_json::Value;
+        match self {
+            WeftType::Primitive(p) => match p {
+                WeftPrimitive::Number => Value::from(0),
+                WeftPrimitive::String => Value::from(""),
+                WeftPrimitive::Boolean => Value::from(false),
+                WeftPrimitive::Null
+                | WeftPrimitive::Empty
+                | WeftPrimitive::Image
+                | WeftPrimitive::Video
+                | WeftPrimitive::Audio
+                | WeftPrimitive::Document => Value::Null,
+            },
+            WeftType::List(_) => Value::Array(Vec::new()),
+            WeftType::Dict(_, _) | WeftType::JsonDict => Value::Object(serde_json::Map::new()),
+            WeftType::Union(types) => types
+                .iter()
+                .find(|t| !t.contains_null())
+                .map_or(Value::Null, |t| t.zero_value()),
+            WeftType::Bus | WeftType::TypeVar(_) | WeftType::MustOverride => Value::Null,
+        }
+    }
+
 
     // ── Compatibility ───────────────────────────────────────────────────
 
-    /// Strict structural compatibility: can a value of type
-    /// `source` flow into a port of type `target` WITHOUT any
-    /// expand/gather inference? Depth-mismatched lists are
+    /// Structural compatibility: can a value of type `source` flow
+    /// into a port of type `target`? Depth-mismatched lists are
     /// rejected. Used by the runtime value checker (validates
-    /// inferred JSON types against declared port types) and by
-    /// merge_ports where narrowing must preserve list depth.
+    /// inferred JSON types against declared port types), by
+    /// merge_ports where narrowing must preserve list depth, and by
+    /// the compile-time edge validator (an edge from `List[T]` to `T`
+    /// is a real type mismatch; to iterate a list, wrap the consumer
+    /// in a `Loop(over: [...])`).
     pub fn is_compatible(source: &WeftType, target: &WeftType) -> bool {
         if source.is_unresolved() || target.is_unresolved() {
             return true;
@@ -252,6 +297,8 @@ impl WeftType {
             (WeftType::Dict(k, _), WeftType::JsonDict) => {
                 matches!(k.as_ref(), WeftType::Primitive(WeftPrimitive::String))
             }
+            // A bus connects only to a bus; payloads are not type-checked.
+            (WeftType::Bus, WeftType::Bus) => true,
             // Both unions: every source variant must match at least one target variant
             (WeftType::Union(sources), WeftType::Union(targets)) => {
                 sources.iter().all(|s| targets.iter().any(|t| Self::is_compatible(s, t)))
@@ -268,61 +315,6 @@ impl WeftType {
         }
     }
 
-    /// Edge-level compatibility: tolerates list-depth mismatch
-    /// because the lane mechanics pass interprets a deeper source
-    /// as an implicit expand and a deeper target as an implicit
-    /// gather. Every other rule mirrors `is_compatible`. Use this
-    /// from the compile-time edge validator, not from runtime
-    /// value checks.
-    pub fn is_edge_compatible(source: &WeftType, target: &WeftType) -> bool {
-        if source.is_unresolved() || target.is_unresolved() {
-            return true;
-        }
-        if matches!(source, WeftType::Primitive(WeftPrimitive::Empty)) {
-            return true;
-        }
-
-        // Depth-reconciliation: strip one List level off the
-        // deeper side and recurse. Only applied when the shallower
-        // side isn't itself a Union (a union is a shape choice, we
-        // want to check each variant). Lists on both sides fall
-        // through to the strict recursion below.
-        if let (WeftType::List(inner), other) = (source, target) {
-            if !matches!(other, WeftType::List(_) | WeftType::Union(_)) {
-                return Self::is_edge_compatible(inner, other);
-            }
-        }
-        if let (other, WeftType::List(inner)) = (source, target) {
-            if !matches!(other, WeftType::List(_) | WeftType::Union(_)) {
-                return Self::is_edge_compatible(other, inner);
-            }
-        }
-
-        match (source, target) {
-            (WeftType::Primitive(a), WeftType::Primitive(b)) => a == b,
-            (WeftType::List(a), WeftType::List(b)) => Self::is_edge_compatible(a, b),
-            (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => {
-                Self::is_edge_compatible(ak, bk) && Self::is_edge_compatible(av, bv)
-            }
-            (WeftType::JsonDict, WeftType::JsonDict) => true,
-            (WeftType::JsonDict, WeftType::Dict(k, _)) => {
-                matches!(k.as_ref(), WeftType::Primitive(WeftPrimitive::String))
-            }
-            (WeftType::Dict(k, _), WeftType::JsonDict) => {
-                matches!(k.as_ref(), WeftType::Primitive(WeftPrimitive::String))
-            }
-            (WeftType::Union(sources), WeftType::Union(targets)) => sources
-                .iter()
-                .all(|s| targets.iter().any(|t| Self::is_edge_compatible(s, t))),
-            (src, WeftType::Union(targets)) => {
-                targets.iter().any(|t| Self::is_edge_compatible(src, t))
-            }
-            (WeftType::Union(sources), tgt) => {
-                sources.iter().all(|s| Self::is_edge_compatible(s, tgt))
-            }
-            _ => false,
-        }
-    }
 
     // ── Type inference from values ────────────────────────────────────────
 
@@ -346,9 +338,15 @@ impl WeftType {
                 WeftType::List(Box::new(unified))
             }
             serde_json::Value::Object(obj) => {
-                // Detect media objects: {url, mimeType, ...}
+                // Sentinel-tagged runtime types: `{"__weft_<typename>__": <payload>}`.
+                // A single distinguishing key keeps the recognition unambiguous
+                // (no plain user dict can collide accidentally) and gives every
+                // runtime-only type the same shape.
                 if let Some(media_type) = Self::detect_media_type(obj) {
                     return media_type;
+                }
+                if Self::detect_bus_type(obj).is_some() {
+                    return WeftType::Bus;
                 }
                 if obj.is_empty() {
                     return WeftType::Dict(
@@ -366,16 +364,61 @@ impl WeftType {
         }
     }
 
-    /// Detect if an object is a media type (Image, Video, Audio, Document).
+    /// Detect a media value: `{"__weft_media__": {"url"|"data": ..., "mimeType": "..."}}`.
+    /// The sentinel key guarantees no ordinary user dict is misread as media.
     fn detect_media_type(obj: &serde_json::Map<String, serde_json::Value>) -> Option<WeftType> {
-        let has_url = obj.contains_key("url") || obj.contains_key("data");
+        let payload = obj.get("__weft_media__")?.as_object()?;
+        let has_url = payload.contains_key("url") || payload.contains_key("data");
         if !has_url { return None; }
-        let mime = obj.get("mimeType").or_else(|| obj.get("mimetype"))
+        let mime = payload.get("mimeType").or_else(|| payload.get("mimetype"))
             .and_then(|m| m.as_str())?;
         if mime.starts_with("image/") { Some(WeftType::Primitive(WeftPrimitive::Image)) }
         else if mime.starts_with("video/") { Some(WeftType::Primitive(WeftPrimitive::Video)) }
         else if mime.starts_with("audio/") { Some(WeftType::Primitive(WeftPrimitive::Audio)) }
         else { Some(WeftType::Primitive(WeftPrimitive::Document)) }
+    }
+
+    /// Detect a bus marker. The shape is structured to match `__weft_media__`:
+    /// `{"__weft_bus__": {"id": "<uuid-string>", "mode": "journaled" | "ephemeral"}}`.
+    /// Returns the inner payload object so callers can read both fields without
+    /// re-parsing. We don't validate the UUID format here; `ctx.bus(...)` errors
+    /// loudly on miss.
+    fn detect_bus_type(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        obj.get("__weft_bus__")?.as_object()
+    }
+
+    /// Public helper: extract the channel id from a Bus marker value. Returns
+    /// `None` if the value is not a Bus marker. Used by `ctx.bus(...)` to
+    /// resolve the handle from the registry.
+    pub fn bus_marker_id(value: &serde_json::Value) -> Option<&str> {
+        Self::detect_bus_type(value.as_object()?)?.get("id")?.as_str()
+    }
+
+    /// Public helper: extract the mode from a Bus marker. Returns
+    /// `Some(BusMode)` on success, `None` if the value is not a Bus
+    /// marker OR the mode field is missing OR the field carries an
+    /// unrecognised string. Callers MUST treat `None` as "this is not
+    /// a routable bus marker for THIS execution"; do NOT default to
+    /// `Journaled`, since silently misclassifying ephemeral as
+    /// journaled would route a frame-rate stream into permanent
+    /// journal storage.
+    pub fn bus_marker_mode(value: &serde_json::Value) -> Option<crate::bus::BusMode> {
+        let s = Self::detect_bus_type(value.as_object()?)?.get("mode")?.as_str()?;
+        crate::bus::BusMode::from_wire_str(s)
+    }
+
+    /// Build a Bus marker JSON value from a channel id and a mode.
+    /// Takes `BusMode` (not `&str`) so the wire-vocabulary invariant
+    /// is enforced at the type system; a typo can't slip through.
+    pub fn bus_marker(id: &str, mode: crate::bus::BusMode) -> serde_json::Value {
+        serde_json::json!({ "__weft_bus__": { "id": id, "mode": mode.as_wire_str() } })
+    }
+
+    /// Build a media marker JSON value. Callers pass the inner payload.
+    pub fn media_marker(payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "__weft_media__": payload })
     }
 
     /// Unify a list of types into a single type.
@@ -507,6 +550,10 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
         return Some(WeftType::JsonDict);
     }
 
+    if s == "Bus" {
+        return Some(WeftType::Bus);
+    }
+
     if s == "MustOverride" {
         return Some(WeftType::MustOverride);
     }
@@ -627,6 +674,7 @@ impl std::fmt::Display for WeftType {
                 write!(f, "{}", parts.join(" | "))
             }
             WeftType::JsonDict => write!(f, "JsonDict"),
+            WeftType::Bus => write!(f, "Bus"),
             WeftType::TypeVar(name) => write!(f, "{}", name),
             WeftType::MustOverride => write!(f, "MustOverride"),
         }

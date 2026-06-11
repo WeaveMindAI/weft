@@ -16,7 +16,7 @@ import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { textTabsForPath } from './tabs';
-import type { HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, WebviewMessage } from './shared/protocol';
+import type { ActionErrorDetails, CatalogEntry, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from './shared/protocol';
 import * as nodePath from 'node:path';
 import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
 
@@ -135,6 +135,33 @@ export class GraphViewController {
   /// X-button on the action-bar error banner. Extension clears
   /// the pinned project's slot.error.
   setDismissErrorHandler(fn: () => void): void { this.dismissErrorHandler = fn; }
+  /// Surface a non-CLI failure (parse, catalog, edit, ...) on the
+  /// action-bar error banner. Extension wires this to
+  /// ActionBarStore.setError for the watched project. Optional: when
+  /// the graph view has no resolved project id yet (early parse
+  /// failure on open), the handler can no-op.
+  setReportErrorHandler(
+    fn: (verb: ErrorVerb, message: string, details?: ActionErrorDetails) => void,
+  ): void {
+    this.reportErrorHandler = fn;
+  }
+  private reportErrorHandler?: (
+    verb: ErrorVerb,
+    message: string,
+    details?: ActionErrorDetails,
+  ) => void;
+
+  /// Resolve a previously-reported system-side error. Extension wires
+  /// this to ActionBarStore.clearErrorIfVerb so a successful parse /
+  /// catalog load clears the sticky banner its own prior failure raised
+  /// (the user never dismisses a parse error by hand: every half-typed
+  /// keystroke fails, so the source has to clear it on its next success).
+  setResolveErrorHandler(
+    fn: (verb: ErrorVerb) => void,
+  ): void {
+    this.resolveErrorHandler = fn;
+  }
+  private resolveErrorHandler?: (verb: ErrorVerb) => void;
   /// Architecture-4: graphView delegates every action-bar verb to
   /// extension.ts via this handler, which shells out to the CLI.
   /// The CLI handles build, hash-skip, registry push, dispatcher
@@ -448,9 +475,25 @@ export class GraphViewController {
       if (seq !== this.parseSeq) return; // superseded by a newer parse
       this.applyParseResult(response, source, layoutCode);
     } catch (err) {
+      // Same seq guard as the success path. A stale parse that errors
+      // after a fresher parse already succeeded must not overwrite the
+      // fresh state: the user would see "parse error" while the graph
+      // shows the correct fresh result.
+      if (seq !== this.parseSeq) return;
+      const message = err instanceof Error ? err.message : String(err);
       this.post({
         kind: 'parseError',
-        error: err instanceof Error ? err.message : String(err),
+        error: message,
+      });
+      // Also surface the parse failure on the action-bar so the user
+      // can open the details modal. The inline `parse error: ...`
+      // banner inside the graph stays for in-context feedback.
+      const file = this.watchedDoc?.uri.fsPath;
+      this.reportErrorHandler?.('parse', message, {
+        what: file ? `Parsing ${nodePath.basename(file)}` : 'Parsing the project',
+        stage: 'parse',
+        diagnostics: [{ severity: 'error', message }],
+        ...(err instanceof Error && err.stack ? { raw: err.stack } : {}),
       });
     }
   }
@@ -460,6 +503,12 @@ export class GraphViewController {
    *  seq guard), and an `edit` feeds the parse the edit-server already returned
    *  (so a GUI edit re-renders from that ONE round-trip, no second parse). */
   private applyParseResult(response: ParseResponse, source: string, layoutCode: string): void {
+    // The parse succeeded: clear any sticky parse-error banner a prior
+    // (half-typed) keystroke raised. The user fixes their code and the
+    // graph renders, so the banner the failure put up must come down on
+    // its own (an error raised by a system-side source is cleared by
+    // that source's next success, not by a manual dismiss).
+    this.resolveErrorHandler?.('parse');
     // Latch the parsed project id as the authoritative watch id when we don't
     // already have one (weft.toml lookup failed on open but the parse returns a
     // real uuid, e.g. a project the CLI knows from its own weft.toml).
@@ -1121,7 +1170,7 @@ export class GraphViewController {
   /// and clobber it.
   private async applyEditTransaction(
     requestId: number,
-    req: { kind: 'edit'; ops: import('./shared/protocol').EditOp[] } | { kind: 'applyEdit'; textEdit: import('./shared/protocol').TextEdit },
+    req: { kind: 'edit'; ops: EditOp[] } | { kind: 'applyEdit'; textEdit: TextEdit },
   ): Promise<void> {
     const doc = this.watchedDoc;
     if (!doc) {
@@ -1132,7 +1181,7 @@ export class GraphViewController {
     try {
       const result = await this.serializeOnPath(key, async () => {
         const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === key) ?? doc;
-        const r = await this.parseServer.request<{ source: string; parse: ParseResponse; inverse: import('./shared/protocol').TextEdit }>({
+        const r = await this.parseServer.request<{ source: string; parse: ParseResponse; inverse: TextEdit }>({
           ...req,
           source: openDoc.getText(),
           file: key,
@@ -1308,22 +1357,31 @@ export class GraphViewController {
       }>(['describe-nodes'], projectDirOf(this.watchedDoc));
       this.post({
         kind: 'catalogAll',
-        catalog: response.catalog as Record<string, import('./shared/protocol').CatalogEntry>,
+        catalog: response.catalog as Record<string, CatalogEntry>,
       });
-      // Catalog loaded. Clear any prior catalog error, and surface
-      // per-node soft warnings (a node mid-rename with bad metadata)
-      // so they aren't computed-then-dropped. Its own channel, not
-      // parseError: a successful parse must not erase it.
+      // Catalog loaded. Clear any prior catalog error (both the webview
+      // channel AND the action-bar banner its failure raised), and
+      // surface per-node soft warnings (a node mid-rename with bad
+      // metadata) so they aren't computed-then-dropped. Its own channel,
+      // not parseError: a successful parse must not erase it.
       this.post({ kind: 'catalogError', warnings: response.warnings ?? [] });
+      this.resolveErrorHandler?.('catalog');
     } catch (err) {
       // The full node catalog failed to load (weft not on PATH, a
       // project error, bad JSON). Surface it on the catalog channel,
       // independent of the parse banner: the source may parse fine
       // while the catalog is unavailable, and a later successful parse
       // must not silently clear this.
+      const message = err instanceof Error ? err.message : String(err);
       this.post({
         kind: 'catalogError',
-        error: `node catalog unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        error: `node catalog unavailable: ${message}`,
+      });
+      this.reportErrorHandler?.('catalog', `node catalog unavailable: ${message}`, {
+        what: 'Loading the node catalog',
+        stage: 'catalog',
+        diagnostics: [{ severity: 'error', message }],
+        ...(err instanceof Error && err.stack ? { raw: err.stack } : {}),
       });
     }
   }

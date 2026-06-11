@@ -18,7 +18,6 @@ import type {
   NodeInstance,
   Edge as V1Edge,
   PortDefinition as V1Port,
-  LaneMode,
 } from './lib/types';
 
 function toV1Port(p: HostPort): V1Port {
@@ -27,9 +26,8 @@ function toV1Port(p: HostPort): V1Port {
     portType: p.portType,
     required: p.required,
     description: p.description ?? undefined,
-    laneMode: (p.laneMode ?? undefined) as LaneMode | undefined,
-    laneDepth: p.laneDepth ?? undefined,
     configurable: p.configurable,
+    synthesizedFromCarry: p.synthesizedFromCarry,
   };
 }
 
@@ -99,11 +97,25 @@ function localName(id: string, parentId: string | undefined): string {
 }
 
 function groupToNodeInstance(g: HostGroup): NodeInstance {
+  // `kind` is required on the wire; if it lands as anything other
+  // than the two known values, the host/webview view of the project
+  // has drifted (version skew, corruption). Silently treating an
+  // unknown kind as Group would render a Loop as a regular group and
+  // hide the divergence; surface it instead.
+  if (g.kind !== 'group' && g.kind !== 'loop') {
+    throw new Error(`host-bridge: unknown container kind '${String(g.kind)}' for id '${g.id}'`);
+  }
+  const isLoop = g.kind === 'loop';
   return {
     id: g.id,
-    nodeType: 'Group',
+    // Distinct nodeType per container so the renderer can pick a
+    // loop-flavored xyflow type vs a group-flavored one. The lowering
+    // (LoopIn/LoopOut boundary nodes) is unaffected by this.
+    nodeType: isLoop ? 'Loop' : 'Group',
     label: localName(g.id, g.parentGroupId ?? undefined),
-    config: {},
+    config: isLoop && g.loopConfig
+      ? (g.loopConfig as Record<string, unknown>)
+      : {},
     position: { x: 0, y: 0 },
     parentId: g.parentGroupId ?? undefined,
     inputs: g.inPorts.map(toV1Port),
@@ -142,7 +154,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     parentId: resolveParentGroup(n, groupIds),
     inputs: n.inputs.map(toV1Port),
     outputs: n.outputs.map(toV1Port),
-    features: n.features as unknown as NodeInstance['features'],
+    features: n.features,
     scope: n.scope,
     groupBoundary: n.groupBoundary ?? undefined,
     includePath: n.includePath,

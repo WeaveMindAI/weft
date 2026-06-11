@@ -289,9 +289,9 @@ export const ALL_NODE_TYPES: string[] = new Proxy([] as string[], {
 
 export type NodeType = string;
 
-/** Group is the only editor-only node type (not in the Rust
- *  catalog). Registered inline so the command palette can list it
- *  and addNode('Group') resolves its NODE_TYPE_CONFIG lookup. */
+/** Group and Loop are editor-only node types (not in the Rust
+ *  catalog). Registered inline so the command palette can list them
+ *  and addNode('Group' | 'Loop') resolves the NODE_TYPE_CONFIG lookup. */
 function registerBuiltins(): void {
 	if (!registry.Group) {
 		registry.Group = {
@@ -304,6 +304,42 @@ function registerBuiltins(): void {
 			tags: ['group', 'container', 'scope'],
 			requiresInfra: false,
 			fields: [],
+			defaultInputs: [],
+			defaultOutputs: [],
+			features: {},
+		};
+	}
+	if (!registry.Loop) {
+		registry.Loop = {
+			type: 'Loop',
+			label: 'Loop',
+			description: 'Iterate over lists, fold via carry ports, or drive by self.done. Body sees one element per iteration. Pick port roles via right-click on each port.',
+			icon: resolveIcon('RotateCw'),
+			color: '#8b5cf6',
+			category: 'Flow' as NodeCategory,
+			tags: ['loop', 'iterate', 'container', 'scope'],
+			requiresInfra: false,
+			fields: [
+				{
+					key: 'parallel',
+					label: 'Parallel',
+					type: 'checkbox',
+					description: 'Run all iterations concurrently (incompatible with carry / self.done).',
+				},
+				{
+					key: 'max_iters',
+					label: 'Max iterations',
+					type: 'number',
+					min: 0,
+					description: 'Hard cap on iteration count. Leave blank for no cap.',
+				},
+				{
+					key: 'trim_on_mismatch',
+					label: 'Trim on length mismatch',
+					type: 'checkbox',
+					description: 'Zip iter inputs to the shortest length. Off = crash loud on mismatch.',
+				},
+			],
 			defaultInputs: [],
 			defaultOutputs: [],
 			features: {},

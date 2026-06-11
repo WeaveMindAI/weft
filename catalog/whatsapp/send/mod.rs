@@ -22,33 +22,12 @@ impl Node for WhatsAppSendNode {
         serde_json::from_str(METADATA_JSON).expect("WhatsAppSend metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let endpoint_url = ctx
             .input
-            .values
-            .get("endpointUrl")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                WeftError::Input(
-                    "endpointUrl is required (connect a WhatsAppBridge output)".into(),
-                )
-            })?
-            .to_string();
-        let to = ctx
-            .input
-            .values
-            .get("to")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| WeftError::Input("'to' is required".into()))?;
-        let message = ctx
-            .input
-            .values
-            .get("message")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| WeftError::Input("'message' is required".into()))?;
+            .required_str("endpointUrl", "endpointUrl (connect a WhatsAppBridge output)")?;
+        let to = ctx.input.required_str("to", "'to' recipient")?;
+        let message = ctx.input.required_str("message", "'message' body")?;
 
         let body = serde_json::json!({
             "action": "sendMessage",
@@ -95,8 +74,13 @@ impl Node for WhatsAppSendNode {
                     "bridge send response missing result.messageId: {parsed}"
                 ))
             })?;
-        Ok(NodeOutput::empty()
-            .set("messageId", serde_json::Value::String(message_id.to_string()))
-            .set("success", serde_json::Value::Bool(true)))
+        // Only emit `messageId`. The previous `success: true` port was
+        // an always-true constant (every failure path errors above), so
+        // its mere presence on the wire was the meaningful signal. The
+        // `messageId` emission already conveys "send succeeded"; if a
+        // user wires a downstream `success` consumer they wire it
+        // against `messageId` instead.
+        ctx.pulse_downstream(NodeOutput::empty()
+            .set("messageId", serde_json::Value::String(message_id.to_string()))).await
     }
 }

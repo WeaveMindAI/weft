@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { Handle, Position, useEdges, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "$lib/nodes";
-	import type { PortDefinition, PortType, NodeDataUpdates, LaneMode } from "$lib/types";
+	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "$lib/types";
 	import { parseWeftType } from "$lib/types";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "$lib/constants/colors";
 	import type { Edge } from "@xyflow/svelte";
@@ -10,6 +10,7 @@
 	import CopyButton from "$lib/components/ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromFields, deriveOutputsFromFields, type FormFieldDef, type FormFieldSpec } from '$lib/utils/form-field-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "$lib/utils/status";
+	import type { FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../shared/protocol";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink } from '@lucide/svelte';
 	import { createFieldEditor } from '$lib/utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
@@ -17,7 +18,8 @@
 	import { createPortContextMenu, buildPortMenuItems } from "$lib/utils/port-context-menu";
 	import { portMarkerStyle } from "$lib/utils/port-marker";
 	import ExecutionInspector from './ExecutionInspector.svelte';
-	
+	import FieldStrip from './FieldStrip.svelte';
+
 	const edgesState = useEdges();
 
 	let { data, id, selected }: {
@@ -27,12 +29,12 @@
 			config: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
-			features?: import('$lib/types').NodeFeatures;
+			features?: NodeFeatures;
 			// Resolved state of @file targets, keyed by the marker's relative
 			// path (content or read error). A config field whose value is a
 			// `@file(...)` tag displays fileContents[path]; config itself never
 			// holds resolved content.
-			fileContents?: Record<string, import('../../../../shared/protocol').FileContent>;
+			fileContents?: Record<string, FileContent>;
 			includePath?: string;
 			onUpdate?: (updates: NodeDataUpdates) => void;
 			onSaveFileRef?: (path: string, content: string) => void;
@@ -41,15 +43,31 @@
 			infraFailureStage?: string;
 			infraFailureMessage?: string;
 			debugData?: unknown;
-			executions?: import('$lib/types').NodeExecution[];
+			executions?: NodeExecution[];
 			executionCount?: number;
+			/// One IRC-style scrollable log per bus this node took part
+			/// in (live + replay, identical shape). Empty `[]` for
+			/// nodes that never touched a bus. Populated by ProjectEditorInner
+			/// from `executionState.busLogByBus` filtered by participant set.
+			busLogs?: Array<{
+				busId: string;
+				events: BusInspectorEvent[];
+				meta?: BusMeta;
+			}>;
+			/// Execution-wide journal corruptions. Empty in the normal
+			/// case. The inspector renders a muted collapsed
+			/// disclosure at the bottom when non-empty; not alarming.
+			journalCorruptions?: Array<{
+				site: CorruptionSite;
+				reason: string;
+			}>;
 			/// Body-panel feed for this node, set ONLY for infra
 			/// (infra /live) and trigger (listener /display) nodes.
 			/// Other nodes get undefined and render no body panel
 			/// here. Distinct from `debugData` which is the JSON
 			/// preview chip Debug-style nodes show under the body
 			/// from the last execution's output.
-			bodyFeed?: import('../../../../shared/protocol').NodeFeedState;
+			bodyFeed?: NodeFeedState;
 		};
 		id: string;
 		selected?: boolean;
@@ -88,7 +106,16 @@
 
 	const executions = $derived(data.executions ?? []);
 	const latestExecution = $derived(executions[executions.length - 1]);
-	const displayedStatus = $derived(latestExecution?.status ?? '');
+	// `undefined` means idle (no execution yet), NOT a status value.
+	// The status helpers are exhaustive over the real statuses only;
+	// the idle case is handled explicitly at each use site (no glyph,
+	// the node's own type color) instead of a `''` sentinel that fell
+	// through every switch and silently returned undefined.
+	const displayedStatus = $derived<NodeExecutionStatus | undefined>(latestExecution?.status);
+	// Per-bus IRC log this node took part in. Empty `[]` for nodes
+	// that never touched a bus.
+	const busLogs = $derived(data.busLogs ?? []);
+	const journalCorruptions = $derived(data.journalCorruptions ?? []);
 
 	const nodeFormFieldSpecs: FormFieldSpec[] = $derived(typeConfig.formFieldSpecs ?? []);
 	const nodeFormSpecMap: Record<string, FormFieldSpec> = $derived(buildSpecMap(nodeFormFieldSpecs));
@@ -124,9 +151,9 @@
 	 *  edge. Synthesized fields appear when the user/AI wrote `port: value`
 	 *  in the weft source (or `node.port = value` on a connection line).
 	 *  Removed when the source removes the value or adds an edge. */
-	const displayedFields: import('$lib/types').FieldDefinition[] = $derived.by(() => {
+	const displayedFields: FieldDefinition[] = $derived.by(() => {
 		const catalogFields = typeConfig.fields ?? [];
-		const result: import('$lib/types').FieldDefinition[] = [...catalogFields];
+		const result: FieldDefinition[] = [...catalogFields];
 		const catalogFieldKeys = new Set(catalogFields.map(f => f.key));
 		const cfg = (data.config as Record<string, unknown>) || {};
 		const inputList = (data.inputs || typeConfig.defaultInputs || []);
@@ -178,8 +205,6 @@
 	const hasExpandableContent = $derived.by(() => {
 		// Has config fields (catalog-declared or synthesized from config-filled ports)
 		if (displayedFields.length > 0) return true;
-		// Has Run Location selector
-		if (typeConfig.features?.showRunLocationSelector) return true;
 		// Has debug preview (Debug node)
 		if (typeConfig.features?.showDebugPreview) return true;
 		// Has setup guide
@@ -305,25 +330,6 @@
 		}
 	}
 	
-	// Action to observe textarea resize
-	function observeTextareaResize(node: HTMLTextAreaElement, fieldKey: string) {
-		let lastHeight = node.clientHeight;
-		const observer = new ResizeObserver(() => {
-			const newHeight = node.clientHeight;
-			if (newHeight !== lastHeight && newHeight >= 60) {
-				lastHeight = newHeight;
-				handleTextareaResize(fieldKey, newHeight);
-			}
-		});
-		observer.observe(node);
-		return {
-			destroy() {
-				observer.disconnect();
-			}
-		};
-	};
-	
-	
 	function getPortColor(portType: PortType): string {
 		return getPortTypeColor(portType);
 	}
@@ -406,7 +412,43 @@
 		return fs ? fs.content === undefined : false;
 	}
 
-	function updateConfig(key: string, value: string | string[] | number | FormFieldDef[] | null) {
+	/// Field keys this node renders itself rather than delegating to the
+	/// shared FieldStrip primitive renderer: only the exotic types (code,
+	/// api_key, form_builder). File-backed primitives render through
+	/// FieldStrip via its displayValueOf / readonlyKeys / headerBadge
+	/// capabilities.
+	const EXOTIC_FIELD_TYPES = new Set(['code', 'api_key', 'form_builder']);
+	const customFieldKeys = $derived.by(() => {
+		const keys = new Set<string>();
+		for (const field of displayedFields) {
+			if (EXOTIC_FIELD_TYPES.has(field.type)) keys.add(field.key);
+		}
+		return keys;
+	});
+
+	/// FieldStrip display override: for a file-backed field, the store
+	/// value is the resolved file content (or a read status), never the
+	/// `@file` marker that config holds. `undefined` for normal fields.
+	function fileDisplayOverride(key: string): string | undefined {
+		const fs = fileFieldState(key);
+		if (!fs) return undefined;
+		if (fs.content !== undefined) return fs.content;
+		if (fs.error !== undefined) return `cannot read ${fs.path}: ${fs.error}`;
+		return `loading ${fs.path}...`;
+	}
+
+	/// File-backed fields whose content isn't loaded (loading / read
+	/// error) are read-only in FieldStrip so the status text can't be
+	/// saved as content.
+	const readonlyFieldKeys = $derived.by(() => {
+		const keys = new Set<string>();
+		for (const field of displayedFields) {
+			if (fileFieldUnready(field.key)) keys.add(field.key);
+		}
+		return keys;
+	});
+
+	function updateConfig(key: string, value: string | string[] | number | boolean | FormFieldDef[] | null) {
 		// File-backed field: the edit goes to the referenced file, never to the
 		// weft source. The `@file(...)` marker in config (and source) is left
 		// untouched; only the file's content changes.
@@ -463,11 +505,6 @@
 		const storeStr = (v === undefined || v === null) ? '' : (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
 		return fieldEditor.display(fieldKey, storeStr);
 	}
-
-	function configSaveFn(fieldKey: string): (value: string) => void {
-		return (value: string) => updateConfig(fieldKey, value);
-	}
-
 
 	let addingFormField = $state(false);
 	let newFormField = $state<FormFieldDef>({ fieldType: 'display', key: '', config: {} });
@@ -539,13 +576,6 @@
 	function removeOption(i: number) {
 		const options = ((newFormField.config?.options as string[]) ?? []).filter((_, idx) => idx !== i);
 		newFormField = { ...newFormField, config: { ...newFormField.config, options } };
-	}
-
-	function updateConfigBool(key: string, value: boolean) {
-		if (data.onUpdate) {
-			const newConfig = { ...data.config, [key]: value };
-			data.onUpdate({ config: newConfig });
-		}
 	}
 
 	function addInputPort() {
@@ -679,7 +709,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	bind:this={nodeElement}
-	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' || displayedStatus === 'suspended' ? 'node-suspended-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''}"
+	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''}"
 	style="
 		width: 100%;
 		height: 100%;
@@ -703,7 +733,9 @@
 		class="px-3 py-2 flex items-center justify-between border-b border-black/5"
 	>
 		<div class="flex items-center gap-1.5">
-			<span class="text-base leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
+			{#if displayedStatus}
+				<span class="text-base leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
+			{/if}
 			{#if isInclude}
 				<FileSymlink size={12} class="text-violet-500" />
 				<span class="text-[11px] font-semibold tracking-wide uppercase text-violet-600">{includeName}</span>
@@ -735,7 +767,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} label={data.label || typeConfig.label} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} label={data.label || typeConfig.label} />
 		{#if isInclude}
 			<button
 				class="px-1.5 h-5 flex items-center gap-1 rounded hover:bg-violet-100 cursor-pointer transition-colors text-violet-600 text-[10px] font-medium nodrag nopan"
@@ -911,7 +943,7 @@
 		     kind: extend LiveDataItem.type and add a branch here. The
 		     action button (if any) is shared via the {@render actionBtn}
 		     snippet so it doesn't drift across kinds. -->
-		{#snippet actionBtn(item: import('$lib/types').LiveDataItem)}
+		{#snippet actionBtn(item: LiveDataItem)}
 			{#if item.action}
 				<button
 					type="button"
@@ -1027,35 +1059,43 @@
 					{/if}
 				{/if}
 
-				<!-- Run Location Override - any node can use this by setting features.showRunLocationSelector = true -->
-				{#if typeConfig.features?.showRunLocationSelector}
-					<div class="space-y-1">
-						<label for={`${id}-run-location`} class="text-[10px] text-muted-foreground font-medium block">Run Location</label>
-						<select
-							id={`${id}-run-location`}
-							class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none"
-							value={(data.config as Record<string, string>)?.runLocation || 'default'}
-							onchange={(e) => updateConfig('runLocation', e.currentTarget.value)}
-							onclick={(e) => e.stopPropagation()}
-						>
-							<option value="default">Use Default</option>
-							<option value="cloud">Cloud</option>
-							<option value="local">Local</option>
-						</select>
-					</div>
-				{/if}
-				
-				{#each displayedFields as field}
+				<!-- Primitive fields (text / textarea / select / multiselect /
+				     checkbox / number / password) render through the shared
+				     FieldStrip, including file-backed ones (displayValueOf
+				     supplies the resolved content, readonlyKeys locks unready
+				     fields, headerBadge shows the path chip). The exotic kinds
+				     (code / api_key / form_builder) are claimed via
+				     customFieldKeys and drawn inline by the renderCustom
+				     snippet below, in the same authored order. -->
+				<FieldStrip
+					fields={displayedFields}
+					config={(data.config as Record<string, unknown>) ?? {}}
+					idPrefix={id}
+					onUpdate={(key, value) => updateConfig(key, value as string | string[] | number | boolean | FormFieldDef[] | null)}
+					{customFieldKeys}
+					heights={textareaHeights}
+					onHeightChange={handleTextareaResize}
+					displayValueOf={fileDisplayOverride}
+					readonlyKeys={readonlyFieldKeys}
+					{headerBadge}
+					{renderCustom}
+				/>
+
+				{#snippet headerBadge(field: FieldDefinition)}
+					{#if fileRefOf(field.key)}
+						{@const ref = fileRefOf(field.key)}
+						<span
+							class="text-[9px] text-muted-foreground font-mono px-1 py-0.5 rounded bg-muted"
+							title={`Loaded from ${ref?.path} (edits save to this file)`}
+						>📄 {ref?.path}</span>
+					{/if}
+				{/snippet}
+
+				{#snippet renderCustom(field: FieldDefinition)}
 					<div class="space-y-1">
 						<div class="flex items-center justify-between">
 							<label for={`${id}-field-${field.key}`} class="text-[10px] text-muted-foreground font-medium">{field.label}</label>
-							{#if fileRefOf(field.key)}
-								{@const ref = fileRefOf(field.key)}
-								<span
-									class="text-[9px] text-muted-foreground font-mono px-1 py-0.5 rounded bg-muted"
-									title={`Loaded from ${ref?.path} (edits save to this file)`}
-								>📄 {ref?.path}</span>
-							{/if}
+							{@render headerBadge(field)}
 						</div>
 						{#if field.type === "code"}
 							<!-- Code editor field - any node can use this by setting field.type = 'code' -->
@@ -1078,68 +1118,6 @@
 									}}
 								/>
 							</div>
-						{:else if field.type === "textarea"}
-							{@const fileUnready = fileFieldUnready(field.key)}
-							<textarea
-								id={`${id}-field-${field.key}`}
-								data-field-key={field.key}
-								class="text-xs px-2 py-1.5 rounded border-none outline-none font-mono nodrag nopan box-border block w-full {fileUnready ? 'bg-rose-50 text-rose-700' : 'bg-muted'}"
-								readonly={fileUnready}
-							onfocusin={(e) => e.currentTarget.classList.add('nowheel')}
-							onfocusout={(e) => e.currentTarget.classList.remove('nowheel')}
-								style="resize: vertical; min-height: 60px; {textareaHeights[field.key] ? `height: ${textareaHeights[field.key]}px;` : ''}"
-								placeholder={field.placeholder}
-								value={getConfigDisplayValue(field.key)}
-								onfocus={() => fieldEditor.focus(field.key, getConfigDisplayValue(field.key))}
-								oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, configSaveFn(field.key))}
-								onblur={() => fieldEditor.blur(field.key, configSaveFn(field.key))}
-								onclick={(e) => e.stopPropagation()}
-								use:observeTextareaResize={field.key}
-							></textarea>
-						{:else if field.type === "select" && field.options}
-							<select
-								id={`${id}-field-${field.key}`}
-								class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none"
-								value={(data.config as Record<string, string>)?.[field.key] || field.options[0]}
-								onchange={(e) => updateConfig(field.key, e.currentTarget.value)}
-								onclick={(e) => e.stopPropagation()}
-							>
-								{#each field.options as option}
-									<option value={option}>{option}</option>
-								{/each}
-							</select>
-						{:else if field.type === "multiselect" && field.options}
-							<div class="multiselect-container flex flex-wrap gap-1 p-1.5 bg-muted rounded">
-								{#each field.options as option}
-									{@const selectedValues = ((data.config as Record<string, string[]>)?.[field.key] || []) as string[]}
-									{@const isSelected = selectedValues.includes(option)}
-									<button
-										type="button"
-										class="text-[10px] px-1.5 py-0.5 rounded transition-colors whitespace-nowrap {isSelected ? 'bg-primary text-primary-foreground' : 'bg-background text-muted-foreground hover:bg-accent'}"
-										onclick={(e) => {
-											e.stopPropagation();
-											const current = ((data.config as Record<string, string[]>)?.[field.key] || []) as string[];
-											const newValues = isSelected
-												? current.filter((v: string) => v !== option)
-												: [...current, option];
-											updateConfig(field.key, newValues);
-										}}
-									>
-										{option}
-									</button>
-								{/each}
-							</div>
-						{:else if field.type === "checkbox"}
-							<label class="flex items-center gap-2 cursor-pointer">
-								<input
-									type="checkbox"
-									class="w-4 h-4 rounded border-muted-foreground/30"
-									checked={(data.config as Record<string, unknown>)?.[field.key] === true}
-									onchange={(e) => updateConfigBool(field.key, e.currentTarget.checked)}
-									onclick={(e) => e.stopPropagation()}
-								/>
-								<span class="text-xs text-muted-foreground">{field.description || field.label}</span>
-							</label>
 						{:else if field.type === "api_key"}
 							{@const currentValue = (data.config as Record<string, string>)?.[field.key] || ""}
 							{@const isByok = currentValue !== "" && currentValue !== "__PLATFORM__"}
@@ -1171,18 +1149,6 @@
 									/>
 								{/if}
 							</div>
-						{:else if field.type === "password"}
-							<input
-								id={`${id}-field-${field.key}`}
-								type="password"
-								class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none font-mono"
-								placeholder={field.placeholder}
-								value={getConfigDisplayValue(field.key)}
-								onfocus={() => fieldEditor.focus(field.key, getConfigDisplayValue(field.key))}
-								oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, configSaveFn(field.key))}
-								onblur={() => fieldEditor.blur(field.key, configSaveFn(field.key))}
-								onclick={(e) => e.stopPropagation()}
-							/>
 						{:else if field.type === "form_builder"}
 							<div class="nodrag nopan space-y-1.5" onclick={(e) => e.stopPropagation()}>
 								{#each getFormFields() as f, i}
@@ -1255,20 +1221,16 @@
 								{/if}
 							</div>
 						{:else}
-							<input
-								id={`${id}-field-${field.key}`}
-								type="text"
-								class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none"
-								placeholder={field.placeholder}
-								value={getConfigDisplayValue(field.key)}
-								onfocus={() => fieldEditor.focus(field.key, getConfigDisplayValue(field.key))}
-								oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, configSaveFn(field.key))}
-								onblur={() => fieldEditor.blur(field.key, configSaveFn(field.key))}
-								onclick={(e) => e.stopPropagation()}
-							/>
+							<!-- Every customFieldKeys entry must have a branch above.
+							     Reaching this means the claim set and the renderer
+							     drifted; surface loud rather than silently rendering
+							     a text input. -->
+							<div class="text-[10px] px-1.5 py-1 rounded bg-destructive/10 text-destructive">
+								ProjectNode: custom field type "{field.type}" has no renderer (key "{field.key}").
+							</div>
 						{/if}
 					</div>
-				{/each}
+				{/snippet}
 
 			<!-- Debug Data Preview (expanded) - any node can use this by setting features.showDebugPreview = true -->
 			{#if typeConfig.features?.showDebugPreview}
@@ -1292,10 +1254,10 @@
 						<span>■</span>
 						<span>{latestExecution?.error || 'Cancelled by user'}</span>
 					</div>
-				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input' || displayedStatus === 'suspended'}
+				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
 					<div class="debug-placeholder running">
 						<span class="debug-spinner"></span>
-						<span>{displayedStatus === 'suspended' || displayedStatus === 'waiting_for_input' ? 'Suspended' : 'Processing...'}</span>
+						<span>{displayedStatus === 'waiting_for_input' ? 'Suspended' : 'Processing...'}</span>
 					</div>
 				{:else}
 					<div class="debug-placeholder waiting">
@@ -1347,7 +1309,7 @@
 	:global(.node-running-glow) {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(245, 158, 11, 0.4) !important;
 	}
-	:global(.node-suspended-glow) {
+	:global(.node-waiting-glow) {
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(6, 182, 212, 0.45) !important;
 	}
 	:global(.node-completed-glow) {
@@ -1357,13 +1319,6 @@
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(239, 68, 68, 0.4) !important;
 	}
 	
-	/* Multiselect should not expand the node - use a reasonable default width */
-	.multiselect-container {
-		width: 100%;
-		max-width: 100%;
-		box-sizing: border-box;
-	}
-
 	/* Debug node data display - single resizable box */
 	.debug-data-container {
 		margin: 0;

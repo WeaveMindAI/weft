@@ -32,6 +32,43 @@ fn errors(diagnostics: &[Diagnostic]) -> Vec<&Diagnostic> {
 }
 
 #[test]
+fn loop_in_missing_parallel_is_a_loud_invariant_error() {
+    // Flatten always materializes `parallel` into the LoopIn config, so
+    // a clean program never hits this. Simulate the invariant breaking
+    // (a LoopIn that reached validate without `parallel`) by stripping
+    // the field, and confirm validate fails LOUD instead of silently
+    // defaulting to sequential and skipping every parallel rule.
+    let mut project = parse_enrich(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+"#,
+    );
+    let loop_in = project
+        .nodes
+        .iter_mut()
+        .find(|n| n.node_type == "LoopIn")
+        .expect("LoopIn present");
+    loop_in
+        .config
+        .as_object_mut()
+        .expect("LoopIn config is an object")
+        .remove("parallel")
+        .expect("parallel was materialized by flatten");
+
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"loop-config-missing-parallel"),
+        "expected loud missing-parallel invariant error, got: {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
 fn clean_program_has_no_diagnostics() {
     let project = parse_enrich(
         r#"
@@ -171,10 +208,8 @@ t = Text
         port_type: WeftType::primitive(WeftPrimitive::String),
         required: false,
         description: None,
-        lane_mode: Default::default(),
-        lane_depth: 1,
         configurable: true,
-        user_typed: false,
+        synthesized_from_carry: false,
     });
     t.config = serde_json::json!({ "value": 42 });
     let d = validate(&project, &catalog());
@@ -196,10 +231,8 @@ t = Text { value: "ok" }
         ),
         required: true,
         description: None,
-        lane_mode: Default::default(),
-        lane_depth: 1,
         configurable: false,
-        user_typed: false,
+        synthesized_from_carry: false,
     });
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"required-port-unmet"), "{d:?}");
@@ -288,4 +321,434 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
         !d3.iter().any(|x| x.message.contains("path starts with '/'")),
         "config_matches must NOT fire when the field is absent: {d3:?}"
     );
+}
+
+// ─── Loop validate tests ────────────────────────────────────────────────────
+
+fn parse_enrich_lenient(source: &str) -> (weft_core::ProjectDefinition, Vec<weft_compiler::weft_compiler::CompileError>) {
+    use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
+    let (mut project, errs) = compile_lenient(source, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    // Use lenient enrich so an unknown type doesn't bail before validate runs.
+    let _ = weft_compiler::enrich::enrich_with_policy(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Lenient);
+    (project, errs)
+}
+
+#[test]
+fn loop_without_parallel_defaults_to_sequential() {
+    // No `parallel` field: defaults to false (sequential), with the
+    // default MATERIALIZED into the flattened LoopIn config by the
+    // compiler (the runtime never carries its own default). No
+    // diagnostic, and the sequential-mode rules apply.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text { value: "x" }
+self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let cs = codes(&d);
+    assert!(!cs.contains(&"loop-parallel-not-boolean"), "no parallel diagnostic: {cs:?}");
+    assert!(!cs.contains(&"parallel-without-over"), "no parallel-without-over: {cs:?}");
+    let loop_in = project
+        .nodes
+        .iter()
+        .find(|n| n.node_type == "LoopIn")
+        .expect("LoopIn boundary exists");
+    assert_eq!(
+        loop_in.config.get("parallel"),
+        Some(&serde_json::Value::Bool(false)),
+        "flatten materializes the sequential default"
+    );
+}
+
+#[test]
+fn loop_parallel_non_boolean_is_rejected() {
+    // `parallel: "yes"` must NOT coerce to sequential: it would run
+    // the wrong drive mode AND skip the parallel-interplay rules.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: "yes"
+    over: ["items"]
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let cs = codes(&d);
+    assert!(cs.contains(&"loop-parallel-not-boolean"), "{cs:?}");
+}
+
+#[test]
+fn loop_unknown_config_key_is_rejected() {
+    // A typo'd knob (`max_itres`) silently running the loop uncapped
+    // is the masked-bug class the language forbids.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["items"]
+    max_itres: 10
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let cs = codes(&d);
+    assert!(cs.contains(&"loop-unknown-config-field"), "{cs:?}");
+}
+
+#[test]
+fn loop_max_iters_and_trim_types_are_enforced() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["items"]
+    max_iters: "ten"
+    trim_on_mismatch: "nope"
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let cs = codes(&d);
+    assert!(cs.contains(&"loop-max-iters-not-integer"), "{cs:?}");
+    assert!(cs.contains(&"loop-trim-not-boolean"), "{cs:?}");
+}
+
+#[test]
+fn parallel_with_carry_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null], acc: String) {
+    parallel: true
+    over: ["items"]
+    carry: ["acc"]
+    p = Text { value: "x" }
+    self.results = p.value
+    self.acc = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"parallel-with-carry"), "expected parallel-with-carry, got {:?}", codes(&d));
+}
+
+#[test]
+fn parallel_without_over_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop() -> () {
+    parallel: true
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"parallel-without-over"), "expected parallel-without-over, got {:?}", codes(&d));
+}
+
+#[test]
+fn parallel_with_done_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["items"]
+    p = Text { value: "x" }
+    self.results = p.value
+    self.done = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"parallel-with-done"), "expected parallel-with-done, got {:?}", codes(&d));
+}
+
+#[test]
+fn sequential_loop_without_termination_fires() {
+    // No `over`, no `max_iters`, no `self.done` write: provably
+    // infinite, rejected at compile time.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop() -> () {
+    parallel: false
+    p = Text { value: "x" }
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"loop-unbounded-no-termination"),
+        "expected loop-unbounded-no-termination, got {:?}", codes(&d));
+}
+
+#[test]
+fn done_wired_sequential_loop_is_accepted_unbounded() {
+    // A `self.done = ...` write is a termination condition: the loop
+    // is the user's own program, trusted and unbounded.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop() -> () {
+    parallel: false
+    p = Text { value: "x" }
+    self.done = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"loop-unbounded-no-termination"),
+        "done-wired loop must not be flagged unbounded, got {:?}", codes(&d));
+}
+
+#[test]
+fn max_iters_only_sequential_loop_is_accepted() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop() -> () {
+    parallel: false
+    max_iters: 5
+    p = Text { value: "x" }
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"loop-unbounded-no-termination"),
+        "max_iters-capped loop must not be flagged unbounded, got {:?}", codes(&d));
+}
+
+#[test]
+fn over_and_carry_overlap_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (items: String) {
+    parallel: false
+    over: ["items"]
+    carry: ["items"]
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"over-and-carry-overlap"), "expected over-and-carry-overlap, got {:?}", codes(&d));
+}
+
+#[test]
+fn gather_output_must_be_nullable_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String]) {
+    parallel: true
+    over: ["items"]
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"gather-output-must-be-nullable"),
+        "expected gather-output-must-be-nullable, got {:?}", codes(&d));
+}
+
+#[test]
+fn reserved_port_name_index_input_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(index: Number, items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["items"]
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"reserved-port-name"),
+        "expected reserved-port-name for 'index' input, got {:?}", codes(&d));
+}
+
+#[test]
+fn reserved_port_name_done_output_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null], done: Boolean) {
+    parallel: true
+    over: ["items"]
+    p = Text { value: "x" }
+    self.results = p.value
+    self.done = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"reserved-port-name"),
+        "expected reserved-port-name for 'done' output, got {:?}", codes(&d));
+}
+
+#[test]
+fn over_not_a_list_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(threshold: Number) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["threshold"]
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"over-not-a-list"),
+        "expected over-not-a-list, got {:?}", codes(&d));
+}
+
+#[test]
+fn loop_over_unknown_port_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["ghost"]
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"loop-over-unknown-port"),
+        "expected loop-over-unknown-port, got {:?}", codes(&d));
+}
+
+#[test]
+fn loop_carry_unknown_port_fires() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: false
+    over: ["items"]
+    carry: ["ghost"]
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"loop-carry-unknown-port"),
+        "expected loop-carry-unknown-port, got {:?}", codes(&d));
+}
+
+#[test]
+fn clean_parallel_map_loop_validates() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let only_loop_errors: Vec<&str> = d.iter()
+        .filter(|x| x.severity == Severity::Error)
+        .filter_map(|x| x.code.as_deref())
+        .filter(|c| c.starts_with("loop-") || c.starts_with("parallel-") || c == &"reserved-port-name" || c == &"gather-output-must-be-nullable" || c == &"over-and-carry-overlap" || c == &"over-not-a-list" || c == &"carry-port-type-mismatch" || c == &"carry-port-missing-output")
+        .collect();
+    assert!(only_loop_errors.is_empty(), "expected no loop-specific errors, got {:?}", only_loop_errors);
+}
+
+#[test]
+fn clean_sequential_fold_loop_validates() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null], acc: String) {
+    parallel: false
+    over: ["items"]
+    carry: ["acc"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+    self.acc = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let only_loop_errors: Vec<&str> = d.iter()
+        .filter(|x| x.severity == Severity::Error)
+        .filter_map(|x| x.code.as_deref())
+        .filter(|c| c.starts_with("loop-") || c.starts_with("parallel-") || c == &"reserved-port-name" || c == &"gather-output-must-be-nullable" || c == &"over-and-carry-overlap" || c == &"over-not-a-list" || c == &"carry-port-type-mismatch" || c == &"carry-port-missing-output")
+        .collect();
+    assert!(only_loop_errors.is_empty(), "expected no loop-specific errors, got {:?}", only_loop_errors);
+}
+
+#[test]
+fn same_name_nested_loops_compile_clean() {
+    // Two loops both named `my_loop`, one nested inside the other, are valid:
+    // the inner is fully-scoped as `my_loop.my_loop`, so the boundary ids
+    // (`my_loop__in/out` vs `my_loop.my_loop__in/out`) cannot collide.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my_loop = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: false
+    over: ["items"]
+    my_loop = Loop(inner: List[String]) -> (inner_results: List[String | Null]) {
+        parallel: true
+        over: ["inner"]
+        p = Text {}
+        p.value = self.inner
+        self.inner_results = p.value
+    }
+    my_loop.inner = self.items
+    self.results = my_loop.inner_results
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let loop_errs: Vec<&str> = d.iter()
+        .filter(|x| x.severity == Severity::Error)
+        .filter_map(|x| x.code.as_deref())
+        .filter(|c| c.starts_with("loop-") || c.starts_with("parallel-") || *c == "reserved-port-name")
+        .collect();
+    assert!(loop_errs.is_empty(), "expected clean nested same-name loops, got {:?}", loop_errs);
+
+    // Two distinct LoopIn boundary ids, two distinct LoopOut boundary ids.
+    let in_ids: Vec<&str> = project.nodes.iter()
+        .filter(|n| n.node_type == "LoopIn")
+        .map(|n| n.id.as_str())
+        .collect();
+    let out_ids: Vec<&str> = project.nodes.iter()
+        .filter(|n| n.node_type == "LoopOut")
+        .map(|n| n.id.as_str())
+        .collect();
+    assert_eq!(in_ids.len(), 2, "two LoopIns: {:?}", in_ids);
+    assert_eq!(out_ids.len(), 2, "two LoopOuts: {:?}", out_ids);
+    // Distinct fully-scoped ids: `my_loop__in` and `my_loop.my_loop__in`.
+    assert!(in_ids.contains(&"my_loop__in"), "{:?}", in_ids);
+    assert!(in_ids.contains(&"my_loop.my_loop__in"), "{:?}", in_ids);
+}
+
+#[test]
+fn same_name_loops_at_same_scope_clash() {
+    // Two loops both named `my_loop` declared at the SAME scope level must
+    // fail compile with the existing duplicate-identifier diagnostic.
+    use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
+    let src = r#"
+my_loop = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["items"]
+}
+my_loop = Loop(other: List[String]) -> (out: List[String | Null]) {
+    parallel: true
+    over: ["other"]
+}
+"#;
+    let (_, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(errs.iter().any(|e| e.message.contains("Duplicate id")),
+        "expected Duplicate id error, got {:?}", errs);
 }

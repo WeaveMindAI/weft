@@ -33,11 +33,11 @@ pub struct MintTokenBody {
     /// narrows the signals this token can enumerate. Tags must
     /// pass the same charset rule used for `_tags`
     /// (`[A-Za-z0-9_-]{1,64}`); rejected at body parse time.
-    #[serde(default, rename = "allowedKinds", alias = "allowed_kinds")]
+    #[serde(default, rename = "allowedKinds")]
     pub allowed_kinds: Vec<String>,
-    #[serde(default, rename = "allowedProjects", alias = "allowed_projects")]
+    #[serde(default, rename = "allowedProjects")]
     pub allowed_projects: Vec<uuid::Uuid>,
-    #[serde(default, rename = "allowedTags", alias = "allowed_tags")]
+    #[serde(default, rename = "allowedTags")]
     pub allowed_tags: Vec<String>,
 }
 

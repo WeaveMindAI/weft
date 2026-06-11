@@ -325,7 +325,7 @@ pub async fn claim_one(
     // Worker-target claims must verify the picking pod is still
     // alive in `worker_pod`. Without this, a pod that's been marked
     // dead (e.g. by replace_stale_worker_if_needed during a sync that
-    // bumped the source_hash) keeps claiming tasks for the up-to-10s
+    // bumped the binary_hash) keeps claiming tasks for the up-to-10s
     // window until its own heartbeat detects the dead row. Those
     // claims then fail when the fencing trigger rejects the
     // resulting journal writes. The DB has the source of truth;

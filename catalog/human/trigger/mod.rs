@@ -4,16 +4,14 @@
 //!   - `Phase::TriggerSetup`: build a Form signal from the node's
 //!     config and register it.
 //!
-//!   - `Phase::Fire`: the submission lands on `__seed__` as the
-//!     raw form payload (a flat JSON object keyed by field key).
-//!     Map the submitted values to output ports per the form field
-//!     definitions.
+//!   - `Phase::Fire`: the wake payload is the raw form payload (a
+//!     flat JSON object keyed by field key). Map the submitted values
+//!     to output ports per the form field definitions.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use weft_core::context::Phase;
-use weft_core::node::NodeOutput;
 use weft_core::signal::{Form, FormSchema};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
@@ -35,7 +33,7 @@ impl Node for HumanTriggerNode {
         serde_json::from_str(METADATA_JSON).expect("HumanTrigger metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let specs = human_form_field_specs();
         match ctx.phase {
             Phase::TriggerSetup => {
@@ -74,22 +72,23 @@ impl Node for HumanTriggerNode {
                     consumer_kind: Some("human_in_the_loop".into()),
                 })
                 .await?;
-                Ok(NodeOutput::empty())
+                Ok(())
             }
             Phase::Fire => {
-                // The submission lands on `__seed__` as the raw
-                // form payload (a JSON object keyed by field key):
-                // `fire_public_entry` seeds the POST body verbatim.
-                let submission = ctx
-                    .input
-                    .values
-                    .get("__seed__")
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                // The wake payload is the form submission (a JSON
+                // object keyed by field key). Missing or non-object
+                // means the dispatcher's form-submission delivery
+                // broke its contract: fail loud, matching the cron /
+                // ApiPost / WhatsAppReceive bar. Substituting an
+                // empty object would silently fire a fake "all fields
+                // empty" submission downstream (which for approve/
+                // reject fields would synthesize a `rejected: true`
+                // pulse).
+                let submission = ctx.wake_payload_object()?;
                 let raw_fields = parse_form_fields(&ctx.config.values);
-                Ok(map_response_to_ports(&submission, &raw_fields, specs))
+                ctx.pulse_downstream(map_response_to_ports(submission, &raw_fields, specs)).await
             }
-            Phase::InfraSetup => Ok(NodeOutput::empty()),
+            Phase::InfraSetup => Ok(()),
         }
     }
 }

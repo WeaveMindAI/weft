@@ -2,23 +2,18 @@
 //! `PulseTable` + `NodeExecutionTable` + project metadata. No IO, no
 //! journal, no HTTP. The runtime crate (inside user binaries) calls
 //! these; the dispatcher also calls them for simulation/dry-run.
-//!
-//! Ported from `crates-v1/weft-core/src/executor_core.rs` but split
-//! across focused modules to avoid the 1700-line monolith.
 
 pub mod execution;
-pub mod mutations;
-pub mod preprocess;
+pub mod emission;
 pub mod ready;
 pub mod postprocess;
 pub mod skip;
 pub mod completion;
 pub mod typecheck;
 
-pub use execution::{NodeAttempt, NodeExecution, NodeExecutionStatus, NodeExecutionTable};
-pub use mutations::{ExpandedChild, PulseMutation};
-pub use preprocess::preprocess_input;
+pub use execution::{NodeExecution, NodeExecutionStatus, NodeExecutionTable};
+pub use emission::PulseEmission;
 pub use ready::{find_ready_nodes, ReadyGroup};
-pub use postprocess::postprocess_output;
+pub use postprocess::{close_unmentioned_downstream, postprocess_output};
 pub use skip::check_should_skip;
 pub use completion::check_completion;

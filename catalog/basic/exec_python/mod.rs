@@ -62,7 +62,7 @@ impl Node for ExecPythonNode {
         serde_json::from_str(METADATA_JSON).expect("ExecPython metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let code: String = ctx.config.get("code")?;
 
         // Bind every input port value under its port name in the
@@ -94,7 +94,7 @@ impl Node for ExecPythonNode {
                 out = out.set(port, value);
             }
         }
-        Ok(out)
+        ctx.pulse_downstream(out).await
     }
 }
 
@@ -244,9 +244,11 @@ fn json_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
     }
 }
 
-/// Convert a Python object back to serde_json. Unsupported types
-/// (sets, custom classes, bytes) fall back to their repr() so the
-/// user at least sees something rather than a crash.
+/// Convert a Python object back to serde_json. Supported: None, bool,
+/// int, float, str, list, dict. Anything else (sets, custom classes,
+/// bytes, tuples) raises `PyTypeError`: a downstream port expecting a
+/// Dict surfaces a structured failure instead of receiving a stringified
+/// `repr()` that pretends to be data.
 fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
@@ -283,7 +285,16 @@ fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         return Ok(Value::Object(map));
     }
-    // Fallback: repr() so the user at least sees something
-    // recognizable in their Debug output.
-    Ok(Value::String(obj.repr()?.to_string()))
+    // Unsupported Python type: refuse to silently downgrade to a
+    // stringified `repr()`. A user wiring a downstream port expecting
+    // a Dict gets a structured failure instead of a `"<set {...}>"`
+    // string that pretends to be data.
+    let type_name = obj
+        .get_type()
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "ExecPython: unsupported return type `{type_name}` (supported: None, bool, int, float, str, list, dict)"
+    )))
 }

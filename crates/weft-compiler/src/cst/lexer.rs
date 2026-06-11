@@ -296,6 +296,9 @@ fn classify_word(word: &str) -> SyntaxKind {
     if word == "Group" {
         return SyntaxKind::KW_GROUP;
     }
+    if word == "Loop" {
+        return SyntaxKind::KW_LOOP;
+    }
     if word == "true" || word == "false" {
         return SyntaxKind::NUMBER;
     }

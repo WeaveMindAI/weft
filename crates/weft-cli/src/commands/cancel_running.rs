@@ -26,7 +26,7 @@ async fn run_inner(
     let client = ctx.client();
     let path = format!("/projects/{id}/cancel-running");
     progress.dispatcher_call_start(&path);
-    client.post_with_body(&path, &serde_json::Value::Null).await?;
+    client.post_empty(&path).await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     if !ctx.json() {
         println!("cancel-running issued for {id}");

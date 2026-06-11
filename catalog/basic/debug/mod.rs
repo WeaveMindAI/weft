@@ -1,16 +1,14 @@
-//! Debug: log whatever flows in, and also pass it through on the
-//! `data` output so a Debug node can sit in-line in a chain without
-//! breaking it. The node's user-facing label (the title shown at the
-//! top of the node in the editor) is used as the log prefix. If the
-//! user hasn't set a label, we fall back to the node id so the log
-//! still points at something identifiable.
+//! Debug: log whatever flows in. A terminal sink (no output ports): the
+//! graph view reads the input value off the SSE event stream and renders
+//! it inline via `features.showDebugPreview`. The node's user-facing
+//! label is the log prefix; if unset, we fall back to the node id so the
+//! log still points at something identifiable.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use weft_core::context::LogLevel;
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
-use weft_core::node::NodeOutput;
 
 pub struct DebugNode;
 
@@ -26,13 +24,10 @@ impl Node for DebugNode {
         serde_json::from_str(METADATA_JSON).expect("Debug metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
-        // No output port: Debug is a terminal node. The graph view
-        // reads the input value off the SSE event stream (weft follow
-        // / replay) and renders it inline via features.showDebugPreview.
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let data = ctx.input.raw("data").cloned().unwrap_or(Value::Null);
         let label = ctx.node_label.as_deref().unwrap_or(&ctx.node_id);
         ctx.log(LogLevel::Info, format!("[{}] {}", label, data)).await?;
-        Ok(NodeOutput::empty())
+        Ok(())
     }
 }

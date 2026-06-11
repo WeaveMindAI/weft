@@ -29,9 +29,37 @@ pub struct ProjectDefinition {
     pub updated_at: DateTime<Utc>,
 }
 
+/// What kind of grouping construct this is. The visual editor uses
+/// this to pick a renderer; the runtime / flatten step uses the
+/// underlying boundary node type (Passthrough vs LoopIn/LoopOut).
+///
+/// The loop's config (parallel / over / carry / max_iters /
+/// trim_on_mismatch) rides INSIDE the `Loop` variant, so "kind ==
+/// Loop" and "has a loop config" cannot drift apart (the invalid
+/// states "Loop without config" / "Group with config" are
+/// unrepresentable). The enum is internally tagged on `kind` and
+/// flattened into `GroupDefinition`, so the wire shape stays
+/// `{"kind": "group"}` / `{"kind": "loop", "loopConfig": {...}}`.
+// SYNC: GroupKind <-> extension-vscode/src/shared/protocol.ts GroupDefinition (kind + loopConfig)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GroupKind {
+    Group,
+    Loop {
+        #[serde(rename = "loopConfig")]
+        loop_config: serde_json::Value,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupDefinition {
     pub id: String,
+    /// Whether this is a `Group` or a `Loop` (with its loop config).
+    /// Required: the compiler always sets it explicitly (see
+    /// `weft_compiler.rs::collect_group_definitions`). A snapshot
+    /// that omits this field is corrupt, not legitimately legacy.
+    #[serde(flatten)]
+    pub kind: GroupKind,
     /// Optional user-facing label. Defaults to id if missing.
     pub label: Option<String>,
     /// External input ports (the ports outside the group connects to).
@@ -51,7 +79,8 @@ pub struct GroupDefinition {
     #[serde(rename = "childGroupIds", default)]
     pub child_group_ids: Vec<String>,
     /// Ids of member nodes (only direct children, not grandchildren).
-    /// Does NOT include the In/Out boundary Passthroughs.
+    /// Does NOT include the In/Out boundary nodes (`Passthrough` for
+    /// groups, `LoopIn`/`LoopOut` for loops).
     #[serde(rename = "nodeIds", default)]
     pub node_ids: Vec<String>,
     /// True for the anonymous top-level group of an included `.weft` file
@@ -261,14 +290,6 @@ pub struct GroupBoundary {
     pub role: GroupBoundaryRole,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum LaneMode {
-    #[default]
-    Single,
-    Expand,
-    Gather,
-}
-
 /// Port shape on a NODE INSTANCE. This is the enriched version:
 /// TypeVars resolved, derived ports materialized, configurable
 /// defaults applied. Nodes declare their ports via NodeMetadata; the
@@ -283,30 +304,18 @@ pub struct PortDefinition {
     pub required: bool,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default, rename = "laneMode")]
-    pub lane_mode: LaneMode,
-    /// Number of List[] levels to expand/gather. Default 1.
-    #[serde(default = "default_lane_depth", rename = "laneDepth")]
-    pub lane_depth: u32,
     /// Whether this port can be filled by a same-named config field on
     /// the node instead of a wired edge.
     #[serde(default = "default_configurable")]
     pub configurable: bool,
-    /// True when the user explicitly typed this port in the .weft
-    /// source (inline `NodeType(x: T) -> (y: U)` syntax). False
-    /// when the type came from the catalog metadata. Used by
-    /// validate to suppress the implicit-expand / implicit-gather
-    /// warnings on edges where BOTH ends are user-typed: the user
-    /// wrote the depth difference deliberately, no surprise to
-    /// warn about. Catalog-typed ports keep the warning so a user
-    /// wiring two pre-typed ports sees the inferred lane mechanic.
-    #[serde(default, rename = "userTyped", skip_serializing_if = "is_false")]
-    pub user_typed: bool,
+    /// True for the auto-synthesized INPUT half of a loop carry port.
+    /// The editor uses this to render it as a non-editable ghost mirroring
+    /// the carry output of the same name. Never set on a user-declared port.
+    #[serde(default, rename = "synthesizedFromCarry", skip_serializing_if = "std::ops::Not::not")]
+    pub synthesized_from_carry: bool,
 }
 
-fn default_lane_depth() -> u32 { 1 }
 fn default_configurable() -> bool { true }
-fn is_false(b: &bool) -> bool { !*b }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -456,10 +465,8 @@ mod project_wire_tests {
             port_type: WeftType::primitive(crate::weft_type::WeftPrimitive::String),
             required: true,
             description: None,
-            lane_mode: crate::LaneMode::Single,
-            lane_depth: 1,
             configurable: false,
-            user_typed: false,
+            synthesized_from_carry: false,
         };
         let node = NodeDefinition {
             id: "g.n".into(),
@@ -482,6 +489,7 @@ mod project_wire_tests {
         };
         let group = GroupDefinition {
             id: "g".into(),
+            kind: GroupKind::Group,
             label: None,
             in_ports: vec![port],
             out_ports: vec![],

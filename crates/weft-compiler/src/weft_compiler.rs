@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
-    ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, LaneMode, NodeDefinition,
+    ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, NodeDefinition,
     PortDefinition, Position, ProjectDefinition, Span,
 };
 use weft_core::weft_type::WeftType;
@@ -52,7 +52,11 @@ struct ParsedPort {
     name: String,
     port_type: WeftType,
     required: bool,
-    lane_mode: LaneMode,
+    /// True iff this port was auto-synthesized by the loop-lowering pass
+    /// (the input side of a carry port). The editor renders these as ghost
+    /// mirrors of the carry output; users edit the output, not this side.
+    /// Never set on a user-declared port; never set on a non-loop group.
+    synthesized_from_carry: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,32 +99,37 @@ struct ParsedConnection {
     span: Option<Span>,
 }
 
+/// What kind of grouping construct this is. Determines the boundary
+/// node types emitted by `flatten_group` (`Passthrough` for groups,
+/// `LoopIn` / `LoopOut` for loops), and whether `loop_config` ships
+/// onto the boundary nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupKind {
+    Group,
+    Loop,
+}
+
 #[derive(Debug, Clone)]
 struct ParsedGroup {
     id: String,
+    kind: GroupKind,
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
     /// @require_one_of groups declared on the group's input port signature.
-    /// Each inner Vec is a group of input port names where at least one must
-    /// have a non-null value at runtime, otherwise the whole group body is
-    /// skipped and all group outputs emit null downstream.
     one_of_required: Vec<Vec<String>>,
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
     child_groups: Vec<ParsedGroup>,
-    /// True for the anonymous top-level group of an included file (declared
-    /// `Group(...) { }` with no `name =`). The include resolver requires this;
-    /// the editor labels it from the filename. Always false for named groups.
     anonymous: bool,
-    /// `@include("path")` declarations inside this group body, resolved after
-    /// parse into child groups (Full) or opaque nodes (Interface).
     includes: Vec<ParsedInclude>,
-    /// Source range covering the entire `label = Group(...) -> (...) { body }`
-    /// block. Used by the webview / surgical layer to delete or rewrite the
-    /// whole group region.
+    /// Loop-only config block: `parallel`, `over`, `carry`, `max_iters`,
+    /// `trim_on_mismatch`. None for regular groups.
+    loop_config: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Source spans of the loop's config fields (`parallel`, `over`, ...).
+    /// The validate pass uses these so a diagnostic like `parallel-with-carry`
+    /// highlights the `carry:` line, not the loop header.
+    loop_config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
     span: Option<Span>,
-    /// Source range of the header line (`label = Group(ports) -> (ports) {`).
-    /// Used for targeted port-signature rewrites.
     header_span: Option<Span>,
 }
 
@@ -650,6 +659,7 @@ fn parse_weft(source: &str, source_id: &str) -> ParseState {
             crate::cst::SyntaxKind::CONNECTION => conn_nodes.push(child.clone()),
             crate::cst::SyntaxKind::NODE_DECL
             | crate::cst::SyntaxKind::GROUP_DECL
+            | crate::cst::SyntaxKind::LOOP_DECL
             | crate::cst::SyntaxKind::INCLUDE_DECL => {
                 if let Some(decl) = CstDecl::cast(child.clone()) {
                     lower_decl(&decl, None, source_id, &li, &mut state, &mut inline);
@@ -826,6 +836,14 @@ fn lower_decl(
                 state.nodes.push(node);
             }
         }
+        CstDecl::Loop(l) => {
+            if let Some(group) = lower_loop(l, parent, source_id, li, &mut state.errors) {
+                if state.has_top_level_id(&group.id) {
+                    state.errors.push(CompileError::at(dup_span(group.header_span, group.span), format!("Duplicate id '{}'", group.id)));
+                }
+                state.groups.push(group);
+            }
+        }
         CstDecl::Group(g) => {
             if let Some(group) = lower_group(g, parent, source_id, li, &mut state.errors) {
                 // An anonymous group's id IS `source_id` (the file's filename id),
@@ -886,7 +904,7 @@ fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileErr
     // this match is presentation, not a second copy of the rule.
     let msg = if local_id == "self" {
         "'self' is a reserved word and cannot be used as an identifier".to_string()
-    } else if local_id == "Group" || local_id == "Passthrough" {
+    } else if is_reserved_type_keyword(local_id) {
         format!("'{local_id}' is a reserved type keyword and cannot be used as a node or group name")
     } else {
         format!("'{local_id}' uses '__', which is reserved for compiler-generated ids (group boundaries, inline expressions); pick a name without a double underscore")
@@ -895,14 +913,28 @@ fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileErr
     false
 }
 
-/// True iff `id` is a name the language reserves: the `self` boundary keyword,
-/// the `Group`/`Passthrough` type keywords, or any `__`-containing id (the
-/// compiler-id separator). The SINGLE source of the reserved-name membership
-/// rule: `reject_reserved_local` delegates here for the decision (and only adds
-/// per-case messages), and `source_name::derive_id` consults it so a
-/// filename-derived anonymous-root id can never be reserved either.
+/// The canonical list of type names the language reserves. The SINGLE
+/// source of truth: identifier reservation, catalog node-type
+/// reservation, and any future surface that needs to know "is this name
+/// taken by the language" all consult this list. To add a new reserved
+/// type, append it here and every consumer picks it up.
+pub const RESERVED_TYPE_KEYWORDS: &[&str] =
+    &["Group", "Passthrough", "Loop", "LoopIn", "LoopOut"];
+
+/// True iff `name` is one of the language's reserved type keywords.
+pub fn is_reserved_type_keyword(name: &str) -> bool {
+    RESERVED_TYPE_KEYWORDS.contains(&name)
+}
+
+/// True iff `id` is a name the language reserves as an identifier: the
+/// `self` boundary keyword, any reserved type keyword, or any `__`
+/// -containing id (the compiler-id separator). The SINGLE source of the
+/// reserved-name membership rule: `reject_reserved_local` delegates here
+/// for the decision (and only adds per-case messages), and
+/// `source_name::derive_id` consults it so a filename-derived
+/// anonymous-root id can never be reserved either.
 pub fn is_reserved_local(id: &str) -> bool {
-    id == "self" || id == "Group" || id == "Passthrough" || id.contains("__")
+    id == "self" || is_reserved_type_keyword(id) || id.contains("__")
 }
 
 /// The header IDENT (the decl's local id) and the type name, from a HEADER node.
@@ -987,10 +1019,67 @@ fn lower_port_sig(
     (ports, oor)
 }
 
-/// Read the input/output port signatures off a HEADER (or post-body PORT_SIG_POST
-/// sibling), returning (in_ports, out_ports, one_of_required).
+/// Read a loop config port list (`over` or `carry`) at LOWERING time.
+/// Non-string entries are NOT silently dropped: each one pushes a
+/// `loop-config-malformed` CompileError so the parse pipeline halts
+/// before the lowered project drifts into a half-baked loop. Empty
+/// when the key is missing or not an array. Once lowering vets the
+/// list this way, subsequent readers (flatten_group, codegen) can
+/// trust the entries and use `read_loop_port_list_vetted`.
+fn read_loop_port_list(
+    loop_id: &str,
+    cfg: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    span: Span,
+    errors: &mut Vec<CompileError>,
+) -> Vec<String> {
+    let Some(arr) = cfg.and_then(|c| c.get(key)).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        match v.as_str() {
+            Some(s) => out.push(s.to_string()),
+            None => errors.push(CompileError::at(
+                span.clone(),
+                format!(
+                    "loop '{loop_id}': [loop-config-malformed] '{key}[{i}]' must be a port name (string); got {v}"
+                ),
+            )),
+        }
+    }
+    out
+}
+
+/// Like `read_loop_port_list` but discards the values. Use when the
+/// caller only needs the side-effect of validating the list (downstream
+/// reads will go through `read_loop_port_list_vetted`).
+fn validate_loop_port_list(
+    loop_id: &str,
+    cfg: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    span: Span,
+    errors: &mut Vec<CompileError>,
+) {
+    let _ = read_loop_port_list(loop_id, cfg, key, span, errors);
+}
+
+/// Read a loop config port list AFTER `read_loop_port_list` already
+/// vetted it during lowering. Trusted: non-string entries are not
+/// expected and would indicate a caller skipped lowering.
+fn read_loop_port_list_vetted(
+    cfg: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Vec<String> {
+    cfg.and_then(|c| c.get(key))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// Read the input/output port signatures off a HEADER,
+/// returning (in_ports, out_ports, one_of_required).
 fn lower_header_ports(
-    decl: &crate::cst::SyntaxNode,
     header: &crate::cst::SyntaxNode,
     li: &LineIndex,
     errors: &mut Vec<CompileError>,
@@ -1012,20 +1101,6 @@ fn lower_header_ports(
                 oor.extend(o);
             }
             _ => {}
-        }
-    }
-    // Post-body output ports: a PORT_SIG_POST sibling of the body, under decl.
-    for sib in decl.children() {
-        if sib.kind() == K::PORT_SIG_POST {
-            let (p, _) = lower_port_sig(&sib, "out", li, errors);
-            let sib_span = li.span_of(&sib);
-            for port in p {
-                if out_ports.iter().any(|e: &ParsedPort| e.name == port.name) {
-                    errors.push(CompileError::at(sib_span, format!("Duplicate output port '{}'", port.name)));
-                } else {
-                    out_ports.push(port);
-                }
-            }
         }
     }
     (in_ports, out_ports, oor)
@@ -1058,7 +1133,7 @@ fn lower_node(
         return None;
     }
     let id = scoped(parent, &local_id);
-    let (in_ports, out_ports, one_of_required) = lower_header_ports(n.syntax(), header.syntax(), li, errors);
+    let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
 
     let mut config = serde_json::Map::new();
     let mut label = None;
@@ -1269,7 +1344,7 @@ fn lower_inline_expr(
     let anon_id = format!("{host_local}__{field_key}");
     // Ports: the inline expr's PORT_DECLs live directly under the INLINE_EXPR
     // (no HEADER sub-node), so read them off the node itself.
-    let (in_ports, out_ports, one_of_required) = lower_header_ports(inline_node, inline_node, li, errors);
+    let (in_ports, out_ports, one_of_required) = lower_header_ports(inline_node, li, errors);
 
     // Body config (recurses for nested inline exprs via lower_config_body). The
     // nested host is THIS anon node (raw `anon_id`), and it shares this node's
@@ -1561,8 +1636,6 @@ fn lower_group(
     li: &LineIndex,
     errors: &mut Vec<CompileError>,
 ) -> Option<ParsedGroup> {
-    use crate::cst::nodes::Decl as CstDecl;
-    use crate::cst::SyntaxKind as K;
     let header = g.header()?;
     let (local_id, _ty) = header_id_and_type(header.syntax());
     // Diagnostics point at the HEADER (where the user wrote the decl), not the
@@ -1589,11 +1662,12 @@ fn lower_group(
     }
     let local_id = if anonymous { source_id.to_string() } else { local_id };
     let id = scoped(parent, &local_id);
-    let (in_ports, out_ports, mut one_of_required) = lower_header_ports(g.syntax(), header.syntax(), li, errors);
+    let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
 
     let mut group = ParsedGroup {
         id: id.clone(),
-        in_ports,
+        kind: GroupKind::Group,
+        in_ports: Vec::new(),
         out_ports,
         one_of_required: Vec::new(),
         nodes: Vec::new(),
@@ -1601,116 +1675,308 @@ fn lower_group(
         child_groups: Vec::new(),
         anonymous,
         includes: Vec::new(),
+        loop_config: None,
+        loop_config_spans: Default::default(),
         span: Some(li.span_of(g.syntax())),
-        header_span: Some(li.span_of(header.syntax())),
+        header_span: Some(header_span),
+    };
+    lower_grouplike_body(&mut group, g.body(), parent, source_id, in_ports, one_of_required, header_span, li, errors);
+    Some(group)
+}
+
+/// Lower a LOOP_DECL recursively into a ParsedGroup with kind=Loop and a
+/// `loop_config` block. The body is MIXED: it can carry config fields
+/// (`parallel: true`, `over: ["x"]`, etc.) AND nested decls/connections.
+fn lower_loop(
+    l: &crate::cst::nodes::LoopDecl,
+    parent: Option<&str>,
+    source_id: &str,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) -> Option<ParsedGroup> {
+    let header = l.header()?;
+    let (local_id, _ty) = header_id_and_type(header.syntax());
+    let header_span = li.span_of(header.syntax());
+    if local_id.is_empty() {
+        errors.push(CompileError::at(header_span, "a Loop must be named (`name = Loop(...)`)"));
+        return None;
+    }
+    if !reject_reserved_local(&local_id, header_span, errors) {
+        return None;
+    }
+    let id = scoped(parent, &local_id);
+    let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
+
+    let mut group = ParsedGroup {
+        id: id.clone(),
+        kind: GroupKind::Loop,
+        in_ports: Vec::new(),
+        out_ports,
+        one_of_required: Vec::new(),
+        nodes: Vec::new(),
+        connections: Vec::new(),
+        child_groups: Vec::new(),
+        anonymous: false,
+        includes: Vec::new(),
+        loop_config: Some(serde_json::Map::new()),
+        loop_config_spans: Default::default(),
+        span: Some(li.span_of(l.syntax())),
+        header_span: Some(header_span),
+    };
+    lower_grouplike_body(&mut group, l.body(), parent, source_id, in_ports, one_of_required, header_span, li, errors);
+    Some(group)
+}
+
+/// Shared body lowering for the two group-like decls (`Group` and `Loop`).
+/// Walks the body children (decls, connections, includes, directives),
+/// merges inline-expression scratch nodes, applies deferred literal-config
+/// fills, and rescopes connection endpoints into the group's scope. The
+/// only kind-specific parts are the CONFIG_FIELD / LABEL_FIELD arms (a
+/// Loop captures its config block; a plain Group takes neither and errors
+/// loudly) and the post-walk carry-port input synthesis (Loop only).
+fn lower_grouplike_body(
+    group: &mut ParsedGroup,
+    body: Option<crate::cst::nodes::Body>,
+    parent: Option<&str>,
+    source_id: &str,
+    mut in_ports: Vec<ParsedPort>,
+    mut one_of_required: Vec<Vec<String>>,
+    header_span: Span,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) {
+    use crate::cst::nodes::Decl as CstDecl;
+    use crate::cst::SyntaxKind as K;
+    let id = group.id.clone();
+
+    let Some(body) = body else {
+        group.in_ports = in_ports;
+        group.one_of_required = one_of_required;
+        return;
     };
 
-    if let Some(body) = g.body() {
-        let mut inline = InlineScope::default();
-        // Defer connections so child nodes exist first: a `child.field = <lit>`
-        // connection is a config-origin field on that child, not an edge.
-        let mut conn_nodes: Vec<crate::cst::SyntaxNode> = Vec::new();
-        for child in body.syntax().children() {
-            match child.kind() {
-                K::CONNECTION => conn_nodes.push(child.clone()),
-                K::NODE_DECL => {
-                    if let Some(cd) = CstDecl::cast(child.clone()) {
-                        if let CstDecl::Node(nd) = &cd {
-                            if let Some(node) = lower_node(nd, Some(&id), li, &mut inline, errors) {
-                                if group.has_member_id(&node.id) {
-                                    errors.push(CompileError::at(dup_span(node.header_span, node.span), format!("Duplicate id '{}'", node.id)));
-                                }
-                                group.nodes.push(node);
+    let mut inline = InlineScope::default();
+    // Defer connections so child nodes exist first: a `child.field = <lit>`
+    // connection is a config-origin field on that child, not an edge.
+    let mut conn_nodes: Vec<crate::cst::SyntaxNode> = Vec::new();
+    for child in body.syntax().children() {
+        match child.kind() {
+            K::CONFIG_FIELD => match group.kind {
+                GroupKind::Loop => {
+                    // Loop config field. Parse via the shared helper and
+                    // copy each value into the loop_config map. Key/value
+                    // SEMANTICS (known keys, types, required `parallel`)
+                    // are validate's job; lowering rejects only what
+                    // validate can never see because it would vanish or
+                    // corrupt the shape before validate runs.
+                    let mut tmp_cfg: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+                    let mut tmp_spans: std::collections::BTreeMap<String, ConfigFieldSpan> = Default::default();
+                    let mut tmp_label: Option<String> = None;
+                    let mut tmp_inline = InlineScope::default();
+                    lower_config_field(
+                        &child,
+                        &id,
+                        parent,
+                        li,
+                        &mut tmp_cfg,
+                        &mut tmp_label,
+                        &mut tmp_spans,
+                        &mut tmp_inline,
+                        errors,
+                    );
+                    // An inline expression as a loop-config value would
+                    // synthesize helper nodes that nothing wires up; the
+                    // value itself would silently disappear.
+                    if !tmp_inline.nodes.is_empty() || !tmp_inline.connections.is_empty() {
+                        errors.push(CompileError::at(
+                            li.span_of(&child),
+                            format!("loop '{id}': inline expressions are not valid loop config values"),
+                        ));
+                    }
+                    if let Some(cfg) = group.loop_config.as_mut() {
+                        for (k, v) in tmp_cfg {
+                            // `parentId` is the boundary pointer flatten
+                            // merges into the LoopIn config; a user key
+                            // with that name would clobber the loop's
+                            // wiring before validate could object.
+                            if k == "parentId" {
+                                errors.push(CompileError::at(
+                                    li.span_of(&child),
+                                    format!("loop '{id}': 'parentId' is a reserved loop config key"),
+                                ));
+                                continue;
                             }
+                            cfg.insert(k, v);
                         }
                     }
-                }
-                K::GROUP_DECL => {
-                    if let Some(CstDecl::Group(cg)) = CstDecl::cast(child.clone()) {
-                        if let Some(child_group) = lower_group(&cg, Some(&id), source_id, li, errors) {
-                            if group.has_member_id(&child_group.id) {
-                                errors.push(CompileError::at(dup_span(child_group.header_span, child_group.span), format!("Duplicate id '{}'", child_group.id)));
-                            }
-                            group.child_groups.push(child_group);
-                        }
+                    for (k, sp) in tmp_spans {
+                        group.loop_config_spans.insert(k, sp);
                     }
                 }
-                K::INCLUDE_DECL => {
-                    if let Some(CstDecl::Include(ci)) = CstDecl::cast(child.clone()) {
-                        if let Some(inc) = lower_include(&ci, Some(&id), li, errors) {
-                            // Nodes, child groups, and include aliases share one
-                            // id namespace within the group: an alias colliding
-                            // with a sibling is a duplicate (parity with the
-                            // node/group arms above).
-                            if group.has_member_id(&inc.alias) {
-                                errors.push(CompileError::at(inc.span, format!("Duplicate id '{}'", inc.alias)));
-                            }
-                            group.includes.push(inc);
-                        }
-                    }
+                GroupKind::Group => {
+                    // Falling into the catch-all would silently eat the
+                    // field; plain groups carry no config block.
+                    errors.push(CompileError::at(
+                        li.span_of(&child),
+                        format!("group '{id}': groups do not take config fields; did you mean a Loop?"),
+                    ));
                 }
-                K::DIRECTIVE => {
-                    // @require_one_of directly in the group body.
-                    if let Some(grp) = lower_directive_require_one_of(&child, li, errors) {
-                        one_of_required.push(grp);
-                    }
-                }
-                _ => {}
+            },
+            K::LABEL_FIELD => {
+                // Falling into the catch-all would silently drop the
+                // label; neither group-like decl carries one.
+                let noun = match group.kind {
+                    GroupKind::Loop => "loop",
+                    GroupKind::Group => "group",
+                };
+                errors.push(CompileError::at(
+                    li.span_of(&child),
+                    format!("{noun} '{id}': {noun}s do not take a 'label' field"),
+                ));
             }
-        }
-        // Scope the inline-expr anon node ids into THIS group (`b__field` ->
-        // `g.b__field`), then merge. Inline nodes are synthesized with RAW ids so
-        // their ids and their edge endpoints are scoped together below (one pass),
-        // which is what keeps a child that shadows the group's name from being
-        // double-scoped. `prefix_node_ids` is the ONE place anon ids get scoped.
-        prefix_node_ids(&mut inline.nodes, &id);
-        merge_inline_nodes(&mut group.nodes, inline.nodes, errors);
-        group.connections.extend(inline.connections);
-
-        // Process deferred connections: `child.field = <literal>` is a config-
-        // origin field on that local child node; everything else is an edge. A
-        // literal to a non-child target is an edge (it may reference an outer or
-        // boundary scope, validated downstream), so a missing local target is
-        // not an error here.
-        // A connection-RHS inline expr (`child.in = T{...}.out`) synthesizes its
-        // own anon node + edge into this scratch scope, merged below.
-        let mut conn_inline = InlineScope::default();
-        for cn in conn_nodes {
-            let fill = literal_config_fill(&cn, li)
-                .and_then(|f| group.nodes.iter_mut().find(|n| local_of(&n.id) == f.target_id).map(|n| (f, n)));
-            match fill {
-                Some((f, node)) => apply_literal_fill(&f, &mut node.config, &mut node.config_spans, errors),
-                None => {
-                    if let Some(c) = lower_connection(&cn, Some(&id), li, &mut conn_inline, errors) {
-                        group.connections.push(c);
+            K::CONNECTION => conn_nodes.push(child.clone()),
+            K::NODE_DECL => {
+                if let Some(CstDecl::Node(nd)) = CstDecl::cast(child.clone()) {
+                    if let Some(node) = lower_node(&nd, Some(&id), li, &mut inline, errors) {
+                        if group.has_member_id(&node.id) {
+                            errors.push(CompileError::at(dup_span(node.header_span, node.span), format!("Duplicate id '{}'", node.id)));
+                        }
+                        group.nodes.push(node);
                     }
                 }
             }
-        }
-        prefix_node_ids(&mut conn_inline.nodes, &id);
-        merge_inline_nodes(&mut group.nodes, conn_inline.nodes, errors);
-        group.connections.extend(conn_inline.connections);
-
-        // Rescope group-internal connection ENDPOINTS (the node ids were just
-        // scoped by `prefix_node_ids`): `self` -> the group's `__in`/`__out`
-        // boundary; a LOCAL-child ref -> `{group}.child` (this also re-prefixes a
-        // raw anon endpoint like `b__in` to `g.b__in`, matching its node);
-        // anything else is an outer/root ref, left as-is. flatten then rewires
-        // passthroughs.
-        let local_children: std::collections::HashSet<String> = group
-            .nodes
-            .iter()
-            .map(|n| local_of(&n.id))
-            .chain(group.child_groups.iter().map(|g| local_of(&g.id)))
-            .chain(group.includes.iter().map(|x| local_of(&x.alias)))
-            .collect();
-        for conn in &mut group.connections {
-            conn.source_id = rescope_endpoint(&conn.source_id, &id, &local_children, true);
-            conn.target_id = rescope_endpoint(&conn.target_id, &id, &local_children, false);
+            K::GROUP_DECL => {
+                if let Some(CstDecl::Group(cg)) = CstDecl::cast(child.clone()) {
+                    if let Some(child_group) = lower_group(&cg, Some(&id), source_id, li, errors) {
+                        if group.has_member_id(&child_group.id) {
+                            errors.push(CompileError::at(dup_span(child_group.header_span, child_group.span), format!("Duplicate id '{}'", child_group.id)));
+                        }
+                        group.child_groups.push(child_group);
+                    }
+                }
+            }
+            K::LOOP_DECL => {
+                if let Some(CstDecl::Loop(cl)) = CstDecl::cast(child.clone()) {
+                    if let Some(child_loop) = lower_loop(&cl, Some(&id), source_id, li, errors) {
+                        if group.has_member_id(&child_loop.id) {
+                            errors.push(CompileError::at(dup_span(child_loop.header_span, child_loop.span), format!("Duplicate id '{}'", child_loop.id)));
+                        }
+                        group.child_groups.push(child_loop);
+                    }
+                }
+            }
+            K::INCLUDE_DECL => {
+                if let Some(CstDecl::Include(ci)) = CstDecl::cast(child.clone()) {
+                    if let Some(inc) = lower_include(&ci, Some(&id), li, errors) {
+                        // Nodes, child groups, and include aliases share one
+                        // id namespace within the group: an alias colliding
+                        // with a sibling is a duplicate (parity with the
+                        // node/group arms above).
+                        if group.has_member_id(&inc.alias) {
+                            errors.push(CompileError::at(inc.span, format!("Duplicate id '{}'", inc.alias)));
+                        }
+                        group.includes.push(inc);
+                    }
+                }
+            }
+            K::DIRECTIVE => {
+                // @require_one_of directly in the body.
+                if let Some(grp) = lower_directive_require_one_of(&child, li, errors) {
+                    one_of_required.push(grp);
+                }
+            }
+            _ => {}
         }
     }
+
+    if matches!(group.kind, GroupKind::Loop) {
+        // Vet `over` so flatten_group's later read can trust the
+        // loop_config map; values themselves aren't needed here.
+        // Both calls push CompileErrors on any non-string entry,
+        // halting the build before lowering produces a half-baked loop.
+        validate_loop_port_list(&id, group.loop_config.as_ref(), "over", header_span, errors);
+        // Auto-create carry input ports from the carry config list.
+        let carry: Vec<String> = read_loop_port_list(&id, group.loop_config.as_ref(), "carry", header_span, errors);
+        // Carry ports: the output side is the source of truth. When
+        // the user did not declare the matching input, synthesize it
+        // (REQUIRED: it seeds iteration 0, and a fabricated default
+        // seed would silently run the whole loop on wrong data).
+        // Everything diagnostic about carry (unknown output, type
+        // mismatch, optional user-declared input) is reported ONCE,
+        // by validate's `check_loop_config`, so a mistake never
+        // produces two errors from two layers.
+        for carry_name in &carry {
+            let out_port = group.out_ports.iter().find(|p| &p.name == carry_name).cloned();
+            let already_declared = in_ports.iter().any(|p| &p.name == carry_name);
+            if let (Some(out), false) = (out_port, already_declared) {
+                in_ports.push(ParsedPort {
+                    name: out.name,
+                    // The carry input mirrors the carry OUTPUT's
+                    // optionality: an optional carry (`acc: Number?`) seeds
+                    // the first iteration from its type's zero value when
+                    // unwired (the engine fills it), so its input must be
+                    // optional too or the LoopIn would never become ready.
+                    // A required carry still demands an explicit seed.
+                    required: out.required,
+                    port_type: out.port_type,
+                    synthesized_from_carry: true,
+                });
+            }
+        }
+    }
+    group.in_ports = in_ports;
+
+    // Scope the inline-expr anon node ids into THIS group (`b__field` ->
+    // `g.b__field`), then merge. Inline nodes are synthesized with RAW ids so
+    // their ids and their edge endpoints are scoped together below (one pass),
+    // which is what keeps a child that shadows the group's name from being
+    // double-scoped. `prefix_node_ids` is the ONE place anon ids get scoped.
+    prefix_node_ids(&mut inline.nodes, &id);
+    merge_inline_nodes(&mut group.nodes, inline.nodes, errors);
+    group.connections.extend(inline.connections);
+
+    // Process deferred connections: `child.field = <literal>` is a config-
+    // origin field on that local child node; everything else is an edge. A
+    // literal to a non-child target is an edge (it may reference an outer or
+    // boundary scope, validated downstream), so a missing local target is
+    // not an error here.
+    // A connection-RHS inline expr (`child.in = T{...}.out`) synthesizes its
+    // own anon node + edge into this scratch scope, merged below.
+    let mut conn_inline = InlineScope::default();
+    for cn in conn_nodes {
+        let fill = literal_config_fill(&cn, li)
+            .and_then(|f| group.nodes.iter_mut().find(|n| local_of(&n.id) == f.target_id).map(|n| (f, n)));
+        match fill {
+            Some((f, node)) => apply_literal_fill(&f, &mut node.config, &mut node.config_spans, errors),
+            None => {
+                if let Some(c) = lower_connection(&cn, Some(&id), li, &mut conn_inline, errors) {
+                    group.connections.push(c);
+                }
+            }
+        }
+    }
+    prefix_node_ids(&mut conn_inline.nodes, &id);
+    merge_inline_nodes(&mut group.nodes, conn_inline.nodes, errors);
+    group.connections.extend(conn_inline.connections);
+
+    // Rescope group-internal connection ENDPOINTS (the node ids were just
+    // scoped by `prefix_node_ids`): `self` -> the group's `__in`/`__out`
+    // boundary; a LOCAL-child ref -> `{group}.child` (this also re-prefixes a
+    // raw anon endpoint like `b__in` to `g.b__in`, matching its node);
+    // anything else is an outer/root ref, left as-is. flatten then rewires
+    // passthroughs.
+    let local_children: std::collections::HashSet<String> = group
+        .nodes
+        .iter()
+        .map(|n| local_of(&n.id))
+        .chain(group.child_groups.iter().map(|g| local_of(&g.id)))
+        .chain(group.includes.iter().map(|x| local_of(&x.alias)))
+        .collect();
+    for conn in &mut group.connections {
+        conn.source_id = rescope_endpoint(&conn.source_id, &id, &local_children, true);
+        conn.target_id = rescope_endpoint(&conn.target_id, &id, &local_children, false);
+    }
     group.one_of_required = one_of_required;
-    Some(group)
 }
 
 /// The local (last `.`-segment) id of a possibly-scoped id.
@@ -1804,13 +2070,10 @@ fn scoped(parent: Option<&str>, local: &str) -> String {
 
 /// Parse a single port declaration.
 /// Port declaration syntax: `name: Type` (required by default) or
-/// `name: Type?` (optional). No prefix characters. Lane modes are inferred
-/// from the type during enrichment, not declared on the port.
+/// `name: Type?` (optional). No prefix characters.
 fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
     let s = trimmed.trim();
     let rest = s;
-    // v2: no explicit expand/gather prefixes. Lane modes are inferred from types by enrichment.
-
     let (name, port_type, optional) = if let Some(colon_pos) = rest.find(':') {
         let name = rest[..colon_pos].trim();
         let mut type_str = rest[colon_pos + 1..].trim();
@@ -1849,7 +2112,7 @@ fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
         name: name.to_string(),
         port_type: port_type,
         required: !optional, // v2: required by default, ? makes optional
-        lane_mode: LaneMode::Single,
+        synthesized_from_carry: false,
     })
 }
 
@@ -2179,10 +2442,8 @@ fn collect_group_definitions(
             port_type: p.port_type.clone(),
             required: p.required,
             description: None,
-            lane_mode: p.lane_mode,
-            lane_depth: 1,
             configurable: p.port_type.is_default_configurable(),
-            user_typed: true,
+            synthesized_from_carry: p.synthesized_from_carry,
         })
         .collect();
     let out_ports: Vec<PortDefinition> = group
@@ -2193,10 +2454,8 @@ fn collect_group_definitions(
             port_type: p.port_type.clone(),
             required: false,
             description: None,
-            lane_mode: LaneMode::Single,
-            lane_depth: 1,
             configurable: p.port_type.is_default_configurable(),
-            user_typed: true,
+            synthesized_from_carry: false,
         })
         .collect();
 
@@ -2205,8 +2464,20 @@ fn collect_group_definitions(
     let node_ids: Vec<String> = group.nodes.iter().map(|n| n.id.clone()).collect();
     let child_group_ids: Vec<String> = group.child_groups.iter().map(|g| g.id.clone()).collect();
 
+    let kind = match group.kind {
+        GroupKind::Group => weft_core::GroupKind::Group,
+        GroupKind::Loop => weft_core::GroupKind::Loop {
+            loop_config: serde_json::Value::Object(
+                group
+                    .loop_config
+                    .clone()
+                    .expect("lower_loop always seeds loop_config for Loop groups"),
+            ),
+        },
+    };
     out.push(weft_core::GroupDefinition {
         id: group.id.clone(),
+        kind,
         label: Some(group.id.clone()),
         in_ports,
         out_ports,
@@ -2241,8 +2512,6 @@ fn flatten_group(
     nodes: &mut Vec<NodeDefinition>,
     edges: &mut Vec<Edge>,
 ) {
-    // Scope for the passthrough nodes: they belong to the group's parent scope.
-    // Scope for internal nodes: includes this group.
     let internal_scope = build_scope_chain(&group.id);
     let boundary_scope = if internal_scope.len() > 1 {
         internal_scope[..internal_scope.len() - 1].to_vec()
@@ -2250,40 +2519,113 @@ fn flatten_group(
         vec![]
     };
 
-    // 1. Create input passthrough: {groupId}__in
+    let (in_type, out_type) = match group.kind {
+        GroupKind::Group => ("Passthrough", "Passthrough"),
+        GroupKind::Loop => ("LoopIn", "LoopOut"),
+    };
+
+    // Loop-only: parse `over` / `carry` to derive the boundary port shapes.
+    // For a Loop:
+    //   - LoopIn.inputs (outer-in) mirror the user's input signature as
+    //     declared (List[T] for ports in `over`, T for broadcast, T for
+    //     carry initial).
+    //   - LoopIn.outputs (inside-out) carry the per-iteration element
+    //     type for `over` ports (T), the broadcast value (T), and add
+    //     the implicit `self.index: Number` port.
+    //   - LoopOut.inputs (inside-in) carry the body's writes: gather
+    //     ports as T?, carry-write ports as T?, plus the implicit
+    //     `self.done: Boolean?` port.
+    //   - LoopOut.outputs (outer-out) are the assembled lists for
+    //     gather ports (the user-declared List[T | Null]) and the final
+    //     carry value for carry ports (T).
+    //
+    // For a Group, all four sides mirror the user's declared types.
+    let (loop_over, loop_carry): (Vec<String>, Vec<String>) = match group.kind {
+        GroupKind::Loop => (
+            read_loop_port_list_vetted(group.loop_config.as_ref(), "over"),
+            read_loop_port_list_vetted(group.loop_config.as_ref(), "carry"),
+        ),
+        GroupKind::Group => (Vec::new(), Vec::new()),
+    };
+
+    let elem_type = |ty: &weft_core::weft_type::WeftType| -> weft_core::weft_type::WeftType {
+        match ty {
+            weft_core::weft_type::WeftType::List(inner) => (**inner).clone(),
+            other => other.clone(),
+        }
+    };
+
     let in_pt_id = format!("{}__in", group.id);
     let in_pt_inputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
         port_type: p.port_type.clone(),
         required: p.required,
         description: None,
-        lane_mode: p.lane_mode,
-        lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
-        user_typed: true,
+        synthesized_from_carry: p.synthesized_from_carry,
     }).collect();
-    let in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| PortDefinition {
-        name: p.name.clone(),
-        port_type: p.port_type.clone(),
-        required: false,
-        description: None,
-        lane_mode: LaneMode::Single,
-        lane_depth: 1,
-        configurable: p.port_type.is_default_configurable(),
-        user_typed: true,
+    let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
+        let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
+            elem_type(&p.port_type)
+        } else {
+            p.port_type.clone()
+        };
+        PortDefinition {
+            name: p.name.clone(),
+            port_type: ty.clone(),
+            required: false,
+            description: None,
+            configurable: ty.is_default_configurable(),
+            synthesized_from_carry: false,
+        }
     }).collect();
+    // Implicit `self.index: Number` for loops. If the user declared a
+    // port named `index` validate already emitted a reserved-name
+    // diagnostic; skip pushing the implicit one rather than producing a
+    // structurally duplicate port that downstream port-by-name lookups
+    // would silently disambiguate.
+    if matches!(group.kind, GroupKind::Loop) && !in_pt_outputs.iter().any(|p| p.name == "index") {
+        in_pt_outputs.push(PortDefinition {
+            name: "index".to_string(),
+            port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number),
+            required: false,
+            description: None,
+            configurable: false,
+            synthesized_from_carry: false,
+        });
+    }
 
-    // Copy the group's @require_one_of directives onto the In passthrough's
-    // features so the executor can consult them at the group boundary: if
-    // any required input is skipped (or the oneOfRequired group is fully
-    // skipped), the entire group body is skipped as a unit.
     let mut in_features = NodeFeatures::default();
     in_features.one_of_required = group.one_of_required.clone();
+    // Stash loop config on the boundary node's `config` JSON so the
+    // engine reads it without a separate registry. parentId is kept so
+    // the existing webview rendering doesn't break.
+    let mut in_cfg = serde_json::json!({"parentId": group.id});
+    if let (GroupKind::Loop, Some(lc)) = (group.kind, &group.loop_config) {
+        if let Some(obj) = in_cfg.as_object_mut() {
+            for (k, v) in lc {
+                obj.insert(k.clone(), v.clone());
+            }
+            // `parallel` defaults to false (sequential): materialized
+            // HERE so the flattened config always carries one explicit
+            // value and the runtime never holds its own default. The
+            // other knobs default by absence (`max_iters` = no cap,
+            // `over`/`carry` = empty).
+            obj.entry("parallel")
+                .or_insert(serde_json::Value::Bool(false));
+        }
+    }
+    let loop_spans: std::collections::BTreeMap<String, ConfigFieldSpan> =
+        if matches!(group.kind, GroupKind::Loop) {
+            group.loop_config_spans.clone()
+        } else {
+            Default::default()
+        };
     nodes.push(NodeDefinition {
         id: in_pt_id.clone(),
-        node_type: "Passthrough".to_string(),
+        node_type: in_type.to_string(),
         label: Some(boundary_label(&group.id, weft_core::project::GroupBoundaryRole::In)),
-        config: serde_json::json!({"parentId": group.id}),
+        config: in_cfg,
         position: Position { x: 0.0, y: 0.0 },
         inputs: in_pt_inputs,
         outputs: in_pt_outputs,
@@ -2294,40 +2636,67 @@ fn flatten_group(
         images: Vec::new(),
         span: None,
         header_span: None,
-        config_spans: Default::default(),
+        config_spans: loop_spans,
         file_refs: Default::default(),
         include_path: None,
     });
 
-    // 2. Create output passthrough: {groupId}__out
-    // v2: all lane modes are Single. Expand/gather is inferred from types during enrichment.
     let out_pt_id = format!("{}__out", group.id);
-    let out_pt_inputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
-        name: p.name.clone(),
-        port_type: p.port_type.clone(),
-        required: false,
-        description: None,
-        lane_mode: LaneMode::Single,
-        lane_depth: 1,
-        configurable: p.port_type.is_default_configurable(),
-        user_typed: true,
+    let mut out_pt_inputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| {
+        let (ty, required) = if matches!(group.kind, GroupKind::Loop) {
+            if loop_carry.contains(&p.name) {
+                // Carry-write port: T (engine reads optional/closed at runtime).
+                (p.port_type.clone(), false)
+            } else {
+                // Gather-write port: the element under List[T | Null] is what
+                // the body writes per iteration; the engine substitutes null
+                // on closure.
+                (elem_type(&p.port_type), false)
+            }
+        } else {
+            (p.port_type.clone(), false)
+        };
+        PortDefinition {
+            name: p.name.clone(),
+            port_type: ty.clone(),
+            required,
+            description: None,
+            configurable: ty.is_default_configurable(),
+            synthesized_from_carry: false,
+        }
     }).collect();
+    // Implicit `self.done: Boolean` for loops. Skip if the user declared a
+    // port named `done` (validate reports the reserved-name collision);
+    // a duplicate port would silently shadow at the next port-by-name lookup.
+    if matches!(group.kind, GroupKind::Loop) && !out_pt_inputs.iter().any(|p| p.name == "done") {
+        out_pt_inputs.push(PortDefinition {
+            name: "done".to_string(),
+            port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Boolean),
+            required: false,
+            description: None,
+            configurable: false,
+            synthesized_from_carry: false,
+        });
+    }
     let out_pt_outputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
         port_type: p.port_type.clone(),
         required: false,
         description: None,
-        lane_mode: LaneMode::Single,
-        lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
-        user_typed: true,
+        synthesized_from_carry: false,
     }).collect();
 
+    // The OUT boundary carries only the parent pointer. Loop config
+    // (parallel, over, carry, max_iters, trim_on_mismatch) is authoritative
+    // on LoopIn; mirroring it on LoopOut would create two sources of truth
+    // for the same fields.
+    let out_cfg = serde_json::json!({"parentId": group.id});
     nodes.push(NodeDefinition {
         id: out_pt_id.clone(),
-        node_type: "Passthrough".to_string(),
+        node_type: out_type.to_string(),
         label: Some(boundary_label(&group.id, weft_core::project::GroupBoundaryRole::Out)),
-        config: serde_json::json!({"parentId": group.id}),
+        config: out_cfg,
         position: Position { x: 0.0, y: 0.0 },
         inputs: out_pt_inputs,
         outputs: out_pt_outputs,
@@ -2379,20 +2748,16 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         port_type: p.port_type.clone(),
         required: p.required,
         description: None,
-        lane_mode: p.lane_mode,
-        lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
-        user_typed: true,
+        synthesized_from_carry: false,
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
         port_type: p.port_type.clone(),
         required: p.required,
         description: None,
-        lane_mode: p.lane_mode,
-        lane_depth: 1,
         configurable: p.port_type.is_default_configurable(),
-        user_typed: true,
+        synthesized_from_carry: false,
     }).collect();
     let mut features = NodeFeatures::default();
     features.one_of_required = pn.one_of_required.clone();

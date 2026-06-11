@@ -6,7 +6,7 @@
  */
 
 import { NODE_TYPE_CONFIG } from '$lib/nodes';
-import { isPortConfigurable } from '$lib/types';
+import { isPortConfigurable, isContainerNodeType } from '$lib/types';
 import type {
 	NodeInstance,
 	Edge,
@@ -168,7 +168,7 @@ function resolveSourceNodeType(
 	const sourceNode = allNodes.find(n => n.id === sourceId);
 	if (!sourceNode) return null;
 
-	if (sourceNode.nodeType === 'Group') {
+	if (isContainerNodeType(sourceNode.nodeType)) {
 		// The edge comes from a Group node. The sourceHandle may have an __inner
 		// suffix (raw parser edges) or may already be stripped (editor snapshot).
 		// Strip __inner to get the canonical port name, then find the edge that

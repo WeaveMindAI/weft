@@ -13,7 +13,7 @@
   ],
   "outputs": [
     { "name": "status", "type": "Number", "required": false },
-    { "name": "body", "type": "JsonDict", "required": false },
+    { "name": "body", "type": "JsonDict | String", "required": false },
     { "name": "ok", "type": "Boolean", "required": false }
   ],
   "fields": [

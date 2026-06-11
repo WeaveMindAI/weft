@@ -274,7 +274,7 @@ async fn run_reactivate(
     // from activate_inner means the project was removed between
     // enqueue and claim: same Cancelled semantic as the deactivate
     // arm above.
-    match crate::api::project::activate_inner(state, project_id, None, None, None).await {
+    match crate::api::project::activate_inner(state, project_id, None, None, None, None).await {
         Ok(_) => Ok(RunOutcome::Succeeded),
         Err((axum::http::StatusCode::NOT_FOUND, _)) => Ok(RunOutcome::Cancelled(format!(
             "project {project_id} no longer exists"

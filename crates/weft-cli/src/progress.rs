@@ -16,10 +16,11 @@
 //!     "phase":   <Phase>,
 //!     "detail":  <object | null> }
 //!
-//! Errors and human-readable logs go to stderr; stdout is reserved
-//! for the NDJSON event stream. Mixing the two on stdout would
-//! force the extension to filter, and would break shell-piping for
-//! humans who run with `--json`.
+//! The two modes never mix on one invocation: in `--json` mode stdout
+//! carries ONLY the NDJSON event stream (human lines are skipped), and
+//! in human mode stdout carries ONLY the human status lines (no
+//! NDJSON). So `--json` stdout is a clean machine stream the extension
+//! parses without filtering.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -83,6 +84,23 @@ pub enum Phase {
     /// Trigger registration started (signals about to be wired up).
     TriggerRegisterStart,
     TriggerRegisterDone,
+    /// Periodic heartbeat while waiting for running executions to
+    /// drain (`--running-policy wait`). The wait is unbounded by
+    /// design (user workflows can run for days); this event keeps it
+    /// legible in both JSON and TTY mode. Detail:
+    /// `{ "runningCount": N, "elapsedSeconds": S }`.
+    DrainWait,
+    /// The build gate parked the project's triggers to drain running
+    /// executions and the verb does NOT reactivate afterwards: the
+    /// project ends INACTIVE with queued fires. Detail:
+    /// `{ "recovery": "activate" }` (the verb that re-enables triggers
+    /// and replays the queue on the new image).
+    ParkedInactive,
+    /// Waiting on a long-running infra supervisor command (stop /
+    /// terminate / start), which can depend on draining in-flight
+    /// executions and so is unbounded like `DrainWait`. Detail:
+    /// `{ "verb": "...", "elapsedSeconds": S }`.
+    InfraWait,
     /// CLI verb finished cleanly.
     Complete,
     /// CLI verb failed. Detail carries `{ "message": "..." }`.
@@ -106,11 +124,28 @@ struct Event<'a> {
 pub struct Progress {
     pub json: bool,
     pub verb: ActionVerb,
+    /// Shared latch tracking whether ANY error event has already been
+    /// emitted on this verb. Lets `with_progress` skip the
+    /// auto-error trap when the body already emitted a structured
+    /// error (so the editor sees the structured one, not a flattened
+    /// duplicate that would overwrite it).
+    error_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Progress {
     pub fn new(verb: ActionVerb, json: bool) -> Self {
-        Self { json, verb }
+        Self {
+            json,
+            verb,
+            error_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// True if any error event has already been emitted on this
+    /// emitter. Used by `with_progress` to avoid double-emitting
+    /// when the body already produced a structured error.
+    pub fn has_emitted_error(&self) -> bool {
+        self.error_emitted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Core emit. Most call sites prefer the typed helpers below
@@ -201,6 +236,33 @@ impl Progress {
         self.emit(Phase::TriggerRegisterStart, None);
     }
 
+    pub fn drain_wait(&self, running_count: u64, elapsed_seconds: u64) {
+        self.emit(
+            Phase::DrainWait,
+            Some(serde_json::json!({
+                "runningCount": running_count,
+                "elapsedSeconds": elapsed_seconds,
+            })),
+        );
+    }
+
+    pub fn parked_inactive(&self) {
+        self.emit(
+            Phase::ParkedInactive,
+            Some(serde_json::json!({ "recovery": "activate" })),
+        );
+    }
+
+    pub fn infra_wait(&self, verb: &str, elapsed_seconds: u64) {
+        self.emit(
+            Phase::InfraWait,
+            Some(serde_json::json!({
+                "verb": verb,
+                "elapsedSeconds": elapsed_seconds,
+            })),
+        );
+    }
+
     pub fn trigger_register_done(&self) {
         self.emit(Phase::TriggerRegisterDone, None);
     }
@@ -213,10 +275,23 @@ impl Progress {
     }
 
     pub fn error(&self, message: &str) {
+        self.error_emitted.store(true, std::sync::atomic::Ordering::SeqCst);
         self.emit(
             Phase::Error,
             Some(serde_json::json!({ "message": message })),
         );
+    }
+
+    /// Structured error variant: lets the verb describe WHAT failed,
+    /// WHICH STAGE, and (optionally) pack a list of per-item
+    /// diagnostics. The editor's action-bar error modal reads these
+    /// fields directly. Use this when there's more context than a
+    /// single message: compile failures, multi-error operations, etc.
+    /// The webview tolerates missing fields (falls back to
+    /// `error(message)` behavior).
+    pub fn structured_error(&self, detail: serde_json::Value) {
+        self.error_emitted.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.emit(Phase::Error, Some(detail));
     }
 }
 
@@ -249,6 +324,38 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
         Phase::ImagePushStart => "loading image".to_string(),
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
+        Phase::DrainWait => {
+            let count = ev
+                .detail
+                .and_then(|d| d.get("runningCount"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let elapsed = ev
+                .detail
+                .and_then(|d| d.get("elapsedSeconds"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!(
+                "still waiting on {count} execution(s) (elapsed {elapsed}s; Ctrl+C to back out)"
+            )
+        }
+        Phase::ParkedInactive => "note: triggers were parked to drain running executions; \
+             the project is now inactive with queued fires. Run `weft activate` to \
+             re-enable triggers and replay them on the new image."
+            .to_string(),
+        Phase::InfraWait => {
+            let verb = ev
+                .detail
+                .and_then(|d| d.get("verb"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("command");
+            let elapsed = ev
+                .detail
+                .and_then(|d| d.get("elapsedSeconds"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("still waiting on infra {verb} (elapsed {elapsed}s; Ctrl+C to back out)")
+        }
         Phase::Complete => return ev
             .detail
             .and_then(|d| d.get("summary"))

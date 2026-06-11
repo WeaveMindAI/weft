@@ -24,7 +24,7 @@ impl Node for LlmConfigNode {
         serde_json::from_str(METADATA_JSON).expect("LlmConfig metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // Base from config fields (the user's design-time settings).
         let mut out: Map<String, Value> = ctx.config.values.clone().into_iter().collect();
 
@@ -34,6 +34,6 @@ impl Node for LlmConfigNode {
             out.insert("systemPrompt".into(), sp);
         }
 
-        Ok(NodeOutput::empty().set("config", Value::Object(out)))
+        ctx.pulse_downstream(NodeOutput::empty().set("config", Value::Object(out))).await
     }
 }

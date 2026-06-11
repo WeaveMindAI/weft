@@ -29,7 +29,7 @@ drop (HTTP via reqwest, DB via sqlx, sleep, file I/O via tokio::fs,
 WebSocket streams, channel receives).
 
 ```rust
-async fn execute(ctx: ExecutionContext, ...) -> WeftResult<NodeOutput> {
+async fn execute(ctx: ExecutionContext, ...) -> WeftResult<()> {
     let resp = reqwest::Client::new()
         .post("https://api.anthropic.com/v1/messages")
         .json(&body)
@@ -37,7 +37,7 @@ async fn execute(ctx: ExecutionContext, ...) -> WeftResult<NodeOutput> {
         .await?
         .json::<ApiResponse>()
         .await?;
-    Ok(NodeOutput::single("response", resp.text))
+    ctx.pulse_downstream(NodeOutput::with("response", resp.text)).await
 }
 ```
 
@@ -139,7 +139,7 @@ For long-running CPU work, pass the cancellation flag into the closure
 and check it between chunks:
 
 ```rust
-async fn execute(ctx: ExecutionContext, image: Vec<u8>) -> WeftResult<NodeOutput> {
+async fn execute(ctx: ExecutionContext, image: Vec<u8>) -> WeftResult<()> {
     let cancel = ctx.cancellation();
     let result = tokio::task::spawn_blocking(move || {
         for chunk in chunks_of(image) {
@@ -150,7 +150,7 @@ async fn execute(ctx: ExecutionContext, image: Vec<u8>) -> WeftResult<NodeOutput
         }
         Ok(...)
     }).await??;
-    Ok(NodeOutput::single("out", result))
+    ctx.pulse_downstream(NodeOutput::with("out", result)).await
 }
 ```
 
@@ -166,7 +166,7 @@ If you need to do something specific on cancel (notify a peer, log a
 metric, release a resource the node owns), branch on the flag:
 
 ```rust
-async fn execute(ctx: ExecutionContext, ...) -> WeftResult<NodeOutput> {
+async fn execute(ctx: ExecutionContext, ...) -> WeftResult<()> {
     let mut conn = open_connection().await?;
     let cancel = ctx.cancellation();
     loop {
@@ -180,7 +180,7 @@ async fn execute(ctx: ExecutionContext, ...) -> WeftResult<NodeOutput> {
             }
         }
     }
-    Ok(NodeOutput::single("done", json!(null)))
+    ctx.pulse_downstream(NodeOutput::with("done", json!(null))).await
 }
 ```
 
@@ -227,10 +227,10 @@ watch for a wake signal (Webhook URL, cron schedule, SSE subscription,
 form). Synchronous: returns the user-facing URL (if the kind mints
 one) and the worker keeps executing. Each external fire later spawns
 a fresh execution of the project. This signal is NOT bound to the
-current execution's lane.
+current execution's firing.
 
 ```rust
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
     match ctx.phase {
         Phase::TriggerSetup => {
             let url = ctx.register_signal(WakeSignalSpec {
@@ -241,26 +241,31 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
             }).await?;
             // url is Some("https://dispatcher/.../signal/<token>") for webhook;
             // None for kinds that don't expose a URL (Timer, SSE).
-            Ok(NodeOutput::with_value("url", json!(url)))
+            ctx.pulse_downstream(NodeOutput::with("url", json!(url))).await
         }
         Phase::Fire => {
             // Run when an external fire arrives.
-            // ctx.input["__seed__"] carries the fire payload.
+            // ctx.wake_payload() returns the wake event's data (the
+            // HTTP body for webhooks, the parsed SSE event JSON, the
+            // timer info, etc.). Returns None for non-trigger nodes
+            // and for trigger setup; trigger Fire bodies that REQUIRE
+            // a payload should `ok_or_else` with a clear error.
             ...
         }
-        _ => Ok(NodeOutput::empty()),
+        _ => Ok(()),
     }
 }
 ```
 
 ### `ctx.await_signal(spec)`
 
-For mid-flow waits (HumanQuery and similar). Stops THIS lane until
+For mid-flow waits (HumanQuery and similar). Parks THIS firing until
 the signal fires. Worker exits while parked; a fresh worker spawns
-when the fire arrives.
+when the fire arrives. Other firings of the same execution at
+different frame stacks keep going independently.
 
 ```rust
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
     let answer = ctx.await_signal(WakeSignalSpec {
         kind: WakeSignalKind::Form {
             form_type: "human-query".into(),
@@ -273,7 +278,7 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
         live_rendering: false,
     }).await?;
     // After the user submits, `answer` is the form payload.
-    Ok(NodeOutput::with_value("answer", answer))
+    ctx.pulse_downstream(NodeOutput::with("answer", answer)).await
 }
 ```
 
@@ -288,13 +293,13 @@ position in the body. On replay, each call returns its own fire's
 value in order.
 
 ```rust
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
     let approval = ctx.await_signal(approval_spec()).await?;
     if approval["accepted"].as_bool() != Some(true) {
-        return Ok(NodeOutput::with_value("decision", json!("rejected")));
+        return ctx.pulse_downstream(NodeOutput::with("decision", json!("rejected"))).await;
     }
     let confirmation = ctx.await_signal(confirmation_spec()).await?;
-    Ok(NodeOutput::with_value("final", confirmation))
+    ctx.pulse_downstream(NodeOutput::with("final", confirmation)).await
 }
 ```
 
@@ -316,7 +321,7 @@ must be wrapped in `ctx.run`. Examples: random tokens, `now()`,
 calling an external API, writing to a database.
 
 ```rust
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
     // Mint an idempotency token ONCE; replays return the same token.
     let idem = ctx.run("idem", || async {
         Ok(json!(uuid::Uuid::new_v4().to_string()))
@@ -334,12 +339,12 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
         Ok(resp)
     }).await?;
 
-    Ok(NodeOutput::with_value("receipt", api_resp))
+    ctx.pulse_downstream(NodeOutput::with("receipt", api_resp)).await
 }
 ```
 
 The closure runs at most once across the lifetime of this (color,
-node, lane) execution. On every subsequent replay, the journaled
+node, frames) firing. On every subsequent replay, the journaled
 value comes back without invoking the closure. Idempotency, signed
 URLs that need to be stable across replays, expensive computation,
 external side effects: all live behind `ctx.run`.
@@ -382,7 +387,7 @@ desyncing.
 
 ### Worker lifetime
 
-A worker pod dies whenever every lane is parked on `await_signal`.
+A worker pod dies whenever every live firing is parked on `await_signal`.
 This is the multiplexing model: thousands of suspended HumanQuery
 flows cost no compute, just journal rows. When a fire arrives, a
 fresh worker pod spawns, folds the journal, and re-runs every node
@@ -534,7 +539,7 @@ downstream:
 ```rust
 // bridge node, in execute:
 let api = ctx.endpoint("api").await?;
-Ok(NodeOutput::empty().set("apiUrl", Value::String(api.url().to_string())))
+ctx.pulse_downstream(NodeOutput::with("apiUrl", Value::String(api.url().to_string()))).await
 
 // send node, in execute: reads the wired URL, appends its own path
 let base = ctx.input.get("apiUrl")?;       // the bridge's exported URL
@@ -672,3 +677,15 @@ it; within your own namespace you can do what you want.
 - **`/outputs` <-> output ports is a convention**, not enforced: keep
   your container's `/outputs` keys in sync with `metadata.json`
   `outputs` by hand.
+- **Keep bus work on your node's own task.** If your node uses a message
+  bus (`ctx.create_bus` / `ctx.bus`), do all of its reads and waits
+  (`cursor.next`, `wait_for`, `recv`) directly in your node body. Do NOT
+  move a bus handle or cursor into a `tokio::spawn`ed background task. The
+  engine decides "every node is stuck, close the buses" by tracking
+  whether each node EXECUTION is waiting or working, and it assumes a
+  node's bus waits run on the node's own task. A wait happening on a task
+  you spawned is invisible to that accounting and can make the engine
+  wrongly tear down a live conversation (or hang). If you need concurrent
+  or background work, model it as another node and exchange with it over
+  the bus, rather than spawning a task yourself. This is a convention, not
+  enforced.

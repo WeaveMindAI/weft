@@ -14,38 +14,49 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     let project_id = project.id().to_string();
 
     // Compute desired hashes from current source. The dispatcher
-    // compares against project.running_source_hash and
-    // project.running_infra_hash to decide which drift bits to set.
+    // compares against project.running_binary_hash,
+    // project.running_definition_hash, and project.running_infra_hash
+    // to decide which drift bits to set.
     let weft_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     // Both hashes are scoped to the compiled project's referenced /
     // infra-closure nodes, so both need the definition + catalog. If
-    // the project can't compile, leave both desired hashes unset:
+    // the project can't compile, leave the desired hashes unset:
     // status is display-only and tolerates an in-progress project.
     let short = |h: String| crate::commands::build::short_hash(&h);
-    let (desired_source, desired_infra) = match crate::hash::load_enriched_project(project) {
-        Ok((def, catalog)) => (
-            crate::hash::compute_source_hash(&def, &project.root, &weft_root, &catalog)
-                .ok()
-                .map(short),
-            crate::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
-                .ok()
-                .map(short),
-        ),
-        Err(_) => (None, None),
-    };
+    let (desired_binary, desired_definition, desired_infra) =
+        match crate::hash::load_enriched_project(project) {
+            Ok((def, catalog)) => (
+                crate::hash::compute_binary_hash(&def, project, &weft_root, &catalog)
+                    .ok()
+                    .map(short),
+                crate::hash::compute_definition_hash(&def).ok().map(short),
+                crate::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
+                    .ok()
+                    .map(short),
+            ),
+            Err(_) => (None, None, None),
+        };
 
     let mut path = format!("/projects/{project_id}/status");
     let mut sep = '?';
-    if let Some(h) = desired_source.as_deref() {
+    // camelCase to match the rest of the wire (body fields are
+    // camelCase via serde rename; query params follow the same).
+    if let Some(h) = desired_binary.as_deref() {
         path.push(sep);
         sep = '&';
-        path.push_str("desired_source_hash=");
+        path.push_str("desiredBinaryHash=");
+        path.push_str(h);
+    }
+    if let Some(h) = desired_definition.as_deref() {
+        path.push(sep);
+        sep = '&';
+        path.push_str("desiredDefinitionHash=");
         path.push_str(h);
     }
     if let Some(h) = desired_infra.as_deref() {
         path.push(sep);
-        path.push_str("desired_infra_hash=");
+        path.push_str("desiredInfraHash=");
         path.push_str(h);
     }
 
@@ -115,16 +126,23 @@ fn print_drift(data: &serde_json::Value) {
         None => return,
     };
     let infra = drift.get("infra_drift").and_then(|v| v.as_bool()).unwrap_or(false);
-    let source = drift.get("source_drift").and_then(|v| v.as_bool()).unwrap_or(false);
-    if !infra && !source {
+    let binary = drift.get("binary_drift").and_then(|v| v.as_bool()).unwrap_or(false);
+    let definition = drift
+        .get("definition_drift")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !infra && !binary && !definition {
         return;
     }
     println!("  drift:");
     if infra {
         println!("    infra: source has changed; click Upgrade to rebuild infra");
     }
-    if source {
-        println!("    source: source has changed; click Resync to re-register");
+    if binary {
+        println!("    binary: worker code has changed; next run rebuilds the image");
+    }
+    if definition {
+        println!("    definition: project shape has changed; click Resync to re-register");
     }
 }
 

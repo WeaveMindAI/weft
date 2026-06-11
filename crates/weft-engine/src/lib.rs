@@ -1,11 +1,13 @@
 //! Weft execution engine, linked into each compiled project binary.
-//! Connects to the broker, folds the journal, drives the pulse loop,
-//! writes journal events through the broker. All control-plane
-//! round-trips (`await_signal`, `register_signal`, `ApplyInfra`)
-//! flow through the dispatcher's task queue (also via the broker).
+//! Connects to the broker, folds the journal, drives one execution
+//! to completion, writes journal events through the broker. All
+//! control-plane round-trips (`await_signal`, `register_signal`,
+//! `ApplyInfra`) flow through the dispatcher's task queue (also via
+//! the broker).
 
-pub mod context;
-pub(crate) mod loop_driver;
+pub(crate) mod context;
+pub(crate) mod execution_driver;
+pub(crate) mod loop_runtime;
 pub mod run_pod;
 
 pub use context::EngineClients;

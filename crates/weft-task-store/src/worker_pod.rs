@@ -52,14 +52,14 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             -- sweep ages terminal rows against this to delete the
             -- finished k8s Pod object after a grace window.
             terminal_at_unix BIGINT,
-            -- Source hash the pod's image was built from. Recorded at
+            -- Binary hash the pod's image was built from. Recorded at
             -- spawn time. The spawn_pod executor compares this against
-            -- the project's current running_source_hash on every spawn
+            -- the project's current running_binary_hash on every spawn
             -- attempt: a mismatch means the alive pod has a stale
-            -- project definition (e.g. user added an infra node since
+            -- binary (e.g. user changed a node implementation since
             -- it spawned). The dispatcher kills the stale pod and
             -- proceeds with a fresh spawn.
-            source_hash TEXT NOT NULL DEFAULT ''
+            binary_hash TEXT NOT NULL DEFAULT ''
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_worker_pod_project_alive
             ON worker_pod(project_id)
@@ -154,13 +154,13 @@ pub async fn insert_spawning(
     project_id: &str,
     namespace: &str,
     owner_dispatcher: &str,
-    source_hash: &str,
+    binary_hash: &str,
 ) -> Result<()> {
     let now = unix_now();
     sqlx::query(
         r#"INSERT INTO worker_pod (
             pod_name, project_id, namespace, status, owner_dispatcher,
-            last_heartbeat_unix, created_at_unix, source_hash
+            last_heartbeat_unix, created_at_unix, binary_hash
         ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
         ON CONFLICT (pod_name) DO NOTHING"#,
     )
@@ -170,7 +170,7 @@ pub async fn insert_spawning(
     .bind(STATUS_SPAWNING)
     .bind(owner_dispatcher)
     .bind(now)
-    .bind(source_hash)
+    .bind(binary_hash)
     .execute(pool)
     .await?;
     Ok(())
@@ -273,16 +273,16 @@ pub async fn has_live_for_project(pool: &PgPool, project_id: &str) -> Result<boo
 }
 
 /// Look up the currently-alive worker pod for `project_id`. Returns
-/// the `(pod_name, namespace, source_hash)` of the first match, or
+/// the `(pod_name, namespace, binary_hash)` of the first match, or
 /// None when no pod is alive. Used by `spawn_pod` to decide whether
-/// to reuse the existing pod or replace it (when its source_hash no
-/// longer matches the project's current `running_source_hash`).
+/// to reuse the existing pod or replace it (when its binary_hash no
+/// longer matches the project's current `running_binary_hash`).
 pub async fn alive_pod_for_project_full(
     pool: &PgPool,
     project_id: &str,
 ) -> Result<Option<(String, String, String)>> {
     let row: Option<(String, String, String)> = sqlx::query_as(
-        r#"SELECT pod_name, namespace, source_hash FROM worker_pod
+        r#"SELECT pod_name, namespace, binary_hash FROM worker_pod
            WHERE project_id = $1 AND status IN ('spawning', 'alive')
            ORDER BY created_at_unix ASC
            LIMIT 1"#,

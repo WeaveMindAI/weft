@@ -10,6 +10,8 @@ pub mod events;
 pub mod traits;
 pub mod write;
 
-pub use events::{fold_to_snapshot, ExecEvent, ExpandedChildRecord};
+pub use events::{fold_to_snapshot, ExecEvent};
 pub use traits::{JournalClient, PostgresJournalClient};
-pub use write::{record_event, record_event_dedup, record_event_from_pod, RecordError};
+pub use write::{
+    record_event, record_event_dedup, record_event_from_pod, record_event_in, RecordError,
+};

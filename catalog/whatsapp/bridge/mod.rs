@@ -13,14 +13,13 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::context::Phase;
 use weft_core::infra::{
     AccessMode, Container, ContainerPort, Endpoint, EnvEntry, Expose, Image, InfraSpec, Lifecycle,
     Mount, Probe, Protocol, Resources, TerminateBehavior, Unit, UnitKind, UpgradeBehavior, Volume,
     VolumeKind,
 };
-use weft_core::node::{NodeInput, NodeMetadata, NodeOutput};
-use weft_core::{ExecutionContext, InfraProvisionContext, Node, WeftResult};
+use weft_core::node::{NodeMetadata, NodeOutput};
+use weft_core::{ExecutionContext, InfraProvisionContext, InputBag, Node, WeftResult};
 
 pub struct WhatsAppBridgeNode;
 
@@ -39,7 +38,7 @@ impl Node for WhatsAppBridgeNode {
     async fn provision(
         &self,
         _ctx: InfraProvisionContext,
-        _input: NodeInput,
+        _input: InputBag,
     ) -> WeftResult<InfraSpec> {
         // No programmatic inputs today; the bridge is parameterless.
         // Future: a `device_label` input could be threaded into env.
@@ -116,10 +115,12 @@ impl Node for WhatsAppBridgeNode {
         })
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
-        match ctx.phase {
-            Phase::InfraSetup | Phase::TriggerSetup | Phase::Fire => query_outputs(&ctx).await,
-        }
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // Bridge behaves the same in every phase: resolve the endpoint
+        // and emit it. Downstream nodes (trigger setup, fire-time data
+        // reads) all need the URL.
+        let out = query_outputs(&ctx).await?;
+        ctx.pulse_downstream(out).await
     }
 }
 
@@ -136,11 +137,10 @@ async fn query_outputs(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
     let bridge_outputs = api
         .call(weft_core::EndpointMethod::Get, "/outputs", None)
         .await?;
-    let mut output = NodeOutput::empty().set("endpointUrl", Value::String(api.url().to_string()));
-    if let Value::Object(map) = bridge_outputs {
-        for (k, v) in map {
-            output = output.set(k, v);
-        }
-    }
-    Ok(output)
+    // `endpointUrl` is our locally-known truth (the resolved
+    // EndpointHandle URL). Exclude it from the bridge response merge
+    // so a misbehaving container can't shadow it with its own value.
+    Ok(NodeOutput::empty()
+        .extend_from_object(&bridge_outputs, &["endpointUrl"])
+        .set("endpointUrl", Value::String(api.url().to_string())))
 }

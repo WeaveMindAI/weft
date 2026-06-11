@@ -124,24 +124,11 @@ wire_enum! {
     }
 }
 
-wire_enum! {
-    /// What to do with in-flight Fire-phase executions of the targeted
-    /// project when a lifecycle verb (stop/terminate/deactivate) fires.
-    pub enum RunningPolicy {
-        /// Cancel running execs immediately, then run the lifecycle op.
-        Cancel = "cancel",
-        /// Wait until running_count reaches 0, then run the lifecycle
-        /// op. New fires are gated per the project's lifecycle axes
-        /// (set by the trigger-deactivate step).
-        Wait = "wait",
-    }
-}
-
-impl Default for RunningPolicy {
-    fn default() -> Self {
-        Self::Wait
-    }
-}
+/// What to do with in-flight Fire-phase executions. Defined once in
+/// weft-core (the CLI's build gate and this wire protocol share the
+/// same concept); re-exported here so the existing
+/// `weft_broker_client::protocol::RunningPolicy` paths keep working.
+pub use weft_core::RunningPolicy;
 
 wire_enum! {
     /// How a `deactivate` command should treat the project's signal
@@ -475,6 +462,40 @@ pub struct InfraEndpointUrlRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlResponse {
     pub endpoint_url: Option<String>,
+}
+
+// ---------- Project (worker fetches its own definition) ----------
+
+/// Worker call to fetch the project's runtime `ProjectDefinition`
+/// at execution claim time. Keyed by `(project_id, expected_hash)`:
+/// the hash makes the lookup content-addressed against the
+/// append-only `project_definition` history table.
+///
+/// Server contract: returns the stored `project_json` for the row
+/// at `(project_id, expected_hash)` if it exists (200), or 404 if
+/// no row was ever recorded under that hash. There is no "raced"
+/// case: the history table is append-only, so a hash either has a
+/// row or it doesn't.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectFetchDefinitionRequest {
+    pub project_id: String,
+    /// The definition hash the caller expects the project to have.
+    /// Workers learn it from the `Execute` / `Resume` task payload;
+    /// the dispatcher (which controls task enqueue) stamps it from
+    /// the project row at enqueue time so the worker sees the
+    /// definition the user clicked Run against.
+    pub expected_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectFetchDefinitionResponse {
+    /// Serialized `weft_core::ProjectDefinition`. The client
+    /// `serde_json::from_str` it into the typed value once.
+    pub project_json: String,
+    /// Echoes the `running_definition_hash` the server matched
+    /// against. Same as `expected_hash` on success; included so
+    /// clients can stamp their cache by the verified value.
+    pub definition_hash: String,
 }
 
 // ---------- Supervisor surface (tenant-scoped) ----------
@@ -994,10 +1015,11 @@ pub struct InfraWaitApplyResponse {
 /// field on Sync / Stop / Terminate. One typed shape, no per-endpoint
 /// duplicates.
 ///
-/// Accepts both camelCase (`graceMinutes`, `runningPolicy`) and
-/// snake_case (`grace_minutes`, `running_policy`): the HTTP client
-/// (extension webview, JS) sends camelCase; the supervisor's
-/// machine-to-machine writes use snake_case.
+/// ONE wire spelling: camelCase (`graceMinutes`, `runningPolicy`).
+/// Every producer goes through this typed struct (the extension/CLI
+/// build JSON bodies in camelCase; the supervisor serializes the
+/// struct itself, which emits camelCase via the renames), so there
+/// is no snake_case producer to tolerate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeactivateSpec {
     pub mode: DeactivationMode,
@@ -1005,13 +1027,9 @@ pub struct DeactivateSpec {
     /// `mode = Hibernate`; ignored otherwise. Default 15 keeps the
     /// wire shape forgiving for clients deactivating with
     /// Park/Wipe (no grace concept).
-    #[serde(
-        default = "default_grace_minutes",
-        rename = "graceMinutes",
-        alias = "grace_minutes"
-    )]
+    #[serde(default = "default_grace_minutes", rename = "graceMinutes")]
     pub grace_minutes: u32,
-    #[serde(rename = "runningPolicy", alias = "running_policy")]
+    #[serde(rename = "runningPolicy")]
     pub running_policy: RunningPolicy,
 }
 
@@ -1234,7 +1252,6 @@ mod wire_enum_roundtrips {
     // visible omission in this single list.
     wire_enum_roundtrip_tests!(
         InfraLifecycleVerb,
-        RunningPolicy,
         DeactivationMode,
         InfraNodeStatus,
         ProjectStatus,
@@ -1251,6 +1268,24 @@ mod wire_enum_roundtrips {
 mod supervisor_protocol_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn project_fetch_definition_round_trip() {
+        let req = ProjectFetchDefinitionRequest {
+            project_id: "p1".into(),
+            expected_hash: "abc123".into(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["project_id"], "p1");
+        assert_eq!(v["expected_hash"], "abc123");
+        let resp: ProjectFetchDefinitionResponse = serde_json::from_value(json!({
+            "project_json": "{\"nodes\":[]}",
+            "definition_hash": "abc123",
+        }))
+        .unwrap();
+        assert_eq!(resp.project_json, "{\"nodes\":[]}");
+        assert_eq!(resp.definition_hash, "abc123");
+    }
 
     #[test]
     fn projects_for_tenant_round_trip() {

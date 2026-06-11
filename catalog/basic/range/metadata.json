@@ -1,0 +1,24 @@
+{
+  "type": "Range",
+  "label": "Range",
+  "description": "Produce a list of numbers between `from` (inclusive) and `to` (exclusive), stepping by `step`. Commonly used to drive `Loop(over: [\"values\"])` for count-based iteration.",
+  "category": "basic",
+  "tags": ["number", "list", "range", "loop"],
+  "icon": "Hash",
+  "color": "#64748b",
+  "inputs": [
+    { "name": "from", "type": "Number", "required": false, "configurable": true },
+    { "name": "to", "type": "Number", "required": true, "configurable": true },
+    { "name": "step", "type": "Number", "required": false, "configurable": true }
+  ],
+  "outputs": [
+    { "name": "values", "type": "List[Number]", "required": false }
+  ],
+  "fields": [
+    { "key": "from", "label": "From (inclusive)", "field_type": { "kind": "number" }, "required": false, "default_value": 0 },
+    { "key": "to", "label": "To (exclusive)", "field_type": { "kind": "number" }, "required": true },
+    { "key": "step", "label": "Step", "field_type": { "kind": "number" }, "required": false, "default_value": 1 }
+  ],
+  "entry": [],
+  "requires_infra": false
+}

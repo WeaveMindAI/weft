@@ -1,6 +1,6 @@
 use weft_compiler::weft_compiler::*;
 use weft_core::weft_type::{WeftPrimitive, WeftType};
-use weft_core::LaneMode;
+
 
 #[test]
 fn test_basic_project() {
@@ -143,9 +143,6 @@ output.data = preprocessor.result
     let edge_from_group = result.edges.iter().find(|e| e.target == "output").expect("edge from group");
     assert_eq!(edge_from_group.source, "preprocessor__out");
 
-    // Passthrough input: outputs should have Single lane mode
-    assert_eq!(pt_in.outputs[0].lane_mode, LaneMode::Single);
-    assert_eq!(pt_out.inputs[0].lane_mode, LaneMode::Single);
 }
 
 #[test]
@@ -318,8 +315,7 @@ node = ExecPython(
 
 #[test]
 fn test_group_ports_types() {
-    // v2: no explicit expand/gather. Types are declared as-is.
-    // Expand/gather is inferred during enrichment, not compilation.
+    // Types are declared as-is in the signature.
     let source = r#"
 # Project: GroupPorts
 batch = Group(items: List[String]) -> (results: List[String]) {
@@ -330,15 +326,10 @@ batch = Group(items: List[String]) -> (results: List[String]) {
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile group ports");
     let pt_in = result.nodes.iter().find(|n| n.id == "batch__in").unwrap();
-    // All lane modes are Single after compilation (inference happens in enrichment)
-    assert_eq!(pt_in.inputs[0].lane_mode, LaneMode::Single);
     assert_eq!(pt_in.inputs[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
-    assert_eq!(pt_in.outputs[0].lane_mode, LaneMode::Single);
 
     let pt_out = result.nodes.iter().find(|n| n.id == "batch__out").unwrap();
-    assert_eq!(pt_out.outputs[0].lane_mode, LaneMode::Single);
     assert_eq!(pt_out.outputs[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
-    assert_eq!(pt_out.inputs[0].lane_mode, LaneMode::Single);
     assert_eq!(pt_out.inputs[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
 }
 
@@ -721,64 +712,6 @@ review = HumanQuery {
     assert!(fields.is_array(), "fields should be a JSON array");
 }
 
-// ─── Post-config Output Ports ──────────────────────────────────────────────
-
-#[test]
-fn test_post_config_output_ports() {
-    let source = r#"
-# Project: PostConfig
-node = Llm {
-    temperature: 0.7
-} -> (
-    summary: String,
-    score: Number?
-)
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile post-config output ports");
-    let node = &result.nodes[0];
-    assert_eq!(node.outputs.len(), 2);
-    assert_eq!(node.outputs[0].name, "summary");
-    assert!(node.outputs[0].required);
-    assert_eq!(node.outputs[1].name, "score");
-    assert!(!node.outputs[1].required);
-}
-
-#[test]
-fn test_blank_line_terminates_decl_before_post_sig() {
-    // A decl is one contiguous block: a BLANK line between `}` and a post-body
-    // `-> (out)` ends the decl, so the dangling `-> (...)` is a separate,
-    // malformed statement (loud error), NOT the node's output signature. The
-    // post-sig must sit on the immediately-following line (see the multiline +
-    // separate-line tests below for the accepted forms).
-    let source = "node = Llm {\n    temperature: 0.7\n}\n\n-> (result: String)\n";
-    let errors = compile(source, uuid::Uuid::new_v4(), None).unwrap_err();
-    // The dangling `-> (...)` is unparseable content (a separate statement), so
-    // it surfaces as a loud "Unexpected content" error, not a silent output port.
-    assert!(
-        errors.iter().any(|e| e.message.contains("Unexpected content")),
-        "blank line before -> must be a loud error: {errors:?}"
-    );
-}
-
-#[test]
-fn test_post_config_output_ports_multiline() {
-    let source = r#"
-# Project: PostConfigMulti
-node = Llm {
-    temperature: 0.7
-} -> (
-    summary: String,
-    keywords: List[String],
-    score: Number?
-)
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
-    let node = &result.nodes[0];
-    assert_eq!(node.outputs.len(), 3);
-    assert_eq!(node.outputs[0].name, "summary");
-    assert_eq!(node.outputs[1].name, "keywords");
-    assert_eq!(node.outputs[2].name, "score");
-}
 
 #[test]
 fn test_post_config_duplicate_output_port_error() {
@@ -792,61 +725,8 @@ node = ExecPython() -> (result: String) {
     assert!(result.is_err(), "Duplicate output port 'result' should produce error");
 }
 
-#[test]
-fn test_pre_and_post_config_output_ports_combined() {
-    let source = r#"
-# Project: PreAndPost
-node = ExecPython(data: String) -> (result: String) {
-    code: "return {}"
-} -> (extra: Number)
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile combined pre + post outputs");
-    let node = &result.nodes[0];
-    assert_eq!(node.outputs.len(), 2);
-    assert!(node.outputs.iter().any(|p| p.name == "result"));
-    assert!(node.outputs.iter().any(|p| p.name == "extra"));
-}
 
-#[test]
-fn test_group_post_config_output_ports() {
-    let source = r#"
-# Project: Test
-# Description: Test
 
-test = Group {
-  # This is a test
-
-  inner = Debug { _label: "X" }
-} -> (testing: String)
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
-    if let Err(ref errors) = result {
-        for e in errors { eprintln!("ERR: {}", e); }
-    }
-    let result = result.expect("should compile group with post-config outputs");
-    // The group should have the output port 'testing'
-    let pt_out = result.nodes.iter().find(|n| n.id == "test__out").unwrap();
-    assert!(pt_out.outputs.iter().any(|p| p.name == "testing"), "test__out should have 'testing' output");
-}
-
-#[test]
-fn test_pre_config_and_post_config_outputs_merged() {
-    // Pattern: id = Type -> (pre_output) { config } -> (post_output1, post_output2)
-    // The pre-config output and post-config outputs should all end up on the node.
-    let source = r#"
-# Project: MergedOutputs
-node = ExecPython -> (response: String) {
-    parseJson: true
-} -> (summary: String, score: Number)
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile merged pre+post config outputs");
-    let node = &result.nodes[0];
-    assert_eq!(node.outputs.len(), 3, "should have 3 outputs: response + summary + score");
-    assert!(node.outputs.iter().any(|p| p.name == "response"), "should have response");
-    assert!(node.outputs.iter().any(|p| p.name == "summary"), "should have summary");
-    assert!(node.outputs.iter().any(|p| p.name == "score"), "should have score");
-    assert_eq!(node.config.get("parseJson").unwrap().as_bool().unwrap(), true);
-}
 
 #[test]
 fn test_output_only_no_inputs_no_config() {
@@ -1026,6 +906,25 @@ fn label_must_be_a_quoted_string_or_heredoc() {
     let (p, herr) = compile_lenient("u = Text {\n  _label: ```\nMulti\nLine\n```\n  value: \"x\"\n}\n", uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
     assert!(herr.is_empty(), "heredoc label valid: {herr:?}");
     assert_eq!(p.nodes.iter().find(|n| n.id == "u").and_then(|n| n.label.as_deref()), Some("Multi\nLine"));
+}
+
+#[test]
+fn config_field_in_group_body_is_a_loud_error() {
+    // A config field typed into a plain Group body used to fall into
+    // the lowering catch-all and vanish silently; only Loops take a
+    // config block.
+    let src = r#"
+g = Group(items: List[String]) -> (out: String) {
+    parallel: true
+    t = Text { value: "x" }
+    self.out = t.value
+}
+"#;
+    let (_, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    assert!(
+        errs.iter().any(|e| e.message.contains("groups do not take config fields")),
+        "stray group config field must error loudly: {errs:?}"
+    );
 }
 
 #[test]
@@ -1705,28 +1604,6 @@ output.data = llm.response
     assert_eq!(llm.config.get("temperature").unwrap(), &serde_json::json!(0.5));
 }
 
-#[test]
-fn test_group_with_post_config_outputs_on_inner_node() {
-    let source = r#"
-# Project: InnerPostConfig
-grp = Group(data: String) -> (summary: String, score: Number) {
-    llm = Llm {
-        temperature: 0.7
-    } -> (
-        summary: String,
-        score: Number
-    )
-    llm.prompt = self.data
-    self.summary = llm.summary
-    self.score = llm.score
-}
-"#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile inner node with post-config outputs");
-    let llm = result.nodes.iter().find(|n| n.id == "grp.llm").unwrap();
-    assert_eq!(llm.outputs.len(), 2);
-    assert!(llm.outputs.iter().any(|p| p.name == "summary"));
-    assert!(llm.outputs.iter().any(|p| p.name == "score"));
-}
 
 // ─── Scope & GroupBoundary ─────────────────────────────────────────────
 
@@ -1893,69 +1770,8 @@ outer = Group(data: String) -> (result: String) {
     assert!(deep.scope.iter().any(|s| s == mocked_group), "deep should be inside mocked group");
 }
 
-#[test]
-fn post_config_outputs_one_liner() {
-    // Post-config outputs on a single line must be parsed correctly.
-    // This is the syntax LLMs produce most often.
-    let src = r#"# Project: Test
-# Description: test
 
-draft = LlmInference -> (response: JsonDict) { _label: "Draft", parseJson: true } -> (subject: String, body: String)
-out = Debug
-out.data = draft.subject
-"#;
-    let project = compile(src, uuid::Uuid::new_v4(), None).expect("should compile");
-    let draft = project.nodes.iter().find(|n| n.id == "draft").expect("draft node");
-    let port_names: Vec<&str> = draft.outputs.iter().map(|p| p.name.as_str()).collect();
-    assert!(port_names.contains(&"response"), "missing response port: {:?}", port_names);
-    assert!(port_names.contains(&"subject"), "missing subject post-config port: {:?}", port_names);
-    assert!(port_names.contains(&"body"), "missing body post-config port: {:?}", port_names);
-}
 
-#[test]
-fn post_config_outputs_multi_line() {
-    // Same thing but multi-line config block (was already working, regression test).
-    let src = r#"# Project: Test
-# Description: test
-
-draft = LlmInference -> (response: JsonDict) {
-  _label: "Draft"
-  parseJson: true
-} -> (subject: String, body: String)
-out = Debug
-out.data = draft.subject
-"#;
-    let project = compile(src, uuid::Uuid::new_v4(), None).expect("should compile");
-    let draft = project.nodes.iter().find(|n| n.id == "draft").expect("draft node");
-    let port_names: Vec<&str> = draft.outputs.iter().map(|p| p.name.as_str()).collect();
-    assert!(port_names.contains(&"response"), "missing response port: {:?}", port_names);
-    assert!(port_names.contains(&"subject"), "missing subject post-config port: {:?}", port_names);
-    assert!(port_names.contains(&"body"), "missing body post-config port: {:?}", port_names);
-}
-
-#[test]
-fn post_config_outputs_brace_arrow_same_line() {
-    let src = r#"# Project: Test
-# Description: test
-
-qualify = LlmInference -> (response: JsonDict) { _label: "Qualify Lead", parseJson: true } -> (is_promising: Boolean, reason: String, summary: String)
-draft = LlmInference -> (response: JsonDict) { _label: "Draft Email", parseJson: true } -> (subject: String, body: String)
-out = Debug
-out.data = draft.subject
-"#;
-    let project = compile(src, uuid::Uuid::new_v4(), None).expect("should compile");
-
-    let qualify = project.nodes.iter().find(|n| n.id == "qualify").expect("qualify node");
-    let q_ports: Vec<&str> = qualify.outputs.iter().map(|p| p.name.as_str()).collect();
-    assert!(q_ports.contains(&"is_promising"), "qualify missing is_promising: {:?}", q_ports);
-    assert!(q_ports.contains(&"reason"), "qualify missing reason: {:?}", q_ports);
-    assert!(q_ports.contains(&"summary"), "qualify missing summary: {:?}", q_ports);
-
-    let draft = project.nodes.iter().find(|n| n.id == "draft").expect("draft node");
-    let d_ports: Vec<&str> = draft.outputs.iter().map(|p| p.name.as_str()).collect();
-    assert!(d_ports.contains(&"subject"), "draft missing subject: {:?}", d_ports);
-    assert!(d_ports.contains(&"body"), "draft missing body: {:?}", d_ports);
-}
 
 // ── @file value injection, end to end through compile() ─────────────────
 
@@ -2570,22 +2386,6 @@ fn strict_classifier_rejects_malformed_forms() {
     }
 }
 
-/// `} -> (out)` same-line and `}\n-> (out)` single-newline are valid; a blank
-/// line terminates the decl (the post-sig becomes a separate error statement).
-#[test]
-fn post_body_output_sig_newline_rules() {
-    // valid: arrow on the line after `}`
-    let ok = "n = Llm {\n  temperature: 0.7\n}\n-> (out: String)\n";
-    let p = compile(ok, uuid::Uuid::new_v4(), None).expect("single-newline post-sig is valid");
-    assert!(p.nodes[0].outputs.iter().any(|o| o.name == "out"));
-    // valid: `} -> (` same line, ports span multiple lines inside the parens
-    let ml = "n = Llm {\n  temperature: 0.7\n} -> (\n  out: String\n)\n";
-    assert!(compile(ml, uuid::Uuid::new_v4(), None).is_ok(), "same-line arrow + multiline ports valid");
-    // invalid: a blank line before `->`
-    let bad = "n = Llm {\n  temperature: 0.7\n}\n\n-> (out: String)\n";
-    assert!(compile(bad, uuid::Uuid::new_v4(), None).is_err(), "blank line before -> errors");
-}
-
 /// A connection-RHS inline expr INSIDE a group synthesizes an anon node whose id
 /// matches the edge endpoint that names it (no dangling edge).
 #[test]
@@ -2774,3 +2574,76 @@ fn inline_expr_host_shadowing_group_name_no_double_scope() {
 }
 
 
+
+/// Post-body output port syntax (`} -> (out: T)` after a body close) is
+/// gone. Such source must NOT silently parse as if the output sig were
+/// part of the decl: the `-> (...)` after the `}` is a separate
+/// statement that doesn't fit any line shape, so the parser produces
+/// an ERROR span there. This pins that the form does not round-trip
+/// into a clean `outputs: [...]` on the node anymore.
+#[test]
+fn post_body_output_syntax_is_no_longer_accepted() {
+    let src = "n = Llm { value: \"x\" } -> (out: String)\n";
+    let (project, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let n = project.nodes.iter().find(|x| x.id == "n").expect("node n must exist");
+    let has_out = n.outputs.iter().any(|p| p.name == "out");
+    // BOTH must hold: an `||` here would let a regression that silently
+    // re-adds the port pass whenever any unrelated error exists.
+    assert!(
+        !has_out,
+        "post-body output syntax must not produce an `out` port; got {:?}",
+        n.outputs.iter().map(|p| &p.name).collect::<Vec<_>>(),
+    );
+    assert!(!errs.is_empty(), "the dangling `-> (...)` must produce a parse error");
+}
+
+/// Same test for the separate-line form: `}\n-> (out: T)`.
+#[test]
+fn separate_line_post_body_output_syntax_is_no_longer_accepted() {
+    let src = "n = Llm {\n  value: \"x\"\n}\n-> (out: String)\n";
+    let (project, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let n = project.nodes.iter().find(|x| x.id == "n").expect("node n must exist");
+    let has_out = n.outputs.iter().any(|p| p.name == "out");
+    assert!(
+        !has_out,
+        "separate-line post-body output syntax must not silently add the `out` port; got {:?}",
+        n.outputs.iter().map(|p| &p.name).collect::<Vec<_>>(),
+    );
+    assert!(!errs.is_empty(), "the dangling `-> (...)` must produce a parse error");
+}
+
+#[test]
+fn include_with_internal_loop_lowers() {
+    // Full-mode @include with a Loop inside the included file: the
+    // loop's LoopIn/LoopOut boundary nodes must land scoped under the
+    // call-site alias, same as Group's boundary Passthroughs. A regression
+    // in the include resolution would either drop the Loop or scope it
+    // wrong.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("inner.weft"),
+        "Group(items: List[String]) -> (results: List[String | Null]) {\n  \
+         doit = Loop(items: List[String]) -> (results: List[String | Null]) {\n    \
+           parallel: false\n    \
+           over: [\"items\"]\n    \
+           p = Text { value: self.items }\n    \
+           self.results = p.value\n  \
+         }\n  \
+         doit.items = self.items\n  \
+         self.results = doit.results\n\
+         }\n",
+    ).unwrap();
+    let project = compile("c = @include(\"inner.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path()))
+        .expect("compile with loop inside include");
+    let ids: std::collections::HashSet<(String, String)> = project
+        .nodes
+        .iter()
+        .map(|n| (n.id.clone(), n.node_type.clone()))
+        .collect();
+    // Outer Group boundary Passthroughs scoped under the alias `c`.
+    assert!(ids.contains(&("c__in".into(), "Passthrough".into())), "outer group in: {ids:?}");
+    assert!(ids.contains(&("c__out".into(), "Passthrough".into())), "outer group out: {ids:?}");
+    // Inner Loop boundary nodes scoped one level deeper.
+    assert!(ids.contains(&("c.doit__in".into(), "LoopIn".into())), "loop in: {ids:?}");
+    assert!(ids.contains(&("c.doit__out".into(), "LoopOut".into())), "loop out: {ids:?}");
+}

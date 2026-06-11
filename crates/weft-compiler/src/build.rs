@@ -47,14 +47,25 @@ pub struct BuildResult {
 /// 3. Emit the multi-stage Dockerfile at
 ///    `.weft/target/Dockerfile.worker`.
 /// 4. Stage the docker build context at
-///    `.weft/target/worker-image/` with `build/`, `weft/`, and
-///    the Dockerfile laid out so `docker build .` works.
+///    `.weft/target/worker-image/` with `build/` and, when not
+///    using the pre-built builder base, `weft/` too; the Dockerfile
+///    is laid out so `docker build .` works.
+///
+/// `builder_base_tag` is the shared `weft-builder-base:<hash>` tag
+/// the CLI computed + ensured. When it kicks in (debian-family
+/// runtime, no custom template), the build context omits `weft/`
+/// because the engine workspace already lives inside the base
+/// image at `/weft/`.
 ///
 /// `_release` is currently unused because cargo invocation moved
 /// into the builder image, which always builds release. Kept on
 /// the signature so future debug/release mode selection doesn't
 /// require another plumbing pass.
-pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<BuildResult> {
+pub fn build_project(
+    project_root: &Path,
+    _release: bool,
+    builder_base_tag: &str,
+) -> CompileResult<BuildResult> {
     let project = Project::load(project_root)?;
     let source = project.read_main_weft()?;
 
@@ -79,12 +90,19 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
     codegen::emit(&definition, project_root, &crate_root, &catalog, &crate_name)?;
     let binary_name = sanitize_crate_name(&crate_name);
 
+    // Cargo.lock cache key: the project UUID. NOT `binary_name`
+    // (user-controlled) because two projects can pick the same crate
+    // name and would then share-and-clobber the same cached lock
+    // file on the developer's machine.
+    let lock_key = definition.id.to_string();
     let dockerfile_summary = worker_image::emit(
         &project.manifest.build.worker,
         project_root,
         &catalog,
         &referenced_nodes,
         &binary_name,
+        &lock_key,
+        builder_base_tag,
     )?;
     let dockerfile_path = project_root.join(".weft/target/Dockerfile.worker");
     if let Some(parent) = dockerfile_path.parent() {
@@ -93,6 +111,12 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
     std::fs::write(&dockerfile_path, &dockerfile_summary.body).map_err(CompileError::Io)?;
 
     let weft_root = resolve_weft_root()?;
+    // The pre-built builder base bakes `/weft/` (the engine workspace)
+    // into its layers, so the per-project Dockerfile no longer COPYs
+    // it. Skip the host-side stage of `weft/` in that case (a
+    // unneeded COPY into the context would be wasted bytes + a slower
+    // tarball for the docker build).
+    let stage_weft = dockerfile_summary.builder_base.is_none();
     let build_context = stage_build_context(
         project_root,
         &crate_root,
@@ -100,6 +124,7 @@ pub fn build_project(project_root: &Path, _release: bool) -> CompileResult<Build
         &dockerfile_path,
         &catalog,
         &referenced_nodes,
+        stage_weft,
     )?;
 
     Ok(BuildResult {
@@ -144,6 +169,7 @@ fn stage_build_context(
     dockerfile_path: &Path,
     catalog: &FsCatalog,
     referenced_nodes: &BTreeSet<String>,
+    stage_weft: bool,
 ) -> CompileResult<PathBuf> {
     let ctx = project_root.join(".weft").join("target").join("worker-image");
     if ctx.exists() {
@@ -159,24 +185,31 @@ fn stage_build_context(
     copy_dir_filtered(crate_root, &ctx.join("build"), &["target"])?;
 
     // `weft/` = the language runtime workspace (crates + manifest).
-    // No catalog: node source comes from `project-nodes/` below.
+    // Staged into the build context only when the project Dockerfile
+    // needs to COPY it in (no pre-built builder base, e.g. custom
+    // template or non-debian runtime). When the pre-built base is
+    // used, `/weft/` lives in the base image layers and re-COPYing
+    // it would just bloat the build context tarball.
+    //
     // Excludes match the source-hash walk over `weft_root/crates`
     // (`hash::walk_dir` uses NODE_TREE_EXCLUDE), so what's staged is
     // exactly what's hashed: a file copied-but-not-hashed (or vice
     // versa) is a stale-image hole.
-    let weft_stage = ctx.join("weft");
-    std::fs::create_dir_all(&weft_stage).map_err(CompileError::Io)?;
-    copy_dir_filtered(
-        &weft_root.join("crates"),
-        &weft_stage.join("crates"),
-        weft_catalog::NODE_TREE_EXCLUDE,
-    )?;
-    // Workspace Cargo.toml + Cargo.lock are required for path deps
-    // to resolve inside the container.
-    for name in ["Cargo.toml", "Cargo.lock"] {
-        let src = weft_root.join(name);
-        if src.exists() {
-            std::fs::copy(&src, weft_stage.join(name)).map_err(CompileError::Io)?;
+    if stage_weft {
+        let weft_stage = ctx.join("weft");
+        std::fs::create_dir_all(&weft_stage).map_err(CompileError::Io)?;
+        copy_dir_filtered(
+            &weft_root.join("crates"),
+            &weft_stage.join("crates"),
+            weft_catalog::NODE_TREE_EXCLUDE,
+        )?;
+        // Workspace Cargo.toml + Cargo.lock are required for path deps
+        // to resolve inside the container.
+        for name in ["Cargo.toml", "Cargo.lock"] {
+            let src = weft_root.join(name);
+            if src.exists() {
+                std::fs::copy(&src, weft_stage.join(name)).map_err(CompileError::Io)?;
+            }
         }
     }
 
@@ -205,6 +238,17 @@ fn stage_build_context(
 /// Recursive directory copy with a simple exclude list matched on
 /// the immediate entry name. Skips symlinks to avoid infinite
 /// recursion and unexpected escapes from the staged context.
+///
+/// Preserves mtime on every copied file. The staged build context
+/// feeds straight into docker, which preserves the host mtime on
+/// `COPY`. Cargo's fingerprint short-circuits a clean crate when
+/// every source file's mtime is older than the crate's rlib in the
+/// target dir; without mtime preservation a fresh stage gives every
+/// file a wall-clock mtime, every per-package crate looks dirty,
+/// and cargo recompiles all of them on every edit. Preserving the
+/// host mtime keeps unchanged sources looking unchanged inside the
+/// container, so cargo only rebuilds the package whose node source
+/// genuinely changed (plus the worker relink).
 pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
     std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
     for entry in std::fs::read_dir(src).map_err(CompileError::Io)? {
@@ -224,6 +268,33 @@ pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Com
             copy_dir_filtered(&from, &to, exclude)?;
         } else {
             std::fs::copy(&from, &to).map_err(CompileError::Io)?;
+            // Mirror the source mtime onto the destination so cargo's
+            // fingerprint inside the docker build container sees an
+            // unchanged file as unchanged. Without this, every staging
+            // run gives cargo a "younger than the rlib" mtime and
+            // every per-package crate looks dirty. A failure here only
+            // costs a full rebuild (correctness is unaffected), but an
+            // invisible one would look like the cache mysteriously
+            // stopped working: warn loud.
+            let mtime_result = std::fs::metadata(&from)
+                .map_err(|e| e.to_string())
+                .and_then(|meta| meta.modified().map_err(|e| e.to_string()))
+                .and_then(|modified| {
+                    filetime::set_file_mtime(
+                        &to,
+                        filetime::FileTime::from_system_time(modified),
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            if let Err(e) = mtime_result {
+                tracing::warn!(
+                    target: "weft_compiler::build",
+                    file = %to.display(),
+                    error = %e,
+                    "could not mirror source mtime; the docker build will treat this \
+                     file as changed and rebuild its crate"
+                );
+            }
         }
     }
     Ok(())

@@ -8,9 +8,10 @@
 		ActionBarOverlay,
 		CliPhase,
 	} from '../../../../shared/protocol';
+	import ErrorDetailsModal from './ErrorDetailsModal.svelte';
 
 	let {
-		state,
+		state: barState,
 		drift,
 		onRun,
 		onActivate,
@@ -90,16 +91,26 @@
 	} = $props();
 
 	// ─── Convenience accessors (all backend-side facts) ──────────
-	const backend = $derived<BackendSnapshot>(state.backend);
-	const overlay = $derived<ActionBarOverlay>(state.overlay);
+	const backend = $derived<BackendSnapshot>(barState.backend);
+	const overlay = $derived<ActionBarOverlay>(barState.overlay);
 
 	// Verbs the dispatcher will currently accept. Stays the same
 	// across overlays (cli_running etc): stale-but-known beats
 	// blank for disabled-state derivation.
 	const isVerbAvailable = (v: ActionVerb): boolean => backend.available.includes(v);
 
-	// Drift bits.
-	const sourceDrift = $derived(drift?.sourceDrift ?? false);
+	// Drift bits. The dispatcher reports three independent signals;
+	// each is resolved by its own verb.
+	//   `binaryDrift`    → `build` (worker image inputs changed)
+	//   `definitionDrift` → `resync` (runtime project shape changed)
+	//   `infraDrift`     → `infra_start` / upgrade (infra closure changed)
+	// Today the action bar still lights a single "Resync" affordance
+	// when EITHER binary or definition drifts (the user-facing label
+	// covers both, and the verb is `resync`); `sourceDrift` is the
+	// derived OR until the action bar gets a dedicated Rebuild slot.
+	const binaryDrift = $derived(drift?.binaryDrift ?? false);
+	const definitionDrift = $derived(drift?.definitionDrift ?? false);
+	const sourceDrift = $derived(binaryDrift || definitionDrift);
 	const infraDrift = $derived(drift?.infraDrift ?? false);
 	const hasPreservedState = $derived.by((): boolean => {
 		const p = drift?.preservation;
@@ -360,22 +371,37 @@
 	const btnDisabled = 'disabled:opacity-50 disabled:cursor-not-allowed';
 	const labelCss = 'font-medium text-[11px] uppercase tracking-wider';
 
-	const errorMessage = $derived(state.error?.message);
-	const errorVerb = $derived(state.error?.verb);
+	const errorMessage = $derived(barState.error?.message);
+	const errorVerb = $derived(barState.error?.verb);
+	const currentError = $derived(barState.error);
+	let errorModalOpen: boolean = $state(false);
+	$effect(() => {
+		if (!currentError) errorModalOpen = false;
+	});
 </script>
 
 <div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 z-20">
 
-	<!-- Sticky error banner. Lives independently of the slots; cleared
-	     by the dismiss X or by a successful idle push. -->
+	<!-- Sticky error banner. Whole banner is clickable: opens the
+	     details modal. The trailing X dismisses the error entirely
+	     (clears the banner). Lives independently of the slots; the
+	     banner is also cleared by a successful idle push. -->
 	{#if errorMessage}
-		<div class="flex items-center gap-2 px-3 py-1.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 shadow-sm">
-			<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-			<span class="font-medium">{errorVerb}:</span>
-			<span class="truncate max-w-[400px]" title={errorMessage}>{errorMessage}</span>
+		<div class="flex items-center gap-1 bg-red-50 border border-red-200 rounded-lg shadow-sm">
 			<button
 				type="button"
-				class="ml-1 p-0.5 rounded hover:bg-red-100 text-red-700"
+				class="flex items-center gap-2 px-3 py-1.5 text-xs text-red-700 hover:bg-red-100/60 rounded-l-lg"
+				title="Click to see details"
+				onclick={() => (errorModalOpen = true)}
+			>
+				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+				<span class="font-medium">{errorVerb}:</span>
+				<span class="truncate max-w-[400px]">{errorMessage}</span>
+				<span class="text-[10px] opacity-60 ml-1 underline">details</span>
+			</button>
+			<button
+				type="button"
+				class="mr-1 p-0.5 rounded hover:bg-red-100 text-red-700"
 				title="Dismiss"
 				aria-label="Dismiss error"
 				onclick={onDismissError}
@@ -383,6 +409,11 @@
 				<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 			</button>
 		</div>
+		<ErrorDetailsModal
+			error={barState.error}
+			bind:open={errorModalOpen}
+			onDismissError={() => onDismissError?.()}
+		/>
 	{/if}
 
 	<div class="flex items-center gap-1.5 p-1.5 bg-white border border-zinc-200 rounded-xl shadow-xl backdrop-blur-md">

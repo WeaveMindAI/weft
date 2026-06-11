@@ -4,11 +4,12 @@
 //!     local publishers push directly. Tokio `broadcast::Sender` keyed
 //!     by `project_id`.
 //!   - **Cross-pod fanout via Postgres LISTEN/NOTIFY**: a publisher
-//!     calls `EventBus::publish_local_and_remote`, which (a) pushes
-//!     locally so this pod's SSE consumers see it instantly and (b)
-//!     issues `NOTIFY weft_dispatcher_events, '<json>'`. A long-lived
-//!     LISTEN task on every other pod receives, decodes, and pushes
-//!     to its own local broadcast.
+//!     calls `EventBus::publish`, which (a) pushes locally so this
+//!     pod's SSE consumers see it instantly and (b) issues `NOTIFY
+//!     weft_dispatcher_events, '<json>'`. A long-lived LISTEN task on
+//!     every other pod receives, decodes, and pushes to its own local
+//!     broadcast. Use `publish_local` when the caller knows the event
+//!     is pod-local (no cross-pod fanout needed).
 //!
 //! The split is deliberate: ExecEvent flows through `journal_bridge`
 //! which polls `exec_event` independently on every pod (so each pod
@@ -26,6 +27,7 @@ use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, RwLock};
 
+use weft_core::frames::LoopFrames;
 use weft_core::Color;
 
 /// LISTEN channel name. Single channel for all cross-pod events;
@@ -35,6 +37,7 @@ const NOTIFY_CHANNEL: &str = "weft_dispatcher_events";
 /// An event the dispatcher publishes about some piece of runtime
 /// state changing. Tagged enum so SSE serialization matches the
 /// spec in the design doc.
+// SYNC: DispatcherEvent <-> extension-vscode/src/execFollower.ts DispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DispatcherEvent {
@@ -42,13 +45,53 @@ pub enum DispatcherEvent {
     ExecutionCompleted { color: Color, project_id: String, outputs: serde_json::Value },
     ExecutionFailed { color: Color, project_id: String, error: String },
     ExecutionCancelled { color: Color, project_id: String, reason: String },
-    NodeStarted { color: Color, node: String, lane: String, input: serde_json::Value, project_id: String },
-    NodeSuspended { color: Color, node: String, lane: String, token: String, project_id: String },
-    NodeResumed { color: Color, node: String, lane: String, token: String, value: serde_json::Value, project_id: String },
-    NodeCancelled { color: Color, node: String, lane: String, reason: String, project_id: String },
-    NodeCompleted { color: Color, node: String, lane: String, output: serde_json::Value, project_id: String },
-    NodeFailed { color: Color, node: String, lane: String, error: String, project_id: String },
-    NodeSkipped { color: Color, node: String, lane: String, project_id: String },
+    NodeStarted { color: Color, node: String, frames: LoopFrames, input: serde_json::Value, closed_ports: Vec<String>, project_id: String },
+    NodeSuspended { color: Color, node: String, frames: LoopFrames, token: String, project_id: String },
+    NodeResumed { color: Color, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, project_id: String },
+    NodeCancelled { color: Color, node: String, frames: LoopFrames, reason: String, project_id: String },
+    NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, project_id: String },
+    NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, project_id: String },
+    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, project_id: String },
+    /// A loop instance was created at `parent_frames`. The inspector
+    /// uses this to render a "Loop opened" marker at the loop's box.
+    LoopInstantiated {
+        color: Color,
+        project_id: String,
+        group_id: String,
+        parent_frames: LoopFrames,
+        iter_count: u32,
+        parallel: bool,
+    },
+    /// An iteration of the loop launched. Inspector renders an
+    /// iteration marker at body_frames.
+    LoopIterationLaunched {
+        color: Color,
+        project_id: String,
+        group_id: String,
+        parent_frames: LoopFrames,
+        index: u32,
+    },
+    /// LoopOut fired for iteration `index`. The per-port gather /
+    /// carry writes ride on the journal but are NOT mirrored to the
+    /// inspector stream: the renderer reads the loop's outward emit
+    /// (a normal pulse) and the per-iteration body activity, not the
+    /// LoopOut firing's raw write map.
+    LoopOutFired {
+        color: Color,
+        project_id: String,
+        group_id: String,
+        parent_frames: LoopFrames,
+        index: u32,
+        done_vote: Option<bool>,
+    },
+    /// The loop terminated outward and emitted its outer outputs.
+    LoopTerminated {
+        color: Color,
+        project_id: String,
+        group_id: String,
+        parent_frames: LoopFrames,
+        reason: weft_core::primitive::LoopTerminationReason,
+    },
     CostReported { color: Color, project_id: String, service: String, amount_usd: f64 },
     TriggerUrlChanged { project_id: String, node_id: String, url: String },
     ProjectRegistered { project_id: String, name: String },
@@ -71,6 +114,82 @@ pub enum DispatcherEvent {
     /// supervisor fell back to defaults. Surfaced as a banner in
     /// the action bar so the user sees their config didn't take.
     InfraConfigError { project_id: String, error: String },
+    /// A bus participant came online. `bus_id` is the channel's uuid
+    /// (same one embedded in the bus marker), so the inspector groups
+    /// multiple buses cleanly. `offset` is the bus-local position used
+    /// to tiebreak same-second entries. `at_unix` is the journal's
+    /// stamp so replay renders honest timestamps, not "now".
+    BusJoined {
+        color: Color,
+        project_id: String,
+        bus_id: String,
+        offset: u64,
+        name: String,
+        at_unix: u64,
+    },
+    /// A bus participant dropped. Pairs with `BusJoined` for the same
+    /// `(bus_id, name)`.
+    BusLeft {
+        color: Color,
+        project_id: String,
+        bus_id: String,
+        offset: u64,
+        name: String,
+        at_unix: u64,
+    },
+    /// A `send` landed on a bus. `from` is the registered name of the
+    /// `payload` is the tagged `BusPayload` (`Journaled { value }`
+    /// for journaled buses, `Ephemeral` for ephemeral). The inspector
+    /// renders metadata-only on `Ephemeral` using `payload_byte_size`
+    /// and the 8-byte SHA-256 prefix. Mirrors the journal shape so
+    /// `Journaled { value: Value::Null }` and `Ephemeral` never
+    /// collapse to the same JSON.
+    BusMessage {
+        color: Color,
+        project_id: String,
+        bus_id: String,
+        offset: u64,
+        from: String,
+        msg_kind: String,
+        payload: weft_core::primitive::BusPayload,
+        payload_byte_size: u64,
+        #[serde(with = "weft_core::hex_array8")]
+        payload_sha256_prefix: [u8; 8],
+        at_unix: u64,
+    },
+    /// The bus was closed. Inspector renders an explicit
+    /// `* the bus closed here` marker; replay cursors stop here.
+    BusClosed {
+        color: Color,
+        project_id: String,
+        bus_id: String,
+        offset: u64,
+        at_unix: u64,
+    },
+    /// Graph-level participation: a node was wired to a bus. Derived
+    /// from `PulseEmitted` events whose payload carries a bus marker
+    /// on a `Bus` port: both source and target nodes are participants.
+    /// `ephemeral` is sniffed from the marker JSON itself (which
+    /// encodes the bus's mode) so the inspector can render a mode
+    /// badge in the panel header without a separate journal event.
+    BusParticipant {
+        color: Color,
+        project_id: String,
+        bus_id: String,
+        node_id: String,
+        ephemeral: bool,
+    },
+    /// A journal row could not be applied during fold (corruption).
+    /// Surfaced one-shot at replay time per affected row so the
+    /// inspector can render a muted "N journal rows corrupted"
+    /// line. Not alarming by design: corrupt rows are a real but
+    /// rare event the user only investigates if they look.
+    JournalCorruption {
+        color: Color,
+        project_id: String,
+        site: weft_core::primitive::CorruptionSite,
+        reason: String,
+    },
 }
 
 impl DispatcherEvent {
@@ -87,6 +206,10 @@ impl DispatcherEvent {
             | Self::NodeCompleted { project_id, .. }
             | Self::NodeFailed { project_id, .. }
             | Self::NodeSkipped { project_id, .. }
+            | Self::LoopInstantiated { project_id, .. }
+            | Self::LoopIterationLaunched { project_id, .. }
+            | Self::LoopOutFired { project_id, .. }
+            | Self::LoopTerminated { project_id, .. }
             | Self::CostReported { project_id, .. }
             | Self::TriggerUrlChanged { project_id, .. }
             | Self::ProjectRegistered { project_id, .. }
@@ -96,7 +219,13 @@ impl DispatcherEvent {
             | Self::InfraFlaky { project_id, .. }
             | Self::InfraRecovered { project_id, .. }
             | Self::InfraTerminated { project_id, .. }
-            | Self::InfraConfigError { project_id, .. } => project_id,
+            | Self::InfraConfigError { project_id, .. }
+            | Self::BusJoined { project_id, .. }
+            | Self::BusLeft { project_id, .. }
+            | Self::BusMessage { project_id, .. }
+            | Self::BusClosed { project_id, .. }
+            | Self::BusParticipant { project_id, .. }
+            | Self::JournalCorruption { project_id, .. } => project_id,
         }
     }
 
@@ -113,7 +242,17 @@ impl DispatcherEvent {
             | Self::NodeCompleted { color, .. }
             | Self::NodeFailed { color, .. }
             | Self::NodeSkipped { color, .. }
-            | Self::CostReported { color, .. } => Some(*color),
+            | Self::LoopInstantiated { color, .. }
+            | Self::LoopIterationLaunched { color, .. }
+            | Self::LoopOutFired { color, .. }
+            | Self::LoopTerminated { color, .. }
+            | Self::CostReported { color, .. }
+            | Self::BusJoined { color, .. }
+            | Self::BusLeft { color, .. }
+            | Self::BusMessage { color, .. }
+            | Self::BusClosed { color, .. }
+            | Self::BusParticipant { color, .. }
+            | Self::JournalCorruption { color, .. } => Some(*color),
             Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }
@@ -130,10 +269,11 @@ impl DispatcherEvent {
 #[derive(Clone)]
 pub struct EventBus {
     inner: Arc<RwLock<HashMap<String, broadcast::Sender<DispatcherEvent>>>>,
-    /// Postgres pool used by `publish_local_and_remote` for NOTIFY.
-    /// `None` for tests or single-pod contexts where the cross-pod
-    /// channel isn't wired; in that case `publish_local_and_remote`
-    /// falls back to `publish_local_only` and logs once.
+    /// Postgres pool used by `publish` for NOTIFY. `None` for tests
+    /// or single-pod contexts where the cross-pod channel isn't
+    /// wired; in that case `publish` skips the NOTIFY step and
+    /// behaves like `publish_local` (the absence of cross-pod fanout
+    /// is the caller's responsibility to choose by passing None).
     pool: Option<PgPool>,
 }
 
@@ -210,14 +350,29 @@ impl EventBus {
             }
         };
         // Postgres NOTIFY caps payloads at 8000 bytes (NAMEDATALEN -
-        // some). Skip if our event blew that and rely on the local
-        // broadcast plus the next poll-based fanout.
+        // some). Events sent via `publish()` (vs `publish_local()`)
+        // do NOT have a journal poll-based recovery: ProjectRegistered
+        // / ProjectActivated / ProjectDeactivated / TriggerUrlChanged /
+        // InfraStatusChanged / InfraFlaky / InfraRecovered /
+        // InfraTerminated / InfraConfigError / ExecutionStarted-fast-
+        // path all ride the NOTIFY-only path. If one of these blows
+        // the cap, sibling pods miss the event entirely until the
+        // next user action triggers a fresh round-trip; this is a
+        // real failure mode worth alerting on, not a recoverable
+        // race. Every user-string field on a publish-path event
+        // (`reason` on InfraFlaky, `error` on InfraConfigError,
+        // `name` on ProjectRegistered, `entry_node` on the
+        // ExecutionStarted fast-path, `node_id`/`url` on
+        // TriggerUrlChanged) is bounded at construction via
+        // `weft_core::truncate_user_string(.., 4096)`, so tripping
+        // this branch is an invariant violation (an unbounded field
+        // slipped into a publish-path event), not expected input.
         if payload.len() > 7800 {
-            tracing::warn!(
+            tracing::error!(
                 target: "weft_dispatcher::events",
                 size = payload.len(),
                 kind = ?std::mem::discriminant(&event),
-                "DispatcherEvent too large for NOTIFY; cross-pod skipped"
+                "DispatcherEvent too large for Postgres NOTIFY; sibling pods will miss it"
             );
             return;
         }
@@ -246,34 +401,94 @@ impl EventBus {
     }
 }
 
-/// Long-lived LISTEN handler. Reconnects on error: PgListener handles
-/// connection drops internally, but a fatal error here means we lose
-/// cross-pod fanout, which is a real outage signal.
+/// Long-lived LISTEN handler. Two failure surfaces:
+///
+/// - Initial `connect_with` / `listen` failures (Postgres down at
+///   boot or transient hiccup). The outer reconnect loop retries
+///   with exponential backoff so a Postgres outage at boot doesn't
+///   silently disable cross-pod fanout for the lifetime of this pod
+///   (the earlier shape used `?` on connect/listen and let the spawn
+///   task die on first failure).
+/// - Per-message decode errors and `listener.recv()` errors AFTER a
+///   successful connect. PgListener handles connection drops
+///   internally and re-establishes LISTEN; these get logged and the
+///   inner loop continues. Once recv() returns a hard error that
+///   PgListener can't recover from, we break out of the inner loop
+///   and the outer loop reconnects from scratch.
+///
+/// The outer `Result` is therefore never returned in normal
+/// operation; the function only ends on task cancellation.
 async fn run_listener(pool: PgPool, bus: EventBus) -> anyhow::Result<()> {
-    let mut listener = PgListener::connect_with(&pool).await?;
-    listener.listen(NOTIFY_CHANNEL).await?;
+    let mut backoff_secs: u64 = 1;
+    const BACKOFF_CAP_SECS: u64 = 30;
     loop {
-        match listener.recv().await {
-            Ok(notif) => {
-                let payload = notif.payload();
-                match serde_json::from_str::<DispatcherEvent>(payload) {
-                    Ok(event) => bus.publish_local_inner(&event).await,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "weft_dispatcher::events",
-                            error = %e,
-                            payload_len = payload.len(),
-                            "could not decode NOTIFY payload"
-                        );
-                    }
-                }
-            }
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(l) => l,
             Err(e) => {
                 tracing::warn!(
                     target: "weft_dispatcher::events",
                     error = %e,
-                    "PgListener recv error; PgListener will reconnect"
+                    backoff_secs,
+                    "PgListener connect failed; retrying"
                 );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(BACKOFF_CAP_SECS);
+                continue;
+            }
+        };
+        if let Err(e) = listener.listen(NOTIFY_CHANNEL).await {
+            tracing::warn!(
+                target: "weft_dispatcher::events",
+                error = %e,
+                backoff_secs,
+                "PgListener listen() failed; retrying"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(BACKOFF_CAP_SECS);
+            continue;
+        }
+        // Connected. Do NOT reset backoff yet: a connection that
+        // succeeds at `listen()` but errors on the first `recv()`
+        // (Postgres backend in a restart loop, network flap) would
+        // otherwise busy-loop reconnect with zero sleep. The
+        // connection counts as genuinely usable once it either
+        // receives a message OR survives quietly for a while: a
+        // healthy-but-quiet cluster (no NOTIFY traffic for hours)
+        // must not keep an escalated backoff from an old flap and
+        // pay the 30s cap on every later reconnect.
+        const HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+        let connected_at = std::time::Instant::now();
+        loop {
+            match listener.recv().await {
+                Ok(notif) => {
+                    backoff_secs = 1;
+                    let payload = notif.payload();
+                    match serde_json::from_str::<DispatcherEvent>(payload) {
+                        Ok(event) => bus.publish_local_inner(&event).await,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "weft_dispatcher::events",
+                                error = %e,
+                                payload_len = payload.len(),
+                                "could not decode NOTIFY payload"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    if connected_at.elapsed() >= HEALTHY_AFTER {
+                        backoff_secs = 1;
+                    }
+                    tracing::warn!(
+                        target: "weft_dispatcher::events",
+                        error = %e,
+                        backoff_secs,
+                        "PgListener recv error; reconnecting after backoff"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(BACKOFF_CAP_SECS);
+                    break;
+                }
             }
         }
     }

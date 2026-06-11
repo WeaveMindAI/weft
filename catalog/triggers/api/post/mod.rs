@@ -4,10 +4,11 @@
 //!     node's config (path + optional apiKey toggle) and register
 //!     it. The dispatcher mounts the public URL.
 //!
-//!   - `Phase::Fire`: the dispatcher seeds the raw posted JSON on
-//!     the `__seed__` port. Forward every top-level field to the
-//!     output port with the same name; add `receivedAt` if the
-//!     payload didn't carry one.
+//!   - `Phase::Fire`: the wake payload is the parsed POST body.
+//!     Forward every top-level field to the output port with the
+//!     same name; stamp `observedAt` with the time we received the
+//!     request (distinct from any `receivedAt` the sender may have
+//!     included in the payload).
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -31,7 +32,7 @@ impl Node for ApiPostNode {
         serde_json::from_str(METADATA_JSON).expect("ApiPost metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         match ctx.phase {
             Phase::TriggerSetup => {
                 let path = ctx
@@ -53,32 +54,27 @@ impl Node for ApiPostNode {
                     WebhookAuth::None
                 };
                 ctx.register_signal(Webhook { path, auth }).await?;
-                Ok(NodeOutput::empty())
+                Ok(())
             }
             Phase::Fire => {
-                // `fire_public_entry` seeds the raw POST body into
-                // `__seed__`; fan its top-level keys onto output ports.
-                let body = ctx
-                    .input
-                    .values
-                    .get("__seed__")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let mut output = NodeOutput::empty();
-                if let Value::Object(obj) = body {
-                    for (k, v) in obj {
-                        output = output.set(k, v);
-                    }
-                }
-                if output.get("receivedAt").is_none() {
-                    output = output.set(
-                        "receivedAt",
-                        Value::String(chrono::Utc::now().to_rfc3339()),
-                    );
-                }
-                Ok(output)
+                // Wake payload is the parsed POST body; missing means
+                // the fire path broke (always delivers), non-object
+                // means the sender violated the "body fields as ports"
+                // contract. Both fail loud via wake_payload_object.
+                let body = ctx.wake_payload_object()?;
+                // Fan only DECLARED body fields onto ports: a sender
+                // can include arbitrary extra fields the user never
+                // wired, and emitting an undeclared port would trip the
+                // runtime's loud rejection on an otherwise-fine webhook.
+                // `observedAt` is our stamp (when WE received it),
+                // excluded from the fan so a sender's own `observedAt`
+                // can't override it.
+                let output = NodeOutput::empty()
+                    .extend_from_declared(body, ctx.declared_output_ports(), &["observedAt"])
+                    .set("observedAt", Value::String(chrono::Utc::now().to_rfc3339()));
+                ctx.pulse_downstream(output).await
             }
-            Phase::InfraSetup => Ok(NodeOutput::empty()),
+            Phase::InfraSetup => Ok(()),
         }
     }
 }

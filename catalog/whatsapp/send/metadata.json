@@ -12,8 +12,7 @@
     { "name": "message", "type": "String", "required": true }
   ],
   "outputs": [
-    { "name": "messageId", "type": "String", "required": false },
-    { "name": "success", "type": "Boolean", "required": false }
+    { "name": "messageId", "type": "String", "required": false }
   ],
   "fields": [],
   "requires_infra": false,

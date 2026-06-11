@@ -1,6 +1,6 @@
 //! Runtime type check. The compiler's static pass catches most
-//! mismatches; this helper runs at preprocess/postprocess time to
-//! catch cases where values diverge from declared port types at
+//! mismatches; this helper runs at firing-input and pulse-emit time
+//! to catch cases where values diverge from declared port types at
 //! runtime (e.g., an LLM producing unexpected JSON).
 
 use serde_json::Value;

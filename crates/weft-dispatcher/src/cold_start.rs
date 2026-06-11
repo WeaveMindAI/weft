@@ -35,7 +35,7 @@ pub fn spawn(state: DispatcherState) {
 async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
     // Find projects with pending worker tasks that have no live
     // pod. The sync handler's `replace_stale_worker_if_needed`
-    // already kills + waits-for-fresh-spawn when the source_hash
+    // already kills + waits-for-fresh-spawn when the binary_hash
     // changes BEFORE enqueueing any work, so by the time cold_start
     // runs we only need the simple "no pod, work pending" case.
     let rows = sqlx::query(

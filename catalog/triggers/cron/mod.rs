@@ -3,13 +3,13 @@
 //!   - `Phase::TriggerSetup`: resolve the timer spec from config
 //!     (`cron` / `after_ms` / `at`) and register a Timer signal.
 //!
-//!   - `Phase::Fire`: the listener's timer tick seeded `__seed__`
-//!     with `{scheduledTime, actualTime}`. Forward them to outputs.
+//!   - `Phase::Fire`: the timer listener delivers `{scheduledTime,
+//!     actualTime}` as the wake payload. Forward them to outputs.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::context::Phase;
+use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 use weft_core::signal::{Timer, TimerSpec};
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
@@ -28,40 +28,45 @@ impl Node for CronNode {
         serde_json::from_str(METADATA_JSON).expect("Cron metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         match ctx.phase {
             Phase::TriggerSetup => {
                 let spec = cron_spec_from_config(&ctx)?;
                 ctx.register_signal(Timer { spec }).await?;
-                Ok(NodeOutput::empty())
+                // Setup registers the signal; it emits nothing downstream.
+                Ok(())
             }
             Phase::Fire => {
-                let payload = ctx
-                    .input
-                    .values
-                    .get("__seed__")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let now = chrono::Utc::now().to_rfc3339();
-                let scheduled = payload
-                    .get("scheduledTime")
-                    .cloned()
-                    .unwrap_or_else(|| Value::String(now.clone()));
-                let actual = payload
-                    .get("actualTime")
-                    .cloned()
-                    .unwrap_or(Value::String(now));
-                Ok(NodeOutput::empty()
+                // The timer listener delivers `{scheduledTime,
+                // actualTime}` as the wake payload. Missing either
+                // means the listener contract broke; fail loud rather
+                // than substitute `now()`, which would silently mask
+                // a broken delivery as an on-time fire.
+                let payload = ctx.wake_payload().ok_or_else(|| {
+                    WeftError::NodeExecution(
+                        "Cron Fire: timer listener delivered no wake payload".into(),
+                    )
+                })?;
+                let scheduled = payload.get("scheduledTime").cloned().ok_or_else(|| {
+                    WeftError::NodeExecution(
+                        "Cron Fire: timer payload missing `scheduledTime`".into(),
+                    )
+                })?;
+                let actual = payload.get("actualTime").cloned().ok_or_else(|| {
+                    WeftError::NodeExecution(
+                        "Cron Fire: timer payload missing `actualTime`".into(),
+                    )
+                })?;
+                ctx.pulse_downstream(NodeOutput::empty()
                     .set("scheduledTime", scheduled)
-                    .set("actualTime", actual))
+                    .set("actualTime", actual)).await
             }
-            Phase::InfraSetup => Ok(NodeOutput::empty()),
+            Phase::InfraSetup => Ok(()),
         }
     }
 }
 
 fn cron_spec_from_config(ctx: &ExecutionContext) -> WeftResult<TimerSpec> {
-    use weft_core::error::WeftError;
     let cfg = &ctx.config.values;
     if let Some(expr) = cfg.get("cron").and_then(|v| v.as_str()) {
         return Ok(TimerSpec::Cron {

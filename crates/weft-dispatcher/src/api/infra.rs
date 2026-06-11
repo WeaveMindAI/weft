@@ -39,22 +39,24 @@ use crate::state::DispatcherState;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SyncRequest {
-    #[serde(default, rename = "sourceHash", alias = "source_hash")]
-    pub source_hash: Option<String>,
-    #[serde(default, rename = "infraHash", alias = "infra_hash")]
+    #[serde(default, rename = "binaryHash")]
+    pub binary_hash: Option<String>,
+    #[serde(default, rename = "definitionHash")]
+    pub definition_hash: Option<String>,
+    #[serde(default, rename = "infraHash")]
     pub infra_hash: Option<String>,
     /// Per-(node, image_name) hash map. Shape:
     /// `{ "<node_id>": { "<image_name>": "<hash_tag>" } }`.
     /// Used by `ApplyInfraExecutor` to resolve `Image::Local { name }`
     /// references to concrete docker tags at compile time.
-    #[serde(default, rename = "imageHashes", alias = "image_hashes")]
+    #[serde(default, rename = "imageHashes")]
     pub image_hashes: BTreeMap<String, BTreeMap<String, String>>,
     /// How to deactivate triggers when the project is currently
     /// Active. Required (412 otherwise) when project is Active;
     /// ignored when Inactive. Carries the same `DeactivateSpec`
     /// shape as the standalone `/deactivate` endpoint, so clients
     /// reuse one picker UI.
-    #[serde(default, rename = "triggerDeactivation", alias = "trigger_deactivation")]
+    #[serde(default, rename = "triggerDeactivation")]
     pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
 }
 
@@ -88,13 +90,13 @@ pub struct InfraStatusEntry {
 /// user's choice (same picker as the standalone Deactivate verb).
 #[derive(Debug, Default, Deserialize)]
 pub struct StopRequest {
-    #[serde(default, rename = "triggerDeactivation", alias = "trigger_deactivation")]
+    #[serde(default, rename = "triggerDeactivation")]
     pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PerNodeRequest {
-    #[serde(default, rename = "runningPolicy", alias = "running_policy")]
+    #[serde(default, rename = "runningPolicy")]
     pub running_policy: Option<RunningPolicy>,
     /// Stop only: force scale-to-zero every unit, ignoring `on_stop`.
     /// Lets the user take down a unit that would normally stay up
@@ -188,36 +190,32 @@ async fn sync_inner(
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
     let project_id = id.to_string();
 
-    // Source/infra-hash writes are load-bearing: the supervisor's
-    // apply-hash compute reads them on the next tick to decide
-    // skip/fresh/replace, and `replace_stale_worker_if_needed`
-    // (below) uses the source_hash to decide whether to kill the
-    // running pod. A silent DB failure here would let sync continue
-    // with stale state.
-    if let Some(h) = body.source_hash.as_deref() {
-        state
-            .projects
-            .set_running_source_hash(id, h)
-            .await
-            .map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_source_hash: {e}"))
-            })?;
-    }
-    if let Some(h) = body.infra_hash.as_deref() {
-        state
-            .projects
-            .set_running_infra_hash(id, h)
-            .await
-            .map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_infra_hash: {e}"))
-            })?;
-    }
-    // Source-hash change means the worker pod's baked-in project
-    // definition is stale. Kill it now so the next worker-target
-    // task (the InfraSetup `execute` enqueued below by
+    // Binary / definition / infra-hash writes are load-bearing:
+    // the supervisor's apply-hash compute reads them on the next
+    // tick to decide skip/fresh/replace, and
+    // `replace_stale_worker_if_needed` (below) uses the binary_hash
+    // to decide whether to kill the running pod. One ATOMIC write for
+    // the trio: separate statements opened a window where a crash (or
+    // a sibling Pod's /run between them) saw a new binary hash paired
+    // with an old definition hash.
+    state
+        .projects
+        .set_running_hashes(
+            id,
+            body.binary_hash.as_deref(),
+            body.definition_hash.as_deref(),
+            body.infra_hash.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_hashes: {e}")))?;
+    // A binary-hash change means the worker pod's baked-in
+    // engine/node code is stale. Kill it now so the next
+    // worker-target task (the InfraSetup `execute` enqueued below by
     // `run_infra_setup`) triggers cold_start to spawn a fresh pod
-    // with the up-to-date image. Without this, the stale pod
-    // happily claims the task before cold_start ever notices.
+    // with the new image; definition changes don't need this (the
+    // worker re-fetches the definition per execution by hash).
+    // Without the kill, the stale pod happily claims the task before
+    // cold_start ever notices.
     crate::api::project::replace_stale_worker_if_needed(&state, &project_id)
         .await
         .map_err(|e| {
@@ -672,16 +670,18 @@ mod tests {
     #[test]
     fn sync_request_defaults() {
         let r: SyncRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(r.source_hash.is_none());
+        assert!(r.binary_hash.is_none());
+        assert!(r.definition_hash.is_none());
         assert!(r.infra_hash.is_none());
         assert!(r.image_hashes.is_empty());
         assert!(r.trigger_deactivation.is_none());
     }
 
     #[test]
-    fn sync_request_parses_trigger_deactivation_camelcase_and_snake_case() {
+    fn sync_request_parses_camelcase_only() {
         let camel: SyncRequest = serde_json::from_value(json!({
-            "sourceHash": "abc",
+            "binaryHash": "abc",
+            "definitionHash": "def0",
             "infraHash": "def",
             "imageHashes": { "node1": { "bridge": "x:1" } },
             "triggerDeactivation": {
@@ -691,25 +691,32 @@ mod tests {
             },
         }))
         .unwrap();
-        assert_eq!(camel.source_hash.as_deref(), Some("abc"));
+        assert_eq!(camel.binary_hash.as_deref(), Some("abc"));
+        assert_eq!(camel.definition_hash.as_deref(), Some("def0"));
         let td = camel.trigger_deactivation.expect("trigger_deactivation present");
         assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
         assert_eq!(td.grace_minutes, 30);
         assert_eq!(td.running_policy, RunningPolicy::Wait);
 
+        // ONE wire spelling: snake_case keys are unknown fields, not
+        // a tolerated second dialect. (`SyncRequest`'s fields are all
+        // defaulted, so unknown top-level keys are silently ignored
+        // by serde; the load-bearing check is that the snake key does
+        // NOT populate the field.)
         let snake: SyncRequest = serde_json::from_value(json!({
-            "source_hash": "abc",
-            "trigger_deactivation": {
+            "binary_hash": "abc",
+        }))
+        .unwrap();
+        assert_eq!(snake.binary_hash, None, "snake_case must not populate the field");
+        // A required inner field spelled snake_case fails the parse
+        // outright (`runningPolicy` has no default).
+        let bad_inner: Result<SyncRequest, _> = serde_json::from_value(json!({
+            "triggerDeactivation": {
                 "mode": "wipe",
                 "running_policy": "cancel",
             },
-        }))
-        .unwrap();
-        let td = snake.trigger_deactivation.expect("present");
-        assert_eq!(td.mode, crate::api::project::DeactivationMode::Wipe);
-        // Default applied when grace_minutes omitted from wire.
-        assert_eq!(td.grace_minutes, 15);
-        assert_eq!(td.running_policy, RunningPolicy::Cancel);
+        }));
+        assert!(bad_inner.is_err(), "snake_case runningPolicy must not parse");
     }
 
     #[test]
@@ -743,9 +750,11 @@ mod tests {
         let r: PerNodeRequest =
             serde_json::from_value(json!({"runningPolicy": "cancel"})).unwrap();
         assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
+        // ONE wire spelling: a snake_case key is an unknown field and
+        // must not populate the (defaulted) field.
         let r: PerNodeRequest =
             serde_json::from_value(json!({"running_policy": "wait"})).unwrap();
-        assert_eq!(r.running_policy, Some(RunningPolicy::Wait));
+        assert_eq!(r.running_policy, None, "snake_case must not populate the field");
     }
 
     #[test]

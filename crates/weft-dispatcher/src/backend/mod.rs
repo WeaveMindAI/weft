@@ -50,12 +50,12 @@ pub struct SpawnPodSpec {
     pub namespace: String,
     /// Dispatcher Pod id stamped on the worker_pod row for traceability.
     pub owner_dispatcher: String,
-    /// Source hash that identifies which worker image to pull.
+    /// Binary hash that identifies which worker image to pull.
     /// None when the project has never been built/registered with
     /// a hash by the CLI; backends should fail loudly in that case
     /// rather than fall back to `:latest` so a misconfigured CLI
     /// doesn't silently spawn the wrong image.
-    pub source_hash: Option<String>,
+    pub binary_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]

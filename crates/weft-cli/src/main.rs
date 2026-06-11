@@ -38,9 +38,24 @@ enum Cmd {
     Build,
     /// Run the current project via the dispatcher. Streams logs until
     /// completion or suspension unless `--detach` is set.
+    ///
+    /// If the build's binary changes from the running deployment AND
+    /// executions are still in flight, the run is gated by a dialog
+    /// (interactive TTY) or a structured error (`--json`). Use
+    /// `--running-policy wait` to let in-flight executions finish on
+    /// the old image, or `--running-policy cancel` to kill them
+    /// immediately. The same flag works at the API boundary so the
+    /// VS Code extension can collect the choice in its own dialog
+    /// and pass it back.
     Run {
         #[arg(long)]
         detach: bool,
+        /// `wait` | `cancel`. Tells the build gate what to do when
+        /// the new binary differs and the project has running
+        /// executions. Omit to be prompted (TTY) or to receive a
+        /// structured error (`--json`).
+        #[arg(long, value_name = "POLICY")]
+        running_policy: Option<String>,
     },
     /// Subscribe to the dispatcher's SSE stream for a project.
     Follow { project: String },
@@ -59,6 +74,13 @@ enum Cmd {
         project: Option<String>,
         #[arg(long = "reactivate-choice", value_name = "choice")]
         reactivate_choice: Option<String>,
+        /// `wait` | `cancel`. Pre-answers the stale-binary build
+        /// gate when activating the cwd project rebuilds the worker
+        /// while executions are in flight. Ignored on activate-by-id
+        /// (no build step). Omit to be prompted (TTY) or to receive
+        /// a structured error (`--json`).
+        #[arg(long = "running-policy", value_name = "wait|cancel")]
+        running_policy: Option<String>,
     },
     /// Deactivate a registered project. By default WIPEs (drops
     /// signals + cancels suspended runs); pass `--mode hibernate`
@@ -93,7 +115,14 @@ enum Cmd {
     /// Used after editing the trigger or fire subgraph: drops live
     /// signals, rebuilds if needed, re-registers everything against
     /// the new binary in one shot.
-    Resync,
+    Resync {
+        /// `wait` | `cancel`. Pre-answers the stale-binary build
+        /// gate when the rebuild lands while executions are in
+        /// flight. Omit to be prompted (TTY) or to receive a
+        /// structured error (`--json`).
+        #[arg(long = "running-policy", value_name = "wait|cancel")]
+        running_policy: Option<String>,
+    },
     /// List every project registered with the dispatcher.
     Ps,
     /// Remove a project at the level you ask for. No flags → the
@@ -477,11 +506,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::New { name } => commands::new::run(ctx, name).await,
         Cmd::Build => commands::build::run(ctx).await,
-        Cmd::Run { detach } => commands::run::run(ctx, detach).await,
+        Cmd::Run { detach, running_policy } => commands::run::run(ctx, detach, running_policy).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,
-        Cmd::Activate { project, reactivate_choice } => {
-            commands::activate::run(ctx, project, reactivate_choice).await
+        Cmd::Activate { project, reactivate_choice, running_policy } => {
+            commands::activate::run(ctx, project, reactivate_choice, running_policy).await
         }
         Cmd::Deactivate { project, opts } => {
             commands::deactivate::run(
@@ -499,7 +528,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::CancelRunning { project } => {
             commands::cancel_running::run(ctx, project).await
         }
-        Cmd::Resync => commands::resync::run(ctx).await,
+        Cmd::Resync { running_policy } => commands::resync::run(ctx, running_policy).await,
         Cmd::Ps => commands::ps::run(ctx).await,
         Cmd::Rm { project, infra, journal, image, local, all, force } => {
             commands::rm::run(

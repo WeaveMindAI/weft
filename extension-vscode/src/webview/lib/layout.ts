@@ -4,7 +4,7 @@
 // source stays clean, and it's a frontend concern (where boxes sit on a
 // canvas), so it stays in the webview rather than going through the Rust
 // edit-server. Format, one entry per line:
-//   scopedId @layout x y [WxH] [expanded|collapsed]
+//   scopedId @layout x y [WxH] [expanded|collapsed] [configCollapsed]
 
 export interface LayoutEntry {
   x: number;
@@ -12,6 +12,10 @@ export interface LayoutEntry {
   w?: number;
   h?: number;
   expanded?: boolean;
+  /// Loop-specific: whether the loop's config strip is collapsed
+  /// inside the expanded box. Persists across reloads alongside
+  /// `expanded`. Ignored for non-loop containers.
+  configCollapsed?: boolean;
 }
 
 /** Parse layoutCode into a map of scoped id -> entry. */
@@ -21,9 +25,9 @@ export function parseLayoutCode(layoutCode: string): Record<string, LayoutEntry>
   for (const line of layoutCode.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    const match = trimmed.match(/^(.+?)\s+@layout\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)(?:\s+(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?))?(?:\s+(collapsed|expanded))?\s*$/);
+    const match = trimmed.match(/^(.+?)\s+@layout\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)(?:\s+(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?))?(?:\s+(collapsed|expanded))?(?:\s+(configCollapsed))?\s*$/);
     if (!match) continue;
-    const [, scopedId, xStr, yStr, wStr, hStr, state] = match;
+    const [, scopedId, xStr, yStr, wStr, hStr, state, configState] = match;
     const entry: LayoutEntry = { x: parseFloat(xStr), y: parseFloat(yStr) };
     if (wStr && hStr) {
       entry.w = parseFloat(wStr);
@@ -31,6 +35,7 @@ export function parseLayoutCode(layoutCode: string): Record<string, LayoutEntry>
     }
     if (state === 'expanded') entry.expanded = true;
     if (state === 'collapsed') entry.expanded = false;
+    if (configState === 'configCollapsed') entry.configCollapsed = true;
     map[scopedId] = entry;
   }
   return map;
@@ -53,6 +58,7 @@ export function updateLayoutEntry(
   w?: number,
   h?: number,
   expanded?: boolean | null,
+  configCollapsed?: boolean | null,
 ): string {
   const lines = (layoutCode || '').split('\n');
   const idx = lines.findIndex((l) => {
@@ -64,7 +70,8 @@ export function updateLayoutEntry(
   const mergedW = w !== undefined ? w : prior?.w;
   const mergedH = h !== undefined ? h : prior?.h;
   const mergedExpanded = expanded !== undefined ? expanded : prior?.expanded;
-  const newLine = `${scopedId} ${formatLayoutStr(x, y, mergedW, mergedH, mergedExpanded)}`;
+  const mergedConfigCollapsed = configCollapsed !== undefined ? configCollapsed : prior?.configCollapsed;
+  const newLine = `${scopedId} ${formatLayoutStr(x, y, mergedW, mergedH, mergedExpanded, mergedConfigCollapsed)}`;
   if (idx >= 0) lines[idx] = newLine;
   else lines.push(newLine);
   return lines.filter((l) => l.trim() !== '').join('\n');
@@ -82,11 +89,12 @@ export function removeLayoutEntry(layoutCode: string, scopedId: string): string 
     .join('\n');
 }
 
-function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?: boolean | null): string {
+function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?: boolean | null, configCollapsed?: boolean | null): string {
   let s = `@layout ${Math.round(x)} ${Math.round(y)}`;
   if (w !== undefined && h !== undefined) s += ` ${Math.round(w)}x${Math.round(h)}`;
   if (expanded === true) s += ' expanded';
   if (expanded === false) s += ' collapsed';
+  if (configCollapsed === true) s += ' configCollapsed';
   return s;
 }
 
@@ -109,7 +117,7 @@ export function renameLayoutSubtree(layoutCode: string, oldKey: string, newKey: 
     else if (key.startsWith(oldKey + '.')) nextKey = newKey + key.slice(oldKey.length);
     if (nextKey === null) continue;
     code = removeLayoutEntry(code, key);
-    code = updateLayoutEntry(code, nextKey, entry.x, entry.y, entry.w, entry.h, entry.expanded ?? null);
+    code = updateLayoutEntry(code, nextKey, entry.x, entry.y, entry.w, entry.h, entry.expanded ?? null, entry.configCollapsed ?? null);
   }
   return code;
 }

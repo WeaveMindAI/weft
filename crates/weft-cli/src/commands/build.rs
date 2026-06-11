@@ -1,6 +1,6 @@
 //! `weft build`: compile the current project into a worker
 //! container image. Tagged `weft-worker-<project-id>:<short-hash>`
-//! where the short-hash is the first 12 chars of the source hash
+//! where the short-hash is the first 16 chars of the binary hash
 //! (so each rebuild yields a fresh tag and the cluster pulls the
 //! right image without cache surprises). The build itself runs
 //! in a multi-stage `docker build` so the host needs only
@@ -26,11 +26,11 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         let weft_root = weft_compiler::build::resolve_weft_root()
             .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
         let (definition, catalog) = crate::hash::load_enriched_project(&project)?;
-        let source_hash =
-            crate::hash::compute_source_hash(&definition, &project.root, &weft_root, &catalog)?;
-        let image_tag = worker_image_tag(&project, &source_hash);
+        let binary_hash =
+            crate::hash::compute_binary_hash(&definition, &project, &weft_root, &catalog)?;
+        let image_tag = worker_image_tag(&project, &binary_hash);
         ensure_worker_image_with_progress(&progress, &project, &image_tag).await?;
-        progress.complete(&format!("worker image {}", short_hash(&source_hash)));
+        progress.complete(&format!("worker image {}", short_hash(&binary_hash)));
         Ok(())
     })
     .await
@@ -62,27 +62,34 @@ pub async fn ensure_worker_image_with_progress(
         return Ok(());
     }
 
+    // Per-project builds FROM the shared builder base. Ensure it
+    // exists FIRST (may be a no-op cache hit) so the per-project
+    // build's `FROM weft-builder-base:<hash>` resolves locally. On
+    // a clean machine this is the only "minutes" step the user sees;
+    // every subsequent per-project build is fast.
+    let builder_base_tag = crate::images::ensure_worker_builder_base().await?;
+
     progress.build_start(image_tag);
-    let build = build_project(&project.root, true)
+    let build = build_project(&project.root, true, &builder_base_tag)
         .map_err(|e| anyhow::anyhow!("build failed: {e}"))?;
     docker_build_and_kind_load(progress, image_tag, &build).await?;
     progress.build_done(image_tag);
     Ok(())
 }
 
-/// Compose a hash-tagged worker image name. The hash is the source
-/// hash from `crate::hash::compute_source_hash`; the dispatcher
+/// Compose a hash-tagged worker image name. The hash is the binary
+/// hash from `crate::hash::compute_binary_hash`; the dispatcher
 /// reads the same hash from the project row when picking the image
 /// to spawn.
-pub fn worker_image_tag(project: &Project, source_hash: &str) -> String {
-    format!("weft-worker-{}:{}", project.id(), short_hash(source_hash))
+pub fn worker_image_tag(project: &Project, binary_hash: &str) -> String {
+    format!("weft-worker-{}:{}", project.id(), short_hash(binary_hash))
 }
 
-/// 16-char prefix of the SHA-256 source hash. Enough collision
-/// resistance for a per-project image namespace; short enough to
-/// keep tag strings legible. The dispatcher uses the SAME prefix
-/// (consumes the hash the CLI sent in /projects body and uses it
-/// verbatim as the tag).
+/// 16-char prefix of the SHA-256 hash. Enough collision resistance
+/// for a per-project image namespace; short enough to keep tag
+/// strings legible. The dispatcher uses the SAME prefix (consumes
+/// the hash the CLI sent in /projects body and uses it verbatim as
+/// the tag).
 pub fn short_hash(hash: &str) -> String {
     hash.chars().take(16).collect()
 }

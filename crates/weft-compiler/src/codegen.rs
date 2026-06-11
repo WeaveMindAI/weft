@@ -11,10 +11,9 @@
 //!                       # + per-node deps (deps.toml) for nodes
 //!                       # actually referenced by this project.
 //!   src/
-//!     main.rs           # spawns weft-engine with the static
-//!                       # project + catalog.
-//!     project.rs        # include_str! + OnceLock<ProjectDefinition>.
-//!     project.json      # serialized ProjectDefinition.
+//!     main.rs           # spawns weft-engine; fetches the
+//!                       # ProjectDefinition per execution from the
+//!                       # broker. NO project.json baked in.
 //!     registry.rs       # NodeCatalog impl: pulls in one shim
 //!                       # `pkg_<name>.rs` per referenced package,
 //!                       # dispatches node_type -> struct.
@@ -31,6 +30,16 @@
 //! are always included in an emitted shim (they may be load-bearing
 //! for the referenced nodes; dead-code analysis in the Rust compiler
 //! prunes unused shared helpers).
+//!
+//! Per-execution project fetch: the worker no longer carries a
+//! baked-in `ProjectDefinition`. Each `Execute` / `Resume` task
+//! payload carries the `definition_hash` the user clicked Run
+//! against; the worker fetches the matching definition from the
+//! broker, caches by hash so repeated executions of the same shape
+//! pay one round trip per shape, and runs the engine on that. A
+//! pure config or topology edit therefore no longer regenerates any
+//! source file in this crate, and the resulting docker image is a
+//! cache hit on the project's binary tag.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -59,23 +68,29 @@ pub fn emit(
         .ok_or_else(|| CompileError::Build("cannot resolve weft workspace root".into()))?
         .to_path_buf();
 
-    // Every node type referenced by the project. Passthrough IS
-    // included because it's a real catalog node (the compiler emits
-    // it, but the runtime runs it like any other).
+    // Every CATALOG-resolved node type referenced by the project.
+    // Runtime-internal built-ins (Passthrough, LoopIn, LoopOut, ...)
+    // are excluded: the engine dispatches them inline, so they don't
+    // need a catalog shim and the catalog doesn't carry them.
     let referenced = collect_node_types(project);
 
     // Group referenced nodes by their owning package. `package_key`
-    // is the package root dir; codegen emits one `pkg_<name>.rs`
-    // shim per distinct package.
+    // is the package root dir; codegen emits one `pkg_<name>/` cargo
+    // crate per distinct package (so editing one node's mod.rs
+    // recompiles only ITS package's .rlib + relinks the worker, not
+    // every package).
     let packages = group_by_package(catalog, &referenced)?;
 
-    write_cargo_toml(&crate_root, catalog, &referenced, &packages, crate_name)?;
+    write_worker_cargo_toml(&crate_root, &packages, crate_name)?;
     write_rust_toolchain(&crate_root, &weft_root)?;
-    write_project_json(&src_dir, project)?;
-    write_project_rs(&src_dir)?;
-    write_package_shims(&src_dir, project_root, catalog, &packages)?;
+    // The `ProjectDefinition` is NOT baked into the binary anymore;
+    // workers fetch it from the broker at execution claim time keyed
+    // by `definition_hash`. A pure-config or pure-topology edit
+    // therefore no longer re-bakes any source file into the worker
+    // crate, and the docker image hash stays cache-hit.
+    write_package_crates(&crate_root, project_root, catalog, &packages)?;
     write_registry_rs(&src_dir, &packages)?;
-    write_main_rs(&src_dir, &packages)?;
+    write_main_rs(&src_dir)?;
 
     Ok(crate_root)
 }
@@ -139,143 +154,85 @@ fn sanitize_pkg_ident(raw: &str) -> String {
     out
 }
 
-/// The set of node types this project references, sorted. Exposed
-/// so callers outside codegen (e.g. Dockerfile emission) can walk
-/// the same set without re-implementing the scan.
+/// The set of CATALOG node types this project references, sorted.
+/// Runtime-internal built-in node types (Passthrough, LoopIn,
+/// LoopOut, ...) are excluded: they live in the engine, not the
+/// catalog, and the codegen / hash / docker passes that consume this
+/// set would otherwise fail to resolve them. Exposed so callers
+/// outside codegen (e.g. Dockerfile emission) walk the same set
+/// without re-implementing the filter.
 pub fn collect_node_types(project: &ProjectDefinition) -> BTreeSet<String> {
-    project.nodes.iter().map(|n| n.node_type.clone()).collect()
+    project
+        .nodes
+        .iter()
+        .map(|n| n.node_type.clone())
+        .filter(|t| !crate::weft_compiler::is_reserved_type_keyword(t))
+        .collect()
 }
 
-fn write_cargo_toml(
+/// Emit the worker binary's `Cargo.toml`. Deps are the engine
+/// surface (engine + core + broker-client + platform-traits), the
+/// runtime essentials (tokio, serde, async-trait, anyhow, clap,
+/// tracing, uuid), and one path dep per referenced package crate
+/// under `pkg_<name>/`. Per-package and per-node cargo deps live
+/// inside each package crate's own `Cargo.toml`, NOT here: a node
+/// that pulls in pyo3 stays a recompile-target of its OWN crate,
+/// while the worker keeps cache-hitting on every other build.
+fn write_worker_cargo_toml(
     crate_root: &Path,
-    catalog: &FsCatalog,
-    referenced: &BTreeSet<String>,
     packages: &[PackageEmit<'_>],
     crate_name: &str,
 ) -> CompileResult<()> {
     let package_name = crate::build::sanitize_crate_name(crate_name);
 
-    // Path deps point at `../weft/crates/<name>`, a path that resolves
-    // INSIDE the builder container (weft workspace at `/weft`, project
-    // crate at `/work`) AND on the host (the build context is staged to
-    // the same layout, so an IDE `cargo check` resolves too). The host
-    // weft repo path is never embedded; only this relative path matters.
-    let mut merged: BTreeMap<String, toml::Value> = BTreeMap::new();
+    let mut deps = base_runtime_deps();
     insert_dep(
-        &mut merged,
+        &mut deps,
         "weft-engine",
         toml::Value::Table(path_table("../weft/crates/weft-engine")),
     );
     insert_dep(
-        &mut merged,
+        &mut deps,
         "weft-core",
         toml::Value::Table(path_table("../weft/crates/weft-core")),
     );
     insert_dep(
-        &mut merged,
+        &mut deps,
         "weft-broker-client",
         toml::Value::Table(path_table("../weft/crates/weft-broker-client")),
     );
     insert_dep(
-        &mut merged,
+        &mut deps,
         "weft-platform-traits",
         toml::Value::Table(path_table("../weft/crates/weft-platform-traits")),
     );
     insert_dep(
-        &mut merged,
-        "tokio",
-        toml::Value::Table(version_with_features("1", &["full"])),
-    );
-    insert_dep(
-        &mut merged,
-        "serde_json",
-        toml::Value::String("1".into()),
-    );
-    insert_dep(
-        &mut merged,
-        "serde",
-        toml::Value::Table(version_with_features("1", &["derive"])),
-    );
-    insert_dep(
-        &mut merged,
-        "async-trait",
-        toml::Value::String("0.1".into()),
-    );
-    insert_dep(&mut merged, "anyhow", toml::Value::String("1".into()));
-    insert_dep(
-        &mut merged,
+        &mut deps,
         "clap",
         toml::Value::Table(version_with_features("4", &["derive", "env"])),
     );
-    insert_dep(&mut merged, "tracing", toml::Value::String("0.1".into()));
     insert_dep(
-        &mut merged,
+        &mut deps,
         "tracing-subscriber",
         toml::Value::Table(version_with_features("0.3", &["env-filter"])),
     );
     insert_dep(
-        &mut merged,
+        &mut deps,
         "uuid",
         toml::Value::Table(version_with_features("1", &["v4", "serde"])),
     );
-
-    // Package-level deps from every referenced package's
-    // `package.toml` + node-level deps from each referenced node's
-    // `deps.toml`. Merge into the base deps. Duplicates follow
-    // "later wins" with a warning if the specs diverge; cargo
-    // enforces final compatibility.
-    let mut add_dep = |name: String, value: toml::Value, source: &str| {
-        match merged.get(&name) {
-            Some(existing) if existing != &value => {
-                tracing::warn!(
-                    target: "weft_compiler::codegen",
-                    "dependency '{name}' declared twice with differing specs; keeping newest ({source}). \
-                     Cargo will enforce final version compatibility."
-                );
-                merged.insert(name, value);
-            }
-            _ => {
-                merged.insert(name, value);
-            }
-        }
-    };
+    // One path dep per referenced package crate.
     for pkg in packages {
-        if let Some(deps) = &pkg.package.package_deps {
-            for (name, value) in deps.iter() {
-                add_dep(
-                    name.clone(),
-                    value.clone(),
-                    &format!("package {}", pkg.package.name),
-                );
-            }
-        }
-    }
-    for node_type in referenced {
-        let deps = catalog
-            .deps(node_type)
-            .map_err(|e| CompileError::Build(format!("deps for '{node_type}': {e}")))?;
-        let Some(deps) = deps else { continue };
-        for (name, value) in deps.dependencies {
-            add_dep(name, value, &format!("node {node_type}"));
-        }
+        insert_dep(
+            &mut deps,
+            &pkg.module_ident,
+            toml::Value::Table(path_table(&format!("./{}", pkg.module_ident))),
+        );
     }
 
-    // Serialize the merged deps. For each key: if the value is a
-    // table, emit `key = { ... inline ... }` (that's how cargo wants
-    // inline dependency specs). If it's a string, emit `key = "..."`.
     let mut deps_fragment = String::new();
-    for (name, value) in merged {
-        let line = match &value {
-            toml::Value::String(_) => {
-                format!("{name} = {}", toml_inline(&value))
-            }
-            toml::Value::Table(_) => {
-                format!("{name} = {}", toml_inline(&value))
-            }
-            other => format!("{name} = {}", toml_inline(other)),
-        };
-        deps_fragment.push_str(&line);
-        deps_fragment.push('\n');
+    for (name, value) in deps {
+        deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
     }
 
     let contents = format!(
@@ -297,6 +254,163 @@ path = "src/main.rs"
         deps = deps_fragment,
     );
     std::fs::write(crate_root.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
+    Ok(())
+}
+
+/// Emit one cargo crate per referenced node package. Each lives at
+/// `<crate_root>/pkg_<name>/`. The package crate's `lib.rs` reuses
+/// the original `pkg_<name>.rs` shim shape (`#[path]`-includes of
+/// shared `.rs` files and each referenced node's `mod.rs`); the
+/// difference is that it now compiles to a standalone `.rlib`, so
+/// editing one node's source rebuilds ONLY this crate plus the
+/// worker's link step, leaving sibling package crates cache-hit.
+///
+/// Per-package and per-node cargo deps land here, not on the worker.
+fn write_package_crates(
+    crate_root: &Path,
+    project_root: &Path,
+    catalog: &FsCatalog,
+    packages: &[PackageEmit<'_>],
+) -> CompileResult<()> {
+    let nodes_root = project_root.join("nodes");
+    for pkg in packages {
+        let pkg_dir = crate_root.join(&pkg.module_ident);
+        let pkg_src = pkg_dir.join("src");
+        std::fs::create_dir_all(&pkg_src).map_err(CompileError::Io)?;
+        write_package_cargo_toml(&pkg_dir, catalog, pkg)?;
+        write_package_lib_rs(&pkg_src, &nodes_root, catalog, pkg)?;
+    }
+    Ok(())
+}
+
+fn write_package_cargo_toml(
+    pkg_dir: &Path,
+    catalog: &FsCatalog,
+    pkg: &PackageEmit<'_>,
+) -> CompileResult<()> {
+    // Runtime essentials shared with the worker, plus the workspace
+    // surface every node body uses. The relative path
+    // (`../../weft/...`) is one level deeper than the worker's
+    // (`../weft/...`) because we live under `pkg_<name>/`.
+    let mut deps = base_runtime_deps();
+    insert_dep(
+        &mut deps,
+        "weft-core",
+        toml::Value::Table(path_table("../../weft/crates/weft-core")),
+    );
+
+    if let Some(pkg_deps) = &pkg.package.package_deps {
+        for (name, value) in pkg_deps.iter() {
+            add_dep(
+                &mut deps,
+                &pkg.package.name,
+                name.clone(),
+                value.clone(),
+                &format!("package {}", pkg.package.name),
+            )?;
+        }
+    }
+    for node_type in &pkg.node_types {
+        let node_deps = catalog
+            .deps(node_type)
+            .map_err(|e| CompileError::Build(format!("deps for '{node_type}': {e}")))?;
+        let Some(node_deps) = node_deps else { continue };
+        for (name, value) in node_deps.dependencies {
+            add_dep(&mut deps, &pkg.package.name, name, value, &format!("node {node_type}"))?;
+        }
+    }
+
+    let mut deps_fragment = String::new();
+    for (name, value) in deps {
+        deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
+    }
+
+    let contents = format!(
+        r#"# Emitted by weft codegen. Per-package crate for `{pkg_name}`.
+# Do not edit by hand; regenerated on every `weft build`.
+
+[package]
+name = "{ident}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+{deps}"#,
+        pkg_name = pkg.package.name,
+        ident = pkg.module_ident,
+        deps = deps_fragment,
+    );
+    std::fs::write(pkg_dir.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
+    Ok(())
+}
+
+/// Per-package `lib.rs`: re-exports each referenced node's module
+/// under a snake_case identifier, after pulling in any
+/// shared-package `.rs` files. Same shape as the old `pkg_*.rs`
+/// shim that lived in the worker crate; the only difference is it
+/// compiles to a standalone `.rlib`.
+fn write_package_lib_rs(
+    pkg_src: &Path,
+    nodes_root: &Path,
+    catalog: &FsCatalog,
+    pkg: &PackageEmit<'_>,
+) -> CompileResult<()> {
+    let mut body = String::new();
+    body.push_str(&format!(
+        "//! Package crate for `{}`. Emitted by codegen; do not edit.\n\n",
+        pkg.package.name
+    ));
+    for shared_path in &pkg.package.shared_rs {
+        let mod_name = shared_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                CompileError::Build(format!(
+                    "package {} has shared file with no stem: {}",
+                    pkg.package.name,
+                    shared_path.display()
+                ))
+            })?;
+        let rel = shared_path.strip_prefix(nodes_root).map_err(|_| {
+            CompileError::Build(format!(
+                "shared file {} is not under project nodes root {}",
+                shared_path.display(),
+                nodes_root.display()
+            ))
+        })?;
+        let in_container = format!(
+            "{}/{}",
+            crate::worker_image::NODES_MOUNT,
+            rel.display().to_string().replace('\\', "/"),
+        );
+        body.push_str(&format!(
+            "#[path = \"{in_container}\"]\npub mod {mod_name};\n\n"
+        ));
+    }
+    for node_type in &pkg.node_types {
+        let entry = catalog.entry(node_type).expect("collected from catalog");
+        let mod_rs = entry.source_dir.join("mod.rs");
+        let rel = mod_rs.strip_prefix(nodes_root).map_err(|_| {
+            CompileError::Build(format!(
+                "node source {} is not under project nodes root {}",
+                mod_rs.display(),
+                nodes_root.display()
+            ))
+        })?;
+        let in_container = format!(
+            "{}/{}",
+            crate::worker_image::NODES_MOUNT,
+            rel.display().to_string().replace('\\', "/"),
+        );
+        let mod_name = ident_for_node_type(node_type);
+        body.push_str(&format!(
+            "#[path = \"{in_container}\"]\npub mod {mod_name};\n\n"
+        ));
+    }
+    std::fs::write(pkg_src.join("lib.rs"), body).map_err(CompileError::Io)?;
     Ok(())
 }
 
@@ -368,117 +482,152 @@ fn insert_dep(map: &mut BTreeMap<String, toml::Value>, name: &str, value: toml::
     map.insert(name.into(), value);
 }
 
-fn write_project_json(src_dir: &Path, project: &ProjectDefinition) -> CompileResult<()> {
-    let json = serde_json::to_string_pretty(project)
-        .map_err(|e| CompileError::Build(format!("serialize project: {e}")))?;
-    std::fs::write(src_dir.join("project.json"), json).map_err(CompileError::Io)?;
-    Ok(())
+/// The shared runtime dep pins every generated crate builds against:
+/// the worker binary and each per-package crate start from this set,
+/// then add their own extras on top. One definition makes the
+/// "same versions everywhere" contract structural, so the workspace
+/// cargo lockfile resolves to a single copy of each.
+fn base_runtime_deps() -> BTreeMap<String, toml::Value> {
+    let mut deps: BTreeMap<String, toml::Value> = BTreeMap::new();
+    insert_dep(
+        &mut deps,
+        "tokio",
+        toml::Value::Table(version_with_features("1", &["full"])),
+    );
+    insert_dep(&mut deps, "serde_json", toml::Value::String("1".into()));
+    insert_dep(
+        &mut deps,
+        "serde",
+        toml::Value::Table(version_with_features("1", &["derive"])),
+    );
+    insert_dep(&mut deps, "async-trait", toml::Value::String("0.1".into()));
+    insert_dep(&mut deps, "anyhow", toml::Value::String("1".into()));
+    insert_dep(&mut deps, "tracing", toml::Value::String("0.1".into()));
+    deps
 }
 
-fn write_project_rs(src_dir: &Path) -> CompileResult<()> {
-    let contents = r#"//! Project shape loaded from the JSON emitted by codegen. Parsed
-//! once per worker invocation via `OnceLock`; subsequent access is a
-//! plain pointer deref.
-
-use std::sync::OnceLock;
-
-use weft_core::ProjectDefinition;
-
-static PROJECT_JSON: &str = include_str!("project.json");
-
-static PROJECT: OnceLock<ProjectDefinition> = OnceLock::new();
-
-/// Return the statically embedded project definition. Parses the JSON
-/// on first access; subsequent calls return the cached value.
-pub fn project() -> &'static ProjectDefinition {
-    PROJECT.get_or_init(|| {
-        serde_json::from_str(PROJECT_JSON)
-            .expect("BUG: emitted project.json is not valid ProjectDefinition")
-    })
-}
-"#;
-    std::fs::write(src_dir.join("project.rs"), contents).map_err(CompileError::Io)?;
-    Ok(())
-}
-
-/// One shim file per referenced package. `#[path]` includes point
-/// at paths INSIDE the builder container: the build step stages the
-/// project's `nodes/` at `NODES_MOUNT` (`/weft/project-nodes`), so a
-/// shim for the `basic` package reaches its debug node at
-/// `/weft/project-nodes/basic/debug/mod.rs`.
-///
-/// Nodes reach their shared helpers via plain `use super::<shared>;`
-/// because the shim wraps every node and shared file under one
-/// Rust module (one module per package).
-fn write_package_shims(
-    src_dir: &Path,
-    project_root: &Path,
-    catalog: &FsCatalog,
-    packages: &[PackageEmit<'_>],
+/// Insert a package- or node-declared cargo dep, MERGING with any
+/// already-resolved spec (the runtime baseline or an earlier
+/// declaration in the same package). The merge mirrors cargo's own
+/// model: if version/path/git and every non-`features` key AGREE, the
+/// two `features` lists are UNIONED (so a node can legitimately add a
+/// feature to a baseline crate, e.g. ask for serde's `rc` on top of
+/// `derive`). A REAL conflict (different version, different source, or a
+/// disagreeing non-features key) is a hard build error: silently keeping
+/// either spec would let one node's deps.toml clobber a baseline pin and
+/// break sibling nodes. Equality is structural, so `serde = "1"` and
+/// `serde = { version = "1" }` are the same spec, not a conflict.
+fn add_dep(
+    deps: &mut BTreeMap<String, toml::Value>,
+    pkg_name: &str,
+    name: String,
+    value: toml::Value,
+    source: &str,
 ) -> CompileResult<()> {
-    // Anchor every node's `#[path]` at the project's `nodes/` root.
-    // The docker build stages `nodes/` verbatim at NODES_MOUNT, so a
-    // node living at `nodes/basic/debug/mod.rs` resolves to
-    // `/weft/project-nodes/basic/debug/mod.rs` via the same relative
-    // suffix.
-    let nodes_root = project_root.join("nodes");
-    for pkg in packages {
-        let mut body = String::new();
-        body.push_str(&format!(
-            "//! Package shim for `{}`. Emitted by codegen; do not edit.\n\n",
-            pkg.package.name
-        ));
-        for shared_path in &pkg.package.shared_rs {
-            let mod_name = shared_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| {
-                    CompileError::Build(format!(
-                        "package {} has shared file with no stem: {}",
-                        pkg.package.name,
-                        shared_path.display()
-                    ))
-                })?;
-            let rel = shared_path.strip_prefix(&nodes_root).map_err(|_| {
+    match deps.remove(&name) {
+        Some(existing) => {
+            let merged = merge_dep_specs(&existing, &value).map_err(|conflict| {
                 CompileError::Build(format!(
-                    "shared file {} is not under project nodes root {}",
-                    shared_path.display(),
-                    nodes_root.display()
+                    "package '{pkg_name}': {source} declares {name} = {}, which conflicts with \
+                     the already-resolved {name} = {} ({conflict}); align the specs in deps.toml",
+                    toml_inline(&value),
+                    toml_inline(&existing),
                 ))
             })?;
-            let in_container = format!(
-                "{}/{}",
-                crate::worker_image::NODES_MOUNT,
-                rel.display().to_string().replace('\\', "/"),
-            );
-            body.push_str(&format!(
-                "#[path = \"{in_container}\"]\npub mod {mod_name};\n\n"
-            ));
+            deps.insert(name, merged);
+            Ok(())
         }
-        for node_type in &pkg.node_types {
-            let entry = catalog.entry(node_type).expect("collected from catalog");
-            let mod_rs = entry.source_dir.join("mod.rs");
-            let rel = mod_rs.strip_prefix(&nodes_root).map_err(|_| {
-                CompileError::Build(format!(
-                    "node source {} is not under project nodes root {}",
-                    mod_rs.display(),
-                    nodes_root.display()
-                ))
-            })?;
-            let in_container = format!(
-                "{}/{}",
-                crate::worker_image::NODES_MOUNT,
-                rel.display().to_string().replace('\\', "/"),
-            );
-            let mod_name = ident_for_node_type(node_type);
-            body.push_str(&format!(
-                "#[path = \"{in_container}\"]\npub mod {mod_name};\n\n"
-            ));
+        None => {
+            deps.insert(name, value);
+            Ok(())
         }
-        let file = src_dir.join(format!("{}.rs", pkg.module_ident));
-        std::fs::write(&file, body).map_err(CompileError::Io)?;
     }
-    Ok(())
+}
+
+/// Normalize a cargo dep spec (bare `"1.0"` string or an inline table)
+/// to table form, so two spellings of the same spec compare equal.
+fn normalize_dep_spec(value: &toml::Value) -> toml::value::Table {
+    match value {
+        toml::Value::Table(t) => t.clone(),
+        other => {
+            let mut t = toml::value::Table::new();
+            t.insert("version".into(), other.clone());
+            t
+        }
+    }
+}
+
+/// Merge two dep specs per cargo's additive-feature model. Returns the
+/// merged spec, or an Err(reason) string naming the disagreeing key on a
+/// real conflict (version/path/git/source or any non-`features` key).
+fn merge_dep_specs(a: &toml::Value, b: &toml::Value) -> Result<toml::Value, String> {
+    let ta = normalize_dep_spec(a);
+    let tb = normalize_dep_spec(b);
+
+    // The non-`features` key SETS must be identical, with identical
+    // values. A key present on only ONE side is a conflict, not a free
+    // adoption: `{version="1"}` vs `{version="1", default-features=false}`
+    // disagree (implicit default-features is true), `package`/`path`/`git`
+    // on one side silently changes the source the other pinned. Only
+    // `features` may differ (cargo unions them).
+    let non_feature_keys = |t: &toml::value::Table| -> std::collections::BTreeSet<String> {
+        t.keys().filter(|k| *k != "features").cloned().collect()
+    };
+    let keys_a = non_feature_keys(&ta);
+    let keys_b = non_feature_keys(&tb);
+    for key in keys_a.union(&keys_b) {
+        match (ta.get(key), tb.get(key)) {
+            (Some(av), Some(bv)) if av != bv => {
+                return Err(format!(
+                    "differing `{key}`: {} vs {}",
+                    toml_inline(av),
+                    toml_inline(bv)
+                ));
+            }
+            (Some(_), Some(_)) => {}
+            // Present on exactly one side.
+            (Some(only), None) | (None, Some(only)) => {
+                return Err(format!(
+                    "`{key}` = {} is declared by only one spec; both specs must agree on every \
+                     non-feature key",
+                    toml_inline(only)
+                ));
+            }
+            (None, None) => unreachable!("key came from the union of both"),
+        }
+    }
+
+    let mut merged = ta.clone();
+
+    // Union the feature lists (dedup, order-stable: a's features then
+    // b's new ones).
+    let features_of = |t: &toml::value::Table| -> Vec<toml::Value> {
+        t.get("features")
+            .and_then(|f| f.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut feats = features_of(&ta);
+    for f in features_of(&tb) {
+        if !feats.contains(&f) {
+            feats.push(f);
+        }
+    }
+    if feats.is_empty() {
+        merged.remove("features");
+    } else {
+        merged.insert("features".into(), toml::Value::Array(feats));
+    }
+
+    // Collapse back to the bare-string form when the only key is
+    // `version` (keeps generated Cargo.toml tidy and matches how
+    // baselines without features are written).
+    if merged.len() == 1 {
+        if let Some(v @ toml::Value::String(_)) = merged.get("version") {
+            return Ok(v.clone());
+        }
+    }
+    Ok(toml::Value::Table(merged))
 }
 
 fn write_registry_rs(
@@ -487,8 +636,9 @@ fn write_registry_rs(
 ) -> CompileResult<()> {
     let mut body = String::new();
     body.push_str("//! Per-project NodeCatalog. Dispatches node_type strings to\n");
-    body.push_str("//! the node structs compiled in through each package shim\n");
-    body.push_str("//! (`pkg_*` modules declared in main.rs).\n\n");
+    body.push_str("//! the node structs in each `pkg_<name>` crate. Each package\n");
+    body.push_str("//! is its own cargo crate, so editing one node's source\n");
+    body.push_str("//! recompiles only that crate; the registry below relinks.\n\n");
     body.push_str("use weft_core::node::{FormFieldSpec, Node, NodeCatalog};\n\n");
     body.push_str("pub struct ProjectCatalog;\n\n");
     body.push_str("impl NodeCatalog for ProjectCatalog {\n");
@@ -498,7 +648,7 @@ fn write_registry_rs(
         for node_type in &pkg.node_types {
             let struct_mod = ident_for_node_type(node_type);
             body.push_str(&format!(
-                "            \"{nt}\" => Some(&crate::{pkg_mod}::{struct_mod}::{nt}Node as &'static dyn Node),\n",
+                "            \"{nt}\" => Some(&{pkg_mod}::{struct_mod}::{nt}Node as &'static dyn Node),\n",
                 nt = node_type,
                 pkg_mod = pkg.module_ident,
                 struct_mod = struct_mod,
@@ -546,11 +696,10 @@ fn ident_for_node_type(node_type: &str) -> String {
     out
 }
 
-fn write_main_rs(src_dir: &Path, packages: &[PackageEmit<'_>]) -> CompileResult<()> {
-    let mut pkg_mods = String::new();
-    for pkg in packages {
-        pkg_mods.push_str(&format!("mod {};\n", pkg.module_ident));
-    }
+// Each package crate is an EXTERNAL cargo dep (path = "./pkg_<name>"
+// in Cargo.toml), so the worker binary just uses them as crates and
+// main.rs needs no package knowledge (no `mod pkg_<name>;`).
+fn write_main_rs(src_dir: &Path) -> CompileResult<()> {
     let contents = format!(
         r#"//! Project worker binary. Spawned by the dispatcher as part of
 //! a per-project pool. Claims `target=worker` tasks for its own
@@ -562,15 +711,14 @@ use std::sync::Arc;
 use clap::Parser;
 
 use weft_broker_client::{{
-    BrokerInfraClient, BrokerInfraStateClient, BrokerJournalClient, BrokerTaskStoreClient,
-    BrokerWorkerPodClient, TokenSource,
+    BrokerInfraClient, BrokerInfraStateClient, BrokerJournalClient, BrokerProjectClient,
+    BrokerTaskStoreClient, BrokerWorkerPodClient, TokenSource,
 }};
 use weft_core::NodeCatalog;
 use weft_engine::EngineClients;
 
-mod project;
 mod registry;
-{pkg_mods}
+
 #[derive(Debug, Parser)]
 #[command(name = "weft-project-worker", version)]
 struct Args {{
@@ -633,6 +781,7 @@ async fn main() -> anyhow::Result<()> {{
     let worker_pods = BrokerWorkerPodClient::new(args.broker_url.clone(), token.clone());
     let infra = BrokerInfraClient::new(args.broker_url.clone(), token.clone());
     let infra_state = BrokerInfraStateClient::new(args.broker_url.clone(), token.clone());
+    let project = BrokerProjectClient::new(args.broker_url.clone(), token.clone());
 
     // The Broker*Client constructors already return `Arc<Self>`, so
     // pass them straight into the `Arc<dyn _>` fields (re-wrapping
@@ -643,14 +792,13 @@ async fn main() -> anyhow::Result<()> {{
         tasks,
         infra,
         infra_state,
+        project,
         clock: std::sync::Arc::new(weft_platform_traits::clock::SystemClock),
     }};
 
-    let project = project::project().clone();
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;
 
     weft_engine::run_pod(
-        project,
         catalog,
         clients,
         worker_pods,
@@ -679,9 +827,153 @@ impl NodeCatalog for CatalogRef {{
     }}
 }}
 "#,
-        pkg_mods = pkg_mods,
     );
     std::fs::write(src_dir.join("main.rs"), contents).map_err(CompileError::Io)?;
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::collect_node_types;
+    use weft_core::project::{NodeDefinition, ProjectDefinition, Position};
+    use weft_core::NodeFeatures;
+
+    fn make_node(id: &str, node_type: &str) -> NodeDefinition {
+        NodeDefinition {
+            id: id.into(),
+            node_type: node_type.into(),
+            label: None,
+            config: serde_json::Value::Object(Default::default()),
+            position: Position { x: 0.0, y: 0.0 },
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            features: NodeFeatures::default(),
+            scope: Vec::new(),
+            group_boundary: None,
+            requires_infra: false,
+            images: Vec::new(),
+            span: None,
+            header_span: None,
+            config_spans: Default::default(),
+            file_refs: Default::default(),
+            include_path: None,
+        }
+    }
+
+    /// Regression: codegen's `collect_node_types` used to return every
+    /// node's `node_type` verbatim, including runtime-internal built-ins
+    /// (Passthrough, LoopIn, LoopOut). Downstream callers (worker-image
+    /// build, source-hash) then fed those to the catalog and the build
+    /// failed with `node 'LoopIn' not found in catalog`. The filter
+    /// must drop those before the catalog lookup.
+    #[test]
+    fn collect_node_types_excludes_runtime_builtins() {
+        let project = ProjectDefinition {
+            id: uuid::Uuid::nil(),
+            nodes: vec![
+                make_node("user_node", "Text"),
+                make_node("my_loop__in", "LoopIn"),
+                make_node("my_loop__out", "LoopOut"),
+                make_node("my_group__in", "Passthrough"),
+                make_node("my_group__out", "Passthrough"),
+            ],
+            edges: Vec::new(),
+            groups: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let types = collect_node_types(&project);
+        assert!(types.contains("Text"), "user catalog type included: {types:?}");
+        assert!(!types.contains("LoopIn"), "LoopIn excluded: {types:?}");
+        assert!(!types.contains("LoopOut"), "LoopOut excluded: {types:?}");
+        assert!(!types.contains("Passthrough"), "Passthrough excluded: {types:?}");
+    }
+
+    use super::{add_dep, merge_dep_specs};
+    use std::collections::BTreeMap;
+
+    fn tbl(s: &str) -> toml::Value {
+        toml::from_str::<toml::Value>(&format!("x = {s}")).unwrap()["x"].clone()
+    }
+
+    #[test]
+    fn merge_unions_features_of_same_version() {
+        // serde with derive, plus a node asking for rc on top -> union.
+        let merged = merge_dep_specs(
+            &tbl(r#"{ version = "1", features = ["derive"] }"#),
+            &tbl(r#"{ version = "1", features = ["rc", "derive"] }"#),
+        )
+        .expect("compatible specs merge");
+        let feats: Vec<&str> = merged["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(feats, vec!["derive", "rc"], "features unioned, deduped");
+        assert_eq!(merged["version"].as_str(), Some("1"));
+    }
+
+    #[test]
+    fn merge_treats_bare_and_table_version_as_equal() {
+        // `serde = "1"` vs `serde = { version = "1" }` is NOT a conflict.
+        let merged = merge_dep_specs(&tbl(r#""1""#), &tbl(r#"{ version = "1" }"#))
+            .expect("same version, different spelling");
+        assert_eq!(merged.as_str(), Some("1"), "collapses to bare string");
+    }
+
+    #[test]
+    fn merge_errors_on_real_version_conflict() {
+        let err = merge_dep_specs(&tbl(r#""1""#), &tbl(r#""2""#))
+            .expect_err("different versions conflict");
+        assert!(err.contains("version"), "{err}");
+    }
+
+    #[test]
+    fn merge_errors_on_one_sided_non_feature_key() {
+        // default-features on one side only: implicit true vs explicit
+        // false is a real disagreement, not a free adoption.
+        let err = merge_dep_specs(
+            &tbl(r#"{ version = "1" }"#),
+            &tbl(r#"{ version = "1", default-features = false }"#),
+        )
+        .expect_err("one-sided default-features is a conflict");
+        assert!(err.contains("default-features"), "{err}");
+
+        // A path/package on one side silently changes the source.
+        let err = merge_dep_specs(&tbl(r#""1""#), &tbl(r#"{ path = "../x" }"#))
+            .expect_err("one-sided path is a conflict");
+        assert!(err.contains("path") || err.contains("version"), "{err}");
+    }
+
+    #[test]
+    fn add_dep_unions_against_baseline() {
+        let mut deps: BTreeMap<String, toml::Value> = BTreeMap::new();
+        deps.insert("serde".into(), tbl(r#"{ version = "1", features = ["derive"] }"#));
+        add_dep(
+            &mut deps,
+            "pkg",
+            "serde".into(),
+            tbl(r#"{ version = "1", features = ["rc"] }"#),
+            "node Foo",
+        )
+        .expect("additive feature merges, not errors");
+        let feats: Vec<&str> = deps["serde"]["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(feats, vec!["derive", "rc"]);
+    }
+
+    #[test]
+    fn add_dep_still_errors_on_conflict() {
+        let mut deps: BTreeMap<String, toml::Value> = BTreeMap::new();
+        deps.insert("tokio".into(), tbl(r#""1""#));
+        let err = add_dep(&mut deps, "pkg", "tokio".into(), tbl(r#""2""#), "node Bar")
+            .expect_err("version conflict is a hard error");
+        assert!(matches!(err, super::CompileError::Build(_)));
+    }
+}

@@ -4,6 +4,12 @@
 //! weft-declared custom ports for nodes with
 //! canAddInputPorts/canAddOutputPorts, and validate that every
 //! referenced node type exists.
+//!
+//! Three node-types are built-in (not catalog): `Passthrough` (group
+//! boundary), `LoopIn` / `LoopOut` (loop boundary). Their port shapes
+//! are written by the compiler's lowering (`flatten_group` in
+//! `weft_compiler.rs`); enrich does not consult the catalog for them
+//! (it `continue`s past these node types).
 
 use serde_json::Value;
 
@@ -13,8 +19,6 @@ use weft_core::weft_type::WeftType;
 
 use crate::error::{CompileError, CompileResult};
 
-/// Which side of a port we're merging. Only used for human-readable
-/// diagnostic messages from `merge_ports`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortDirection {
     Input,
@@ -30,24 +34,6 @@ impl PortDirection {
     }
 }
 
-/// Merge weft-declared ports with catalog ports. Rules:
-///
-/// 1. Every catalog port is present in the result. Catalog is the
-///    source of truth for port identity, lane_mode, and type
-///    (except when catalog type is `MustOverride`, where the
-///    weft-declared type becomes the real type).
-/// 2. A weft port that matches a catalog port by name can:
-///    - override `required` (either direction),
-///    - narrow the type if catalog's type is MustOverride, or
-///      compatible with the weft declaration.
-///    - Incompatible types produce an enrich error tied to the
-///      node id.
-/// 3. A weft port with no matching catalog port:
-///    - If the node has `can_add` for this direction, added to
-///      the result verbatim (must carry a real type).
-///    - Else a warning is logged and the port is dropped. The
-///      compile still succeeds (the weft graph just loses the
-///      connection, which downstream validate flags).
 fn merge_ports(
     catalog_ports: &[PortDefinition],
     weft_ports: &[PortDefinition],
@@ -63,9 +49,6 @@ fn merge_ports(
         .map(|p| (p.name.as_str(), p))
         .collect();
 
-    // Walk catalog ports first so the result carries them all, in
-    // declaration order. For each one, if the weft source re-stated
-    // it, apply the override rules.
     let mut result: Vec<PortDefinition> = catalog_ports
         .iter()
         .map(|cp| {
@@ -73,25 +56,12 @@ fn merge_ports(
                 return cp.clone();
             };
             let mut merged = cp.clone();
-            // required: weft wins in either direction.
             merged.required = wp.required;
-
-            // Type override. Catalog `MustOverride` means "the node
-            // doesn't know yet, whoever wires me tells me." In that
-            // case the weft type IS the type. Otherwise the weft
-            // type must be compatible with (a subtype / narrowing
-            // of) the catalog type; incompatible → hard error.
             if !wp.port_type.is_must_override() {
                 if cp.port_type.is_must_override()
                     || WeftType::is_compatible(&wp.port_type, &cp.port_type)
                 {
                     merged.port_type = wp.port_type.clone();
-                    // The user RESTATED the type in the .weft
-                    // source: surface that to validate so the
-                    // implicit-expand/gather warnings can stay
-                    // quiet for edges where both sides are
-                    // user-stated.
-                    merged.user_typed = true;
                 } else {
                     errors.push(format!(
                         "node '{}': {} port '{}' declared type {} incompatible with catalog type {}",
@@ -103,37 +73,38 @@ fn merge_ports(
                     ));
                 }
             }
-
-            if wp.lane_mode != cp.lane_mode && wp.lane_mode != Default::default() {
-                tracing::warn!(
-                    "enrich: node '{}' {} port '{}': weft lane_mode {:?} differs from catalog {:?}; using catalog",
-                    node_id,
-                    direction.as_str(),
-                    cp.name,
-                    wp.lane_mode,
-                    cp.lane_mode,
-                );
-            }
             merged
         })
         .collect();
 
-    // Then: weft ports that are NOT in the catalog. These are only
-    // valid on nodes with can_add_<direction>_ports.
     for wp in weft_ports {
         if catalog_by_name.contains_key(wp.name.as_str()) {
             continue;
         }
         if !can_add {
-            tracing::warn!(
-                "enrich: node '{}' declares custom {} port '{}' but node type does not support custom {} ports; dropping",
+            // The user wrote a port in source that this node type does
+            // not accept in this direction. Dropping it silently makes
+            // it vanish from the materialized node (edges wired to it
+            // later surface as a confusing unknown-port error, and an
+            // unwired one disappears with no signal). Fail loud instead.
+            // Not gated by EnrichPolicy: that only forgives unknown node
+            // TYPES; a known type rejecting an authored port is a hard
+            // authoring error in every mode.
+            errors.push(format!(
+                "node '{}': declares custom {} port '{}' but node type does not support custom {} ports",
                 node_id,
                 direction.as_str(),
                 wp.name,
                 direction.as_str(),
-            );
+            ));
             continue;
         }
+        // A user-added port with the placeholder `MustOverride` type is the
+        // graph editor's default for "I added a port but haven't set the
+        // type yet". Keep the port in the materialized list so the UI shows
+        // it (the user just added it), and surface the missing-type as an
+        // error diagnostic instead. Without this, the round-trip silently
+        // ate the port and it vanished from the canvas.
         if wp.port_type.is_must_override() {
             errors.push(format!(
                 "node '{}': custom {} port '{}' needs a concrete type",
@@ -141,7 +112,6 @@ fn merge_ports(
                 direction.as_str(),
                 wp.name,
             ));
-            continue;
         }
         result.push(wp.clone());
     }
@@ -149,65 +119,75 @@ fn merge_ports(
     result
 }
 
-/// Policy for handling unknown node types during enrichment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrichPolicy {
-    /// Fail the whole enrichment on any unknown node type. Used by the
-    /// full compile pipeline where an unknown type is a hard error.
     Strict,
-    /// Skip unknown types and continue. Used by the /parse endpoint
-    /// during interactive editing where the user might be partway
-    /// through typing a node type name.
     Lenient,
 }
 
-/// Strict enrichment. Fails on unknown node types. Equivalent to
-/// `enrich_with_policy(project, catalog, EnrichPolicy::Strict)`.
 pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) -> CompileResult<()> {
     enrich_with_policy(project, catalog, EnrichPolicy::Strict)
 }
 
-/// Enrich every node in the project with its catalog metadata, then
-/// resolve TypeVars across connected edges. Policy controls what to do
-/// with unknown node types.
 pub fn enrich_with_policy(
     project: &mut ProjectDefinition,
     catalog: &dyn MetadataCatalog,
     policy: EnrichPolicy,
 ) -> CompileResult<()> {
     let mut errors = Vec::new();
+    // One [reserved-node-type] error per offending TYPE, not per node:
+    // boundary types appear on two nodes per group, and a project full
+    // of groups would otherwise report the same corrupt catalog entry
+    // 2xN times.
+    let mut reported_reserved: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for node in project.nodes.iter_mut() {
+        // Built-in boundary node-types. Their ports are written by the
+        // compiler's lowering pass (Passthrough by group-flatten, LoopIn
+        // / LoopOut by loop-lowering); enrich does not consult the
+        // catalog for them. A catalog entry that masquerades as one of
+        // these built-in names is rejected loud as a corrupt catalog:
+        // letting a catalog impl shadow the runtime built-in would
+        // silently break group / loop boundaries.
+        if matches!(node.node_type.as_str(), "Passthrough" | "LoopIn" | "LoopOut") {
+            if catalog.lookup(&node.node_type).is_some()
+                && reported_reserved.insert(node.node_type.clone())
+            {
+                errors.push(format!(
+                    "[reserved-node-type] catalog declares '{}' but that name is a built-in language type; rename the catalog node",
+                    node.node_type,
+                ));
+            }
+            continue;
+        }
+
+        // A catalog claiming any other reserved type keyword is also a
+        // corrupt catalog (e.g. an entry literally named 'Group' or
+        // 'Loop'). The reserved-type set is the single source of truth
+        // for this check.
+        if crate::weft_compiler::is_reserved_type_keyword(&node.node_type) {
+            if catalog.lookup(&node.node_type).is_some()
+                && reported_reserved.insert(node.node_type.clone())
+            {
+                errors.push(format!(
+                    "[reserved-node-type] catalog declares '{}' but that name is a reserved language keyword",
+                    node.node_type,
+                ));
+            }
+            continue;
+        }
+
         let Some(meta) = catalog.lookup(&node.node_type) else {
             if policy == EnrichPolicy::Strict {
                 errors.push(format!("unknown node type: '{}'", node.node_type));
             }
-            // Lenient: leave inputs/outputs empty; render shows a
-            // placeholder box. Diagnostics pass surfaces the real
-            // error separately.
             continue;
         };
 
-        // Passthrough is a real catalog entry, but its ports are
-        // written by the compiler's group-flatten pass, not derived
-        // from metadata. Skip port enrichment; let features through.
-        if node.node_type == "Passthrough" {
-            node.features = meta.features.clone();
-            continue;
-        }
-
-        // Snapshot the weft-declared ports before we overwrite from
-        // catalog. The parser stores whatever the user wrote in the
-        // `NodeType(in: T) -> (out: U)` header into node.inputs /
-        // node.outputs. merge_ports below consumes these to respect
-        // user-declared custom ports on nodes with canAddInputPorts /
-        // canAddOutputPorts, and to override `required` on catalog
-        // ports that the user re-stated with `*`.
         let weft_inputs = std::mem::take(&mut node.inputs);
         let weft_outputs = std::mem::take(&mut node.outputs);
 
-        // Base ports from catalog. user_typed=false because the
-        // type came from metadata.json, not the .weft source.
         let catalog_inputs: Vec<PortDefinition> = meta
             .inputs
             .iter()
@@ -216,10 +196,8 @@ pub fn enrich_with_policy(
                 port_type: p.port_type.clone(),
                 required: p.required,
                 description: None,
-                lane_mode: p.lane_mode,
-                lane_depth: 1,
                 configurable: p.configurable || p.port_type.is_default_configurable(),
-                user_typed: false,
+                synthesized_from_carry: false,
             })
             .collect();
         let catalog_outputs: Vec<PortDefinition> = meta
@@ -230,10 +208,8 @@ pub fn enrich_with_policy(
                 port_type: p.port_type.clone(),
                 required: p.required,
                 description: None,
-                lane_mode: p.lane_mode,
-                lane_depth: 1,
                 configurable: false,
-                user_typed: false,
+                synthesized_from_carry: false,
             })
             .collect();
 
@@ -254,7 +230,6 @@ pub fn enrich_with_policy(
             &mut errors,
         );
 
-        // Form-derived ports (for nodes declaring has_form_schema).
         if meta.features.has_form_schema {
             let specs = catalog.form_field_specs(&node.node_type);
             materialize_form_ports(&node.config, specs, &mut inputs, &mut outputs);
@@ -272,80 +247,13 @@ pub fn enrich_with_policy(
     }
 
     resolve_type_vars(project)?;
-    infer_lane_modes(project);
     Ok(())
 }
 
-/// Walk edges; infer `lane_mode` + `lane_depth` on the target
-/// port whenever source and target disagree on list depth.
-/// A `List[T]` source into a `T` target is implicit expand (set
-/// the target's `lane_mode = Expand, lane_depth = delta`). A
-/// `T` source into a `List[T]` target is implicit gather (set
-/// the target's `lane_mode = Gather`). Matches the warnings
-/// already emitted by validate.rs so runtime and compiler agree.
-fn infer_lane_modes(project: &mut ProjectDefinition) {
-    use weft_core::project::LaneMode;
-
-    let mut edits: Vec<(String, String, LaneMode, u32)> = Vec::new();
-    for edge in &project.edges {
-        let Some(src_handle) = edge.source_handle.as_deref() else { continue };
-        let Some(tgt_handle) = edge.target_handle.as_deref() else { continue };
-        let Some(src_node) = project.nodes.iter().find(|n| n.id == edge.source) else { continue };
-        let Some(tgt_node) = project.nodes.iter().find(|n| n.id == edge.target) else { continue };
-        let Some(src_port) = src_node.outputs.iter().find(|p| p.name == src_handle) else { continue };
-        let Some(tgt_port) = tgt_node.inputs.iter().find(|p| p.name == tgt_handle) else { continue };
-
-        let src_depth = list_depth(&src_port.port_type);
-        let tgt_depth = list_depth(&tgt_port.port_type);
-        if src_depth > tgt_depth {
-            let delta = (src_depth - tgt_depth) as u32;
-            edits.push((
-                edge.target.clone(),
-                tgt_handle.to_string(),
-                LaneMode::Expand,
-                delta,
-            ));
-        } else if tgt_depth > src_depth {
-            let delta = (tgt_depth - src_depth) as u32;
-            edits.push((
-                edge.target.clone(),
-                tgt_handle.to_string(),
-                LaneMode::Gather,
-                delta,
-            ));
-        }
-    }
-
-    for (node_id, port_name, mode, depth) in edits {
-        let Some(node) = project.nodes.iter_mut().find(|n| n.id == node_id) else { continue };
-        let Some(port) = node.inputs.iter_mut().find(|p| p.name == port_name) else { continue };
-        // Don't clobber an explicit Expand/Gather on the port
-        // (the node catalog declared its own lane mechanics).
-        if port.lane_mode == LaneMode::Single {
-            port.lane_mode = mode;
-            port.lane_depth = depth;
-        }
-    }
-}
-
-fn list_depth(ty: &WeftType) -> usize {
-    match ty {
-        WeftType::List(inner) => 1 + list_depth(inner),
-        _ => 0,
-    }
-}
-
-/// Walk edges; wherever one end is a concrete type and the other is
-/// a TypeVar, substitute the concrete type for that TypeVar across
-/// the node's ports. Iterate to a fixed point (resolving one
-/// TypeVar can open new resolutions). `MustOverride` left alone
-/// (compile error elsewhere).
 fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
     loop {
         let mut changed = false;
 
-        // Collect all edge endpoint types into a snapshot so we can
-        // mutate nodes without fighting the borrow checker.
         let snapshot: Vec<(String, String, WeftType, String, String, WeftType)> = project
             .edges
             .iter()
@@ -376,8 +284,6 @@ fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
             .collect();
 
         for (src_node, _src_port, src_type, tgt_node, _tgt_port, tgt_type) in snapshot {
-            // Tgt has a TypeVar, src is concrete: resolve the var on
-            // the tgt side.
             if let WeftType::TypeVar(name) = &tgt_type {
                 if !src_type.is_unresolved() {
                     if substitute_type_var(project, &tgt_node, name, &src_type) {
@@ -385,9 +291,6 @@ fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
                     }
                 }
             }
-            // Src has a TypeVar, tgt is concrete: resolve on the src
-            // side (rarer, but it happens when a trigger's output
-            // type is `T` and downstream expects `String`).
             if let WeftType::TypeVar(name) = &src_type {
                 if !tgt_type.is_unresolved() {
                     if substitute_type_var(project, &src_node, name, &tgt_type) {
@@ -405,9 +308,6 @@ fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
     Ok(())
 }
 
-/// Replace every occurrence of `TypeVar(var_name)` in the given
-/// node's inputs and outputs with `concrete`. Returns true if any
-/// replacement happened.
 fn substitute_type_var(
     project: &mut ProjectDefinition,
     node_id: &str,
@@ -447,9 +347,6 @@ fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bo
     }
 }
 
-/// Given the node's `config.fields` array and the node type's
-/// FormFieldSpecs, produce extra input and output ports. Used by
-/// HumanQuery and runner-style trigger nodes.
 fn materialize_form_ports(
     config: &Value,
     specs: &[weft_core::FormFieldSpec],
@@ -462,11 +359,6 @@ fn materialize_form_ports(
 
     for field in fields {
         let Some(obj) = field.as_object() else { continue };
-        // Field-type lookup accepts the v1-flat shape used by the
-        // .weft source and form_builder UI (`fieldType: "display"`)
-        // and, as a fallback, the v2-nested shape some early code
-        // paths produced (`field_type: { kind: "display" }`). The
-        // node's spec is keyed by the bare string in either case.
         let field_type = obj
             .get("fieldType")
             .and_then(|v| v.as_str())
@@ -506,11 +398,7 @@ fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> Por
         port_type: port_type.clone(),
         required: !is_output,
         description: None,
-        lane_mode: Default::default(),
-        lane_depth: 1,
         configurable: !is_output && port_type.is_default_configurable(),
-        // Form-derived ports come from form_field_specs in the
-        // node's metadata, not the .weft source.
-        user_typed: false,
+        synthesized_from_carry: false,
     }
 }

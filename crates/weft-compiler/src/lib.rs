@@ -156,22 +156,26 @@ pub fn compile_checked(
     Ok(project)
 }
 
-/// Compile + strict enrich, no validation, aborting if any
-/// `Error`-severity diagnostic fires. For callers that need the
-/// enriched topology (infra-closure walk, hashing) but not the full
-/// validation gate, which the build path owns. Shares the same
-/// compile+enrich core and abort logic as the entries above.
-pub fn compile_enriched(
+/// Compile + strict enrich, no validation, returning the full
+/// diagnostic list on failure. For callers that need the enriched
+/// topology (infra-closure walk, hashing) but not the full validation
+/// gate (which the build path owns) and want to surface structured
+/// per-error info to the user.
+pub fn compile_enriched_with_diagnostics(
     source: &str,
     project_id: Uuid,
     base_dir: Option<&std::path::Path>,
     catalog: &dyn MetadataCatalog,
-) -> CompileResult<ProjectDefinition> {
-    // Topology/hash path: a real project with a named main group (no anonymous
-    // root), so the source name is unused; `None` falls back to `Untitled`.
+) -> Result<ProjectDefinition, Vec<Diagnostic>> {
     let (project, diagnostics) = compile_and_enrich(source, project_id, base_dir, catalog, None);
-    bail_on_errors(diagnostics)?;
-    Ok(project)
+    let any_errors = diagnostics
+        .iter()
+        .any(|d| matches!(d.severity, Severity::Error));
+    if any_errors {
+        Err(diagnostics)
+    } else {
+        Ok(project)
+    }
 }
 
 /// The shared front half of every strict pipeline: lex + parse +
@@ -209,20 +213,33 @@ fn compile_and_enrich(
     (project, diagnostics)
 }
 
+/// Render a diagnostic list as one `line:column message` per line.
+/// Prefers Error-severity lines; if the compile failed with only
+/// warnings/hints, renders those instead of an empty string that
+/// would read as "failed for no stated reason". The single
+/// human-facing diagnostic rendering: `bail_on_errors` here and the
+/// CLI's TTY compile-failure path both call it so the two can't drift.
+pub fn render_diagnostics(diagnostics: &[Diagnostic]) -> String {
+    let render = |only_errors: bool| -> String {
+        diagnostics
+            .iter()
+            .filter(|d| !only_errors || matches!(d.severity, Severity::Error))
+            .map(|d| format!("{}:{} {}", d.line, d.column, d.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let errors = render(true);
+    if errors.is_empty() { render(false) } else { errors }
+}
+
 /// Turn an `Error`-severity diagnostic set into a single loud
 /// `CompileError`; `Ok(())` when only warnings (or nothing) remain.
 /// One place so every aborting entry formats failures identically.
 fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> CompileResult<()> {
-    let msg = diagnostics
-        .iter()
-        .filter(|d| matches!(d.severity, Severity::Error))
-        .map(|d| format!("{}:{} {}", d.line, d.column, d.message))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if msg.is_empty() {
-        Ok(())
+    if diagnostics.iter().any(|d| matches!(d.severity, Severity::Error)) {
+        Err(error::CompileError::Validate(render_diagnostics(&diagnostics)))
     } else {
-        Err(error::CompileError::Validate(msg))
+        Ok(())
     }
 }
 

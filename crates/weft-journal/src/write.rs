@@ -49,7 +49,7 @@ pub async fn record_event_from_pod(
 /// Idempotent variant: caller provides a stable dedup key. A retry
 /// of the same write collapses on the partial UNIQUE index. Used
 /// by dispatcher tasks (e.g. route_entry) that may re-execute after
-/// a crash and must not double-fire ExecutionStarted / PulseSeeded.
+/// a crash and must not double-fire ExecutionStarted / NodeKicked.
 pub async fn record_event_dedup(
     pool: &PgPool,
     event: &ExecEvent,
@@ -58,8 +58,21 @@ pub async fn record_event_dedup(
     record_event_inner(pool, event, None, Some(dedup_key)).await
 }
 
-async fn record_event_inner(
-    pool: &PgPool,
+/// Executor-generic variant so a caller can place the INSERT inside
+/// its own transaction (the dispatcher pairs `ExecutionStarted` with
+/// its `execution_color` seed atomically). Same row shape as every
+/// other path.
+pub async fn record_event_in<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    event: &ExecEvent,
+    pod_name: Option<&str>,
+    dedup_key: Option<&str>,
+) -> Result<(), RecordError> {
+    record_event_inner(executor, event, pod_name, dedup_key).await
+}
+
+async fn record_event_inner<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     event: &ExecEvent,
     pod_name: Option<&str>,
     dedup_key: Option<&str>,
@@ -80,7 +93,7 @@ async fn record_event_inner(
     .bind(now)
     .bind(pod_name)
     .bind(dedup_key)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

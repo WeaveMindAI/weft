@@ -42,6 +42,7 @@ pub enum SyntaxKind {
     JSON_VALUE, // a `[...]`/`{...}` config value, ONE opaque token
     MARKER,     // @file(...) / @include(...) / @require_one_of(...), ONE opaque token
     KW_GROUP,   // the `Group` reserved type keyword
+    KW_LOOP,    // the `Loop` reserved type keyword
 
     ERROR, // an unrecognized byte run (lenient parse; never panics)
 
@@ -49,13 +50,13 @@ pub enum SyntaxKind {
     WEFT_FILE, // the root
 
     NODE_DECL,    // id = Type(sig) -> (sig) { body }
-    GROUP_DECL,   // label = Group(sig) -> (sig) { body } -> (post)
+    GROUP_DECL,   // label = Group(sig) -> (sig) { body }
+    LOOP_DECL,    // label = Loop(sig) -> (sig) { config + body }
     INCLUDE_DECL, // alias = @include("path")
 
     HEADER,        // `id = Type` + signatures, up to (not incl.) the body `{`
     PORT_SIG_IN,   // (a: T, b: U?) input signature
-    PORT_SIG_OUT,  // (out: T) output signature (pre-body, after `->`)
-    PORT_SIG_POST, // post-body output signature: `} -> (out: T)` / separate line
+    PORT_SIG_OUT,  // (out: T) output signature (after `->`)
     PORT_DECL,     // one `name: Type` / `name: Type?` inside a signature
 
     BODY,         // { ... } the brace-delimited block of a node or group
@@ -95,8 +96,8 @@ const ALL_KINDS: &[SyntaxKind] = {
     use SyntaxKind::*;
     &[
         WHITESPACE, COMMENT, L_PAREN, R_PAREN, L_BRACE, R_BRACE, ARROW, COLON, COMMA, DOT, EQ,
-        QUESTION, IDENT, STRING, NUMBER, HEREDOC, JSON_VALUE, MARKER, KW_GROUP, ERROR, WEFT_FILE,
-        NODE_DECL, GROUP_DECL, INCLUDE_DECL, HEADER, PORT_SIG_IN, PORT_SIG_OUT, PORT_SIG_POST,
+        QUESTION, IDENT, STRING, NUMBER, HEREDOC, JSON_VALUE, MARKER, KW_GROUP, KW_LOOP, ERROR,
+        WEFT_FILE, NODE_DECL, GROUP_DECL, LOOP_DECL, INCLUDE_DECL, HEADER, PORT_SIG_IN, PORT_SIG_OUT,
         PORT_DECL, BODY, CONFIG_FIELD, CONNECTION, ENDPOINT, INLINE_EXPR, DIRECTIVE, LABEL_FIELD,
         GROUP_DESC,
     ]

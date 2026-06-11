@@ -6,14 +6,13 @@
 //!     SSE signal. The listener subscribes; the dispatcher receives
 //!     `message.received` events and fires fresh executions.
 //!
-//!   - `Phase::Fire`: the event data seeded `__seed__`. Map the
-//!     WhatsApp-specific fields to output ports.
+//!   - `Phase::Fire`: the SSE event delivers a parsed JSON object as
+//!     the wake payload. Map the WhatsApp-specific fields to output
+//!     ports.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::context::Phase;
-use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 use weft_core::signal::Sse;
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
@@ -32,27 +31,26 @@ impl Node for WhatsAppReceiveNode {
         serde_json::from_str(METADATA_JSON).expect("WhatsAppReceive metadata.json must be valid")
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<NodeOutput> {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         match ctx.phase {
-            Phase::TriggerSetup => register(&ctx).await,
-            Phase::Fire => fire(&ctx),
-            Phase::InfraSetup => Ok(NodeOutput::empty()),
+            // Setup registers the SSE signal; emits nothing downstream.
+            Phase::TriggerSetup => {
+                register(&ctx).await?;
+                Ok(())
+            }
+            Phase::Fire => {
+                let out = fire(&ctx)?;
+                ctx.pulse_downstream(out).await
+            }
+            Phase::InfraSetup => Ok(()),
         }
     }
 }
 
-async fn register(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
+async fn register(ctx: &ExecutionContext) -> WeftResult<()> {
     let bridge = ctx
         .input
-        .values
-        .get("endpointUrl")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            WeftError::Config(
-                "WhatsAppReceive requires an `endpointUrl` input (from WhatsAppBridge)".into(),
-            )
-        })?
-        .to_string();
+        .required_str("endpointUrl", "endpointUrl (from WhatsAppBridge)")?;
     // `endpointUrl` is the bridge's bare endpoint URL (the bridge node
     // exports `ctx.endpoint("api").url()`, no path). Append our route.
     let events_url = format!("{}/events", bridge.trim_end_matches('/'));
@@ -60,55 +58,24 @@ async fn register(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
         url: events_url,
         event_name: "message.received".into(),
     })
-    .await?;
-    Ok(NodeOutput::empty())
+    .await
 }
 
 fn fire(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
-    // The SSE listener delivers the parsed `data:` object as the
-    // fire payload, which the dispatcher seeds verbatim into
-    // `__seed__`. That object is the message itself.
-    let data = ctx
-        .input
-        .values
-        .get("__seed__")
-        .cloned()
-        .unwrap_or(Value::Null);
-
-    let mut output = NodeOutput::empty();
-    output = output.set(
-        "content",
-        data.get("content").cloned().unwrap_or(Value::Null),
-    );
-    output = output.set(
-        "from",
-        data.get("from").cloned().unwrap_or(Value::String(String::new())),
-    );
-    output = output.set(
-        "pushName",
-        data.get("pushName")
-            .cloned()
-            .unwrap_or(Value::String(String::new())),
-    );
-    output = output.set(
-        "messageId",
-        data.get("messageId")
-            .cloned()
-            .unwrap_or(Value::String(String::new())),
-    );
-    output = output.set(
-        "timestamp",
-        data.get("timestamp").cloned().unwrap_or(Value::Null),
-    );
-    output = output.set(
-        "isGroup",
-        data.get("isGroup").cloned().unwrap_or(Value::Bool(false)),
-    );
-    output = output.set(
-        "chatId",
-        data.get("chatId")
-            .cloned()
-            .unwrap_or(Value::String(String::new())),
-    );
-    Ok(output)
+    // The SSE listener delivers the parsed `data:` object as the wake
+    // payload. Forward each present field on its matching output port;
+    // missing fields stay un-mentioned and the engine closes those
+    // ports at termination. Substituting empty strings or `false` for
+    // absent fields would publish data nulls indistinguishable from
+    // real user values to the consumer.
+    //
+    // The bridge's `message.received` SSE event contract is CLOSED at
+    // exactly these 7 fields: `content`, `from`, `pushName`, `messageId`,
+    // `timestamp`, `isGroup`, `chatId`. The metadata declares the same
+    // 7 output ports. An extra field on the wire would land on an
+    // undeclared output port and trip the engine's
+    // `check_declared_outputs` (fail-loud); a missing field stays un-
+    // mentioned and the engine closes that port at termination.
+    let data = ctx.wake_payload_object()?;
+    Ok(NodeOutput::empty().extend_from_object(data, &[]))
 }

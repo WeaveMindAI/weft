@@ -24,6 +24,31 @@ use serde_json::Value;
 
 use weft_core::Color;
 
+/// Outcome of looking up a value derived from a color's first
+/// `ExecutionStarted` row. `NotFound` = no such row (the color is
+/// unknown). `Corrupt` = the row exists but its stored JSON no
+/// longer decodes: a PERMANENT poison, so callers must word their
+/// failure honestly ("journal row for color X is corrupt; see
+/// dispatcher logs") and must NOT retry (retrying cannot fix it;
+/// pollers that would loop on an `Err` skip instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorLookup<T> {
+    Found(T),
+    NotFound,
+    Corrupt,
+}
+
+impl<T> ColorLookup<T> {
+    /// Collapse to `Option` when the caller treats an unknown and a
+    /// corrupt color identically (e.g. "skip this row").
+    pub fn found(self) -> Option<T> {
+        match self {
+            Self::Found(t) => Some(t),
+            Self::NotFound | Self::Corrupt => None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait Journal: Send + Sync {
     // ----- Event log (state source of truth) -------------------------
@@ -46,7 +71,7 @@ pub trait Journal: Send + Sync {
 
     /// Drop the signal row for a single-use resume token. Called
     /// when a suspension's fire is consumed (the engine has handed
-    /// the value back to the waiting lane). Returns true if a row
+    /// the value back to the waiting firing). Returns true if a row
     /// was deleted. Entry-trigger rows (`is_resume=false`) stay
     /// untouched; the deactivate path manages those separately.
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool>;
@@ -72,18 +97,26 @@ pub trait Journal: Send + Sync {
     // ----- Derived views over the event log --------------------------
 
     /// Look up which project a color belongs to. Walks the event
-    /// log for the first `ExecutionStarted` event. `Ok(None)` if
-    /// the color is unknown.
-    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>>;
+    /// log for the first `ExecutionStarted` event. `NotFound` if
+    /// the color is unknown; `Corrupt` if the row no longer decodes.
+    async fn execution_project(&self, color: Color) -> anyhow::Result<ColorLookup<String>>;
+
+    /// Look up the `definition_hash` an execution was STARTED with.
+    /// Resume task producers use this to stamp the resume payload,
+    /// so a suspended execution always resumes against the SAME
+    /// project shape it was started on (not the project row's
+    /// CURRENT hash, which may have moved if the user edited and
+    /// re-registered between suspend and webhook-fire). Reads the
+    /// first `ExecutionStarted` event of the color. `NotFound` if
+    /// the color is unknown; `Corrupt` if the row no longer decodes.
+    async fn execution_definition_hash(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<ColorLookup<String>>;
 
     /// Log lines for a color, oldest first. Folded from
     /// `ExecEvent::LogLine` events.
     async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
-
-    /// Per-node lifecycle events for a color, oldest first. Folded
-    /// from `ExecEvent::Node{Started, Suspended, Resumed, Cancelled,
-    /// Completed, Failed, Skipped}`.
-    async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>>;
 
     /// Summary row for every execution the dispatcher has ever
     /// seen, newest first.
@@ -105,9 +138,6 @@ pub trait Journal: Send + Sync {
 
     /// Look up a single signal by its token.
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
-
-    /// Remove a signal by token. Returns whether a row existed.
-    async fn signal_remove(&self, token: &str) -> anyhow::Result<bool>;
 
     /// Remove signals by token in one SQL statement. Returns the
     /// deleted rows so the caller can drive listener-unregister
@@ -234,71 +264,6 @@ impl SignalRegistration {
 }
 
 // ----- Public types -----------------------------------------------
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NodeExecEvent {
-    pub color: Color,
-    pub node_id: String,
-    /// Encoded lane path; JSON array of LaneFrame. Empty string
-    /// for nodes with no expand/gather context.
-    pub lane: String,
-    pub kind: NodeExecKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Wake-signal token. Set on Suspended/Resumed; None otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// Delivered value. Set on Resumed; None otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    /// Cancellation reason. Set on Cancelled; None otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    pub at_unix: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeExecKind {
-    Started,
-    Suspended,
-    Resumed,
-    Cancelled,
-    Completed,
-    Failed,
-    Skipped,
-}
-
-impl NodeExecKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Suspended => "suspended",
-            Self::Resumed => "resumed",
-            Self::Cancelled => "cancelled",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "started" => Some(Self::Started),
-            "suspended" => Some(Self::Suspended),
-            "resumed" => Some(Self::Resumed),
-            "cancelled" => Some(Self::Cancelled),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "skipped" => Some(Self::Skipped),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecutionSummary {

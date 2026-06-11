@@ -11,6 +11,7 @@
 	import ActionBar from "./ActionBar.svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "$lib/nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "$lib/types";
+	import { isContainerNodeType, isLoopNodeType, containerKindOf } from "$lib/types";
 	import type { EditOp, TextEdit } from "../../../../shared/protocol";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "$lib/constants/colors";
 	import { autoOrganize } from "$lib/auto-organize";
@@ -129,12 +130,7 @@
 		// Per-execution state for graph decorations: which edges
 		// are pulsing right now, last-observed node outputs, etc.
 		// Independent of action-bar state.
-		executionState?: {
-			isRunning: boolean;
-			nodeOutputs: Record<string, unknown>;
-			nodeStatuses: Record<string, string>;
-			nodeExecutions: import('$lib/types').NodeExecutionTable;
-		};
+		executionState?: import('$lib/types').ExecutionState;
 		autoOrganizeOnMount?: boolean;
 		/// Per-node infra /live tick state. Read for nodes whose
 		/// `requiresInfra` flag is true; ignored otherwise.
@@ -185,7 +181,8 @@
 		layoutCode = updateLayoutEntry(layoutCode, key,
 			node.position.x, node.position.y,
 			cfg?.width as number | undefined, cfg?.height as number | undefined,
-			cfg?.expanded as boolean | undefined ?? undefined);
+			cfg?.expanded as boolean | undefined ?? undefined,
+			cfg?.configCollapsed as boolean | undefined ?? undefined);
 	}
 
 	/** Move a node or group to a different scope: emit the move intent (Rust
@@ -205,11 +202,31 @@
 	 *  live `nodes` array (the caller already wrote the reparented coords there). */
 	function weftMoveScopeAny(node: Node, targetGroupLabel: string | undefined, targetGroupId?: string) {
 		const oldKey = getLayoutKey(node);
-		const isGroup = node.type === 'group' || node.type === 'groupCollapsed';
-		const op: EditOp = isGroup && node.data.label
-			? { op: 'moveGroupScope', group: node.data.label as string, targetGroup: targetGroupLabel ?? null }
-			: { op: 'moveNodeScope', node: node.id, targetGroup: targetGroupLabel ?? null };
-		const localId = isGroup ? (node.data.label as string) : node.id.split('.').pop()!;
+		const isContainer = node.type === 'group' || node.type === 'groupCollapsed';
+		// Group/Loop have distinct move ops; the Rust side rejects a
+		// mismatched-kind move loudly. The kind check has to happen
+		// in this function (callers already reparented the visual)
+		// so an unset kind is a return-and-warn (no source op) rather
+		// than a throw mid-handler. The visual reparent is left in
+		// place; the user can re-trigger the move once the node tag
+		// re-hydrates.
+		let op: EditOp;
+		if (isContainer && node.data.label) {
+			const kind = containerKindOf(node.data?.nodeType);
+			if (kind === null) {
+				console.warn(
+					`[move] container ${node.id} reached weftMoveScopeAny with nodeType=${JSON.stringify(node.data?.nodeType)};`,
+					'skipping source op until the node re-hydrates'
+				);
+				return;
+			}
+			op = kind === 'Loop'
+				? { op: 'moveLoopScope', loopId: node.data.label as string, targetGroup: targetGroupLabel ?? null }
+				: { op: 'moveGroupScope', group: node.data.label as string, targetGroup: targetGroupLabel ?? null };
+		} else {
+			op = { op: 'moveNodeScope', node: node.id, targetGroup: targetGroupLabel ?? null };
+		}
+		const localId = isContainer ? (node.data.label as string) : node.id.split('.').pop()!;
 		const newKey = scopedLayoutKey(localId, targetGroupId || targetGroupLabel);
 		// The reparented (relative-to-new-parent) position the caller just committed.
 		const pos = (nodes.find(n => n.id === node.id) ?? node).position;
@@ -460,6 +477,29 @@
 			// Capture old group label BEFORE updating (for rename in weft code)
 			const oldGroupLabel = ('label' in updates) ? nodes.find(n => n.id === nodeId)?.data.label as string | undefined : undefined;
 
+			// Container-kind precondition. If this update would build a
+			// Loop-vs-Group-distinct op (rename / updatePorts) AND the
+			// node is a container, resolve the kind BEFORE any visual
+			// mutation. A null kind here means the container reached
+			// the dispatch with no kind tag (hydration race); bail with
+			// a console warning and no source op, leaving the visual
+			// state untouched so the user can retry once the node
+			// re-hydrates. The earlier shape did this check inline
+			// AFTER mutating `nodes`, which left the UI desynced from
+			// source on the rare-but-possible bad-state.
+			const wouldDispatchKindDistinct = ('label' in updates) || ('inputs' in updates) || ('outputs' in updates);
+			if (wouldDispatchKindDistinct) {
+				const current = nodes.find(n => n.id === nodeId);
+				const isContainer = current?.type === 'group' || current?.type === 'groupCollapsed';
+				if (isContainer && containerKindOf(current?.data?.nodeType) === null) {
+					console.warn(
+						`[edit] container ${nodeId} reached dispatch with nodeType=${JSON.stringify(current?.data?.nodeType)};`,
+						'aborting edit until the node re-hydrates'
+					);
+					return;
+				}
+			}
+
 			// Capture old dimensions BEFORE updating, for anchor-point fix and neighbor shift
 			let oldWidth = 0;
 			let oldHeight = 0;
@@ -600,9 +640,19 @@
 
 			if ('label' in updates) {
 				const node = nodes.find(n => n.id === nodeId);
-				const isGroup = node?.type === 'group' || node?.type === 'groupCollapsed';
-				if (isGroup && oldGroupLabel && updates.label) {
-					ops.push({ op: 'renameGroup', oldLabel: oldGroupLabel, newLabel: updates.label as string });
+				const isContainer = node?.type === 'group' || node?.type === 'groupCollapsed';
+				if (isContainer && oldGroupLabel && updates.label) {
+					// Group/Loop have distinct rename ops. The Rust side
+					// rejects RenameGroup on a Loop (and vice versa) loudly;
+					// routing by container kind is required, not just nicer.
+					// Precondition (above) already verified kind is set;
+					// `containerKindOf` returns non-null here.
+					const kind = containerKindOf(node?.data?.nodeType);
+					if (kind === 'Loop') {
+						ops.push({ op: 'renameLoop', oldLabel: oldGroupLabel, newLabel: updates.label as string });
+					} else {
+						ops.push({ op: 'renameGroup', oldLabel: oldGroupLabel, newLabel: updates.label as string });
+					}
 					// Re-key the group's layout subtree (its own entry + descendants) from
 					// the old scoped address to the new one. Same exact, non-compounding
 					// re-key a move uses; a rename only changes the last path segment.
@@ -620,7 +670,7 @@
 				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
 					if (['parentId', 'textareaHeights', '_opaqueChildren'].includes(key)) continue;
-					if (['width', 'height', 'expanded'].includes(key)) {
+					if (['width', 'height', 'expanded', 'configCollapsed'].includes(key)) {
 						needsLayout = true;
 						continue;
 					}
@@ -643,9 +693,19 @@
 				if (node?.data) {
 					const inputs = toPortSigs((updates.inputs ?? node.data.inputs) as PortLike[]);
 					const outputs = toPortSigs((updates.outputs ?? node.data.outputs) as PortLike[]);
-					const isGroup = node.type === 'group' || node.type === 'groupCollapsed';
-					if (isGroup && node.data.label) {
-						ops.push({ op: 'updateGroupPorts', group: node.data.label as string, inputs, outputs });
+					const isContainer = node.type === 'group' || node.type === 'groupCollapsed';
+					if (isContainer && node.data.label) {
+						// Group/Loop have distinct port-update ops to keep the
+						// protocol surface symmetric with rename/remove (the
+						// Rust impls share a generic helper but the dispatch
+						// validates the decl kind matches the op). Precondition
+						// at handler entry already verified kind is set.
+						const kind = containerKindOf(node.data.nodeType);
+						if (kind === 'Loop') {
+							ops.push({ op: 'updateLoopPorts', loopId: node.data.label as string, inputs, outputs });
+						} else {
+							ops.push({ op: 'updateGroupPorts', group: node.data.label as string, inputs, outputs });
+						}
 					} else {
 						ops.push({ op: 'updateNodePorts', node: nodeId, inputs, outputs });
 					}
@@ -722,7 +782,7 @@
 	// must be allowed through the catalog filter explicitly.
 	const SPECIAL_NODE_TYPES = new Set(['Group', 'Annotation', 'IncludedGroup']);
 
-	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean }>): Node[] {
+	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configCollapsed?: boolean }>): Node[] {
 		// Pure merge step: overlay each node's layout entry (width/height/expanded)
 		// onto its config UP FRONT, so the structural parse (which carries none of
 		// this view-state) plus the layout file produce one merged node list. The
@@ -737,6 +797,7 @@
 				if (e.w !== undefined) cfg.width = e.w;
 				if (e.h !== undefined) cfg.height = e.h;
 				if (e.expanded !== undefined) cfg.expanded = e.expanded;
+				if (e.configCollapsed !== undefined) cfg.configCollapsed = e.configCollapsed;
 				return { ...n, config: cfg };
 			}) as typeof projectNodes;
 		}
@@ -748,8 +809,8 @@
 
 		// xyflow requires parent nodes to appear before children in the array.
 		// Topologically sort groups so parent groups come first, then non-group nodes.
-		const groupNodes = validNodes.filter(n => n.nodeType === 'Group');
-		const otherNodes = validNodes.filter(n => n.nodeType !== 'Group');
+		const groupNodes = validNodes.filter(n => isContainerNodeType(n.nodeType));
+		const otherNodes = validNodes.filter(n => !isContainerNodeType(n.nodeType));
 		const groupById = new Map(groupNodes.map(g => [g.id, g]));
 		const sortedGroups: typeof groupNodes = [];
 		const visited = new Set<string>();
@@ -766,7 +827,7 @@
 		const sortedNodes = [...sortedGroups, ...otherNodes];
 		
 		return sortedNodes.map((n) => {
-			const isGroup = n.nodeType === 'Group';
+			const isGroup = isContainerNodeType(n.nodeType);
 			const isAnnotation = n.nodeType === 'Annotation';
 			const rawParentId = (n.config as Record<string, string>)?.parentId;
 			// Walk up the ancestor chain: hide if any ancestor is collapsed
@@ -902,11 +963,48 @@
 	// svelte-ignore state_referenced_locally
 	let edges = $state.raw<Edge[]>(buildEdges(project.edges, project.nodes));
 
+	// Memoize the participants→buses inversion across $effect ticks.
+	// `busParticipantsByBus` is replaced by reference only when a new
+	// participant lands (see App.svelte's bus_participant handler), so
+	// reference equality with the prior tick means the inversion is
+	// unchanged. Without this, every nodeOutputs/nodeExecutions tick
+	// (which happens on every SSE event) re-inverts and re-allocates
+	// the whole nodes array, quadratic with execution age.
+	let busesByNodeCache: { ref: unknown; value: Record<string, string[]> } = {
+		ref: undefined,
+		value: {},
+	};
+
 	$effect(() => {
 		const state = executionState;
 		if (state) {
 			const nodeOutputs = state.nodeOutputs || {};
 			const nodeExecutions = state.nodeExecutions || {};
+			const busLogByBus = state.busLogByBus || {};
+			const busParticipantsByBus = state.busParticipantsByBus || {};
+			// Read these THREE in the tracked region (above the untrack
+			// below) so the effect re-runs when they change. App.svelte
+			// mutates them in place (executionState.loopEventsByGroup =
+			// {...}, etc.) without replacing the whole executionState
+			// object, so a read buried inside untrack() would never
+			// register the dependency: the inspector would show stale
+			// loop events / corruption markers / bus metadata until an
+			// unrelated tick replaced executionState wholesale.
+			const loopEventsByGroup = state.loopEventsByGroup ?? {};
+			const journalCorruptions = state.journalCorruptions ?? [];
+			const busMetaByBus = state.busMetaByBus ?? {};
+			let busesByNode: Record<string, string[]>;
+			if (busesByNodeCache.ref === busParticipantsByBus) {
+				busesByNode = busesByNodeCache.value;
+			} else {
+				busesByNode = {};
+				for (const [busId, participants] of Object.entries(busParticipantsByBus)) {
+					for (const nodeId of participants) {
+						(busesByNode[nodeId] ??= []).push(busId);
+					}
+				}
+				busesByNodeCache = { ref: busParticipantsByBus, value: busesByNode };
+			}
 
 			untrack(() => {
 				nodes = nodes.map(n => {
@@ -932,7 +1030,7 @@
 
 					let executions: import('$lib/types').NodeExecution[];
 
-					if (nodeType === 'Group') {
+					if (isContainerNodeType(nodeType)) {
 						const groupId = n.id;
 
 						// Boundary passthrough executions (compiled IDs follow {groupId}__in / {groupId}__out)
@@ -947,9 +1045,19 @@
 							}
 						}
 
+						// Pair the __out boundary execution to its __in by
+						// FRAME STACK, not array index. A parallel loop fires
+						// many iterations whose __in / __out events interleave
+						// and arrive out of order, so the i-th __in is not the
+						// i-th __out; matching by framesKey ties each iteration's
+						// in to its own out. (Sequential loops and plain groups
+						// happen to line up by index, but framesKey is correct
+						// for all of them.)
+						const outByFrames = new Map(outExecs.map((e) => [e.framesKey, e]));
+
 						// Build synthetic execution: one per __in execution
-						executions = inExecs.map((inExec, i) => {
-							const outExec = outExecs[i];
+						executions = inExecs.map((inExec) => {
+							const outExec = outByFrames.get(inExec.framesKey);
 							// Derive status from all children + in/out
 							const allRelated = [...internalExecs, ...inExecs, ...outExecs];
 							const hasRunning = allRelated.some(e => e.status === 'running' || e.status === 'waiting_for_input');
@@ -963,7 +1071,10 @@
 								: inExec.status;
 
 							return {
-								id: `${groupId}-synth-${i}`,
+								// Frame-stack-keyed id so an iteration's card keeps
+								// a stable identity across ticks even as sibling
+								// iterations' events interleave (index would shuffle).
+								id: `${groupId}-synth-${inExec.framesKey}`,
 								nodeId: groupId,
 								status,
 								pulseIdsAbsorbed: inExec.pulseIdsAbsorbed,
@@ -973,10 +1084,18 @@
 								completedAt: outExec?.completedAt ?? inExec.completedAt,
 								input: inExec.output, // __in output = what flows into the group
 								output: outExec?.output, // __out output = what the group produces
+								// Closed input ports surface from the `__in` boundary
+								// (its own `closedPorts` is the set of group-level
+								// inputs that arrived as closures). Without this, a
+								// group inspector with closed inputs renders a
+								// blank Input panel where the per-node inspector
+								// shows `port: (closed)` rows.
+								closedPorts: inExec.closedPorts,
 								costUsd: allRelated.reduce((sum, e) => sum + (e.costUsd || 0), 0),
 								logs: [],
 								color: inExec.color,
-								lane: inExec.lane,
+								frames: inExec.frames,
+								framesKey: inExec.framesKey,
 							};
 						});
 					} else {
@@ -990,6 +1109,36 @@
 						: execStatus === 'failed' ? 'node-failed'
 						: execStatus === 'completed' || execStatus === 'skipped' ? 'node-completed'
 						: '';
+
+					// Bus panels: for an ordinary node, the buses this node
+					// participated in directly. For a group, the union of
+					// every internal node's bus participation (so the
+					// group's modal shows the conversations its members
+					// had with each other or with the outside).
+					const busIdsForNode = new Set<string>(busesByNode[execKey(n.id)] ?? []);
+					if (isContainerNodeType(n.data?.nodeType)) {
+						for (const projNode of project.nodes) {
+							if (projNode.scope?.includes(n.id)) {
+								for (const busId of busesByNode[execKey(projNode.id)] ?? []) {
+									busIdsForNode.add(busId);
+								}
+							}
+						}
+					}
+					// Sort by busId so panel order is stable across SSE
+					// ticks. Without this, every new participant could
+					// shuffle the order in which panels render (Set
+					// insertion order leaks to the user).
+					const busLogs = Array.from(busIdsForNode).sort().map((busId) => ({
+						busId,
+						events: busLogByBus[busId] ?? [],
+						meta: busMetaByBus[busId],
+					}));
+
+					const loopEvents = isLoopNodeType(n.data?.nodeType)
+						? (loopEventsByGroup[execKey(n.id)] ?? [])
+						: [];
+
 					return {
 						...n,
 						data: {
@@ -997,6 +1146,9 @@
 							debugData,
 							executions,
 							executionCount: executions.length,
+							busLogs,
+							loopEvents,
+							journalCorruptions,
 						},
 						class: nodeClass,
 					};
@@ -1549,7 +1701,7 @@
 			layoutCode = newLayoutCode;
 		}
 		// Fast path: source text unchanged, but the compiler may have re-inferred
-		// port metadata (laneMode for implicit Gather/Expand, concrete portTypes).
+		// port metadata (concrete portTypes resolved from TypeVars).
 		// Patch ports in place without rebuilding the node list or re-running ELK.
 		if (newWeftCode === weftCode) {
 			mergeInferredPortMetadata(newProject);
@@ -1562,7 +1714,7 @@
 	/// Update each existing graph node's `data.inputs` / `data.outputs`
 	/// to match the freshly-parsed project's port metadata. Used when
 	/// the source text didn't change but the compiler may have
-	/// re-inferred laneMode (implicit Gather/Expand) or concrete
+	/// resolved TypeVars to concrete
 	/// portTypes. Only touches port arrays; positions, configs,
 	/// edge IDs are untouched, so xyflow doesn't relayout.
 	function mergeInferredPortMetadata(parsed: ProjectDefinition): void {
@@ -1590,7 +1742,6 @@
 			const pa = a[i]; const pb = b[i];
 			if (pa.name !== pb.name) return false;
 			if (pa.portType !== pb.portType) return false;
-			if (pa.laneMode !== pb.laneMode) return false;
 			if (!!pa.required !== !!pb.required) return false;
 		}
 		return true;
@@ -1958,41 +2109,64 @@
 		if (structuralLock) return;
 		const typeConfig = NODE_TYPE_CONFIG[type];
 		const isGroup = type === 'Group';
+		const isLoop = type === 'Loop';
+		const isContainer = isGroup || isLoop;
 		const isAnnotation = type === 'Annotation';
-		// A group is declared in source by its label (`MyGroup = Group()...`),
-		// so the label IS its node id once parsed. Use the label as the
-		// optimistic node's id too, otherwise the optimistic node (`group_1`)
-		// and the round-tripped node (`MyGroup`) have different ids: the graph
-		// flashes (swap) and the position is lost (no currentPositions match).
-		// Seed group names from a safe default, NOT the type's display label:
-		// that label is "Group", which is a reserved type keyword the compiler
-		// rejects as an identifier (and `MyGroup.out` references would misparse
-		// as inline groups). "MyGroup" is a valid, non-reserved starting point.
-		const groupLabel = isGroup ? generateUniqueGroupLabel('MyGroup') : null;
-		const id = isGroup ? groupLabel! : generateNodeId(type);
+		// A container is declared in source by its label (`MyGroup = Group()...`
+		// or `MyLoop = Loop()...`), so the label IS its node id once parsed.
+		// Seed names from a safe default, NOT the type's display label:
+		// "Group" / "Loop" are reserved type keywords. "MyGroup" / "MyLoop"
+		// are valid, non-reserved starting points.
+		const containerLabel = isContainer
+			? generateUniqueGroupLabel(isLoop ? 'MyLoop' : 'MyGroup')
+			: null;
+		const id = isContainer ? containerLabel! : generateNodeId(type);
 		const pos = contextMenuFlowPos ?? getViewportCenter();
 		contextMenuFlowPos = null;
+		// Default container size: groups get 500x350, loops get a wider /
+		// taller default to fit the config strip plus a few body nodes.
+		// The autonomous min-height logic in GroupNode bumps it higher
+		// once ports are added, but a generous starting size keeps the
+		// first paint pleasant.
+		const containerConfig: Record<string, unknown> = isContainer
+			? (isLoop
+				? { width: 600, height: 500, expanded: true }
+				: { width: 500, height: 350, expanded: true })
+			: {};
+		// Loop config left empty: parallel defaults to false (sequential),
+		// over and carry default to empty lists. No need to seed them.
 		const newNode: Node = {
 			id,
-			type: isGroup ? 'group' : isAnnotation ? 'annotation' : 'project',
+			type: isContainer ? 'group' : isAnnotation ? 'annotation' : 'project',
 			position: { x: pos.x, y: pos.y },
-			selected: true, // Select the new node
+			selected: true,
 			data: {
-				label: groupLabel,
+				label: containerLabel,
 				nodeType: type,
-				config: isGroup ? { width: 400, height: 300, expanded: true } : isAnnotation ? { width: 250, height: 120, content: '' } : {},
+				config: isContainer
+					? containerConfig
+					: isAnnotation
+						? { width: 250, height: 120, content: '' }
+						: {},
 				inputs: [...typeConfig.defaultInputs],
 				outputs: [...typeConfig.defaultOutputs],
 				features: typeConfig.features || {},
 				onUpdate: createNodeUpdateHandler(id),
 			},
-			...((isGroup || isAnnotation) ? { style: `width: ${isAnnotation ? 250 : 400}px; height: ${isAnnotation ? 120 : 300}px;` } : {}),
+			...((isContainer || isAnnotation)
+				? {
+					style: isAnnotation
+						? `width: 250px; height: 120px;`
+						: isLoop
+							? `width: 600px; height: 500px;`
+							: `width: 500px; height: 350px;`,
+				}
+				: {}),
 		};
-		
-		// Deselect all existing nodes before adding the new one
+
 		const deselectedNodes = nodes.map(n => ({ ...n, selected: false }));
-		
-		if (isGroup || isAnnotation) {
+
+		if (isContainer || isAnnotation) {
 			const specialNodes = deselectedNodes.filter(n => n.type === 'group' || n.type === 'groupCollapsed' || n.type === 'annotation');
 			const otherNodes = deselectedNodes.filter(n => n.type !== 'group' && n.type !== 'groupCollapsed' && n.type !== 'annotation');
 			nodes = [...specialNodes, newNode, ...otherNodes];
@@ -2000,15 +2174,17 @@
 			nodes = [...deselectedNodes, newNode];
 		}
 		selectedNodeId = id;
-		// One reversible action: the add intent (source) + the drop position
-		// (layout). The source round-trip re-renders; the layout entry keeps the
-		// node where it was dropped (patchFromProject reads it, so the round-trip
-		// doesn't ELK-place it).
-		const op: EditOp = isGroup
-			? { op: 'addGroup', label: newNode.data.label as string, parentGroup: null }
-			: { op: 'addNode', id, nodeType: type, parentGroup: null };
+		const op: EditOp = isLoop
+			? { op: 'addLoop', label: newNode.data.label as string, parentGroup: null }
+			: isGroup
+				? { op: 'addGroup', label: newNode.data.label as string, parentGroup: null }
+				: { op: 'addNode', id, nodeType: type, parentGroup: null };
 		recordEdit([op], () => {
-			if (isGroup) layoutCode = updateLayoutEntry(layoutCode, newNode.data.label as string, pos.x, pos.y, 400, 300);
+			if (isContainer) {
+				const w = isLoop ? 600 : 500;
+				const h = isLoop ? 500 : 350;
+				layoutCode = updateLayoutEntry(layoutCode, newNode.data.label as string, pos.x, pos.y, w, h);
+			}
 			else layoutCode = updateLayoutEntry(layoutCode, id, pos.x, pos.y);
 		});
 	}
@@ -2017,12 +2193,35 @@
 		if (nodeIds.length === 0) return;
 		if (structuralLock) return;
 
-		// Capture group labels before visual deletion removes them from the nodes array
+		// Capture container labels (groups + loops) and their kind
+		// before visual deletion removes them from the nodes array.
+		// The kind decides which EditOp to emit: `removeLoop` for
+		// loops, `removeGroup` for groups. The Rust side rejects
+		// RemoveGroup on a Loop (and vice versa) loudly, so routing
+		// by container kind is required.
 		const groupLabels = new Map<string, string>();
+		const loopLabels = new Set<string>();
 		for (const nodeId of nodeIds) {
 			const n = nodes.find(nd => nd.id === nodeId);
 			if (n && (n.type === 'group' || n.type === 'groupCollapsed') && n.data.label) {
+				// Precondition before any visual mutation: a container
+				// with no kind tag means a hydration race. Bail the
+				// whole delete batch with a warning so the user can
+				// retry once nodes re-hydrate. Half-deleting (visually
+				// remove some, can't route the source op) would leave
+				// the UI desynced from source.
+				const kind = containerKindOf(n.data.nodeType);
+				if (kind === null) {
+					console.warn(
+						`[delete] container ${nodeId} has nodeType=${JSON.stringify(n.data.nodeType)};`,
+						'aborting delete batch until the node re-hydrates'
+					);
+					return;
+				}
 				groupLabels.set(nodeId, n.data.label as string);
+				if (kind === 'Loop') {
+					loopLabels.add(nodeId);
+				}
 			}
 		}
 
@@ -2088,7 +2287,11 @@
 		for (const nodeId of nodeIds) {
 			const groupLabel = groupLabels.get(nodeId);
 			if (groupLabel) {
-				ops.push({ op: 'removeGroup', group: groupLabel });
+				if (loopLabels.has(nodeId)) {
+					ops.push({ op: 'removeLoop', loopId: groupLabel });
+				} else {
+					ops.push({ op: 'removeGroup', group: groupLabel });
+				}
 				layoutKeysToDrop.push(groupLabel);
 			}
 		}

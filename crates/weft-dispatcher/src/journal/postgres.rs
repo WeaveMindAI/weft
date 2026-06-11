@@ -14,7 +14,7 @@ use weft_core::Color;
 
 use weft_journal::ExecEvent;
 use crate::journal::{
-    ApiToken, ExecutionSummary, Journal, LogEntry, NodeExecEvent, NodeExecKind, SignalRegistration,
+    ApiToken, ColorLookup, ExecutionSummary, Journal, LogEntry, SignalRegistration,
 };
 
 pub struct PostgresJournal {
@@ -57,25 +57,93 @@ impl PostgresJournal {
         &self.pool
     }
 
-    /// On `ExecutionStarted`, denormalize (color, project_id, tenant_id)
-    /// into `execution_color`. The broker's scope check reads this
-    /// table to verify "color C belongs to tenant T" without folding
-    /// the journal. Idempotent on conflict; tenant_id is derived by
-    /// joining `project` so we never store stale denormalization.
-    async fn maybe_seed_execution_color(&self, event: &ExecEvent) -> anyhow::Result<()> {
-        if let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, .. } = event {
-            sqlx::query(
-                "INSERT INTO execution_color (color, project_id, tenant_id, started_at_unix, phase) \
-                 SELECT $1, $2, p.tenant_id, $3, $4 FROM project p WHERE p.id = $2::uuid \
-                 ON CONFLICT (color) DO NOTHING",
+    /// The color's first `ExecutionStarted` event, decoded. The ONE
+    /// fetch behind `execution_project` and
+    /// `execution_definition_hash`. A row whose JSON no longer
+    /// decodes is a PERMANENT poison: returning `Err` would make
+    /// pollers (the journal bridge's per-row processing) retry the
+    /// same row forever, stalling the cursor fleet-wide. Log loud
+    /// and report `Corrupt` (non-retryable, distinct from
+    /// `NotFound`) so callers can word the failure honestly.
+    async fn execution_started(&self, color: Color) -> anyhow::Result<ColorLookup<ExecEvent>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT payload_json FROM exec_event \
+             WHERE color = $1 AND kind = 'execution_started' \
+             ORDER BY id ASC LIMIT 1",
+        )
+        .bind(color.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((payload,)) = row else { return Ok(ColorLookup::NotFound) };
+        match serde_json::from_str::<ExecEvent>(&payload) {
+            Ok(ev) => Ok(ColorLookup::Found(ev)),
+            Err(e) => {
+                tracing::error!(
+                    target: "weft_dispatcher::journal",
+                    %color,
+                    error = %e,
+                    "ExecutionStarted row failed to decode \
+                     (permanent corruption, retrying cannot fix it)"
+                );
+                Ok(ColorLookup::Corrupt)
+            }
+        }
+    }
+
+    /// Write one event, pairing an `ExecutionStarted` with its
+    /// `execution_color` seed in ONE transaction. The seed
+    /// denormalizes (color, project_id, tenant_id) so the broker's
+    /// scope check and the terminal sweeps
+    /// (`list_non_terminal_colors_for_project`) can see the color
+    /// without folding the journal; a crash between the event insert
+    /// and a separate seed would create a color those sweeps can
+    /// NEVER see (untouchable junk), so the two commit together. A
+    /// missing project row fails the whole write loudly instead of
+    /// silently journaling an unsweepable execution.
+    async fn record_with_seed(
+        &self,
+        event: &ExecEvent,
+        dedup_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, .. } = event else {
+            return weft_journal::record_event_in(&self.pool, event, None, dedup_key)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"));
+        };
+        let mut tx = self.pool.begin().await?;
+        weft_journal::record_event_in(&mut *tx, event, None, dedup_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let rows = sqlx::query(
+            "INSERT INTO execution_color (color, project_id, tenant_id, started_at_unix, phase) \
+             SELECT $1, $2, p.tenant_id, $3, $4 FROM project p WHERE p.id = $2::uuid \
+             ON CONFLICT (color) DO NOTHING",
+        )
+        .bind(color.to_string())
+        .bind(project_id)
+        .bind(*at_unix as i64)
+        .bind(phase.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if rows.rows_affected() == 0 {
+            // Zero rows = conflict (already seeded: a dedup'd retry)
+            // OR missing project. Only the latter is an error.
+            let (already_seeded,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS(SELECT 1 FROM execution_color WHERE color = $1)",
             )
             .bind(color.to_string())
-            .bind(project_id)
-            .bind(*at_unix as i64)
-            .bind(phase.as_str())
-            .execute(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
+            if !already_seeded {
+                anyhow::bail!(
+                    "refuse to journal ExecutionStarted for color {color}: project \
+                     {project_id} has no row, so the execution_color seed (which the \
+                     broker scope check and the terminal sweeps depend on) cannot be \
+                     written; register the project first"
+                );
+            }
         }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -215,12 +283,11 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
 #[async_trait]
 impl Journal for PostgresJournal {
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
-        // Single canonical write path lives in weft-journal so the
-        // dispatcher, engine, and listener all INSERT identical rows.
-        weft_journal::record_event(&self.pool, event)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        self.maybe_seed_execution_color(event).await
+        // Single canonical row shape lives in weft-journal so the
+        // dispatcher, engine, and listener all INSERT identical rows;
+        // `record_with_seed` adds the execution_color seed in the
+        // same transaction for ExecutionStarted.
+        self.record_with_seed(event, None).await
     }
 
     async fn record_event_dedup(
@@ -228,10 +295,7 @@ impl Journal for PostgresJournal {
         event: &ExecEvent,
         dedup_key: &str,
     ) -> anyhow::Result<()> {
-        weft_journal::record_event_dedup(&self.pool, event, dedup_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        self.maybe_seed_execution_color(event).await
+        self.record_with_seed(event, Some(dedup_key)).await
     }
 
     async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>> {
@@ -363,20 +427,28 @@ impl Journal for PostgresJournal {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn execution_project(&self, color: Color) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM exec_event \
-             WHERE color = $1 AND kind = 'execution_started' \
-             ORDER BY id ASC LIMIT 1",
-        )
-        .bind(color.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((payload,)) = row else { return Ok(None) };
-        let ev: ExecEvent = serde_json::from_str(&payload)?;
-        Ok(match ev {
-            ExecEvent::ExecutionStarted { project_id, .. } => Some(project_id),
-            _ => None,
+    async fn execution_project(&self, color: Color) -> anyhow::Result<ColorLookup<String>> {
+        Ok(match self.execution_started(color).await? {
+            ColorLookup::Found(ExecEvent::ExecutionStarted { project_id, .. }) => {
+                ColorLookup::Found(project_id)
+            }
+            ColorLookup::Found(_) => ColorLookup::NotFound,
+            ColorLookup::NotFound => ColorLookup::NotFound,
+            ColorLookup::Corrupt => ColorLookup::Corrupt,
+        })
+    }
+
+    async fn execution_definition_hash(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<ColorLookup<String>> {
+        Ok(match self.execution_started(color).await? {
+            ColorLookup::Found(ExecEvent::ExecutionStarted { definition_hash, .. }) => {
+                ColorLookup::Found(definition_hash)
+            }
+            ColorLookup::Found(_) => ColorLookup::NotFound,
+            ColorLookup::NotFound => ColorLookup::NotFound,
+            ColorLookup::Corrupt => ColorLookup::Corrupt,
         })
     }
 
@@ -396,29 +468,6 @@ impl Journal for PostgresJournal {
                 serde_json::from_str::<ExecEvent>(&payload)
             {
                 out.push(LogEntry { at_unix, level, message });
-            }
-        }
-        Ok(out)
-    }
-
-    async fn events_for(&self, color: Color) -> anyhow::Result<Vec<NodeExecEvent>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM exec_event \
-             WHERE color = $1 AND kind IN ( \
-                 'node_started', 'node_suspended', 'node_resumed', \
-                 'node_cancelled', \
-                 'node_completed', 'node_failed', 'node_skipped' \
-             ) \
-             ORDER BY id ASC",
-        )
-        .bind(color.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (payload,) in rows {
-            let Ok(ev) = serde_json::from_str::<ExecEvent>(&payload) else { continue };
-            if let Some(converted) = exec_event_to_node_exec(&ev) {
-                out.push(converted);
             }
         }
         Ok(out)
@@ -613,14 +662,6 @@ impl Journal for PostgresJournal {
         Ok(row.map(row_to_signal))
     }
 
-    async fn signal_remove(&self, token: &str) -> anyhow::Result<bool> {
-        let res = sqlx::query("DELETE FROM signal WHERE token = $1")
-            .bind(token)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
     async fn signal_remove_many(
         &self,
         tokens: &[String],
@@ -751,103 +792,6 @@ fn row_to_signal(row: SignalRow) -> SignalRegistration {
         auth_kind: row.auth_kind,
         auth_config: row.auth_config,
         kind_state: row.kind_state,
-    }
-}
-
-fn exec_event_to_node_exec(ev: &ExecEvent) -> Option<NodeExecEvent> {
-    match ev {
-        ExecEvent::NodeStarted { color, node_id, lane, input, at_unix, .. } => Some(NodeExecEvent {
-            color: *color,
-            node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-            kind: NodeExecKind::Started,
-            input: Some(input.clone()),
-            output: None,
-            error: None,
-            token: None,
-            value: None,
-            reason: None,
-            at_unix: *at_unix,
-        }),
-        ExecEvent::NodeSuspended { color, node_id, lane, token, at_unix } => Some(NodeExecEvent {
-            color: *color,
-            node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-            kind: NodeExecKind::Suspended,
-            input: None,
-            output: None,
-            error: None,
-            token: Some(token.clone()),
-            value: None,
-            reason: None,
-            at_unix: *at_unix,
-        }),
-        ExecEvent::NodeResumed { color, node_id, lane, token, value, at_unix } => Some(NodeExecEvent {
-            color: *color,
-            node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-            kind: NodeExecKind::Resumed,
-            input: None,
-            output: None,
-            error: None,
-            token: Some(token.clone()),
-            value: Some(value.clone()),
-            reason: None,
-            at_unix: *at_unix,
-        }),
-        ExecEvent::NodeCancelled { color, node_id, lane, reason, at_unix } => Some(NodeExecEvent {
-            color: *color,
-            node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-            kind: NodeExecKind::Cancelled,
-            input: None,
-            output: None,
-            error: Some(reason.clone()),
-            token: None,
-            value: None,
-            reason: Some(reason.clone()),
-            at_unix: *at_unix,
-        }),
-        ExecEvent::NodeCompleted { color, node_id, lane, output, at_unix } => Some(NodeExecEvent {
-            color: *color,
-            node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-            kind: NodeExecKind::Completed,
-            input: None,
-            output: Some(output.clone()),
-            error: None,
-            token: None,
-            value: None,
-            reason: None,
-            at_unix: *at_unix,
-        }),
-        ExecEvent::NodeFailed { color, node_id, lane, error, at_unix } => Some(NodeExecEvent {
-            color: *color,
-            node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-            kind: NodeExecKind::Failed,
-            input: None,
-            output: None,
-            error: Some(error.clone()),
-            token: None,
-            value: None,
-            reason: None,
-            at_unix: *at_unix,
-        }),
-        ExecEvent::NodeSkipped { color, node_id, lane, at_unix } => Some(NodeExecEvent {
-            color: *color,
-            node_id: node_id.clone(),
-            lane: serde_json::to_string(lane).expect("Lane (Vec<LaneFrame>) serializes"),
-            kind: NodeExecKind::Skipped,
-            input: None,
-            output: None,
-            error: None,
-            token: None,
-            value: None,
-            reason: None,
-            at_unix: *at_unix,
-        }),
-        _ => None,
     }
 }
 

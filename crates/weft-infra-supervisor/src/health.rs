@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use weft_core::truncate_user_string;
 
 use crate::health_engine::{
     evaluate_node_health, evaluate_protocols, all_units_healthy, NodeHealthState,
@@ -37,8 +38,8 @@ struct BackoffState {
 }
 
 /// Backoff delay for the Nth consecutive failure: 5s, 10s, 20s, 40s,
-/// ... doubling, capped at 5 min. The action still self-heals (it
-/// keeps retrying), just not in a tight loop while broken.
+/// doubling, capped at 5 min. The action still self-heals (it keeps
+/// retrying), just not in a tight loop while broken.
 fn backoff_delay(consecutive_failures: u32) -> Duration {
     const BASE_SECS: u64 = 5;
     const CAP_SECS: u64 = 300;
@@ -380,6 +381,11 @@ async fn tick_project(
                 // user explicitly configured for park-only). Skip
                 // is safer: the next tick re-reads the column and
                 // recovers automatically once the user fixes it.
+                // serde error strings can balloon on deeply nested
+                // protocol shapes (each tried untagged-enum branch
+                // shows up in the message). Bound it before shipping
+                // so a verbose error doesn't blow the 7800-byte
+                // Postgres NOTIFY cap and cause sibling-pod dropout.
                 state
                     .broker
                     .event_record(
@@ -387,7 +393,7 @@ async fn tick_project(
                         None,
                         weft_broker_client::protocol::InfraEvent::ProtocolConfigError(
                             weft_broker_client::protocol::ProtocolConfigErrorPayload {
-                                error: e.to_string(),
+                                error: truncate_user_string(&e.to_string(), 4096),
                             },
                         ),
                     )

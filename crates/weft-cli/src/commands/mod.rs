@@ -116,7 +116,13 @@ impl Ctx {
         match body(progress.clone()).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                progress.error(&format!("{e}"));
+                // Skip the auto-trap if the body already emitted a
+                // structured error: the editor would otherwise see
+                // a second `error` phase with a flattened message
+                // and overwrite the structured one in its store.
+                if !progress.has_emitted_error() {
+                    progress.error(&format!("{e}"));
+                }
                 Err(e)
             }
         }

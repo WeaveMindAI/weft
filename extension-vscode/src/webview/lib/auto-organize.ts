@@ -5,6 +5,8 @@
 
 import ELK from 'elkjs/lib/elk.bundled.js';
 import type { NodeInstance, Edge } from './types';
+import { isContainerNodeType, isLoopNodeType } from './types';
+import { LOOP_CONFIG_STRIP_BAR_PX, LOOP_CONFIG_STRIP_OPEN_PX } from './constants/loop-layout';
 
 export interface AutoOrganizeResult {
 	positions: Map<string, { x: number; y: number }>;
@@ -41,12 +43,12 @@ export async function autoOrganize(
 	// Only expanded groups are ELK containers; collapsed groups are leaf nodes
 	const groupIds = new Set(
 		projectNodes
-			.filter(n => n.nodeType === 'Group' && (n.config as Record<string, unknown>)?.expanded !== false)
+			.filter(n => isContainerNodeType(n.nodeType) && (n.config as Record<string, unknown>)?.expanded !== false)
 			.map(n => n.id)
 	);
 	const collapsedGroupIds = new Set(
 		projectNodes
-			.filter(n => n.nodeType === 'Group' && (n.config as Record<string, unknown>)?.expanded === false)
+			.filter(n => isContainerNodeType(n.nodeType) && (n.config as Record<string, unknown>)?.expanded === false)
 			.map(n => n.id)
 	);
 
@@ -219,9 +221,23 @@ export async function autoOrganize(
 
 	const GROUP_TOP_PADDING = 80;   // header + port labels
 	const GROUP_SIDE_PADDING = 60;  // port labels on sides
-	const GROUP_BOTTOM_PADDING = 40;
+	const GROUP_BOTTOM_PADDING = 60; // extra breathing room below the body
 	const COLLAPSED_GROUP_WIDTH = 200;
 	const COLLAPSED_GROUP_HEIGHT = 80;
+
+	/** Extra vertical space the loop config strip (open or collapsed bar)
+	 *  occupies below the header. 0 for non-loops. Both ELK padding and
+	 *  side-port Y offsets add this so children never sit on the strip. */
+	function loopStripPx(nodeId: string): number {
+		const node = projectNodes.find(n => n.id === nodeId);
+		if (!node || !isLoopNodeType(node.nodeType)) return 0;
+		const configCollapsed = (node.config as Record<string, unknown> | undefined)?.configCollapsed === true;
+		return configCollapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX;
+	}
+
+	function paddingForGroup(groupId: string): string {
+		return `[top=${GROUP_TOP_PADDING + loopStripPx(groupId)},left=${GROUP_SIDE_PADDING},bottom=${GROUP_BOTTOM_PADDING},right=${GROUP_SIDE_PADDING}]`;
+	}
 
 	// Port Y position constants (must match CSS in GroupNode.svelte and ProjectNode.svelte)
 	// Expanded group: ports start at top:40px + 4px padding, each ~30px tall with 6px gap
@@ -238,9 +254,10 @@ export async function autoOrganize(
 		return NODE_PORT_START_Y + portIndex * (NODE_PORT_HEIGHT + NODE_PORT_GAP) + NODE_PORT_HEIGHT / 2;
 	}
 
-	/** Compute port Y position for expanded groups (side ports) */
-	function groupPortY(portIndex: number): number {
-		return GROUP_PORT_START_Y + portIndex * (GROUP_PORT_HEIGHT + GROUP_PORT_GAP) + GROUP_PORT_HEIGHT / 2;
+	/** Compute port Y position for expanded groups (side ports). Loop
+	 *  containers push side ports down by the config-strip height. */
+	function groupPortY(nodeId: string, portIndex: number): number {
+		return GROUP_PORT_START_Y + loopStripPx(nodeId) + portIndex * (GROUP_PORT_HEIGHT + GROUP_PORT_GAP) + GROUP_PORT_HEIGHT / 2;
 	}
 
 	/** Get the actual measured port Y, falling back to computed position if DOM isn't available (e.g. during streaming). */
@@ -248,7 +265,7 @@ export async function autoOrganize(
 		const measured = portPositions?.get(nodeId)?.get(handleId);
 		if (measured !== undefined) return measured;
 		// Fallback: compute from constants (used during streaming when DOM isn't rendered)
-		return isGroup ? groupPortY(portIndex) : nodePortY(portIndex);
+		return isGroup ? groupPortY(nodeId, portIndex) : nodePortY(portIndex);
 	}
 
 	// --- Shared ELK layout options ---
@@ -671,7 +688,7 @@ export async function autoOrganize(
 				const children = (childrenOf.get(groupId) ?? []).filter(c => elkVisibleNodeIds.has(c.id));
 				if (children.length === 0) continue;
 
-				const padding = `[top=${GROUP_TOP_PADDING},left=${GROUP_SIDE_PADDING},bottom=${GROUP_BOTTOM_PADDING},right=${GROUP_SIDE_PADDING}]`;
+				const padding = paddingForGroup(groupId);
 
 				// Find disconnected components first
 				const childIds = new Set(children.map(c => c.id));
@@ -710,7 +727,7 @@ export async function autoOrganize(
 					const newSize = arrangeDisconnectedComponents(
 						sortedComps.map(c => c.comp),
 						{
-							top: GROUP_TOP_PADDING,
+							top: GROUP_TOP_PADDING + loopStripPx(groupId),
 							left: GROUP_SIDE_PADDING,
 							bottom: GROUP_BOTTOM_PADDING,
 							right: GROUP_SIDE_PADDING,
