@@ -6,39 +6,6 @@ before implementation. An entry that already has a full written plan
 links to a file in `todo_plans/` (the plan holds every detail; the
 entry here is just the pointer + one-paragraph what/why).
 
-## Graph edit pipeline: optimistic projection with unified rollback
-
-**Plan:** [`todo_plans/graph-edit-optimistic-projection.md`](todo_plans/graph-edit-optimistic-projection.md)
-
-**Problem.** In the VS Code graph editor, each edit (drag, connect,
-rename, delete, type a config field) takes ~0.5s to round-trip to the
-`.weft` source. Stacking edits within that window corrupts them: the
-last one silently fails, the visual diverges from the source, the user
-has to reload/undo. There are also ~12 ad-hoc rejection/rollback paths
-(7 preflight + 5 post-flight), each with its own shape, plus a silent
-"parse error after edit = no rollback" gap.
-
-**Direction.** Make the visible graph a pure `derive(truth, pendingOps,
-layoutCode)` projection: gestures apply instantly (optimistic), the
-EditOp goes to the host in the background, and confirm advances truth /
-reject resyncs from the host and re-derives. ONE rollback path for both
-preflight and server rejections. Config typing becomes a pendingOp from
-the first keystroke. Plus a logic-lock (auto + explicit) so graph edits
-can't corrupt in-progress code-tab / AI edits. See the plan for the
-full shape, steps, and test matrix.
-
-**Why deferred.** Big single-delivery reshape of `ProjectEditorInner.
-svelte` + the host edit pipeline; designed but not started. This is the
-"graph<->code interaction" work the feat-bus review round explicitly
-EXCLUDED (the X1 / X-M2 / X-M5 / X-M6 / X-M7 / X-M11 findings all belong
-here, not to that round).
-
-[Update Notice Warning] If we touch the webview edit path
-(`recordEdit`, `applyEdits`/`editApplied`, `applyExternalSource`,
-`pendingConfigOps`, the undo/redo stacks) or `graphView.ts`'s
-`applyEditTransaction`, this plan is the intended shape; revisit it
-before patching those ad hoc.
-
 ## Unify journal holes: a missing/corrupt event is a HOLE, fatal only on the resume frontier
 
 ### Mental model first (read this, the rest follows from it)
@@ -271,66 +238,6 @@ it, not an external wake event.
 this SHARE the journal/replay + suspend/resume machinery (a callback is
 a suspension whose resolver is an internal subgraph) or need its own
 path? Likely design this BEFORE loops (loops may fall out of it).
-
-## Loops
-
-**Problem.** No way to express iteration in the graph.
-
-**Direction.** Ideas exist, deferred. Open question: is a loop a
-distinct primitive, or does it fall out of function callbacks +
-Expand/Gather (a callback invoked N times, or an Expand that feeds
-back, is already most of a loop)?
-
-**Why deferred.** Decide after the callback shape is clear; the two are
-coupled and callbacks probably come first.
-
-## File import / multi-file projects
-
-**Problem.** A project is one `main.weft`. There's no way to split it
-across files or compose pieces, which doesn't scale as projects grow.
-
-**Direction.** Let a project import other `.weft` files into values,
-into a group, or anywhere (imports inject at any scope). The project
-becomes a tree of files the **compiler inlines into one executable at
-compile time** (a compile-time include/inline, NOT a runtime module
-system); the whole thing still compiles to one standalone artifact.
-
-**Requirements.**
-- Import granularity: a value, a group, or an arbitrary node/subgraph
-  (probably all three).
-- Name resolution + collision rules across files.
-- Distinct axis from the node-library question (see "standard library
-  as cloned user nodes"): file import is `.weft` SOURCE composition;
-  node discovery is the node LIBRARY. Don't conflate them.
-
-**Why deferred.** Needs a design pass on granularity + name resolution.
-
-## Standard library as cloned user nodes (not built into weft)
-
-**Problem.** The standard library shipping inside the weft binary/repo
-as a special case is a maintenance nightmare and a special-casing seam.
-
-**Direction.** Stop shipping it built in. On `weft new`, **clone the
-stdlib into the project's `nodes/` folder**, and have execution read
-ONLY the user's `nodes/` folder. The stdlib then is just ordinary user
-nodes: the user can delete what they don't use, fork, or replace any of
-it with their own. Everything is a user node in `nodes/`; the model
-becomes uniform with no built-in/user split.
-
-**Same task: nested node discovery.** Discovery must detect nodes
-anywhere nested under `nodes/`, in BOTH forms: bare single-node
-directories AND package form (multi-node packages with a `package.toml`
-unioned with each node's `deps.toml`).
-
-**Requirements.**
-- Per-project `nodes/` discovery REPLACES the built-in catalog as the
-  source of nodes at compile time.
-- One discovery path that handles both the bare-node and package forms
-  at any nesting depth.
-
-**Why deferred.** This reshapes the catalog-loading path (`weft-catalog`,
-the compiler's node registry, `Image::Local` resolution) and is a real
-migration of how compile finds nodes, not a tweak. Plan it as such.
 
 ## Edge-owned transform + type pipeline (with Error-as-value)
 
