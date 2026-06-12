@@ -557,3 +557,32 @@ the journal/replay machinery (the worker that holds is the same worker
 that would otherwise have died and refolded) and on the lifecycle/leasing
 implications of a pinned worker. Surfaced from the node-authoring docs,
 which promised this primitive before it existed.
+
+## setup.sh cross-version upgrade path [DORMANT until MVP]
+
+**Status: OFF.** Inactive while pre-users (no install base to protect).
+Turns ON when Quentin says "I am opening the MVP" (or equivalent); at
+that point start enforcing it. Until then a corrupted-state-on-rerun is
+acceptable, the fix is just `setup.sh --uninstall --purge` then
+`setup.sh`.
+
+**The rule (when ON).** `setup.sh` must support a clean upgrade from ANY
+shipped version (every version from the MVP launch onward) to current,
+with NO manual purge and NO corrupted state left behind. When something
+cross-cutting changes (image/tag naming scheme, k8s manifest shape,
+on-disk project layout, DB lifecycle), the upgrade path must detect the
+old shape and migrate or clean it automatically.
+
+**Why.** Once there is an install base, an upgrade that silently breaks
+state is a production incident for every user who reruns setup.
+Pre-users it costs nothing, so the work is deferred, but the obligation
+is recorded so it isn't forgotten at launch. Past incident (pre-MVP,
+harmless then): the image/resource tagging scheme changed between two
+builds; rerunning `setup.sh` left stale state mismatched with the new
+code (`weft run` failed with "project not found" / status-gate errors);
+only `--uninstall --purge` + reinstall fixed it. With users, that same
+situation would corrupt their install on a routine upgrade.
+
+When this flips ON, revisit alongside setup.sh's flag set and the
+image/tag + manifest + project-layout conventions; the migration logic
+lives wherever setup.sh sequences install/upgrade.
