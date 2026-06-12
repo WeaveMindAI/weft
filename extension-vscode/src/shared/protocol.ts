@@ -721,10 +721,32 @@ export type ActionBarOverlay =
 export type HostMessage =
   | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string; freshMount?: boolean }
   | { kind: 'parseError'; error: string }
-  /// Reply to `applyEdits` / `applyTextEdit`: `inverse` is the text edit that
-  /// undoes what was just applied (the webview stores it on its undo stack).
-  /// `ok:false` means the edit failed (the webview drops the pending action).
-  | { kind: 'editApplied'; requestId: number; ok: boolean; inverse?: TextEdit }
+  /// Reply to `applyEdits` / `applyTextEdit`. Success carries the inverse text
+  /// edit (the action's undo) and, NORMALLY, the post-edit truth (parse +
+  /// source) so the webview advances its truth in one message with no second
+  /// round-trip. `response`/`source` are ABSENT when the user switched `.weft`
+  /// tabs mid-round-trip: the write landed on the right (now-background) doc,
+  /// but the truth belongs to a graph the webview is no longer showing, so the
+  /// webview resolves the inverse for undo bookkeeping WITHOUT advancing truth
+  /// (the new doc's `parseResult` is its truth). Failure carries a user-
+  /// readable `reason` for the rollback toast: the edit-server's message, or
+  /// the `'code-was-edited'` sentinel when the doc changed under the edit.
+  | { kind: 'editApplied'; requestId: number; ok: true; inverse?: TextEdit; response?: ParseResponse; source?: string }
+  | { kind: 'editApplied'; requestId: number; ok: false; reason: string }
+  /// Reply to `resyncSource`: the host's current truth, parsed fresh. Sent
+  /// after a rejected edit so the webview can snap back to the authoritative
+  /// state instead of mirroring server semantics locally. `ok:false` means
+  /// the current source doesn't parse (the webview keeps its previous truth).
+  | { kind: 'sourceResynced'; requestId: number; ok: true; response: ParseResponse; source: string }
+  | { kind: 'sourceResynced'; requestId: number; ok: false; error: string }
+  /// An EXTERNAL change landed on the watched `.weft` doc (user typing in the
+  /// text tab, AI streaming edits): the webview engages its 1s auto-lock on
+  /// source-mutating graph gestures. Re-posted on every keystroke; the lock
+  /// deadline slides forward and expires on its own.
+  | { kind: 'codeEditTouched' }
+  /// Engage / release the explicit graph-logic lock (AI assistant integration;
+  /// the webview also renders a banner with `reason` and a release button).
+  | { kind: 'setGraphLogicLock'; locked: boolean; reason?: string }
   /// Resolved state of every `@file`-referenced file in the current view,
   /// keyed by the marker's relative path. Each entry is either the file's
   /// content or a read error (unreadable/missing). The webview displays a
@@ -833,6 +855,9 @@ export type WebviewMessage =
   /// Replay a raw source text edit (undo/redo of a source action). Same
   /// reply shape as `applyEdits` (the inverse undoes THIS replay).
   | { kind: 'applyTextEdit'; edit: TextEdit; requestId: number }
+  /// Ask the host for its current truth (fresh parse of the open doc).
+  /// Sent after a rejected edit; answered with `sourceResynced`.
+  | { kind: 'resyncSource'; requestId: number }
   | { kind: 'saveLayout'; layoutCode: string }
   /// Write-back for a file-backed config field (`@file("path", Type)`).
   /// The edit goes to the referenced file, not the `@file(...)` token in

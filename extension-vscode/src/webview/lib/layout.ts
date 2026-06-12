@@ -102,7 +102,7 @@ function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?
  *  follows insertion order of the map. The inverse of `parseLayoutCode`. */
 export function serializeLayoutMap(map: Record<string, LayoutEntry>): string {
   return Object.entries(map)
-    .map(([id, e]) => `${id} ${formatLayoutStr(e.x, e.y, e.w, e.h, e.expanded ?? undefined)}`)
+    .map(([id, e]) => `${id} ${formatLayoutStr(e.x, e.y, e.w, e.h, e.expanded ?? undefined, e.configCollapsed ?? undefined)}`)
     .join('\n');
 }
 
@@ -143,6 +143,74 @@ export function renameLayoutSubtree(layoutCode: string, oldKey: string, newKey: 
   return serializeLayoutMap(rebuilt);
 }
 
+// ── Container containment floors ─────────────────────────────────────────
+//
+// A container's drawn box must visually enclose its children, including
+// children that are themselves containers (a Loop inside a Group). Nothing
+// in the incremental edit path grows a parent when a large child lands
+// inside it (only a full ELK pass recomputes sizes), so the renderer floors
+// each expanded container's size by its children's extents, recursively
+// bottom-up. Pure geometry: positions are parent-relative, sizes come from
+// the layout entries (with caller-supplied defaults for unmeasured nodes).
+
+export interface ContainmentItem {
+  id: string;
+  /// Parent container id (undefined = top level).
+  parentId?: string;
+  /// True for an EXPANDED container (collapsed containers are leaf chips).
+  container: boolean;
+  /// Parent-relative position.
+  x: number;
+  y: number;
+  /// Drawn size, when known (layout entry / config). Defaults apply otherwise.
+  w?: number;
+  h?: number;
+}
+
+/** Effective minimum (w, h) per expanded container so every child fits inside
+ *  with `margin` to spare on the right/bottom. A container's own saved size
+ *  wins when larger. Children at negative coordinates are not compensated
+ *  (the box can only grow right/down; a full auto-organize repacks those). */
+export function computeContainmentFloors(
+  items: ContainmentItem[],
+  defaults: { w: number; h: number },
+  margin: { right: number; bottom: number },
+): Map<string, { w: number; h: number }> {
+  const childrenOf = new Map<string, ContainmentItem[]>();
+  for (const item of items) {
+    if (!item.parentId) continue;
+    const list = childrenOf.get(item.parentId);
+    if (list) list.push(item);
+    else childrenOf.set(item.parentId, [item]);
+  }
+  const floors = new Map<string, { w: number; h: number }>();
+  const visiting = new Set<string>(); // cycle guard: malformed parent chains stay finite
+  const effectiveSize = (item: ContainmentItem): { w: number; h: number } => {
+    if (item.container) {
+      const cached = floors.get(item.id);
+      if (cached) return cached;
+      if (visiting.has(item.id)) return { w: item.w ?? defaults.w, h: item.h ?? defaults.h };
+      visiting.add(item.id);
+      let w = item.w ?? defaults.w;
+      let h = item.h ?? defaults.h;
+      for (const child of childrenOf.get(item.id) ?? []) {
+        const cs = effectiveSize(child);
+        w = Math.max(w, child.x + cs.w + margin.right);
+        h = Math.max(h, child.y + cs.h + margin.bottom);
+      }
+      visiting.delete(item.id);
+      const size = { w, h };
+      floors.set(item.id, size);
+      return size;
+    }
+    return { w: item.w ?? defaults.w, h: item.h ?? defaults.h };
+  };
+  for (const item of items) {
+    if (item.container) effectiveSize(item);
+  }
+  return floors;
+}
+
 // ── Reversible layout edits ──────────────────────────────────────────────
 //
 // Layout mutations are SEMANTIC ops (not text patches) so they're reversible
@@ -163,7 +231,7 @@ export function applyLayoutOps(layoutCode: string, ops: LayoutOp[]): string {
   for (const op of ops) {
     if (op.op === 'setEntry') {
       const e = op.entry;
-      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w, e.h, e.expanded ?? null);
+      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w, e.h, e.expanded ?? null, e.configCollapsed ?? null);
     } else {
       code = removeLayoutEntry(code, op.id);
     }
@@ -192,5 +260,6 @@ export function diffLayoutOps(from: string, to: string): LayoutOp[] {
 }
 
 function sameEntry(a: LayoutEntry, b: LayoutEntry): boolean {
-  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h && a.expanded === b.expanded;
+  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
+    && a.expanded === b.expanded && a.configCollapsed === b.configCollapsed;
 }

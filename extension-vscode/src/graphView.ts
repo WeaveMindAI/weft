@@ -270,6 +270,14 @@ export class GraphViewController {
           // rendered text all leave the text == lastRenderedSource and need no
           // reparse (the graph isn't stale). A genuine edit differs and reparses.
           if (e.document.getText() === this.lastRenderedSource) return;
+          // A genuine EXTERNAL change (text-tab typing, AI streaming): tell the
+          // webview so it engages its auto-lock on source-mutating graph
+          // gestures. Re-posted per keystroke; the lock window slides forward.
+          // Skip our OWN edit writes: their change events land here (the doc
+          // differs from lastRenderedSource until applyParseResult runs), but
+          // auto-locking the user right after their own GUI edit is wrong. The
+          // selfWriteDepth bracket scopes exactly our applyEdit + save events.
+          if (this.selfWriteDepth === 0) this.post({ kind: 'codeEditTouched' });
           this.scheduleParse();
           return;
         }
@@ -505,7 +513,7 @@ export class GraphViewController {
    *  post-parse path: a `parse` request feeds it (via triggerParse, behind the
    *  seq guard), and an `edit` feeds the parse the edit-server already returned
    *  (so a GUI edit re-renders from that ONE round-trip, no second parse). */
-  private applyParseResult(response: ParseResponse, source: string, layoutCode: string): void {
+  private applyParseResult(response: ParseResponse, source: string, layoutCode: string, postToWebview = true): void {
     // The parse succeeded: clear any sticky parse-error banner a prior
     // (half-typed) keystroke raised. The user fixes their code and the
     // graph renders, so the banner the failure put up must come down on
@@ -535,7 +543,12 @@ export class GraphViewController {
     // mutates doesn't fire one spurious reparse. (The graph is identical for
     // whitespace-only differences, so skipping is correct.)
     this.lastRenderedSource = this.watchedDoc?.getText() ?? source;
-    this.post({ kind: 'parseResult', response, source, layoutCode, freshMount: this.freshMount });
+    // An edit-fed render hands the webview its truth inside the `editApplied`
+    // reply instead (one message, no double render); only parse-fed renders
+    // post `parseResult`.
+    if (postToWebview) {
+      this.post({ kind: 'parseResult', response, source, layoutCode, freshMount: this.freshMount });
+    }
     this.freshMount = false;
     this.syncInfraLivePollers(response);
     this.syncSignalDisplayPollers(response);
@@ -1002,6 +1015,9 @@ export class GraphViewController {
       case 'applyTextEdit':
         void this.applyEditTransaction(msg.requestId, { kind: 'applyEdit', textEdit: msg.edit });
         break;
+      case 'resyncSource':
+        void this.resyncSource(msg.requestId);
+        break;
       case 'saveLayout':
         void this.saveLayoutCode(msg.layoutCode);
         break;
@@ -1124,6 +1140,16 @@ export class GraphViewController {
   /// (The old time-window flag missed late save-pipeline change events and flickered.)
   private lastRenderedSource: string | null = null;
 
+  /// >0 while THIS controller is writing the watched doc (a graph edit's
+  /// writeTextRaw). The `onDidChangeTextDocument` change events for our own
+  /// applyEdit + save (and any save participant) are delivered before those
+  /// awaits resolve, so they land inside this bracket. Used to suppress the
+  /// `codeEditTouched` auto-lock for our own writes: lastRenderedSource still
+  /// holds the PRE-edit text at that moment (it updates later in
+  /// applyParseResult), so a text comparison can't tell our write apart from
+  /// external typing, but the depth gate can.
+  private selfWriteDepth = 0;
+
   /// Replace a document's entire text with `text`, persisted to disk,
   /// serialized per path. If the file is open in an editor its document is
   /// edited (so the open buffer stays in sync, no disk-write-behind-editor
@@ -1158,8 +1184,21 @@ export class GraphViewController {
       const end = openDoc.lineAt(openDoc.lineCount - 1).range.end;
       const edit = new vscode.WorkspaceEdit();
       edit.replace(uri, new vscode.Range(0, 0, end.line, end.character), text);
-      await vscode.workspace.applyEdit(edit);
-      await openDoc.save();
+      // Bracket the write so our own change events don't trip the auto-lock.
+      this.selfWriteDepth++;
+      try {
+        // applyEdit returns false (without throwing) when the buffer changed
+        // under the computed full-document range, the residual TOCTOU window
+        // after the version backstop. Failing loud here routes through the
+        // caller's rejection path (rollback + resync) instead of saving + and
+        // replying ok:true with truth the doc never received.
+        if (!(await vscode.workspace.applyEdit(edit))) {
+          throw new Error('document edit failed to apply (buffer changed mid-write)');
+        }
+        await openDoc.save();
+      } finally {
+        this.selfWriteDepth--;
+      }
     } else {
       await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(text));
     }
@@ -1187,44 +1226,104 @@ export class GraphViewController {
   ): Promise<void> {
     const doc = this.watchedDoc;
     if (!doc) {
-      this.post({ kind: 'editApplied', requestId, ok: false });
+      this.post({ kind: 'editApplied', requestId, ok: false, reason: 'no document is open' });
       return;
     }
     const key = doc.uri.fsPath;
     try {
       const result = await this.serializeOnPath(key, async () => {
         const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === key) ?? doc;
+        // Doc-version backstop: if the user (or AI) typed into the doc while
+        // the edit-server was computing, writing the result would overwrite
+        // that keystroke. Capture the version AFTER the predecessor settled,
+        // re-check it before writing, and abort cleanly on a change; the
+        // webview's standard rejection path rolls the gesture back. This is
+        // the race-safe third layer under the webview's preflight lock and
+        // the 1s auto-lock window.
+        const versionBefore = openDoc.version;
         const r = await this.parseServer.request<{ source: string; parse: ParseResponse; inverse: TextEdit }>({
           ...req,
           source: openDoc.getText(),
           file: key,
         });
+        if (openDoc.version !== versionBefore) {
+          return { aborted: true as const };
+        }
         await this.writeTextRaw(doc.uri, r.source);
         // Suppress the RENDER (not the write) if the user switched `.weft` while
         // this was in flight: applyParseResult reads the live watchedDoc and
         // consumes freshMount, so rendering A after the view moved to B would
         // bind A's refs against B and steal B's rebuild. Same discipline as
         // triggerParse's seq guard. The write already landed on the right doc.
-        if (this.watchedDoc === doc) {
+        const sameDoc = this.watchedDoc === doc;
+        if (sameDoc) {
           this.parseSeq++; // authoritative result; drop a concurrent stale parse
-          this.applyParseResult(r.parse, r.source, await this.readLayoutCode(doc));
+          // The webview receives this truth inside the editApplied reply
+          // (postToWebview=false): one message advances source + parse + undo.
+          this.applyParseResult(r.parse, r.source, await this.readLayoutCode(doc), false);
         }
-        return r.inverse;
+        // `current` carries truth ONLY when this is still the watched doc. On a
+        // mid-edit doc switch the render was suppressed above; carrying the old
+        // doc's truth in the reply would regress the webview (now showing the
+        // new doc) to a graph it isn't displaying.
+        return { aborted: false as const, inverse: r.inverse, current: sameDoc ? { parse: r.parse, source: r.source } : null };
       });
-      this.post({ kind: 'editApplied', requestId, ok: true, inverse: result });
+      if (result.aborted) {
+        this.post({ kind: 'editApplied', requestId, ok: false, reason: 'code-was-edited' });
+        return;
+      }
+      this.post({
+        kind: 'editApplied', requestId, ok: true, inverse: result.inverse,
+        ...(result.current ? { response: result.current.parse, source: result.current.source } : {}),
+      });
     } catch (err) {
-      // An edit being REJECTED (e.g. a duplicate id, a cross-scope wire) is not a
-      // parse failure: the source on disk is unchanged (the write above never ran).
-      // `editApplied {ok:false}` REJECTS the webview's edit RPC, which makes the
-      // editor's `commit` roll back its optimistic layout AND rebuild nodes/edges
-      // from its last-rendered project (discarding the optimistic structural
-      // change). The webview owns its optimistic state, so it owns the rollback;
-      // the host just reports the refusal. This is NOT a `parseError` (which would
-      // blank a perfectly renderable project), just a non-blocking toast.
-      this.post({ kind: 'editApplied', requestId, ok: false });
-      void vscode.window.showErrorMessage(
-        `Weft: edit rejected: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      // An edit being REJECTED (e.g. a duplicate id, a cross-scope wire) is not
+      // a parse failure: the source on disk is unchanged (the write above never
+      // ran). The reply carries the edit-server's message as the rollback
+      // toast's reason (minus the wire's `edit: ` envelope prefix); the webview
+      // owns its optimistic state, so it owns the rollback (resync + drop the
+      // pending op). This is NOT a `parseError` (which would blank a perfectly
+      // renderable project).
+      const message = err instanceof Error ? err.message : String(err);
+      this.post({
+        kind: 'editApplied', requestId, ok: false,
+        reason: message.replace(/^edit: /, ''),
+      });
+    }
+  }
+
+  /// Answer the webview's `resyncSource`: parse the open doc's CURRENT text
+  /// and reply with the authoritative truth. Sent by the webview after a
+  /// rejected edit so it can snap back to the host's state instead of
+  /// mirroring server semantics locally. Serialized on the doc's path chain
+  /// so the resync sees the post-rejection (settled) source.
+  private async resyncSource(requestId: number): Promise<void> {
+    const doc = this.watchedDoc;
+    if (!doc) {
+      this.post({ kind: 'sourceResynced', requestId, ok: false, error: 'no document is open' });
+      return;
+    }
+    const key = doc.uri.fsPath;
+    try {
+      const { response, source } = await this.serializeOnPath(key, async () => {
+        const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === key) ?? doc;
+        const source = openDoc.getText();
+        const response = await this.parseServer.request<ParseResponse>({
+          kind: 'parse',
+          source,
+          file: key,
+        });
+        return { response, source };
+      });
+      this.post({ kind: 'sourceResynced', requestId, ok: true, response, source });
+    } catch (err) {
+      // The current source doesn't parse (the user is mid-edit in the text
+      // tab). The webview keeps its previous truth; the parse path will
+      // deliver a fresh one once the source parses again.
+      this.post({
+        kind: 'sourceResynced', requestId, ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

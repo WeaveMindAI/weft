@@ -33,6 +33,7 @@ use crate::cst::parse;
 /// cannot be resolved (the batch then aborts and the original source is kept by
 /// the caller). The `view` carries `source_id` so every scoped-id resolution
 /// uses the SAME anon-group prefix the lowering writes.
+/// SYNC: apply_op <-> extension-vscode/src/webview/lib/projection/apply.ts applyOp (the editor's optimistic mirror of these op semantics)
 pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditError> {
     use super::EditOp::*;
     match op {
@@ -124,24 +125,38 @@ fn resolve_loop(view: &FileView, id: &str) -> Result<crate::cst::nodes::LoopDecl
     }
 }
 
+/// The body node of a container scope ref (Group OR Loop), or the file root
+/// when `scope_group` is None. The ONE scope-resolution rule shared by the
+/// connection-finder (`find_connection`) and the body-insert path
+/// (`target_body`), so a wire inside a Loop resolves its scope exactly like an
+/// insert does. A Group-only resolver here silently failed to find/replace
+/// loop-body drivers, appending a second driver on the same input port.
+fn scope_container_body(view: &FileView, scope_group: &str) -> Result<Body, EditError> {
+    let decl = resolve(view, scope_group)?;
+    let body = match &decl {
+        Decl::Group(grp) => grp.body(),
+        Decl::Loop(lp) => lp.body(),
+        _ => return Err(EditError::ContainerNotFound(scope_group.to_string())),
+    };
+    body.ok_or_else(|| EditError::ContainerNotFound(scope_group.to_string()))
+}
+
+fn scope_body(view: &FileView, scope_group: Option<&str>) -> Result<SyntaxNode, EditError> {
+    match scope_group {
+        None => Ok(view.file().syntax().clone()),
+        Some(g) => Ok(scope_container_body(view, g)?.syntax().clone()),
+    }
+}
+
 /// The body to insert into for a given parent ref. Accepts groups AND
 /// loops as containers. None = the file root.
 fn target_body(view: &FileView, parent_group: Option<&str>) -> Result<InsertTarget, EditError> {
     match parent_group {
         None => Ok(InsertTarget::FileRoot(view.file().clone())),
         Some(g) => {
-            let decl = resolve(view, g)?;
-            match &decl {
-                Decl::Group(grp) => {
-                    let body = grp.body().ok_or_else(|| EditError::ContainerNotFound(g.to_string()))?;
-                    Ok(InsertTarget::GroupBody { body, indent: group_body_indent_decl(&decl) })
-                }
-                Decl::Loop(lp) => {
-                    let body = lp.body().ok_or_else(|| EditError::ContainerNotFound(g.to_string()))?;
-                    Ok(InsertTarget::GroupBody { body, indent: group_body_indent_decl(&decl) })
-                }
-                _ => Err(EditError::ContainerNotFound(g.to_string())),
-            }
+            let body = scope_container_body(view, g)?;
+            let indent = group_body_indent_decl(&resolve(view, g)?);
+            Ok(InsertTarget::GroupBody { body, indent })
         }
     }
 }
@@ -668,6 +683,29 @@ fn set_label(view: &FileView, node_id: &str, label: Option<&str>) -> Result<(), 
     }
 }
 
+/// The string entries of a loop's `carry: [...]` config field. The `[...]`
+/// value lexes as ONE opaque JSON_VALUE token, so parse it as JSON (non-list
+/// or non-string entries are a config error the compiler reports; the sweep
+/// just sees no carry names). Used by the dangling-wire sweep to recognize
+/// the carry-synthesized input side.
+fn read_carry_list(decl: &Decl) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for field in find_fields(decl, "carry") {
+        for token in field.descendants_with_tokens().filter_map(|e| e.into_token()) {
+            if token.kind() == SyntaxKind::JSON_VALUE {
+                if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(token.text()) {
+                    for item in items {
+                        if let serde_json::Value::String(s) = item {
+                            out.insert(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Every CONFIG_FIELD / LABEL_FIELD child of `decl`'s body whose key matches.
 /// Returned in source order. Used to collapse duplicates: edit the first,
 /// detach the rest.
@@ -833,9 +871,10 @@ fn add_edge(
     target: &str,
     target_port: &str,
 ) -> Result<(), EditError> {
-    // Both endpoints must exist (or be `self`).
-    require_endpoint(view, source)?;
-    require_endpoint(view, target)?;
+    // Both endpoints must exist (or be `self`). Refs are SCOPE-LOCAL: `x`
+    // inside scope `G` means `G.x`, not a file-wide `x`.
+    require_endpoint(view, scope_group, source)?;
+    require_endpoint(view, scope_group, target)?;
     // Remove the existing driver of this target port in the same scope.
     remove_driver(view, scope_group, target, target_port);
     let conn = format!("{target}.{target_port} = {source}.{source_port}");
@@ -850,15 +889,48 @@ fn add_edge(
     }
 }
 
-/// An endpoint ref must be `self` or resolve to a real node/group.
-fn require_endpoint(view: &FileView, id: &str) -> Result<(), EditError> {
+/// An endpoint ref must be `self` (only inside a scope) or resolve by the
+/// language's connection-scoping rule, which is exactly TWO probes (mirroring
+/// `rescope_endpoint` in the lowering and `endpoint_resolves_to` in the typed
+/// view): a ref `x` inside scope `G` is `G.x` if that exact id exists, else
+/// the BARE top-level `x`. There is NO intermediate-ancestor resolution: the
+/// lowering only prefixes an immediate-scope child and otherwise leaves the id
+/// bare (a bare id wires to a top-level node), so accepting `Outer.x` for a
+/// ref inside `Outer.Inner` would validate an edge the compiler can't wire.
+/// Resolving file-wide instead let an edge validate against a same-named node
+/// in an UNRELATED scope; the two-probe rule is scope-local, immediate match
+/// winning.
+/// SYNC: require_endpoint <-> crates/weft-compiler/src/weft_compiler.rs
+/// rescope_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to
+fn require_endpoint(view: &FileView, scope_group: Option<&str>, id: &str) -> Result<(), EditError> {
     if id == "self" {
+        // `self` names the enclosing container; it is meaningless at file root.
+        return match scope_group {
+            Some(_) => Ok(()),
+            None => Err(EditError::NodeNotFound("self".into())),
+        };
+    }
+    // An endpoint id is a SINGLE segment (a local name or `self`). A dotted ref
+    // would make probe 2 (bare top-level) accept a nested scoped id and author a
+    // 3-segment endpoint the grammar silently truncates to (node, port),
+    // mis-wiring. Reject it so the malformed state is unrepresentable.
+    if id.contains('.') {
+        return Err(EditError::InvalidArgument(format!(
+            "endpoint id must be a single segment; got '{id}'"
+        )));
+    }
+    // Probe 1: an immediate-scope child `{scope}.{id}`.
+    if let Some(g) = scope_group {
+        let prefix = view.scoped_id_of(&resolve(view, g)?).ok_or_else(|| EditError::ContainerNotFound(g.to_string()))?;
+        if view.scoped_id_exists(&format!("{prefix}.{id}")) {
+            return Ok(());
+        }
+    }
+    // Probe 2: a bare top-level `id` (the lowering's outer-ref fallthrough).
+    if view.scoped_id_exists(id) {
         return Ok(());
     }
-    match view.resolve_decl(id) {
-        Resolution::Found(_) => Ok(()),
-        _ => Err(EditError::NodeNotFound(id.to_string())),
-    }
+    Err(EditError::NodeNotFound(id.to_string()))
 }
 
 /// Drop the connection that currently drives `target.target_port` in the scope.
@@ -878,7 +950,7 @@ fn remove_edge(
     target_port: &str,
 ) -> Result<(), EditError> {
     let conn = find_connection(view, scope_group, target, target_port, Some(source), Some(source_port))
-        .map_err(|_| EditError::ConnectionNotFound(source.into(), source_port.into(), target.into(), target_port.into()))?;
+        .map_err(|_| EditError::ConnectionNotFound(target.into(), target_port.into(), source.into(), source_port.into()))?;
     detach_with_leading_ws(&conn);
     Ok(())
 }
@@ -894,14 +966,7 @@ fn find_connection(
     source: Option<&str>,
     source_port: Option<&str>,
 ) -> Result<SyntaxNode, EditError> {
-    let scope = match scope_group {
-        None => view.file().syntax().clone(),
-        Some(g) => resolve_group(view, g)?
-            .body()
-            .ok_or_else(|| EditError::ContainerNotFound(g.to_string()))?
-            .syntax()
-            .clone(),
-    };
+    let scope = scope_body(view, scope_group)?;
     scope
         .children()
         .filter(|n| n.kind() == SyntaxKind::CONNECTION)
@@ -918,7 +983,7 @@ fn find_connection(
             target_ok && source_ok
         })
         .ok_or_else(|| EditError::ConnectionNotFound(
-            source.unwrap_or("").into(), source_port.unwrap_or("").into(), target.into(), target_port.into(),
+            target.into(), target_port.into(), source.unwrap_or("").into(), source_port.unwrap_or("").into(),
         ))
 }
 
@@ -1281,7 +1346,10 @@ fn map_lines_outside_heredoc(block: &str, f: impl Fn(&str) -> String) -> String 
 
 /// Rewrite a node/group's COMPLETE port signature: rebuild the decl with
 /// `id = Type` + the new signature as its header, preserving the body
-/// verbatim. The new signature is the single source of the decl's ports.
+/// verbatim. The new signature is the single source of the decl's ports, so
+/// connections bound to ports that left the signature are detached first:
+/// leaving them would fail validation on the next build (the editor's
+/// delete-port gesture relies on the wire dying with the port).
 fn update_ports(
     view: &FileView,
     id: &str,
@@ -1298,11 +1366,101 @@ fn update_ports(
             &decl,
         ));
     }
+    // Match parent-scope legs by the decl's LOCAL id (how endpoints are
+    // written in source). None = an anonymous root group (no local name): it
+    // can't be named by any parent leg, so the parent-scope sweep is skipped;
+    // its `self.<port>` body wiring is still swept.
+    detach_dangling_port_connections(&decl, decl.local_id().as_deref(), inputs, outputs);
     let header = decl_header_text(&decl);
     // head = `id = Type` (everything up to the first `(` or `->`).
     let (head, _) = split_header_head(&header);
     let new_header = format!("{}{}", head.trim_end(), build_signature(inputs, outputs));
     rebuild_decl(&decl, &new_header)
+}
+
+/// Detach connections bound to ports outside the NEW signature, in the two
+/// scopes that can reference the decl: its parent scope (legs naming the
+/// decl's local id) and, for a container, its own body (`self.<port>`
+/// boundary wiring, where the direction FLIPS: `self` as target writes an
+/// OUTPUT port, `self` as source reads an INPUT). Loop-only port surfaces
+/// outside the signature survive: the implicit `self.done` (write) /
+/// `self.index` (read), and the carry-SYNTHESIZED input side (a carry pairs
+/// each listed output with a derived input the lowering creates, so a seed
+/// wire `l.acc = ...` or a body read `x.a = self.acc` is valid whenever
+/// `acc` is in the carry list AND the new signature keeps the output).
+/// Config-origin lines (`n.key = <literal>`) are never touched; an inline-expr
+/// RHS (`n.a = Type{...}.out`) IS swept like any other wire when its port left
+/// the signature. Both classifications go through the shared
+/// `connection_is_config_origin` so the sweep can't drift from the lowering.
+fn detach_dangling_port_connections(decl: &Decl, id: Option<&str>, inputs: &[PortSig], outputs: &[PortSig]) {
+    let ins: std::collections::HashSet<&str> = inputs.iter().map(|p| p.name.as_str()).collect();
+    let outs: std::collections::HashSet<&str> = outputs.iter().map(|p| p.name.as_str()).collect();
+    let is_loop = matches!(decl, Decl::Loop(_));
+    // Read post-batch state: a `SetLoopConfig carry` earlier in the same op
+    // batch already updated the body's carry field, so a dissolved carry's
+    // wires sweep and a surviving carry's wires stay.
+    let carry = if is_loop { read_carry_list(decl) } else { Default::default() };
+    let carry_input_ok = |p: &str| is_loop && carry.contains(p) && outs.contains(p);
+
+    let dangling = |conn: &SyntaxNode, self_side: bool| -> bool {
+        // A literal config fill (`n.key = value`) is never a wire and is left
+        // untouched: without the catalog the editor cannot tell a fill of a
+        // (now-removed) input port from a genuine config KEY that merely shares
+        // the name, so sweeping it would risk deleting real config. An inline-
+        // expr RHS, despite having one ENDPOINT, IS a wire and must be swept.
+        if crate::cst::nodes::connection_is_config_origin(conn, None, None) {
+            return false;
+        }
+        let (t_id, t_port) = endpoint_parts(conn, 0);
+        let (s_id, s_port) = endpoint_parts(conn, 1);
+        // Parent-scope side needs the decl's local id; an anonymous root has
+        // none (the caller skips the parent sweep entirely), so this closure
+        // is only ever called with self_side=true in that case.
+        let ref_id = if self_side { "self" } else { id.unwrap_or("") };
+        let target_bad = t_id.as_deref() == Some(ref_id) && {
+            let p = t_port.as_deref().unwrap_or("");
+            if self_side {
+                !(outs.contains(p) || (is_loop && p == "done"))
+            } else {
+                !(ins.contains(p) || carry_input_ok(p))
+            }
+        };
+        let source_bad = s_id.as_deref() == Some(ref_id) && {
+            let p = s_port.as_deref().unwrap_or("");
+            if self_side {
+                !(ins.contains(p) || (is_loop && p == "index") || carry_input_ok(p))
+            } else {
+                !outs.contains(p)
+            }
+        };
+        target_bad || source_bad
+    };
+
+    // Parent-scope sweep: only when the decl has a local name a parent leg
+    // could reference. An anonymous root group (id None) has no parent legs.
+    if id.is_some() {
+        if let Some(parent) = decl.syntax().parent() {
+            let doomed: Vec<SyntaxNode> = parent
+                .children()
+                .filter(|n| n.kind() == SyntaxKind::CONNECTION && dangling(n, false))
+                .collect();
+            for c in doomed {
+                detach_with_leading_ws(&c);
+            }
+        }
+    }
+    if let Some(body) = decl.body() {
+        // Only `self` endpoints: a body child that SHADOWS the container's
+        // local id resolves to the child in there, never to the container.
+        let doomed: Vec<SyntaxNode> = body
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::CONNECTION && dangling(n, true))
+            .collect();
+        for c in doomed {
+            detach_with_leading_ws(&c);
+        }
+    }
 }
 
 /// Rebuild a decl in place with a new header line, preserving its body content
@@ -1378,6 +1536,7 @@ fn build_signature(inputs: &[PortSig], outputs: &[PortSig]) -> String {
 }
 
 /// Render a string to a `.weft` value token (quoted, or heredoc if multi-line).
+/// SYNC: format_string <-> extension-vscode/src/webview/lib/value-format.ts formatConfigValue (and parseConfigToken, its inverse)
 fn format_string(s: &str) -> Result<String, EditError> {
     if s.contains('\n') {
         // A multi-line value is emitted as a ```...``` heredoc. The heredoc has

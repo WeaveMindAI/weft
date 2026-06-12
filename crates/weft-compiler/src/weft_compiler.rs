@@ -1901,6 +1901,9 @@ fn lower_grouplike_body(
         // the user did not declare the matching input, synthesize it
         // (REQUIRED: it seeds iteration 0, and a fabricated default
         // seed would silently run the whole loop on wrong data).
+        // SYNC: carry input synthesis <-> extension-vscode/src/webview/lib/
+        // projection/apply.ts syncLoopCarryInputs (the editor's optimistic
+        // projection derives the same ghost inputs between round-trips).
         // Everything diagnostic about carry (unknown output, type
         // mismatch, optional user-declared input) is reported ONCE,
         // by validate's `check_loop_config`, so a mistake never
@@ -1997,7 +2000,9 @@ fn prefix_node_ids(nodes: &mut [ParsedNode], group_id: &str) {
 /// Rescope a group-internal connection endpoint id. `self` becomes the group's
 /// boundary passthrough (`__in` for a source, `__out` for a target); a local
 /// child ref (by its head segment) is prefixed with the group id; an outer ref
-/// is left unchanged.
+/// is left unchanged. The two-probe rule (immediate-child-else-bare) the editor
+/// must mirror when validating an edge endpoint.
+/// SYNC: rescope_endpoint <-> crates/weft-compiler/src/edit/ops.rs require_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to
 fn rescope_endpoint(
     endpoint: &str,
     group_id: &str,

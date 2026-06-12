@@ -611,6 +611,270 @@ fn update_node_ports_on_node_with_body_preserves_body() {
 
 
 #[test]
+fn update_node_ports_drops_connections_on_removed_ports() {
+    // Deleting a port must take its wires with it: the new signature is the
+    // single source of the decl's ports, and a leftover `x.y = n.removed`
+    // fails validation on the next build (the exact bug: deleting the python
+    // node's `stop` output left `self.done = exec_python_1.stop` behind).
+    let src = "n = Text() -> (kept: String, removed: String)\nd = Debug { }\nd.data = n.removed\nd2 = Debug { }\nd2.data = n.kept\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![],
+        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: Some("String".into()) }],
+    }]);
+    assert!(!out.contains("n.removed"), "wire on the removed port must die: {out}");
+    assert!(out.contains("d2.data = n.kept"), "wire on the kept port survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_drops_every_fanout_wire_of_a_removed_output() {
+    // An output port fans out to many targets; removing the port must drop
+    // EVERY wire it feeds, while a sibling port's fan-out is untouched.
+    let src = "n = Text() -> (kept: String, removed: String)\nd1 = Debug { }\nd1.data = n.removed\nd2 = Debug { }\nd2.data = n.removed\nd3 = Debug { }\nd3.data = n.removed\nk1 = Debug { }\nk1.data = n.kept\nk2 = Debug { }\nk2.data = n.kept\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![],
+        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: Some("String".into()) }],
+    }]);
+    assert!(!out.contains("n.removed"), "all three fan-out wires must die: {out}");
+    assert_eq!(out.matches("= n.kept").count(), 2, "both kept-port wires survive: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_drops_incoming_connection_on_removed_input() {
+    let src = "src_1 = Text() -> (value: String)\nn = Text(a: String, b: String)\nn.a = src_1.value\nn.b = src_1.value\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![],
+    }]);
+    assert!(!out.contains("n.b ="), "incoming wire on the removed input must die: {out}");
+    assert!(out.contains("n.a = src_1.value"), "kept input's wire survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_keeps_config_origin_lines() {
+    // `n.key = "value"` shares the connection SYNTAX but is a config field
+    // (one endpoint); the dangling-wire sweep must never eat it.
+    let src = "n = Text(a: String)\nn.value = \"hello\"\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![],
+        outputs: vec![],
+    }]);
+    assert!(out.contains("n.value = \"hello\""), "config-origin line survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_group_ports_drops_self_wiring_on_removed_ports() {
+    // Inside the body, `self` direction flips: `self.out = child.x` writes an
+    // OUTPUT, `child.y = self.in` reads an INPUT. Removing either port must
+    // drop its boundary wiring; the kept port's wiring survives.
+    let src = "g = Group(inp: String) -> (outp: String, gone: String) {\n  x = Text(v: String) -> (value: String)\n  x.v = self.inp\n  self.outp = x.value\n  self.gone = x.value\n}\n";
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: Some("String".into()) }],
+    }]);
+    assert!(!out.contains("self.gone"), "removed output's boundary wiring must die: {out}");
+    assert!(out.contains("self.outp = x.value"), "kept output wiring survives: {out}");
+    assert!(out.contains("x.v = self.inp"), "kept input wiring survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_loop_ports_keeps_reserved_done_and_index() {
+    // A Loop's implicit `self.done` (write) and `self.index` (read) are
+    // reserved ports OUTSIDE the signature; the sweep must not treat them as
+    // dangling. Removing the loop's `stop`-feeding output elsewhere is what
+    // the gesture does; here we shrink the signature and assert the implicit
+    // wiring survives while a removed iter input's wiring dies.
+    let src = "l = Loop(items: List[String], extra: String) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  x = Text(v: String, n: Number, e: String) -> (value: String, stop: Boolean)\n  x.v = self.items\n  x.n = self.index\n  x.e = self.extra\n  self.acc = x.value\n  self.done = x.stop\n}\nl2 = Debug { }\nl2.data = l.acc\n";
+    let out = apply(src, vec![EditOp::UpdateLoopPorts {
+        loop_id: "l".into(),
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[String]".into()) }],
+        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: Some("String".into()) }],
+    }]);
+    assert!(out.contains("self.done = x.stop"), "reserved self.done survives: {out}");
+    assert!(out.contains("x.n = self.index"), "reserved self.index survives: {out}");
+    assert!(!out.contains("self.extra"), "removed input's boundary wiring must die: {out}");
+    assert!(out.contains("x.v = self.items"), "kept over-port wiring survives: {out}");
+    assert!(out.contains("l2.data = l.acc"), "outer leg on a kept port survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn carry_to_gather_batch_drops_the_carry_input_and_its_wires() {
+    // The editor's "Make gather output" gesture: one batch flipping the carry
+    // list AND removing the paired input from the signature. The input's
+    // wires (the parent-scope seed, the body's `self.acc` read) die with it;
+    // the gather output's wiring survives.
+    let src = "seed = Text() -> (value: Number)\nl = Loop(acc: Number, items: List[Number]) -> (acc: Number) {\n  over: [\n  \"items\"\n]\n  carry: [\n  \"acc\"\n]\n  x = Text(v: Number, a: Number) -> (acc: Number)\n  x.v = self.items\n  x.a = self.acc\n  self.acc = x.acc\n}\nl.acc = seed.value\nd = Debug { }\nd.data = l.acc\n";
+    let out = apply(src, vec![
+        EditOp::SetLoopConfig { loop_id: "l".into(), key: "carry".into(), value: "[]".into() },
+        EditOp::UpdateLoopPorts {
+            loop_id: "l".into(),
+            inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[Number]".into()) }],
+            outputs: vec![PortSig { name: "acc".into(), required: true, port_type: Some("Number".into()) }],
+        },
+    ]);
+    assert!(!out.contains("l.acc = seed.value"), "the carry input's seed wire must die: {out}");
+    assert!(!out.contains("x.a = self.acc"), "the body read of the carry input must die: {out}");
+    assert!(out.contains("self.acc = x.acc"), "the gather output's boundary wiring survives: {out}");
+    assert!(out.contains("d.data = l.acc"), "the outer leg on the output survives: {out}");
+    assert!(out.contains("x.v = self.items"), "the over port's wiring survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_loop_ports_keeps_wires_of_a_surviving_carry() {
+    // A carry input is SYNTHESIZED (not in the signature); a ports update on
+    // the loop must not sweep its wires while the carry list still pairs it
+    // with an output. Here the signature never declares `acc` as input, yet
+    // its seed wire and body read survive an unrelated ports rewrite.
+    let src = "seed = Text() -> (value: Number)\nl = Loop(items: List[Number]) -> (acc: Number) {\n  over: [\n  \"items\"\n]\n  carry: [\n  \"acc\"\n]\n  x = Text(v: Number, a: Number) -> (acc: Number)\n  x.v = self.items\n  x.a = self.acc\n  self.acc = x.acc\n}\nl.acc = seed.value\n";
+    let out = apply(src, vec![EditOp::UpdateLoopPorts {
+        loop_id: "l".into(),
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[Number]".into()) }],
+        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: Some("Number".into()) }],
+    }]);
+    assert!(out.contains("l.acc = seed.value"), "surviving carry's seed wire stays: {out}");
+    assert!(out.contains("x.a = self.acc"), "surviving carry's body read stays: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_drops_inline_expr_wire_on_removed_input() {
+    // An inline-expr RHS (`n.a = Text{...}.value`) is a wire with ONE endpoint,
+    // not a config-origin line; removing its input port must take it with the
+    // port (the s_id.is_none early-return previously kept it, then validation
+    // failed on the next build). A kept input's inline-expr wire survives.
+    let src = "n = Debug(a: String, b: String)\nn.a = Upper { text: \"x\" }.out\nn.b = Upper { text: \"y\" }.out\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![],
+    }]);
+    assert!(!out.contains("n.b ="), "inline-expr wire on the removed input must die: {out}");
+    assert!(out.contains("n.a = Upper { text: \"x\" }.out"), "inline-expr wire on the kept input survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn add_edge_inside_loop_body_replaces_existing_driver() {
+    // addEdge in a Loop body must REMOVE the existing driver of the target port
+    // (one driver per input), exactly as in a Group body. A Group-only scope
+    // resolver in find_connection silently failed the removal and appended a
+    // SECOND driver line (two drivers on one port).
+    let src = "l = Loop(items: List[String]) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  a = Text() -> (value: String)\n  b = Text() -> (value: String)\n  x = Text(v: String) -> (value: String)\n  x.v = a.value\n  self.acc = x.value\n}\n";
+    let out = apply(src, vec![EditOp::AddEdge {
+        scope_group: Some("l".into()),
+        source: "b".into(), source_port: "value".into(),
+        target: "x".into(), target_port: "v".into(),
+    }]);
+    assert_eq!(out.matches("x.v =").count(), 1, "exactly one driver on x.v after re-drive: {out}");
+    assert!(out.contains("x.v = b.value"), "the new driver replaced the old: {out}");
+    assert!(!out.contains("x.v = a.value"), "the old driver was removed: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn remove_edge_inside_loop_body_finds_the_wire() {
+    // removeEdge in a Loop body must resolve its scope as a Loop, not error out
+    // on a Group kind-mismatch (which would surface ConnectionNotFound).
+    let src = "l = Loop(items: List[String]) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  a = Text() -> (value: String)\n  x = Text(v: String) -> (value: String)\n  x.v = a.value\n  self.acc = x.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveEdge {
+        scope_group: Some("l".into()),
+        source: "a".into(), source_port: "value".into(),
+        target: "x".into(), target_port: "v".into(),
+    }]);
+    assert!(!out.contains("x.v = a.value"), "the loop-body wire was removed: {out}");
+    assert!(out.contains("self.acc = x.value"), "unrelated loop wiring stays: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_group_ports_on_anonymous_root_sweeps_self_wiring() {
+    // An anonymous root group (no `name =`) has no local id, so it can't be
+    // named by a parent leg; the parent-scope sweep is skipped, but its own
+    // `self.<port>` boundary wiring is still swept when a port is removed.
+    let src = "Group(raw: String) -> (outp: String, gone: String) {\n  t = Text(v: String) -> (value: String)\n  t.v = self.raw\n  self.outp = t.value\n  self.gone = t.value\n}\n";
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "Untitled".into(),
+        inputs: vec![PortSig { name: "raw".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: Some("String".into()) }],
+    }]);
+    assert!(!out.contains("self.gone"), "removed output's boundary wiring dies on an anon root: {out}");
+    assert!(out.contains("self.outp = t.value"), "kept output wiring survives: {out}");
+    assert!(out.contains("t.v = self.raw"), "kept input wiring survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn add_edge_allows_an_outer_ref_from_inside_a_group() {
+    // Weft connections may reference an OUTER node (the lowering's outward
+    // scoping rule); the editor must accept an edge inside `g` whose source is
+    // a top-level node with no `g.`-scoped namesake.
+    let src = "a = Text() -> (value: String)\ng = Group() -> () {\n  sink = Debug { }\n}\n";
+    let out = apply(src, vec![EditOp::AddEdge {
+        scope_group: Some("g".into()),
+        source: "a".into(), source_port: "value".into(),
+        target: "sink".into(), target_port: "data".into(),
+    }]);
+    assert!(out.contains("sink.data = a.value"), "outer-ref edge added: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn add_edge_rejects_a_dotted_endpoint_ref() {
+    // An endpoint id must be a single segment; a dotted ref would author a
+    // 3-segment endpoint the grammar silently truncates (mis-wiring). The
+    // edit refuses it loudly instead.
+    let src = "g = Group() -> () {\n  inner = Text() -> (value: String)\n}\nsink = Debug { }\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
+        scope_group: None,
+        source: "g.inner".into(), source_port: "value".into(),
+        target: "sink".into(), target_port: "data".into(),
+    }]);
+    assert!(err.is_err(), "a dotted endpoint ref must be refused: {err:?}");
+}
+
+#[test]
+fn add_edge_rejects_an_intermediate_ancestor_ref() {
+    // Connection scoping is TWO probes: immediate-scope child, else bare
+    // top-level. There is NO intermediate-ancestor resolution. A ref `y`
+    // inside `outer.inner` must NOT resolve to `outer.y` (the compiler would
+    // leave the authored `sink.data = y.value` dangling), so the edit refuses.
+    let src = "outer = Group() -> () {\n  y = Text() -> (value: String)\n  inner = Group() -> () {\n    sink = Debug { }\n  }\n}\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
+        scope_group: Some("outer.inner".into()),
+        source: "y".into(), source_port: "value".into(),
+        target: "sink".into(), target_port: "data".into(),
+    }]);
+    assert!(err.is_err(), "an intermediate-ancestor ref must be refused: {err:?}");
+}
+
+#[test]
+fn add_edge_ref_is_scope_local_not_file_wide() {
+    // An endpoint ref inside a group is SCOPE-LOCAL: `inner` in scope `g` means
+    // `g.inner`. A same-named `inner` at top level must NOT satisfy the
+    // endpoint requirement, and the file-wide resolver must not reject the
+    // scoped ref as ambiguous because the local name is reused elsewhere.
+    let src = "inner = Text() -> (value: String)\ng = Group() -> () {\n  inner = Text() -> (value: String)\n  sink = Debug { }\n}\n";
+    let out = apply(src, vec![EditOp::AddEdge {
+        scope_group: Some("g".into()),
+        source: "inner".into(), source_port: "value".into(),
+        target: "sink".into(), target_port: "data".into(),
+    }]);
+    assert!(out.contains("sink.data = inner.value"), "edge added with scope-local refs: {out}");
+    parse_ok(&out);
+}
+
+#[test]
 fn remove_node_drops_edges_in_other_scopes() {
     // Regression: RemoveNode must drop edges referencing the node in ANY scope,
     // including a child group's body, not only the node's own scope.

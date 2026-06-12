@@ -252,29 +252,22 @@
 			const current = classifyOutputPort(port, lc, inputs);
 			if (current.conflictReason) return;
 			if (current.role === 'carry') {
+				// Dissolve the pairing: the name leaves the carry list AND the
+				// paired input leaves the signature, whether it was a derived
+				// ghost or a source-declared input (older sources wrote carry
+				// inputs explicitly). The edit server drops the input's wires
+				// with the port; the gather output itself stays.
 				const carry = (lc.carry as string[] | undefined ?? []).filter(n => n !== portName);
-				const newInputs = inputs.filter(p => !(p.name === portName && p.synthesizedFromCarry));
+				const newInputs = inputs.filter(p => p.name !== portName);
 				data.onUpdate({ config: { ...lc, carry }, inputs: newInputs });
 			} else if (current.role === 'gather') {
-				// Symmetric with carry → gather above: append the
-				// synthesized ghost input in the SAME onUpdate so the
-				// optimistic projection lands as one atomic batch.
-				// Without this the carry config flips but the ghost
-				// input is missing for the round-trip window, the
-				// user sees a flicker, and the contract "single
-				// onUpdate so the round-trip lands as one atomic
-				// batch" silently breaks for this direction.
+				// Only the carry list changes: the paired input is DERIVED (the
+				// compiler synthesizes it on parse, the projection on apply), so
+				// nothing is written into the signature. The ghost appears in the
+				// same projection re-derive as the config flip, no flicker.
 				const carry = [...(lc.carry as string[] | undefined ?? [])];
 				if (!carry.includes(portName)) carry.push(portName);
-				const newInputs = inputs.some(p => p.name === portName && p.synthesizedFromCarry)
-					? inputs
-					: [...inputs, {
-						name: portName,
-						portType: port.portType,
-						required: false,
-						synthesizedFromCarry: true,
-					}];
-				data.onUpdate({ config: { ...lc, carry }, inputs: newInputs });
+				data.onUpdate({ config: { ...lc, carry } });
 			}
 		}
 	}

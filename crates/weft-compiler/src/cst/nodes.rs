@@ -443,6 +443,7 @@ fn scoped_with(prefix: &[String], local: &str) -> String {
 /// (self -> None), the other REWRITES for flatten (self -> the `__in`/`__out`
 /// boundary). The shared rule is pinned by `endpoint_resolution_matches_flatten`
 /// so the two can't silently diverge.
+/// SYNC: endpoint_resolves_to <-> crates/weft-compiler/src/edit/ops.rs require_endpoint, crates/weft-compiler/src/weft_compiler.rs rescope_endpoint
 fn endpoint_resolves_to(ep: &Endpoint, scope: &[String], all_ids: &std::collections::HashSet<String>) -> Option<String> {
     let (id, _) = ep.parts();
     let id = id?;

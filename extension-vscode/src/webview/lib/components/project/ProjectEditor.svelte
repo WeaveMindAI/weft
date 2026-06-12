@@ -9,6 +9,8 @@
 	interface InnerApi {
 		flushAllPendingSaves(): void;
 		applyExternalSource(project: ProjectDefinition, weftCode: string, layoutCode: string): void;
+		setCodeEditTouched(): void;
+		setGraphLogicLock(locked: boolean, reason?: string): void;
 	}
 	let inner: InnerApi | undefined = $state();
 
@@ -23,11 +25,23 @@
 		inner?.applyExternalSource(project, weftCode, layoutCode);
 	}
 
+	/// An external change landed on the watched `.weft` doc: slide the editor's
+	/// 1s auto-lock forward (source-mutating graph gestures pause).
+	export function setCodeEditTouched(): void {
+		inner?.setCodeEditTouched();
+	}
+
+	/// Engage/release the explicit graph-logic lock (AI assistant, UI toggle).
+	export function setGraphLogicLock(locked: boolean, reason?: string): void {
+		inner?.setGraphLogicLock(locked, reason);
+	}
+
 	let {
 		project,
 		onSave,
 		onApplyEdits,
 		onApplyTextEdit,
+		onResyncSource,
 		onRun,
 		onStop,
 		onDismissError,
@@ -53,15 +67,15 @@
 		autoOrganizeOnMount = false,
 		infraFeedByNode,
 		signalFeedByNode,
-		structuralLock = false,
 		onOpenInclude = () => {},
 		execPrefix = '',
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
 		onSave: (data: { layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
-		onApplyEdits: (ops: import('../../../../shared/protocol').EditOp[]) => Promise<import('../../../../shared/protocol').TextEdit | null>;
-		onApplyTextEdit: (edit: import('../../../../shared/protocol').TextEdit) => Promise<import('../../../../shared/protocol').TextEdit | null>;
+		onApplyEdits: (ops: import('../../../../shared/protocol').EditOp[]) => Promise<import('$lib/projection/types').EditRpcResult>;
+		onApplyTextEdit: (edit: import('../../../../shared/protocol').TextEdit) => Promise<import('$lib/projection/types').EditRpcResult>;
+		onResyncSource: () => Promise<{ project: ProjectDefinition; weftCode: string } | null>;
 		onOpenInclude?: (path: string, alias: string) => void;
 		execPrefix?: string;
 		fileContents?: Record<string, import('../../../../shared/protocol').FileContent>;
@@ -97,7 +111,6 @@
 		/// Per-node listener /display tick state. Only consumed for
 		/// nodes with `features.isTrigger`.
 		signalFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
-		structuralLock?: boolean;
 	} = $props();
 </script>
 
@@ -108,6 +121,7 @@
 		{onSave}
 		{onApplyEdits}
 		{onApplyTextEdit}
+		{onResyncSource}
 		{onRun}
 		{onStop}
 		{onDismissError}
@@ -133,7 +147,6 @@
 		{autoOrganizeOnMount}
 		{infraFeedByNode}
 		{signalFeedByNode}
-		{structuralLock}
 		{onOpenInclude}
 		{execPrefix}
 		{fileContents}

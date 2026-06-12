@@ -122,6 +122,8 @@ pub enum EditError {
     AmbiguousId(String),
     #[error("id already exists in scope: {0}")]
     DuplicateId(String),
+    /// Args are (target, target_port, source, source_port): the Display renders
+    /// real weft syntax `target.port = source.port`.
     #[error("connection not found: {0}.{1} = {2}.{3}")]
     ConnectionNotFound(String, String, String, String),
     #[error("invalid edit argument: {0}")]

@@ -8,7 +8,8 @@
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
-  import type { ActionBarState, ActionAvailability, NodeFeedState, TextEdit, EditOp, FileContent } from '../shared/protocol';
+  import type { ActionBarState, ActionAvailability, NodeFeedState, TextEdit, EditOp, FileContent, ProjectDefinition as ProtocolProject } from '../shared/protocol';
+  import type { EditRpcResult } from '$lib/projection/types';
 
   let project: V1Project | null = $state(null);
   let error: string | null = $state(null);
@@ -19,21 +20,29 @@
   let catalogWarnings: string[] = $state([]);
   let layoutCode = $state('');
   // RPC for source edits: applyEdits/applyTextEdit await the host's
-  // `editApplied` reply (correlated by id) carrying the inverse text edit the
-  // editor stores for undo. The webview owns the undo stack.
-  let nextEditRequestId = 0;
-  // A pending edit resolves with the inverse (or null for a successful edit that
-  // has no inverse, e.g. a layout-only round-trip) and REJECTS when the host
-  // reports the edit was refused by Rust. Resolve-vs-reject is the success/failure
-  // channel: a refused edit must surface as a thrown error so the editor's `commit`
-  // rolls back its optimistic layout/node state, never as a `null` that looks like
-  // a no-inverse success (that conflation left rejected edits applied on screen).
-  const pendingEdits = new Map<number, { resolve: (inverse: TextEdit | null) => void; reject: (err: Error) => void }>();
-  function requestEdit(make: (requestId: number) => void): Promise<TextEdit | null> {
-    const requestId = nextEditRequestId++;
+  // `editApplied` reply (correlated by id). Success carries the inverse text
+  // edit (the editor's undo) PLUS the post-edit truth, translated here at the
+  // wire boundary so the editor stays in its own project shape. A refusal
+  // REJECTS with the host's reason: resolve-vs-reject is the success/failure
+  // channel, so a refused edit always rolls the editor's optimistic op back.
+  let nextRequestId = 0;
+  const pendingEdits = new Map<number, { resolve: (r: EditRpcResult) => void; reject: (err: Error) => void }>();
+  function requestEdit(make: (requestId: number) => void): Promise<EditRpcResult> {
+    const requestId = nextRequestId++;
     return new Promise((resolve, reject) => {
       pendingEdits.set(requestId, { resolve, reject });
       make(requestId);
+    });
+  }
+  // RPC for post-rejection resyncs: resolves the host's current truth, or
+  // null when the source doesn't parse right now (the editor keeps its
+  // previous truth until the parse path delivers a fresh one).
+  const pendingResyncs = new Map<number, { resolve: (r: { project: V1Project; weftCode: string } | null) => void }>();
+  function requestResync(): Promise<{ project: V1Project; weftCode: string } | null> {
+    const requestId = nextRequestId++;
+    return new Promise((resolve) => {
+      pendingResyncs.set(requestId, { resolve });
+      send({ kind: 'resyncSource', requestId });
     });
   }
   // Include-navigation back-stack state, driven by the host's `navState`.
@@ -101,11 +110,24 @@
   let signalFeedByNode = $state<Record<string, NodeFeedState>>({});
 
   // Source-derived flags: does the project DECLARE infra / trigger
-  // nodes. Driven by parse results, not by backend state. Used to
-  // gate visibility of bar sections (don't show the Infra section
-  // for a project with no infra nodes in source).
+  // nodes. Driven by every truth carrier (parseResult, editApplied,
+  // sourceResynced), not by backend state. Used to gate visibility of
+  // bar sections (don't show the Infra section for a project with no
+  // infra nodes in source). Recomputed on every truth so the bar
+  // follows graph edits too, e.g. dropping in the first infra node.
   let hasInfraInGraph = $state(false);
   let hasTriggersInGraph = $state(false);
+  function recomputeSourceFlags(project: ProtocolProject): void {
+    hasInfraInGraph = project.nodes.some((n) =>
+      nodeRequiresInfra({
+        nodeType: n.nodeType,
+        requiresInfra: (n as unknown as { requiresInfra?: boolean }).requiresInfra,
+      }),
+    );
+    hasTriggersInGraph = project.nodes.some((n) =>
+      nodeIsTrigger({ nodeType: n.nodeType, features: n.features }),
+    );
+  }
 
   // Auto-follow state. The host-side controller owns the actual
   // decisions; we just render the badge and forward clicks.
@@ -157,15 +179,78 @@
     const unsub = onMessage((msg) => {
       if (msg.kind === 'editApplied') {
         // Reply to applyEdits/applyTextEdit. Success resolves with the inverse
-        // text edit (or null if the edit has no inverse); a refusal REJECTS so the
-        // editor rolls back its optimistic state instead of treating it as a
-        // no-inverse success.
+        // PLUS the post-edit truth (translated here); a refusal REJECTS with
+        // the host's reason so the editor rolls its optimistic op back. A
+        // translation failure on the reply (wire-shape drift) is surfaced as a
+        // rejection too: the editor rolls back instead of diverging silently.
         const pending = pendingEdits.get(msg.requestId);
-        if (pending) {
-          pendingEdits.delete(msg.requestId);
-          if (msg.ok) pending.resolve(msg.inverse ?? null);
-          else pending.reject(new Error('edit refused'));
+        if (!pending) return;
+        pendingEdits.delete(msg.requestId);
+        if (!msg.ok) {
+          pending.reject(new Error(msg.reason));
+          return;
         }
+        // No truth payload: the host applied the edit but the user switched
+        // `.weft` tabs mid-round-trip. Resolve the inverse for undo bookkeeping
+        // WITHOUT advancing truth (the new doc's parseResult is its truth).
+        if (msg.response === undefined || msg.source === undefined) {
+          pending.resolve({ inverse: msg.inverse ?? null, project: null, weftCode: '' });
+          return;
+        }
+        try {
+          // Translate FIRST: only advance catalog + bar flags once the new
+          // truth actually renders, so a failure can't leave them ahead of the
+          // displayed project.
+          const translated = translateProject(msg.response.project, msg.source, layoutCode);
+          registerCatalog(msg.response.catalog as unknown as Record<string, CatalogEntry>);
+          recomputeSourceFlags(msg.response.project);
+          error = null;
+          pending.resolve({ inverse: msg.inverse ?? null, project: translated, weftCode: msg.source });
+        } catch (e) {
+          // The edit IS on disk; this is not a refused edit, it's a truth the
+          // webview cannot render (wire-shape drift). Do NOT roll back (that
+          // would diverge the editor from disk). Surface the inline error
+          // banner (same as a parseResult translation failure) and resolve the
+          // undo inverse with no truth advance.
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.error('translateProject failed on editApplied:', errMsg);
+          error = `Project translation failed: ${errMsg}`;
+          pending.resolve({ inverse: msg.inverse ?? null, project: null, weftCode: '' });
+        }
+        return;
+      }
+      if (msg.kind === 'sourceResynced') {
+        const pending = pendingResyncs.get(msg.requestId);
+        if (!pending) return;
+        pendingResyncs.delete(msg.requestId);
+        if (!msg.ok) {
+          // The current source doesn't parse (user mid-edit in the text tab).
+          // The editor keeps its previous truth; surface why.
+          toast.warning('Source has errors', { description: msg.error, duration: 4000 });
+          pending.resolve(null);
+          return;
+        }
+        try {
+          const translated = translateProject(msg.response.project, msg.source, layoutCode);
+          registerCatalog(msg.response.catalog as unknown as Record<string, CatalogEntry>);
+          recomputeSourceFlags(msg.response.project);
+          pending.resolve({ project: translated, weftCode: msg.source });
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.error('translateProject failed on sourceResynced:', errMsg);
+          toast.warning('Resync failed', { description: errMsg, duration: 4000 });
+          pending.resolve(null);
+        }
+        return;
+      }
+      if (msg.kind === 'codeEditTouched') {
+        // An external change landed on the watched doc: slide the editor's
+        // auto-lock forward (source-mutating graph gestures pause for 1s).
+        editorRef?.setCodeEditTouched?.();
+        return;
+      }
+      if (msg.kind === 'setGraphLogicLock') {
+        editorRef?.setGraphLogicLock?.(msg.locked, msg.reason);
         return;
       }
       if (msg.kind === 'catalogAll') {
@@ -216,20 +301,7 @@
         } else if (editorRef) {
           editorRef.applyExternalSource?.(translated, msg.source, msg.layoutCode);
         }
-        // Recompute "source has infra / triggers" flags on every
-        // parse so the ActionBar follows the user's edits. Source-
-        // derived (independent of backend state) so a freshly
-        // authored project with infra nodes shows the Start button
-        // even before anything is provisioned.
-        hasInfraInGraph = msg.response.project.nodes.some((n) =>
-          nodeRequiresInfra({
-            nodeType: n.nodeType,
-            requiresInfra: (n as unknown as { requiresInfra?: boolean }).requiresInfra,
-          }),
-        );
-        hasTriggersInGraph = msg.response.project.nodes.some((n) =>
-          nodeIsTrigger({ nodeType: n.nodeType, features: n.features }),
-        );
+        recomputeSourceFlags(msg.response.project);
         error = null;
         return;
       }
@@ -523,18 +595,22 @@
     }
   }
 
-  /// A graph (GUI) edit: send the intents to the host (Rust edit-server applies
-  /// + writes the source, parseResult re-renders). Resolves with the inverse
-  /// text edit (this action's undo), or null if nothing was applied / it failed.
-  function onApplyEdits(ops: EditOp[]): Promise<TextEdit | null> {
-    if (ops.length === 0) return Promise.resolve(null);
+  /// A graph (GUI) edit: send the intents to the host (Rust edit-server
+  /// applies + writes the source). Resolves with the inverse text edit (this
+  /// action's undo) plus the post-edit truth; rejects with the host's reason.
+  function onApplyEdits(ops: EditOp[]): Promise<EditRpcResult> {
     return requestEdit((requestId) => send({ kind: 'applyEdits', ops, requestId }));
   }
 
-  /// Replay a raw source text edit (undo/redo of a source action). Resolves with
-  /// the inverse (so undo<->redo round-trips).
-  function onApplyTextEdit(edit: TextEdit): Promise<TextEdit | null> {
+  /// Replay a raw source text edit (undo/redo of a source action). Same reply
+  /// shape (the inverse undoes THIS replay, so undo<->redo round-trips).
+  function onApplyTextEdit(edit: TextEdit): Promise<EditRpcResult> {
     return requestEdit((requestId) => send({ kind: 'applyTextEdit', edit, requestId }));
+  }
+
+  /// Fetch the host's current truth after a rejected edit.
+  function onResyncSource(): Promise<{ project: V1Project; weftCode: string } | null> {
+    return requestResync();
   }
 
   function onOpenInclude(path: string, alias: string) {
@@ -641,6 +717,7 @@
       {onSave}
       {onApplyEdits}
       {onApplyTextEdit}
+      {onResyncSource}
       {onOpenInclude}
       {execPrefix}
       {fileContents}
