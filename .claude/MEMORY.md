@@ -40,7 +40,7 @@ Three tiers, one responsibility each.
 **Dispatcher.** Routes events outside-world <-> workers. Owns lifecycle for listeners + workers; spawns/kills listener Pods (per tenant, lazy) and worker Pods (per color). Persists everything to Postgres (journal, signal table, leases). Does NOT execute node logic or compute anything domain-specific. Pure routing + lifecycle.
 **Worker.** Runs the compiled project binary. WS to dispatcher: receives Start packet (wake spec + snapshot), drives the pulse loop, reports state, dies on stall. Does not persist. On stall + later fire, dispatcher spawns a fresh worker re-seeded from journal; the worker doesn't know it resumed.
 **Why:** independent scale + failure. Listeners I/O-bound + idle; dispatcher is the coordination plane (HA via Postgres leases); workers CPU-bound + ephemeral. Stall-then-die lets one node-pool serve thousands of parked executions.
-**Architecture 4 (implemented; plan `weft/docs/v2-control-plane-unification.md`):** listener IS the kind-aware processor, dispatcher is pure transport.
+**Architecture 4 (implemented):** listener IS the kind-aware processor, dispatcher is pure transport.
 - Listener owns `/register`, `/unregister`, `/process`. Registry stores kind spec + generic signal props (`is_resume`, `color`) needed at fire time.
 - Listener's `process()` returns a kind-agnostic `ProcessAction` (ResolveSuspension / FireEntryTrigger / Hold / NoOp); dispatcher acts without inspecting kind.
 - Dispatcher hosts `POST /signal/{token}`; webhooks come through dispatcher first (uniform parking gate).
@@ -82,7 +82,7 @@ Pre-prod, fresh DB on every rebuild. Don't write `ALTER TABLE ADD COLUMN IF NOT 
 **How to apply:** add a column -> edit the `CREATE TABLE` (NOT NULL DEFAULT or nullable). Remove a column/table/index -> delete it from the `CREATE`, no `DROP ... IF EXISTS`. Rename -> change the `CREATE`, no `RENAME COLUMN`. Backfill for new computed columns -> never; the writer fills it on the next run (cross-table denormalization like `execution_color` seeded from `ExecutionStarted` is a runtime concern, not migrate-time).
 [Update Notice] If the project ever ships with production DB state worth preserving, retire this and add a real migration framework (sqlx-migrate, refinery) first.
 ## Layer-3 testing shape (subsystem rigs)
-Shape for every new testable subsystem (supervisor done; listener, dispatcher, worker pending). Strategy doc: `weft/docs/v2-testing-strategy.md`.
+Shape for every new testable subsystem (supervisor done; listener, dispatcher, worker pending).
 **Trait + fake colocation.** Each I/O dep gets a consumer-side trait in the consuming crate (e.g. `BrokerSupervisorOps` in `weft-infra-supervisor/src/broker_ops.rs`), whose file holds: trait def, `impl Trait for RealClient`, and `FakeX` (gated `#[cfg(any(test, feature = "test-helpers"))]`). Same pattern as `MockProjectStore`.
 **Cross-cutting deps in `weft-platform-traits`.** k8s + clock are shared by supervisor/listener/(eventually)dispatcher. Trait + prod impl always shipped; fake gated behind `test-helpers`. Subsystems depend on `weft-platform-traits = { workspace = true }` for prod, add `features=["test-helpers"]` in `[dev-dependencies]`.
 **State uses trait objects.** `SupervisorState` holds `Arc<dyn BrokerSupervisorOps>`, `Arc<dyn KubeClient>`, `Arc<dyn Clock>`. Never `Instant::now()` / `tokio::time::sleep` directly in subsystem code; always `state.clock.now()` / `.sleep()`.

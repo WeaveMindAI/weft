@@ -7,7 +7,7 @@ repository.workspace = true
 
 # Shared trait surface + production impls for cross-cutting platform
 # concerns (k8s API access, clock). Fakes live behind `test-helpers`
-# so production builds don't link them. See docs/v2-testing-strategy.md.
+# so production builds don't link them.
 
 [features]
 default = []

@@ -4,7 +4,7 @@ Thanks for considering it. Weft is early, opinionated, and moves fast. Every ext
 
 If anything here is wrong, unclear, or out of date, that is a bug. Open an issue.
 
-> **Architecture note.** This document still describes the v1 architecture (Restate orchestrator, `dev.sh`, `backend.rs` + `frontend.ts` per node). The v2 architecture (kubernetes-native, single-binary dispatcher, VS Code extension as the UI, `mod.rs` + `metadata.json` per node) is in flight. See `docs/v2-control-plane-unification.md` and `docs/authoring-nodes.md` for the current shape. A CONTRIBUTING rewrite is on the punch list.
+> **Architecture note.** This document still describes the v1 architecture (Restate orchestrator, `dev.sh`, `backend.rs` + `frontend.ts` per node). The v2 architecture (kubernetes-native, single-binary dispatcher, VS Code extension as the UI, `mod.rs` + `metadata.json` per node) is in flight. See `docs/authoring-nodes.md` for the current shape. A CONTRIBUTING rewrite is on the punch list.
 
 ---
 

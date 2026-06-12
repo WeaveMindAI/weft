@@ -333,7 +333,7 @@ def method_name(self, # Self on the same line as the function name, because it d
 
 *Applies in [code mode].*
 
-Tests live in four layers. Pick the right layer for what you're testing and call it by the right name. Each project may have its own per-project testing doc (e.g. `docs/v2-testing-strategy.md`) with the project-specific trait list and layout; check there first.
+Tests live in four layers. Pick the right layer for what you're testing and call it by the right name.
 
 ## The four layers
 
