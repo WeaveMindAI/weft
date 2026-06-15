@@ -111,48 +111,6 @@ lands.
 suspension-resume fold (`SuspensionRegistered` / `NodeSuspended` /
 `NodeResumed` / `SuspensionResolved`), revisit this entry.
 
-## Project-scoped file storage (large-data plane)
-
-**Problem.** Workers and infra nodes need to store and exchange large
-data (audio/video/documents from WhatsApp, model outputs, uploads,
-intermediate artifacts) that's too big to live inline in the journal /
-task payloads / pulse values. The v1 design had a `store_temp_file`
-split: local OSS mode wrote to local disk, cloud (weavemind) wrote to
-Cloudflare R2. That split is exactly the kind of "two code paths for
-the same role" we're trying to eliminate in v2.
-
-**Direction.** Tie storage to the **project namespace**, the same way
-infra nodes already are. A project gets a storage resource scoped to
-its namespace; whether we're local (kind) or cloud (real k8s), it's the
-same mechanism and the same code path. Candidates to evaluate:
-
-- A per-project storage backend declared like an infra node (PVC-backed
-  locally, object-store-backed in cloud) that the language exposes a
-  generic handle for (`ctx.storage()` returning put/get/url, analogous
-  to `ctx.endpoint()`).
-- A MinIO/S3-API sidecar per project namespace (one API, kind locally
-  via a MinIO pod, real object store in cloud), so workers and infra
-  nodes both speak S3 and the local/cloud difference is just the
-  endpoint.
-
-**Requirements.**
-- One code path for local and cloud (no `#[cfg]` / OSS-vs-cloud split
-  in the language; the cloud-only behavior, if any, wraps a generic
-  weft mechanism per the open/closed repo rule).
-- Workers AND infra nodes can read/write; data outlives a single
-  worker pod (workers are ephemeral, `restartPolicy: Never`).
-- User-manageable: the user can see/manage stored data for a project
-  (CLI + extension surface), and `weft clean <project>` wipes it with
-  the rest of the project's namespaced state.
-- Large objects never travel through the journal/task/pulse path; those
-  carry references (keys/URLs), not bytes.
-
-**Why deferred.** Needs a design pass (which backend shape, how the
-language exposes it, how it composes with the existing infra-node /
-endpoint machinery) before implementation. Surfaced from the WhatsApp
-audio path: the bridge already produces base64 audio inline, which is
-fine for small clips but won't scale to real media.
-
 ## Unified error / degraded-state surfacing to the user
 
 **Problem.** When something goes wrong that the runtime can't auto-fix

@@ -64,8 +64,8 @@ importers:
         specifier: ^2.1.1
         version: 2.1.1
       elkjs:
-        specifier: ^0.9.3
-        version: 0.9.3
+        specifier: ^0.11.1
+        version: 0.11.1
       lucide-svelte:
         specifier: ^0.477.0
         version: 0.477.0(svelte@5.55.4)
@@ -775,8 +775,8 @@ packages:
   devalue@5.7.1:
     resolution: {integrity: sha512-MUbZ586EgQqdRnC4yDrlod3BEdyvE4TapGYHMW2CiaW+KkkFmWEFqBUaLltEZCGi0iFXCEjRF0OjF0DV2QHjOA==}
 
-  elkjs@0.9.3:
-    resolution: {integrity: sha512-f/ZeWvW/BCXbhGEf1Ujp29EASo/lk1FDnETgNKwJrsVvGZhUWCZyg3xLJjAsxfOmt8KjswHmI5EwCQcPMpOYhQ==}
+  elkjs@0.11.1:
+    resolution: {integrity: sha512-zxxR9k+rx5ktMwT/FwyLdPCrq7xN6e4VGGHH8hA01vVYKjTFik7nHOxBnAYtrgYUB1RpAiLvA1/U2YraWxyKKg==}
 
   enhanced-resolve@5.20.1:
     resolution: {integrity: sha512-Qohcme7V1inbAfvjItgw0EaxVX5q2rdVEZHRBrEQdRZTssLDGsL8Lwrznl8oQ/6kuTJONLaDcGjkNP247XEhcA==}
@@ -1758,7 +1758,7 @@ snapshots:
 
   devalue@5.7.1: {}
 
-  elkjs@0.9.3: {}
+  elkjs@0.11.1: {}
 
   enhanced-resolve@5.20.1:
     dependencies:

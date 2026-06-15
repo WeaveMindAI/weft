@@ -1591,14 +1591,22 @@
 		const nodeEl = document.querySelector(`[data-id="${nodeId}"]`) as HTMLElement | null;
 		if (!nodeEl) return portYMap;
 		const nodeRect = nodeEl.getBoundingClientRect();
+		// getBoundingClientRect is SCREEN space (scaled by the canvas zoom), but the
+		// node sizes we feed ELK come from `n.measured`, which xyflow stores in GRAPH
+		// space (unscaled). Mixing the two means that when auto-organize runs while
+		// zoomed out, every port Y shrinks by the zoom factor and the ports collapse
+		// into a tiny band at the node's top, so ELK sees near-coincident anchors and
+		// can't separate the edges (the tangled-layout regression). Divide the
+		// relative offset by the live zoom to bring port Ys back into graph space.
+		const zoom = getViewport().zoom || 1;
 		// Find all handles inside this node
 		const handles = nodeEl.querySelectorAll('.svelte-flow__handle');
 		for (const handle of handles) {
 			const handleId = handle.getAttribute('data-handleid');
 			if (!handleId) continue;
 			const handleRect = handle.getBoundingClientRect();
-			// Y relative to node top
-			const relativeY = handleRect.top + handleRect.height / 2 - nodeRect.top;
+			// Y relative to node top, converted screen -> graph space.
+			const relativeY = (handleRect.top + handleRect.height / 2 - nodeRect.top) / zoom;
 			portYMap.set(handleId, relativeY);
 		}
 		return portYMap;
@@ -1606,14 +1614,9 @@
 
 	function runAutoOrganize(andFitView = false): Promise<void> {
 		const sizes = new Map<string, { width: number; height: number }>();
-		let measuredCount = 0;
-		let unmeasuredCount = 0;
 		for (const n of nodes) {
 			if (n.measured?.width && n.measured?.height) {
 				sizes.set(n.id, { width: n.measured.width, height: n.measured.height });
-				measuredCount++;
-			} else {
-				unmeasuredCount++;
 			}
 		}
 
