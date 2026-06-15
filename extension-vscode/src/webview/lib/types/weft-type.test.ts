@@ -218,7 +218,13 @@ describe('complex type parsing', () => {
 		const t = parseWeftType('Media');
 		expect(t?.kind).toBe('union');
 		if (t?.kind === 'union') {
-			expect(t.types).toHaveLength(4);
+			expect(t.types).toHaveLength(3); // Image | Video | Audio
+		}
+		const f = parseWeftType('File');
+		if (f?.kind === 'union') {
+			expect(f.types).toHaveLength(4); // Image | Video | Audio | Blob
+		} else {
+			throw new Error('File should be a union');
 		}
 	});
 
@@ -226,7 +232,7 @@ describe('complex type parsing', () => {
 		const t = parseWeftType('String | Media');
 		expect(t?.kind).toBe('union');
 		if (t?.kind === 'union') {
-			expect(t.types.length).toBeGreaterThanOrEqual(5); // String + 4 media types
+			expect(t.types.length).toBe(4); // String + 3 media types
 		}
 	});
 
@@ -242,7 +248,7 @@ describe('complex type parsing', () => {
 		const t = parseWeftType('List[Media | String]');
 		expect(t?.kind).toBe('list');
 		if (t?.kind === 'list' && t.inner.kind === 'union') {
-			expect(t.inner.types.length).toBe(5); // 4 media + String
+			expect(t.inner.types.length).toBe(4); // 3 media + String
 		}
 	});
 
@@ -265,7 +271,7 @@ describe('complex type parsing', () => {
 	it('Media roundtrip: expands then re-parses', () => {
 		const t = parseWeftType('Media')!;
 		const s = weftTypeToString(t);
-		expect(s).toBe('Image | Video | Audio | Document');
+		expect(s).toBe('Image | Video | Audio');
 		const reparsed = parseWeftType(s);
 		expect(reparsed).toEqual(t);
 	});
@@ -373,7 +379,7 @@ describe('Null type', () => {
 		const t = parseWeftType('Media | Null');
 		expect(t?.kind).toBe('union');
 		if (t?.kind === 'union') {
-			expect(t.types.length).toBe(5); // 4 media + Null
+			expect(t.types.length).toBe(4); // 3 media + Null
 		}
 		expect(isWeftTypeCompatible('Image', 'Media | Null')).toBe(true);
 		expect(isWeftTypeCompatible('Null', 'Media | Null')).toBe(true);
@@ -394,8 +400,10 @@ describe('Media compatibility', () => {
 		expect(isWeftTypeCompatible('Audio', 'Media')).toBe(true);
 	});
 
-	it('Document → Media: OK', () => {
-		expect(isWeftTypeCompatible('Document', 'Media')).toBe(true);
+	it('Blob is NOT Media but IS File', () => {
+		expect(isWeftTypeCompatible('Blob', 'Media')).toBe(false);
+		expect(isWeftTypeCompatible('Blob', 'File')).toBe(true);
+		expect(isWeftTypeCompatible('Image', 'File')).toBe(true);
 	});
 
 	it('String → Media: fails', () => {
@@ -406,7 +414,7 @@ describe('Media compatibility', () => {
 		expect(isWeftTypeCompatible('Number', 'Media')).toBe(false);
 	});
 
-	it('Media → Image: fails (Video/Audio/Document not handled)', () => {
+	it('Media → Image: fails (Video/Audio not handled)', () => {
 		expect(isWeftTypeCompatible('Media', 'Image')).toBe(false);
 	});
 
@@ -652,18 +660,22 @@ describe('inferTypeFromValue', () => {
 		}
 	});
 
-	it('detects media objects by mimeType', () => {
-		expect(inferTypeFromValue({ url: 'http://x.com/img.png', mimeType: 'image/png' }))
+	it('detects stored-file objects by their concrete marker', () => {
+		// The marker IS the type; a bare {url, mimeType} (no marker) is NOT
+		// a stored file, it types as a Dict.
+		expect(inferTypeFromValue({ __weft_image__: { url: 'http://x/i', mimeType: 'image/png' } }))
 			.toEqual({ kind: 'primitive', value: 'Image' });
-		expect(inferTypeFromValue({ url: 'http://x.com/vid.mp4', mimeType: 'video/mp4' }))
+		expect(inferTypeFromValue({ __weft_video__: { url: 'http://x/v', mimeType: 'video/mp4' } }))
 			.toEqual({ kind: 'primitive', value: 'Video' });
-		expect(inferTypeFromValue({ url: 'http://x.com/aud.wav', mimeType: 'audio/wav' }))
+		expect(inferTypeFromValue({ __weft_audio__: { url: 'http://x/a', mimeType: 'audio/wav' } }))
 			.toEqual({ kind: 'primitive', value: 'Audio' });
-		expect(inferTypeFromValue({ url: 'http://x.com/doc.pdf', mimeType: 'application/pdf' }))
-			.toEqual({ kind: 'primitive', value: 'Document' });
+		expect(inferTypeFromValue({ __weft_blob__: { key: 'exec/c/x', mimeType: 'application/pdf' } }))
+			.toEqual({ kind: 'primitive', value: 'Blob' });
+		// No marker -> not a stored file.
+		expect(inferTypeFromValue({ url: 'http://x/i', mimeType: 'image/png' }).kind).toBe('dict');
 	});
 
-	it('does not detect media without url', () => {
+	it('does not detect a stored file without a handle', () => {
 		const t = inferTypeFromValue({ mimeType: 'image/png', size: 1024 });
 		expect(t.kind).toBe('dict');
 	});

@@ -306,6 +306,22 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
+    /// A node tried to emit a value on `port` whose inferred type is not
+    /// compatible with the port's declared type. The engine refused the
+    /// value and closed the port instead (downstream sees null). This is
+    /// NON-terminal: the node keeps running and its other ports emit
+    /// normally; this row is the visible record that one port's value was
+    /// dropped. Folds into the matching `NodeExecution.port_warnings`.
+    PortTypeMismatch {
+        color: Color,
+        node_id: String,
+        frames: LoopFrames,
+        port: String,
+        expected: String,
+        actual: String,
+        at_unix: u64,
+    },
+
     ExecutionCompleted {
         color: Color,
         outputs: Value,
@@ -422,6 +438,7 @@ impl ExecEvent {
             | Self::RunOutput { color, .. }
             | Self::CostReported { color, .. }
             | Self::LogLine { color, .. }
+            | Self::PortTypeMismatch { color, .. }
             | Self::ExecutionCompleted { color, .. }
             | Self::ExecutionFailed { color, .. }
             | Self::ExecutionCancelled { color, .. }
@@ -453,6 +470,7 @@ impl ExecEvent {
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
             Self::LogLine { .. } => "log_line",
+            Self::PortTypeMismatch { .. } => "port_type_mismatch",
             Self::ExecutionCompleted { .. } => "execution_completed",
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::ExecutionCancelled { .. } => "execution_cancelled",
@@ -691,6 +709,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         output: None,
                         cost_usd: 0.0,
                         logs: Vec::new(),
+                        port_warnings: Vec::new(),
                         color: *c,
                         frames: frames.clone(),
                     };
@@ -1033,6 +1052,21 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                                 *resolved = Some(value.clone());
                             }
                         }
+                    }
+                }
+            }
+            ExecEvent::PortTypeMismatch { node_id, frames, port, expected, actual, color: c, .. } => {
+                if let Some(execs) = executions.get_mut(node_id) {
+                    if let Some(e) = execs
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.color == *c && &e.frames == frames)
+                    {
+                        e.port_warnings.push(weft_core::exec::PortWarning {
+                            port: port.clone(),
+                            expected: expected.clone(),
+                            actual: actual.clone(),
+                        });
                     }
                 }
             }

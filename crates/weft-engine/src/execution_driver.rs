@@ -51,7 +51,7 @@ use weft_journal::JournalClient;
 
 use crate::context::{
     ship_node_completed, ship_node_failed, ship_node_lifecycle, ship_node_skipped,
-    ship_node_suspended, EngineClients, RunnerHandle,
+    ship_node_suspended, EngineClients, NodeTaskOutcome, RunnerHandle, TaskMsg,
 };
 use crate::now_unix;
 
@@ -342,6 +342,12 @@ pub async fn run_one_execution(
         }
         ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck => {
             journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
+            // Eager storage sweep: delete this run's un-kept exec
+            // files right away. PURELY an optimization (errors only
+            // log): the dispatcher's durable terminate sweep is the
+            // guarantee, since a stall-killed worker never reaches
+            // this line.
+            clients.storage.eager_sweep(color).await;
         }
         ExecutionOutcome::Stalled => {
             // Worker exits cleanly without writing a terminal event.
@@ -665,12 +671,18 @@ async fn drive(
     journaled_baseline: usize,
 ) -> anyhow::Result<ExecutionOutcome> {
     let journal = clients.journal.as_ref();
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<NodeTaskResult>();
-    // Emissions from `ctx.pulse_downstream` arrive here while a node
-    // task is still running (a node may emit several times, or emit then
-    // keep living on a bus). The loop drains these and postprocesses
-    // them into downstream pulses without closing the emitting node.
-    let (emit_tx, mut emit_rx) = mpsc::unbounded_channel::<crate::context::EmitMsg>();
+    // ONE ordered channel from node tasks to the loop. A node sends
+    // `TaskMsg::Emission` zero or more times while it runs (each
+    // `pulse_downstream` / `close_port`, applied without closing the
+    // emitting node), then exactly one `TaskMsg::Terminal` when its body
+    // returns. FIFO ordering on this single channel is load-bearing: the
+    // loop always observes a node's emissions BEFORE its terminal, so the
+    // close-unmentioned-ports sweep at the terminal sees the complete set
+    // of emitted ports. (Two separate channels left a window where a
+    // terminal could be read before a just-sent emission, closing a port
+    // that was actually emitted and skipping its consumer until a
+    // re-dispatch, an emit-then-immediately-return race.)
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<crate::context::TaskMsg>();
     // Per-(node, frames) set of OUTPUT PORTS this firing has mentioned
     // across all its `pulse_downstream` and `close_port` calls. On the
     // firing's terminal event (Completed / Failed / Skipped / Cancelled),
@@ -786,8 +798,7 @@ async fn drive(
             );
             cancel_cleanup(
                 &mut in_flight,
-                &mut emit_rx,
-                &mut result_rx,
+                &mut task_rx,
                 &mut waiting,
                 executions,
                 &mut emitted_ports,
@@ -1052,6 +1063,7 @@ async fn drive(
                     output: None,
                     cost_usd: 0.0,
                     logs: Vec::new(),
+                    port_warnings: Vec::new(),
                     color: group.color,
                     frames: group.frames.clone(),
                 };
@@ -1222,8 +1234,12 @@ async fn drive(
                 .remove(&(node_id.clone(), group.frames.clone()))
                 .unwrap_or_default();
 
-            let declared_outputs: std::collections::HashSet<String> =
-                node_def.outputs.iter().map(|p| p.name.clone()).collect();
+            let declared_outputs: std::collections::HashMap<String, weft_core::weft_type::WeftType> =
+                node_def
+                    .outputs
+                    .iter()
+                    .map(|p| (p.name.clone(), p.port_type.clone()))
+                    .collect();
             let wake_payload = kick_payloads.remove(&(node_id.clone(), group.frames.clone()));
             let mut runner = RunnerHandle::new(
                 exec_id.to_string(),
@@ -1239,7 +1255,7 @@ async fn drive(
                 declared_outputs,
             )
             .with_awaited_sequence(sequence)
-            .with_emit_channel(emit_tx.clone());
+            .with_emit_channel(task_tx.clone());
             if let Some(payload) = wake_payload {
                 runner = runner.with_wake_payload(payload);
             }
@@ -1281,10 +1297,11 @@ async fn drive(
             //      (provisioned-but-execute-failed sub-state).
             //
             // For non-InfraSetup phases AND non-infra nodes, this
-            // is just `execute`. The task writes its result back via
-            // `result_tx`; the main loop applies the effect on
+            // is just `execute`. The task sends its terminal back on the
+            // shared `task_tx` (after any emissions it sent on the same
+            // channel); the main loop applies the effect on
             // `pulses`/`executions`.
-            let tx = result_tx.clone();
+            let tx = task_tx.clone();
             let node_id_task = node_id.clone();
             let color_task = group.color;
             let frames_task = group.frames.clone();
@@ -1319,7 +1336,7 @@ async fn drive(
                     let spec = match node_impl.provision(infra_ctx, provision_input).await {
                         Ok(s) => s,
                         Err(e) => {
-                            let _ = tx.send(NodeTaskResult {
+                            let _ = tx.send(TaskMsg::Terminal {
                                 node_id: node_id_task,
                                 color: color_task,
                                 frames: frames_task,
@@ -1360,7 +1377,7 @@ async fn drive(
                     )
                     .await
                     {
-                        let _ = tx.send(NodeTaskResult {
+                        let _ = tx.send(TaskMsg::Terminal {
                             node_id: node_id_task,
                             color: color_task,
                             frames: frames_task,
@@ -1372,9 +1389,10 @@ async fn drive(
                 }
 
                 // `execute` returns `()`: it fires downstream only via
-                // `ctx.pulse_downstream` (emissions arrive on emit_rx,
-                // applied by the loop while the task runs). The return
-                // just signals terminal outcome.
+                // `ctx.pulse_downstream` (emissions ride the SAME task
+                // channel, applied by the loop while the task runs, and
+                // always BEFORE this terminal by FIFO ordering). The
+                // return just signals terminal outcome.
                 let result = node_impl.execute(ctx).await;
                 let outcome = match result {
                     Ok(()) => NodeTaskOutcome::Completed,
@@ -1383,7 +1401,7 @@ async fn drive(
                     }
                     Err(e) => NodeTaskOutcome::Failed(format!("{e}")),
                 };
-                let _ = tx.send(NodeTaskResult {
+                let _ = tx.send(TaskMsg::Terminal {
                     node_id: node_id_task,
                     color: color_task,
                     frames: frames_task,
@@ -1393,33 +1411,19 @@ async fn drive(
             task_firings.insert(abort_handle.id(), (node_id.clone(), group.frames.clone()));
         }
 
-        // Drain `pulse_downstream` emissions first: a still-running
-        // node may have emitted (releasing downstream, or streaming a
-        // bus). Postprocess each into downstream pulses, keeping the
-        // emitting node Running. Track the per-firing mentioned-port
-        // set so a zero-emit (or partial-emit) Completed closes every
-        // unmentioned output port at termination.
-        let emit_progress = apply_emissions(
-            &mut emit_rx,
+        // Drain the task channel in FIFO order: each `Emission`
+        // (a still-running node's `pulse_downstream` / `close_port`)
+        // postprocesses into downstream pulses and records the mentioned
+        // port, keeping the emitting node Running; each `Terminal` closes
+        // the firing's record and closes every UNmentioned output port.
+        // Because emissions and the terminal share this one ordered
+        // channel, a node's emissions are always drained before its
+        // terminal, so the close-unmentioned sweep sees the complete
+        // mentioned set (no emit-then-return race). Non-blocking so we
+        // keep dispatching newly-ready nodes next iteration.
+        let progress = apply_task_msgs(
+            &mut task_rx,
             color,
-            project,
-            edge_idx,
-            pulses,
-            executions,
-            journal,
-            pod_name,
-            &mut emitted_ports,
-            phase_scope.as_ref(),
-            /* is_cancel = */ false,
-        )
-        .await;
-
-        // Drain completed tasks' results WITHOUT blocking so we can
-        // keep dispatching newly-ready nodes in the next iteration.
-        // If nothing ran this turn AND tasks are in flight, block
-        // on the next result.
-        let progress = apply_results(
-            &mut result_rx,
             project,
             edge_idx,
             pulses,
@@ -1429,10 +1433,11 @@ async fn drive(
             &mut waiting,
             &mut emitted_ports,
             phase_scope.as_ref(),
+            /* is_cancel = */ false,
         )
         .await;
 
-        if progress || emit_progress {
+        if progress {
             idled_since_progress = false;
             continue;
         }
@@ -1635,11 +1640,12 @@ async fn drive(
                                 );
                                 // Route the panic through the SAME failure
                                 // path a body-returned error takes: send a
-                                // synthetic Failed result and loop. The next
-                                // iteration drains emit_rx first (so pulses
-                                // the node emitted before panicking are
-                                // applied), then apply_results fails the node
-                                // with the correct `mentioned` set from
+                                // synthetic Failed terminal and loop. The
+                                // next iteration drains the task channel in
+                                // FIFO order, so any pulses the node emitted
+                                // before panicking are applied first, then
+                                // this Terminal fails the node with the
+                                // correct `mentioned` set from
                                 // `emitted_ports` (keeping already-emitted
                                 // ports' values, closing only the rest) and
                                 // cleans up its `emitted_ports` entry.
@@ -1647,7 +1653,7 @@ async fn drive(
                                 // set would double-pulse already-emitted
                                 // ports (value + closure on one edge) and
                                 // leak the emitted_ports entry.
-                                let _ = result_tx.send(NodeTaskResult {
+                                let _ = task_tx.send(TaskMsg::Terminal {
                                     node_id,
                                     color,
                                     frames,
@@ -1671,14 +1677,17 @@ async fn drive(
                     None => {}
                 }
             }
-            emitted = emit_rx.recv() => {
-                // Re-apply this emission immediately (we consumed it,
-                // so we can't let it drop). Then loop. Live path, not
-                // cancel: a bad-shape emission journals NodeFailed.
-                if let Some(msg) = emitted {
-                    apply_one_emission(
+            task_msg = task_rx.recv() => {
+                // Apply this message immediately (we consumed it from the
+                // channel, so we can't let it drop). It may be an Emission
+                // OR a Terminal; both must be handled here, not just
+                // emissions. Then loop. Live path, not cancel: a bad-shape
+                // emission journals NodeFailed.
+                if let Some(msg) = task_msg {
+                    apply_one_task_msg(
                         msg, color, project, edge_idx, pulses, executions, journal, pod_name,
-                        &mut emitted_ports, phase_scope.as_ref(), /* is_cancel = */ false,
+                        &mut waiting, &mut emitted_ports, phase_scope.as_ref(),
+                        /* is_cancel = */ false,
                     )
                     .await;
                 }
@@ -1695,8 +1704,7 @@ async fn drive(
                 );
                 cancel_cleanup(
                     &mut in_flight,
-                    &mut emit_rx,
-                    &mut result_rx,
+                    &mut task_rx,
                     &mut waiting,
                     executions,
                     &mut emitted_ports,
@@ -2869,20 +2877,19 @@ async fn handle_node_skip(
 ///    path could flip the final state to Completed AFTER we wrote
 ///    NodeCancelled (last-write-wins fold).
 ///
-/// 2. Drain `emit_rx` so any in-channel `pulse_downstream` emissions
-///    from those tasks land in `emitted_ports` BEFORE we compute the
-///    "unmentioned" closure set. Otherwise a port that the body just
-///    emitted on (but we didn't read yet) would be wrongly closed
-///    as unmentioned, violating "stuff already sent stays sent".
+/// 2. Drain the task channel (one FIFO pass). In-channel `pulse_downstream`
+///    emissions land in `emitted_ports` (and their downstream pulses)
+///    BEFORE we compute the "unmentioned" closure set, so a port the body
+///    just emitted on isn't wrongly closed as unmentioned ("stuff already
+///    sent stays sent"). In-channel terminals (Completed/Failed) land in
+///    `executions` STATE ONLY (no journal write here) so they are SKIPPED
+///    by the closure sweep below; otherwise a firing that completed during
+///    the abort window would get closure-downstreamed AND a NodeCancelled,
+///    when the right answer is "it completed, leave it alone". The shared
+///    channel's FIFO ordering means a node's emissions precede its
+///    terminal in this same pass.
 ///
-/// 3. Drain `result_rx` so any in-channel terminal transitions
-///    (Completed/Failed) land in `executions` and are SKIPPED by the
-///    closure sweep below. Without this, a firing that completed
-///    cleanly during the abort window would get closure-downstreamed
-///    AND a NodeCancelled, when the right answer is "it completed,
-///    leave it alone".
-///
-/// 4. Walk `executions` and close downstream for every non-terminal
+/// 3. Walk `executions` and close downstream for every non-terminal
 ///    firing. This is "two sources of truth" with
 ///    `journal_node_cancellations` (which re-folds the journal),
 ///    consolidated by ensuring `executions` is fully drained first
@@ -2893,8 +2900,7 @@ async fn handle_node_skip(
 #[allow(clippy::too_many_arguments)]
 async fn cancel_cleanup(
     in_flight: &mut tokio::task::JoinSet<()>,
-    emit_rx: &mut mpsc::UnboundedReceiver<crate::context::EmitMsg>,
-    result_rx: &mut mpsc::UnboundedReceiver<NodeTaskResult>,
+    task_rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
     waiting: &mut HashMap<String, (String, weft_core::frames::LoopFrames)>,
     executions: &mut NodeExecutionTable,
     emitted_ports: &mut HashMap<
@@ -2912,37 +2918,27 @@ async fn cancel_cleanup(
 ) {
     // 1. Drive every spawned task to its abort point.
     in_flight.shutdown().await;
-    // 2. Apply any in-channel emissions so emitted_ports reflects the
-    //    real "what was sent" set. `is_cancel=true` so a bad-shape
-    //    emission queued before the cancel doesn't journal `NodeFailed`
-    //    and race the dispatcher's post-cancel `NodeCancelled` write
-    //    (last-write-wins would flip the node's final status to
-    //    Failed). Downstream-closure writes still happen so no pulses
-    //    leak.
-    apply_emissions(
-        emit_rx, color, project, edge_idx, pulses, executions, journal, pod_name,
-        emitted_ports, phase_scope, /* is_cancel = */ true,
+    // 2. Drain the task channel in one FIFO pass. Emissions: apply with
+    //    `is_cancel=true` so a bad-shape emission queued before the cancel
+    //    doesn't journal `NodeFailed` and race the dispatcher's post-cancel
+    //    `NodeCancelled` write (last-write-wins would flip the node's final
+    //    status to Failed); downstream-closure writes still happen so no
+    //    pulses leak, and `emitted_ports` reflects the real "what was sent"
+    //    set. Terminals: applied to `executions` STATE ONLY (no journal
+    //    write) so a firing that completed during the abort window is
+    //    SKIPPED by the closure sweep below instead of getting both a
+    //    closure-downstream AND a NodeCancelled. The dispatcher's post-loop
+    //    `journal_node_cancellations` owns the journal side via the folded
+    //    snapshot. The returned `late_terminated` list (firings that landed
+    //    Completed/Failed here) is appended in step 3 so their
+    //    unmentioned-port closures get the same walk (else a late-Completed
+    //    firing's closures would be lost and downstream never learn).
+    let late_terminated = drain_task_msgs_for_cancel(
+        task_rx, color, project, edge_idx, pulses, executions, journal, pod_name,
+        waiting, emitted_ports, phase_scope,
     )
     .await;
-    // 3. Apply any in-channel terminal transitions so `executions`
-    //    reflects the real status of every firing, but DO NOT journal
-    //    those terminal events. The dispatcher may have already
-    //    written `NodeCancelled` for the same (node, frames); journaling
-    //    `NodeCompleted`/`NodeFailed`/`NodeSkipped` after it would
-    //    last-write-wins flip the final state back to Completed and
-    //    leak fake outputs downstream. The post-loop
-    //    `journal_node_cancellations` handles the journal side via the
-    //    folded snapshot (it idempotently skips terminals already
-    //    written). The returned `late_terminated` list is the set of
-    //    firings that landed Completed/Failed during drain; step 4
-    //    must close-their-unmentioned-ports too so the replay-from-
-    //    snapshot view matches what the live worker saw (without it,
-    //    a late-Completed firing's unmentioned-port closures would be
-    //    lost and downstream would never learn).
-    let late_terminated = drain_results_into_state(
-        result_rx, executions, waiting,
-    );
-    // 4. Snapshot the (node, frames) keys to close so we don't borrow
+    // 3. Snapshot the (node, frames) keys to close so we don't borrow
     //    `executions` and `emitted_ports` simultaneously, then for each
     //    non-terminal firing close every output port that wasn't already
     //    emitted or closed (mirrors the Completed/Failed/Skipped shape
@@ -3219,38 +3215,18 @@ async fn apply_one_emission(
     }
 }
 
-/// Drain all pending emissions. Returns true if any were applied.
-/// `is_cancel` propagates to `apply_one_emission` so a bad-shape
-/// emission queued before cancellation doesn't journal `NodeFailed`
-/// and race the dispatcher's `NodeCancelled` write.
+/// Drain the task channel in FIFO order, applying each `Emission`
+/// (downstream pulse, node stays Running) and each `Terminal` (close
+/// the firing + close unmentioned ports). Because emissions and the
+/// terminal ride this ONE ordered channel, a node's emissions are
+/// always applied before its terminal, so the close-unmentioned sweep
+/// sees the complete mentioned set. Returns true if any were applied.
+/// `is_cancel` propagates to a bad-shape emission so it doesn't journal
+/// `NodeFailed` and race the dispatcher's `NodeCancelled` write.
 #[allow(clippy::too_many_arguments)]
-async fn apply_emissions(
-    rx: &mut mpsc::UnboundedReceiver<crate::context::EmitMsg>,
+async fn apply_task_msgs(
+    rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
     color: Color,
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-    executions: &mut NodeExecutionTable,
-    journal: &dyn JournalClient,
-    pod_name: &str,
-    emitted_ports: &mut HashMap<
-        (String, weft_core::frames::LoopFrames),
-        std::collections::HashSet<String>,
-    >,
-    phase_scope: Option<&std::collections::HashSet<String>>,
-    is_cancel: bool,
-) -> bool {
-    let mut any = false;
-    while let Ok(msg) = rx.try_recv() {
-        any = true;
-        apply_one_emission(msg, color, project, edge_idx, pulses, executions, journal, pod_name, emitted_ports, phase_scope, is_cancel).await;
-    }
-    any
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn apply_results(
-    rx: &mut mpsc::UnboundedReceiver<NodeTaskResult>,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
@@ -3263,71 +3239,98 @@ async fn apply_results(
         std::collections::HashSet<String>,
     >,
     phase_scope: Option<&std::collections::HashSet<String>>,
+    is_cancel: bool,
 ) -> bool {
     let mut any = false;
-    while let Ok(result) = rx.try_recv() {
+    while let Ok(msg) = rx.try_recv() {
         any = true;
-        match result.outcome {
+        apply_one_task_msg(
+            msg, color, project, edge_idx, pulses, executions, journal, pod_name,
+            waiting, emitted_ports, phase_scope, is_cancel,
+        )
+        .await;
+    }
+    any
+}
+
+/// Apply ONE task message. The single message the idle-wait `select!`
+/// consumes goes through here too (it can't be re-queued), so emissions
+/// and terminals are both handled in one place.
+#[allow(clippy::too_many_arguments)]
+async fn apply_one_task_msg(
+    msg: TaskMsg,
+    color: Color,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    pulses: &mut PulseTable,
+    executions: &mut NodeExecutionTable,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    waiting: &mut HashMap<String, (String, weft_core::frames::LoopFrames)>,
+    emitted_ports: &mut HashMap<
+        (String, weft_core::frames::LoopFrames),
+        std::collections::HashSet<String>,
+    >,
+    phase_scope: Option<&std::collections::HashSet<String>>,
+    is_cancel: bool,
+) {
+    match msg {
+        TaskMsg::Emission(emit) => {
+            apply_one_emission(
+                emit, color, project, edge_idx, pulses, executions, journal, pod_name,
+                emitted_ports, phase_scope, is_cancel,
+            )
+            .await;
+        }
+        TaskMsg::Terminal { node_id, color: tcolor, frames, outcome } => match outcome {
             NodeTaskOutcome::Completed => {
-                // Emissions already happened via `pulse_downstream`
-                // (applied by apply_emissions). Close the record and
-                // ship the recorded output. Then emit CLOSURE markers
-                // on every output port the firing never mentioned, so
-                // downstream consumers learn nothing's coming for
-                // those ports. Already-mentioned ports keep their
-                // emitted values; a node that emits A then B has both
-                // A and B as real values downstream.
-                mark_completed(executions, &result.node_id, result.color, &result.frames);
+                // Emissions already happened via `pulse_downstream` and
+                // were applied before this terminal (FIFO on the shared
+                // channel). Close the record and ship the recorded
+                // output, then emit CLOSURE markers on every output port
+                // the firing never mentioned, so downstream consumers
+                // learn nothing's coming for those ports. Already-
+                // mentioned ports keep their emitted values; a node that
+                // emits A then B has both A and B as real values
+                // downstream.
+                mark_completed(executions, &node_id, tcolor, &frames);
                 let output = executions
-                    .get(&result.node_id)
-                    .and_then(|v| {
-                        v.iter().rev().find(|e| {
-                            e.color == result.color && e.frames == result.frames
-                        })
-                    })
+                    .get(&node_id)
+                    .and_then(|v| v.iter().rev().find(|e| e.color == tcolor && e.frames == frames))
                     .and_then(|e| e.output.clone())
                     .unwrap_or(serde_json::Value::Null);
                 let mentioned = emitted_ports
-                    .remove(&(result.node_id.clone(), result.frames.clone()))
+                    .remove(&(node_id.clone(), frames.clone()))
                     .unwrap_or_default();
                 // Build the unmentioned-port closures FIRST, then carry
                 // them INSIDE the NodeCompleted row (atomic marker+
                 // closures, same reason as the failure/skip paths).
                 let closures = build_unmentioned_closures_and_prune(
-                    &result.node_id, &mentioned, result.color, &result.frames,
+                    &node_id, &mentioned, tcolor, &frames,
                     project, edge_idx, pulses, phase_scope,
                 );
                 ship_node_completed(
-                    journal, pod_name, result.color, &result.node_id, &result.frames,
-                    &output, closures,
+                    journal, pod_name, tcolor, &node_id, &frames, &output, closures,
                 )
                 .await;
             }
             NodeTaskOutcome::Failed(err) => {
                 let mentioned = emitted_ports
-                    .remove(&(result.node_id.clone(), result.frames.clone()))
+                    .remove(&(node_id.clone(), frames.clone()))
                     .unwrap_or_default();
                 handle_node_failure(
-                    &result.node_id, &mentioned, result.color, &result.frames, &err,
-                    project, edge_idx, pulses, executions, journal, pod_name,
-                    phase_scope,
+                    &node_id, &mentioned, tcolor, &frames, &err,
+                    project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
                 )
                 .await;
             }
             NodeTaskOutcome::Waiting(token) => {
-                mark_waiting(
-                    executions,
-                    &result.node_id,
-                    result.color,
-                    &result.frames,
-                    &token,
-                );
-                ship_node_suspended(journal, pod_name,result.color, &result.node_id, &result.frames, &token).await;
-                waiting.insert(token, (result.node_id, result.frames));
+                mark_waiting(executions, &node_id, tcolor, &frames, &token);
+                ship_node_suspended(journal, pod_name, tcolor, &node_id, &frames, &token).await;
+                waiting.insert(token, (node_id, frames));
             }
-        }
+        },
     }
-    any
 }
 
 /// Drain queued task results into in-memory state ONLY (no journal
@@ -3350,26 +3353,52 @@ async fn apply_results(
 /// downstream nodes never learn no value is coming on the unmentioned
 /// output ports of a late-completed firing, and the replay-from-
 /// snapshot view diverges from what the live worker actually saw.
-fn drain_results_into_state(
-    rx: &mut mpsc::UnboundedReceiver<NodeTaskResult>,
+#[allow(clippy::too_many_arguments)]
+async fn drain_task_msgs_for_cancel(
+    rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
+    color: Color,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
+    journal: &dyn JournalClient,
+    pod_name: &str,
     waiting: &mut HashMap<String, (String, weft_core::frames::LoopFrames)>,
+    emitted_ports: &mut HashMap<
+        (String, weft_core::frames::LoopFrames),
+        std::collections::HashSet<String>,
+    >,
+    phase_scope: Option<&std::collections::HashSet<String>>,
 ) -> Vec<(String, weft_core::frames::LoopFrames)> {
     let mut late_terminated: Vec<(String, weft_core::frames::LoopFrames)> = Vec::new();
-    while let Ok(result) = rx.try_recv() {
-        match result.outcome {
-            NodeTaskOutcome::Completed => {
-                mark_completed(executions, &result.node_id, result.color, &result.frames);
-                late_terminated.push((result.node_id, result.frames));
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            // Emissions: apply with downstream closures (is_cancel=true),
+            // recording the mentioned port. FIFO ordering means a node's
+            // emissions are applied before its terminal below.
+            TaskMsg::Emission(emit) => {
+                apply_one_emission(
+                    emit, color, project, edge_idx, pulses, executions, journal, pod_name,
+                    emitted_ports, phase_scope, /* is_cancel = */ true,
+                )
+                .await;
             }
-            NodeTaskOutcome::Failed(err) => {
-                mark_failed(executions, &result.node_id, result.color, &result.frames, &err);
-                late_terminated.push((result.node_id, result.frames));
-            }
-            NodeTaskOutcome::Waiting(token) => {
-                mark_waiting(executions, &result.node_id, result.color, &result.frames, &token);
-                waiting.insert(token, (result.node_id, result.frames));
-            }
+            // Terminals: STATE ONLY, no journal write (the post-loop
+            // cancellation walk owns the journal side).
+            TaskMsg::Terminal { node_id, color: tcolor, frames, outcome } => match outcome {
+                NodeTaskOutcome::Completed => {
+                    mark_completed(executions, &node_id, tcolor, &frames);
+                    late_terminated.push((node_id, frames));
+                }
+                NodeTaskOutcome::Failed(err) => {
+                    mark_failed(executions, &node_id, tcolor, &frames, &err);
+                    late_terminated.push((node_id, frames));
+                }
+                NodeTaskOutcome::Waiting(token) => {
+                    mark_waiting(executions, &node_id, tcolor, &frames, &token);
+                    waiting.insert(token, (node_id, frames));
+                }
+            },
         }
     }
     late_terminated
@@ -3438,29 +3467,6 @@ fn waiting_count(executions: &NodeExecutionTable) -> usize {
         .flat_map(|v| v.iter())
         .filter(|e| e.status == NodeExecutionStatus::WaitingForInput)
         .count()
-}
-
-// ---------- Task plumbing ----------
-
-struct NodeTaskResult {
-    node_id: String,
-    color: Color,
-    frames: weft_core::frames::LoopFrames,
-    outcome: NodeTaskOutcome,
-}
-
-enum NodeTaskOutcome {
-    /// `execute` returned `Ok(())`. Any downstream pulses were already
-    /// emitted via `pulse_downstream` (applied by `apply_emissions`).
-    Completed,
-    Failed(String),
-    /// The node called `await_signal` and is now waiting on a fired
-    /// wake signal. The loop driver marks the node's execution
-    /// WaitingForInput and adds the token to the waiting list; when
-    /// all tasks are done and some are waiting, the loop stalls
-    /// the worker (sends `Stalled`, exits) so the dispatcher can
-    /// kill the process and respawn on fire.
-    Waiting(String),
 }
 
 // ---------- Mutation helpers ----------
@@ -4428,6 +4434,7 @@ mod bus_comm_tests {
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
         };
 
         let outcome = run_one_execution(
@@ -4568,6 +4575,7 @@ mod bus_comm_tests {
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
         };
         let cancel = CancellationFlag::new_arc();
 
@@ -4828,6 +4836,7 @@ mod bus_comm_tests {
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -5486,6 +5495,7 @@ mod bus_comm_tests {
                 infra_state: Arc::new(NoopInfraState),
                 project: Arc::new(NoopProject),
                 clock: Arc::new(weft_platform_traits::clock::SystemClock),
+                storage: crate::storage::FakeWorkerStorage::new(),
             };
             run_one_execution(
                 Arc::new(project),
@@ -6088,6 +6098,96 @@ mod bus_comm_tests {
             matches!(outcome, ExecutionOutcome::Stalled),
             "once the bus closed, the unresolved await must stall+exit for a respawn; got {outcome:?}"
         );
+    }
+
+    /// Two nodes: `producer` emits a value on `out` then RETURNS
+    /// IMMEDIATELY (no work between the emit and the return); `consumer`
+    /// has a REQUIRED input wired to it and emits nothing. The producer's
+    /// emission and its terminal are sent back-to-back, so this is the
+    /// exact shape that, with two separate task channels, raced: the
+    /// terminal could be observed before the emission, the `out` port
+    /// closed as "unmentioned", and the consumer SKIPPED (then re-
+    /// dispatched). With one ordered task channel the emission always
+    /// precedes the terminal, so the consumer must NEVER be skipped and
+    /// must receive the value. Looped many times to surface any residual
+    /// scheduling race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn emit_then_immediately_return_never_skips_the_consumer() {
+        fn producer_consumer_project() -> ProjectDefinition {
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::new_v4(), "name": "emit-return", "description": null,
+                "nodes": [
+                    {
+                        "id": "producer", "nodeType": "Configurable", "label": null, "config": null,
+                        "position": { "x": 0.0, "y": 0.0 },
+                        "inputs": [],
+                        "outputs": [{ "name": "out", "portType": "String", "required": false }],
+                        "features": {}, "scope": [], "groupBoundary": null,
+                        "requiresInfra": false, "images": []
+                    },
+                    {
+                        "id": "consumer", "nodeType": "Configurable", "label": null, "config": null,
+                        "position": { "x": 1.0, "y": 0.0 },
+                        "inputs": [{ "name": "in", "portType": "String", "required": true }],
+                        "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
+                        "requiresInfra": false, "images": []
+                    }
+                ],
+                "edges": [{
+                    "id": "e0", "source": "producer", "target": "consumer",
+                    "sourceHandle": "out", "targetHandle": "in"
+                }],
+                "groups": []
+            }))
+            .expect("project")
+        }
+
+        for i in 0..100 {
+            let project = producer_consumer_project();
+            let pid = project.id.to_string();
+            install_body(
+                &pid,
+                "producer",
+                std::sync::Arc::new(|ctx| {
+                    Box::pin(async move {
+                        // Emit then return with nothing in between: the
+                        // emission and the terminal are sent back-to-back.
+                        ctx.pulse_downstream(NodeOutput::with("out", json!("payload"))).await?;
+                        Ok(())
+                    })
+                }),
+            );
+            install_body(
+                &pid,
+                "consumer",
+                std::sync::Arc::new(|_ctx| Box::pin(async move { Ok(()) })),
+            );
+
+            let journal = Arc::new(MemJournal::default());
+            let tasks = AwaitTasks::new();
+            let (handle, color) = spawn_run(project, &["producer"], journal.clone(), tasks);
+            tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("must not hang")
+                .expect("join")
+                .expect("run ok");
+
+            let events = journal.events_for_color(color).await.unwrap();
+            // The consumer must NEVER be skipped: its required `in` arrived
+            // as a real value, not a closure.
+            let consumer_skipped = events.iter().any(|e| {
+                matches!(e, ExecEvent::NodeSkipped { node_id, .. } if node_id == "consumer")
+            });
+            assert!(!consumer_skipped, "iter {i}: consumer was skipped (its emitted input was wrongly closed)");
+            // And the consumer's firing must have seen the value on `in`.
+            let consumer_got_value = events.iter().any(|e| match e {
+                ExecEvent::NodeStarted { node_id, input, .. } if node_id == "consumer" => {
+                    input.get("in").and_then(|v| v.as_str()) == Some("payload")
+                }
+                _ => false,
+            });
+            assert!(consumer_got_value, "iter {i}: consumer never received the producer's value on `in`");
+        }
     }
 
 }

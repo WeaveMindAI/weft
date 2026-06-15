@@ -9,6 +9,7 @@ mod commands;
 pub mod hash;
 pub mod images;
 pub mod progress;
+pub mod prompt;
 mod walk;
 
 #[derive(Debug, Parser)]
@@ -236,6 +237,17 @@ enum Cmd {
         #[command(subcommand)]
         action: ListenerAction,
     },
+    /// Browse + manage stored files (the tenant's storage box):
+    /// project files, shared spaces, past-execution survivors.
+    Files {
+        #[command(subcommand)]
+        action: FilesAction,
+    },
+    /// Storage configuration (per-tenant backing-disk profile).
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
+    },
     /// Remove stale state. Default subject is the journal: with no
     /// flags, deletes executions older than --keep-days (30). Pass
     /// a positional UUID to target one execution. Other subjects
@@ -412,6 +424,54 @@ enum ListenerAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum FilesAction {
+    /// List stored files, organized by space (project files, shared
+    /// spaces, past-execution survivors). Optional prefix filter.
+    Ls {
+        #[arg(value_name = "prefix")]
+        prefix: Option<String>,
+    },
+    /// Show one file's full metadata.
+    Inspect { key: String },
+    /// Download a file: handshake with the dispatcher, then stream
+    /// the bytes DIRECTLY from the storage box.
+    Download {
+        key: String,
+        /// Output path; defaults to the stored filename.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Remove a file (full key) or a whole space (prefix ending in `/`).
+    Rm {
+        #[arg(value_name = "key-or-space/")]
+        target: String,
+        /// Delete without the interactive confirmation. Required to
+        /// delete non-interactively (piped stdin), since a prefix wipe
+        /// can remove kept files you deliberately persisted.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Stored bytes + per-disk usage of the tenant's storage box.
+    Usage,
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageAction {
+    /// View or set the backing-disk profile (StorageClass + unit
+    /// size). With no flags, prints the current profile. Applies to
+    /// disks provisioned from now on.
+    Config {
+        /// Kubernetes StorageClass for new backing disks
+        /// (`default` clears the override).
+        #[arg(long)]
+        class: Option<String>,
+        /// Backing-disk unit size in GiB (grow/shrink granularity).
+        #[arg(long)]
+        disk_gib: Option<u64>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum DaemonAction {
     /// Start the daemon. Ensures the kind cluster, ingress, images,
     /// and dispatcher Deployment exist, then opens a port-forward
@@ -557,6 +617,20 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Events { color } => commands::executions::events(ctx, color).await,
         Cmd::Listener { action } => match action {
             ListenerAction::Inspect => commands::listener::inspect(ctx).await,
+        },
+        Cmd::Files { action } => match action {
+            FilesAction::Ls { prefix } => commands::files::ls(ctx, prefix).await,
+            FilesAction::Inspect { key } => commands::files::inspect(ctx, key).await,
+            FilesAction::Download { key, output } => {
+                commands::files::download(ctx, key, output).await
+            }
+            FilesAction::Rm { target, yes } => commands::files::rm(ctx, target, yes).await,
+            FilesAction::Usage => commands::files::usage(ctx).await,
+        },
+        Cmd::Storage { action } => match action {
+            StorageAction::Config { class, disk_gib } => {
+                commands::files::config(ctx, class, disk_gib).await
+            }
         },
         Cmd::Clean { color, keep_days, all, images, build_cache } => {
             commands::executions::clean(ctx, color, keep_days, all, images, build_cache).await

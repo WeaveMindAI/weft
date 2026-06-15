@@ -508,10 +508,11 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
     # 2. Reclaim every weft-related host docker image.
     if command -v docker >/dev/null 2>&1; then
-      for tag in weft-dispatcher:local weft-listener:local weft-broker:local; do
+      for tag in weft-dispatcher:local weft-listener:local weft-broker:local \
+                 weft-infra-supervisor:local weft-storage:local; do
         docker image rm -f "${tag}" >/dev/null 2>&1 || true
       done
-      ok "removed dispatcher + listener + broker images"
+      ok "removed dispatcher + listener + broker + supervisor + storage images"
 
       docker image prune --force \
         --filter "label=weft.dev/project" >/dev/null 2>&1 || true

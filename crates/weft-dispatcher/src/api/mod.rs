@@ -26,6 +26,7 @@ mod extension_names;
 mod dashboard;
 mod infra;
 pub(crate) mod signal;
+pub mod storage;
 
 pub fn router(state: DispatcherState) -> Router {
     Router::new()
@@ -96,6 +97,16 @@ pub fn router(state: DispatcherState) -> Router {
         .route("/dashboard", get(dashboard::serve_root))
         .route("/dashboard/{*path}", get(dashboard::serve))
         .route("/listener/inspect", get(signal::listener_inspect))
+        // Storage plane: user/CLI surface (list, usage, download
+        // handshake, remove, profile) + the boxes' internal
+        // grow/shrink endpoints. Bulk bytes never flow here.
+        .route("/storage/files", get(storage::list_files).delete(storage::remove))
+        .route("/storage/files/download", post(storage::download))
+        .route("/storage/public-base", get(storage::public_base))
+        .route("/storage/usage", get(storage::usage))
+        .route("/storage/profile", get(storage::get_profile).put(storage::set_profile))
+        .route("/internal/storage/{tenant}/disks/add", post(storage::disk_add))
+        .route("/internal/storage/{tenant}/disks/remove", post(storage::disk_remove))
         // Inspector proxy: project-scoped read of signal display
         // info (mount_path, plaintext key while listener still
         // holds it, etc). Project-token gated.

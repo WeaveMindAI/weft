@@ -1,1 +1,4 @@
 [dependencies]
+# Media fetch from the bridge's /media endpoint now goes through the
+# language's ctx.storage(...).put_from_url capability, so this node
+# needs no HTTP/stream dependency of its own.

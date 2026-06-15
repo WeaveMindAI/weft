@@ -70,8 +70,28 @@ pub struct NodeExecution {
     pub output: Option<Value>,
     pub cost_usd: f64,
     pub logs: Vec<Value>,
+    /// Non-terminal per-port warnings raised during this dispatch. The
+    /// only current source is a runtime output-type mismatch: the node
+    /// tried to emit a value whose type is not compatible with the
+    /// port's declared type, so the engine refused the value and closed
+    /// the port instead (downstream sees null). The node did NOT fail
+    /// (`status` stays Completed); the warning is the visible record
+    /// that one port's value was dropped.
+    pub port_warnings: Vec<PortWarning>,
     pub color: Color,
     pub frames: LoopFrames,
+}
+
+/// A non-terminal, per-port problem on a single firing. Today the sole
+/// kind is an output-type mismatch (see `NodeExecution::port_warnings`).
+// SYNC: PortWarning <-> extension-vscode/src/webview/lib/types/index.ts PortWarning
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortWarning {
+    pub port: String,
+    /// The port's declared type (what the node promised to emit).
+    pub expected: String,
+    /// The inferred type of the value the node actually tried to emit.
+    pub actual: String,
 }
 
 /// One entry per node, growing as each dispatch records its lifecycle.

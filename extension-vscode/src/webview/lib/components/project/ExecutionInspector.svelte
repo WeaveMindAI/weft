@@ -2,8 +2,10 @@
 	import { Search } from '@lucide/svelte';
 	import type { NodeExecution } from '$lib/types';
 	import type { BusInspectorEvent, BusMeta, CorruptionSite, LoopInspectorEvent, LoopIteration } from '../../../../shared/protocol';
+	import { parseStoredFile } from '../../../../shared/protocol';
 	import { displayStatus, getStatusIcon } from '$lib/utils/status';
 	import JsonTree from './JsonTree.svelte';
+	import StoredFileCard from './StoredFileCard.svelte';
 	import CopyButton from '$lib/components/ui/CopyButton.svelte';
 	import * as Dialog from '$lib/components/ui/dialog';
 
@@ -261,7 +263,12 @@
 				<div class="overflow-auto flex-1 p-2">
 					{#if selected.input && typeof selected.input === 'object' && Object.keys(selected.input as Record<string, unknown>).length > 0}
 						{#each Object.entries(selected.input as Record<string, unknown>) as [key, value]}
-							<JsonTree data={value} label={key} defaultExpanded={true} />
+							{@const file = parseStoredFile(value)}
+							{#if file}
+								<StoredFileCard label={key} {file} />
+							{:else}
+								<JsonTree data={value} label={key} defaultExpanded={true} />
+							{/if}
 						{/each}
 					{:else if selected.input !== null && selected.input !== undefined && typeof selected.input !== 'object'}
 						<div class="p-1 text-[11px] font-mono text-zinc-700">{JSON.stringify(selected.input)}</div>
@@ -284,6 +291,16 @@
 					<CopyButton text={detailsText} />
 				</div>
 				<div class="overflow-auto flex-1 p-3 space-y-3">
+					{#if selected.portWarnings && selected.portWarnings.length > 0}
+						<div class="rounded border border-amber-200 bg-amber-50 p-2.5">
+							<div class="text-[10px] font-semibold text-amber-700 mb-1">Output type mismatch</div>
+							{#each selected.portWarnings as w}
+								<div class="text-[11px] text-amber-700 font-mono break-words">
+									Port <span class="font-semibold">{w.port}</span> expected <span class="font-semibold">{w.expected}</span> but got <span class="font-semibold">{w.actual}</span>; the value was not sent and the port was closed.
+								</div>
+							{/each}
+						</div>
+					{/if}
 					{#if selected.error}
 						<div class="rounded border border-red-200 bg-red-50 p-2.5">
 							<div class="text-[10px] font-semibold text-red-700 mb-1">Error</div>
@@ -313,7 +330,12 @@
 				<div class="overflow-auto flex-1 p-2">
 					{#if selected.output && typeof selected.output === 'object' && Object.keys(selected.output as Record<string, unknown>).length > 0}
 						{#each Object.entries(selected.output as Record<string, unknown>) as [key, value]}
-							<JsonTree data={value} label={key} defaultExpanded={true} />
+							{@const file = parseStoredFile(value)}
+							{#if file}
+								<StoredFileCard label={key} {file} />
+							{:else}
+								<JsonTree data={value} label={key} defaultExpanded={true} />
+							{/if}
 						{/each}
 					{:else if selected.output !== null && selected.output !== undefined}
 						<div class="p-1 text-[11px] font-mono text-zinc-700">{JSON.stringify(selected.output)}</div>

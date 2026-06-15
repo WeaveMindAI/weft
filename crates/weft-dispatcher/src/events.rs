@@ -52,6 +52,11 @@ pub enum DispatcherEvent {
     NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, project_id: String },
     NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, project_id: String },
     NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, project_id: String },
+    /// A node emitted a value whose type is incompatible with the
+    /// declared (possibly narrowed) type of `port`. The engine refused
+    /// the value and closed the port (downstream sees null); the node did
+    /// NOT fail. The extension renders this as a per-port warning.
+    PortTypeMismatch { color: Color, node: String, frames: LoopFrames, port: String, expected: String, actual: String, project_id: String },
     /// A loop instance was created at `parent_frames`. The inspector
     /// uses this to render a "Loop opened" marker at the loop's box.
     LoopInstantiated {
@@ -206,6 +211,7 @@ impl DispatcherEvent {
             | Self::NodeCompleted { project_id, .. }
             | Self::NodeFailed { project_id, .. }
             | Self::NodeSkipped { project_id, .. }
+            | Self::PortTypeMismatch { project_id, .. }
             | Self::LoopInstantiated { project_id, .. }
             | Self::LoopIterationLaunched { project_id, .. }
             | Self::LoopOutFired { project_id, .. }
@@ -242,6 +248,7 @@ impl DispatcherEvent {
             | Self::NodeCompleted { color, .. }
             | Self::NodeFailed { color, .. }
             | Self::NodeSkipped { color, .. }
+            | Self::PortTypeMismatch { color, .. }
             | Self::LoopInstantiated { color, .. }
             | Self::LoopIterationLaunched { color, .. }
             | Self::LoopOutFired { color, .. }

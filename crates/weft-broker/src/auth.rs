@@ -1,6 +1,10 @@
-//! Caller identity: extract + validate the projected SA token,
-//! cache the resolved `(tenant, role)` so the hot path doesn't hit
-//! the k8s API on every request.
+//! Caller identity: extract + validate the projected SA token, and
+//! cache the REVIEWED cryptographic identity (`ReviewedToken`: who the
+//! token is, no role/tenant attached) so the hot path doesn't hit the
+//! k8s API on every request. Role + tenant interpretation runs per
+//! endpoint ON TOP of a cache hit, so endpoints with different caller
+//! universes (the storage-authorize path admits the dispatcher + box
+//! SAs, not just the role table) share one TokenReview + one cache.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -23,6 +27,17 @@ pub struct AuthConfig {
     pub audience: String,
 }
 
+// Service-account names + the dispatcher namespace, defined ONCE.
+// `from_sa_name` and `storage_authorize` both branch on these; without
+// shared consts a rename would update one site and silently break the
+// other (e.g. workers losing their storage identity).
+pub(crate) const WORKER_SA: &str = "weft-worker-sa";
+pub(crate) const LISTENER_SA: &str = "weft-listener-sa";
+pub(crate) const INFRA_SUPERVISOR_SA: &str = "weft-infra-supervisor-sa";
+pub(crate) const STORAGE_SA: &str = "weft-storage-sa";
+pub(crate) const DISPATCHER_SA: &str = "weft-dispatcher";
+pub(crate) const DISPATCHER_NS: &str = "weft-system";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Listener,
@@ -44,12 +59,32 @@ pub enum Role {
 impl Role {
     fn from_sa_name(sa: &str) -> Option<Self> {
         match sa {
-            "weft-listener-sa" => Some(Self::Listener),
-            "weft-worker-sa" => Some(Self::Worker),
-            "weft-infra-supervisor-sa" => Some(Self::InfraSupervisor),
+            LISTENER_SA => Some(Self::Listener),
+            WORKER_SA => Some(Self::Worker),
+            INFRA_SUPERVISOR_SA => Some(Self::InfraSupervisor),
             _ => None,
         }
     }
+}
+
+// NOTE: the per-tenant storage box (`weft-storage-sa`) and the
+// dispatcher (`weft-dispatcher` in `weft-system`) are deliberately
+// NOT in the role table: they never call the broker's tenant data
+// endpoints. They only appear on `/storage/authorize` (see
+// `handlers::storage_authorize`), which resolves them from the raw
+// reviewed token.
+
+/// The cached output of a TokenReview: who the token cryptographically
+/// is, with no role/tenant interpretation attached. Interpretation
+/// (role table, tenant lookup) happens per endpoint ON TOP of this,
+/// so endpoints with different caller universes (the storage
+/// authorize path admits the dispatcher and storage boxes) share one
+/// review + one cache.
+#[derive(Debug, Clone)]
+pub struct ReviewedToken {
+    pub sa_name: String,
+    pub namespace: String,
+    pub pod_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,14 +118,15 @@ type HmacSha256 = Hmac<Sha256>;
 const CACHE_CAPACITY: usize = 4096;
 
 pub struct IdentityCache {
-    inner: Mutex<LruCache<TokenHash, (CallerIdentity, Instant)>>,
+    inner: Mutex<LruCache<TokenHash, (ReviewedToken, Instant)>>,
     /// Per-process HMAC key, generated fresh at construction. New
     /// process means existing cache entries become unreachable, which
     /// is fine: the next request re-validates.
     hmac_key: [u8; 32],
-    /// Identities are cached for this long. SA tokens rotate every
-    /// hour (kubelet projection); shorter cache keeps the validation
-    /// chain fresh against revocation.
+    /// How long a reviewed token stays cached (30s, see `new`).
+    /// Independent of the ~1h kubelet token projection: this TTL bounds
+    /// how stale a revoked-but-still-cached token can be, not the token
+    /// lifetime. Short so a revocation takes effect within 30s.
     ttl: Duration,
 }
 
@@ -113,7 +149,7 @@ impl IdentityCache {
         })
     }
 
-    pub fn get(&self, token: &str) -> Option<CallerIdentity> {
+    pub fn get(&self, token: &str) -> Option<ReviewedToken> {
         let key = self.hash(token);
         let mut cache = self.inner.lock();
         let (id, at) = cache.get(&key)?;
@@ -125,9 +161,9 @@ impl IdentityCache {
         }
     }
 
-    pub fn put(&self, token: &str, identity: CallerIdentity) {
+    pub fn put(&self, token: &str, reviewed: ReviewedToken) {
         let key = self.hash(token);
-        self.inner.lock().put(key, (identity, Instant::now()));
+        self.inner.lock().put(key, (reviewed, Instant::now()));
     }
 
     fn hash(&self, token: &str) -> TokenHash {
@@ -138,16 +174,14 @@ impl IdentityCache {
     }
 }
 
-/// Axum extractor: validates the bearer + returns the resolved
-/// identity. Reject patterns:
+/// Validate the bearer cryptographically (TokenReview, cached) and
+/// return WHO it is, with no role/tenant interpretation:
 ///   - missing / empty bearer  → 401
 ///   - TokenReview rejects     → 401
-///   - SA name not in our role table → 403 (`weft-{role}-sa` only)
-///   - namespace doesn't carry our prefix → 403
-pub async fn extract_identity(
+pub async fn reviewed_token(
     state: &Arc<BrokerState>,
     headers: &HeaderMap,
-) -> Result<CallerIdentity, (StatusCode, String)> {
+) -> Result<ReviewedToken, (StatusCode, String)> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -169,43 +203,48 @@ pub async fn extract_identity(
             tracing::warn!(target: "weft_broker::auth", error = %e, "tokenreview failed");
             (StatusCode::UNAUTHORIZED, format!("tokenreview: {e}"))
         })?;
-
-    let role = Role::from_sa_name(&outcome.sa_name).ok_or((
-        StatusCode::FORBIDDEN,
-        format!("unknown service account '{}'", outcome.sa_name),
-    ))?;
-    // Authoritative lookup: the dispatcher writes a row to
-    // `weft_namespace_tenant` whenever it creates a namespace,
-    // so the broker doesn't have to parse the namespace string
-    // (which would be unsafe if a tenant could create their own
-    // namespaces). A missing row = unrecognized namespace = 403.
-    let tenant_id: Option<String> = sqlx::query_scalar(
-        "SELECT tenant_id FROM weft_namespace_tenant WHERE namespace = $1",
-    )
-    .bind(&outcome.namespace)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::warn!(target: "weft_broker::auth", error = %e, "namespace lookup failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("namespace lookup: {e}"))
-    })?;
-    let tenant_id = tenant_id.ok_or((
-        StatusCode::FORBIDDEN,
-        format!(
-            "namespace '{}' is not registered to any tenant; \
-             only namespaces the dispatcher created can authenticate",
-            outcome.namespace
-        ),
-    ))?;
-
-    let identity = CallerIdentity {
-        tenant_id,
-        role,
+    let reviewed = ReviewedToken {
+        sa_name: outcome.sa_name,
         namespace: outcome.namespace,
         pod_name: outcome.pod_name,
     };
-    state.identity_cache.put(token, identity.clone());
-    Ok(identity)
+    state.identity_cache.put(token, reviewed.clone());
+    Ok(reviewed)
+}
+
+/// Resolve the namespace's owning tenant. Authoritative lookup: the
+/// dispatcher writes a row to `weft_namespace_tenant` whenever it
+/// creates a namespace, so the broker doesn't have to parse the
+/// namespace string (which would be unsafe if a tenant could create
+/// their own namespaces). A missing row = unrecognized namespace =
+/// 403. Cached in the scope cache.
+pub async fn namespace_tenant(
+    state: &Arc<BrokerState>,
+    namespace: &str,
+) -> Result<String, (StatusCode, String)> {
+    crate::scope::lookup_namespace_tenant(&state.scope_cache, &state.pool, namespace).await
+}
+
+/// Axum-extractor backend: reviewed token + role table + tenant
+/// resolution. Reject patterns on top of `reviewed_token`:
+///   - SA name not in our role table → 403 (`weft-{role}-sa` only)
+///   - namespace not registered to a tenant → 403
+pub async fn extract_identity(
+    state: &Arc<BrokerState>,
+    headers: &HeaderMap,
+) -> Result<CallerIdentity, (StatusCode, String)> {
+    let reviewed = reviewed_token(state, headers).await?;
+    let role = Role::from_sa_name(&reviewed.sa_name).ok_or((
+        StatusCode::FORBIDDEN,
+        format!("unknown service account '{}'", reviewed.sa_name),
+    ))?;
+    let tenant_id = namespace_tenant(state, &reviewed.namespace).await?;
+    Ok(CallerIdentity {
+        tenant_id,
+        role,
+        namespace: reviewed.namespace,
+        pod_name: reviewed.pod_name,
+    })
 }
 
 /// Convenience extractor for handlers: pulls headers out, runs

@@ -279,6 +279,28 @@ pub async fn remove(
     // log-and-continue for the cluster-unreachable case; only DB
     // writes are fail-loud.
     crate::api::infra::delete_project(&state, id, query.force).await?;
+    // Wipe the project's storage (`project/<id>/` files). Exec
+    // scratch/survivors of past executions stay until their TTL or
+    // an explicit `weft clean`; project data goes with the project.
+    // Box-unreachable aborts the remove (a retry replays cleanly);
+    // proceeding would leak bytes with no owning project row left.
+    let tenant = state.tenant_router.tenant_for_project(&id.to_string());
+    if crate::storage_box::box_exists(&state.pg_pool, tenant.as_str())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("storage lookup: {e}")))?
+    {
+        let box_url = crate::storage_box::box_url(&state, &tenant);
+        state
+            .storage_admin
+            .wipe_prefix(&box_url, &format!("project/{id}/"))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("could not wipe the project's stored files: {e}; retry `weft rm`"),
+                )
+            })?;
+    }
     let removed = state
         .projects
         .remove(id)

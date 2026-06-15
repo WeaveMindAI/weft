@@ -56,6 +56,10 @@ export interface NodeFeaturesWire {
   hasFormSchema?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
+  // SYNC: showImagePreview <-> crates/weft-core/src/node.rs NodeFeatures.show_image_preview
+  showImagePreview?: boolean;
+  // SYNC: showDownloadLink <-> crates/weft-core/src/node.rs NodeFeatures.show_download_link
+  showDownloadLink?: boolean;
   isOutputDefault?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
@@ -156,7 +160,8 @@ export type FieldKind =
   | 'number'
   | 'checkbox'
   | 'password'
-  | 'blob'
+  // SYNC: FieldKind 'file_drop' <-> crates/weft-core/src/node.rs FieldType::FileDrop
+  | 'file_drop'
   | 'api_key'
   | 'form_builder';
 
@@ -774,6 +779,13 @@ export type HostMessage =
   /// failures when the catalog loaded but some nodes were skipped.
   | { kind: 'catalogError'; error?: string; warnings?: string[] }
   | { kind: 'execEvent'; event: NodeExecEvent }
+  /// A non-terminal output-type mismatch on one firing: the node emitted a
+  /// value whose type is incompatible with the port's declared (possibly
+  /// narrowed) type, so the engine closed the port instead of forwarding
+  /// the value. Attaches a warning to the matching execution row WITHOUT
+  /// changing its state (the node did not fail). Kept separate from
+  /// `execEvent`, which is purely a state transition.
+  | { kind: 'execPortWarning'; nodeId: string; frames: LoopIteration[]; port: string; expected: string; actual: string }
   /// One bus event (live or replay). Carries only what the bus layer
   /// recorded: join / left / message / closed keyed by `busId`.
   /// Routing to node inspector panels is a SEPARATE signal,
@@ -830,7 +842,12 @@ export type HostMessage =
   /// per-node infra badges. Stays current across cli_running so
   /// the bar can show "Resync available" while a different verb
   /// is in flight without flickering.
-  | { kind: 'statusSnapshot'; snapshot: ActionAvailability };
+  | { kind: 'statusSnapshot'; snapshot: ActionAvailability }
+  /// Reply to `resolveStoredFileUrl`. `url` present = the box's
+  /// public URL (carrying a short-lived capability) the <img>/<video>
+  /// streams directly from; `error` present = the file is
+  /// expired/deleted or the handshake failed (preview shows fallback).
+  | { kind: 'storedFileUrl'; requestId: number; url?: string; error?: string };
 
 export interface FollowStatus {
   mode: 'latest' | 'pinned';
@@ -942,7 +959,67 @@ export type WebviewMessage =
   /// the slot's `error` field; the bar stops rendering the banner.
   /// Errors otherwise survive auto-refreshes so the user has time
   /// to read them.
-  | { kind: 'dismissError' };
+  | { kind: 'dismissError' }
+  /// User clicked Download on a stored-file value in the replay
+  /// inspector. The host runs the brokered handshake (POST
+  /// `/storage/files/download`; the dispatcher authenticates + asks
+  /// the tenant's storage box to mint a short-lived capability) and
+  /// opens the returned box URL externally: the BYTES stream
+  /// browser<->box directly, never through the dispatcher. A 404
+  /// surfaces as "expired or deleted" (the metadata in the value
+  /// stays readable; the bytes are gone).
+  | { kind: 'downloadStoredFile'; key: string }
+  /// Inline image preview: the webview asks the host to run the
+  /// brokered handshake and return the box's public URL (carrying a
+  /// short-lived capability). The host replies with a correlated
+  /// `storedFileUrl`; the <img> streams directly from the box (the
+  /// CSP admits the storage origin).
+  | { kind: 'resolveStoredFileUrl'; key: string; requestId: number };
+
+// SYNC: StoredFileWire <-> crates/weft-core/src/storage.rs StoredFile
+/// The payload INSIDE a concrete stored-file marker: a logical key +
+/// self-describing metadata, NO url (bytes are fetched via the
+/// authenticated handshake above). url/data file values are the other
+/// two handle forms and don't carry `key`.
+export interface StoredFileWire {
+  key: string;
+  mimeType: string;
+  sizeBytes: number;
+  filename: string;
+}
+
+// SYNC: STORED_FILE_MARKERS <-> crates/weft-core/src/weft_type.rs FileKind::marker_key
+/// The per-kind sentinel keys a stored-file value can carry. The marker
+/// IS the value's concrete type; there is no `__weft_media__` umbrella.
+const STORED_FILE_MARKERS = [
+  '__weft_image__',
+  '__weft_video__',
+  '__weft_audio__',
+  '__weft_blob__',
+] as const;
+
+// SYNC: parseStoredFile <-> crates/weft-core/src/storage.rs StoredFile::from_value
+/// The ONE place the webview parses a stored-file value, regardless of
+/// which concrete marker (image/video/audio/blob) it carries. Returns
+/// null for anything that is not a key-backed stored-file value. Every
+/// consumer (inspector card, node preview) routes through here so the
+/// shape is validated identically.
+export function parseStoredFile(value: unknown): StoredFileWire | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const obj = value as Record<string, unknown>;
+  const marker = STORED_FILE_MARKERS.find((m) => m in obj);
+  if (marker === undefined) return null;
+  const payload = obj[marker];
+  if (typeof payload !== 'object' || payload === null) return null;
+  const p = payload as Record<string, unknown>;
+  if (typeof p.key !== 'string' || typeof p.mimeType !== 'string') return null;
+  return {
+    key: p.key,
+    mimeType: p.mimeType,
+    sizeBytes: typeof p.sizeBytes === 'number' ? p.sizeBytes : 0,
+    filename: typeof p.filename === 'string' ? p.filename : '',
+  };
+}
 
 // SYNC: EditOp <-> crates/weft-compiler/src/edit.rs EditOp
 /// A structured edit intent (serde tag `op`, camelCase fields).

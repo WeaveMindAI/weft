@@ -26,6 +26,7 @@ pub mod executions;
 pub mod status;
 pub mod token;
 pub mod listener;
+pub mod files;
 
 use std::sync::Arc;
 

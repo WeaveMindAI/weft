@@ -247,8 +247,8 @@ export async function createBridge(authDir, webhookManager, messageStore) {
       const { content, messageType } = extractMessageContent(msg);
 
       // Skip non-actionable noise (reactions, receipts, protocol msgs).
-      // Media without caption still goes through so a downstream node
-      // can resolve it via /media/:id once media support lands.
+      // Media without caption still goes through; the receive node
+      // resolves the bytes via /media/:id and stores them.
       const hasText = content != null && content !== '';
       const isMedia = ['image', 'video', 'document', 'audio', 'sticker'].includes(messageType);
       if (!hasText && !isMedia) continue;
@@ -260,6 +260,9 @@ export async function createBridge(authDir, webhookManager, messageStore) {
         from,
         pushName: msg.pushName || null,
         content,
+        // The receive node branches on this to fetch media bytes
+        // via /media/:id and store them as a Weft media reference.
+        messageType,
         messageId: msg.key.id,
         // Baileys deserializes the protobuf int64 as a Long object
         // {low, high} on the live path; coerce to a JS number so the

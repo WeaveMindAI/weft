@@ -151,12 +151,36 @@ spec:
               value: "${WEFT_CLUSTER_SERVICE_CIDR}"
             - name: WEFT_BROKER_URL
               value: "http://weft-broker.weft-db.svc.cluster.local:9090"
-            # Public ingress URL surfaced to users in webhook /
-            # activation URLs. Override per-deploy; localhost is the
-            # right default for local dev with `kubectl port-forward`
-            # but production should set the real ingress host.
+            # Public base URL surfaced to users in webhook /
+            # activation URLs AND storage file downloads
+            # (<base>/storage/<tenant>/...). The `weft daemon` apply
+            # path substitutes this from the local ingress port
+            # (http://127.0.0.1:<ingress_port>), which the daemon
+            # forwards the cluster ingress to; a real-cloud operator
+            # substitutes the external ingress host instead. Loopback
+            # is allowed in-cluster only when WEFT_LOCAL_DEV is set
+            # (see below); production must set a real host.
             - name: WEFT_DISPATCHER_PUBLIC_BASE_URL
-              value: "http://dispatcher.weft.local"
+              value: "${WEFT_DISPATCHER_PUBLIC_BASE_URL}"
+            # Declares "this is a local kind cluster reached via
+            # port-forward", which makes a loopback public base URL
+            # legal in-cluster. The daemon sets it to "1" locally;
+            # absent in any real deploy, where loopback stays a fatal
+            # misconfiguration.
+            - name: WEFT_LOCAL_DEV
+              value: "${WEFT_LOCAL_DEV}"
+            # New env vars are APPENDED here (some code paths read env
+            # by index; inserting mid-list would shift them). Storage:
+            - name: WEFT_STORAGE_IMAGE
+              value: weft-storage:local
+            # Projected SA token (audience weft-broker) so the
+            # dispatcher's storage-box admin client can authenticate:
+            # the box relays this bearer to the broker's
+            # /storage/authorize, which resolves it to weft-dispatcher
+            # in weft-system (the control plane). Same path tenant
+            # pods use to reach the broker.
+            - name: WEFT_BROKER_TOKEN_PATH
+              value: "/var/run/weft/sa/token"
           readinessProbe:
             httpGet:
               path: /health
@@ -169,6 +193,18 @@ spec:
               port: 9999
             initialDelaySeconds: 10
             periodSeconds: 15
+          volumeMounts:
+            - name: weft-sa-token
+              mountPath: /var/run/weft/sa
+              readOnly: true
+      volumes:
+        - name: weft-sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: weft-broker
+                  expirationSeconds: 3600
+                  path: token
 ---
 # Round-robin Service: external clients (CLI, browser extension,
 # webhooks) hit this; k8s load-balances across Pods.

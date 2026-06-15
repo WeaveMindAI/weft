@@ -1,0 +1,30 @@
+{
+  "type": "FetchToStorage",
+  "label": "Fetch to Storage",
+  "description": "Download a file from a URL straight into execution storage and emit a file reference. The bytes stream directly into storage (never buffered whole), so it handles large files. Wire `file` into ImageDisplay, DownloadLink, KeepFile, or any node that takes a stored file.",
+  "category": "Storage",
+  "tags": ["storage", "fetch", "download", "file"],
+  "icon": "CloudDownload",
+  "color": "#8b5cf6",
+  "inputs": [
+    { "name": "url", "type": "String", "required": true, "description": "URL of the file to fetch." },
+    { "name": "filename", "type": "String", "required": false, "description": "Override the stored filename. Defaults to the URL's last path segment." }
+  ],
+  "outputs": [
+    { "name": "file", "type": "File", "required": false, "description": "Self-describing reference to the stored file (any type)." },
+    { "name": "sizeBytes", "type": "Number", "required": false },
+    { "name": "mimeType", "type": "String", "required": false }
+  ],
+  "fields": [
+    {
+      "key": "keep",
+      "label": "Keep past the run",
+      "field_type": { "kind": "checkbox" },
+      "required": false,
+      "default_value": false,
+      "description": "Store the file already flagged to survive the execution-end sweep (30-day access-extended TTL)."
+    }
+  ],
+  "entry": [],
+  "requires_infra": false
+}

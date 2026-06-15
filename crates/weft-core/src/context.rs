@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
@@ -9,6 +9,7 @@ use crate::cancellation::CancellationFlag;
 use crate::error::{WeftError, WeftResult};
 use crate::frames::LoopFrames;
 use crate::primitive::{CostReport, SignalSpec};
+use crate::weft_type::WeftType;
 use crate::Color;
 
 /// Which lifecycle phase this invocation belongs to. v2 mirrors v1's
@@ -210,7 +211,7 @@ impl ExecutionContext {
     /// emits only declared ports, instead of tripping the
     /// undeclared-port error AFTER a paid / irreversible call. See
     /// [`crate::node::NodeOutput::extend_from_declared`].
-    pub fn declared_output_ports(&self) -> &HashSet<String> {
+    pub fn declared_output_ports(&self) -> &HashMap<String, WeftType> {
         self.handle.declared_output_ports()
     }
 
@@ -336,6 +337,28 @@ impl ExecutionContext {
             handle: self.handle.clone(),
             url,
         })
+    }
+
+    // ----- Storage primitive ------------------------------------------
+
+    /// Open a handle on the tenant's storage box, walled to `scope`
+    /// (`StorageScope::Execution` is the default: per-run scratch,
+    /// swept on terminate unless kept). Big bytes flow worker<->box
+    /// directly; only the small self-describing stored-file reference
+    /// the handle returns ever rides edges / the journal.
+    ///
+    /// The scope governs WRITES and LISTS (`put` builds keys under
+    /// the scope's prefix; `list` enumerates it). Key-addressed verbs
+    /// (`get`/`delete`/`keep`/`presign`) act on the key's OWN scope
+    /// (the key encodes its prefix), so a downstream node can `get` a
+    /// stored-file value without knowing which scope produced it; the box
+    /// still enforces the wall (own color, own project, granted
+    /// shared names).
+    pub fn storage(&self, scope: crate::storage::StorageScope) -> StorageHandle {
+        StorageHandle {
+            handle: self.handle.clone(),
+            scope,
+        }
     }
 
     // ----- Side-effect primitives ------------------------------------
@@ -537,6 +560,149 @@ impl EndpointHandle {
     }
 }
 
+/// Scoped handle on the tenant's storage box, minted by
+/// [`ExecutionContext::storage`]. Every verb delegates to the
+/// `ContextHandle` storage methods; the handle itself only carries
+/// the chosen scope.
+///
+/// Key-addressed verbs accept either a stored-file value (the
+/// concrete `__weft_<kind>__` reference an upstream node emitted) or a
+/// raw key string wrapped in a JSON string; see [`StoredFile::key_from`].
+#[derive(Clone)]
+pub struct StorageHandle {
+    handle: Arc<dyn ContextHandle>,
+    scope: crate::storage::StorageScope,
+}
+
+impl StorageHandle {
+    /// Store `bytes` under this handle's scope. Returns the
+    /// self-describing stored-file value (`key` + `mimeType` +
+    /// `sizeBytes` + `filename`, NO url) to emit downstream. `keep` flags an
+    /// execution-scoped file to survive the terminate sweep (with the
+    /// given access-bumped TTL); it is meaningless for project/shared
+    /// scopes (those persist without a flag) and rejected there.
+    pub async fn put(
+        &self,
+        bytes: impl Into<bytes::Bytes>,
+        mime_type: &str,
+        filename: &str,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.handle
+            .storage_put(
+                &self.scope,
+                crate::storage::bytes_stream(bytes.into()),
+                mime_type,
+                filename,
+                keep,
+            )
+            .await
+    }
+
+    /// Streaming variant of [`Self::put`]: pipe an incoming body
+    /// (an HTTP response, a transform's output) straight into
+    /// storage without buffering the whole file.
+    pub async fn put_stream(
+        &self,
+        stream: crate::storage::ByteStream,
+        mime_type: &str,
+        filename: &str,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.handle
+            .storage_put(&self.scope, stream, mime_type, filename, keep)
+            .await
+    }
+
+    /// Fetch an HTTP(S) URL straight into this handle's scope and
+    /// return the stored-file value to emit downstream. The bytes
+    /// stream through (never fully buffered), the mime is taken from
+    /// the response Content-Type, and `filename` None derives one from
+    /// the URL. The one-call "I want this URL in storage" capability;
+    /// nodes never hand-roll an HTTP client for this.
+    pub async fn put_from_url(
+        &self,
+        url: &str,
+        filename: Option<&str>,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.handle.storage_put_from_url(&self.scope, url, filename, keep).await
+    }
+
+    /// Stream a stored file's bytes. Accepts a stored-file value or a
+    /// raw key (JSON string). Counts as access (bumps a kept file's TTL).
+    pub async fn get(
+        &self,
+        file_or_key: &Value,
+    ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
+        let key = crate::storage::StoredFile::key_from(file_or_key)?;
+        self.handle.storage_get(&key, None).await
+    }
+
+    /// Range read: stream only `range` of the file. The home of the
+    /// process-a-huge-file-piecewise pattern (split an audio into
+    /// chunks for an API without ever holding the whole file).
+    pub async fn get_range(
+        &self,
+        file_or_key: &Value,
+        range: crate::storage::ByteRange,
+    ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
+        let key = crate::storage::StoredFile::key_from(file_or_key)?;
+        self.handle.storage_get(&key, Some(range)).await
+    }
+
+    /// Convenience: [`Self::get`] fully collected into memory. Only
+    /// for files known to be small; large files should stream.
+    pub async fn get_bytes(
+        &self,
+        file_or_key: &Value,
+    ) -> WeftResult<(crate::storage::StoredFileMeta, bytes::Bytes)> {
+        let (meta, stream) = self.get(file_or_key).await?;
+        let bytes = crate::storage::collect_stream(stream)
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("storage get stream: {e}")))?;
+        Ok((meta, bytes))
+    }
+
+    /// Delete a stored file. Space is reclaimed in place, instantly.
+    pub async fn delete(&self, file_or_key: &Value) -> WeftResult<()> {
+        let key = crate::storage::StoredFile::key_from(file_or_key)?;
+        self.handle.storage_delete(&key).await
+    }
+
+    /// List the files under this handle's scope prefix.
+    pub async fn list(&self) -> WeftResult<Vec<crate::storage::StoredFileMeta>> {
+        self.handle.storage_list(&self.scope).await
+    }
+
+    /// Mark an existing execution-scoped file to survive the
+    /// terminate sweep (the after-the-fact twin of `put(.., keep)`).
+    /// Keep is purely ADDITIVE: there is no un-keep / keep-only verb.
+    pub async fn keep(
+        &self,
+        file_or_key: &Value,
+        ttl: crate::storage::KeepTtl,
+    ) -> WeftResult<()> {
+        let key = crate::storage::StoredFile::key_from(file_or_key)?;
+        self.handle.storage_keep(&key, ttl).await
+    }
+
+    /// Mint a TEMPORARY signed URL for handing this file to an
+    /// external URL-accepting API; the external service streams
+    /// directly from the storage box. `ttl_secs: None` uses the
+    /// service default (~15 min). The URL is an explicit, per-file,
+    /// expiring artifact; the stored-file VALUE never carries it. Counts
+    /// as access (bumps a kept file's TTL).
+    pub async fn presign(
+        &self,
+        file_or_key: &Value,
+        ttl_secs: Option<u64>,
+    ) -> WeftResult<String> {
+        let key = crate::storage::StoredFile::key_from(file_or_key)?;
+        self.handle.storage_presign(&key, ttl_secs).await
+    }
+}
+
 /// The runtime-facing handle. The engine crate implements this; the
 /// `Node` trait's execute receives an `ExecutionContext` that
 /// delegates to an implementation.
@@ -591,7 +757,7 @@ pub trait ContextHandle: Send + Sync {
     /// undeclared-port error AFTER a paid/irreversible call. Generic
     /// surface: any node can read it; no node-specific knowledge in
     /// the engine.
-    fn declared_output_ports(&self) -> &HashSet<String>;
+    fn declared_output_ports(&self) -> &HashMap<String, WeftType>;
 
     /// Fire downstream with `output`. The engine turns each mentioned
     /// output port into pulses on its outgoing edges, at the firing's
@@ -624,6 +790,62 @@ pub trait ContextHandle: Send + Sync {
     /// live channel. Errors loud on every failure mode (not a marker,
     /// malformed uuid, no live bus with that id).
     fn bus(&self, marker: &Value) -> WeftResult<crate::bus::BusHandle>;
+
+    /// Store a byte stream under `scope`; returns the stored-file
+    /// value (see [`crate::storage::StoredFile`]). Implementations
+    /// resolve the tenant's box endpoint, attach the caller's
+    /// identity, and stream the body; they never buffer the whole
+    /// file. `keep` only applies to `StorageScope::Execution`.
+    async fn storage_put(
+        &self,
+        scope: &crate::storage::StorageScope,
+        data: crate::storage::ByteStream,
+        mime_type: &str,
+        filename: &str,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value>;
+
+    /// Stream an HTTP(S) URL straight into `scope` storage and return
+    /// the stored-file value. The implementation GETs the URL, fails
+    /// loud on a non-success status, derives the mime from the
+    /// response Content-Type (normalized), and streams the body into
+    /// storage without buffering the whole file. `filename` None lets
+    /// the implementation derive one from the URL's last path segment.
+    /// The capability node authors use instead of hand-rolling an HTTP
+    /// client; lives on the trait (not `StorageHandle`) because the
+    /// HTTP client is an engine dependency, not a core one.
+    async fn storage_put_from_url(
+        &self,
+        scope: &crate::storage::StorageScope,
+        url: &str,
+        filename: Option<&str>,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value>;
+
+    /// Stream a stored file (optionally a byte range). The key
+    /// encodes its own scope; the service enforces the wall from the
+    /// caller's verified identity.
+    async fn storage_get(
+        &self,
+        key: &str,
+        range: Option<crate::storage::ByteRange>,
+    ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)>;
+
+    /// Delete a stored file by key.
+    async fn storage_delete(&self, key: &str) -> WeftResult<()>;
+
+    /// List files under `scope`'s prefix.
+    async fn storage_list(
+        &self,
+        scope: &crate::storage::StorageScope,
+    ) -> WeftResult<Vec<crate::storage::StoredFileMeta>>;
+
+    /// Flag an execution-scoped file to survive the terminate sweep.
+    async fn storage_keep(&self, key: &str, ttl: crate::storage::KeepTtl) -> WeftResult<()>;
+
+    /// Mint a temporary signed URL for an external service to fetch
+    /// `key` directly from the box. `None` TTL = service default.
+    async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
 
     /// The wake event's payload for this firing. `Some(value)` only
     /// when the engine dispatched this node as the FIRING TRIGGER of

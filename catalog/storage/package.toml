@@ -1,0 +1,10 @@
+[package]
+name = "storage"
+
+# Nodes that exercise the storage plane: fetch a file into storage,
+# keep it past the run, and surface it in the graph (inline image,
+# download link). They use only the language's own storage
+# capabilities on ctx (including put_from_url, which fetches a URL
+# straight into storage), so no extra HTTP/stream dependency is
+# needed here.
+[dependencies]

@@ -11,6 +11,7 @@ pub mod project;
 pub mod pulse;
 pub mod running_policy;
 pub mod signal;
+pub mod storage;
 pub mod tag;
 pub mod weft_type;
 
@@ -92,6 +93,7 @@ pub use bus::{
 pub use cancellation::CancellationFlag;
 pub use context::{
     ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, InputBag, Phase,
+    StorageHandle,
 };
 pub use error::{WeftError, WeftResult};
 pub use infra::{
@@ -118,6 +120,7 @@ pub use project::{
 };
 pub use pulse::Pulse;
 pub use running_policy::RunningPolicy;
+pub use storage::{ByteRange, ByteStream, KeepTtl, StorageScope, StoredFileMeta, StoredFile};
 pub use weft_type::{WeftPrimitive, WeftType};
 
 /// The identity of ONE execution. A color IS an execution: every

@@ -787,6 +787,11 @@ async fn main() -> anyhow::Result<()> {{
     // pass them straight into the `Arc<dyn _>` fields (re-wrapping
     // would make `Arc<Arc<_>>`, which doesn't implement the trait).
     // `SystemClock` is bare, so it still needs the `Arc::new`.
+    let storage = weft_engine::WorkerStorage::new(
+        tasks.clone(),
+        args.tenant_id.clone(),
+        std::path::PathBuf::from(&args.broker_token_path),
+    );
     let clients = EngineClients {{
         journal,
         tasks,
@@ -794,6 +799,7 @@ async fn main() -> anyhow::Result<()> {{
         infra_state,
         project,
         clock: std::sync::Arc::new(weft_platform_traits::clock::SystemClock),
+        storage,
     }};
 
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;

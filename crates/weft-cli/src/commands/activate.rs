@@ -8,7 +8,6 @@
 //! sent in the activate body (`reactivateChoice`); the dispatcher's
 //! activate handler decides whether to drain/wipe/keep based on it.
 
-use std::io::{BufRead, Write};
 
 use super::Ctx;
 use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
@@ -174,17 +173,12 @@ async fn prompt_reactivate_choice(
     println!("  1) execute_parked_keep_suspended  drain parked + keep suspensions");
     println!("  2) keep_suspended_only            drop parked, keep suspensions");
     println!("  3) wipe_all                       drop everything, fresh start");
-    print!("> ");
-    std::io::stdout().flush().ok();
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    let trimmed = line.trim();
-    let choice = match trimmed {
+    let line = crate::prompt::prompt_line("> ", "--reactivate-choice <choice>")?;
+    let choice = match line.as_str() {
         "1" | "execute_parked_keep_suspended" => "execute_parked_keep_suspended",
         "2" | "keep_suspended_only" => "keep_suspended_only",
         "3" | "wipe_all" => "wipe_all",
-        _ => anyhow::bail!("invalid reactivate choice '{trimmed}'; expected 1, 2, or 3"),
+        _ => anyhow::bail!("invalid reactivate choice '{line}'; expected 1, 2, or 3"),
     };
     Ok(Some(choice.to_string()))
 }

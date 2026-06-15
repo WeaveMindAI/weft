@@ -247,6 +247,17 @@ async fn process_one_row(
         | ExecEvent::ExecutionFailed { .. }
         | ExecEvent::ExecutionCancelled { .. } => {
             terminal_cleanup(state, color).await?;
+            // Storage terminate sweep: queue the un-kept exec-file
+            // sweep DURABLY (workers stall-then-die, so worker-side
+            // cleanup is only an eager optimization; this row is the
+            // guarantee). The storage_sweep reaper drains the queue.
+            let tenant = state.tenant_router.tenant_for_project(&project_id);
+            crate::storage_box::enqueue_sweep(
+                &state.pg_pool,
+                tenant.as_str(),
+                &color.to_string(),
+            )
+            .await?;
         }
         // A suspension is the running -> suspended edge of the drain
         // condition: `running_count` excludes suspended colors (the
@@ -383,6 +394,17 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 node: node_id.clone(),
                 frames: frames.clone(),
                 closed_ports: closed_ports.clone(),
+                project_id,
+            }]
+        }
+        ExecEvent::PortTypeMismatch { color, node_id, frames, port, expected, actual, .. } => {
+            vec![DispatcherEvent::PortTypeMismatch {
+                color: *color,
+                node: node_id.clone(),
+                frames: frames.clone(),
+                port: port.clone(),
+                expected: expected.clone(),
+                actual: actual.clone(),
                 project_id,
             }]
         }

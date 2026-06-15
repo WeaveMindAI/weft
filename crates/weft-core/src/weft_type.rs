@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 //
 // Python-style recursive types with strict enforcement. No Any type.
 //
-// Primitives:     String, Number, Boolean, Image, Video, Audio, Document
+// Primitives:     String, Number, Boolean, Image, Video, Audio, Blob
 // Parameterized:  List[T], Dict[K, V]
 // Unions:         String | Number, List[String] | String
-// Aliases:        Media = Image | Video | Audio | Document
+// Aliases:        Media = Image | Video | Audio;  File = Media | Blob
 // Type variables: T, T1, T2... : node-scoped, same T on input and output = same type
 // MustOverride:   Node can't know the type, user/AI must declare it in Weft code
 //
@@ -57,7 +57,11 @@ define_primitives!(
     Image,
     Video,
     Audio,
-    Document,
+    // Blob is the catch-all stored-file primitive: any bytes whose mime is
+    // not image/video/audio (a pdf, a zip, an unknown type). It never
+    // claims a format, so future first-class file types (Document, Text,
+    // Presentation, ...) peel OUT of Blob without renaming the fallback.
+    Blob,
     Empty,
 );
 
@@ -67,11 +71,74 @@ impl std::fmt::Display for WeftPrimitive {
     }
 }
 
+/// The concrete kind of a stored-file value: the single concept that
+/// ties together the on-wire marker key, the `WeftType` primitive, and
+/// the mime classification. A stored value is ALWAYS exactly one kind
+/// (never the `Media`/`File` unions, which are signature-only). Blob is
+/// the catch-all for any mime that is not image/video/audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Image,
+    Video,
+    Audio,
+    Blob,
+}
+
+impl FileKind {
+    /// The on-wire sentinel key that tags a value of this kind.
+    pub fn marker_key(self) -> &'static str {
+        match self {
+            FileKind::Image => "__weft_image__",
+            FileKind::Video => "__weft_video__",
+            FileKind::Audio => "__weft_audio__",
+            FileKind::Blob => "__weft_blob__",
+        }
+    }
+
+    /// The type-system primitive this kind types as.
+    pub fn primitive(self) -> WeftPrimitive {
+        match self {
+            FileKind::Image => WeftPrimitive::Image,
+            FileKind::Video => WeftPrimitive::Video,
+            FileKind::Audio => WeftPrimitive::Audio,
+            FileKind::Blob => WeftPrimitive::Blob,
+        }
+    }
+
+    /// Classify a mime type into a concrete kind. The ONE place the
+    /// mime->kind mapping lives: image/* -> Image, video/* -> Video,
+    /// audio/* -> Audio, everything else -> Blob (the catch-all). When a
+    /// future first-class type (Document/Text/...) peels out of Blob,
+    /// it gets a branch here and nowhere else.
+    pub fn from_mime(mime: &str) -> Self {
+        if mime.starts_with("image/") {
+            FileKind::Image
+        } else if mime.starts_with("video/") {
+            FileKind::Video
+        } else if mime.starts_with("audio/") {
+            FileKind::Audio
+        } else {
+            FileKind::Blob
+        }
+    }
+
+    /// Identify the kind of a marker object by which sentinel key it
+    /// carries. None if the object carries no stored-file marker.
+    pub fn from_marker_obj(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        for kind in [FileKind::Image, FileKind::Video, FileKind::Audio, FileKind::Blob] {
+            if obj.contains_key(kind.marker_key()) {
+                return Some(kind);
+            }
+        }
+        None
+    }
+}
+
 
 /// Recursive port type system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeftType {
-    /// Scalar: String, Number, Boolean, Image, Video, Audio, Document
+    /// Scalar: String, Number, Boolean, Image, Video, Audio, Blob
     Primitive(WeftPrimitive),
     /// Homogeneous list: List[T]
     List(Box<WeftType>),
@@ -143,13 +210,54 @@ impl WeftType {
         Self::union(prims.into_iter().map(WeftType::Primitive).collect())
     }
 
+    /// Resolve a NAMED union alias to its concrete union type, the ONE
+    /// place a union name expands. `Media`/`File` are language-builtin
+    /// aliases; this is also the hook where user-defined unions
+    /// (`X = A | B | C`, for dynamic typing) will register, so name
+    /// resolution stays a single generic mechanism, never a hardcoded
+    /// per-name branch in the parser. Returns None for a non-alias name.
+    pub fn named_union(name: &str) -> Option<Self> {
+        use WeftPrimitive::{Audio, Blob, Image, Video};
+        let prims: &[WeftPrimitive] = match name {
+            // Media-proper: a picture, a clip, or a sound. Never includes
+            // Blob (a spreadsheet/zip is not "media").
+            "Media" => &[Image, Video, Audio],
+            // Any stored file: media plus the Blob catch-all (and, later,
+            // Document/Text/Presentation as they become first-class).
+            "File" => &[Image, Video, Audio, Blob],
+            _ => return None,
+        };
+        Some(Self::union_primitives(prims.to_vec()))
+    }
+
+    /// The `Media` union (Image | Video | Audio). Convenience over
+    /// `named_union("Media")`.
     pub fn media() -> Self {
-        Self::union(vec![
-            WeftType::Primitive(WeftPrimitive::Image),
-            WeftType::Primitive(WeftPrimitive::Video),
-            WeftType::Primitive(WeftPrimitive::Audio),
-            WeftType::Primitive(WeftPrimitive::Document),
-        ])
+        Self::named_union("Media").expect("Media is a builtin alias")
+    }
+
+    /// The `File` union (any stored-file primitive). Convenience over
+    /// `named_union("File")`.
+    pub fn file() -> Self {
+        Self::named_union("File").expect("File is a builtin alias")
+    }
+
+    /// The primitive members of the `File` union, the single source of
+    /// truth for "is this primitive a stored-file reference". Derived
+    /// from the `File` alias so adding a file primitive in `named_union`
+    /// updates every membership check (references_file, detection).
+    pub fn file_primitives() -> Vec<WeftPrimitive> {
+        match Self::file() {
+            WeftType::Union(types) => types
+                .into_iter()
+                .filter_map(|t| match t {
+                    WeftType::Primitive(p) => Some(p),
+                    _ => None,
+                })
+                .collect(),
+            WeftType::Primitive(p) => vec![p],
+            _ => Vec::new(),
+        }
     }
 
     pub fn type_var(name: &str) -> Self {
@@ -179,21 +287,19 @@ impl WeftType {
         matches!(self, WeftType::TypeVar(_) | WeftType::MustOverride)
     }
 
-    /// True if this type is or contains a media primitive (Image/Video/Audio/
-    /// Document) anywhere in its structure. Media is a `{url, mimeType}`
-    /// reference, never inline bytes, so it can't be cast from file text.
-    pub fn references_media(&self) -> bool {
+    /// True if this type is or contains a stored-file primitive (any
+    /// member of the `File` union: Image/Video/Audio/Blob) anywhere in
+    /// its structure. A stored file is a `{key|url, mimeType}` reference,
+    /// never inline bytes, so it can't be cast from a local file's text.
+    /// Membership is derived from the `File` union (the generic source of
+    /// truth), not a hand-listed match, so adding a file primitive in one
+    /// place updates this too.
+    pub fn references_file(&self) -> bool {
         match self {
-            WeftType::Primitive(p) => matches!(
-                p,
-                WeftPrimitive::Image
-                    | WeftPrimitive::Video
-                    | WeftPrimitive::Audio
-                    | WeftPrimitive::Document
-            ),
-            WeftType::List(inner) => inner.references_media(),
-            WeftType::Dict(_, v) => v.references_media(),
-            WeftType::Union(types) => types.iter().any(|t| t.references_media()),
+            WeftType::Primitive(p) => Self::file_primitives().contains(p),
+            WeftType::List(inner) => inner.references_file(),
+            WeftType::Dict(_, v) => v.references_file(),
+            WeftType::Union(types) => types.iter().any(|t| t.references_file()),
             WeftType::JsonDict | WeftType::Bus | WeftType::TypeVar(_) | WeftType::MustOverride => {
                 false
             }
@@ -201,14 +307,14 @@ impl WeftType {
     }
 
     /// Whether a port of this type should be configurable by default. False
-    /// only for Media (alone or in containers), TypeVar, and MustOverride.
-    /// Everything else (primitives, lists, dicts, JsonDict, unions of the
-    /// above) is configurable so users can paste literal JSON into the config
-    /// field instead of wiring a separate Text node. Catalog authors override
-    /// per port via `PortDef::wired_only(...)` for runtime-only values.
+    /// only for stored files (alone or in containers), TypeVar, and
+    /// MustOverride. Everything else (primitives, lists, dicts, JsonDict,
+    /// unions of the above) is configurable so users can paste literal JSON
+    /// into the config field instead of wiring a separate Text node. Catalog
+    /// authors override per port via `PortDef::wired_only(...)`.
     pub fn is_default_configurable(&self) -> bool {
         match self {
-            WeftType::Primitive(_) => !self.references_media(),
+            WeftType::Primitive(_) => !self.references_file(),
             WeftType::List(inner) => inner.is_default_configurable(),
             WeftType::Dict(_, v) => v.is_default_configurable(),
             WeftType::Union(types) => types.iter().all(|t| t.is_default_configurable()),
@@ -251,7 +357,7 @@ impl WeftType {
                 | WeftPrimitive::Image
                 | WeftPrimitive::Video
                 | WeftPrimitive::Audio
-                | WeftPrimitive::Document => Value::Null,
+                | WeftPrimitive::Blob => Value::Null,
             },
             WeftType::List(_) => Value::Array(Vec::new()),
             WeftType::Dict(_, _) | WeftType::JsonDict => Value::Object(serde_json::Map::new()),
@@ -321,7 +427,8 @@ impl WeftType {
     /// Infer a WeftType from a runtime JSON value.
     /// Produces the most specific type in our type system.
     /// Arrays are typed as List[T] where T is the union of all element types.
-    /// Objects with url+mimeType are detected as Image/Video/Audio/Document.
+    /// Objects carrying a concrete stored-file marker (`__weft_image__` /
+    /// video / audio / blob) are typed as that primitive.
     /// Other objects are typed as Dict[String, V] where V is the union of all value types.
     pub fn infer(value: &serde_json::Value) -> WeftType {
         match value {
@@ -342,8 +449,8 @@ impl WeftType {
                 // A single distinguishing key keeps the recognition unambiguous
                 // (no plain user dict can collide accidentally) and gives every
                 // runtime-only type the same shape.
-                if let Some(media_type) = Self::detect_media_type(obj) {
-                    return media_type;
+                if let Some(file_type) = Self::detect_file_type(obj) {
+                    return file_type;
                 }
                 if Self::detect_bus_type(obj).is_some() {
                     return WeftType::Bus;
@@ -364,21 +471,27 @@ impl WeftType {
         }
     }
 
-    /// Detect a media value: `{"__weft_media__": {"url"|"data": ..., "mimeType": "..."}}`.
-    /// The sentinel key guarantees no ordinary user dict is misread as media.
-    fn detect_media_type(obj: &serde_json::Map<String, serde_json::Value>) -> Option<WeftType> {
-        let payload = obj.get("__weft_media__")?.as_object()?;
-        let has_url = payload.contains_key("url") || payload.contains_key("data");
-        if !has_url { return None; }
-        let mime = payload.get("mimeType").or_else(|| payload.get("mimetype"))
-            .and_then(|m| m.as_str())?;
-        if mime.starts_with("image/") { Some(WeftType::Primitive(WeftPrimitive::Image)) }
-        else if mime.starts_with("video/") { Some(WeftType::Primitive(WeftPrimitive::Video)) }
-        else if mime.starts_with("audio/") { Some(WeftType::Primitive(WeftPrimitive::Audio)) }
-        else { Some(WeftType::Primitive(WeftPrimitive::Document)) }
+    /// Detect a stored-file value by its CONCRETE marker key. A value
+    /// carries its exact type as its sentinel: `__weft_image__`,
+    /// `__weft_video__`, `__weft_audio__`, or `__weft_blob__` (the
+    /// catch-all). The type is read directly from the marker, never
+    /// re-derived by guessing from the mime string. There is NO
+    /// `__weft_media__` umbrella on the wire: `Media`/`File` are
+    /// type-system unions a value matches, never a tag a value carries.
+    /// Each payload has a handle (`url`|`data`|`key`) + `mimeType`.
+    fn detect_file_type(obj: &serde_json::Map<String, serde_json::Value>) -> Option<WeftType> {
+        let kind = FileKind::from_marker_obj(obj)?;
+        let payload = obj.get(kind.marker_key())?.as_object()?;
+        let has_handle = payload.contains_key("url")
+            || payload.contains_key("data")
+            || payload.contains_key("key");
+        if !has_handle {
+            return None;
+        }
+        Some(WeftType::Primitive(kind.primitive()))
     }
 
-    /// Detect a bus marker. The shape is structured to match `__weft_media__`:
+    /// Detect a bus marker. The shape mirrors the stored-file markers:
     /// `{"__weft_bus__": {"id": "<uuid-string>", "mode": "journaled" | "ephemeral"}}`.
     /// Returns the inner payload object so callers can read both fields without
     /// re-parsing. We don't validate the UUID format here; `ctx.bus(...)` errors
@@ -416,9 +529,12 @@ impl WeftType {
         serde_json::json!({ "__weft_bus__": { "id": id, "mode": mode.as_wire_str() } })
     }
 
-    /// Build a media marker JSON value. Callers pass the inner payload.
-    pub fn media_marker(payload: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "__weft_media__": payload })
+    /// Build a stored-file marker JSON value of the given concrete
+    /// `kind`: `{ "<kind marker key>": <payload> }`. The producer picks
+    /// the kind once (from the mime) at store time; the value then
+    /// self-describes its exact type.
+    pub fn file_marker(kind: FileKind, payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ kind.marker_key(): payload })
     }
 
     /// Unify a list of types into a single type.
@@ -512,12 +628,13 @@ impl WeftType {
             WeftType::TypeVar(_) | WeftType::MustOverride => {
                 Err(format!("@file cannot cast to {}: name a concrete type", self))
             }
-            // Media (anywhere in the type: bare, List[Image], Image | String) is
-            // a {url, mimeType} reference, not inline bytes. Loading a binary
-            // file's text and JSON-parsing it would always fail with a confusing
-            // "not valid JSON"; reject loudly with the real reason.
-            _ if self.references_media() => Err(format!(
-                "@file cannot cast to {}: media is referenced by URL, not loaded inline from a file",
+            // A stored file (anywhere in the type: bare, List[Image],
+            // Image | String) is a {key|url, mimeType} reference, not inline
+            // bytes. Loading a binary file's text and JSON-parsing it would
+            // always fail with a confusing "not valid JSON"; reject loudly
+            // with the real reason.
+            _ if self.references_file() => Err(format!(
+                "@file cannot cast to {}: a stored file is referenced by key/URL, not loaded inline from a file",
                 self
             )),
             // Structural types: parse the file as JSON, then check the inferred
@@ -542,8 +659,10 @@ impl WeftType {
 fn parse_single_type(s: &str) -> Option<WeftType> {
     let s = s.trim();
 
-    if s == "Media" {
-        return Some(WeftType::media());
+    // Named union aliases (Media, File, and later user-defined unions)
+    // all resolve through the one registry, never a per-name branch.
+    if let Some(alias) = WeftType::named_union(s) {
+        return Some(alias);
     }
 
     if s == "JsonDict" {

@@ -11,7 +11,7 @@ pub mod skip;
 pub mod completion;
 pub mod typecheck;
 
-pub use execution::{NodeExecution, NodeExecutionStatus, NodeExecutionTable};
+pub use execution::{NodeExecution, NodeExecutionStatus, NodeExecutionTable, PortWarning};
 pub use emission::PulseEmission;
 pub use ready::{find_ready_nodes, ReadyGroup};
 pub use postprocess::{close_unmentioned_downstream, postprocess_output};

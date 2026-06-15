@@ -154,6 +154,12 @@ metadata:
   name: weft-infra-supervisor-sa
   namespace: {namespace}
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weft-storage-sa
+  namespace: {namespace}
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -314,6 +320,7 @@ mod tests {
         // Worker / infra SAs are in project namespaces.
         assert!(yaml.contains("name: weft-listener-sa"));
         assert!(yaml.contains("name: weft-infra-supervisor-sa"));
+        assert!(yaml.contains("name: weft-storage-sa"));
         assert!(!yaml.contains("name: weft-worker-sa"));
         assert!(!yaml.contains("name: weft-infra-sa"));
     }

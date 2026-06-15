@@ -16,6 +16,7 @@ weft-task-store = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
+weft-storage = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -49,3 +50,4 @@ tempfile = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-dispatcher = { path = ".", features = ["test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+weft-storage = { workspace = true, features = ["test-helpers"] }

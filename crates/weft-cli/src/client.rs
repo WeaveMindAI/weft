@@ -104,6 +104,24 @@ impl DispatcherClient {
         Ok(())
     }
 
+    pub async fn put_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.put(&url).json(body).send().await.with_context(|| format!("PUT {url}"))?;
+        Self::check(resp).await?.json().await.context("parse response")
+    }
+
+    /// DELETE carrying a JSON body and returning JSON (the storage
+    /// files endpoint takes its key/prefix selector in the body).
+    pub async fn delete_with_body(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.delete(&url).json(body).send().await.with_context(|| format!("DELETE {url}"))?;
+        Self::check(resp).await?.json().await.context("parse response")
+    }
+
     /// POST with a JSON body, discard the response. For endpoints
     /// that return 204 No Content (idempotent state mutations).
     pub async fn post_with_body(

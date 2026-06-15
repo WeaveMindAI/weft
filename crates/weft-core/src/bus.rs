@@ -64,7 +64,7 @@
 //!   in a dedicated set (`ever_joined`), so `wait_for` semantics are
 //!   unaffected.
 //!
-//! The marker JSON grew a structured payload to match `__weft_media__`:
+//! The marker JSON grew a structured payload to match the stored-file markers:
 //! `{"__weft_bus__": {"id": "<uuid>", "mode": "journaled" | "ephemeral"}}`.
 //! Mode is the only field the wire surfaces; `ephemeral_window` is a
 //! per-creator producer-side knob and is not exposed externally.

@@ -18,10 +18,8 @@ tracing = { workspace = true }
 inventory = { workspace = true }
 cron = "0.12"
 sha2 = { workspace = true }
-
-[dev-dependencies]
-# Used by the `stress_test!` macro (test-only). Provides
-# `FutureExt::catch_unwind` so a panic in any stress iteration is
-# captured and reported as a clean test failure with the iteration
-# index, rather than poisoning the runtime.
+# Storage-plane byte streaming: `storage::ByteStream` is a
+# `futures::stream::BoxStream` of Bytes, named in the `ContextHandle`
+# storage methods (a core trait), so the alias must live in core.
 futures = { workspace = true }
+bytes = { workspace = true }

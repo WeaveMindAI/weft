@@ -9,9 +9,11 @@ pub(crate) mod context;
 pub(crate) mod execution_driver;
 pub(crate) mod loop_runtime;
 pub mod run_pod;
+pub mod storage;
 
 pub use context::EngineClients;
 pub use run_pod::run_pod;
+pub use storage::{WorkerStorage, WorkerStorageOps};
 
 /// Wall-clock seconds since the UNIX epoch, for `at_unix` event
 /// timestamps (observational metadata, not control-flow deadlines:

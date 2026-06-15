@@ -74,6 +74,9 @@ async fn main() -> anyhow::Result<()> {
     weft_dispatcher::journal_bridge::migrate(journal.pool())
         .await
         .context("apply journal_bridge cursor migrations")?;
+    weft_dispatcher::storage_box::migrate(journal.pool())
+        .await
+        .context("storage_box migrate")?;
     weft_dispatcher::infra_event_bridge::migrate(journal.pool())
         .await
         .context("apply infra_event_bridge cursor migrations")?;
@@ -186,6 +189,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "ingress-nginx".to_string());
     let supervisor_image = std::env::var("WEFT_SUPERVISOR_IMAGE")
         .unwrap_or_else(|_| "weft-infra-supervisor:local".to_string());
+    let storage_image = std::env::var("WEFT_STORAGE_IMAGE")
+        .unwrap_or_else(|_| "weft-storage:local".to_string());
 
     // Infra rehydrate on restart: the supervisor pod owns runtime
     // tracking, so the dispatcher doesn't need to scan k8s. Each
@@ -204,37 +209,42 @@ async fn main() -> anyhow::Result<()> {
     // possible, at the cost of one DB round-trip per listener call.
     let listener_pool = ListenerPool::new();
 
-    // Public base URL: this is what users hit for webhooks /
-    // activation URLs. In-cluster the manifest must set
-    // WEFT_DISPATCHER_PUBLIC_BASE_URL to the external ingress;
-    // outside the cluster (local dev), localhost is the right
-    // default. Detect the cluster via KUBERNETES_SERVICE_HOST
-    // (always set inside a Pod). In-cluster, the URL must be the
-    // real external ingress: fail loud if the env var is unset OR
-    // its host is loopback. Outside the cluster (local dev), the
-    // localhost default is fine.
     let in_cluster = std::env::var("KUBERNETES_SERVICE_HOST").is_ok();
-    let public_base_url = match std::env::var("WEFT_DISPATCHER_PUBLIC_BASE_URL") {
-        Ok(v) => {
-            if in_cluster && is_loopback_url(&v) {
-                anyhow::bail!(
-                    "WEFT_DISPATCHER_PUBLIC_BASE_URL='{v}' resolves to a loopback \
-                     host in-cluster; set it on the dispatcher Deployment to the \
-                     external ingress URL before deploying"
-                );
-            }
-            v
-        }
-        Err(_) => {
-            if in_cluster {
-                anyhow::bail!(
-                    "WEFT_DISPATCHER_PUBLIC_BASE_URL is required in-cluster; \
-                     set it on the dispatcher Deployment to the external ingress URL"
-                );
-            }
-            format!("http://localhost:{}", http_port)
-        }
+    // Empty counts as unset: the k8s-backend manifest substitutes
+    // `WEFT_LOCAL_DEV` to "" (no local-dev), and env-var-set-to-empty
+    // reads back as Ok(""), which must NOT enable the loopback bypass.
+    let local_dev = std::env::var("WEFT_LOCAL_DEV").map(|v| !v.is_empty()).unwrap_or(false);
+    let public_base_url = resolve_public_base_url(
+        std::env::var("WEFT_DISPATCHER_PUBLIC_BASE_URL").ok().as_deref(),
+        in_cluster,
+        local_dev,
+        http_port,
+    )?;
+
+    // In-cluster URL tenant pods (storage boxes) call back on. Local
+    // dev (no cluster) talks straight to the local process.
+    let internal_base_url = if in_cluster {
+        format!(
+            "http://weft-dispatcher.{}.svc.cluster.local:{}",
+            std::env::var("WEFT_SYSTEM_NAMESPACE").unwrap_or_else(|_| "weft-system".into()),
+            http_port,
+        )
+    } else {
+        format!("http://localhost:{http_port}")
     };
+
+    // Admin client to tenant storage boxes; authenticates with this
+    // pod's projected SA token (audience weft-broker; the box relays
+    // it to the broker, which recognizes the dispatcher SA).
+    let storage_admin: Arc<dyn weft_storage::client::StorageAdminOps> =
+        Arc::new(weft_storage::client::BoxAdminClient::new(Arc::new(
+            weft_storage::client::TokenFileIdentity {
+                token_path: std::env::var("WEFT_BROKER_TOKEN_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/var/run/weft/sa/token")),
+                color: None,
+            },
+        )));
 
     let state = DispatcherState {
         pod_id,
@@ -252,6 +262,10 @@ async fn main() -> anyhow::Result<()> {
         cluster_service_cidr,
         cluster_ingress_namespace,
         supervisor_image,
+        storage_image,
+        internal_base_url,
+        storage_admin,
+        broker_authorize: weft_storage::auth::BrokerAuth::new(broker_url.clone()),
         kube,
     };
 
@@ -314,6 +328,10 @@ async fn main() -> anyhow::Result<()> {
         .register(
             TaskKind::RecordLog,
             Arc::new(weft_dispatcher::task_kinds::RecordLogExecutor),
+        )
+        .register(
+            TaskKind::EnsureStorageBox,
+            Arc::new(weft_dispatcher::task_kinds::EnsureStorageBoxExecutor),
         )
         .build();
     let picker_state = state.clone();
@@ -421,6 +439,51 @@ fn is_loopback_url(raw: &str) -> bool {
     }
 }
 
+/// Resolve the public base URL users hit for webhooks / activation
+/// URLs AND storage file downloads (`<base>/storage/<tenant>/...`).
+///
+/// In a real cloud cluster the URL must be the external ingress host;
+/// a loopback there is a deploy bug (no client could reach it), so we
+/// fail loud. Local-dev kind is the exception: the dispatcher still
+/// runs as a Pod (so `in_cluster` is true), but the operator's
+/// machine reaches the cluster ingress via a port-forward to
+/// `127.0.0.1:<port>`, so a loopback public URL is exactly correct.
+/// `KUBERNETES_SERVICE_HOST` cannot tell "real cloud Pod" from "local
+/// kind Pod"; only the operator's intent (`WEFT_LOCAL_DEV`, set by the
+/// daemon on the local manifest) can, which makes loopback legal
+/// without weakening the cloud check. Pure so the security-sensitive
+/// branching is unit-tested below.
+fn resolve_public_base_url(
+    env_value: Option<&str>,
+    in_cluster: bool,
+    local_dev: bool,
+    http_port: u16,
+) -> anyhow::Result<String> {
+    let strict = in_cluster && !local_dev;
+    match env_value {
+        Some(v) => {
+            if strict && is_loopback_url(v) {
+                anyhow::bail!(
+                    "WEFT_DISPATCHER_PUBLIC_BASE_URL='{v}' resolves to a loopback \
+                     host in-cluster; set it on the dispatcher Deployment to the \
+                     external ingress URL before deploying (or set WEFT_LOCAL_DEV=1 \
+                     if this really is a local kind cluster reached via port-forward)"
+                );
+            }
+            Ok(v.to_string())
+        }
+        None => {
+            if strict {
+                anyhow::bail!(
+                    "WEFT_DISPATCHER_PUBLIC_BASE_URL is required in-cluster; \
+                     set it on the dispatcher Deployment to the external ingress URL"
+                );
+            }
+            Ok(format!("http://localhost:{http_port}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod is_loopback_url_tests {
     use super::is_loopback_url;
@@ -452,6 +515,51 @@ mod is_loopback_url_tests {
     fn malformed_url_is_loopback() {
         assert!(is_loopback_url("not a url"));
         assert!(is_loopback_url(""));
+    }
+}
+
+#[cfg(test)]
+mod resolve_public_base_url_tests {
+    use super::resolve_public_base_url;
+
+    // Cloud (in_cluster, not local_dev): the strict path.
+    #[test]
+    fn cloud_rejects_loopback() {
+        assert!(resolve_public_base_url(Some("http://127.0.0.1:9998"), true, false, 9999).is_err());
+        assert!(resolve_public_base_url(Some("http://localhost:9999"), true, false, 9999).is_err());
+    }
+
+    #[test]
+    fn cloud_rejects_missing() {
+        assert!(resolve_public_base_url(None, true, false, 9999).is_err());
+    }
+
+    #[test]
+    fn cloud_accepts_external_host() {
+        assert_eq!(
+            resolve_public_base_url(Some("https://files.example.com"), true, false, 9999).unwrap(),
+            "https://files.example.com"
+        );
+    }
+
+    // Local-dev kind (in_cluster AND local_dev): loopback is correct,
+    // reached via the daemon's ingress port-forward.
+    #[test]
+    fn local_dev_accepts_loopback() {
+        assert_eq!(
+            resolve_public_base_url(Some("http://127.0.0.1:9998"), true, true, 9999).unwrap(),
+            "http://127.0.0.1:9998"
+        );
+    }
+
+    // Outside the cluster (CLI-launched local process): default to
+    // localhost on the dispatcher's own port.
+    #[test]
+    fn out_of_cluster_defaults_to_localhost() {
+        assert_eq!(
+            resolve_public_base_url(None, false, false, 9999).unwrap(),
+            "http://localhost:9999"
+        );
     }
 }
 

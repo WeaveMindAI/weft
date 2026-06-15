@@ -8,7 +8,7 @@ export const PORT_TYPE_COLORS: Record<string, string> = {
 	Image: '#c4a35a',    // Warm gold
 	Video: '#8b6fc0',    // Rich purple
 	Audio: '#4a9e6f',    // Forest green
-	Document: '#9e7c5a', // Warm brown
+	Blob: '#9e7c5a',     // Warm brown (catch-all stored file)
 	List: '#5a8a8a',     // Monokai teal
 	Dict: '#7c6f9f',     // Monokai purple
 	TypeVar: '#6366f1',  // Indigo
@@ -35,7 +35,7 @@ export function getPortTypeColor(portType: string): string {
 	if (!portType) return FALLBACK_COLOR;
 	// Direct match for single primitives (fast path)
 	if (PORT_TYPE_COLORS[portType]) return PORT_TYPE_COLORS[portType];
-	if (portType === 'Media') return PORT_TYPE_COLORS.Image;
+	if (portType === 'Media' || portType === 'File') return PORT_TYPE_COLORS.Image;
 	// Parse and resolve
 	const parsed = parseWeftType(portType);
 	return parsed ? colorForParsed(parsed) : FALLBACK_COLOR;

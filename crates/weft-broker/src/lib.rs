@@ -143,5 +143,6 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/infra/wait_apply",
             post(handlers::infra_wait_apply),
         )
+        .route("/storage/authorize", post(handlers::storage_authorize))
         .with_state(state)
 }

@@ -12,6 +12,7 @@ weft-task-store = { workspace = true }
 weft-infra = { path = "../weft-infra" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
+weft-storage = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -21,10 +22,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+# Stream adapters for put_from_url (TryStreamExt on the reqwest body),
+# and FutureExt::catch_unwind for the stress_test! macro in tests.
+futures = { workspace = true }
+
+[features]
+test-helpers = ["weft-storage/test-helpers"]
 
 [dev-dependencies]
-# Consumed by the `stress_test!` macro (exported from weft-core) at
-# tests' macro-expansion sites: needs `FutureExt::catch_unwind` to
-# convert a panic in any stress iteration into a clean failure with
-# iteration index.
-futures = { workspace = true }
+weft-storage = { workspace = true, features = ["test-helpers"] }
+bytes = { workspace = true }

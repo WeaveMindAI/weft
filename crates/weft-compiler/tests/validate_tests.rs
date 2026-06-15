@@ -752,3 +752,56 @@ my_loop = Loop(other: List[String]) -> (out: List[String | Null]) {
     assert!(errs.iter().any(|e| e.message.contains("Duplicate id")),
         "expected Duplicate id error, got {:?}", errs);
 }
+
+#[test]
+fn storage_plane_example_chain_validates_clean() {
+    // FetchToStorage emits a File (any stored file). DownloadLink and
+    // KeepFile take File, so those edges are File -> File. ImageDisplay
+    // demands Image, which File does NOT satisfy. The author NARROWS the
+    // fetch's output port to Image in the node header (`-> (file: Image)`):
+    // legal because Image is a sub-case of the declared File, and the
+    // narrowed Image then satisfies ImageDisplay. The runtime enforces the
+    // narrow (a non-image fetched here closes the port and warns).
+    let project = parse_enrich(
+        r#"
+file_url = Text { value: "https://example.com/x.png" }
+
+fetch = FetchToStorage -> (file: Image) { keep: false }
+fetch.url = file_url.value
+
+show = ImageDisplay
+show.image = fetch.file
+
+link = DownloadLink
+link.file = fetch.file
+
+kept = KeepFile { ttl_days: 30 }
+kept.file = fetch.file
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "storage chain should validate clean: {:?}", d);
+}
+
+#[test]
+fn output_narrow_to_incompatible_type_is_rejected() {
+    // FetchToStorage outputs File. Narrowing to Image is legal (sub-case);
+    // "narrowing" to Number is NOT (Number is not a sub-case of File), so
+    // enrich must reject it loud instead of silently adopting the bogus
+    // type. This is the legality gate behind output-port type narrowing.
+    let mut project = compile(
+        r#"
+fetch = FetchToStorage -> (file: Number) { keep: false }
+"#,
+        uuid::Uuid::new_v4(),
+        None,
+    )
+    .expect("compile ok");
+    let err = enrich(&mut project, &catalog());
+    assert!(err.is_err(), "narrowing File to Number must be rejected");
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("incompatible with catalog type"),
+        "error should explain the narrow is incompatible: {msg}"
+    );
+}

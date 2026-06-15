@@ -18,6 +18,11 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
+    /// Wall-clock unix seconds. For values that PERSIST across
+    /// process restarts (storage expiry stamps, capability
+    /// expirations); `now()` (monotonic) cannot serve those because
+    /// an Instant is meaningless outside the process that minted it.
+    fn now_unix(&self) -> i64;
     async fn sleep(&self, d: Duration);
 }
 
@@ -36,6 +41,13 @@ impl SystemClock {
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn now_unix(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs() as i64
     }
 
     async fn sleep(&self, d: Duration) {
@@ -58,13 +70,22 @@ mod fake {
     /// Read the current time with `now`.
     pub struct FakeClock {
         anchor: Instant,
+        /// Unix-seconds epoch the fake wall clock starts at. An
+        /// arbitrary fixed value (not the real wall clock) so tests
+        /// assert exact persisted timestamps deterministically.
+        unix_anchor: i64,
         elapsed: Mutex<Duration>,
     }
+
+    /// Deterministic start for `FakeClock::now_unix` (2023-11-15ish;
+    /// the value is arbitrary, only its stability matters).
+    pub const FAKE_UNIX_ANCHOR: i64 = 1_700_000_000;
 
     impl FakeClock {
         pub fn new() -> Arc<Self> {
             Arc::new(Self {
                 anchor: Instant::now(),
+                unix_anchor: FAKE_UNIX_ANCHOR,
                 elapsed: Mutex::new(Duration::ZERO),
             })
         }
@@ -85,6 +106,7 @@ mod fake {
         fn default() -> Self {
             Self {
                 anchor: Instant::now(),
+                unix_anchor: FAKE_UNIX_ANCHOR,
                 elapsed: Mutex::new(Duration::ZERO),
             }
         }
@@ -94,6 +116,10 @@ mod fake {
     impl Clock for FakeClock {
         fn now(&self) -> Instant {
             self.anchor + *self.elapsed.lock()
+        }
+
+        fn now_unix(&self) -> i64 {
+            self.unix_anchor + self.elapsed.lock().as_secs() as i64
         }
 
         async fn sleep(&self, d: Duration) {

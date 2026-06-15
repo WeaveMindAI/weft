@@ -1,4 +1,22 @@
 use super::*;
+use crate::weft_type::FileKind;
+
+/// A stored-file value carrying the CONCRETE marker its mime implies,
+/// built through the real production path (from_mime + file_marker), so
+/// fixtures match exactly what a producer emits and the test exercises
+/// the marker logic, not a hand-written shape.
+fn file_val(mime: &str, handle_key: &str, handle: &str) -> serde_json::Value {
+    let kind = FileKind::from_mime(mime);
+    WeftType::file_marker(
+        kind,
+        serde_json::json!({ handle_key: handle, "mimeType": mime }),
+    )
+}
+
+/// Convenience: a url-backed stored-file value of the given mime.
+fn file_url(mime: &str) -> serde_json::Value {
+    file_val(mime, "url", "https://x.com/f")
+}
 
   #[test]
   fn parse_primitives() {
@@ -62,10 +80,18 @@ use super::*;
 
   #[test]
   fn parse_media_alias() {
+      // Media = Image | Video | Audio (NOT Blob: a spreadsheet/zip is
+      // not media). File is the wider "any stored file" union.
       let m = WeftType::parse("Media").unwrap();
       assert!(matches!(m, WeftType::Union(_)));
       if let WeftType::Union(types) = &m {
-          assert_eq!(types.len(), 4);
+          assert_eq!(types.len(), 3);
+      }
+      let f = WeftType::parse("File").unwrap();
+      if let WeftType::Union(types) = &f {
+          assert_eq!(types.len(), 4); // Image | Video | Audio | Blob
+      } else {
+          panic!("expected File union");
       }
   }
 
@@ -80,10 +106,10 @@ use super::*;
 
   #[test]
   fn parse_media_union_with_string() {
-      // Media | String = Image | Video | Audio | Document | String
+      // Media | String = Image | Video | Audio | String
       let t = WeftType::parse("Media | String").unwrap();
       if let WeftType::Union(types) = &t {
-          assert_eq!(types.len(), 5); // 4 media + String
+          assert_eq!(types.len(), 4); // 3 media + String
       } else {
           panic!("expected union");
       }
@@ -94,7 +120,7 @@ use super::*;
       let t = WeftType::parse("List[Media | String]").unwrap();
       if let WeftType::List(inner) = &t {
           if let WeftType::Union(types) = inner.as_ref() {
-              assert_eq!(types.len(), 5);
+              assert_eq!(types.len(), 4); // Image | Video | Audio | String
           } else {
               panic!("expected union inside list");
           }
@@ -117,9 +143,9 @@ use super::*;
   fn compatibility_media_accepts_image() {
       let media = WeftType::parse("Media").unwrap();
       let image = WeftType::primitive(WeftPrimitive::Image);
-      // Image fits into Media (Image | Video | Audio | Document)
+      // Image fits into Media (Image | Video | Audio)
       assert!(WeftType::is_compatible(&image, &media));
-      // Media does not fit into just Image (Video/Audio/Document might arrive)
+      // Media does not fit into just Image (Video/Audio might arrive)
       assert!(!WeftType::is_compatible(&media, &image));
   }
 
@@ -129,7 +155,9 @@ use super::*;
       assert!(WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::Image), &media));
       assert!(WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::Video), &media));
       assert!(WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::Audio), &media));
-      assert!(WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::Document), &media));
+      // Blob is NOT Media (it IS File though).
+      assert!(!WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::Blob), &media));
+      assert!(WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::Blob), &WeftType::file()));
       // String is NOT Media
       assert!(!WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::String), &media));
   }
@@ -151,7 +179,7 @@ use super::*;
       let list_image = WeftType::parse("List[Image]").unwrap();
       // List[Image] → List[Media]: OK (Image fits into Media)
       assert!(WeftType::is_compatible(&list_image, &list_media));
-      // List[Media] → List[Image]: fails (Video/Audio/Document don't fit into Image)
+      // List[Media] → List[Image]: fails (Video/Audio don't fit into Image)
       assert!(!WeftType::is_compatible(&list_media, &list_image));
   }
 
@@ -172,8 +200,11 @@ use super::*;
   #[test]
   fn runtime_check_media_image_matches() {
       let media = WeftType::parse("Media").unwrap();
-      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
-      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}})));
+      assert!(check(&media, &file_url("image/png")));
+      assert!(check(&media, &file_url("video/mp4")));
+      // A Blob (pdf) is NOT Media; it IS File.
+      assert!(!check(&media, &file_url("application/pdf")));
+      assert!(check(&WeftType::file(), &file_url("application/pdf")));
       assert!(!check(&media, &serde_json::json!("just a string")));
       assert!(!check(&media, &serde_json::json!(42)));
   }
@@ -181,22 +212,16 @@ use super::*;
   #[test]
   fn runtime_check_list_media_or_string() {
       let t = WeftType::parse("List[Media | String]").unwrap();
-      assert!(check(&t, &serde_json::json!([
-          {"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}},
-          "hello"
-      ])));
-      assert!(!check(&t, &serde_json::json!([
-          {"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}},
-          42
-      ])));
+      assert!(check(&t, &serde_json::json!([file_url("image/png"), "hello"])));
+      assert!(!check(&t, &serde_json::json!([file_url("image/png"), 42])));
   }
 
   #[test]
   fn runtime_check_dict_string_media() {
       let t = WeftType::parse("Dict[String, Media]").unwrap();
       assert!(check(&t, &serde_json::json!({
-          "photo": {"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}},
-          "clip": {"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}}
+          "photo": file_url("image/png"),
+          "clip": file_url("video/mp4")
       })));
       assert!(!check(&t, &serde_json::json!({
           "photo": "not a media object"
@@ -207,9 +232,9 @@ use super::*;
   fn media_roundtrip_display() {
       let t = WeftType::parse("Media").unwrap();
       let s = t.to_string();
-      // Media expands to union, so display shows the expanded form
-      assert_eq!(s, "Image | Video | Audio | Document");
-      // Re-parsing the expanded form should give the same type
+      // Media expands to its union, so display shows the expanded form.
+      assert_eq!(s, "Image | Video | Audio");
+      // Re-parsing the expanded form gives the same type.
       let reparsed = WeftType::parse(&s).unwrap();
       assert_eq!(t, reparsed);
   }
@@ -506,10 +531,13 @@ use super::*;
 
   #[test]
   fn infer_media() {
-      let img = serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}});
-      assert_eq!(WeftType::infer(&img), WeftType::primitive(WeftPrimitive::Image));
-      let vid = serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}});
-      assert_eq!(WeftType::infer(&vid), WeftType::primitive(WeftPrimitive::Video));
+      // The CONCRETE marker IS the inferred type, no mime re-guessing.
+      assert_eq!(WeftType::infer(&file_url("image/png")), WeftType::primitive(WeftPrimitive::Image));
+      assert_eq!(WeftType::infer(&file_url("video/mp4")), WeftType::primitive(WeftPrimitive::Video));
+      assert_eq!(WeftType::infer(&file_url("audio/mpeg")), WeftType::primitive(WeftPrimitive::Audio));
+      // Any non image/video/audio mime is the Blob catch-all.
+      assert_eq!(WeftType::infer(&file_url("application/pdf")), WeftType::primitive(WeftPrimitive::Blob));
+      assert_eq!(WeftType::infer(&file_url("application/zip")), WeftType::primitive(WeftPrimitive::Blob));
   }
 
   #[test]
@@ -548,59 +576,59 @@ use super::*;
   #[test]
   fn runtime_check_image() {
       let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &serde_json::json!({"__weft_media__": {"url": "https://example.com/img.png", "mimeType": "image/png"}})));
-      assert!(!check(&img, &serde_json::json!({"__weft_media__": {"url": "https://example.com/vid.mp4", "mimeType": "video/mp4"}})));
+      assert!(check(&img, &file_url("image/png")));
+      // A video value carries the __weft_video__ marker, NOT __weft_image__.
+      assert!(!check(&img, &file_url("video/mp4")));
       assert!(!check(&img, &serde_json::json!("just a string")));
-      assert!(!check(&img, &serde_json::json!({"__weft_media__": {"url": "https://example.com/img.png"}}))); // no mimeType
+      // A marker object with no handle (url/data/key) is not a stored file.
+      assert!(!check(&img, &WeftType::file_marker(FileKind::Image, serde_json::json!({"mimeType": "image/png"}))));
   }
 
   #[test]
   fn runtime_check_video() {
       let vid = WeftType::primitive(WeftPrimitive::Video);
-      assert!(check(&vid, &serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}})));
-      assert!(!check(&vid, &serde_json::json!({"__weft_media__": {"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"}})));
+      assert!(check(&vid, &file_url("video/mp4")));
+      assert!(!check(&vid, &file_url("audio/mpeg")));
   }
 
   #[test]
   fn runtime_check_audio() {
       let aud = WeftType::primitive(WeftPrimitive::Audio);
-      assert!(check(&aud, &serde_json::json!({"__weft_media__": {"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"}})));
-      assert!(!check(&aud, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
+      assert!(check(&aud, &file_url("audio/mpeg")));
+      assert!(!check(&aud, &file_url("image/png")));
   }
 
   #[test]
-  fn runtime_check_document() {
-      let doc = WeftType::primitive(WeftPrimitive::Document);
-      assert!(check(&doc, &serde_json::json!({"__weft_media__": {"url": "https://x.com/f.pdf", "mimeType": "application/pdf"}})));
-      // image/video/audio are NOT documents
-      assert!(!check(&doc, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
-      // missing url
-      assert!(!check(&doc, &serde_json::json!({"__weft_media__": {"mimeType": "application/pdf"}})));
+  fn runtime_check_blob() {
+      // Blob is the catch-all: any mime that is not image/video/audio.
+      let blob = WeftType::primitive(WeftPrimitive::Blob);
+      assert!(check(&blob, &file_url("application/pdf")));
+      assert!(check(&blob, &file_url("application/zip")));
+      assert!(check(&blob, &file_url("text/csv")));
+      // image/video/audio are NOT blobs (they carry their own markers).
+      assert!(!check(&blob, &file_url("image/png")));
+      // A marker with no handle is not a stored file.
+      assert!(!check(&blob, &WeftType::file_marker(FileKind::Blob, serde_json::json!({"mimeType": "application/pdf"}))));
   }
 
   #[test]
   fn runtime_check_media_alias() {
-      let media = WeftType::media(); // Image | Video | Audio | Document
-      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
-      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}})));
-      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/a.mp3", "mimeType": "audio/mpeg"}})));
-      assert!(check(&media, &serde_json::json!({"__weft_media__": {"url": "https://x.com/f.pdf", "mimeType": "application/pdf"}})));
+      let media = WeftType::media(); // Image | Video | Audio
+      assert!(check(&media, &file_url("image/png")));
+      assert!(check(&media, &file_url("video/mp4")));
+      assert!(check(&media, &file_url("audio/mpeg")));
+      // A Blob (pdf) is NOT Media (it is File).
+      assert!(!check(&media, &file_url("application/pdf")));
+      assert!(check(&WeftType::file(), &file_url("application/pdf")));
       assert!(!check(&media, &serde_json::json!("just a string")));
       assert!(!check(&media, &serde_json::json!(42)));
   }
 
   #[test]
-  fn runtime_check_media_with_mimetype_lowercase() {
-      // Some nodes use lowercase "mimetype" instead of "mimeType"
-      let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimetype": "image/png"}})));
-  }
-
-  #[test]
   fn runtime_check_media_with_data_field() {
-      // Some media uses "data" instead of "url"
+      // The handle may be `data` (inline) instead of `url`/`key`.
       let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &serde_json::json!({"__weft_media__": {"data": "base64...", "mimeType": "image/png"}})));
+      assert!(check(&img, &file_val("image/png", "data", "base64...")));
   }
 
   // ── Runtime check: unions ───────────────────────────────────────────
@@ -624,7 +652,7 @@ use super::*;
           WeftType::primitive(WeftPrimitive::Image),
       ]);
       assert!(check(&sm, &serde_json::json!("hello")));
-      assert!(check(&sm, &serde_json::json!({"__weft_media__": {"url": "https://x.com/i.png", "mimeType": "image/png"}})));
+      assert!(check(&sm, &file_url("image/png")));
       assert!(!check(&sm, &serde_json::json!(42)));
   }
 
@@ -963,15 +991,9 @@ use super::*;
   fn runtime_check_list_of_media_mixed() {
       // List[Image] : all elements must be images
       let t = WeftType::list(WeftType::primitive(WeftPrimitive::Image));
-      assert!(check(&t, &serde_json::json!([
-          {"__weft_media__": {"url": "https://x.com/a.png", "mimeType": "image/png"}},
-          {"__weft_media__": {"url": "https://x.com/b.jpg", "mimeType": "image/jpeg"}}
-      ])));
+      assert!(check(&t, &serde_json::json!([file_url("image/png"), file_url("image/jpeg")])));
       // One element is a video, not an image
-      assert!(!check(&t, &serde_json::json!([
-          {"__weft_media__": {"url": "https://x.com/a.png", "mimeType": "image/png"}},
-          {"__weft_media__": {"url": "https://x.com/v.mp4", "mimeType": "video/mp4"}}
-      ])));
+      assert!(!check(&t, &serde_json::json!([file_url("image/png"), file_url("video/mp4")])));
   }
 
   #[test]
@@ -1418,12 +1440,13 @@ use super::*;
   }
 
   #[test]
-  fn cast_rejects_media_types_loudly() {
-      // Media is a {url, mimeType} reference, not inline bytes: @file can't
-      // load it. Fails with a clear reason, not a confusing JSON-parse error.
-      for t in ["Image", "Video", "Audio", "Document"] {
+  fn cast_rejects_file_types_loudly() {
+      // A stored file is a {key|url, mimeType} reference, not inline bytes:
+      // @file can't load it. Fails with a clear reason, not a confusing
+      // JSON-parse error. Covers the concrete types and the unions.
+      for t in ["Image", "Video", "Audio", "Blob", "Media", "File"] {
           let err = ty(t).cast_text("\u{0089}PNG binary").unwrap_err();
-          assert!(err.contains("media is referenced by URL"), "{t}: {err}");
+          assert!(err.contains("a stored file is referenced by key/URL"), "{t}: {err}");
       }
   }
 

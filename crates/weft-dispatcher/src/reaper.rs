@@ -18,7 +18,18 @@ pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(30), "worker_pod_gc", sweep_terminal_worker_pods);
     spawn_loop(state.clone(), Duration::from_secs(3600), "tasks", sweep_tasks);
     spawn_loop(state.clone(), Duration::from_secs(10), "listener", sweep_listeners);
-    spawn_loop(state, Duration::from_secs(60), "supervisor", sweep_supervisors);
+    spawn_loop(state.clone(), Duration::from_secs(60), "supervisor", sweep_supervisors);
+    // Storage plane: the durable terminate sweep (un-kept exec files)
+    // and the scale-to-zero box reaper. Idempotent across pods like
+    // the rest: the sweep queue deletes per-color rows only after the
+    // box confirms; teardown re-checks live usage first.
+    spawn_loop(
+        state.clone(),
+        Duration::from_secs(15),
+        "storage_sweep",
+        crate::storage_box::process_sweep_queue,
+    );
+    spawn_loop(state, Duration::from_secs(60), "storage_box", crate::storage_box::sweep_boxes);
 }
 
 /// Grace before a terminal (`done`/`dead`) worker_pod's k8s Pod

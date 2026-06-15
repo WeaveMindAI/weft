@@ -498,6 +498,39 @@ pub struct ProjectFetchDefinitionResponse {
     pub definition_hash: String,
 }
 
+/// `POST /storage/authorize`: the storage box (or the dispatcher)
+/// relays a caller's bearer token to the broker and gets back the
+/// VERIFIED identity facts the storage wall is computed from. The
+/// bearer on the request is the token being verified, not the
+/// relayer's own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageAuthorizeRequest {
+    /// The execution color the caller claims to be driving. The
+    /// broker verifies the claim the same way it gates journal
+    /// writes: the color's `owner_pod_name` must be the caller's
+    /// pod, and the color's project must be the caller's namespace's
+    /// project. Verified -> echoed in the response; failed -> 403.
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageAuthorizeResponse {
+    /// A worker pod: tenant + project resolved from the token's
+    /// namespace (DB-backed, never parsed/claimed), color verified
+    /// per the request.
+    Worker {
+        tenant_id: String,
+        project_id: String,
+        color: Option<String>,
+    },
+    /// The dispatcher (cluster control plane, `weft-system`).
+    ControlPlane,
+    /// A tenant's storage box pod (used by the dispatcher to
+    /// authenticate grow/shrink requests FROM a box).
+    StorageBox { tenant_id: String },
+}
+
 // ---------- Supervisor surface (tenant-scoped) ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1770,3 +1803,44 @@ mod supervisor_protocol_tests {
     }
 }
 
+
+#[cfg(test)]
+mod storage_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn storage_authorize_request_round_trip() {
+        let req = StorageAuthorizeRequest { color: Some("c1".into()) };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["color"], "c1");
+        let none: StorageAuthorizeRequest =
+            serde_json::from_value(json!({ "color": null })).unwrap();
+        assert_eq!(none.color, None);
+    }
+
+    #[test]
+    fn storage_authorize_response_round_trips_each_variant() {
+        // The internally-tagged `kind` discriminator must round-trip
+        // for all three identities the wall depends on.
+        let worker = StorageAuthorizeResponse::Worker {
+            tenant_id: "t1".into(),
+            project_id: "p1".into(),
+            color: Some("c1".into()),
+        };
+        let v = serde_json::to_value(&worker).unwrap();
+        assert_eq!(v["kind"], "worker");
+        assert_eq!(v["tenant_id"], "t1");
+        assert_eq!(serde_json::from_value::<StorageAuthorizeResponse>(v).unwrap(), worker);
+
+        let cp = StorageAuthorizeResponse::ControlPlane;
+        let v = serde_json::to_value(&cp).unwrap();
+        assert_eq!(v["kind"], "control_plane");
+        assert_eq!(serde_json::from_value::<StorageAuthorizeResponse>(v).unwrap(), cp);
+
+        let bx = StorageAuthorizeResponse::StorageBox { tenant_id: "t1".into() };
+        let v = serde_json::to_value(&bx).unwrap();
+        assert_eq!(v["kind"], "storage_box");
+        assert_eq!(serde_json::from_value::<StorageAuthorizeResponse>(v).unwrap(), bx);
+    }
+}

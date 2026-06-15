@@ -354,6 +354,44 @@
         executionState.nodeExecutions = rows;
         return;
       }
+      if (msg.kind === 'execPortWarning') {
+        // Non-terminal: append a port-type-mismatch warning to the
+        // matching firing's row without touching its status.
+        const framesKey = JSON.stringify(msg.frames);
+        const rows = executionState.nodeExecutions[msg.nodeId];
+        const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
+        if (!rows || idx < 0) {
+          // The firing's row must already exist (node_started precedes the
+          // mismatch on both the live and replay paths). Don't fabricate a
+          // stateless row, but don't swallow either: a miss means an
+          // ordering/keying regression, so surface it instead of losing
+          // the warning silently.
+          console.warn('[weft] port warning for an unknown firing', msg);
+          return;
+        }
+        // Idempotent WITHIN a firing: the dispatcher re-streams journal
+        // events on every follow/reconnect, so the same mismatch can
+        // arrive via both the replay snapshot and the live stream (the
+        // same overlap the bus reducer dedups). A port mismatches AT MOST
+        // ONCE per firing (one emission per port), so `port` is its
+        // identity within the firing's row; skip a re-delivery instead of
+        // stacking it. This dedup is safe across re-runs because the
+        // `execEvent` reducer clears `portWarnings` on each `running`
+        // transition, so we only ever dedup within one firing's warnings,
+        // never against a previous attempt's.
+        const existing = rows[idx].portWarnings ?? [];
+        if (existing.some((w) => w.port === msg.port)) {
+          return;
+        }
+        const warning = { port: msg.port, expected: msg.expected, actual: msg.actual };
+        executionState.nodeExecutions = {
+          ...executionState.nodeExecutions,
+          [msg.nodeId]: rows.map((r, i) =>
+            i === idx ? { ...r, portWarnings: [...existing, warning] } : r,
+          ),
+        };
+        return;
+      }
       if (msg.kind === 'execEvent') {
         const e = msg.event;
         const state = e.state;
@@ -411,6 +449,16 @@
             }
             if (state === 'running' && e.input !== undefined && r.input === undefined) {
               updated.input = e.input;
+            }
+            // A `running` transition is a FRESH firing of this (node,
+            // frames) row (a resume / re-dispatch reuses the row). Reset
+            // its per-firing port warnings so the new firing starts clean
+            // and the inspector shows THIS firing's dropped ports, not a
+            // stale union with a previous attempt's. Same per-firing-state
+            // discipline as `error` (refreshed on terminal) and
+            // `closedPorts` (refreshed below).
+            if (state === 'running') {
+              updated.portWarnings = [];
             }
             // closedPorts may arrive on node_started (state=running) or
             // node_skipped (state=skipped); always refresh from the event

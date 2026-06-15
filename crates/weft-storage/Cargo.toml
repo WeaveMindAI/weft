@@ -1,0 +1,57 @@
+[package]
+name = "weft-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The per-tenant storage box: a hand-rolled blob service that places
+# file chunks across several modest backing disks (plain PVCs mounted
+# as directories), walls access by verified caller identity, and is
+# the single authority for download capabilities. Also hosts the
+# consumer-side `StorageOps` client (used by the engine, the
+# dispatcher, and the CLI) and the test fakes/rig.
+
+[features]
+default = []
+test-helpers = ["weft-platform-traits/test-helpers"]
+
+[dependencies]
+weft-core = { workspace = true }
+weft-platform-traits = { workspace = true }
+# Broker authorize protocol types + TokenSource (the box relays
+# caller tokens to the broker for verification).
+weft-broker-client = { path = "../weft-broker-client" }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+# Per-disk blob I/O (streaming put/get/delete/list per mounted PVC).
+# We hand-roll only the placement brain + index on top.
+object_store = { workspace = true }
+base64 = { workspace = true }
+# Per-disk free/total space (statvfs) for placement + resize decisions.
+nix = { version = "0.29", features = ["fs"] }
+# Capability-secret minting (OS RNG; same posture as the broker's
+# identity-cache key: refuse to run with a guessable secret).
+getrandom = "0.2"
+
+[dev-dependencies]
+weft-storage = { path = ".", features = ["test-helpers"] }
+weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"

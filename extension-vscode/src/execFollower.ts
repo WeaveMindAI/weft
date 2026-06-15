@@ -37,6 +37,7 @@ export type DispatcherEvent =
   | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; project_id: string }
   | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; project_id: string }
   | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; project_id: string }
+  | { kind: 'port_type_mismatch'; color: string; node: string; frames: LoopIteration[]; port: string; expected: string; actual: string; project_id: string }
   | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown }
   | { kind: 'execution_failed'; color: string; project_id: string; error: string }
   | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string }
@@ -286,6 +287,20 @@ export class ExecutionFollower implements vscode.Disposable {
           closedPorts: e.closed_ports,
         };
         this.post({ kind: 'execEvent', event: execEvent });
+        break;
+      }
+      case 'port_type_mismatch': {
+        // Non-terminal: attach a warning to the firing's row without a
+        // state change. The node keeps running; one port's value was
+        // dropped and the port closed.
+        this.post({
+          kind: 'execPortWarning',
+          nodeId: e.node,
+          frames: e.frames,
+          port: e.port,
+          expected: e.expected,
+          actual: e.actual,
+        });
         break;
       }
       case 'execution_completed':

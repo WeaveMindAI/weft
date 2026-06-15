@@ -25,10 +25,10 @@ export type { NodeFeaturesWire as NodeFeatures } from '../../../shared/protocol'
 //
 // Python-style recursive types with strict enforcement. No Any type.
 //
-// Primitives:     String, Number, Boolean, Image, Video, Audio, Document
+// Primitives:     String, Number, Boolean, Image, Video, Audio, Blob
 // Parameterized:  List[T], Dict[K, V]
 // Unions:         String | Number, List[String] | String
-// Aliases:        Media = Image | Video | Audio | Document
+// Aliases:        Media = Image | Video | Audio;  File = Media | Blob
 // Type variables: T, T1, T2..., node-scoped, same T on input and output = same type
 // MustOverride:   Node can't know the type, user/AI must declare it in Weft code
 //
@@ -45,9 +45,10 @@ export type { NodeFeaturesWire as NodeFeatures } from '../../../shared/protocol'
 //   portType: 'MustOverride'         user must declare type in Weft
 // =============================================================================
 
+// SYNC: WeftPrimitive <-> crates/weft-core/src/weft_type.rs WeftPrimitive
 export type WeftPrimitive =
 	| "String" | "Number" | "Boolean" | "Null"
-	| "Image" | "Video" | "Audio" | "Document"
+	| "Image" | "Video" | "Audio" | "Blob"
 	| "Empty";
 
 /** A port type string. Supports recursive syntax: List[String], Dict[K, V], unions, type vars. */
@@ -56,11 +57,23 @@ export type PortType = string;
 /** All recognized primitive type names */
 export const ALL_PRIMITIVE_TYPES: WeftPrimitive[] = [
 	"String", "Number", "Boolean", "Null",
-	"Image", "Video", "Audio", "Document", "Empty",
+	"Image", "Video", "Audio", "Blob", "Empty",
 ];
 
-/** Built-in alias: Media expands to Image | Video | Audio | Document */
-export const MEDIA_TYPES: WeftPrimitive[] = ["Image", "Video", "Audio", "Document"];
+// SYNC: NAMED_UNIONS <-> crates/weft-core/src/weft_type.rs WeftType::named_union
+/** Named union aliases. The ONE place a union name expands (mirrors the
+ *  backend registry). `Media` = media-proper (Image|Video|Audio); `File`
+ *  = any stored file (Media + the Blob catch-all). Resolved generically,
+ *  never a per-name branch in the parser; future user-defined unions
+ *  register here. */
+export const NAMED_UNIONS: Record<string, WeftPrimitive[]> = {
+	Media: ["Image", "Video", "Audio"],
+	File: ["Image", "Video", "Audio", "Blob"],
+};
+
+/** The primitive members of the `File` union: the single source of truth
+ *  for "is this primitive a stored-file reference". */
+export const FILE_PRIMITIVES: WeftPrimitive[] = NAMED_UNIONS.File;
 
 // ── Parsed type representation ──────────────────────────────────────────────
 
@@ -121,11 +134,11 @@ function splitTopLevel(s: string, delimiter: string): string[] {
 
 function parseSingleType(s: string): WeftType | null {
 	s = s.trim();
-	if (s === 'Media') {
-		return {
-			kind: 'union',
-			types: MEDIA_TYPES.map(t => ({ kind: 'primitive', value: t })),
-		};
+	// Named union aliases (Media, File, future user unions) all resolve
+	// through the one registry, never a per-name branch.
+	const alias = NAMED_UNIONS[s];
+	if (alias !== undefined) {
+		return { kind: 'union', types: alias.map(t => ({ kind: 'primitive', value: t })) };
 	}
 	if (s === 'JsonDict') return { kind: 'json_dict' };
 	if (s === 'Bus') return { kind: 'bus' };
@@ -279,10 +292,17 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 
 // ── Type inference from runtime values ──────────────────────────────────────
 
-const MEDIA_KEYS = ['url', 'data'];
-const MIME_PREFIXES: Record<string, WeftPrimitive> = {
-	'image/': 'Image', 'video/': 'Video', 'audio/': 'Audio',
+// SYNC: STORED_FILE_MARKER_TYPES <-> crates/weft-core/src/weft_type.rs FileKind
+/** The per-kind sentinel key -> primitive type. A stored-file value
+ *  carries its CONCRETE type as its marker key; the type is read from
+ *  the marker, never re-derived from the mime string. */
+const STORED_FILE_MARKER_TYPES: Record<string, WeftPrimitive> = {
+	'__weft_image__': 'Image',
+	'__weft_video__': 'Video',
+	'__weft_audio__': 'Audio',
+	'__weft_blob__': 'Blob',
 };
+const FILE_HANDLE_KEYS = ['url', 'data', 'key'];
 
 /** Infer the WeftType of a JSON value. Mirrors WeftType::infer() in Rust. */
 export function inferTypeFromValue(value: unknown): WeftType {
@@ -297,14 +317,14 @@ export function inferTypeFromValue(value: unknown): WeftType {
 	}
 	if (typeof value === 'object') {
 		const obj = value as Record<string, unknown>;
-		// Detect media objects
-		const hasUrl = MEDIA_KEYS.some(k => k in obj);
-		const mime = (obj['mimeType'] ?? obj['mimetype']) as string | undefined;
-		if (hasUrl && typeof mime === 'string') {
-			for (const [prefix, prim] of Object.entries(MIME_PREFIXES)) {
-				if (mime.startsWith(prefix)) return { kind: 'primitive', value: prim };
+		// Detect a stored-file value by its CONCRETE marker key: the
+		// marker IS the type. The payload must carry a handle (url/data/key).
+		for (const [marker, prim] of Object.entries(STORED_FILE_MARKER_TYPES)) {
+			const payload = obj[marker];
+			if (typeof payload === 'object' && payload !== null
+				&& FILE_HANDLE_KEYS.some(k => k in (payload as Record<string, unknown>))) {
+				return { kind: 'primitive', value: prim };
 			}
-			return { kind: 'primitive', value: 'Document' };
 		}
 		const values = Object.values(obj);
 		if (values.length === 0) {
@@ -318,13 +338,13 @@ export function inferTypeFromValue(value: unknown): WeftType {
 
 /** Whether a port of this type should be configurable by default (i.e.,
  *  fillable from a same-named config field). Mirrors
- *  WeftType::is_default_configurable() in Rust. Media types, TypeVar, and
+ *  WeftType::is_default_configurable() in Rust. File types, TypeVar, and
  *  MustOverride are wired-only; everything else (primitives, lists, dicts,
  *  JsonDict, unions of configurable types) defaults to configurable. */
 export function isDefaultConfigurable(t: WeftType): boolean {
 	switch (t.kind) {
 		case 'primitive':
-			return t.value !== 'Image' && t.value !== 'Video' && t.value !== 'Audio' && t.value !== 'Document';
+			return !FILE_PRIMITIVES.includes(t.value);
 		case 'list':
 			return isDefaultConfigurable(t.inner);
 		case 'dict':
@@ -371,7 +391,7 @@ export interface PortDefinition {
 	description?: string;
 	/** Whether this port can be filled by a same-named config field on the
 	 *  node (in addition to being wired by an edge). Defaults to true unless
-	 *  the type is a Media type or otherwise non-configurable. Catalog
+	 *  the type is a File type or otherwise non-configurable. Catalog
 	 *  authors opt out per port. Edge wins over config when both are present. */
 	configurable?: boolean;
 	/** True iff this is the auto-synthesized input half of a loop carry port.
@@ -441,6 +461,23 @@ export interface NodeExecution {
 	/// events to the right running row when several firings run
 	/// in parallel. `[]` at root (outside any loop).
 	framesKey: string;
+	/// Non-terminal per-port warnings raised on this firing. The only
+	/// source is a runtime output-type mismatch: the node tried to emit a
+	/// value whose type is incompatible with the port's declared type, so
+	/// the engine closed the port instead. The node did NOT fail.
+	// SYNC: PortWarning <-> crates/weft-core/src/exec/execution.rs PortWarning
+	portWarnings?: PortWarning[];
+}
+
+/// A non-terminal, per-port problem on a single firing (output-type
+/// mismatch). See `NodeExecution.portWarnings`.
+// SYNC: PortWarning <-> crates/weft-core/src/exec/execution.rs PortWarning
+export interface PortWarning {
+	port: string;
+	/// The port's declared type (what the node promised to emit).
+	expected: string;
+	/// The inferred type of the value the node actually tried to emit.
+	actual: string;
 }
 
 /** Node executions keyed by node ID. */

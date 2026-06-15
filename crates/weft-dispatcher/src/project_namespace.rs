@@ -147,6 +147,11 @@ pub fn render(args: &ProjectNamespaceArgs<'_>) -> String {
     // below.
     let tenant_id = SafeLabel::new(tenant_id, 63);
     let project_id = SafeLabel::new(project_id, 63);
+    // The worker->box egress port is the box's fixed listen port; pull
+    // it from the one constant so it can never drift from the box's own
+    // Service/containerPort (a literal here once meant changing
+    // STORAGE_PORT would silently break the data path).
+    let storage_port = weft_storage::config::STORAGE_PORT;
     format!(
         r#"---
 apiVersion: v1
@@ -221,6 +226,18 @@ spec:
         - podSelector:
             matchLabels:
               weft.dev/role: infra
+    # Tenant-namespace storage box (the ctx.storage data path:
+    # worker<->box byte streaming).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {tenant_namespace}
+          podSelector:
+            matchLabels:
+              weft.dev/role: storage
+      ports:
+        - protocol: TCP
+          port: {storage_port}
     # Internet egress (HTTP APIs, model downloads, etc).
     - to:
         - ipBlock:

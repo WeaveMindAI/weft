@@ -406,6 +406,33 @@ pub async fn delete_execution(
     Path(color_str): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Wipe the execution's storage folder (kept survivors included:
+    // `weft clean <color>` IS the explicit removal verb for them)
+    // BEFORE the journal rows go, while the color->project mapping
+    // still exists. A spent color's storage address dies with its
+    // journal history.
+    if let Ok(Some(project_id)) = state.journal.execution_project(color).await.map(|p| p.found())
+    {
+        let tenant = state.tenant_router.tenant_for_project(&project_id);
+        let has_box = crate::storage_box::box_exists(&state.pg_pool, tenant.as_str())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if has_box {
+            let box_url = crate::storage_box::box_url(&state, &tenant);
+            state
+                .storage_admin
+                .wipe_prefix(&box_url, &format!("exec/{color}/"))
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        target: "weft_dispatcher::storage",
+                        %color, error = %e,
+                        "could not wipe execution storage; aborting clean so a retry can"
+                    );
+                    StatusCode::SERVICE_UNAVAILABLE
+                })?;
+        }
+    }
     state
         .journal
         .delete_execution(color)

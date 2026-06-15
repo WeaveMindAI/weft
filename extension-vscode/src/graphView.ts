@@ -24,6 +24,14 @@ export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
   private watchedDoc: vscode.TextDocument | undefined;
   private watchedProjectId: string | undefined;
+  /// Origin (scheme://host:port) the storage box serves file bytes
+  /// from, fetched once from the dispatcher at panel boot. The
+  /// webview CSP allows this origin in img-src/media-src so an
+  /// <img>/<video> streams directly from the box (range requests,
+  /// seeking), exactly as the cloud web app will. Empty if the fetch
+  /// failed (older dispatcher / offline): previews then can't load,
+  /// which surfaces as the node's fallback rather than a silent break.
+  private storageOrigin = '';
   /// Include-navigation back-stack. Each frame records the doc the user came
   /// from and the include alias they clicked to descend (used to build the
   /// execution-id prefix so sub-graph journal values render). `openInclude`
@@ -236,6 +244,10 @@ export class GraphViewController {
       await this.triggerParse();
       return;
     }
+
+    // Learn the storage origin before rendering the CSP, so an
+    // <img>/<video> can stream directly from the box.
+    await this.loadStorageOrigin();
 
     this.panel = vscode.window.createWebviewPanel(
       'weft.graph',
@@ -1106,6 +1118,83 @@ export class GraphViewController {
       case 'stopAction':
         this.stopActionHandler?.();
         break;
+      case 'downloadStoredFile':
+        void this.runDownloadStoredFile(msg.key);
+        break;
+      case 'resolveStoredFileUrl':
+        void this.runResolveStoredFileUrl(msg.key, msg.requestId);
+        break;
+    }
+  }
+
+  /// Fetch the storage origin the webview CSP must allow so media
+  /// streams directly from the box. Best-effort: on failure the origin
+  /// stays empty and image previews can't load (their node shows the
+  /// "unavailable" fallback at the point of use, which is the visible
+  /// signal). We do NOT block panel boot or pop a modal, since a
+  /// storage-less project never previews media; the failure is logged
+  /// so a developer can see the real cause (dispatcher unreachable /
+  /// too old) rather than guessing from a blank preview.
+  private async loadStorageOrigin(): Promise<void> {
+    try {
+      const resp = await this.client.get<{ public_base_url: string }>('/storage/public-base');
+      this.storageOrigin = new URL(resp.public_base_url).origin;
+    } catch (err) {
+      this.storageOrigin = '';
+      console.warn(
+        '[weft] storage origin unavailable; inline media previews will show a fallback ' +
+          'until the graph is reopened with the dispatcher reachable',
+        err,
+      );
+    }
+  }
+
+  /// Inline preview (image display). Run the brokered handshake and
+  /// hand the webview the box's public URL; the <img> streams the
+  /// bytes DIRECTLY from the box (the CSP admits the storage origin;
+  /// the box does range requests, so this scales to video). Identical
+  /// to the cloud web app: the only thing that differs per deployment
+  /// is the origin. Correlated by requestId. A 404 (expired/swept)
+  /// becomes an `error` reply so the preview shows a fallback.
+  private async runResolveStoredFileUrl(key: string, requestId: number): Promise<void> {
+    try {
+      const resp = await this.client.post<{ url: string }>(
+        '/storage/files/download',
+        { key, project: this.watchedProjectId ?? null },
+      );
+      this.post({ kind: 'storedFileUrl', requestId, url: resp.url });
+    } catch (e) {
+      const error =
+        e instanceof HttpError && e.status === 404
+          ? 'expired or deleted'
+          : e instanceof Error
+            ? e.message
+            : String(e);
+      this.post({ kind: 'storedFileUrl', requestId, error });
+    }
+  }
+
+  /// Stored-file download: handshake with the dispatcher (it
+  /// authenticates and asks the tenant's storage box to mint a
+  /// short-lived capability), then open the box's public URL in the
+  /// browser, which streams the bytes DIRECTLY from the box.
+  private async runDownloadStoredFile(key: string): Promise<void> {
+    try {
+      const resp = await this.client.post<{ url: string }>(
+        '/storage/files/download',
+        { key, project: this.watchedProjectId ?? null },
+      );
+      await vscode.env.openExternal(vscode.Uri.parse(resp.url));
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 404) {
+        void vscode.window.showWarningMessage(
+          `Stored file is expired or deleted (its metadata stays in the replay): ${key}`,
+        );
+        return;
+      }
+      void vscode.window.showErrorMessage(
+        `Download failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -1540,7 +1629,7 @@ export class GraphViewController {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data:; font-src ${cspSource}; connect-src ${cspSource};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data: ${this.storageOrigin}; media-src ${cspSource} ${this.storageOrigin}; font-src ${cspSource}; connect-src ${cspSource};">
 <link rel="stylesheet" href="${bundleCss}">
 <title>Weft Graph</title>
 <style>html,body,#app{margin:0;padding:0;width:100%;height:100%;overflow:hidden}</style>

@@ -40,6 +40,7 @@ pub struct ScopeCache {
     project_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
     color_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
     signal_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
+    namespace_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
 }
 
 impl ScopeCache {
@@ -49,6 +50,7 @@ impl ScopeCache {
             project_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
             color_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
             signal_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
+            namespace_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
         }
     }
 }
@@ -209,6 +211,36 @@ async fn lookup_signal_tenant(
         .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?
         .0;
     cache_put(&cache.signal_to_tenant, token.to_string(), tenant.clone()).await;
+    Ok(tenant)
+}
+
+/// Namespace -> tenant, from the registry the dispatcher writes at
+/// namespace-creation time. 403 on a namespace it never created.
+pub async fn lookup_namespace_tenant(
+    cache: &ScopeCache,
+    pool: &PgPool,
+    namespace: &str,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(t) = cache_get(&cache.namespace_to_tenant, namespace).await {
+        return Ok(t);
+    }
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT tenant_id FROM weft_namespace_tenant WHERE namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("namespace lookup: {e}")))?;
+    let tenant = row
+        .ok_or((
+            StatusCode::FORBIDDEN,
+            format!(
+                "namespace '{namespace}' is not registered to any tenant; only namespaces \
+                 the dispatcher created can authenticate"
+            ),
+        ))?
+        .0;
+    cache_put(&cache.namespace_to_tenant, namespace.to_string(), tenant.clone()).await;
     Ok(tenant)
 }
 

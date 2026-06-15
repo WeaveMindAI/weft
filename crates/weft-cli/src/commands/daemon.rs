@@ -38,7 +38,15 @@ pub struct ClusterConfig {
     pub listener_image: String,
     pub broker_image: String,
     pub supervisor_image: String,
+    pub storage_image: String,
     pub dispatcher_port: u16,
+    /// Local port the daemon forwards the cluster ingress controller
+    /// to. Storage file downloads (and any ingress-served URL) are
+    /// minted as `http://127.0.0.1:<ingress_port>/...` in local dev,
+    /// reached via this forward. Distinct from `dispatcher_port`
+    /// (the dispatcher's own API): downloads stream straight from the
+    /// storage box through the ingress, never through the dispatcher.
+    pub ingress_port: u16,
     /// Cluster Service CIDR. The apiserver's ClusterIP lives in this
     /// range; the broker NetworkPolicy allows TokenReview egress to
     /// it, and the dispatcher gets it as env. kind's default is
@@ -88,10 +96,16 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "weft-broker:local".into());
         let supervisor_image = std::env::var("WEFT_SUPERVISOR_IMAGE")
             .unwrap_or_else(|_| "weft-infra-supervisor:local".into());
+        let storage_image = std::env::var("WEFT_STORAGE_IMAGE")
+            .unwrap_or_else(|_| "weft-storage:local".into());
         let dispatcher_port = std::env::var("WEFT_DISPATCHER_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(9999);
+        let ingress_port = std::env::var("WEFT_INGRESS_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9998);
         // Raw here; validated where they're consumed (the manifest
         // apply, `apply_static_manifests`), not at config load: a
         // malformed CIDR should fail the apply loudly, not break
@@ -118,7 +132,9 @@ impl ClusterConfig {
             listener_image,
             broker_image,
             supervisor_image,
+            storage_image,
             dispatcher_port,
+            ingress_port,
             service_cidr,
             pod_cidr,
             backend,
@@ -162,25 +178,57 @@ fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
     ip.is_private() || matches!(ip.octets(), [100, b, ..] if (64..=127).contains(&b))
 }
 
-/// Validate both cluster CIDRs and return the `${VAR}` substitution
-/// pairs for `kubectl_apply_*` (CIDRs + the derived apiserver
-/// ClusterIP that scopes the broker's egress NetworkPolicy). The ONLY
-/// way to get the substitution vars, so a manifest carrying a
-/// placeholder can never be applied without the CIDRs having passed
-/// validation first. Validated at the apply boundary, not at config
-/// load, so commands that don't apply manifests (stop / logs / rm)
-/// aren't gated on the CIDR env being well-formed.
-fn validated_cidr_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, String)>> {
+/// Validate cluster inputs and return the `${VAR}` substitution
+/// pairs for `kubectl_apply_*`: the CIDRs + derived apiserver
+/// ClusterIP (broker egress NetworkPolicy scope), plus the
+/// dispatcher's public base URL + local-dev flag (storage download /
+/// webhook addressing). The ONLY way to get the substitution vars,
+/// so a manifest carrying a placeholder can never be applied without
+/// the CIDRs having passed validation first. Validated at the apply
+/// boundary, not at config load, so commands that don't apply
+/// manifests (stop / logs / rm) aren't gated on the env being
+/// well-formed.
+///
+/// Public base URL policy:
+/// - Kind (local dev): default to `http://127.0.0.1:<ingress_port>`
+///   (the daemon forwards the cluster ingress there) and set
+///   WEFT_LOCAL_DEV=1 so the dispatcher accepts the loopback host.
+///   An operator may still override WEFT_DISPATCHER_PUBLIC_BASE_URL.
+/// - K8s (real cluster): the operator MUST set
+///   WEFT_DISPATCHER_PUBLIC_BASE_URL to the external ingress host;
+///   WEFT_LOCAL_DEV is empty, so a loopback there fails loud.
+fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, String)>> {
     check_cidr(&cfg.service_cidr, true)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
     check_cidr(&cfg.pod_cidr, false)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_POD_CIDR='{}': {e}", cfg.pod_cidr))?;
     let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
+
+    let (public_base_url, local_dev) = match cfg.backend {
+        ClusterBackend::Kind => {
+            let url = std::env::var("WEFT_DISPATCHER_PUBLIC_BASE_URL")
+                .unwrap_or_else(|_| format!("http://127.0.0.1:{}", cfg.ingress_port));
+            (url, "1".to_string())
+        }
+        ClusterBackend::K8s => {
+            let url = std::env::var("WEFT_DISPATCHER_PUBLIC_BASE_URL").map_err(|_| {
+                anyhow::anyhow!(
+                    "WEFT_DISPATCHER_PUBLIC_BASE_URL is required for the k8s backend; \
+                     set it to the cluster's external ingress host (e.g. \
+                     https://files.example.com)"
+                )
+            })?;
+            (url, String::new())
+        }
+    };
+
     Ok(vec![
         ("WEFT_CLUSTER_SERVICE_CIDR", cfg.service_cidr.clone()),
         ("WEFT_CLUSTER_POD_CIDR", cfg.pod_cidr.clone()),
         ("WEFT_APISERVER_CLUSTERIP", apiserver_ip),
+        ("WEFT_DISPATCHER_PUBLIC_BASE_URL", public_base_url),
+        ("WEFT_LOCAL_DEV", local_dev),
     ])
 }
 
@@ -237,6 +285,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         listener: listener_built,
         broker: broker_built,
         supervisor: supervisor_built,
+        storage: storage_built,
     } = built;
 
     // Re-apply k8s manifests on every restart. NetworkPolicy /
@@ -247,12 +296,12 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // kube-apiserver layer (resourceVersion match).
     let manifests_changed = apply_static_manifests(cfg).await?;
 
-    if dispatcher_built || listener_built || broker_built || supervisor_built || manifests_changed {
+    if dispatcher_built || listener_built || broker_built || supervisor_built || storage_built || manifests_changed {
         if cfg.backend == ClusterBackend::Kind {
             // System tags are reused (`:local`), so tag presence on the
             // kind node DOESN'T imply matching content. Use the _force
             // variant so a freshly-built image actually replaces the
-            // stale one inside the node. Load all four in parallel:
+            // stale one inside the node. Load all in parallel:
             // kind-load is independent per image and the kind node
             // tolerates concurrent loads.
             tokio::try_join!(
@@ -260,6 +309,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
                 images::kind_load_force(&cfg.cluster_name, &cfg.listener_image),
                 images::kind_load_force(&cfg.cluster_name, &cfg.broker_image),
                 images::kind_load_force(&cfg.cluster_name, &cfg.supervisor_image),
+                images::kind_load_force(&cfg.cluster_name, &cfg.storage_image),
             )?;
         }
         // Roll the dispatcher pod so it picks up the new image OR
@@ -279,8 +329,8 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
             anyhow::bail!("rollout restart failed");
         }
         wait_for_statefulset_ready("weft-dispatcher").await?;
-        kill_existing_port_forward();
-        start_port_forward().await?;
+        kill_existing_port_forwards();
+        start_port_forwards().await?;
         wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
         // Once the dispatcher is back up, roll the dependent
         // deployments concurrently. They are independent rollouts
@@ -311,11 +361,26 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         };
         let supervisor_rollout = async {
             if supervisor_built {
-                roll_supervisor_deployments().await?;
+                roll_role_deployments("infra-supervisor", "infra-supervisor").await?;
             }
             Ok::<(), anyhow::Error>(())
         };
-        tokio::try_join!(listener_rollout, broker_rollout, supervisor_rollout)?;
+        // Storage boxes are per-tenant, dispatcher-created at runtime
+        // (not static manifests), so the kind-load above doesn't reach
+        // an already-running box pod; roll it explicitly like the
+        // supervisor / listener.
+        let storage_rollout = async {
+            if storage_built {
+                roll_role_deployments("storage", "storage").await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::try_join!(
+            listener_rollout,
+            broker_rollout,
+            supervisor_rollout,
+            storage_rollout
+        )?;
         println!("daemon refreshed; new image / manifests rolled out");
     } else {
         println!("daemon already running with the latest images and manifests; nothing to do");
@@ -331,9 +396,10 @@ struct BuiltImages {
     listener: bool,
     broker: bool,
     supervisor: bool,
+    storage: bool,
 }
 
-/// Build the four daemon system images AND pre-warm the per-project
+/// Build the daemon system images AND pre-warm the per-project
 /// worker builder base, all concurrently (independent input sets,
 /// per-image buildkit cache mounts). Shared by `start` and `restart`
 /// so the two verbs cannot drift on input lists or failure policy.
@@ -386,11 +452,12 @@ async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltIma
     };
     // Only the dispatcher stages `catalog/` (describe / compile
     // endpoints); the others must not rebuild on a catalog edit.
-    let (dispatcher, listener, broker, supervisor, ()) = tokio::join!(
+    let (dispatcher, listener, broker, supervisor, storage, ()) = tokio::join!(
         images::ensure_system_image(&cfg.dispatcher_image, "dispatcher.Dockerfile", &["catalog"], rebuild),
         images::ensure_system_image(&cfg.listener_image, "listener.Dockerfile", &[], rebuild),
         images::ensure_system_image(&cfg.broker_image, "broker.Dockerfile", &[], rebuild),
         images::ensure_system_image(&cfg.supervisor_image, "infra-supervisor.Dockerfile", &[], rebuild),
+        images::ensure_system_image(&cfg.storage_image, "storage.Dockerfile", &[], rebuild),
         worker_base_prewarm,
     );
     let mut failures: Vec<String> = Vec::new();
@@ -406,6 +473,7 @@ async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltIma
         listener: unwrap("listener", listener),
         broker: unwrap("broker", broker),
         supervisor: unwrap("supervisor", supervisor),
+        storage: unwrap("storage", storage),
     };
     if !failures.is_empty() {
         anyhow::bail!("system image build failed:\n  {}", failures.join("\n  "));
@@ -420,15 +488,16 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     let repo_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let manifests = repo_root.join("deploy/k8s");
-    // broker + dispatcher carry ${WEFT_CLUSTER_*_CIDR} placeholders
-    // (see start()) substituted from `cidr_vars`; the others have no
+    // broker + dispatcher carry ${...} placeholders (CIDRs, and for
+    // the dispatcher the public base URL + local-dev flag), all
+    // substituted from `template_vars`; the others have no
     // placeholders so the same applier is a no-op substitution for
     // them. `cluster-rbac.yaml`: ClusterRoles for the per-tenant
     // supervisor + listener pods, bound into project namespaces by
     // RoleBindings the dispatcher creates at register time.
     // Cluster-scoped; in the rolling-apply list so RBAC drift (e.g.
     // the supervisor's surface growing) stays in sync.
-    let cidr_vars = validated_cidr_vars(cfg)?;
+    let template_vars = manifest_template_vars(cfg)?;
     let mut any_changed = false;
     for name in [
         "system-namespace.yaml",
@@ -439,10 +508,10 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
         "ingress.yaml",
         "cluster-rbac.yaml",
     ] {
-        // Every manifest goes through the same applier with the CIDR
-        // vars; substitution is a no-op for the manifests without
-        // placeholders (broker + dispatcher are the only ones today).
-        any_changed |= kubectl_apply_changed(&manifests.join(name), &cidr_vars).await?;
+        // Every manifest goes through the same applier with the
+        // template vars; substitution is a no-op for the manifests
+        // without placeholders (broker + dispatcher are the only ones).
+        any_changed |= kubectl_apply_changed(&manifests.join(name), &template_vars).await?;
     }
     Ok(any_changed)
 }
@@ -452,12 +521,56 @@ pub fn data_dir() -> PathBuf {
     home.join(".local/share/weft")
 }
 
-pub fn pid_file_path() -> PathBuf {
-    data_dir().join("port-forward.pid")
+/// A background `kubectl port-forward` the daemon owns. Each forward
+/// tracks its own pid + log file (keyed by `name`) so they start,
+/// stop, and report liveness independently.
+struct PortForward {
+    /// Stable key for the pid/log filenames (e.g. "dispatcher").
+    name: &'static str,
+    namespace: String,
+    service: &'static str,
+    local_port: u16,
+    remote_port: u16,
 }
 
-pub fn log_file_path() -> PathBuf {
-    data_dir().join("port-forward.log")
+/// Every port-forward the daemon maintains:
+/// - dispatcher: the control plane API (CLI / extension talk here).
+///   Always present.
+/// - ingress: the kind ingress controller, so storage file downloads
+///   minted as `http://127.0.0.1:<ingress_port>/storage/...` are
+///   reachable from the operator's machine. Downloads stream straight
+///   from the storage box through the ingress; the dispatcher is
+///   never in the byte path, so this is a separate forward, not a
+///   route through the dispatcher port. Kind-only: a real k8s
+///   operator sets a real external ingress host
+///   (WEFT_DISPATCHER_PUBLIC_BASE_URL) reachable without a forward,
+///   and the ingress-nginx Service name may differ in their cluster.
+fn port_forwards(cfg: &ClusterConfig) -> Vec<PortForward> {
+    let mut forwards = vec![PortForward {
+        name: "dispatcher",
+        namespace: cfg.system_namespace.clone(),
+        service: "weft-dispatcher",
+        local_port: cfg.dispatcher_port,
+        remote_port: 9999,
+    }];
+    if cfg.backend == ClusterBackend::Kind {
+        forwards.push(PortForward {
+            name: "ingress",
+            namespace: "ingress-nginx".to_string(),
+            service: "ingress-nginx-controller",
+            local_port: cfg.ingress_port,
+            remote_port: 80,
+        });
+    }
+    forwards
+}
+
+pub fn data_dir_pid_file(name: &str) -> PathBuf {
+    data_dir().join(format!("port-forward-{name}.pid"))
+}
+
+fn pf_log_file(name: &str) -> PathBuf {
+    data_dir().join(format!("port-forward-{name}.log"))
 }
 
 async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
@@ -479,6 +592,7 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
         images::kind_load_force(&cfg.cluster_name, &cfg.listener_image).await?;
         images::kind_load_force(&cfg.cluster_name, &cfg.broker_image).await?;
         images::kind_load_force(&cfg.cluster_name, &cfg.supervisor_image).await?;
+        images::kind_load_force(&cfg.cluster_name, &cfg.storage_image).await?;
     }
 
     let repo_root = weft_compiler::build::resolve_weft_root()
@@ -491,15 +605,15 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // supervisor pod) on first project register.
     kubectl_apply_file(&manifests.join("postgres.yaml")).await?;
     wait_for_deployment_ready_in_ns("weft-postgres", &cfg.db_namespace).await?;
-    // broker + dispatcher carry cluster-specific CIDRs (the broker's
-    // TokenReview-egress NetworkPolicy and the dispatcher's env);
-    // substitute them so a non-kind operator sets the CIDRs once via
-    // WEFT_CLUSTER_SERVICE_CIDR / WEFT_CLUSTER_POD_CIDR instead of
-    // hand-editing manifests.
-    let cidr_vars = validated_cidr_vars(cfg)?;
-    kubectl_apply_templated(&manifests.join("broker.yaml"), &cidr_vars).await?;
+    // broker + dispatcher carry cluster-specific placeholders (the
+    // broker's TokenReview-egress NetworkPolicy CIDRs, the
+    // dispatcher's CIDRs + public base URL + local-dev flag);
+    // substitute them so a non-kind operator sets them once via env
+    // instead of hand-editing manifests.
+    let template_vars = manifest_template_vars(cfg)?;
+    kubectl_apply_templated(&manifests.join("broker.yaml"), &template_vars).await?;
     wait_for_deployment_ready_in_ns("weft-broker", &cfg.db_namespace).await?;
-    kubectl_apply_templated(&manifests.join("dispatcher.yaml"), &cidr_vars).await?;
+    kubectl_apply_templated(&manifests.join("dispatcher.yaml"), &template_vars).await?;
     kubectl_apply_file(&manifests.join("ingress.yaml")).await?;
     // Cluster-scoped RBAC: ClusterRoles the supervisor + listener
     // RoleBindings (created per project namespace by the dispatcher)
@@ -507,7 +621,11 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     kubectl_apply_file(&manifests.join("cluster-rbac.yaml")).await?;
 
     wait_for_statefulset_ready("weft-dispatcher").await?;
-    start_port_forward().await?;
+    // Kill any stale forwards from a previous daemon before
+    // re-establishing, so a restarted daemon doesn't leak processes
+    // or bind-conflict on the local ports.
+    kill_existing_port_forwards();
+    start_port_forwards().await?;
     wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
 
     let _ = ctx;
@@ -528,7 +646,7 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
 
 async fn stop() -> Result<()> {
     let cfg = cluster_config();
-    kill_existing_port_forward();
+    kill_existing_port_forwards();
     let _ = kubectl(&[
         "-n", &cfg.system_namespace, "scale", "statefulset/weft-dispatcher", "--replicas=0",
     ])
@@ -538,20 +656,27 @@ async fn stop() -> Result<()> {
     Ok(())
 }
 
-/// Kill any running `kubectl port-forward` we previously spawned
-/// for the dispatcher Service. Called on stop and before we
-/// re-establish a port-forward after a Pod rollout. Idempotent.
-fn kill_existing_port_forward() {
-    let pf = pid_file_path();
-    if let Some(pid) = read_pid(&pf) {
-        let _ = signal_term(pid);
-        let _ = fs::remove_file(&pf);
+/// Kill every running `kubectl port-forward` we previously spawned
+/// (dispatcher + ingress). Called on stop and before we
+/// re-establish forwards after a Pod rollout. Idempotent.
+fn kill_existing_port_forwards() {
+    let cfg = cluster_config();
+    for pf in port_forwards(cfg) {
+        let pid_file = data_dir_pid_file(pf.name);
+        if let Some(pid) = read_pid(&pid_file) {
+            let _ = signal_term(pid);
+            let _ = fs::remove_file(&pid_file);
+        }
     }
 }
 
 async fn status(ctx: &Ctx) -> Result<()> {
     let cfg = cluster_config();
-    let pf_alive = read_pid(&pid_file_path()).map(process_alive).unwrap_or(false);
+    // All forwards must be alive to report "up"; if any died the
+    // operator's reachability is partially broken.
+    let pf_alive = port_forwards(cfg)
+        .iter()
+        .all(|pf| read_pid(&data_dir_pid_file(pf.name)).map(process_alive).unwrap_or(false));
     match ctx.client().get_json("/projects").await {
         Ok(v) => {
             let n = v.as_array().map(|a| a.len()).unwrap_or(0);
@@ -775,22 +900,27 @@ async fn roll_listener_deployments(cfg: &ClusterConfig) -> Result<()> {
     Ok(())
 }
 
-/// Roll every per-tenant infra-supervisor Deployment after the
-/// supervisor image was rebuilt, so tenants pick up the new binary
+/// Roll every per-tenant Deployment carrying `weft.dev/role=<role>`
+/// after its image was rebuilt, so tenants pick up the new binary
 /// instead of running stale code until their pod happens to restart.
-/// Supervisors live one-per-tenant across `wm-tenant-*` namespaces.
-/// `rollout restart` has no `--all-namespaces`, so we first list the
+/// These deployments live one-per-tenant across `wm-*` namespaces and
+/// are created by the DISPATCHER at runtime (not by static manifests),
+/// so the daemon-refresh kind-load alone doesn't reach an
+/// already-running pod: it must be rolled explicitly.
+///
+/// `rollout restart` has no `--all-namespaces`, so we list the
 /// (namespace, name) pairs by role label cluster-wide, then roll each
-/// in its namespace. `rollout restart` is graceful (rolling, not a
-/// hard pod-delete). Best-effort: a failure doesn't fail the refresh
-/// (the next register reconciles), but we log it loudly.
-async fn roll_supervisor_deployments() -> Result<()> {
+/// in its namespace. Graceful (rolling, not a hard pod-delete).
+/// Best-effort: a failure doesn't fail the refresh (the next
+/// reconcile catches it), but we log it loudly. `noun` is the
+/// user-facing label for the summary line + the stale-pod warning.
+async fn roll_role_deployments(role: &str, noun: &str) -> Result<()> {
     let out = kubectl(&[
         "get",
         "deployments",
         "--all-namespaces",
         "-l",
-        "weft.dev/role=infra-supervisor",
+        &format!("weft.dev/role={role}"),
         "-o",
         "jsonpath={range .items[*]}{.metadata.namespace} {.metadata.name}{\"\\n\"}{end}",
     ])
@@ -799,7 +929,7 @@ async fn roll_supervisor_deployments() -> Result<()> {
     if !out.status.success() {
         tracing::warn!(
             target: "weft_cli::daemon",
-            "listing infra-supervisor deployments failed; skipping supervisor roll"
+            "listing {noun} deployments failed; skipping {noun} roll"
         );
         return Ok(());
     }
@@ -810,8 +940,8 @@ async fn roll_supervisor_deployments() -> Result<()> {
             line.trim().split_once(' ').map(|(ns, name)| (ns.to_string(), name.to_string()))
         })
         .collect();
-    // Roll every per-tenant supervisor in parallel: independent
-    // kubectl calls across different namespaces, no shared state.
+    // Roll every per-tenant pod in parallel: independent kubectl calls
+    // across different namespaces, no shared state.
     let tasks = pairs.iter().map(|(ns, name)| async move {
         let status = kubectl(&["-n", ns, "rollout", "restart", &format!("deployment/{name}")])
             .status()
@@ -819,7 +949,7 @@ async fn roll_supervisor_deployments() -> Result<()> {
         if !status.success() {
             tracing::warn!(
                 target: "weft_cli::daemon",
-                "rollout restart {ns}/{name} failed; tenant may run a stale supervisor \
+                "rollout restart {ns}/{name} failed; tenant may run a stale {noun} \
                  until its pod restarts"
             );
             return Ok::<bool, anyhow::Error>(false);
@@ -829,32 +959,34 @@ async fn roll_supervisor_deployments() -> Result<()> {
     let results = futures::future::try_join_all(tasks).await?;
     let rolled = results.into_iter().filter(|ok| *ok).count();
     if rolled > 0 {
-        println!("rolled {rolled} infra-supervisor deployment(s)");
+        println!("rolled {rolled} {noun} deployment(s)");
     }
     Ok(())
 }
 
-async fn start_port_forward() -> Result<()> {
+async fn start_port_forwards() -> Result<()> {
     let cfg = cluster_config();
     fs::create_dir_all(data_dir())?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file_path())?;
-    let err = log.try_clone()?;
-    let child = std::process::Command::new("kubectl")
-        .args([
-            "--context", &cfg.kube_context,
-            "-n", &cfg.system_namespace,
-            "port-forward", "svc/weft-dispatcher",
-            &format!("{}:9999", cfg.dispatcher_port),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .context("spawn kubectl port-forward")?;
-    fs::write(pid_file_path(), child.id().to_string())?;
+    for pf in port_forwards(cfg) {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(pf_log_file(pf.name))?;
+        let err = log.try_clone()?;
+        let child = std::process::Command::new("kubectl")
+            .args([
+                "--context", &cfg.kube_context,
+                "-n", &pf.namespace,
+                "port-forward", &format!("svc/{}", pf.service),
+                &format!("{}:{}", pf.local_port, pf.remote_port),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .with_context(|| format!("spawn kubectl port-forward ({})", pf.name))?;
+        fs::write(data_dir_pid_file(pf.name), child.id().to_string())?;
+    }
     Ok(())
 }
 

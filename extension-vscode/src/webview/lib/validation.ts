@@ -108,7 +108,7 @@ export function validateProjectAtLevel(
 /**
  * Helper to check if a required input port is satisfied, either by being
  * wired to an edge, or by being filled from a same-named config field on the
- * node (for configurable ports). Media-type ports are wired-only by default;
+ * node (for configurable ports). File-type ports are wired-only by default;
  * primitives and dicts are configurable by default.
  *
  * Edge wins over config when both are present at runtime; for this validation

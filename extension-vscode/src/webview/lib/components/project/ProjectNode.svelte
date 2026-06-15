@@ -19,6 +19,9 @@
 	import { portMarkerStyle } from "$lib/utils/port-marker";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import FieldStrip from './FieldStrip.svelte';
+	import StoredFilePreview from './StoredFilePreview.svelte';
+	import type { StoredFileWire } from "../../../../shared/protocol";
+	import { parseStoredFile } from "../../../../shared/protocol";
 
 	const edgesState = useEdges();
 
@@ -201,12 +204,30 @@
 		return JSON.stringify(cleaned, null, 2);
 	});
 
+	// Stored-file preview (ImageDisplay / DownloadLink): these sink
+	// nodes take a File value on an INPUT port and emit nothing, so
+	// the preview reads the latest execution's input, not its output.
+	// Returns the first stored-file value found (a concrete
+	// `__weft_<kind>__` marker carrying a logical `key`; url/data file
+	// values have no key and are skipped).
+	const storedInputFile = $derived.by<StoredFileWire | null>(() => {
+		const input = latestExecution?.input;
+		if (typeof input !== 'object' || input === null) return null;
+		for (const value of Object.values(input as Record<string, unknown>)) {
+			const file = parseStoredFile(value);
+			if (file) return file;
+		}
+		return null;
+	});
+
 	// Check if node has expandable content (fields, run location option, debug preview, etc.)
 	const hasExpandableContent = $derived.by(() => {
 		// Has config fields (catalog-declared or synthesized from config-filled ports)
 		if (displayedFields.length > 0) return true;
 		// Has debug preview (Debug node)
 		if (typeConfig.features?.showDebugPreview) return true;
+		// Has a stored-file preview (ImageDisplay / DownloadLink)
+		if (typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink) return true;
 		// Has setup guide
 		if (typeConfig.setupGuide && typeConfig.setupGuide.length > 0) return true;
 		return false;
@@ -1261,6 +1282,33 @@
 					<div class="debug-placeholder waiting">
 						<span>📥</span>
 						<span>Waiting for data...</span>
+					</div>
+				{/if}
+			{/if}
+
+			<!-- Stored-file preview: inline image (ImageDisplay) or a
+			     download-link card (DownloadLink). Reads the latest
+			     execution's INPUT (these nodes emit nothing). Both fetch
+			     through the authenticated download handshake. -->
+			{#if typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink}
+				{#if storedInputFile}
+					<StoredFilePreview
+						file={storedInputFile}
+						mode={typeConfig.features?.showImagePreview ? 'image' : 'link'}
+					/>
+				{:else if displayedStatus === 'completed'}
+					<div class="debug-placeholder completed">
+						<span>✓</span>
+						<span>No file received</span>
+					</div>
+				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
+					<div class="debug-placeholder running">
+						<span class="debug-spinner"></span>
+						<span>Processing...</span>
+					</div>
+				{:else}
+					<div class="debug-placeholder waiting">
+						<span>Waiting for a file...</span>
 					</div>
 				{/if}
 			{/if}

@@ -33,6 +33,7 @@ pub mod project_namespace;
 pub mod project_store;
 pub mod reaper;
 pub mod state;
+pub mod storage_box;
 pub mod task_kinds;
 pub mod tenant;
 pub mod tenant_namespace;

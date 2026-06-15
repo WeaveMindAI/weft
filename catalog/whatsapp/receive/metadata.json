@@ -16,7 +16,9 @@
     { "name": "messageId", "type": "String", "required": false },
     { "name": "timestamp", "type": "Number", "required": false },
     { "name": "isGroup", "type": "Boolean", "required": false },
-    { "name": "chatId", "type": "String", "required": false }
+    { "name": "chatId", "type": "String", "required": false },
+    { "name": "messageType", "type": "String", "required": false },
+    { "name": "file", "type": "File", "required": false, "description": "Stored-file reference for image/video/audio/document/sticker messages; absent for text." }
   ],
   "fields": [],
   "requires_infra": false,

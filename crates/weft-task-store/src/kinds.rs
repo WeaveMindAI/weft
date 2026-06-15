@@ -48,6 +48,11 @@ pub enum TaskKind {
     /// Dispatcher: journal a `LogLine` event on behalf of a worker.
     /// Same durability rationale as `RecordCost`.
     RecordLog,
+    /// Dispatcher: lazily provision the caller's tenant storage box
+    /// (idempotent) and return its in-cluster URL. Producer = engine
+    /// `ctx.storage(...)` before its first call / after a
+    /// box-unreachable error.
+    EnsureStorageBox,
 }
 
 impl TaskKind {
@@ -62,6 +67,7 @@ impl TaskKind {
             Self::CancelExecution => "cancel_execution",
             Self::RecordCost => "record_cost",
             Self::RecordLog => "record_log",
+            Self::EnsureStorageBox => "ensure_storage_box",
         }
     }
 }

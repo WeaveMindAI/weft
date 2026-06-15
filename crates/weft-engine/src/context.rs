@@ -17,12 +17,13 @@
 //! supervisor pod handles the kubectl work. Once apply completes,
 //! the loop driver runs `node.execute` with `Phase::InfraSetup`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -35,6 +36,7 @@ use weft_core::context::{ContextHandle, LogLevel};
 use weft_core::error::{WeftError, WeftResult};
 use weft_core::node::NodeOutput;
 use weft_core::primitive::{CostReport, SignalSpec};
+use weft_core::weft_type::WeftType;
 use weft_core::Color;
 
 use crate::now_unix;
@@ -80,6 +82,11 @@ pub struct EngineClients {
     /// real clock; layer-3 tests pass `FakeClock` so deadlines
     /// can be exercised without burning real wall-clock seconds.
     pub clock: Arc<dyn weft_platform_traits::Clock>,
+    /// Worker-side storage data path (`ctx.storage(...)`): the
+    /// lazily-ensured box endpoint + ensure-then-retry policy.
+    /// Production: `crate::storage::WorkerStorage`; tests inject a
+    /// fake.
+    pub storage: Arc<dyn crate::storage::WorkerStorageOps>,
 }
 
 /// Trait surface over `BrokerProjectClient` so tests can inject a
@@ -943,6 +950,37 @@ pub struct EmitMsg {
     pub kind: EmitKind,
 }
 
+/// The SINGLE message a node task sends to the loop driver, over ONE
+/// ordered channel. A node emits zero or more `Emission`s while it runs
+/// (each `pulse_downstream` / `close_port`), then sends exactly one
+/// `Terminal` when `execute` returns. Putting both on one FIFO channel
+/// is load-bearing: it guarantees the driver observes a node's emissions
+/// BEFORE its terminal, so the close-unmentioned-ports sweep at the
+/// terminal always sees the complete set of emitted ports. Two separate
+/// channels left a window where the terminal could be read first and a
+/// just-emitted port wrongly closed (skipping its consumer, then a
+/// re-dispatch), an emit-then-immediately-return race.
+pub enum TaskMsg {
+    Emission(EmitMsg),
+    Terminal {
+        node_id: String,
+        color: Color,
+        frames: weft_core::frames::LoopFrames,
+        outcome: NodeTaskOutcome,
+    },
+}
+
+/// How a node's `execute` ended. The driver turns each into the
+/// firing's terminal lifecycle event.
+pub enum NodeTaskOutcome {
+    /// `execute` returned `Ok(())`.
+    Completed,
+    Failed(String),
+    /// The node called `await_signal` and is now waiting on a fired
+    /// wake signal (carries the suspension token).
+    Waiting(String),
+}
+
 /// What the emission carries. A node either ships values on N output
 /// ports (`Values`) or closes a single port (`Close`). One enum so the
 /// loop driver has one channel to drain and the per-firing
@@ -959,8 +997,8 @@ pub enum EmitKind {
 
 /// Round-trip timeout for control-plane tasks. Generous because
 /// some involve listener spawn + Pod readiness wait.
-const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
-const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Journal write stamped with this Pod's name for fencing. Logs the
 /// error instead of propagating (most call sites are teardown paths
@@ -968,6 +1006,16 @@ const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// `PoisonOnWriteFailure`, so the failure latches a flag the drive
 /// loop checks every iteration: the worker exits instead of driving
 /// on top of a journal that no longer matches its live state.
+/// Does `declared` accept a value whose inferred type is `infer(value)`?
+/// The runtime output-type gate: a node may only emit on a port a value
+/// compatible with the port's declared type. An unresolved declared type
+/// (TypeVar / MustOverride / unresolved) accepts anything, since
+/// `is_compatible` short-circuits to true when either side is unresolved.
+fn type_accepts(declared: &WeftType, value: &Value) -> bool {
+    let inferred = WeftType::infer(value);
+    WeftType::is_compatible(&inferred, declared)
+}
+
 pub async fn record_from_pod(journal: &dyn JournalClient, event: ExecEvent, pod_name: &str) {
     if let Err(e) = journal.record_event(&event, Some(pod_name)).await {
         tracing::error!(
@@ -1093,10 +1141,12 @@ pub struct RunnerHandle {
     /// call rather than silently colliding on the dedup key.
     entry_register_count: AtomicU32,
     /// Channel to the loop driver for `pulse_downstream` emissions. The
-    /// node task sends `EmitMsg`s; the loop applies them to the pulse
-    /// table while the task keeps running. `None` only in unit tests
-    /// that never emit.
-    emit_tx: Option<mpsc::UnboundedSender<EmitMsg>>,
+    /// node task sends `TaskMsg::Emission`s here (the same channel its
+    /// terminal `TaskMsg::Terminal` rides, so the loop sees emissions
+    /// before the terminal); the loop applies them to the pulse table
+    /// while the task keeps running. `None` only in unit tests that
+    /// never emit.
+    emit_tx: Option<mpsc::UnboundedSender<TaskMsg>>,
     /// Output ports this firing has already emitted on. A second
     /// `pulse_downstream` mentioning a port that's already in here is
     /// a node-author bug (each port can be emitted AT MOST ONCE per
@@ -1108,12 +1158,15 @@ pub struct RunnerHandle {
     /// of truth for "which buses are live this execution") and the park
     /// counters the loop driver uses for dead-end detection.
     bus_coordinator: Arc<BusCoordinator>,
-    /// Output port names this node declares in its metadata. Used by
-    /// `pulse_downstream` / `close_port` to reject emits on undeclared
-    /// ports loudly at the API boundary, before the bad-shape value
-    /// reaches the loop driver and silently routes through the
-    /// (post)process layer's no-such-port fallthrough.
-    declared_outputs: HashSet<String>,
+    /// Output ports this node declares in its metadata, name -> declared
+    /// type. Used by `pulse_downstream` / `close_port` to reject emits on
+    /// undeclared ports loudly at the API boundary (before the bad-shape
+    /// value reaches the loop driver and silently routes through the
+    /// (post)process layer's no-such-port fallthrough), AND to validate
+    /// the TYPE of each emitted value against the port's declared type
+    /// (an incompatible value is refused, the port closed, a
+    /// `PortTypeMismatch` recorded).
+    declared_outputs: HashMap<String, WeftType>,
     /// Wake event payload for this firing. `Some` only when this
     /// dispatch is the consumption of a `NodeKicked` for a firing
     /// trigger; `None` for every other dispatch (regular pulse-driven
@@ -1142,7 +1195,7 @@ impl RunnerHandle {
         tenant_id: String,
         cancellation: Arc<CancellationFlag>,
         bus_coordinator: Arc<BusCoordinator>,
-        declared_outputs: HashSet<String>,
+        declared_outputs: HashMap<String, WeftType>,
     ) -> Self {
         Self {
             execution_id,
@@ -1170,7 +1223,7 @@ impl RunnerHandle {
     /// dispatching the node so `pulse_downstream` can reach the loop.
     pub fn with_emit_channel(
         mut self,
-        emit_tx: mpsc::UnboundedSender<EmitMsg>,
+        emit_tx: mpsc::UnboundedSender<TaskMsg>,
     ) -> Self {
         self.emit_tx = Some(emit_tx);
         self
@@ -1255,7 +1308,7 @@ impl RunnerHandle {
     /// a downstream Gather hanging.
     fn check_declared_outputs(&self, ports: &[String]) -> WeftResult<()> {
         for port_name in ports {
-            if !self.declared_outputs.contains(port_name) {
+            if !self.declared_outputs.contains_key(port_name) {
                 return Err(WeftError::NodeExecution(format!(
                     "node '{}' tried to emit on undeclared output port '{}'. \
                      Declare it in metadata.json's outputs list, or correct \
@@ -1307,17 +1360,39 @@ impl RunnerHandle {
                     .into(),
             ));
         };
-        tx.send(EmitMsg {
+        tx.send(TaskMsg::Emission(EmitMsg {
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
             kind,
-        })
+        }))
         .map_err(|_| {
             WeftError::Runtime(anyhow::anyhow!(
                 "emission: loop driver receiver closed"
             ))
         })?;
         Ok(())
+    }
+
+    /// Journal a non-terminal output-type mismatch for `port`: the node
+    /// tried to emit `value` on a port declared `declared`, the types are
+    /// incompatible, so the engine closed the port instead. Folds into the
+    /// node execution's `port_warnings` and surfaces as a UI warning.
+    /// Does not change the node's status.
+    async fn record_port_type_mismatch(&self, port: &str, declared: &WeftType, value: &Value) {
+        record_from_pod(
+            self.clients.journal.as_ref(),
+            ExecEvent::PortTypeMismatch {
+                color: self.color,
+                node_id: self.node_id.clone(),
+                frames: self.node_frames.clone(),
+                port: port.to_string(),
+                expected: declared.to_string(),
+                actual: WeftType::infer(value).to_string(),
+                at_unix: now_unix(),
+            },
+            &self.pod_name,
+        )
+        .await;
     }
 }
 
@@ -1692,6 +1767,89 @@ impl ContextHandle for RunnerHandle {
         Ok(())
     }
 
+    async fn storage_put(
+        &self,
+        scope: &weft_core::storage::StorageScope,
+        data: weft_core::storage::ByteStream,
+        mime_type: &str,
+        filename: &str,
+        keep: Option<weft_core::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.clients
+            .storage
+            .put(self.color, scope, mime_type, filename, keep, data)
+            .await
+    }
+
+    async fn storage_put_from_url(
+        &self,
+        scope: &weft_core::storage::StorageScope,
+        url: &str,
+        filename: Option<&str>,
+        keep: Option<weft_core::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        // Reuse the process-wide pooled client (a fresh Client::new()
+        // per fetch rebuilds the connection pool; see http_client).
+        let resp = http_client()
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("fetch {url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WeftError::NodeExecution(format!(
+                "fetch {url} returned {status}: {}",
+                weft_core::truncate_user_string(&body, 512)
+            )));
+        }
+        let mime = weft_core::storage::normalize_content_type(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        );
+        let name = filename
+            .filter(|f| !f.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| weft_core::storage::filename_from_url(url));
+        // Stream the body straight through (never buffer the whole
+        // file), so a multi-gigabyte download stays bounded-memory.
+        let stream: weft_core::storage::ByteStream = Box::pin(
+            resp.bytes_stream()
+                .map_err(|e| std::io::Error::other(format!("fetch stream: {e}"))),
+        );
+        self.clients.storage.put(self.color, scope, &mime, &name, keep, stream).await
+    }
+
+    async fn storage_get(
+        &self,
+        key: &str,
+        range: Option<weft_core::storage::ByteRange>,
+    ) -> WeftResult<(weft_core::storage::StoredFileMeta, weft_core::storage::ByteStream)> {
+        self.clients.storage.get(self.color, key, range).await
+    }
+
+    async fn storage_delete(&self, key: &str) -> WeftResult<()> {
+        self.clients.storage.delete(self.color, key).await
+    }
+
+    async fn storage_list(
+        &self,
+        scope: &weft_core::storage::StorageScope,
+    ) -> WeftResult<Vec<weft_core::storage::StoredFileMeta>> {
+        self.clients.storage.list(self.color, scope).await
+    }
+
+    async fn storage_keep(
+        &self,
+        key: &str,
+        ttl: weft_core::storage::KeepTtl,
+    ) -> WeftResult<()> {
+        self.clients.storage.keep(self.color, key, ttl).await
+    }
+
+    async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
+        self.clients.storage.presign(self.color, key, ttl_secs).await
+    }
+
     async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
         let endpoint = self
             .clients
@@ -1717,7 +1875,7 @@ impl ContextHandle for RunnerHandle {
         body: Option<serde_json::Value>,
     ) -> WeftResult<serde_json::Value> {
         let url = format!("{}{}", base.trim_end_matches('/'), path);
-        let client = endpoint_http_client();
+        let client = http_client();
         let req = match method {
             weft_core::EndpointMethod::Get => client.get(&url),
             weft_core::EndpointMethod::Post => {
@@ -1840,7 +1998,7 @@ impl ContextHandle for RunnerHandle {
         self.cancellation.clone()
     }
 
-    fn declared_output_ports(&self) -> &HashSet<String> {
+    fn declared_output_ports(&self) -> &HashMap<String, WeftType> {
         &self.declared_outputs
     }
 
@@ -1853,8 +2011,39 @@ impl ContextHandle for RunnerHandle {
     async fn pulse_downstream(&self, output: NodeOutput) -> WeftResult<()> {
         let ports: Vec<String> = output.outputs.keys().cloned().collect();
         self.check_declared_outputs(&ports)?;
+        // Every port this call touches is claimed up front (the
+        // one-emission-per-port rule). A type-mismatched port is still
+        // "touched": it gets closed instead of emitted, so it must be
+        // claimed too, or a later legitimate emit on it would slip past.
         self.mention_or_err(&ports)?;
-        self.send_emission(EmitKind::Values(output))
+
+        // Runtime output-type check: each value must be compatible with
+        // its port's DECLARED type (which already reflects any narrowing
+        // the author applied in the node header). An incompatible value is
+        // refused: we record a non-terminal PortTypeMismatch and CLOSE the
+        // port (downstream sees null) instead of letting the wrong-typed
+        // value flow. Compatible ports emit together in one Values batch.
+        let mut kept = NodeOutput::empty();
+        let mut closed: Vec<String> = Vec::new();
+        for (port, value) in output.outputs {
+            match self.declared_outputs.get(&port) {
+                Some(declared) if !type_accepts(declared, &value) => {
+                    self.record_port_type_mismatch(&port, declared, &value).await;
+                    closed.push(port);
+                }
+                _ => {
+                    kept.outputs.insert(port, value);
+                }
+            }
+        }
+
+        for port in closed {
+            self.send_emission(EmitKind::Close(port))?;
+        }
+        if !kept.outputs.is_empty() {
+            self.send_emission(EmitKind::Values(kept))?;
+        }
+        Ok(())
     }
 
     /// Close a single output port mid-firing. Goes through the same
@@ -1965,13 +2154,77 @@ async fn enqueue_register_signal_task(
     }
 }
 
-/// Process-wide `reqwest::Client` for endpoint calls. One per worker
-/// process so the connection pool stays warm across every `endpoint_call`
-/// inside a loop body (the documented anti-pattern is `Client::new()` per
-/// request: every call rebuilds the pool).
-fn endpoint_http_client() -> &'static reqwest::Client {
+/// Process-wide `reqwest::Client` for the engine's outbound HTTP
+/// (endpoint calls + storage put_from_url fetches). One per worker
+/// process so the connection pool stays warm across calls inside a
+/// loop body (the anti-pattern is `Client::new()` per request: every
+/// call rebuilds the pool).
+fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new)
+}
+
+#[cfg(test)]
+mod type_check_tests {
+    use super::type_accepts;
+    use weft_core::storage::StoredFile;
+    use weft_core::weft_type::{FileKind, WeftType};
+
+    fn image_value() -> serde_json::Value {
+        StoredFile {
+            key: "exec/c/img".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 10,
+            filename: "x.png".into(),
+        }
+        .to_value()
+    }
+
+    fn video_value() -> serde_json::Value {
+        StoredFile {
+            key: "exec/c/vid".into(),
+            mime_type: "video/mp4".into(),
+            size_bytes: 10,
+            filename: "x.mp4".into(),
+        }
+        .to_value()
+    }
+
+    #[test]
+    fn declared_file_accepts_any_stored_file() {
+        let file = WeftType::file();
+        assert!(type_accepts(&file, &image_value()));
+        assert!(type_accepts(&file, &video_value()));
+    }
+
+    #[test]
+    fn narrowed_image_accepts_image_rejects_video() {
+        // The File port narrowed to Image: an image flows, a video does not.
+        let image = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Image);
+        assert!(type_accepts(&image, &image_value()));
+        assert!(!type_accepts(&image, &video_value()), "a video on an Image port is refused");
+    }
+
+    #[test]
+    fn primitive_mismatch_is_rejected() {
+        let number = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number);
+        assert!(type_accepts(&number, &serde_json::json!(42)));
+        assert!(!type_accepts(&number, &serde_json::json!("not a number")));
+    }
+
+    #[test]
+    fn unresolved_declared_accepts_anything() {
+        // A TypeVar / MustOverride port has no concrete contract yet, so the
+        // gate must not reject (is_compatible short-circuits on unresolved).
+        assert!(type_accepts(&WeftType::MustOverride, &video_value()));
+        assert!(type_accepts(&WeftType::type_var("T"), &serde_json::json!("anything")));
+    }
+
+    // Touch FileKind so the import is used even if the helpers change.
+    #[test]
+    fn image_value_infers_as_image_marker() {
+        assert_eq!(FileKind::from_mime("image/png"), FileKind::Image);
+    }
 }
 
 #[cfg(test)]
@@ -1991,6 +2244,7 @@ mod replay_tests {
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
         };
         RunnerHandle::new(
             "exec-1".into(),
@@ -2003,9 +2257,69 @@ mod replay_tests {
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
             BusCoordinator::new(),
-            HashSet::new(),
+            HashMap::new(),
         )
         .with_awaited_sequence(seq)
+    }
+
+    // Layer 3: the ContextHandle storage methods over the fake
+    // worker-storage (scope-built keys, stored-file value round trip,
+    // wall enforcement, keep + sweep semantics).
+    #[tokio::test]
+    async fn storage_methods_round_trip_and_enforce_the_wall() {
+        use weft_core::storage::{KeepTtl, StorageScope, StoredFile};
+        let handle = handle_with_sequence(vec![]);
+
+        let file = handle
+            .storage_put(
+                &StorageScope::Execution,
+                weft_core::storage::bytes_stream(bytes::Bytes::from_static(b"payload")),
+                "audio/ogg",
+                "clip.ogg",
+                None,
+            )
+            .await
+            .expect("put");
+        let stored = StoredFile::from_value(&file).expect("self-describing value");
+        assert!(stored.key.starts_with("exec/c1/"), "{}", stored.key);
+        assert_eq!(stored.size_bytes, 7);
+
+        let (meta, stream) = handle.storage_get(&stored.key, None).await.expect("get");
+        assert_eq!(meta.mime_type, "audio/ogg");
+        let bytes = weft_core::storage::collect_stream(stream).await.unwrap();
+        assert_eq!(&bytes[..], b"payload");
+
+        // The wall: another color's exec key is denied.
+        let err = match handle.storage_get("exec/OTHER/f0", None).await {
+            Err(e) => e,
+            Ok(_) => panic!("cross-color get must be denied"),
+        };
+        assert!(err.to_string().contains("denied"), "{err}");
+
+        // Keep + eager sweep: kept survives, un-kept goes.
+        handle.storage_keep(&stored.key, KeepTtl::Default).await.expect("keep");
+        let scratch = handle
+            .storage_put(
+                &StorageScope::Execution,
+                weft_core::storage::bytes_stream(bytes::Bytes::from_static(b"tmp")),
+                "text/plain",
+                "t.txt",
+                None,
+            )
+            .await
+            .expect("put scratch");
+        let scratch_key = StoredFile::from_value(&scratch).unwrap().key;
+        handle.clients.storage.eager_sweep(handle.color).await;
+        assert!(handle.storage_get(&stored.key, None).await.is_ok(), "kept survives");
+        let err = match handle.storage_get(&scratch_key, None).await {
+            Err(e) => e,
+            Ok(_) => panic!("un-kept scratch must be swept"),
+        };
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        // Presign mints a URL for an owned file.
+        let url = handle.storage_presign(&stored.key, Some(60)).await.expect("presign");
+        assert!(url.contains("cap="), "{url}");
     }
 
     struct NoopJournal;

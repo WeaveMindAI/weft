@@ -15,6 +15,7 @@ members = [
     "crates/weft-infra",
     "crates/weft-infra-supervisor",
     "crates/weft-platform-traits",
+    "crates/weft-storage",
 ]
 
 [workspace.package]
@@ -68,6 +69,10 @@ tempfile = "3"
 parking_lot = "0.12"
 ipnet = "2"
 filetime = "0.2"
+# Per-disk blob I/O for the storage box (LocalFileSystem per mounted
+# backing PVC: streaming put/get/delete/list).
+object_store = "0.12"
+base64 = "0.22"
 
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }
@@ -77,3 +82,4 @@ weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
 weft-platform-traits = { path = "crates/weft-platform-traits" }
+weft-storage = { path = "crates/weft-storage" }

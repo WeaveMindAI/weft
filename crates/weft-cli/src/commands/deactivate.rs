@@ -194,14 +194,12 @@ fn prompt_grace() -> anyhow::Result<u32> {
         "Hibernate grace window in minutes (default {DEFAULT_GRACE_MINUTES}): \
          submissions arriving after this point will be refused. Press Enter for default."
     );
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
+    let line = crate::prompt::prompt_line("> ", "--grace <minutes>")?;
+    if line.is_empty() {
         return Ok(DEFAULT_GRACE_MINUTES);
     }
-    trimmed.parse::<u32>().map_err(|_| {
-        anyhow::anyhow!("grace must be a non-negative integer (minutes); got '{trimmed}'")
+    line.parse::<u32>().map_err(|_| {
+        anyhow::anyhow!("grace must be a non-negative integer (minutes); got '{line}'")
     })
 }
 
@@ -210,10 +208,8 @@ fn prompt_mode() -> anyhow::Result<String> {
     println!("  1) wipe       drop all signals, cancel suspended runs (fully fresh on reactivate)");
     println!("  2) hibernate  keep signals; hide pending tasks from extension; park late submissions");
     println!("  3) park       keep signals visible; queue new submissions for reactivate");
-    println!("Enter 1, 2, or 3:");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(match line.trim() {
+    let line = crate::prompt::prompt_line("Enter 1, 2, or 3: ", "--mode wipe | hibernate | park")?;
+    Ok(match line.as_str() {
         "1" | "wipe" => "wipe".into(),
         "2" | "hibernate" => "hibernate".into(),
         "3" | "park" => "park".into(),

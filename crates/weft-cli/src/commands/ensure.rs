@@ -22,7 +22,6 @@
 //!   - Post to `POST /projects`; the dispatcher is idempotent on
 //!     the `id` field (existing row gets its source updated).
 
-use std::io::{BufRead, Write};
 
 use anyhow::{Context, Result};
 
@@ -491,24 +490,10 @@ fn prompt_running_policy(running_count: u64) -> Result<RunningPolicy> {
     println!("Choose:");
     println!("  1) wait    let the running executions finish on the old image");
     println!("  2) cancel  cancel running executions immediately and run on the new image");
-    print!("> ");
-    std::io::stdout().flush().ok();
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    let read = stdin.lock().read_line(&mut line)?;
-    // EOF (read == 0): stdin is piped/closed, so there's no human to
-    // answer. Name the non-interactive escape hatch rather than
-    // emitting "invalid choice ''", which reads like a typo.
-    if read == 0 {
-        anyhow::bail!(
-            "no input for the running-executions prompt (stdin is not a terminal); \
-             pass --running-policy wait | cancel to choose non-interactively"
-        );
-    }
+    let raw = crate::prompt::prompt_line("> ", "--running-policy wait | cancel")?;
     // The wire parse is exact-match (lowercase); accept any casing
     // from the human, plus the numeric shortcuts.
-    let raw = line.trim();
-    match raw {
+    match raw.as_str() {
         "1" => Ok(RunningPolicy::Wait),
         "2" => Ok(RunningPolicy::Cancel),
         other => RunningPolicy::parse(&other.to_ascii_lowercase()).ok_or_else(|| {

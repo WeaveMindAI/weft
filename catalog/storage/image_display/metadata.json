@@ -1,0 +1,20 @@
+{
+  "type": "ImageDisplay",
+  "label": "Image Display",
+  "description": "Show a stored image inline in the graph. Wire a stored Image into `image`; the node renders the picture right in the editor, fetched through the same authenticated path a download uses. A terminal preview node: it emits nothing.",
+  "category": "Storage",
+  "tags": ["storage", "image", "display", "preview"],
+  "icon": "Image",
+  "color": "#8b5cf6",
+  "inputs": [
+    { "name": "image", "type": "Image", "required": true, "description": "Stored image to show inline." }
+  ],
+  "outputs": [],
+  "fields": [],
+  "entry": [],
+  "requires_infra": false,
+  "features": {
+    "showImagePreview": true,
+    "isOutputDefault": true
+  }
+}

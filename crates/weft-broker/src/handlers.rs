@@ -137,7 +137,10 @@ pub async fn task_enqueue_dedup(
             // survive the worker pod dying.
             if !matches!(
                 kind,
-                TaskKind::RegisterSignal | TaskKind::RecordCost | TaskKind::RecordLog
+                TaskKind::RegisterSignal
+                    | TaskKind::RecordCost
+                    | TaskKind::RecordLog
+                    | TaskKind::EnsureStorageBox
             ) {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -1810,4 +1813,119 @@ async fn require_worker_pod_owned_by(
 
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+}
+
+/// `POST /storage/authorize`: the identity authority behind the
+/// storage box's prefix wall. The RELAYED bearer (the box forwards
+/// its caller's token; the dispatcher forwards a box's token) is
+/// reviewed and interpreted into the verified facts the wall needs:
+///   - worker  -> tenant + project from the token's NAMESPACE
+///     (DB-backed; nothing is claimed), color verified exactly like
+///     journal writes (`execution_color.owner_pod_name` must be the
+///     caller's pod, and the color must belong to the caller's
+///     project).
+///   - the dispatcher (`weft-dispatcher` in `weft-system`) -> the
+///     control plane.
+///   - a storage box (`weft-storage-sa` in a tenant namespace) ->
+///     StorageBox (used by the dispatcher to authenticate
+///     grow/shrink requests).
+/// This endpoint deliberately bypasses the tenant role table: its
+/// caller universe is wider than the broker's data endpoints.
+pub async fn storage_authorize(
+    State(state): State<Arc<BrokerState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<StorageAuthorizeRequest>,
+) -> Resp<StorageAuthorizeResponse> {
+    use crate::auth::{DISPATCHER_NS, DISPATCHER_SA, STORAGE_SA, WORKER_SA};
+    let reviewed = crate::auth::reviewed_token(&state, &headers).await?;
+    match reviewed.sa_name.as_str() {
+        DISPATCHER_SA if reviewed.namespace == DISPATCHER_NS => {
+            Ok(Json(StorageAuthorizeResponse::ControlPlane))
+        }
+        STORAGE_SA => {
+            let tenant_id = scope::lookup_namespace_tenant(
+                &state.scope_cache,
+                &state.pool,
+                &reviewed.namespace,
+            )
+            .await?;
+            Ok(Json(StorageAuthorizeResponse::StorageBox { tenant_id }))
+        }
+        WORKER_SA => {
+            // Resolve project AND tenant from the ONE `project` row for
+            // this namespace, not from two independent table lookups.
+            // A worker's namespace IS its project, and the project row
+            // carries the tenant, so a single source of truth removes
+            // any chance of the namespace->tenant and project->tenant
+            // mappings disagreeing.
+            //
+            // SAFETY (registration gate preserved by write ordering):
+            // the dispatcher's project register path writes the
+            // `weft_namespace_tenant` registry row (via
+            // project_namespace::ensure -> namespace_registry::register)
+            // BEFORE it writes the `project` row's `project_namespace`
+            // column (register_with_hashes), both with the SAME tenant.
+            // So a `project` row whose `project_namespace` matches here
+            // could only exist if the namespace was already registered
+            // to that same tenant: trusting `project.tenant_id` is
+            // equivalent to going through the registry gate, not weaker.
+            // (If that ordering is ever reversed, restore the explicit
+            // `lookup_namespace_tenant` gate + a tenant-agreement check.)
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT id::text, tenant_id FROM project WHERE project_namespace = $1",
+            )
+            .bind(&reviewed.namespace)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
+            let (project_id, tenant_id) = row.ok_or((
+                StatusCode::FORBIDDEN,
+                format!("namespace '{}' is not a registered project namespace", reviewed.namespace),
+            ))?;
+            let color = match req.color {
+                None => None,
+                Some(color) => {
+                    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                        "SELECT tenant_id, project_id, owner_pod_name \
+                         FROM execution_color WHERE color = $1",
+                    )
+                    .bind(&color)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(internal)?;
+                    let Some((color_tenant, color_project, owner_pod)) = row else {
+                        return Err((StatusCode::FORBIDDEN, "unknown execution color".into()));
+                    };
+                    if color_tenant != tenant_id || color_project != project_id {
+                        tracing::warn!(
+                            target: "weft_broker::scope",
+                            caller_ns = %reviewed.namespace,
+                            color = %color,
+                            "storage authorize rejected cross-project color claim"
+                        );
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            "color belongs to a different project".into(),
+                        ));
+                    }
+                    // Same gate as journal writes: only the pod that
+                    // claimed the execution drives its color.
+                    if reviewed.pod_name.is_none()
+                        || owner_pod.as_deref() != reviewed.pod_name.as_deref()
+                    {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            "color is not owned by the calling pod".into(),
+                        ));
+                    }
+                    Some(color)
+                }
+            };
+            Ok(Json(StorageAuthorizeResponse::Worker { tenant_id, project_id, color }))
+        }
+        other => Err((
+            StatusCode::FORBIDDEN,
+            format!("service account '{other}' has no storage identity"),
+        )),
+    }
 }

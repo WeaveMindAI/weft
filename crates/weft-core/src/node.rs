@@ -303,7 +303,7 @@ pub struct NodeFeatures {
     /// Each inner list is a port group where at least ONE port must
     /// be non-null. If every port in a group is null/missing, the
     /// node is skipped. Example: email send might declare
-    /// `one_of_required: [["message", "media"]]`.
+    /// `one_of_required: [["message", "attachment"]]`.
     #[serde(default, rename = "oneOfRequired")]
     pub one_of_required: Vec<Vec<String>>,
     /// The node accepts ad-hoc extra input ports declared in weft
@@ -325,6 +325,20 @@ pub struct NodeFeatures {
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview")]
     pub show_debug_preview: bool,
+    /// Webview hint: when the node's input is a stored image
+    /// reference, render the picture inline on the node body, fetched
+    /// through the authenticated download handshake. Used by
+    /// ImageDisplay.
+    // SYNC: showImagePreview <-> extension-vscode/src/shared/protocol.ts NodeFeaturesWire.showImagePreview
+    #[serde(default, rename = "showImagePreview")]
+    pub show_image_preview: bool,
+    /// Webview hint: when the node's input is a stored-file
+    /// reference, render a download button inline on the node body
+    /// (the click runs the same handshake a CLI download uses). Used
+    /// by DownloadLink.
+    // SYNC: showDownloadLink <-> extension-vscode/src/shared/protocol.ts NodeFeaturesWire.showDownloadLink
+    #[serde(default, rename = "showDownloadLink")]
+    pub show_download_link: bool,
     /// Default value of the node's `is_output` config flag. Nodes that
     /// are semantically "produce this thing" (Debug, Output) default
     /// to true. Any project can override by setting `is_output` in the
@@ -496,6 +510,13 @@ pub enum FieldType {
     Password,
     ApiKey { provider: String },
     FormBuilder,
+    /// Editor file picker: the user drops/selects a file, the editor
+    /// uploads it to project-scoped storage and the field's config
+    /// value becomes the stored-file reference (see
+    /// `crate::storage::StoredFile`).
+    /// `accept` is an HTML-accept-style filter (e.g. "audio/*").
+    // SYNC: FieldType::FileDrop <-> extension-vscode/src/shared/protocol.ts FieldKind 'file_drop'
+    FileDrop { accept: Option<String> },
 }
 
 /// What a node emits when it's done.
@@ -561,12 +582,12 @@ impl NodeOutput {
     pub fn extend_from_declared(
         mut self,
         source: &Value,
-        declared: &std::collections::HashSet<String>,
+        declared: &std::collections::HashMap<String, WeftType>,
         exclude: &[&str],
     ) -> Self {
         if let Value::Object(map) = source {
             for (k, v) in map {
-                if exclude.contains(&k.as_str()) || !declared.contains(k) {
+                if exclude.contains(&k.as_str()) || !declared.contains_key(k) {
                     continue;
                 }
                 self.outputs.insert(k.clone(), v.clone());
@@ -584,6 +605,15 @@ impl NodeOutput {
 mod node_output_tests {
     use super::*;
     use serde_json::json;
+
+    /// Build a declared-output map from port names. `extend_from_declared`
+    /// only consults membership, so the type is an irrelevant placeholder.
+    fn declared_ports(names: &[&str]) -> std::collections::HashMap<String, WeftType> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), WeftType::MustOverride))
+            .collect()
+    }
 
     #[test]
     fn extend_from_object_fans_keys_onto_ports() {
@@ -607,10 +637,7 @@ mod node_output_tests {
     #[test]
     fn extend_from_declared_only_fans_declared_keys() {
         let src = json!({"sentiment": "positive", "score": 0.9, "extra": "ignored"});
-        let declared: std::collections::HashSet<String> =
-            ["sentiment".to_string(), "score".to_string(), "response".to_string()]
-                .into_iter()
-                .collect();
+        let declared = declared_ports(&["sentiment", "score", "response"]);
         let out = NodeOutput::empty().extend_from_declared(&src, &declared, &[]);
         assert_eq!(out.outputs.len(), 2, "only declared keys present in the object are fanned");
         assert!(out.outputs.contains_key("sentiment"));
@@ -624,8 +651,7 @@ mod node_output_tests {
     #[test]
     fn extend_from_declared_honors_exclude() {
         let src = json!({"response": "full", "field": "x"});
-        let declared: std::collections::HashSet<String> =
-            ["response".to_string(), "field".to_string()].into_iter().collect();
+        let declared = declared_ports(&["response", "field"]);
         let out = NodeOutput::empty()
             .set("response", json!("full-object"))
             .extend_from_declared(&src, &declared, &["response"]);

@@ -80,6 +80,19 @@ pub struct DispatcherState {
     /// dispatcher renders + applies a Deployment with this image to
     /// each tenant namespace at first project register.
     pub supervisor_image: String,
+    /// Docker tag of the per-tenant storage-box image (lazy-applied
+    /// on first storage use; see `storage_box`).
+    pub storage_image: String,
+    /// In-cluster base URL of THIS dispatcher service (what tenant
+    /// pods, e.g. the storage box's grow/shrink requests, call).
+    pub internal_base_url: String,
+    /// Control-plane client for tenant storage boxes (mint, sweeps,
+    /// usage, wipes). Never carries file bytes.
+    pub storage_admin: Arc<dyn weft_storage::client::StorageAdminOps>,
+    /// Relay to the broker's `/storage/authorize`: how the
+    /// dispatcher verifies a storage box's bearer on the internal
+    /// grow/shrink endpoints.
+    pub broker_authorize: Arc<dyn weft_storage::auth::BrokerAuthorizeOps>,
     /// kube client used by the reaper (supervisor scale-down). The
     /// listener and worker backends hold their own clones of the
     /// same `Arc<dyn KubeClient>` (constructed once in main). The
