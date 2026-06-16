@@ -18,14 +18,59 @@ export interface LayoutEntry {
   configCollapsed?: boolean;
 }
 
+// ── Per-project view mode ────────────────────────────────────────────────
+//
+// The graph can render in two view modes: the full builder view (every port,
+// config, body) or a simplified view (each node a square with one in/one out
+// dot, edges collapsed per node-pair). This is a PER-PROJECT preference, not
+// per-node, so it lives as a single header line in the `.layout` file rather
+// than in the node map:
+//   @view simplified
+// Absence of the line means builder view (the default). `parseLayoutCode`
+// already skips any line that isn't a `@layout` entry, so the header is inert
+// to the node-position parser; only `parseViewMode`/`setViewMode` read it.
+
+export type ViewMode = 'builder' | 'simplified';
+
+/** Read the per-project view mode from layoutCode (default 'builder'). */
+export function parseViewMode(layoutCode: string): ViewMode {
+  if (!layoutCode) return 'builder';
+  for (const line of layoutCode.split('\n')) {
+    if (line.trim() === '@view simplified') return 'simplified';
+  }
+  return 'builder';
+}
+
+/** Return layoutCode with the view-mode header set to `mode`. Removes the
+ *  header for 'builder' (the default) so a builder-view project carries no
+ *  marker, and writes a single `@view simplified` line otherwise. The header
+ *  is kept as the first line for legibility. */
+export function setViewMode(layoutCode: string, mode: ViewMode): string {
+  const lines = (layoutCode || '').split('\n').filter((l) => l.trim() !== '@view simplified' && l.trim() !== '');
+  if (mode === 'simplified') lines.unshift('@view simplified');
+  return lines.join('\n');
+}
+
 /** Parse layoutCode into a map of scoped id -> entry. */
-export function parseLayoutCode(layoutCode: string): Record<string, LayoutEntry> {
+// Each view stores its node positions under its own verb on its own lines, so
+// the builder layout and the simplified layout coexist in ONE file without
+// clobbering each other (a node is a wide box in builder, a small square in
+// simplified, so they need independent positions). Builder uses `@layout` (the
+// original format, untouched); simplified uses `@slayout`. Every layout helper
+// takes a `verb` so the SAME machinery serves both views (DRY): pass
+// `LAYOUT_VERB` for builder, `SIMPLIFIED_LAYOUT_VERB` for simplified.
+export const LAYOUT_VERB = '@layout';
+export const SIMPLIFIED_LAYOUT_VERB = '@slayout';
+export type LayoutVerb = typeof LAYOUT_VERB | typeof SIMPLIFIED_LAYOUT_VERB;
+
+export function parseLayoutCode(layoutCode: string, verb: LayoutVerb = LAYOUT_VERB): Record<string, LayoutEntry> {
   const map: Record<string, LayoutEntry> = {};
   if (!layoutCode) return map;
+  const re = new RegExp(`^(.+?)\\s+${verb}\\s+(-?\\d+(?:\\.\\d+)?)\\s+(-?\\d+(?:\\.\\d+)?)(?:\\s+(\\d+(?:\\.\\d+)?)x(\\d+(?:\\.\\d+)?))?(?:\\s+(collapsed|expanded))?(?:\\s+(configCollapsed))?\\s*$`);
   for (const line of layoutCode.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    const match = trimmed.match(/^(.+?)\s+@layout\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)(?:\s+(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?))?(?:\s+(collapsed|expanded))?(?:\s+(configCollapsed))?\s*$/);
+    const match = trimmed.match(re);
     if (!match) continue;
     const [, scopedId, xStr, yStr, wStr, hStr, state, configState] = match;
     const entry: LayoutEntry = { x: parseFloat(xStr), y: parseFloat(yStr) };
@@ -59,38 +104,39 @@ export function updateLayoutEntry(
   h?: number,
   expanded?: boolean | null,
   configCollapsed?: boolean | null,
+  verb: LayoutVerb = LAYOUT_VERB,
 ): string {
   const lines = (layoutCode || '').split('\n');
   const idx = lines.findIndex((l) => {
     const t = l.trim();
-    return t.startsWith(scopedId + ' @layout') || t.startsWith(scopedId + '\t@layout');
+    return t.startsWith(scopedId + ' ' + verb) || t.startsWith(scopedId + '\t' + verb);
   });
   // Merge against the existing entry so undefined args preserve prior values.
-  const prior = idx >= 0 ? parseLayoutCode(lines[idx])[scopedId] : undefined;
+  const prior = idx >= 0 ? parseLayoutCode(lines[idx], verb)[scopedId] : undefined;
   const mergedW = w !== undefined ? w : prior?.w;
   const mergedH = h !== undefined ? h : prior?.h;
   const mergedExpanded = expanded !== undefined ? expanded : prior?.expanded;
   const mergedConfigCollapsed = configCollapsed !== undefined ? configCollapsed : prior?.configCollapsed;
-  const newLine = `${scopedId} ${formatLayoutStr(x, y, mergedW, mergedH, mergedExpanded, mergedConfigCollapsed)}`;
+  const newLine = `${scopedId} ${formatLayoutStr(x, y, mergedW, mergedH, mergedExpanded, mergedConfigCollapsed, verb)}`;
   if (idx >= 0) lines[idx] = newLine;
   else lines.push(newLine);
   return lines.filter((l) => l.trim() !== '').join('\n');
 }
 
-/** Remove a layout entry. Returns the new layoutCode. */
-export function removeLayoutEntry(layoutCode: string, scopedId: string): string {
+/** Remove a layout entry (one view's verb). Returns the new layoutCode. */
+export function removeLayoutEntry(layoutCode: string, scopedId: string, verb: LayoutVerb = LAYOUT_VERB): string {
   if (!layoutCode) return '';
   return layoutCode
     .split('\n')
     .filter((l) => {
       const t = l.trim();
-      return !(t.startsWith(scopedId + ' @layout') || t.startsWith(scopedId + '\t@layout'));
+      return !(t.startsWith(scopedId + ' ' + verb) || t.startsWith(scopedId + '\t' + verb));
     })
     .join('\n');
 }
 
-function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?: boolean | null, configCollapsed?: boolean | null): string {
-  let s = `@layout ${Math.round(x)} ${Math.round(y)}`;
+function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?: boolean | null, configCollapsed?: boolean | null, verb: LayoutVerb = LAYOUT_VERB): string {
+  let s = `${verb} ${Math.round(x)} ${Math.round(y)}`;
   if (w !== undefined && h !== undefined) s += ` ${Math.round(w)}x${Math.round(h)}`;
   if (expanded === true) s += ' expanded';
   if (expanded === false) s += ' collapsed';
@@ -98,11 +144,11 @@ function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?
   return s;
 }
 
-/** Serialize a layout map back to layoutCode (one line per entry). Entry order
- *  follows insertion order of the map. The inverse of `parseLayoutCode`. */
-export function serializeLayoutMap(map: Record<string, LayoutEntry>): string {
+/** Serialize a layout map back to layoutCode lines under `verb` (one line per
+ *  entry). The inverse of `parseLayoutCode` for that verb. */
+export function serializeLayoutMap(map: Record<string, LayoutEntry>, verb: LayoutVerb = LAYOUT_VERB): string {
   return Object.entries(map)
-    .map(([id, e]) => `${id} ${formatLayoutStr(e.x, e.y, e.w, e.h, e.expanded ?? undefined, e.configCollapsed ?? undefined)}`)
+    .map(([id, e]) => `${id} ${formatLayoutStr(e.x, e.y, e.w, e.h, e.expanded ?? undefined, e.configCollapsed ?? undefined, verb)}`)
     .join('\n');
 }
 
@@ -129,18 +175,29 @@ export function serializeLayoutMap(map: Record<string, LayoutEntry>): string {
  *  always the moved entry regardless of original line order. */
 export function renameLayoutSubtree(layoutCode: string, oldKey: string, newKey: string): string {
   if (!layoutCode || oldKey === newKey) return layoutCode;
-  const map = parseLayoutCode(layoutCode);
-  const rebuilt: Record<string, LayoutEntry> = {};
-  const reKeyed: Array<[string, LayoutEntry]> = [];
-  for (const [key, entry] of Object.entries(map)) {
-    if (key === oldKey) reKeyed.push([newKey, entry]);
-    else if (key.startsWith(oldKey + '.')) reKeyed.push([newKey + key.slice(oldKey.length), entry]);
-    else rebuilt[key] = entry; // outside the subtree: keep as-is
-  }
-  // Re-keyed entries last so the moved subtree wins any collision with an entry
-  // outside it (the displaced entry's view-state is obsolete after the rename).
-  for (const [k, entry] of reKeyed) rebuilt[k] = entry;
-  return serializeLayoutMap(rebuilt);
+  // A move/rename re-keys the node in BOTH views' position blocks. Re-key each
+  // verb independently and recombine, so neither the builder nor the simplified
+  // positions are dropped.
+  const reKeyVerb = (verb: LayoutVerb): string => {
+    const map = parseLayoutCode(layoutCode, verb);
+    const rebuilt: Record<string, LayoutEntry> = {};
+    const reKeyed: Array<[string, LayoutEntry]> = [];
+    for (const [key, entry] of Object.entries(map)) {
+      if (key === oldKey) reKeyed.push([newKey, entry]);
+      else if (key.startsWith(oldKey + '.')) reKeyed.push([newKey + key.slice(oldKey.length), entry]);
+      else rebuilt[key] = entry; // outside the subtree: keep as-is
+    }
+    // Re-keyed entries last so the moved subtree wins any collision with an
+    // entry outside it (the displaced entry's view-state is obsolete).
+    for (const [k, entry] of reKeyed) rebuilt[k] = entry;
+    return serializeLayoutMap(rebuilt, verb);
+  };
+  const builder = reKeyVerb(LAYOUT_VERB);
+  const simplified = reKeyVerb(SIMPLIFIED_LAYOUT_VERB);
+  // serializeLayoutMap emits only node lines, so re-apply the view-mode header
+  // (a move/reparent must not silently drop simplified view).
+  const body = [builder, simplified].filter((s) => s !== '').join('\n');
+  return setViewMode(body, parseViewMode(layoutCode));
 }
 
 // ── Container containment floors ─────────────────────────────────────────
@@ -222,8 +279,15 @@ export function computeContainmentFloors(
 // where structure matters). Layout is TS-owned: Rust never sees these ops.
 
 export type LayoutOp =
-  | { op: 'setEntry'; id: string; entry: LayoutEntry }
-  | { op: 'removeEntry'; id: string };
+  // `verb` says which view's position block the op targets (absent = builder,
+  // for back-compat with existing call sites). A drag in simplified view emits
+  // ops with verb '@slayout'; a builder drag omits it.
+  | { op: 'setEntry'; id: string; entry: LayoutEntry; verb?: LayoutVerb }
+  | { op: 'removeEntry'; id: string; verb?: LayoutVerb }
+  // The per-project view mode is part of the layout state, so it travels as a
+  // layout op through the SAME pipeline as node moves (apply/diff/undo/persist).
+  // Without this it could never round-trip the engine's op-based layout fold.
+  | { op: 'setView'; mode: ViewMode };
 
 /** Apply a layout op batch to `layoutCode`, returning the new layoutCode. */
 export function applyLayoutOps(layoutCode: string, ops: LayoutOp[]): string {
@@ -231,9 +295,11 @@ export function applyLayoutOps(layoutCode: string, ops: LayoutOp[]): string {
   for (const op of ops) {
     if (op.op === 'setEntry') {
       const e = op.entry;
-      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w, e.h, e.expanded ?? null, e.configCollapsed ?? null);
+      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w, e.h, e.expanded ?? null, e.configCollapsed ?? null, op.verb ?? LAYOUT_VERB);
+    } else if (op.op === 'removeEntry') {
+      code = removeLayoutEntry(code, op.id, op.verb ?? LAYOUT_VERB);
     } else {
-      code = removeLayoutEntry(code, op.id);
+      code = setViewMode(code, op.mode);
     }
   }
   return code;
@@ -246,15 +312,26 @@ export function applyLayoutOps(layoutCode: string, ops: LayoutOp[]): string {
  *  a single source of truth for layout reversibility. A `renamePrefix` shows up
  *  as remove+set of the affected entries, which replays identically. */
 export function diffLayoutOps(from: string, to: string): LayoutOp[] {
-  const a = parseLayoutCode(from);
-  const b = parseLayoutCode(to);
   const ops: LayoutOp[] = [];
-  for (const [id, entry] of Object.entries(b)) {
-    const prior = a[id];
-    if (!prior || !sameEntry(prior, entry)) ops.push({ op: 'setEntry', id, entry });
-  }
-  for (const id of Object.keys(a)) {
-    if (!(id in b)) ops.push({ op: 'removeEntry', id });
+  // View-mode change is a layout op too, so a toggle round-trips the engine's
+  // fold and undo stack identically to a node move.
+  const fromView = parseViewMode(from);
+  const toView = parseViewMode(to);
+  if (fromView !== toView) ops.push({ op: 'setView', mode: toView });
+  // Diff each view's position block independently so a gesture in either view
+  // (or a rename touching both) yields the right verb-tagged ops. Builder ops
+  // omit `verb` (default) to keep existing op streams byte-identical.
+  for (const verb of [LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB] as const) {
+    const a = parseLayoutCode(from, verb);
+    const b = parseLayoutCode(to, verb);
+    const tag = verb === LAYOUT_VERB ? {} : { verb };
+    for (const [id, entry] of Object.entries(b)) {
+      const prior = a[id];
+      if (!prior || !sameEntry(prior, entry)) ops.push({ op: 'setEntry', id, entry, ...tag });
+    }
+    for (const id of Object.keys(a)) {
+      if (!(id in b)) ops.push({ op: 'removeEntry', id, ...tag });
+    }
   }
   return ops;
 }

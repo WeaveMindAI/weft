@@ -18,6 +18,18 @@ export const PORT_TYPE_COLORS: Record<string, string> = {
 
 const FALLBACK_COLOR = '#52525b'; // Dark gray
 
+// Container identity colors: a Group is zinc, a Loop is violet. ONE definition
+// for both views (builder header/ports AND the simplified square/dots). The
+// scoped CSS in GroupNode.svelte can't read a TS const, so it restates the same
+// hex; that boundary is the only sanctioned duplication.
+// SYNC: GROUP_COLOR (#52525b) / LOOP_COLOR (#8b5cf6) <-> GroupNode.svelte <style>:
+//   #52525b in .expanded-header, .expanded-port-block, .collapsed-accent (bg),
+//   .collapsed-type; #8b5cf6 in .loop-config-toggle, .carry-glyph, .implicit-glyph,
+//   .implicit-port .expanded-port-label, AND as channels 139,92,246 in
+//   .loop-config-strip's rgba() background + border.
+export const GROUP_COLOR = '#52525b';
+export const LOOP_COLOR = '#8b5cf6';
+
 function colorForParsed(t: WeftType): string {
 	switch (t.kind) {
 		case 'primitive': return PORT_TYPE_COLORS[t.value] ?? FALLBACK_COLOR;

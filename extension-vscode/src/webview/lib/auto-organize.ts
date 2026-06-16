@@ -18,6 +18,7 @@ export async function autoOrganize(
 	projectEdges: Edge[],
 	nodeSizes?: Map<string, { width: number; height: number }>,
 	portPositions?: Map<string, Map<string, number>>,
+	simplified = false,
 ): Promise<AutoOrganizeResult> {
 	const positions = new Map<string, { x: number; y: number }>();
 	const groupSizes = new Map<string, { width: number; height: number }>();
@@ -229,6 +230,11 @@ export async function autoOrganize(
 	 *  occupies below the header. 0 for non-loops. Both ELK padding and
 	 *  side-port Y offsets add this so children never sit on the strip. */
 	function loopStripPx(nodeId: string): number {
+		// In simplified view the loop config strip is not drawn (GroupNode gates it
+		// on !data.simplified), so it occupies zero vertical space. Reserving the
+		// open-strip height here would push the first child row down by ~220px with
+		// nothing to fill it: the phantom top gap above a simplified loop's body.
+		if (simplified) return 0;
 		const node = projectNodes.find(n => n.id === nodeId);
 		if (!node || !isLoopNodeType(node.nodeType)) return 0;
 		const configCollapsed = (node.config as Record<string, unknown> | undefined)?.configCollapsed === true;
@@ -571,10 +577,13 @@ export async function autoOrganize(
 			const scopeNode = nodeById.get(scopeId)!;
 			const inputs = (scopeNode.inputs || []).map(p => p.name);
 			const outputs = (scopeNode.outputs || []).map(p => p.name);
-			// Use a small default size, ELK will grow the group to fit children.
-			// Don't use measured DOM size as minimum, it would prevent ELK from shrinking.
-			const minW = 400;
-			const minH = 300;
+			// Floor only: ELK grows the group to fit its children, so this minimum
+			// just sets how small an (almost) empty group may get. Keep it small so
+			// the group hugs its content instead of leaving a big empty band at the
+			// bottom/right when the content is short (common with simplified-view
+			// squares). Don't use measured DOM size, it would block shrinking.
+			const minW = 120;
+			const minH = 100;
 			// Port positions on the east side need a reference width.
 			// Use a large value; ELK will place the east ports at the final computed width.
 			const portRefW = 400;

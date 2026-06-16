@@ -11,6 +11,8 @@
 	import { toast } from 'svelte-sonner';
 	import { portMarkerStyle } from '$lib/utils/port-marker';
 	import ExecutionInspector from './ExecutionInspector.svelte';
+	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "$lib/constants/simplified-view";
+	import { GROUP_COLOR, LOOP_COLOR } from "$lib/constants/colors";
 	import FieldStrip from './FieldStrip.svelte';
 
 	// Group interface ports cannot be config-filled (see the rule enforced in
@@ -23,6 +25,10 @@
 		data: {
 			label: string | null;
 			nodeType: string;
+			/// Simplified view: collapsed renders a square like a plain node;
+			/// expanded keeps the box but collapses its interface to one dot
+			/// per side (+ inner dots for children, + loop index/done).
+			simplified?: boolean;
 			config: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
@@ -77,6 +83,10 @@
 	const loopEvents = $derived(data.loopEvents ?? []);
 
 	const isLoop = $derived(isLoopNodeType(data.nodeType));
+	// Container identity color (violet for a Loop, zinc for a Group). One value for
+	// the header, ports, and the simplified square; the scoped style block restates
+	// the same hex (see the SYNC note on GROUP_COLOR/LOOP_COLOR in colors.ts).
+	const containerColor = $derived(isLoop ? LOOP_COLOR : GROUP_COLOR);
 	const configCollapsed = $derived((data.config?.configCollapsed as boolean) ?? false);
 
 	/// Field definitions for the loop config strip. over and carry no
@@ -114,7 +124,7 @@
 	/// collapsed bar) pushes them below the header.
 	const portsTop = $derived(
 		GROUP_PORTS_TOP_PX +
-			(isLoop ? (configCollapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX) : 0),
+			(isLoop && !data.simplified ? (configCollapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX) : 0),
 	);
 
 	// Auto-enforce minimum height when ports change or on load. This is a LAYOUT
@@ -324,12 +334,17 @@
 		// drawn inside the body would overlap the strip. `collapsed` is the
 		// config-strip state to compute FOR (may differ from current state
 		// when called from the toggle handler).
-		const visibleInputs = numInputs + (isLoop ? 1 : 0);
-		const visibleOutputs = numOutputs + (isLoop ? 1 : 0);
-		const portsBlock = Math.max(visibleInputs, visibleOutputs) * 30 + 24;
+		// Simplified view draws one interface dot per side and no config strip, so
+		// the per-port rows and the strip reserve no space (matching the layout
+		// engine's loopStripPx, which returns 0 when simplified). Counting them
+		// here would floor the box at a height with phantom empty bands.
+		const loopExtras = isLoop && !data.simplified;
+		const visibleInputs = numInputs + (loopExtras ? 1 : 0);
+		const visibleOutputs = numOutputs + (loopExtras ? 1 : 0);
+		const portsBlock = data.simplified ? 0 : Math.max(visibleInputs, visibleOutputs) * 30 + 24;
 		const headerArea = 44;
 		const bodyMin = 220; // breathing room for at least a couple of child nodes
-		const configArea = isLoop ? (collapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX) : 0;
+		const configArea = loopExtras ? (collapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX) : 0;
 		return headerArea + configArea + portsBlock + bodyMin;
 	}
 
@@ -462,7 +477,7 @@
 	<div class="expanded-header">
 		<span class="header-icon">
 			{#if isLoopNodeType(data.nodeType)}
-				<RotateCw size={13} color="#8b5cf6" />
+				<RotateCw size={13} color={LOOP_COLOR} />
 			{:else}
 				<Group size={13} />
 			{/if}
@@ -488,8 +503,9 @@
 		</div>
 	</div>
 
-	{#if isLoop}
-		<!-- Loop config strip: own collapse independent of the box. -->
+	{#if isLoop && !data.simplified}
+		<!-- Loop config strip: own collapse independent of the box. Hidden in
+		     simplified view (no config there). -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
 		<div class="loop-config-strip nodrag nopan" onclick={(e) => e.stopPropagation()}>
@@ -516,6 +532,31 @@
 
 	<!-- Left boundary ports -->
 	<div class="expanded-side-ports expanded-side-left nodrag nopan" style="top: {portsTop}px">
+		{#if data.simplified}
+			<!-- Single left interface: outer target (outside -> group inputs) +
+			     inner source (group inputs -> children). Loop adds an `index`
+			     inner-source dot below. -->
+			<div class="expanded-port-block">
+				<div class="expanded-port-dots">
+					<Handle type="target" position={Position.Left} id={SIMPLIFIED_IN_HANDLE}
+						style={simplifiedDotStyle(GROUP_COLOR)}
+						class="!rounded-full !relative !inset-auto !transform-none" />
+					<Handle type="source" position={Position.Right} id={SIMPLIFIED_INNER_SOURCE_HANDLE}
+						style={simplifiedDotStyle(GROUP_COLOR)}
+						class="!rounded-full !relative !inset-auto !transform-none" />
+				</div>
+			</div>
+			{#if isLoop}
+				<div class="expanded-port-block implicit-port" title="self.index (current iteration)">
+					<div class="expanded-port-label-row"><span class="implicit-glyph">∗</span><span class="expanded-port-label">index</span></div>
+					<div class="expanded-port-dots">
+						<Handle type="source" position={Position.Right} id={SIMPLIFIED_LOOP_INDEX_HANDLE}
+							style={simplifiedDotStyle(LOOP_COLOR)}
+							class="!rounded-full !relative !inset-auto !transform-none" />
+					</div>
+				</div>
+			{/if}
+		{:else}
 		{#each inputs as input}
 			{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, noConfigFilled, getPortTypeColor(input.portType), 'input', '!relative !inset-auto !transform-none')}
 			{@const isGhost = !!input.synthesizedFromCarry}
@@ -593,16 +634,42 @@
 						type="source"
 						position={Position.Right}
 						id="index__inner"
-						style="background-color: #8b5cf6;"
+						style="background-color: {LOOP_COLOR};"
 						class="!w-2.5 !h-2.5 !border !border-white !rounded-full !relative !inset-auto !transform-none"
 					/>
 				</div>
 			</div>
 		{/if}
+		{/if}
 	</div>
 
 	<!-- Right boundary ports -->
 	<div class="expanded-side-ports expanded-side-right nodrag nopan" style="top: {portsTop}px">
+		{#if data.simplified}
+			<!-- Single right interface: inner target (children -> group outputs) +
+			     outer source (group outputs -> outside). Loop adds a `done`
+			     inner-target dot below. -->
+			<div class="expanded-port-block expanded-port-block-right">
+				<div class="expanded-port-dots expanded-port-dots-right">
+					<Handle type="target" position={Position.Left} id={SIMPLIFIED_INNER_TARGET_HANDLE}
+						style={simplifiedDotStyle(GROUP_COLOR)}
+						class="!rounded-full !relative !inset-auto !transform-none" />
+					<Handle type="source" position={Position.Right} id={SIMPLIFIED_OUT_HANDLE}
+						style={simplifiedDotStyle(GROUP_COLOR)}
+						class="!rounded-full !relative !inset-auto !transform-none" />
+				</div>
+			</div>
+			{#if isLoop}
+				<div class="expanded-port-block expanded-port-block-right implicit-port" title="self.done (write true to terminate loop)">
+					<div class="expanded-port-label-row expanded-port-label-row-right"><span class="expanded-port-label">done</span><span class="implicit-glyph">∗</span></div>
+					<div class="expanded-port-dots expanded-port-dots-right">
+						<Handle type="target" position={Position.Left} id={SIMPLIFIED_LOOP_DONE_HANDLE}
+							style={simplifiedDotStyle(LOOP_COLOR)}
+							class="!rounded-full !relative !inset-auto !transform-none" />
+					</div>
+				</div>
+			{/if}
+		{:else}
 		{#each outputs as output}
 			{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noConfigFilled, getPortTypeColor(output.portType), 'output', '!relative !inset-auto !transform-none')}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -675,15 +742,40 @@
 						type="target"
 						position={Position.Left}
 						id="done__inner"
-						style="background-color: #8b5cf6;"
+						style="background-color: {LOOP_COLOR};"
 						class="!w-2.5 !h-2.5 !border !border-white !rounded-full !relative !inset-auto !transform-none"
 					/>
 				</div>
 			</div>
 		{/if}
+		{/if}
 	</div>
 </div>
 
+{:else if data.simplified}
+<!-- ═══════════════ COLLAPSED + SIMPLIFIED: a square, like a plain node ═══════════════ -->
+<Handle type="target" position={Position.Left} id={SIMPLIFIED_IN_HANDLE}
+	style="top: 50%; {simplifiedDotStyle(containerColor)}" />
+<div class="simplified-node rounded-lg select-none" class:selected
+	style="width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: {SIMPLIFIED_SQUARE_PAD_PX}px; background: rgba(255,255,255,0.95); border: 1px solid {selected ? containerColor : 'rgba(0,0,0,0.08)'}; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);">
+	<div class="absolute top-1 right-1 flex items-center gap-0.5 nodrag nopan">
+		<ExecutionInspector {executions} {busLogs} {journalCorruptions} {loopEvents} label={data.label || 'Group'} />
+		<button class="expand-toggle" onclick={toggleExpand} title="Expand group"><Maximize2 size={12} /></button>
+	</div>
+	<!-- Fixed-width content column so a collapsed container measures as a uniform
+	     square (the wrapper is `width: max-content`); a long label truncates. -->
+	<div class="flex flex-col items-center gap-1" style="width: {SIMPLIFIED_CONTENT_W_PX}px;">
+	{#if isLoop}
+		<RotateCw size={26} color={containerColor} />
+		<span class="text-[10px] font-semibold tracking-wide uppercase text-center leading-tight max-w-full truncate" style="color: {containerColor};">{data.label || 'Loop'}</span>
+	{:else}
+		<Group size={26} color={containerColor} />
+		<span class="text-[10px] font-semibold tracking-wide uppercase text-center leading-tight max-w-full truncate" style="color: {containerColor};">{data.label || 'Group'}</span>
+	{/if}
+	</div>
+</div>
+<Handle type="source" position={Position.Right} id={SIMPLIFIED_OUT_HANDLE}
+	style="top: 50%; {simplifiedDotStyle(containerColor)}" />
 {:else}
 <!-- ═══════════════ COLLAPSED: looks like a regular node ═══════════════ -->
 <div class="collapsed-node" class:selected>
@@ -694,10 +786,10 @@
 	<div class="collapsed-header">
 		<div class="collapsed-header-left">
 			{#if isLoopNodeType(data.nodeType)}
-				<span class="header-icon" style="color: #8b5cf6;"><RotateCw size={14} /></span>
-				<span class="collapsed-type" style="color: #8b5cf6;">LOOP</span>
+				<span class="header-icon" style="color: {LOOP_COLOR};"><RotateCw size={14} /></span>
+				<span class="collapsed-type" style="color: {LOOP_COLOR};">LOOP</span>
 			{:else}
-				<span class="header-icon" style="color: #52525b;"><Group size={14} /></span>
+				<span class="header-icon" style="color: {GROUP_COLOR};"><Group size={14} /></span>
 				<span class="collapsed-type">GROUP</span>
 			{/if}
 		</div>
@@ -857,6 +949,10 @@
 {/if}
 
 <style>
+	/* SYNC: container hex colors <-> $lib/constants/colors.ts GROUP_COLOR (#52525b)
+	   / LOOP_COLOR (#8b5cf6). Svelte scoped CSS can't read a TS const, so these
+	   rules restate the hex (and the loop violet also appears alpha-blended as
+	   rgba(139,92,246,...) in .loop-config-strip). Change one side, change both. */
 	/* ═══════════════ EXPANDED MODE ═══════════════ */
 	.expanded-container {
 		width: 100%;

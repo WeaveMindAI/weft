@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { SvelteFlow, Controls, Background, useSvelteFlow, useUpdateNodeInternals, type Node, type Edge, type Connection, SelectionMode, ConnectionLineType, MarkerType } from "@xyflow/svelte";
-	import { untrack, tick } from "svelte";
+	import { untrack, tick, onDestroy } from "svelte";
 	import "@xyflow/svelte/dist/style.css";
 	import { browser } from "$app/environment";
 	import ProjectNode from "./ProjectNode.svelte";
@@ -15,8 +15,11 @@
 	import type { EditOp, TextEdit } from "../../../../shared/protocol";
 	import { PORT_TYPE_COLORS } from "$lib/constants/colors";
 	import { autoOrganize } from "$lib/auto-organize";
-	import { updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors } from "$lib/layout";
+	import { updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "$lib/layout";
+	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_SQUARE_PX, SIMPLIFIED_CARD_MAX_W_PX } from "$lib/constants/simplified-view";
+	import { Boxes } from "@lucide/svelte";
 	import { formatConfigValue } from "$lib/value-format";
+	import { measureTextWidth, nodeLabelFont } from "$lib/utils/measure-text";
 	import { foldOps } from "$lib/projection/apply";
 	import { diffConfigOps, VIEW_KEYS, NON_SOURCE_KEYS } from "$lib/projection/config-diff";
 	import { ProjectionEngine } from "$lib/projection/engine.svelte";
@@ -162,12 +165,31 @@
 		untrack(() => project.layoutCode ?? ''),
 	);
 	const layoutCode = $derived(engine.layoutCode);
+	// Per-project view mode (builder = full ports/config/body; simplified =
+	// square nodes, one in/out dot, edges collapsed per node-pair). Persisted as
+	// a `@view` header in the layout file, so it survives reload and is per
+	// project. `simplified` feeds buildNodes/buildEdges/computeSizing so the
+	// whole render derives from it; the toggle is a layout-only edit (undoable).
+	const simplified = $derived(parseViewMode(layoutCode) === 'simplified');
+	// Which view's position block to read/write. Builder and simplified keep
+	// SEPARATE positions in the same layout file (a node is a wide box vs a small
+	// square), so every layout read/write picks the verb for the active view.
+	const layoutVerb = $derived<LayoutVerb>(simplified ? SIMPLIFIED_LAYOUT_VERB : LAYOUT_VERB);
+	function toggleSimplified(): void {
+		const next: ViewMode = simplified ? 'builder' : 'simplified';
+		recordEdit([], (layout) => setViewMode(layout, next));
+	}
 	const fold = $derived(foldOps(engine.truth.project, engine.pendingOps, NODE_TYPE_CONFIG));
 	// A gesture's layout half is PURE: `(currentLayout) => newLayout`. The
 	// engine runs it against the right layout and captures the diff, so the
 	// binding never reaches into engine state (no `engine.layoutCode = ...`).
 	function recordEdit(ops: EditOp[], mutateLayout: import('$lib/projection/engine.svelte').LayoutMutator = (l) => l, typingKey?: string): void {
 		engine.recordEdit(ops, mutateLayout, typingKey);
+	}
+	/** Persist a layout-only change with NO undo entry (automatic re-flows the user
+	 *  didn't author, e.g. a content-driven re-organize). */
+	function persistLayoutEdit(mutateLayout: import('$lib/projection/engine.svelte').LayoutMutator): void {
+		engine.persistLayoutEdit(mutateLayout);
 	}
 	function transaction(fn: () => void): void {
 		engine.transaction(fn);
@@ -222,11 +244,13 @@
 	function layoutUpdateAny(node: Node): (layout: string) => string {
 		const cfg = node.data.config as Record<string, unknown> | undefined;
 		const key = getLayoutKey(node);
+		const verb = layoutVerb;
 		return (layout) => updateLayoutEntry(layout, key,
 			node.position.x, node.position.y,
 			cfg?.width as number | undefined, cfg?.height as number | undefined,
 			cfg?.expanded as boolean | undefined ?? undefined,
-			cfg?.configCollapsed as boolean | undefined ?? undefined);
+			cfg?.configCollapsed as boolean | undefined ?? undefined,
+			verb);
 	}
 
 	/** Move a node or group to a different scope: emit the move intent (Rust
@@ -451,11 +475,18 @@
 
 	/** Parse width/height from an xyflow node's style string + measured fallback */
 	function getNodeRect(n: Node): { width: number; height: number } {
-		// Try explicit style first
-		const wMatch = n.style?.match(/width:\s*(\d+)px/);
-		const hMatch = n.style?.match(/height:\s*(\d+)px/);
-		const w = wMatch ? parseInt(wMatch[1]) : (n.measured?.width ?? 200);
-		const h = hMatch && !n.style?.includes('height: auto') ? parseInt(hMatch[1]) : (n.measured?.height ?? 60);
+		// Read a DEFINITE `width: Npx` / `height: Npx` from the style, but ignore
+		// `min-width`/`min-height` (the `(?<![a-z-])` guard) and `max-content` /
+		// `auto` sizes: those aren't the rendered size, so fall back to the real
+		// measured DOM size. Simplified nodes style as `min-width: 96px; width:
+		// max-content`, so without this guard the regex matched `min-width` and
+		// reported every node as 96px wide, breaking the expand viewport math.
+		const wMatch = n.style?.match(/(?<![a-z-])width:\s*(\d+)px/);
+		const hMatch = n.style?.match(/(?<![a-z-])height:\s*(\d+)px/);
+		const styleW = wMatch && !n.style?.includes('width: max-content') && !n.style?.includes('width: auto');
+		const styleH = hMatch && !n.style?.includes('height: max-content') && !n.style?.includes('height: auto');
+		const w = styleW ? parseInt(wMatch![1]) : (n.measured?.width ?? 200);
+		const h = styleH ? parseInt(hMatch![1]) : (n.measured?.height ?? 60);
 		return { width: w, height: h };
 	}
 
@@ -600,7 +631,12 @@
 				tick().then(() => {
 					requestAnimationFrame(() => {
 						requestAnimationFrame(() => {
-							runAutoOrganize(false).then(() => {
+							runAutoOrganize(false).then((outcome) => {
+								// If the organize bailed (view toggled away, or the editor
+								// closed) nothing was repositioned, so the viewport-pin math is
+								// meaningless and touching the viewport on a destroyed component
+								// could throw. Only adjust when the layout actually applied.
+								if (outcome !== 'applied') return;
 								// Compute new top-right corner in flow coordinates
 								const postNode = nodes.find(n => n.id === pinnedNodeId);
 								if (postNode) {
@@ -692,7 +728,7 @@
 				// miss the entry (read undefined -> every dim looks "changed" -> a spurious
 				// layout write + history churn on a keystroke).
 				const liveNode = nodes.find(n => n.id === nodeId);
-				const layoutEntry = liveNode ? parseLayoutCode(layoutCode)[getLayoutKey(liveNode)] : undefined;
+				const layoutEntry = liveNode ? parseLayoutCode(layoutCode, layoutVerb)[getLayoutKey(liveNode)] : undefined;
 				const persistedDim = (key: string): unknown =>
 					key === 'width' ? layoutEntry?.w
 						: key === 'height' ? layoutEntry?.h
@@ -813,9 +849,12 @@
 
 	function computeMinNodeWidth(inputs?: PortDefinition[], outputs?: PortDefinition[]): number {
 		const MIN_WIDTH = 200;
-		const CHAR_WIDTH = 6.5; // approximate px per char at text-[10px], slightly generous
 		const PADDING = 60; // handles (12*2) + gaps + px padding
 		const GAP = 20; // minimum gap between input and output labels
+		// Port labels render at text-[10px] in the app's sans font; measure the real
+		// pixel width of each label in that exact font instead of guessing chars*px
+		// (which clips wide labels like WWWW and over-reserves narrow ones like iiii).
+		const font = nodeLabelFont(10);
 
 		const inputNames = (inputs || []).map(p => p.name + (p.required ? '*' : ''));
 		const outputNames = (outputs || []).map(p => p.name);
@@ -823,9 +862,9 @@
 		let maxRowWidth = 0;
 		const rowCount = Math.max(inputNames.length, outputNames.length);
 		for (let i = 0; i < rowCount; i++) {
-			const leftLen = i < inputNames.length ? inputNames[i].length : 0;
-			const rightLen = i < outputNames.length ? outputNames[i].length : 0;
-			const rowWidth = (leftLen + rightLen) * CHAR_WIDTH + GAP;
+			const leftW = i < inputNames.length ? measureTextWidth(inputNames[i], font) : 0;
+			const rightW = i < outputNames.length ? measureTextWidth(outputNames[i], font) : 0;
+			const rowWidth = leftW + rightW + GAP;
 			if (rowWidth > maxRowWidth) maxRowWidth = rowWidth;
 		}
 
@@ -838,7 +877,13 @@
 	// must be allowed through the catalog filter explicitly.
 	const SPECIAL_NODE_TYPES = new Set(['Group', 'Annotation', 'IncludedGroup']);
 
-	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configCollapsed?: boolean }>): Node[] {
+	// `liveNodes` is the CURRENTLY-rendered xyflow array, read only for last-render
+	// measured sizes (the simplified containment floor). It is passed explicitly
+	// rather than read from the module-level `nodes` because buildNodes runs inside
+	// the `let nodes = $state.raw(buildNodes(...))` initializer, where reading
+	// `nodes` would hit its temporal dead zone (the "Loading graph..." crash). At
+	// init there is nothing measured yet, so the caller passes `[]`.
+	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configCollapsed?: boolean }>, liveNodes: Node[] = []): Node[] {
 		// Pure merge step: overlay each node's layout entry (width/height/expanded)
 		// onto its config UP FRONT, so the structural parse (which carries none of
 		// this view-state) plus the layout file produce one merged node list. The
@@ -900,6 +945,14 @@
 		// its children, recursively, so a container child (a Loop inside a
 		// Group) can never render ejected outside its parent. Saved sizes win
 		// when already large enough; a full auto-organize recomputes properly.
+		// Measured DOM size of the currently-rendered node, if any. Used in
+		// simplified view so the containment floor reflects a node's REAL drawn size
+		// (a live-display card is bigger than the base square), keeping a grown child
+		// inside its parent. The square is only the lower bound before measurement.
+		const measuredOf = (id: string) => {
+			const live = liveNodes.find(ln => ln.id === id)?.measured;
+			return live?.width && live?.height ? { w: live.width, h: live.height } : undefined;
+		};
 		const floors = computeContainmentFloors(
 			sortedNodes.map(n => {
 				const cfg = n.config as Record<string, unknown>;
@@ -911,14 +964,24 @@
 				// the node's pre-collapse footprint, so the parent never shrinks.
 				const drawsAtConfigDims = n.nodeType === 'Annotation'
 					|| ((cfg?.expanded as boolean | undefined) ?? isContainer) !== false;
+				// Simplified leaf: prefer the MEASURED size (real drawn footprint of the
+				// square or the live-display card), falling back to the base square as a
+				// lower bound before the DOM is measured. NEVER the builder min-width
+				// (>= 200px), which inflated the group's right edge on the rightmost
+				// node (the lopsided-gap bug). Builder leaf keeps its min-width.
+				const measured = simplified ? measuredOf(n.id) : undefined;
 				return {
 					id: n.id,
 					parentId: cfg?.parentId as string | undefined,
 					container: isContainer && (cfg?.expanded as boolean ?? true) !== false,
 					x: entry?.x ?? n.position.x,
 					y: entry?.y ?? n.position.y,
-					w: drawsAtConfigDims ? cfg?.width as number | undefined : computeMinNodeWidth(n.inputs, n.outputs),
-					h: drawsAtConfigDims ? cfg?.height as number | undefined : undefined,
+					w: drawsAtConfigDims
+						? cfg?.width as number | undefined
+						: (simplified ? Math.max(SIMPLIFIED_SQUARE_PX, measured?.w ?? 0) : computeMinNodeWidth(n.inputs, n.outputs)),
+					h: drawsAtConfigDims
+						? cfg?.height as number | undefined
+						: (simplified ? Math.max(SIMPLIFIED_SQUARE_PX, measured?.h ?? 0) : undefined),
 				};
 			}),
 			{ w: 280, h: 120 },
@@ -979,6 +1042,7 @@
 				inputs: n.inputs,
 				outputs: n.outputs,
 				nestingDepth,
+				simplified,
 			});
 
 			// Position is layout's job: the merge places a node at its saved layout
@@ -1010,6 +1074,10 @@
 				data: {
 					label: n.label,
 					nodeType: n.nodeType,
+					// Per-project view mode flows into every node so ProjectNode can
+					// render the simplified square (icon + type, single in/out dot)
+					// instead of the full ports/config/body.
+					simplified,
 					// Overlay the session-local textarea heights (view-state with
 					// no source/layout home) so they survive this rebuild.
 					config: textareaHeightsByNode.has(n.id)
@@ -1033,9 +1101,105 @@
 	}
 
 	// svelte-ignore state_referenced_locally
-	let nodes = $state.raw<Node[]>(buildNodes(project.nodes, project.edges, parseLayoutCode(layoutCode)));
+	let nodes = $state.raw<Node[]>(buildNodes(project.nodes, project.edges, parseLayoutCode(layoutCode, layoutVerb)));
 
 	function buildEdges(projectEdges: typeof project.edges, projectNodes: typeof project.nodes): Edge[] {
+		// Resolve a node's ports / kind against the PROJECTED nodes being rendered,
+		// not the live `nodes` (still the previous render at rebuild time).
+		const nodeOf = (id: string) => projectNodes.find(n => n.id === id);
+		const outputsOf = (id: string) =>
+			nodeOf(id)?.outputs as Array<{ name: string; portType: string }> | undefined;
+		const inputsOf = (id: string) =>
+			nodeOf(id)?.inputs as Array<{ name: string; portType: string }> | undefined;
+		const isLoopNode = (id: string) => isLoopNodeType(nodeOf(id)?.nodeType ?? '');
+
+		// Simplified view: every connection between two nodes collapses onto the
+		// single in/out dots, and all the lines between the same pair merge into
+		// ONE edge. Color: the shared type's color if every merged connection is
+		// the same type, else the mixed (TypeVar) color. Self-reference handles
+		// (`__inner`) resolve to the container's own simplified dots so a group's
+		// interface still connects in this view.
+		if (simplified) {
+			// An edge's source handle attaches to the source node's single OUT dot,
+			// unless the parser marked it `__inner` (an expanded container feeding
+			// one of its own inputs to a child), which attaches to the container's
+			// inner SOURCE dot instead. Symmetrically for targets and the inner
+			// TARGET dot (a child writing the container's output). This keeps a
+			// group's interface wiring visible in simplified view.
+			// xyflow scopes a handle id to its node (it pairs (node, handleId)), so
+			// these are the BARE handle ids the node renders, NOT prefixed with the
+			// node id. The source node's single OUT dot, unless the parser marked
+			// the edge `__inner` (an expanded container feeding its own input to a
+			// child) which uses the inner SOURCE dot. Symmetrically for targets.
+			// `index`/`done` are reserved implicit ports ONLY on loops; a plain Group
+			// may legitimately declare an interface port literally named `index` or
+			// `done`. So the loop-dot special-case is gated on the SOURCE/TARGET node
+			// actually being a loop (read from its nodeType), never inferred from the
+			// handle string alone, or a Group's `index__inner` edge would be routed to
+			// a `__simp_index` dot that a non-loop GroupNode never renders (the edge
+			// would point at a nonexistent handle and vanish).
+			const srcHandleId = (e: typeof projectEdges[0]) => {
+				if (e.sourceHandle === 'index__inner' && isLoopNode(e.source)) return SIMPLIFIED_LOOP_INDEX_HANDLE;
+				return e.sourceHandle?.endsWith('__inner') ? SIMPLIFIED_INNER_SOURCE_HANDLE : SIMPLIFIED_OUT_HANDLE;
+			};
+			const tgtHandleId = (e: typeof projectEdges[0]) => {
+				if (e.targetHandle === 'done__inner' && isLoopNode(e.target)) return SIMPLIFIED_LOOP_DONE_HANDLE;
+				return e.targetHandle?.endsWith('__inner') ? SIMPLIFIED_INNER_TARGET_HANDLE : SIMPLIFIED_IN_HANDLE;
+			};
+			// Merge every connection that lands on the SAME pair of dots into one
+			// edge. The key is the resolved dot ids (not just the node ids) so an
+			// inner and an outer edge between the same two nodes stay distinct.
+			const byPair = new Map<string, { source: string; target: string; sh: string; th: string; types: Set<string> }>();
+			for (const e of projectEdges) {
+				const sh = srcHandleId(e);
+				const th = tgtHandleId(e);
+				// Key includes the node ids (handle ids are bare/shared), so edges
+				// only merge when they land on the SAME dot pair of the SAME nodes.
+				const key = `${e.source}.${sh}->${e.target}.${th}`;
+				let entry = byPair.get(key);
+				if (!entry) { entry = { source: e.source, target: e.target, sh, th, types: new Set() }; byPair.set(key, entry); }
+				// Resolve the connection's type to color the merged edge. A normal
+				// source handle names one of the source node's OUTPUTS; an `__inner`
+				// source (an expanded container feeding its own input to a child) names
+				// one of the container's INPUTS (see dropDanglingPortEdges in apply.ts:
+				// an inner source feeds an IN port). Resolving against the wrong list
+				// returned undefined -> every inner-source edge fell back to 'Any'.
+				const isInnerSrc = e.sourceHandle?.endsWith('__inner') ?? false;
+				const cleanHandle = isInnerSrc ? e.sourceHandle!.slice(0, -'__inner'.length) : e.sourceHandle;
+				const port = (isInnerSrc ? inputsOf(e.source) : outputsOf(e.source))?.find(p => p.name === cleanHandle);
+				entry.types.add(port?.portType ?? 'Any');
+			}
+			return Array.from(byPair.values()).map(({ source, target, sh, th, types }) => {
+				const edgeColor = types.size === 1
+					? (PORT_TYPE_COLORS[[...types][0]] || PORT_TYPE_COLORS.TypeVar)
+					: PORT_TYPE_COLORS.TypeVar;
+				return {
+					id: `simplified:${source}.${sh}->${target}.${th}`,
+					source,
+					target,
+					sourceHandle: sh,
+					targetHandle: th,
+					type: 'custom',
+					animated: false,
+					zIndex: 5,
+					// A simplified edge merges many real connections, so it is
+					// non-interactive: not selectable, not deletable. Reconnect is
+					// disabled where it actually matters: CustomEdge.svelte omits the
+					// <EdgeReconnectAnchor> in simplified view (no grab zone, so the
+					// gesture can't start), and the onReconnect*/onConnectEnd handlers
+					// self-guard on `simplified` as defense. (Svelte Flow has no
+					// per-edge `reconnectable` field, unlike React Flow, so the anchor
+					// is the real lever.) Without this, dragging a merged edge's end
+					// would record a removeEdge against the SYNTHETIC `__simp_*` handle.
+					selectable: false,
+					deletable: false,
+					data: { simplified: true },
+					style: `stroke-width: 2px; stroke: ${edgeColor};`,
+					markerEnd: { type: MarkerType.ArrowClosed, width: 20, height: 20, color: edgeColor },
+				};
+			});
+		}
+
 		// Deduplicate edges - only keep one edge per target+targetHandle (last one wins)
 		const seenTargets = new Map<string, typeof projectEdges[0]>();
 		for (const e of projectEdges) {
@@ -1043,12 +1207,7 @@
 			seenTargets.set(key, e);
 		}
 		const deduplicatedEdges = Array.from(seenTargets.values());
-		
-		
-		// Resolve source-port type against the PROJECTED nodes being rendered,
-		// not the live `nodes` (still the previous render at rebuild time).
-		const outputsOf = (id: string) =>
-			projectNodes.find(n => n.id === id)?.outputs as Array<{ name: string; portType: string }> | undefined;
+
 		return deduplicatedEdges.map((e) => {
 			const edgeColor = getEdgeColor(e.source, e.sourceHandle, outputsOf);
 
@@ -1396,7 +1555,7 @@
 		// freshly duplicated copies). The request set is consumed here.
 		const prevSelected = new Set(nodes.filter(n => n.selected).map(n => n.id));
 		const want = (id: string) => prevSelected.has(id) || id === selectedNodeId || selectOnNextRebuild.has(id);
-		const built = buildNodes(f.project.nodes, f.project.edges, parseLayoutCode(engine.layoutCode))
+		const built = buildNodes(f.project.nodes, f.project.edges, parseLayoutCode(engine.layoutCode, layoutVerb), nodes)
 			.map(n => (want(n.id) ? { ...n, selected: true } : n));
 		selectOnNextRebuild.clear();
 		const decorated = decorate(built, buildEdges(f.project.edges, f.project.nodes), readOverlayCtx());
@@ -1437,9 +1596,65 @@
 		});
 	});
 
+	// Simplified view sizes every node to its measured content (see simplifiedSizing),
+	// so when a node gains a live display (an image loads, a feed grows) it RESIZES.
+	// A resize can make it overlap a neighbour, so we re-run auto-organize to re-flow
+	// around the new measured size (a full re-layout: in simplified view that is
+	// accepted over preserving manual positions). Keyed off the REAL measured sizes
+	// of leaf (non-container) nodes, so it fires on any actual resize (image, feed,
+	// label) without duplicating the "has live display" predicate, and never loops:
+	// auto-organize changes positions, not a leaf's content-driven measured size.
+	// Debounced so a burst of streaming updates triggers one re-flow, not dozens.
+	let leafSizeSig = '';
+	let resizeReflowTimer: ReturnType<typeof setTimeout> | null = null;
+	// True once the component is torn down, so an in-flight async organize that
+	// resolves after teardown does not write `nodes` / persist on dead state.
+	let destroyed = false;
+	// Cancel a pending reflow: on teardown (the timer must not fire on dead state)
+	// and when leaving simplified view (a stale reflow would run in builder view and
+	// silently rewrite builder positions with no undo entry). This clears the
+	// debounce timer; an organize ALREADY in flight (mid measure-wait) is caught
+	// separately by runAutoOrganize re-checking the active view + `destroyed` before
+	// it writes (see runAutoOrganize's apply guard), so neither window can persist
+	// the wrong view's positions or touch a destroyed component.
+	function cancelResizeReflow(): void {
+		if (resizeReflowTimer) { clearTimeout(resizeReflowTimer); resizeReflowTimer = null; }
+	}
+	onDestroy(() => { destroyed = true; cancelResizeReflow(); });
+	$effect(() => {
+		if (!simplified) { leafSizeSig = ''; cancelResizeReflow(); return; }
+		// Read measured sizes reactively so this re-runs when xyflow re-measures.
+		const sig = nodes
+			.filter(n => n.type === 'project' || n.type === 'groupCollapsed')
+			.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`)
+			.join('|');
+		untrack(() => {
+			// Skip until the active view has had its initial organize (the mount /
+			// view-switch effects own that); only react to LATER resizes.
+			if (!organizedVerbs.has(layoutVerb)) { leafSizeSig = sig; return; }
+			if (sig === leafSizeSig) return;
+			leafSizeSig = sig;
+			if (resizeReflowTimer) clearTimeout(resizeReflowTimer);
+			// No fitView (don't yank the camera mid-execution); non-undoable (an
+			// automatic re-flow is not a user action, must not pollute the undo stack).
+			resizeReflowTimer = setTimeout(() => { resizeReflowTimer = null; void runAutoOrganize(false, false); }, 250);
+		});
+	});
+
 	let selectedNodeId = $state<string | null>(null);
 
 	let contextMenu = $state<{ x: number; y: number; flowX: number; flowY: number; nodeId: string | null } | null>(null);
+	// An OPEN node menu in simplified view shows only infra lifecycle actions; if
+	// the node's infra actions disappear while the menu is open (an execution tick
+	// terminates the node), the menu would render empty. Close it instead, using the
+	// SAME predicate that gates opening (nodeInfraActions), so open-time and
+	// stay-open agree. The empty-area menu (no nodeId) always has Undo/Redo, never
+	// empties.
+	$effect(() => {
+		if (contextMenu?.nodeId && simplified && !nodeInfraActions(contextMenu.nodeId).has) {
+			contextMenu = null;
+		}
+	});
 	let commandPaletteOpen = $state(false);
 
 	// Flow position saved from the context menu (right-click) for placing nodes
@@ -1472,8 +1687,27 @@
 		inputs?: PortDefinition[];
 		outputs?: PortDefinition[];
 		nestingDepth?: number;   // expanded groups stack above their parents
+		simplified?: boolean;    // square nodes, fixed size, no port/config sizing
 	};
 	type Sizing = { type: 'group' | 'groupCollapsed' | 'annotation' | 'project'; zIndex: number; style: string; width?: number; height?: number };
+	// Simplified-view node sizing: SIZE TO CONTENT, never a pinned size. A bare
+	// node's content is constrained to a square in ProjectNode/GroupNode, so it
+	// measures as a SIMPLIFIED_SQUARE_PX square; a node with a live display (image,
+	// feed, debug preview) grows its card and measures bigger. We pass NO width/
+	// height prop so xyflow reads the real DOM size into `n.measured`, which is what
+	// the layout engine consumes. `min-width`/`min-height` floor the empty square;
+	// `max-width` caps a runaway card. When a live display appears and the node
+	// resizes, the overlay effect re-runs auto-organize so the layout re-reads the
+	// new measured size (a full re-flow, accepted over preserving manual positions).
+	// A `function` (hoisted), not a const arrow: computeSizing runs during the
+	// `$state.raw(buildNodes(...))` initializer above, so a const declared here
+	// would be in its temporal dead zone (the "Loading graph..." crash).
+	function simplifiedSizing(type: 'project' | 'groupCollapsed'): Sizing {
+		return {
+			type, zIndex: 4,
+			style: `width: max-content; min-width: ${SIMPLIFIED_SQUARE_PX}px; max-width: ${SIMPLIFIED_CARD_MAX_W_PX}px; min-height: ${SIMPLIFIED_SQUARE_PX}px; height: auto;`,
+		};
+	}
 	function computeSizing(s: SizingInput): Sizing {
 		if (s.isAnnotation) {
 			return { type: 'annotation', zIndex: -1, style: `width: ${s.configWidth || 250}px; height: ${s.configHeight || 120}px;` };
@@ -1484,9 +1718,11 @@
 				const h = s.configHeight || s.fallbackHeight || 300;
 				return { type: 'group', zIndex: -1 + (s.nestingDepth ?? 0), style: `width: ${w}px; height: ${h}px;` };
 			}
+			if (s.simplified) return simplifiedSizing('groupCollapsed');
 			const minW = computeMinNodeWidth(s.inputs, s.outputs);
 			return { type: 'groupCollapsed', zIndex: 4, style: `width: ${minW}px; height: auto;` };
 		}
+		if (s.simplified) return simplifiedSizing('project');
 		// Regular node: collapsed (default) = min-width/auto; expanded = saved
 		// w/h (>= minW), else fit. A collapsed node ignores any saved w/h.
 		const minW = computeMinNodeWidth(s.inputs, s.outputs);
@@ -1516,6 +1752,7 @@
 			fallbackHeight: rect?.height,
 			inputs: (newData.inputs ?? cfg?.inputs) as PortDefinition[] | undefined,
 			outputs: (newData.outputs ?? cfg?.outputs) as PortDefinition[] | undefined,
+			simplified: newData.simplified as boolean | undefined,
 		});
 		return {
 			...n,
@@ -1609,10 +1846,78 @@
 			const relativeY = (handleRect.top + handleRect.height / 2 - nodeRect.top) / zoom;
 			portYMap.set(handleId, relativeY);
 		}
+		// Simplified view: the node renders only ONE input dot and ONE output dot,
+		// but the layout engine (shared with the builder view) looks up each REAL
+		// port by name. So alias every real input port name to the single in-dot's
+		// measured Y and every real output (plus `_raw`) to the out-dot's. The
+		// engine then naturally collapses all of a node's ports onto its two dots,
+		// using the exact positions measured on screen. This keeps ONE layout path
+		// for both views: it always reads "the dots that actually exist".
+		if (simplified) {
+			const inY = portYMap.get(SIMPLIFIED_IN_HANDLE);
+			const outY = portYMap.get(SIMPLIFIED_OUT_HANDLE);
+			const node = nodes.find(n => n.id === nodeId);
+			const inputs = (node?.data.inputs as PortDefinition[] | undefined) ?? [];
+			const outputs = (node?.data.outputs as PortDefinition[] | undefined) ?? [];
+			if (inY !== undefined) for (const p of inputs) portYMap.set(p.name, inY);
+			if (outY !== undefined) {
+				for (const p of outputs) portYMap.set(p.name, outY);
+				portYMap.set('_raw', outY);
+			}
+		}
 		return portYMap;
 	}
 
-	function runAutoOrganize(andFitView = false): Promise<void> {
+	// `undoable`: a user-initiated organize (palette button, collapse/expand,
+	// first-show) records an undo entry; an AUTOMATIC re-flow (a node resized
+	// because live-display content arrived) persists without one, so a streaming
+	// execution can't bury the user's real edits under reflow frames.
+	// Outcome of an organize: it APPLIED, or it bailed because the active view
+	// CHANGED mid-run (a later toggle back will re-fire and re-organize), or because
+	// the component was DESTROYED. Callers that claimed a verb in `organizedVerbs`
+	// un-claim ONLY on 'view-changed' (so the toggle-back recovers); 'destroyed'
+	// needs no recovery, and re-inferring the reason at the call site is fragile, so
+	// it's returned explicitly.
+	type OrganizeOutcome = 'applied' | 'view-changed' | 'destroyed';
+	async function runAutoOrganize(andFitView = false, undoable = true): Promise<OrganizeOutcome> {
+		// The view this organize is FOR. ELK runs across an up-to-2s measure-wait,
+		// during which the user can toggle views or close the editor. The result is
+		// only valid for the view that was active at entry, so the apply step below
+		// bails if the active view changed (or the component was destroyed) by the
+		// time ELK resolves. Without this, a reflow scheduled in simplified view
+		// could resolve after a toggle and persist BUILDER positions (wrong verb,
+		// non-undoable), or write `nodes` on a torn-down component.
+		const startVerb = layoutVerb;
+		// Wait until every visible node has a measured DOM size before reading
+		// sizes. ELK is only as good as the sizes it's fed: a node measured at a
+		// stale (pre-toggle) size makes ELK place neighbours against the wrong
+		// edge (the "node stuck to the collapsed group" bug). The palette path got
+		// this right by waiting externally; doing it HERE makes every caller
+		// correct (collapse/expand, mount, manual) with one wait. Cap at 2s.
+		{
+			// Wait until sizes are not just present but STABLE across two polls. A
+			// bare "every node has a measured size" check breaks too early right after
+			// a view toggle: the nodes still carry the PREVIOUS view's measured sizes
+			// (builder boxes) until Svelte re-renders the squares and the ResizeObserver
+			// catches up, so ELK would run on stale sizes and the first simplified open
+			// looks wrong. Requiring the size signature to repeat means the DOM has
+			// settled into the CURRENT view before we read it.
+			const deadline = Date.now() + 2000;
+			let prevSig = '';
+			let settled = false;
+			while (Date.now() < deadline) {
+				await tick();
+				const allMeasured = nodes.every(n => n.style === 'display: none;' || (n.measured?.width && n.measured?.height));
+				const sig = nodes.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`).join('|');
+				if (allMeasured && sig === prevSig) { settled = true; break; }
+				prevSig = sig;
+				await new Promise(resolve => setTimeout(resolve, 50));
+			}
+			// Fail loud (breadcrumb): the wait's whole point is to feed ELK a SETTLED
+			// DOM. If sizes never stabilized within the cap, ELK runs on whatever's
+			// there, which can be a wrong layout; surface it instead of failing silent.
+			if (!settled) console.warn(`[auto-organize] node sizes never settled within 2s (${nodes.length} nodes); laying out on unstable sizes.`);
+		}
 		const sizes = new Map<string, { width: number; height: number }>();
 		for (const n of nodes) {
 			if (n.measured?.width && n.measured?.height) {
@@ -1642,14 +1947,25 @@
 			features: { ...(NODE_TYPE_CONFIG[n.data.nodeType as string]?.features || {}), ...((n.data.features as NodeFeatures) || {}) },
 			sourceLine: n.data.sourceLine as number | undefined,
 		}));
-		const currentEdges = edges.map(e => ({
+		// Feed ELK the RAW edges (original `__inner` handles), not the live xyflow
+		// edges: in simplified view those are collapsed to `__simp_*` handles, but
+		// autoOrganize's simplified mapping needs the real direction/inner markers
+		// to place endpoints. It collapses topology to one in/out port per node
+		// itself, so parallel raw edges between a pair are harmless.
+		const rawEdges = fold.project.edges.map(e => ({
 			id: e.id,
 			source: e.source,
 			target: e.target,
-			sourceHandle: e.sourceHandle || null,
-			targetHandle: e.targetHandle || null,
+			sourceHandle: e.sourceHandle ?? null,
+			targetHandle: e.targetHandle ?? null,
 		}));
-		return autoOrganize(currentNodes, currentEdges, sizes, portPositions).then(({ positions, groupSizes }) => {
+		return autoOrganize(currentNodes, rawEdges, sizes, portPositions, simplified).then(({ positions, groupSizes }) => {
+			// The view changed (toggle) or the editor closed while ELK ran: this
+			// result is stale, discard it rather than write the wrong view's layout
+			// or mutate a destroyed component. (layoutVerb is the view identity:
+			// @slayout in simplified, @layout in builder.)
+			if (destroyed) return 'destroyed';
+			if (layoutVerb !== startVerb) return 'view-changed';
 			nodes = nodes.map((n) => {
 				const pos = positions.get(n.id);
 				const groupSize = groupSizes.get(n.id);
@@ -1663,24 +1979,27 @@
 				}
 				return updated;
 			});
-			// ELK positions are LAYOUT, not source: record as one reversible
-			// layout action (recordEdit persists + captures the diff for undo).
-			// Persist EVERY visible node, not only the ones ELK repositioned:
-			// ELK may leave a node in place (no `positions` entry), and a
-			// collapse/expand toggle drives this path precisely to persist the
-			// toggled node's `expanded` flag. Gating on ELK movement dropped that
-			// flag for untouched nodes, so they snapped back to their default on
-			// the next rebuild (the intermittent recollapse). Hidden nodes
-			// (display:none under a collapsed ancestor) keep their stored entry.
-			recordEdit([], (layout) => {
+			// ELK positions are LAYOUT, not source. Persist EVERY visible node, not
+			// only the ones ELK repositioned: ELK may leave a node in place (no
+			// `positions` entry), and a collapse/expand toggle drives this path
+			// precisely to persist the toggled node's `expanded` flag. Gating on ELK
+			// movement dropped that flag for untouched nodes, so they snapped back to
+			// their default on the next rebuild (the intermittent recollapse). Hidden
+			// nodes (display:none under a collapsed ancestor) keep their stored entry.
+			// Undoable (user-initiated) captures one reversible layout action; an
+			// automatic re-flow persists with no undo entry.
+			const persistAll = (layout: string) => {
 				let next = layout;
 				for (const n of nodes) {
 					if (n.style === 'display: none;') continue;
 					next = layoutUpdateAny(n)(next);
 				}
 				return next;
-			});
+			};
+			if (undoable) recordEdit([], persistAll);
+			else persistLayoutEdit(persistAll);
 			if (andFitView) setTimeout(() => doFitView(), 50);
+			return 'applied';
 		});
 	}
 
@@ -1698,23 +2017,37 @@
 	let hasAutoOrganized = $state(false);
 	// Hide canvas until initial ELK layout completes to avoid flash of ugly unorganized positions
 	let canvasReady = $state(false);
+	// The set of view verbs (@layout / @slayout) whose positions have already been
+	// established (saved on disk OR organized-on-first-show), so neither the mount
+	// effect nor the view-switch effect organizes the same view twice. Seeded by
+	// BOTH effects: whichever first handles a verb claims it, so they can't both
+	// fire runAutoOrganize for one view (the double-organize race: two concurrent
+	// recordEdits + racing `nodes=`). A plain Set (not $state) on purpose: it's a
+	// write-only ledger; making it reactive would re-run the effects on their own
+	// mutation. The wait-for-measured + ELK run lives solely in runAutoOrganize, so
+	// both effects just `await runAutoOrganize(true)` (no duplicated wait loop).
+	let organizedVerbs = new Set<LayoutVerb>();
 	$effect(() => {
 		if (!hasFitView && nodes.length > 0) {
 			hasFitView = true;
-			if (!layoutCode || autoOrganizeOnMount) {
+			// Auto-organize if the ACTIVE VIEW has no saved positions (the builder
+			// and simplified views keep separate position blocks; a project laid out
+			// in builder has none for simplified, so it must organize on first show).
+			const activeViewHasPositions = Object.keys(parseLayoutCode(layoutCode, layoutVerb)).length > 0;
+			// Claim this verb so the view-switch effect below doesn't ALSO organize it
+			// on this same mount (both would otherwise see empty positions and race).
+			const claimedVerb = layoutVerb;
+			organizedVerbs.add(claimedVerb);
+			if (!activeViewHasPositions || autoOrganizeOnMount) {
 				// No saved layout or explicitly requested: run ELK to compute positions.
-				// Wait until SvelteFlow has measured every node before firing ELK,
-				// otherwise ELK uses zero-sized fallbacks and produces garbage layouts.
-				// Cap at 2s so a pathological case doesn't wedge the canvas forever.
+				// runAutoOrganize waits for measured sizes internally (see its body).
 				hasAutoOrganized = true;
 				void (async () => {
-					const deadline = Date.now() + 2000;
-					while (Date.now() < deadline) {
-						await tick();
-						if (nodes.every(n => n.measured?.width && n.measured?.height)) break;
-						await new Promise(resolve => setTimeout(resolve, 50));
-					}
-					await runAutoOrganize(true);
+					// Un-claim ONLY on 'view-changed' (the user switched away mid-run): a
+					// toggle BACK then re-fires the view-switch effect, which re-claims and
+					// re-organizes. 'destroyed' needs no recovery (component is gone), so
+					// leave the claim.
+					if (await runAutoOrganize(true) === 'view-changed') organizedVerbs.delete(claimedVerb);
 					canvasReady = true;
 				})();
 			} else {
@@ -1726,8 +2059,38 @@
 		}
 	});
 
+	// Switching to a view whose position block is empty (first time the simplified
+	// view is shown for a project laid out only in builder, or vice versa)
+	// organizes it once, then fits. Guarded by `organizedVerbs` so it can't loop,
+	// double-fire with the mount effect, or fight a user who then drags things.
+	$effect(() => {
+		const verb = layoutVerb;
+		void layoutCode;
+		untrack(() => {
+			if (!hasFitView || organizedVerbs.has(verb)) return;
+			if (Object.keys(parseLayoutCode(layoutCode, verb)).length > 0) {
+				organizedVerbs.add(verb);
+				return;
+			}
+			if (nodes.length === 0) return;
+			organizedVerbs.add(verb);
+			// Un-claim ONLY on 'view-changed' (switched away mid-run): a toggle back
+			// re-fires this effect and re-organizes. 'destroyed' needs no recovery.
+			void runAutoOrganize(true).then((outcome) => { if (outcome === 'view-changed') organizedVerbs.delete(verb); });
+		});
+	});
+
 	// Handle actions from command palette
+	// Actions that mutate the graph's STRUCTURE (source). Blocked in simplified
+	// view, where the only allowed interactions are visual: expand/collapse and
+	// reposition. Creating or deleting would be ambiguous against collapsed
+	// nodes and merged edges, so it is refused here (toggle back to builder).
+	const STRUCTURAL_ACTIONS = new Set(['duplicate', 'delete', 'addNode', 'paste', 'group', 'ungroup']);
 	function handlePaletteAction(action: string) {
+		if (simplified && STRUCTURAL_ACTIONS.has(action)) {
+			toast.info('Switch to the builder view to edit the graph', { description: 'Simplified view is read-only (you can still move, expand, and collapse).', duration: 4000 });
+			return;
+		}
 		switch (action) {
 			case 'save':
 				saveProject();
@@ -1801,6 +2164,10 @@
 	}
 
 	function isValidConnection(connection: Edge | Connection): boolean {
+		// Simplified view is look-only for wiring: the single in/out dots don't
+		// map to real ports, so no edge can be authored or reconnected here. The
+		// user toggles back to the builder view to change connections.
+		if (simplified) return false;
 		const sourceScope = getHandleScope(connection.source!, connection.sourceHandle);
 		const targetScope = getHandleScope(connection.target!, connection.targetHandle);
 		if (sourceScope === null || targetScope === null) return false;
@@ -1823,6 +2190,7 @@
 	
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnectStart(event: MouseEvent | TouchEvent, edge: any) {
+		if (simplified) return; // simplified edges are merged + non-interactive
 		reconnectSuccessful = false;
 		// Set connection line color based on the edge being reconnected
 		if (edge?.source) {
@@ -1832,6 +2200,7 @@
 	
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnect(oldEdge: any, newConnection: any) {
+		if (simplified) return; // no wiring edits in simplified view
 		reconnectSuccessful = true;
 
 		// Remove old edge, add new one: one atomic batch. The projection paints
@@ -1846,6 +2215,7 @@
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnectEnd(event: MouseEvent | TouchEvent, edge: any) {
+		if (simplified) return; // no wiring edits in simplified view
 		// Reconnect dropped on empty space = remove the edge (the gesture's
 		// meaning, expressed as the same removeEdge op a delete uses).
 		if (!reconnectSuccessful) {
@@ -1860,7 +2230,7 @@
 	
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onConnectEnd(event: MouseEvent | TouchEvent, connectionState: any) {
-			
+		if (simplified) return; // no new connections / add-on-drop in simplified view
 		// When a connection is dropped on the pane it's not valid
 		// Based on React Flow example: https://reactflow.dev/examples/nodes/add-node-on-edge-drop
 		if (!connectionState.isValid) {
@@ -1921,6 +2291,12 @@
 	}
 
 	function addNode(type: NodeType) {
+		// Simplified view is read-only for structure: refuse node creation (the
+		// command palette / context menu reach this directly, not via the gate).
+		if (simplified) {
+			toast.info('Switch to the builder view to add nodes', { description: 'Simplified view is read-only (you can still move, expand, and collapse).', duration: 4000 });
+			return;
+		}
 		const isGroup = type === 'Group';
 		const isLoop = type === 'Loop';
 		const isContainer = isGroup || isLoop;
@@ -2206,7 +2582,11 @@
 		const draggedIds = new Set(draggedNodes.map(dn => dn.id));
 		transaction(() => {
 			const movedIds = new Set<string>();
-			const currentNode = nodes.find(n => n.id === targetNode.id);
+			// Simplified view is READ-ONLY for structure: a drag may REPOSITION but
+			// must not REPARENT. Re-scoping (dropping a node into a group) rewrites
+			// the .weft source, so it is suppressed here; only the position write
+			// below runs. (Builder view does both.)
+			const currentNode = simplified ? undefined : nodes.find(n => n.id === targetNode.id);
 			if (currentNode) {
 				if (applyNodeScopeChange(currentNode)) movedIds.add(currentNode.id);
 				if (currentNode.type === 'group' || currentNode.type === 'groupCollapsed') {
@@ -2244,7 +2624,9 @@
 		const draggedIds = new Set(selectedNodes.map(sn => sn.id));
 		transaction(() => {
 			const movedIds = new Set<string>();
-			for (const selectedNode of selectedNodes) {
+			// Simplified view is READ-ONLY for structure: reposition only, no reparent
+			// (see onNodeDragStop). The scope-change scan is skipped; positions persist.
+			for (const selectedNode of (simplified ? [] : selectedNodes)) {
 				const node = nodes.find(n => n.id === selectedNode.id);
 				if (!node) continue;
 				if (applyNodeScopeChange(node)) movedIds.add(node.id);
@@ -2393,12 +2775,31 @@
 		}
 	}
 
+	/** Whether a node's context menu has any INFRA lifecycle action (stop/terminate).
+	 *  The one source of truth for "infra actions present", used both to decide
+	 *  whether to open the menu in simplified view and to render the infra section. */
+	function nodeInfraActions(nodeId: string | null): { stop: boolean; terminate: boolean; has: boolean } {
+		const infra = nodeId ? infraNodes?.find(n => n.nodeId === nodeId) : undefined;
+		const stop = !!infra && (infra.status === 'running' || infra.status === 'flaky');
+		const terminate = !!infra && infra.status !== 'terminating';
+		return { stop, terminate, has: stop || terminate };
+	}
+
 	function onContextMenu(event: MouseEvent) {
 		event.preventDefault();
-		
+
 		const flowPos = screenToFlowPosition({ x: event.clientX, y: event.clientY });
 		const clickedNodeId = findNodeAtPosition(event.clientX, event.clientY);
-		
+
+		// Simplified view hides the structural node-menu items (Duplicate/Delete),
+		// leaving only infra lifecycle actions. A node with no infra actions would
+		// open an empty popover, so don't open the menu at all in that case. (The
+		// empty-area menu still has Undo/Redo, so it's never empty.)
+		if (simplified && clickedNodeId && !nodeInfraActions(clickedNodeId).has) {
+			contextMenu = null;
+			return;
+		}
+
 		contextMenu = {
 			x: event.clientX,
 			y: event.clientY,
@@ -2629,6 +3030,28 @@
 		}
 	}}>
 		{#if browser}
+			<!-- View-mode toggle (top-right). An explicit labelled on/off switch so
+			     it always reads as "Simplified view: off/on", never an opaque icon.
+			     Per-project, persisted. -->
+			<div class="absolute top-3 right-3 z-30 pointer-events-auto">
+				<button
+					type="button"
+					role="switch"
+					aria-checked={simplified}
+					onclick={toggleSimplified}
+					class="flex items-center gap-2 pl-2.5 pr-2 py-1.5 rounded-md border bg-white text-zinc-700 border-zinc-200 shadow-sm text-xs font-medium hover:bg-zinc-50 transition"
+					title={simplified
+						? 'Simplified view is ON: nodes are squares with one in/out dot, read-only. Click to turn off (back to the full builder view).'
+						: 'Simplified view is OFF: full builder view with every port and config. Click to turn on a clean square overview.'}
+				>
+					<Boxes class="w-3.5 h-3.5 {simplified ? 'text-violet-600' : 'text-zinc-400'}" />
+					<span>Simplified view</span>
+					<!-- on/off track -->
+					<span class="relative inline-flex h-4 w-7 items-center rounded-full transition-colors {simplified ? 'bg-violet-600' : 'bg-zinc-300'}">
+						<span class="inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform {simplified ? 'translate-x-3.5' : 'translate-x-0.5'}"></span>
+					</span>
+				</button>
+			</div>
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="svelte-flow-wrapper" style="width: 100%; height: 100%;" onwheelcapture={handleWheel}>
 			<SvelteFlow
@@ -2768,29 +3191,40 @@
 				{@const nodeToEdit = nodes.find(n => n.id === targetNodeId)}
 				{@const nodeConfig = nodeToEdit ? NODE_TYPE_CONFIG[nodeToEdit.data.nodeType as NodeType] : null}
 				{@const infraInfo = infraNodes?.find(n => n.nodeId === targetNodeId)}
-				{@const canNodeStop = !!infraInfo && (infraInfo.status === 'running' || infraInfo.status === 'flaky')}
-				{@const canNodeTerminate = !!infraInfo && infraInfo.status !== 'terminating'}
-
-				{#if nodeToEdit && nodeConfig}
+				{@const infraActions = nodeInfraActions(targetNodeId)}
+				{@const canNodeStop = infraActions.stop}
+				{@const canNodeTerminate = infraActions.terminate}
+				{@const hasInfraActions = infraActions.has}
+				<!-- In simplified view the only node-menu items are infra lifecycle actions
+				     (structural Duplicate/Delete are hidden), so render the menu only when
+				     there's something to show, never an empty popover. -->
+				{#if nodeToEdit && nodeConfig && (!simplified || hasInfraActions)}
 					<div class="px-1">
-						<button
-							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-							onclick={() => duplicateNode(contextMenu!.nodeId!)}
-						>
-							<span class="text-muted-foreground text-xs">Ctrl+D</span>
-							<span>Duplicate</span>
-						</button>
-						<button
-							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
-							onclick={() => deleteNode(contextMenu!.nodeId!)}
-						>
-							<span class="text-xs">Del</span>
-							<span>Delete</span>
-						</button>
-						{#if infraInfo && (canNodeStop || canNodeTerminate)}
-							<div class="my-1 mx-2 border-t"></div>
+						<!-- Duplicate/Delete are STRUCTURAL edits: hidden in simplified view
+						     (read-only for structure). Infra Stop/Terminate below are runtime
+						     lifecycle actions (not source edits), so they stay available. This
+						     is the same gate STRUCTURAL_ACTIONS applies to the palette/keyboard;
+						     the context menu is the other entry point and must gate too. -->
+						{#if !simplified}
+							<button
+								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+								onclick={() => duplicateNode(contextMenu!.nodeId!)}
+							>
+								<span class="text-muted-foreground text-xs">Ctrl+D</span>
+								<span>Duplicate</span>
+							</button>
+							<button
+								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
+								onclick={() => deleteNode(contextMenu!.nodeId!)}
+							>
+								<span class="text-xs">Del</span>
+								<span>Delete</span>
+							</button>
+						{/if}
+						{#if hasInfraActions}
+							{#if !simplified}<div class="my-1 mx-2 border-t"></div>{/if}
 							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">
-								Infra ({infraInfo.status})
+								Infra ({infraInfo!.status})
 							</div>
 							{#if canNodeStop && onInfraNodeStop}
 								<button
@@ -2816,14 +3250,18 @@
 			{:else}
 				<!-- Quick Add Menu -->
 				<div class="px-1">
-					<button
-						class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-						onclick={() => { contextMenuFlowPos = contextMenu ? { x: contextMenu.flowX, y: contextMenu.flowY } : null; contextMenu = null; commandPaletteOpen = true; }}
-					>
-						<span class="text-muted-foreground text-xs">Ctrl+P</span>
-						<span>Add Node...</span>
-					</button>
-					<div class="my-1 mx-2 border-t"></div>
+					<!-- Add Node is a STRUCTURAL edit: hidden in simplified view. Undo/Redo
+					     stay (they only reverse layout/structure the user already did). -->
+					{#if !simplified}
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+							onclick={() => { contextMenuFlowPos = contextMenu ? { x: contextMenu.flowX, y: contextMenu.flowY } : null; contextMenu = null; commandPaletteOpen = true; }}
+						>
+							<span class="text-muted-foreground text-xs">Ctrl+P</span>
+							<span>Add Node...</span>
+						</button>
+						<div class="my-1 mx-2 border-t"></div>
+					{/if}
 					<button
 						class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
 						onclick={() => { contextMenu = null; undo(); }}

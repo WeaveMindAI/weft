@@ -242,6 +242,17 @@ export class ProjectionEngine {
 		this.recordGesture(ops, mutateLayout, typingKey);
 	}
 
+	/** Persist a layout-only change WITHOUT an undo entry. For positions the user
+	 *  did not author: an automatic re-flow (auto-organize triggered by a node
+	 *  resizing when live-display content arrives) is not a user action, so it must
+	 *  not pollute the undo stack (a streaming execution would otherwise bury real
+	 *  edits under dozens of reflow frames). Routes through the SAME durable-layout
+	 *  primitive as `recordEdit`'s layout path, just skipping `pushHistory`. */
+	persistLayoutEdit(mutateLayout: LayoutMutator): void {
+		const before = this.layoutCode;
+		this.applyLayoutChange(diffLayoutOps(before, mutateLayout(before)));
+	}
+
 	private recordGesture(ops: EditOp[], mutateLayout: LayoutMutator, typingKey: string | undefined): void {
 		// Layout-only gesture (drag, resize, collapse): no source op, no
 		// preflight (the logic lock gates source mutations only). It is durable

@@ -18,6 +18,7 @@
 	import { createPortContextMenu, buildPortMenuItems } from "$lib/utils/port-context-menu";
 	import { portMarkerStyle } from "$lib/utils/port-marker";
 	import ExecutionInspector from './ExecutionInspector.svelte';
+	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "$lib/constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
 	import StoredFilePreview from './StoredFilePreview.svelte';
 	import type { StoredFileWire } from "../../../../shared/protocol";
@@ -29,6 +30,10 @@
 		data: {
 			label: string | null;
 			nodeType: NodeType;
+			/// Simplified view: render as a fixed square (icon + type label,
+			/// one in/out dot), no ports/config/body. Execution overlays
+			/// (status glyph, inspector, glow) are kept.
+			simplified?: boolean;
 			config: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
@@ -232,6 +237,20 @@
 		if (typeConfig.setupGuide && typeConfig.setupGuide.length > 0) return true;
 		return false;
 	});
+
+	// The THREE live-display parts, each a single predicate that is the ONE source
+	// of truth for "is this part present". Both the `hasLiveDisplay` boolean (which
+	// decides square-vs-card) and the `liveDisplay` renderer gate on these exact
+	// flags, so a part can never render without growing the card, or be counted
+	// without rendering. Add a new live-display kind = add a flag here and a branch
+	// in `liveDisplay`, and `hasLiveDisplay` picks it up for free.
+	const showBodyFeed = $derived(!!data.bodyFeed && (data.bodyFeed.state === 'error' || data.bodyFeed.items.length > 0));
+	const showDebugDisplay = $derived(!!(typeConfig.features?.showDebugPreview && debugDataJson));
+	const showFileDisplay = $derived(!!((typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink) && storedInputFile));
+	// Simplified view: a node with any live-display part (an infra/trigger feed, a
+	// debug preview, an image/file preview) is drawn as a card showing that display
+	// instead of a bare square.
+	const hasLiveDisplay = $derived(showBodyFeed || showDebugDisplay || showFileDisplay);
 
 	// Get expanded state from config (persisted), default collapsed for regular nodes
 	const expanded = $derived((data.config?.expanded as boolean) ?? false);
@@ -710,9 +729,198 @@
 
 </script>
 
+<!-- The live-display content (infra/trigger feed, debug preview, image/file
+     preview) rendered the SAME way in the full body and the simplified card,
+     so the two never drift. `actionBtn` is its helper. Defined at the top
+     level so both render branches can call it. -->
+{#snippet actionBtn(item: LiveDataItem)}
+	{#if item.action}
+		<button
+			type="button"
+			class="mt-1 text-[10px] px-2 py-0.5 rounded border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-700"
+			onclick={(e) => {
+				e.stopPropagation();
+				const action = item.action!;
+				const ev = new CustomEvent('weft-signal-action', {
+					detail: { nodeId: id, actionKind: action.actionKind, payload: action.payload, confirm: action.confirm },
+					bubbles: true,
+				});
+				(e.currentTarget as HTMLElement).dispatchEvent(ev);
+			}}
+		>
+			{item.action.label}
+		</button>
+	{/if}
+{/snippet}
+
+{#snippet bodyFeedDisplay()}
+	{#if data.bodyFeed}
+		{#if data.bodyFeed.state === 'error'}
+			<div class="flex items-start gap-1.5 text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1.5">
+				<span class="font-medium shrink-0">Error</span>
+				<span class="break-all">{data.bodyFeed.error}</span>
+			</div>
+		{:else if data.bodyFeed.items.length > 0}
+			<div class="space-y-2">
+				{#each data.bodyFeed.items as item}
+					{#if item.type === 'image' && typeof item.data === 'string'}
+						<div class="live-data-item">
+							<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
+							<img src={item.data} alt={item.label} class="w-full rounded border border-zinc-200 mt-1" />
+							{@render actionBtn(item)}
+						</div>
+					{:else if item.type === 'text'}
+						<div class="live-data-item">
+							<span class="text-[10px] text-muted-foreground font-medium block mb-1">{item.label}</span>
+							<div class="relative">
+								<div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 pr-7 break-all border border-zinc-200 select-text cursor-text">{item.data}</div>
+								<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
+							</div>
+							{@render actionBtn(item)}
+						</div>
+					{:else if item.type === 'secret'}
+						{@const revealed = revealedSecrets[item.label] ?? false}
+						<div class="live-data-item">
+							<span class="text-[10px] text-muted-foreground font-medium block mb-1">{item.label}</span>
+							<div class="relative">
+								<div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 pr-12 break-all border border-zinc-200 select-text cursor-text">
+									{#if revealed}{item.data}{:else}{'•'.repeat(Math.min(String(item.data).length, 32))}{/if}
+								</div>
+								<button
+									type="button"
+									class="absolute top-1 right-7 p-0.5 text-zinc-500 hover:text-zinc-700"
+									title={revealed ? 'Hide' : 'Reveal'}
+									onclick={(e) => { e.stopPropagation(); revealedSecrets = { ...revealedSecrets, [item.label]: !revealed }; }}
+								>
+									{#if revealed}<EyeOff class="w-3 h-3" />{:else}<Eye class="w-3 h-3" />{/if}
+								</button>
+								<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
+							</div>
+							{@render actionBtn(item)}
+						</div>
+					{:else if item.type === 'progress' && typeof item.data === 'number'}
+						<div class="live-data-item">
+							<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
+							<div class="w-full h-1.5 bg-zinc-200 rounded-full mt-1 overflow-hidden">
+								<div class="h-full bg-emerald-500 rounded-full transition-all" style="width: {Math.round(item.data * 100)}%"></div>
+							</div>
+							{@render actionBtn(item)}
+						</div>
+					{/if}
+				{/each}
+			</div>
+		{/if}
+	{/if}
+{/snippet}
+
+<!-- The simplified-view live display: the body feed plus the debug/image
+     previews, shown together under the card header. The full builder view
+     renders bodyFeed (always) and debug/image (expanded-gated) separately; the
+     bodyFeed markup is shared via {@render bodyFeedDisplay}. -->
+{#snippet liveDisplay()}
+	{#if showBodyFeed}{@render bodyFeedDisplay()}{/if}
+	<!-- Gate on the nullable value itself (not just the flag) so the type narrows
+	     to non-null at the use site; the flag stays the card-vs-square authority. -->
+	{#if showDebugDisplay && debugDataJson}
+		<div class="relative">
+			<CopyButton text={debugDataJson} class="absolute top-1 right-1 z-10 nodrag" />
+			<pre class="debug-data-container nodrag nopan nowheel select-text cursor-text">{debugDataJson}</pre>
+		</div>
+	{/if}
+	{#if showFileDisplay && storedInputFile}
+		<StoredFilePreview file={storedInputFile} mode={typeConfig.features?.showImagePreview ? 'image' : 'link'} />
+	{/if}
+{/snippet}
+
+{#if data.simplified}
+	<!-- Simplified view. A bare node is a square: icon, type, editable label, one
+	     in/out dot. A node with LIVE DISPLAY content (infra feed, debug preview,
+	     image) grows into a card that shows that display under the header instead
+	     of staying square. Execution overlays (status glyph, inspector, glow) are
+	     kept; ports/config are not shown; structure is not editable, but the
+	     LABEL can still be renamed by double-click. -->
+	{@const Icon = typeConfig.icon}
+	<Handle
+		type="target"
+		position={Position.Left}
+		id={SIMPLIFIED_IN_HANDLE}
+		style="top: 50%; z-index: 5; {simplifiedDotStyle(typeConfig.color)}"
+	/>
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div
+		bind:this={nodeElement}
+		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''}"
+		style="
+			width: 100%;
+			height: 100%;
+			{hasLiveDisplay ? `min-width: 220px; max-width: ${SIMPLIFIED_CARD_MAX_W_PX}px;` : ''}
+			display: flex;
+			flex-direction: column;
+			align-items: {hasLiveDisplay ? 'stretch' : 'center'};
+			justify-content: {hasLiveDisplay ? 'flex-start' : 'center'};
+			gap: 4px;
+			padding: {SIMPLIFIED_SQUARE_PAD_PX}px;
+			background: rgba(255, 255, 255, 0.95);
+			border: 1px solid {selected ? typeConfig.color : 'rgba(0, 0, 0, 0.08)'};
+			box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05){selected ? `, 0 0 0 1px ${typeConfig.color}20` : ''};
+			backdrop-filter: blur(8px);
+		"
+	>
+		<!-- Status glyph (top-right) + inspector (magnifier), same as full view -->
+		<div class="absolute top-1 right-1 flex items-center gap-0.5 nodrag nopan z-10">
+			{#if displayedStatus}
+				<span class="text-xs leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
+			{/if}
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} label={data.label || typeConfig.label} />
+		</div>
+		<!-- Bare node: the content column is fixed to the square's inner width (the
+		     square side minus the 8px padding each side) so the node measures as a
+		     uniform square regardless of label length (the wrapper is `width:
+		     max-content`). A live-display node stretches to its card width instead,
+		     so the wrapper grows and the layout re-reads the measured size. -->
+		<div class="flex flex-col items-center gap-1 {hasLiveDisplay ? 'self-center' : ''}" style={hasLiveDisplay ? '' : `width: ${SIMPLIFIED_CONTENT_W_PX}px;`}>
+			{#if isInclude}
+				<FileSymlink size={22} class="text-violet-500" />
+			{:else}
+				<Icon size={26} color={typeConfig.color} />
+			{/if}
+			<span class="text-[9px] font-semibold tracking-wide uppercase text-center leading-tight opacity-70 max-w-full truncate" style="color: {typeConfig.color};">
+				{isInclude ? includeName : typeConfig.label}
+			</span>
+			<!-- Editable node label (double-click to rename), all nodes. Defaults to
+			     the SAME label the builder view shows when none is set. -->
+			{#if editingLabel}
+				<input
+					type="text"
+					class="w-full text-[11px] font-medium text-center bg-zinc-100 text-zinc-900 px-1 py-0.5 rounded border border-zinc-200 outline-none focus:border-zinc-400 nodrag nopan"
+					bind:value={labelInput}
+					onblur={saveLabel}
+					onkeydown={handleLabelKeydown}
+					onclick={(e) => e.stopPropagation()}
+				/>
+			{:else}
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<p class="text-[11px] font-medium text-zinc-700 text-center leading-tight cursor-text hover:bg-black/5 px-1 rounded max-w-full truncate nodrag nopan" ondblclick={startEditLabel} title="Double-click to rename">{data.label || `${typeConfig.label} Node`}</p>
+			{/if}
+		</div>
+		{#if hasLiveDisplay}
+			<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+			<div class="mt-1 pt-2 border-t border-black/5 nodrag nopan nowheel overflow-auto" style="max-height: 280px;" onclick={(e) => e.stopPropagation()}>
+				{@render liveDisplay()}
+			</div>
+		{/if}
+	</div>
+	<Handle
+		type="source"
+		position={Position.Right}
+		id={SIMPLIFIED_OUT_HANDLE}
+		style="top: 50%; z-index: 5; {simplifiedDotStyle(typeConfig.color)}"
+	/>
+{:else}
+
 <!-- Node Resizer - only visible when selected AND expanded -->
 {#if expanded}
-<NodeResizer 
+<NodeResizer
 	minWidth={200} 
 	minHeight={minResizeHeight}
 	isVisible={selected}
@@ -958,103 +1166,13 @@
 		</div>
 
 		<!-- Live Data Items - always visible regardless of expanded state.
-		     One render branch per item.type. Adding a new presentation
-		     kind: extend LiveDataItem.type and add a branch here. The
-		     action button (if any) is shared via the {@render actionBtn}
-		     snippet so it doesn't drift across kinds. -->
-		{#snippet actionBtn(item: LiveDataItem)}
-			{#if item.action}
-				<button
-					type="button"
-					class="mt-1 text-[10px] px-2 py-0.5 rounded border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-700"
-					onclick={(e) => {
-						e.stopPropagation();
-						const action = item.action!;
-						// Confirmation prompt is owned by the host
-						// (VS Code QuickPick); the webview just fires
-						// the action message with the `confirm` string
-						// attached.
-						const ev = new CustomEvent('weft-signal-action', {
-							detail: {
-								nodeId: id,
-								actionKind: action.actionKind,
-								payload: action.payload,
-								confirm: action.confirm,
-							},
-							bubbles: true,
-						});
-						(e.currentTarget as HTMLElement).dispatchEvent(ev);
-					}}
-				>
-					{item.action.label}
-				</button>
-			{/if}
-		{/snippet}
-		{#if data.bodyFeed}
-			{#if data.bodyFeed.state === 'error'}
-				<div class="mt-2 pt-2 border-t live-data-container">
-					<div class="flex items-start gap-1.5 text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1.5">
-						<span class="font-medium shrink-0">Error</span>
-						<span class="break-all">{data.bodyFeed.error}</span>
-					</div>
-				</div>
-			{:else if data.bodyFeed.items.length > 0}
-				<div class="mt-2 pt-2 border-t live-data-container space-y-2">
-					{#each data.bodyFeed.items as item}
-						{#if item.type === 'image' && typeof item.data === 'string'}
-							<div class="live-data-item">
-								<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
-								<img src={item.data} alt={item.label} class="w-full rounded border border-zinc-200 mt-1" />
-								{@render actionBtn(item)}
-							</div>
-						{:else if item.type === 'text'}
-							<div class="live-data-item">
-								<span class="text-[10px] text-muted-foreground font-medium block mb-1">{item.label}</span>
-								<div class="relative">
-									<div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 pr-7 break-all border border-zinc-200 select-text cursor-text">{item.data}</div>
-									<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
-								</div>
-								{@render actionBtn(item)}
-							</div>
-						{:else if item.type === 'secret'}
-							{@const revealed = revealedSecrets[item.label] ?? false}
-							<div class="live-data-item">
-								<span class="text-[10px] text-muted-foreground font-medium block mb-1">{item.label}</span>
-								<div class="relative">
-									<div class="w-full text-[10px] font-mono bg-zinc-100 rounded px-2 py-1.5 pr-12 break-all border border-zinc-200 select-text cursor-text">
-										{#if revealed}{item.data}{:else}{'•'.repeat(Math.min(String(item.data).length, 32))}{/if}
-									</div>
-									<button
-										type="button"
-										class="absolute top-1 right-7 p-0.5 text-zinc-500 hover:text-zinc-700"
-										title={revealed ? 'Hide' : 'Reveal'}
-										onclick={(e) => {
-											e.stopPropagation();
-											revealedSecrets = { ...revealedSecrets, [item.label]: !revealed };
-										}}
-									>
-										{#if revealed}
-											<EyeOff class="w-3 h-3" />
-										{:else}
-											<Eye class="w-3 h-3" />
-										{/if}
-									</button>
-									<CopyButton text={String(item.data)} class="absolute top-1 right-1" />
-								</div>
-								{@render actionBtn(item)}
-							</div>
-						{:else if item.type === 'progress' && typeof item.data === 'number'}
-							<div class="live-data-item">
-								<span class="text-[10px] text-muted-foreground font-medium">{item.label}</span>
-								<div class="w-full h-1.5 bg-zinc-200 rounded-full mt-1 overflow-hidden">
-									<div class="h-full bg-emerald-500 rounded-full transition-all" style="width: {Math.round(item.data * 100)}%"></div>
-								</div>
-								{@render actionBtn(item)}
-							</div>
-						{/if}
-					{/each}
-				</div>
-			{/if}
+		     One render branch per item.type. The action button (if any) is
+		     shared via the top-level {@render actionBtn} snippet so it doesn't
+		     drift across kinds (and is reused by the simplified-view card). -->
+		{#if showBodyFeed}
+			<div class="mt-2 pt-2 border-t live-data-container">
+				{@render bodyFeedDisplay()}
+			</div>
 		{/if}
 
 		<!-- Expanded Config Fields -->
@@ -1342,6 +1460,7 @@
 		/>
 	</svg>
 </Handle>
+{/if}
 
 <!-- Port context menu is rendered via $effect on document.body to avoid CSS transform issues -->
 
