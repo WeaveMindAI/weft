@@ -29,6 +29,12 @@ const STATUS_ALIVE: &str = "alive";
 const STATUS_DONE: &str = "done";
 const STATUS_DEAD: &str = "dead";
 
+/// Minimal projection of the `worker_pod` table: only the columns the stale /
+/// terminal reapers act on. The e2e rig reads a DIFFERENT projection of the same
+/// table (it needs `status` + `terminal_at_unix`, which production reads via
+/// WHERE clauses, not struct fields), so the two are honestly-distinct read
+/// shapes, not a fragmented concept; keep them separate and grep-linked.
+/// SYNC: worker_pod columns <-> crates/weft-e2e/src/platform.rs (WorkerPodRow)
 #[derive(Debug, Clone)]
 pub struct WorkerPodRow {
     pub pod_name: String,

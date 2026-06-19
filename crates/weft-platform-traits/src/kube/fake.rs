@@ -43,10 +43,6 @@ pub enum KubeCall {
         name: String,
         opts: super::DeleteOpts,
     },
-    DeploymentExists {
-        namespace: String,
-        name: String,
-    },
     PodWaitingReason {
         namespace: String,
         pod_name: String,
@@ -207,29 +203,30 @@ impl KubeReader for FakeKube {
             namespace: namespace.to_string(),
             selector: selector.to_string(),
         });
-        Ok(inner.workloads.get(namespace).cloned().unwrap_or_default())
-    }
-
-    async fn deployment_exists(&self, namespace: &str, name: &str) -> super::DeploymentLookup {
-        use super::DeploymentLookup;
-        let mut inner = self.inner.lock();
-        inner.calls.push(KubeCall::DeploymentExists {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-        });
-        let exists = inner
+        // Honor the label selector the way kubectl's `-l` does for our
+        // calls. Route through the SAME `parse_selector` the writer side
+        // (`delete_by_label`) uses, so both paths reject unsupported grammar
+        // identically: a selector/label MISMATCH (e.g. asking for `role=infra`
+        // when the workload is labeled `role=infra-supervisor`) and a malformed
+        // term both surface here instead of silently matching everything, which
+        // is exactly the class of bug this fake must be able to catch. An empty
+        // selector means "no filter" (match all), so handle it before
+        // delegating (`parse_selector` loudly rejects empty for the writer).
+        let needles = if selector.is_empty() {
+            Vec::new()
+        } else {
+            parse_selector(selector)
+        };
+        Ok(inner
             .workloads
             .get(namespace)
             .map(|ws| {
                 ws.iter()
-                    .any(|w| w.name == name && w.kind == WorkloadKind::Deployment)
+                    .filter(|w| label_matches(&w.labels, &needles))
+                    .cloned()
+                    .collect()
             })
-            .unwrap_or(false);
-        if exists {
-            DeploymentLookup::Exists
-        } else {
-            DeploymentLookup::NotFound
-        }
+            .unwrap_or_default())
     }
 
     async fn pod_waiting_reason(
@@ -468,6 +465,41 @@ mod tests {
         let ws = result.list_replica_state("ns", "").await.unwrap();
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].name, "inst-a");
+    }
+
+    /// The whole point of routing `list_replica_state` through the selector
+    /// filter: a selector whose value does not match the workload's label must
+    /// return nothing, exactly as real kubectl `-l` does. This pins the bug
+    /// class where the reaper asked for `role=infra` while the supervisor is
+    /// labeled `role=infra-supervisor`, which silently matched nothing in prod;
+    /// the fake must reproduce that miss so a contract test can catch the drift.
+    #[tokio::test]
+    async fn list_filters_by_selector_value() {
+        let mut labels = HashMap::new();
+        labels.insert("weft.dev/role".into(), "infra-supervisor".into());
+        let sup = WorkloadReplicaState {
+            kind: WorkloadKind::Deployment,
+            name: "weft-infra-supervisor".into(),
+            namespace: "ns".into(),
+            desired: 1,
+            ready: 1,
+            labels,
+        };
+        let k = FakeKube::new();
+        k.set_workloads("ns", vec![sup]);
+        let r: &dyn KubeReader = &*k;
+        // Wrong value: the supervisor is `role=infra-supervisor`, not `role=infra`.
+        let miss = r.list_replica_state("ns", "weft.dev/role=infra").await.unwrap();
+        assert!(miss.is_empty(), "wrong selector value must match nothing");
+        // Right value: matches.
+        let hit = r
+            .list_replica_state("ns", "weft.dev/role=infra-supervisor")
+            .await
+            .unwrap();
+        assert_eq!(hit.len(), 1);
+        // Empty selector means no filter: match all.
+        let all = r.list_replica_state("ns", "").await.unwrap();
+        assert_eq!(all.len(), 1);
     }
 
     #[tokio::test]

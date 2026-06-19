@@ -2379,7 +2379,7 @@ async fn wipe_project_signals(
 
 /// Body for `POST /projects/{id}/deactivate`.
 ///
-/// `preservationMode` controls what survives the inactive window:
+/// `mode` controls what survives the inactive window:
 ///   - `wipe`:      every signal row + cancel every color
 ///                  (suspended ones too). Fresh slate on reactivate.
 ///   - `hibernate`: signal rows stay; gate parks fires for the

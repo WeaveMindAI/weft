@@ -11,6 +11,15 @@ use std::time::Duration;
 
 use crate::state::DispatcherState;
 
+/// The per-tenant infra-supervisor Deployment's name and its
+/// `weft.dev/role` label value, as minted in `tenant_namespace.rs`.
+/// The supervisor reaper references both so its label selector and
+/// its name filter cannot drift from each other. NOT the bare `infra`
+/// role, which tags the user's infra NODES in project namespaces.
+/// SYNC: SUPERVISOR_NAME/SUPERVISOR_ROLE <-> crate::tenant_namespace (YAML literals: name `weft-infra-supervisor`, `weft.dev/role: infra-supervisor`)
+pub(crate) const SUPERVISOR_NAME: &str = "weft-infra-supervisor";
+pub(crate) const SUPERVISOR_ROLE: &str = "infra-supervisor";
+
 /// Spawn every reaper. Returns immediately; the reapers run for the
 /// lifetime of the process.
 pub fn spawn_all(state: DispatcherState) {
@@ -409,38 +418,128 @@ async fn sweep_one_tenant(state: &DispatcherState, tenant_id: &str) -> anyhow::R
     // so a concurrent sync waits behind us). Every skip path drops
     // `tx` (rollback) instead, since nothing was written and the
     // lock should release immediately. NotFound/Errored are skips.
-    use weft_platform_traits::{DeploymentLookup, WorkloadKind};
-    match state.kube.deployment_exists(&namespace, "weft-infra-supervisor").await {
-        DeploymentLookup::NotFound => return Ok(()),
-        DeploymentLookup::Errored(msg) => {
+    use weft_platform_traits::WorkloadKind;
+    // Read the supervisor's current replica state. Only scale (and log a reap)
+    // when it is actually UP (desired > 0). Re-scaling an already-zero
+    // deployment every 60s is a pointless kubectl call AND a lie in the log
+    // ("reaped" when nothing changed); gating on the live replica count makes
+    // the sweep a true no-op once the supervisor is down. The selector and the
+    // name filter both reference SUPERVISOR_* so they cannot drift apart, and
+    // the selector value MUST match the label the supervisor Deployment is
+    // minted with in tenant_namespace.rs (`weft.dev/role: infra-supervisor`);
+    // the bare `infra` role belongs to the user's infra NODES in project
+    // namespaces, a different concept that would match nothing here.
+    let states = match state
+        .kube
+        .list_replica_state(&namespace, &format!("weft.dev/role={SUPERVISOR_ROLE}"))
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
             tracing::warn!(
                 target: "weft_dispatcher::reaper",
                 tenant = %tenant_id,
-                error = %msg,
-                "kubectl get supervisor deployment errored; skipping this tenant"
+                error = %e,
+                "list supervisor replica state errored; skipping this tenant"
             );
             return Ok(());
         }
-        DeploymentLookup::Exists => {}
+    };
+    if !supervisor_needs_reap(&states) {
+        // Deployment absent (never provisioned / already removed) or already
+        // scaled to zero: true no-op, no scale call, no log. Drop `tx`.
+        return Ok(());
     }
-    if let Err(e) = state
+    match state
         .kube
-        .scale_workload(&namespace, WorkloadKind::Deployment, "weft-infra-supervisor", 0)
+        .scale_workload(&namespace, WorkloadKind::Deployment, SUPERVISOR_NAME, 0)
         .await
     {
-        tracing::warn!(
-            target: "weft_dispatcher::reaper",
-            tenant = %tenant_id,
-            error = %e,
-            "supervisor scale-to-0 failed"
-        );
-    } else {
-        tracing::info!(
-            target: "weft_dispatcher::reaper",
-            tenant = %tenant_id,
-            "reaped idle infra-supervisor (scaled to 0)"
-        );
+        Err(e) => {
+            // Errored is a skip, like every other early return: drop `tx`
+            // (rollback) so the advisory lock releases and the next sweep
+            // retries. Committing here would persist any future write added
+            // to this tx despite the scale having failed.
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                tenant = %tenant_id,
+                error = %e,
+                "supervisor scale-to-0 failed"
+            );
+            Ok(())
+        }
+        Ok(()) => {
+            // Commit only after a successful scale (holds the lock across the
+            // kubectl call so a concurrent sync waits behind us).
+            tx.commit().await?;
+            tracing::info!(
+                target: "weft_dispatcher::reaper",
+                tenant = %tenant_id,
+                "reaped idle infra-supervisor (scaled to 0)"
+            );
+            Ok(())
+        }
     }
-    tx.commit().await?;
-    Ok(())
+}
+
+/// Pure decision: given the replica states returned for the
+/// supervisor's role selector, should the reaper scale the supervisor
+/// Deployment down? True only when the supervisor Deployment is
+/// present AND currently up (`desired > 0`). Absent (never
+/// provisioned / already removed) or already at zero → false (no-op).
+/// Extracted from `sweep_one_tenant` so the workload-selection +
+/// desired-gate logic (where a wrong selector silently matched
+/// nothing) is unit-testable without a Postgres rig.
+fn supervisor_needs_reap(states: &[weft_platform_traits::WorkloadReplicaState]) -> bool {
+    use weft_platform_traits::WorkloadKind;
+    states
+        .iter()
+        .find(|s| s.name == SUPERVISOR_NAME && s.kind == WorkloadKind::Deployment)
+        .is_some_and(|s| s.desired > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use weft_platform_traits::{WorkloadKind, WorkloadReplicaState};
+
+    fn supervisor(desired: i64) -> WorkloadReplicaState {
+        let mut labels = HashMap::new();
+        labels.insert("weft.dev/role".into(), SUPERVISOR_ROLE.into());
+        WorkloadReplicaState {
+            kind: WorkloadKind::Deployment,
+            name: SUPERVISOR_NAME.into(),
+            namespace: "wm-alice".into(),
+            desired,
+            ready: desired,
+            labels,
+        }
+    }
+
+    #[test]
+    fn reaps_when_up() {
+        assert!(supervisor_needs_reap(&[supervisor(1)]));
+    }
+
+    #[test]
+    fn no_op_when_already_zero() {
+        assert!(!supervisor_needs_reap(&[supervisor(0)]));
+    }
+
+    #[test]
+    fn no_op_when_absent() {
+        assert!(!supervisor_needs_reap(&[]));
+    }
+
+    /// The selector that feeds this decision must return the supervisor by its
+    /// real role label. A decoy workload under a DIFFERENT name (e.g. a user
+    /// infra node that leaked into the same list) must never be mistaken for
+    /// the supervisor: only the exact `SUPERVISOR_NAME` Deployment counts.
+    #[test]
+    fn ignores_non_supervisor_workloads() {
+        let mut decoy = supervisor(1);
+        decoy.name = "some-user-infra-node".into();
+        assert!(!supervisor_needs_reap(&[decoy]));
+    }
 }

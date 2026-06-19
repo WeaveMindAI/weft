@@ -1,0 +1,15 @@
+# Project: e2e_custom_node
+# Uses a project-local custom node (Multiply, defined under nodes/multiply/).
+# ExecPython supplies the two operands; Multiply produces the product; Debug
+# receives it. Proves a user-authored node compiles into the worker and runs.
+
+operands = ExecPython() -> (a: Number, b: Number) {
+  code: "return {'a': 6, 'b': 7}"
+}
+
+mul = Multiply
+mul.a = operands.a
+mul.b = operands.b
+
+out = Debug
+out.data = mul.product

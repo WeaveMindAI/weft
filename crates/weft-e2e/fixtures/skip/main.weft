@@ -1,0 +1,18 @@
+# Project: e2e_skip
+# Null-propagation: a Gate whose `pass` is false closes its `value` output, so
+# the downstream Debug never runs (it is SKIPPED, not failed). ExecPython emits
+# both the literal value and the boolean gate signal inline.
+#
+# The rig asserts: the gate ran, but `out` was skipped (closed input), never
+# started. This is the core "branch off on null" behavior of the language.
+
+source = ExecPython() -> (value: String, pass: Boolean) {
+  code: "return {'value': 'never-delivered', 'pass': False}"
+}
+
+gate = Gate
+gate.value = source.value
+gate.pass = source.pass
+
+out = Debug
+out.data = gate.value

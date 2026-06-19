@@ -1,0 +1,68 @@
+[package]
+name = "weft-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Layer-4 end-to-end test rig. This crate drives a REAL running weft cluster
+# (dispatcher + listener + worker pods on kind) and asserts behavior through the
+# public API, exactly as a user / the outside world would. Because it needs the
+# cluster up, the tests are gated behind the `e2e` feature, OFF by default: the
+# whole library and its tests compile under `cargo test --workspace`, but the
+# test bodies are absent without the feature, so the default workspace run never
+# needs a cluster. Run the rig with:
+#
+#   cargo test -p weft-e2e --features e2e -- --test-threads=1
+#
+# The rig invokes `setup.sh` once at suite start to bring the cluster to current
+# code (idempotent), then each test prepares an isolated project, drives it, and
+# asserts via the dispatcher's public API.
+#
+# src/   = the toolkit (helper library; all "talk to the system" logic).
+# tests/ = the tests (free-form Rust built on the toolkit).
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# OFF by default. Gates the live-cluster test bodies and the runtime they need.
+# Without it the crate still type-checks (the toolkit is always compiled) but no
+# test touches a cluster. `sqlx` is pulled in ONLY here: the platform layer
+# reads the cluster's Postgres directly (a host-side, test-only reach-behind the
+# public API, never shipped), so its weight lands solely on the e2e build, not
+# on `cargo test --workspace`.
+e2e = ["dep:sqlx", "dep:weft-task-store"]
+
+[dependencies]
+# Light real types reused for the wire-shape safety net. weft-core is
+# dependency-light; we deliberately do NOT depend on weft-dispatcher (heavy:
+# sqlx + k8s) even though it re-exports DispatcherEvent. The event envelope is
+# mirrored in src/event.rs with a SYNC marker instead, so the safety net stays
+# where it is cheap (the value types) without dragging the server's whole tree
+# into the test build.
+weft-core = { workspace = true }
+
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+
+# Optional: only compiled under the `e2e` feature (see [features]). The platform
+# layer (src/platform.rs) connects to the cluster's Postgres to observe
+# worker-pod identity per execution and to backdate idle-timestamps so the
+# existing wall-clock reapers fire deterministically in a test.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
+
+# Optional: only under `e2e`. Source of the worker-pod table shape and the
+# reaper threshold constants (e.g. HEARTBEAT_STALE_SECS) the backdate helpers
+# read, so "old enough" tracks the real source instead of a hard-coded number.
+# Dependency-light (no k8s / no dispatcher tree); safe to pull into the rig.
+weft-task-store = { workspace = true, optional = true }

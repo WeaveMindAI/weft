@@ -59,17 +59,6 @@ pub struct WorkloadReplicaState {
     pub labels: HashMap<String, String>,
 }
 
-/// Three-valued lookup for `KubeReader::deployment_exists`.
-/// Distinguishes "not there" (legitimate no-op) from "kubectl
-/// could not answer" (apiserver flap, auth blip, etc.). Callers
-/// log Errored loudly and back off; NotFound is silent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeploymentLookup {
-    Exists,
-    NotFound,
-    Errored(String),
-}
-
 /// Options for `KubeWriter::delete_named`. The two orthogonal
 /// axes a `kubectl delete` cares about:
 ///   - `wait`: block until the resource is gone (`--wait=true`)
@@ -118,18 +107,17 @@ impl DeleteOpts {
 pub trait KubeReader: Send + Sync {
     /// List Deployment + StatefulSet replica state in a namespace,
     /// filtered by `selector` (label selector passed to kubectl's
-    /// `-l`). Pass `weft.dev/role=infra` for supervisor reads.
+    /// `-l`). The selector value must match the labels the target
+    /// workloads were minted with: `weft.dev/role=infra` for the
+    /// user's infra NODES (project namespaces), `infra-supervisor`
+    /// for the supervisor's OWN Deployment (tenant namespace). These
+    /// are distinct concepts; an exact-match selector for one will
+    /// not match the other.
     async fn list_replica_state(
         &self,
         namespace: &str,
         selector: &str,
     ) -> Result<Vec<WorkloadReplicaState>>;
-
-    /// Three-valued: Exists / NotFound / Errored. `kubectl scale`
-    /// doesn't accept `--ignore-not-found`, so callers that need
-    /// to scale a Deployment that might not exist check existence
-    /// first and route around NotFound.
-    async fn deployment_exists(&self, namespace: &str, name: &str) -> DeploymentLookup;
 
     /// The first container's `state.waiting.reason` for a pod, or
     /// `None` if the container isn't waiting (running / not yet

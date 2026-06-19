@@ -62,9 +62,17 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         // either fails the project is left in an inconsistent state
         // (deactivate half-done OR registration alive while signals
         // wiped). Bubble loudly so the user sees what to fix.
+        // `/deactivate` takes a required `DeactivateSpec` body (the handler's
+        // `Json` extractor rejects an empty request). `rm` always means a full
+        // teardown, so send the explicit wipe spec: drop every signal and
+        // cancel running executions (wipe is only legal with cancel). Same
+        // canonical body `weft deactivate` posts.
         progress.dispatcher_call_start(&format!("/projects/{project_id}/deactivate"));
         client
-            .post_empty(&format!("/projects/{project_id}/deactivate"))
+            .post_with_body(
+                &format!("/projects/{project_id}/deactivate"),
+                &serde_json::json!({ "mode": "wipe", "runningPolicy": "cancel" }),
+            )
             .await
             .context("deactivate")?;
         progress.dispatcher_call_done(serde_json::json!({ "step": "deactivate" }));

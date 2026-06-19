@@ -1,0 +1,16 @@
+# Project: e2e_reach_out_feed
+# Reach-out trigger: the system DIALS OUT to an SSE feed and fires per event.
+# A project-local custom trigger (TestSseTrigger) subscribes to the fake SSE
+# server the rig stands up; each pushed event fires a fresh execution carrying
+# the event's `value` to Debug.
+#
+# __E2E_FAKE_URL__ is substituted by the test with the fake SSE feed's
+# cluster-reachable URL before activating.
+
+feed = TestSseTrigger {
+  url: "__E2E_FAKE_URL__"
+  event_name: "tick"
+}
+
+out = Debug
+out.data = feed.value

@@ -63,10 +63,19 @@ pub async fn renew_tenant_listener(
     pod_id: &str,
 ) -> Result<bool> {
     let leased_until = now_unix() + LEASE_DURATION_SECS;
+    // Only renew rows that are still LIVE (starting / alive). A row left in
+    // `stopping` means a reap began and did not finish (the owner crashed
+    // between `claim_stopping` and `delete_row`, or `backend.stop` hung).
+    // Renewing such a row keeps its lease alive forever, which defeats the
+    // crash-recovery in `decide_under_lock` (it only adopts a `stopping` row
+    // once the lease lapses) and wedges every `with_listener` into waiting on a
+    // stop that never completes. Letting a stuck `stopping` lease lapse IS the
+    // recovery: the next ensure adopts it, re-runs the idempotent stop, and
+    // respawns.
     let res = sqlx::query(
         "UPDATE tenant_listener \
          SET leased_until_unix = $1 \
-         WHERE tenant_id = $2 AND owner_pod_id = $3",
+         WHERE tenant_id = $2 AND owner_pod_id = $3 AND state <> 'stopping'",
     )
     .bind(leased_until)
     .bind(tenant_id)

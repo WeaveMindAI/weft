@@ -141,31 +141,6 @@ impl KubeReader for KubectlClient {
         Ok(out)
     }
 
-    async fn deployment_exists(&self, namespace: &str, name: &str) -> super::DeploymentLookup {
-        use super::DeploymentLookup;
-        let out = Command::new("kubectl")
-            .args(["-n", namespace, "get", "deployment", name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => DeploymentLookup::Exists,
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                if stderr.contains("NotFound") || stderr.contains("not found") {
-                    DeploymentLookup::NotFound
-                } else {
-                    DeploymentLookup::Errored(format!(
-                        "kubectl status={:?} stderr={}",
-                        o.status, stderr
-                    ))
-                }
-            }
-            Err(e) => DeploymentLookup::Errored(format!("kubectl run failed: {e}")),
-        }
-    }
-
     async fn pod_waiting_reason(
         &self,
         namespace: &str,

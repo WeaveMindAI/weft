@@ -22,8 +22,7 @@ pub mod kube;
 // without leaking the internal module layout. Fakes stay gated.
 pub use clock::{Clock, SystemClock};
 pub use kube::{
-    DeleteOpts, DeploymentLookup, KubeClient, KubeReader, KubeWriter, WorkloadKind,
-    WorkloadReplicaState,
+    DeleteOpts, KubeClient, KubeReader, KubeWriter, WorkloadKind, WorkloadReplicaState,
 };
 #[cfg(any(test, feature = "test-helpers"))]
 pub use clock::FakeClock;

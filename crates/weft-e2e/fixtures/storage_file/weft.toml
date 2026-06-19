@@ -1,0 +1,4 @@
+[package]
+name = "e2e_storage_file"
+id = "00000000-0000-0000-0000-000000000009"
+version = "0.1.0"

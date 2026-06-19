@@ -1,0 +1,18 @@
+{
+  "type": "MiniService",
+  "label": "Mini Service",
+  "description": "A minimal infra node: a single-container HTTP sidecar serving /health and /outputs. Used by the e2e rig to exercise the full infra lifecycle (provision, run, read outputs, terminate) with the smallest possible backing service.",
+  "category": "Custom",
+  "tags": ["infra", "e2e"],
+  "icon": "Server",
+  "color": "#22c55e",
+  "inputs": [],
+  "outputs": [
+    { "name": "endpointUrl", "type": "String" },
+    { "name": "status", "type": "String" }
+  ],
+  "fields": [],
+  "requires_infra": true,
+  "images": ["images/mini_service"],
+  "features": {}
+}

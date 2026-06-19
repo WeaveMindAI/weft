@@ -1,0 +1,23 @@
+# Project: e2e_loop_map
+# A sequential map loop: Range produces [0,1,2,3,4]; the loop doubles each
+# element; the assembled List[Number | Null] flows to Debug.
+#
+# The rig asserts: the loop launched 5 iterations and the final list is
+# [0,2,4,6,8].
+
+nums = Range { to: 5 }
+
+doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
+  parallel: false
+  over: ["values"]
+
+  step = ExecPython(n: Number) -> (out: Number) {
+    code: "return {'out': n * 2}"
+  }
+  step.n = self.values
+  self.results = step.out
+}
+doubler.values = nums.values
+
+out = Debug
+out.data = doubler.results

@@ -60,6 +60,7 @@ pub async fn ensure_supervisor_deployment(
     kube.apply_yaml(&manifest).await
 }
 
+// SYNC: render_supervisor_deployment (name `weft-infra-supervisor`, `weft.dev/role: infra-supervisor`) <-> crate::reaper::{SUPERVISOR_NAME, SUPERVISOR_ROLE}
 pub fn render_supervisor_deployment(
     namespace: &str,
     // SafeLabel: the type forces sanitization before this id reaches
@@ -376,8 +377,24 @@ mod tests {
     #[test]
     fn supervisor_render_carries_tenant_label() {
         let yaml = render_supervisor_deployment("wm-alice", &sl("alice"), "img:1");
-        assert!(yaml.contains("weft.dev/role: infra-supervisor"));
         assert!(yaml.contains("weft.dev/tenant: \"alice\""));
+        // The reaper finds + scales this Deployment by the SAME name and role
+        // label it is minted with here. If the YAML and the reaper's constants
+        // drift, the reaper's exact-match selector silently matches nothing and
+        // the supervisor never gets reaped. Pin both sides to the constants,
+        // matching whole lines (a `role: infra` substring would otherwise match
+        // `role: infra-supervisor`, defeating the check), so a drift fails THIS
+        // test, not production.
+        let role_line = format!("weft.dev/role: {}", crate::reaper::SUPERVISOR_ROLE);
+        let name_line = format!("name: {}", crate::reaper::SUPERVISOR_NAME);
+        assert!(
+            yaml.lines().any(|l| l.trim() == role_line),
+            "no exact role line {role_line:?} in:\n{yaml}"
+        );
+        assert!(
+            yaml.lines().any(|l| l.trim() == name_line),
+            "no exact name line {name_line:?} in:\n{yaml}"
+        );
     }
 
     #[test]

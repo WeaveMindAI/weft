@@ -3423,6 +3423,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-e2e"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "toml",
+ "tracing",
+ "uuid",
+ "weft-core",
+ "weft-task-store",
+]
+
+[[package]]
 name = "weft-engine"
 version = "0.2.0"
 dependencies = [

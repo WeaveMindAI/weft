@@ -16,6 +16,7 @@ members = [
     "crates/weft-infra-supervisor",
     "crates/weft-platform-traits",
     "crates/weft-storage",
+    "crates/weft-e2e",
 ]
 
 [workspace.package]

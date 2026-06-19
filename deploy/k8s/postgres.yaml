@@ -42,6 +42,7 @@ metadata:
   labels:
     weft.dev/scope: local-dev-only
 type: Opaque
+# SYNC: local-dev PG credentials <-> crates/weft-e2e/src/platform.rs (PG_USER/PG_PASSWORD/PG_DBNAME)
 data:
   POSTGRES_USER: d2VmdA==
   POSTGRES_PASSWORD: d2VmdC1sb2NhbC1kZXY=

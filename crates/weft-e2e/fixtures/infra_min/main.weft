@@ -1,0 +1,11 @@
+# Project: e2e_infra_min
+# A minimal infra node: MiniService provisions a tiny HTTP sidecar on k8s. Once
+# the infra is running, a run resolves the sidecar's endpoint, reads its
+# /outputs, and emits `status` to Debug.
+#
+# The rig drives the full lifecycle: infra start -> wait running -> run ->
+# assert status="ready" reached Debug -> infra terminate -> assert cleanup.
+
+svc = MiniService
+out = Debug
+out.data = svc.status

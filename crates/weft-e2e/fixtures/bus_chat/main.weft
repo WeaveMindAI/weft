@@ -1,0 +1,12 @@
+# Project: e2e_bus_chat
+# Two nodes converse over a bus: the host opens a bus and emits its marker, the
+# guest joins it; they exchange a scripted back-and-forth, then the host closes
+# the bus. The rig asserts a bus conversation happened (>=2 participants, >=1
+# message) and the bus closed.
+
+host = BusChatHost
+guest = BusChatGuest
+out = Debug
+
+guest.channel = host.channel
+out.data = host.done

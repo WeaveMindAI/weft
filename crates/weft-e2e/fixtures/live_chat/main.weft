@@ -1,0 +1,11 @@
+# Project: e2e_live_chat
+# A live two-way WebSocket: an outside caller opens a socket at /chat; the echo
+# node holds the conversation, replying to each message with {echo, turn}. The
+# rig opens the socket, sends two messages, and asserts the echoes come back.
+
+sock = LiveSocket { path: "__E2E_PATH__" }
+echo = LiveWsEcho
+out = Debug
+
+echo.started = sock.started
+out.data = echo.done
