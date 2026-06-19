@@ -1,0 +1,17 @@
+{
+  "type": "LiveHttpResponder",
+  "label": "Live: HTTP Responder",
+  "description": "Demo node for an HTTP live connection. Reads the caller's request, streams two progress chunks, then sends a final JSON body echoing what they sent. Wire under an ApiEndpoint trigger.",
+  "category": "live",
+  "tags": ["live", "http", "demo", "stream"],
+  "icon": "Send",
+  "color": "#06b6d4",
+  "inputs": [
+    { "name": "started", "type": "Boolean", "required": false, "description": "Kick from the ApiEndpoint trigger." }
+  ],
+  "outputs": [
+    { "name": "done", "type": "Boolean", "required": false, "description": "Fires true once the response has been sent." }
+  ],
+  "fields": [],
+  "requires_infra": false
+}

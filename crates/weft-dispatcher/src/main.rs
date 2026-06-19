@@ -192,6 +192,21 @@ async fn main() -> anyhow::Result<()> {
     let storage_image = std::env::var("WEFT_STORAGE_IMAGE")
         .unwrap_or_else(|_| "weft-storage:local".to_string());
 
+    // Live caller connection provisioning. The signing secret (hex) is
+    // shared with every worker pod (the dispatcher injects it into the
+    // spawn spec); empty = live connections disabled (handshake fails
+    // loud). The gateway base URL is the public origin callers are
+    // pointed at (cloud: the live-domain host; local: the nip.io origin
+    // the daemon forwards to the local Envoy Gateway).
+    let caller_token_secret: Arc<Vec<u8>> = Arc::new(
+        match std::env::var("WEFT_CALLER_TOKEN_SECRET") {
+            Ok(hex) if !hex.is_empty() => hex::decode(&hex)
+                .map_err(|e| anyhow::anyhow!("WEFT_CALLER_TOKEN_SECRET is not valid hex: {e}"))?,
+            _ => Vec::new(),
+        },
+    );
+    let gateway_base_url = std::env::var("WEFT_GATEWAY_BASE_URL").unwrap_or_default();
+
     // Infra rehydrate on restart: the supervisor pod owns runtime
     // tracking, so the dispatcher doesn't need to scan k8s. Each
     // tenant's supervisor will list pods on its own startup and
@@ -267,6 +282,8 @@ async fn main() -> anyhow::Result<()> {
         storage_admin,
         broker_authorize: weft_storage::auth::BrokerAuth::new(broker_url.clone()),
         kube,
+        caller_token_secret,
+        gateway_base_url,
     };
 
     let renewer_state = state.clone();

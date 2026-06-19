@@ -140,7 +140,7 @@ pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Resu
     // 3 + 4. Journal terminal events directly. Done in every path
     // (live worker or not). The worker's own terminal-write path
     // is idempotent and skips if these rows already exist.
-    journal_cancel_terminals(state, color).await?;
+    journal_cancel_terminals(state, color, "Cancelled by user").await?;
 
     Ok(())
 }
@@ -149,8 +149,15 @@ pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Resu
 /// directly from the dispatcher. Used when
 /// the worker isn't going to do it (suspended execution, no live
 /// worker, race window). Idempotent: skips entirely if the journal
-/// already shows a terminal for this color.
-async fn journal_cancel_terminals(state: &DispatcherState, color: Color) -> anyhow::Result<()> {
+/// already shows a terminal for this color, so it never stacks a second
+/// terminal on a color a worker may have already finished (the canonical
+/// dispatcher-side terminal writer; other call sites must route through it
+/// rather than recording `ExecutionCancelled` directly).
+pub(crate) async fn journal_cancel_terminals(
+    state: &DispatcherState,
+    color: Color,
+    reason: &str,
+) -> anyhow::Result<()> {
     use weft_journal::ExecEvent;
 
     if has_terminal_event(&state.pg_pool, color).await? {
@@ -186,24 +193,38 @@ async fn journal_cancel_terminals(state: &DispatcherState, color: Color) -> anyh
                 color,
                 node_id: node_id.clone(),
                 frames: e.frames.clone(),
-                reason: "Cancelled by user".to_string(),
+                reason: reason.to_string(),
                 // Dispatcher-side catch-up cancel only flips records
                 // terminal; the closure cascade is the worker/cleanup's
                 // job, so no per-node closures ride here.
                 closure_emissions: Vec::new(),
                 at_unix: now,
             };
-            state.journal.record_event(&event).await?;
+            // Dedup-key each per-node write so a partial failure + retry (e.g.
+            // the orphan sweep's retry-next-tick loop, which re-runs this whole
+            // function) collapses instead of stacking a duplicate NodeCancelled
+            // row (which would also republish a duplicate UI event). The key is
+            // stable per (color, node, frame-stack).
+            let frames_key: String =
+                e.frames.iter().map(|f| f.index.to_string()).collect::<Vec<_>>().join(".");
+            let dedup = format!("cancel:{color}:{node_id}:{frames_key}");
+            state.journal.record_event_dedup(&event, &dedup).await?;
             wrote_node_count += 1;
         }
     }
 
     let terminal = ExecEvent::ExecutionCancelled {
         color,
-        reason: "Cancelled by user".to_string(),
+        reason: reason.to_string(),
         at_unix: now,
     };
-    state.journal.record_event(&terminal).await?;
+    // Dedup the terminal too (idempotent re-run): a re-call also short-circuits
+    // at `has_terminal_event` above, but the key makes the row-level write safe
+    // even if two cancels for the same color race past that check.
+    state
+        .journal
+        .record_event_dedup(&terminal, &format!("execution_cancelled:{color}"))
+        .await?;
     tracing::info!(
         target: "weft_dispatcher::cancel",
         color = %color,
@@ -245,7 +266,7 @@ pub(crate) enum TerminalOutcome {
     Cancelled,
 }
 
-async fn has_terminal_event(pool: &sqlx::PgPool, color: Color) -> anyhow::Result<bool> {
+pub(crate) async fn has_terminal_event(pool: &sqlx::PgPool, color: Color) -> anyhow::Result<bool> {
     Ok(terminal_outcome(pool, color).await?.is_some())
 }
 

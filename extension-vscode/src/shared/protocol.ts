@@ -368,12 +368,12 @@ export type LoopInspectorEvent =
 /// so a node attached to multiple buses gets one scrollable section
 /// per bus. Replay orders lines by arrival from the SSE stream (the
 /// dispatcher already orders them by journal row id server-side).
-// SYNC: BusPayload <-> crates/weft-core/src/primitive.rs BusPayload
+// SYNC: JournaledPayload <-> crates/weft-core/src/primitive.rs JournaledPayload
 /// Tagged payload. Default `Option<Value>` would collapse `Some(Value::Null)` with
 /// `None` at the JSON boundary; the tag preserves the distinction
 /// so a journaled bus that sends literal `null` doesn't render as
 /// if it were ephemeral.
-export type BusPayload =
+export type JournaledPayload =
   | { kind: 'journaled'; value: unknown }
   | { kind: 'ephemeral' };
 
@@ -386,12 +386,38 @@ export type BusInspectorEvent =
       offset: number;
       from: string;
       msgKind: string;
-      payload: BusPayload;
+      payload: JournaledPayload;
       payloadByteSize: number;
       payloadSha256Prefix: string;
       atUnix: number;
     }
   | { kind: 'closed'; busId: string; offset: number; atUnix: number };
+
+/// One live-caller-connection event the inspector replays. One caller
+/// per execution (no busId; the execution color is the identity).
+/// `payload` reuses `JournaledPayload` so a high-volume stream renders
+/// metadata-only exactly like an ephemeral bus.
+export type CallerInspectorEvent =
+  | { kind: 'connected'; offset: number; protocol: string; atUnix: number }
+  | {
+      kind: 'inbound';
+      offset: number;
+      payload: JournaledPayload;
+      payloadByteSize: number;
+      payloadSha256Prefix: string;
+      atUnix: number;
+    }
+  | {
+      kind: 'outbound';
+      offset: number;
+      payload: JournaledPayload;
+      payloadByteSize: number;
+      payloadSha256Prefix: string;
+      terminal: boolean;
+      atUnix: number;
+    }
+  | { kind: 'errored'; offset: number; message: string; atUnix: number }
+  | { kind: 'disconnected'; offset: number; reason: string; atUnix: number };
 
 /// Per-bus metadata derived dispatcher-side from the bus marker JSON
 /// (`{"__weft_bus__": {"id":..., "mode":"journaled"|"ephemeral"}}`).
@@ -792,6 +818,11 @@ export type HostMessage =
   /// `busParticipant`, because participation is a property of the
   /// graph, not of the live bus stream.
   | { kind: 'busEvent'; event: BusInspectorEvent }
+  /// One live-caller-connection event (live or replay). One caller per
+  /// execution, so unlike `busEvent` there is no busId; the inspector
+  /// renders a single "caller" panel for the run replaying what the
+  /// program said to and heard from the caller.
+  | { kind: 'callerEvent'; event: CallerInspectorEvent }
   /// One loop event (live or replay). Routes by groupId + parentFrames
   /// so the inspector card for each LoopOut node groups its
   /// iterations together.

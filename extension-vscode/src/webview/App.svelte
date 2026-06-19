@@ -83,6 +83,7 @@
     busParticipantsByBus: {},
     journalCorruptions: [],
     loopEventsByGroup: {},
+    callerLog: [],
   });
 
   // Dedup keys for append-only inspector logs. The execution follower
@@ -97,6 +98,7 @@
   // ($state) since they're pure bookkeeping, not rendered.
   let seenBusKeys = new Set<string>();
   let seenLoopKeys = new Set<string>();
+  let seenCallerOffsets = new Set<string>();
 
   // Per-node body-panel feeds. Each node ID maps to AT MOST ONE
   // feed depending on type:
@@ -324,9 +326,11 @@
           busParticipantsByBus: {},
           journalCorruptions: [],
           loopEventsByGroup: {},
+          callerLog: [],
         };
         seenBusKeys = new Set();
         seenLoopKeys = new Set();
+        seenCallerOffsets = new Set();
         return;
       }
       if (msg.kind === 'execTerminal') {
@@ -504,6 +508,16 @@
           ...executionState.busLogByBus,
           [busId]: [...log, msg.event],
         };
+        return;
+      }
+      if (msg.kind === 'callerEvent') {
+        // One caller per execution: a flat ordered log. Dedup on offset
+        // (unique per caller stream) because the replay snapshot and the
+        // live stream overlap during a replay follow.
+        const callerKey = `caller:${msg.event.offset}`;
+        if (seenCallerOffsets.has(callerKey)) return;
+        seenCallerOffsets.add(callerKey);
+        executionState.callerLog = [...executionState.callerLog, msg.event];
         return;
       }
       if (msg.kind === 'loopEvent') {

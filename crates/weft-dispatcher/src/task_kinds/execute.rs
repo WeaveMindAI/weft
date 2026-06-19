@@ -77,6 +77,7 @@ async fn enqueue_execution(
         project_id: project_id.to_string(),
         color: color_str.clone(),
         definition_hash: definition_hash.to_string(),
+        live_connection: None,
     };
     let dedup = format!("{color_str}:{}", kind.as_str());
     enqueue_dedup(
@@ -94,6 +95,47 @@ async fn enqueue_execution(
     )
     .await?;
     Ok(())
+}
+
+/// Enqueue a fresh execution STARTED by a live-caller handshake, pinned to
+/// a specific worker pod (per-pod addressing) and carrying the trigger's
+/// full signal spec (tag + config) so the worker recovers the protocol and
+/// the connection knobs and expects a caller to attach for this color. The
+/// `target_pod_name` claim filter guarantees ONLY the chosen pod runs it, so
+/// the caller (routed to that same pod by the gateway) and the execution
+/// land on the same process.
+/// ATOMICALLY admit a live execution: pick the least-loaded under-cap worker
+/// pod for the project and insert the pinned execute task on it, in one
+/// transaction (admission IS the task insert; the task row is the capacity
+/// slot, so there is no separate counter to drift). Returns the chosen pod,
+/// or `None` if every pod is at `cap` (caller spawns another and retries).
+pub async fn admit_live_execution(
+    pool: &sqlx::PgPool,
+    project_id: &str,
+    color: weft_core::Color,
+    definition_hash: &str,
+    tenant_id: Option<&str>,
+    live_spec: serde_json::Value,
+    cap: i32,
+) -> Result<Option<weft_task_store::tasks::AdmittedPod>> {
+    let color_str = color.to_string();
+    let payload = ExecutionPayload {
+        project_id: project_id.to_string(),
+        color: color_str.clone(),
+        definition_hash: definition_hash.to_string(),
+        live_connection: Some(live_spec),
+    };
+    let payload_json = serde_json::to_value(&payload)?;
+    let admitted = weft_task_store::tasks::admit_live_execution(
+        pool,
+        project_id,
+        &color_str,
+        tenant_id,
+        &payload_json,
+        cap,
+    )
+    .await?;
+    Ok(admitted)
 }
 
 /// Enqueue a `cancel_execution` task addressed to the Pod that owns

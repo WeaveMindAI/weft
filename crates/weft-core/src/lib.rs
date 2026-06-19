@@ -1,4 +1,6 @@
 pub mod bus;
+pub mod caller;
+pub mod caller_token;
 pub mod cancellation;
 pub mod context;
 pub mod error;
@@ -11,8 +13,10 @@ pub mod project;
 pub mod pulse;
 pub mod running_policy;
 pub mod signal;
+pub mod signed_token;
 pub mod storage;
 pub mod tag;
+pub mod wait;
 pub mod weft_type;
 
 // Hosts the `stress_test!` macro (`#[macro_export]`). The macro is

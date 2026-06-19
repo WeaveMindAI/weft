@@ -94,6 +94,16 @@ pub struct ExecutionPayload {
     /// execution loudly); there is no race semantics on this path,
     /// the hash IS the lookup key.
     pub definition_hash: String,
+    /// Present only for executions STARTED by a live-caller handshake (the
+    /// dispatcher's `/connect` endpoint). Opaque to this generic store:
+    /// carries the trigger's full signal spec JSON (kind tag + config body),
+    /// from which the worker recovers BOTH the wire protocol (the tag:
+    /// `api_endpoint` -> HTTP, `live_socket` -> WS) and the connection knobs
+    /// (the body) to build the `CallerConnection` runtime config and expect
+    /// a caller to attach for this color. `None` for every ordinary
+    /// pull-queue / resume execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_connection: Option<serde_json::Value>,
 }
 
 /// Payload for `TaskKind::FireSignal`. Producer = listener; consumer =

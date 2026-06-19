@@ -7,6 +7,7 @@
 import type {
 	BusInspectorEvent,
 	BusMeta,
+	CallerInspectorEvent,
 	CorruptionSite,
 	LoopInspectorEvent,
 	LoopIteration,
@@ -517,6 +518,12 @@ export interface ExecutionState {
 	 *  the loop's `groupId`; the parentFrames stack lives on each
 	 *  event so a card can split by nesting/sibling iteration. */
 	loopEventsByGroup: Record<string, LoopInspectorEvent[]>;
+	/** Full ordered log of the live caller exchange (connected /
+	 *  inbound / outbound / errored / disconnected). One caller per
+	 *  execution, so this is a flat list, not keyed. Empty for runs
+	 *  with no live connection. The inspector replays it as a single
+	 *  caller panel on the execution. */
+	callerLog: CallerInspectorEvent[];
 }
 
 /** A typed data item shown on a node's body-panel feed. The

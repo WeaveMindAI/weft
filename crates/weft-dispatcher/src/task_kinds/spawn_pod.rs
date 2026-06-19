@@ -97,6 +97,8 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
             namespace: payload.namespace.clone(),
             owner_dispatcher: payload.owner_dispatcher.clone(),
             binary_hash: Some(want_hash),
+            // Worker verifies live-connection routing tokens with this.
+            caller_token_secret_hex: hex::encode(state.caller_token_secret.as_ref()),
         };
         let handle = state.workers.spawn_pod(&pod_name, spec).await?;
         Ok(serde_json::to_value(SpawnPodResult {

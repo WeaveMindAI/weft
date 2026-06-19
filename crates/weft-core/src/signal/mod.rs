@@ -1,8 +1,8 @@
 //! Wake-signal kinds.
 //!
 //! A wake signal is "something the listener listens for on behalf of
-//! a node." Each kind (webhook, timer, form, sse, ...) is a plain
-//! data struct in this module. Node code constructs one and passes
+//! a node." Each kind (timer, form, sse_subscribe, api_endpoint, ...) is
+//! a plain data struct in this module. Node code constructs one and passes
 //! it directly to `ctx.register_signal(...)` (entry trigger) or
 //! `ctx.await_signal(...)` (mid-execution resume). The framework
 //! projects the typed kind onto the internal `SignalSpec` wire
@@ -20,15 +20,24 @@
 //! No central enum, no match dispatch. The framework discovers kinds
 //! at startup via the `inventory` registry.
 
-pub mod webhook;
+pub mod auth;
 pub mod timer;
 pub mod form;
-pub mod sse;
+pub mod sse_subscribe;
+pub mod poll_endpoint;
+pub mod socket_listen;
+pub mod live_connection;
 
-pub use webhook::{Webhook, WebhookAuth};
+pub use auth::PublicEntryAuth;
 pub use timer::{Timer, TimerSpec};
 pub use form::{Form, FormSchema, FormField};
-pub use sse::Sse;
+pub use sse_subscribe::SseSubscribe;
+pub use poll_endpoint::PollEndpoint;
+pub use socket_listen::{SocketFrame, SocketListen};
+pub use live_connection::{
+    protocol_for_tag, ApiEndpoint, Backpressure, DataType, ErrorMode, JournalMode,
+    LiveConnectionConfig, LiveSocket, Protocol,
+};
 
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -48,7 +57,7 @@ use crate::primitive::SignalSpec;
 /// fresh entry or a paused-firing resume is decided by which
 /// `ExecutionContext` method the author called.
 pub trait Signal: Serialize + DeserializeOwned + Sized {
-    /// Kind tag stored on the wire (`"webhook"`, `"timer"`, ...).
+    /// Kind tag stored on the wire (`"timer"`, `"api_endpoint"`, ...).
     /// Used to route incoming specs to the right handler in the
     /// listener.
     const TAG: &'static str;
@@ -162,7 +171,15 @@ mod tests {
         tags.sort_unstable();
         assert_eq!(
             tags,
-            vec!["form", "sse", "timer", "webhook"],
+            vec![
+                "api_endpoint",
+                "form",
+                "live_socket",
+                "poll_endpoint",
+                "socket_listen",
+                "sse_subscribe",
+                "timer",
+            ],
             "kinds shipped in weft-core must all register; add the new tag here when adding a kind"
         );
     }
@@ -170,7 +187,7 @@ mod tests {
     #[test]
     fn validate_spec_routes_to_kind() {
         let spec = SignalSpec {
-            kind: "webhook".into(),
+            kind: "api_endpoint".into(),
             config: serde_json::json!({ "path": "/leading-slash", "auth": { "kind": "none" } }),
             consumer_kind: None,
         };

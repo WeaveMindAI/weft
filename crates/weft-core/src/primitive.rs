@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::Color;
 
@@ -31,7 +32,7 @@ use crate::Color;
 /// rides the dispatcher's `RegisterRequest`, not the spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalSpec {
-    /// Kind tag (e.g. `"webhook"`, `"timer"`). Matched against the
+    /// Kind tag (e.g. `"api_endpoint"`, `"timer"`). Matched against the
     /// inventory of `SignalKind` impls; unknown tags fail validation.
     pub kind: String,
     /// Kind-specific configuration. Each kind owns its shape.
@@ -63,7 +64,8 @@ pub enum SignalSurface {
     /// root: external callers POST to `<dispatcher_base>/<path>`.
     /// `path = ""` means root `/`. Path uniqueness enforced
     /// project-wide at register time (UNIQUE on signal.mount_path).
-    /// Used by Webhook, ApiPost, future public-form-like kinds.
+    /// Used by the live-caller kinds (ApiEndpoint, LiveSocket) and any
+    /// future public-form-like kind.
     PublicEntry { path: String },
     /// Per-task callback. Mounted at `/signal/<token>` where the
     /// dispatcher mints the UUID at register time. Used by
@@ -384,44 +386,60 @@ impl LoopWrite {
     }
 }
 
-/// Payload mode on a journaled `BusMessage`. The tag distinguishes
-/// "journaled bus, payload IS Value::Null" from "ephemeral bus,
-/// payload not in journal". Default serde on `Option<Value>`
-/// collapses `Some(Value::Null)` and `None` to the same JSON form,
-/// so a `Some(Null)` payload (a node legitimately sending JSON null
-/// on a journaled bus) would round-trip indistinguishable from an
-/// ephemeral message. Mirrors the `LoopWrite` shape for the same
-/// reason. The surrounding event (`ExecEvent::BusMessage` /
-/// `DispatcherEvent::BusMessage`) carries `payload_byte_size` and
-/// `payload_sha256_prefix` so the inspector can render a stable
-/// identifier even on `Ephemeral`.
-// SYNC: BusPayload <-> extension-vscode/src/shared/protocol.ts BusPayload
+/// How a value rides (or doesn't ride) in a journaled event: the full
+/// value, or metadata-only with the bytes kept elsewhere. A GENERAL
+/// payload mode reused by every feature with the journaled-vs-ephemeral
+/// tradeoff (the bus's `BusMessage`, the live caller's `Caller*` events,
+/// future high-volume streams), NOT bus-specific (hence the neutral name).
+///
+/// The tag distinguishes "journaled, payload IS Value::Null" from
+/// "ephemeral, payload not in journal". Default serde on `Option<Value>`
+/// collapses `Some(Value::Null)` and `None` to the same JSON form, so a
+/// `Some(Null)` payload (a node legitimately sending JSON null) would
+/// round-trip indistinguishable from an ephemeral message. The surrounding
+/// event carries `payload_byte_size` and `payload_sha256_prefix` so the
+/// inspector can render a stable identifier even on `Ephemeral`.
+// SYNC: JournaledPayload <-> extension-vscode/src/shared/protocol.ts JournaledPayload
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BusPayload {
-    /// Journaled-mode bus: full payload (which may be `Value::Null`)
-    /// rides in the event so consumers can read history.
+pub enum JournaledPayload {
+    /// Journaled mode: full payload (which may be `Value::Null`) rides in
+    /// the event so consumers can read history.
     Journaled { value: Value },
-    /// Ephemeral-mode bus: payload was stored in the in-RAM sliding
-    /// window only; the journal carries the metadata so the
-    /// inspector can render it without the value.
+    /// Ephemeral mode: payload was stored in an in-RAM sliding window only;
+    /// the journal carries the metadata so the inspector can render it
+    /// without the value.
     Ephemeral,
 }
 
-impl BusPayload {
+impl JournaledPayload {
     pub fn value(&self) -> Option<&Value> {
         match self {
-            BusPayload::Journaled { value } => Some(value),
-            BusPayload::Ephemeral => None,
+            JournaledPayload::Journaled { value } => Some(value),
+            JournaledPayload::Ephemeral => None,
         }
     }
 
     pub fn into_value(self) -> Option<Value> {
         match self {
-            BusPayload::Journaled { value } => Some(value),
-            BusPayload::Ephemeral => None,
+            JournaledPayload::Journaled { value } => Some(value),
+            JournaledPayload::Ephemeral => None,
         }
     }
+}
+
+/// The journaled metadata for a payload `Value`: its serialized byte size
+/// and the first 8 bytes of its SHA-256. ONE derivation shared by every
+/// journaled-event producer (the bus and the live-caller connection both
+/// stamp this on their events), so the size/hash shape can never drift
+/// between them. A `Value` always serializes, so the serialize cannot fail.
+pub fn payload_metadata(value: &Value) -> (u64, [u8; 8]) {
+    let bytes = serde_json::to_vec(value).expect("a serde_json::Value always serializes");
+    let size = bytes.len() as u64;
+    let digest = Sha256::digest(&bytes);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    (size, prefix)
 }
 
 /// Folded view of one live `LoopInstance`. The engine reads this on

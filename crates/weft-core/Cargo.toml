@@ -23,3 +23,15 @@ sha2 = { workspace = true }
 # storage methods (a core trait), so the alias must live in core.
 futures = { workspace = true }
 bytes = { workspace = true }
+# Signed routing-token mint/verify (`caller_token`): the dispatcher signs
+# a (color, project, pod) token at the control handshake; the worker
+# verifies it before accepting a live connection. HMAC-SHA256 over a
+# base64url payload, mirroring `weft-storage::capability`.
+hmac = { workspace = true }
+base64 = { workspace = true }
+
+[features]
+# Ships the hand-rolled fakes colocated with their traits (currently
+# `caller::FakeCallerConnection`) so downstream crates can wire them into
+# layer-3 tests. Off by default; consumers enable it in `[dev-dependencies]`.
+test-helpers = []

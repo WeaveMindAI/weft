@@ -118,6 +118,12 @@ pub async fn run_one_execution(
     // InfraSetup.
     namespace: String,
     cancellation: Arc<CancellationFlag>,
+    // The live caller connection for this execution, if any. `Some` only
+    // on the worker that received a `live_connection` request; threaded
+    // into every firing's `RunnerHandle` (so `ctx.caller()` resolves) and
+    // into the loop's keep-warm decision (an attached caller under a
+    // `keep_alive` reconcile holds the worker warm like a live bus does).
+    caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
 ) -> anyhow::Result<ExecutionOutcome> {
     let project = &*project;
     let edge_idx = EdgeIndex::build(&project);
@@ -272,6 +278,7 @@ pub async fn run_one_execution(
             &namespace,
             &cancellation,
             &bus_coordinator,
+            caller.as_ref(),
             &mut pulses,
             &mut executions,
             &mut kicked,
@@ -284,29 +291,82 @@ pub async fn run_one_execution(
         if !matches!(outcome, ExecutionOutcome::Stalled | ExecutionOutcome::Stuck) {
             break;
         }
-        if clients.clock.now().saturating_duration_since(refetch_start) > refetch_deadline {
-            // Don't overwrite the outcome: a Stalled drive that ran
-            // out of refetch budget is STILL Stalled (the worker
-            // exits cleanly, dispatcher respawns on next fire). Only
-            // an already-Stuck drive stays Stuck. Relabeling Stalled
-            // as Stuck here would journal a terminal event and kill
-            // legitimate parked work permanently.
+        // The worker has stalled: every branch is parked or done. THIS is
+        // the true suspension point, the one place we reconcile the live
+        // caller against a durable wait (never per-await, since other
+        // branches may have still been running and talking to the caller).
+        //
+        // A caller-tied run (`can_suspend = false`) HOLDS the worker warm
+        // here instead of exiting: it keeps the connection and polls the
+        // journal in-process for the resolving signal, up to the resolved
+        // hold time. The same warmth a live bus gives, expressed at the
+        // resume loop because an `await_signal` node (unlike a bus node)
+        // ends its task. On hold expiry (or caller drop), a tied run cannot
+        // degrade into a background job, so it is KILLED (cancelled), not
+        // cleanly suspended. A suspendable run (`can_suspend = true`) does
+        // not hold: it falls through to the normal clean exit and resumes
+        // later caller-less.
+        let caller_warm = match caller.as_ref() {
+            Some(conn) => !conn.config().suspend.can_suspend && conn.is_connected(),
+            None => false,
+        };
+        // The hold bound for a warm tied run = the run's default hold time
+        // (per-call override plumbing is a follow-on; the trigger default
+        // is the bound today). A non-warm stall uses the normal short
+        // refetch deadline.
+        let effective_deadline = match (caller_warm, caller.as_ref()) {
+            (true, Some(conn)) => {
+                std::time::Duration::from_secs(conn.config().suspend.default_hold_secs)
+            }
+            _ => refetch_deadline,
+        };
+        if clients.clock.now().saturating_duration_since(refetch_start) > effective_deadline {
+            if caller_warm {
+                // Tied run, hold expired with the caller still attached and
+                // no resolving signal: it cannot make progress and must not
+                // become a background job. Kill it (cancel the color); the
+                // connection layer surfaces the clear disconnect message.
+                tracing::warn!(
+                    target: "weft_engine::resume",
+                    color = %color,
+                    hold_secs = effective_deadline.as_secs(),
+                    "caller-tied run held past its hold time with no resolving signal; \
+                     cancelling (a tied run cannot degrade into a background job)"
+                );
+                cancellation.cancel();
+                outcome = ExecutionOutcome::Cancelled;
+                break;
+            }
+            // Suspendable (or no caller): a Stalled drive that ran out of
+            // refetch budget is STILL Stalled (the worker exits cleanly,
+            // dispatcher respawns on the next fire). Don't relabel.
             tracing::warn!(
                 target: "weft_engine::resume",
                 color = %color,
-                deadline_secs = REFETCH_WALL_CLOCK_DEADLINE_SECS,
+                deadline_secs = effective_deadline.as_secs(),
                 outcome = ?outcome,
-                "refetch loop hit wall-clock deadline; exiting with last drive outcome"
+                "refetch loop hit deadline; exiting with last drive outcome"
             );
             break;
         }
         let fresh = fetch_events(journal.as_ref(), color).await?;
         // Append-only journal: fresh.len() can only grow or stay equal.
         // No new events since the last fetch means we're parked behind
-        // a signal the dispatcher hasn't resolved yet; exit cleanly so
-        // the worker dies and the next fire respawns it.
+        // a signal the dispatcher hasn't resolved yet.
         debug_assert!(fresh.len() >= event_count_before, "journal shrank under us");
         if fresh.len() == event_count_before {
+            // No resolving signal yet. A caller-tied warm run holds (sleep
+            // a poll interval and re-fetch, keeping the connection alive
+            // until the signal lands, the caller drops, or the hold expires
+            // above). A suspendable run exits cleanly and respawns on the
+            // fire.
+            if caller_warm {
+                clients
+                    .clock
+                    .sleep(std::time::Duration::from_millis(RESUME_POLL_INTERVAL_MS))
+                    .await;
+                continue;
+            }
             break;
         }
         event_count_before = fresh.len();
@@ -656,6 +716,7 @@ async fn drive(
     namespace: &str,
     cancellation: &Arc<CancellationFlag>,
     bus_coordinator: &Arc<crate::context::BusCoordinator>,
+    caller: Option<&Arc<dyn weft_core::caller::CallerConnection>>,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     kicked: &mut HashMap<String, weft_core::primitive::KickedNode>,
@@ -1255,7 +1316,8 @@ async fn drive(
                 declared_outputs,
             )
             .with_awaited_sequence(sequence)
-            .with_emit_channel(task_tx.clone());
+            .with_emit_channel(task_tx.clone())
+            .with_caller_connection(caller.cloned());
             if let Some(payload) = wake_payload {
                 runner = runner.with_wake_payload(payload);
             }
@@ -4446,6 +4508,7 @@ mod bus_comm_tests {
             "tenant-test".into(),
             "ns-test".into(),
             CancellationFlag::new_arc(),
+            None,
         )
         .await
         .expect("run_one_execution ok");
@@ -4583,6 +4646,7 @@ mod bus_comm_tests {
             Arc::new(project), catalog, color, clients,
             "pod".into(), "tenant".into(), "ns".into(),
             cancel.clone(),
+            None,
         ));
         // Let the waiter reach its cursor wait, then cancel.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -4844,6 +4908,7 @@ mod bus_comm_tests {
                 Arc::new(project), configurable_catalog(), color, clients,
                 "pod".into(), "tenant".into(), "ns".into(),
                 CancellationFlag::new_arc(),
+                None,
             ),
         )
         .await
@@ -5506,6 +5571,7 @@ mod bus_comm_tests {
                 "tenant".into(),
                 "ns".into(),
                 CancellationFlag::new_arc(),
+                None,
             )
             .await
         });
@@ -6188,6 +6254,796 @@ mod bus_comm_tests {
             });
             assert!(consumer_got_value, "iter {i}: consumer never received the producer's value on `in`");
         }
+    }
+
+    // ─── Live caller × other features (layer 3) ──────────────────────────
+    //
+    // These reuse the in-process `run_one_execution` harness above but wire
+    // a `FakeCallerConnection` into the run (the last arg the bus test left
+    // `None`), so a node's `ctx.caller()` resolves. They prove the live
+    // caller coexists with the bus, with downstream pulses, with multiple
+    // readers (broadcast), and that the disconnect lifetime axis behaves.
+
+    use weft_core::caller::{
+        CallerConnection, CallerHandle, CallerRuntimeConfig, FakeCallerConnection,
+        InboundMessage, OutboundChunk,
+    };
+    use weft_core::signal::{Backpressure, DataType, ErrorMode, Protocol};
+    use weft_core::wait::SuspendPolicy;
+
+    /// Runtime config for a fake caller. `can_suspend = false` is the
+    /// caller-tied default (disconnect cancels); `true` is the survives case.
+    fn caller_cfg(protocol: Protocol, can_suspend: bool) -> CallerRuntimeConfig {
+        CallerRuntimeConfig {
+            protocol,
+            data_type: DataType::Json,
+            backpressure: Backpressure::Block,
+            error_mode: ErrorMode::Surface,
+            connect_timeout_secs: 5,
+            max_inbound_bytes: 1_048_576,
+            max_session_secs: 0,
+            suspend: SuspendPolicy { can_suspend, default_hold_secs: 60 },
+            inbound_window: weft_core::caller::DEFAULT_INBOUND_WINDOW,
+        }
+    }
+
+    /// Seed a journal with ExecutionStarted(Fire) + a NodeKicked on
+    /// `entry`, the minimal state to make a no-input node ready.
+    async fn seed(journal: &MemJournal, color: Color, project: &ProjectDefinition, entry: &str) {
+        journal
+            .record_event(
+                &ExecEvent::ExecutionStarted {
+                    color,
+                    project_id: project.id.to_string(),
+                    entry_node: entry.into(),
+                    phase: weft_core::context::Phase::Fire,
+                    definition_hash: "test-hash".into(),
+                    at_unix: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .record_event(
+                &ExecEvent::NodeKicked { color, node_id: entry.into(), payload: None, at_unix: 0 },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Run `project` to completion with `catalog` and an optional live
+    /// caller wired in. Returns the outcome; the caller's call log is read
+    /// off the `Arc<FakeCallerConnection>` the test still holds.
+    async fn run_with_caller(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        journal: Arc<MemJournal>,
+        color: Color,
+        caller: Option<Arc<dyn CallerConnection>>,
+    ) -> ExecutionOutcome {
+        run_with_caller_tasks(project, catalog, journal, color, caller, Arc::new(NoopTasks)).await
+    }
+
+    /// As `run_with_caller` but with an explicit tasks client (await_signal
+    /// nodes enqueue a RegisterSignal task, which `NoopTasks` rejects; those
+    /// tests pass `AwaitTasks`).
+    async fn run_with_caller_tasks(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        journal: Arc<MemJournal>,
+        color: Color,
+        caller: Option<Arc<dyn CallerConnection>>,
+        tasks: Arc<dyn weft_task_store::TaskStoreClient>,
+    ) -> ExecutionOutcome {
+        let clients = EngineClients {
+            journal,
+            tasks,
+            infra: Arc::new(NoopInfra),
+            infra_state: Arc::new(NoopInfraState),
+            project: Arc::new(NoopProject),
+            clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
+        };
+        run_one_execution(
+            Arc::new(project),
+            catalog,
+            color,
+            clients,
+            "pod-test".into(),
+            "tenant-test".into(),
+            "ns-test".into(),
+            CancellationFlag::new_arc(),
+            caller,
+        )
+        .await
+        .expect("run_one_execution ok")
+    }
+
+    /// A single-node project for `node_type` with no inputs and a `done`
+    /// boolean output, the shape every caller test node uses as the entry.
+    fn single_node_project(node_type: &str) -> ProjectDefinition {
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "name": "caller-test",
+            "description": null,
+            "nodes": [{
+                "id": "entry", "nodeType": node_type, "label": null,
+                "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [],
+                "outputs": [{ "name": "done", "portType": "Boolean", "required": false }],
+                "features": {}, "scope": [], "groupBoundary": null,
+                "requiresInfra": false, "images": []
+            }],
+            "edges": [],
+            "groups": []
+        }))
+        .expect("single-node project")
+    }
+
+    // ----- Test nodes -------------------------------------------------------
+
+    /// Reads every inbound WS message from the live caller and forwards each
+    /// onto a bus it creates, then closes the bus. Proves caller + bus
+    /// coexist in one firing. Exposes the bus on `channel` for a consumer.
+    struct CallerToBus;
+    #[async_trait]
+    impl Node for CallerToBus {
+        fn node_type(&self) -> &'static str { "CallerToBus" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("CallerToBus") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
+            };
+            let (mut bus, marker) = ctx.create_bus(weft_core::bus::BusOptions::default())?;
+            bus.register("caller_to_bus").expect("register");
+            // Pulse the bus marker downstream FIRST so the consumer node
+            // fires and registers, THEN wait for it (mirrors Producer).
+            ctx.pulse_downstream(NodeOutput::with("channel", marker)).await?;
+            bus.wait_for("drain").await.expect("consumer registers");
+            // The test scripts inbound before the run, so read history from
+            // the retained window start (a forward `ws.receive()` would only
+            // see messages arriving after attach).
+            let cursor = ws.cursor_from_start();
+            loop {
+                match cursor.receive().await {
+                    Ok(InboundMessage::Json(v)) => {
+                        bus.send("msg", v).expect("send to bus");
+                    }
+                    Ok(InboundMessage::Text(s)) => {
+                        bus.send("msg", Value::String(s)).expect("send");
+                    }
+                    Ok(InboundMessage::Bytes(_)) => {}
+                    Err(_) => break, // caller idle / gone: stop forwarding
+                }
+            }
+            bus.close();
+            Ok(())
+        }
+    }
+
+    /// One WS reader that records every message it sees into a shared
+    /// collector keyed by its own label. Two of these on one caller prove
+    /// inbound is broadcast (both see every message, neither steals).
+    struct WsReader {
+        label: &'static str,
+        seen: Arc<StdMutex<Vec<(&'static str, Value)>>>,
+    }
+    #[async_trait]
+    impl Node for WsReader {
+        fn node_type(&self) -> &'static str { "WsReader" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("WsReader") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
+            };
+            // Test scripts inbound before the run; each reader reads history
+            // from the window start on its OWN cursor (broadcast: both
+            // readers see every message, neither steals).
+            let cursor = ws.cursor_from_start();
+            loop {
+                match cursor.receive().await {
+                    Ok(InboundMessage::Json(v)) => {
+                        self.seen.lock().unwrap().push((self.label, v));
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true))).await
+        }
+    }
+
+    /// HTTP responder: streams one chunk, sends the final body, AND pulses
+    /// `done` downstream, proving talk-to-caller and graph emission compose.
+    struct HttpResponder;
+    #[async_trait]
+    impl Node for HttpResponder {
+        fn node_type(&self) -> &'static str { "HttpResponder" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("HttpResponder") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let Some(CallerHandle::Http(http)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeExecution("no http caller".into()));
+            };
+            http.write(OutboundChunk::Json(json!({ "stage": "working" }))).await?;
+            http.respond(OutboundChunk::Json(json!({ "stage": "done" }))).await?;
+            ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true))).await
+        }
+    }
+
+    /// Sends one message to the caller. On a caller-tied run a disconnect
+    /// makes the send error (cancel); on a survives run it is a no-op and
+    /// the node still completes. Distinguishes the two lifetime regimes.
+    struct CallerSender;
+    #[async_trait]
+    impl Node for CallerSender {
+        fn node_type(&self) -> &'static str { "CallerSender" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("CallerSender") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
+            };
+            // Propagate the send result: a caller-tied disconnect surfaces
+            // as an error (-> cancel); a survives disconnect is Ok (void).
+            ws.send(OutboundChunk::Json(json!({ "hi": true }))).await?;
+            ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true))).await
+        }
+    }
+
+    /// Requires a caller and fails loud when there is none. Models a node
+    /// wired under a live trigger but run on a caller-less execution.
+    struct NeedsCaller;
+    #[async_trait]
+    impl Node for NeedsCaller {
+        fn node_type(&self) -> &'static str { "NeedsCaller" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("NeedsCaller") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            if ctx.caller().is_none() {
+                return Err(weft_core::error::WeftError::NodeExecution(
+                    "NeedsCaller ran without a live caller".into(),
+                ));
+            }
+            ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true))).await
+        }
+    }
+
+    /// One-node catalog over a single boxed node, for the single-node
+    /// caller projects.
+    struct OneNodeCatalog {
+        node: &'static dyn Node,
+    }
+    impl NodeCatalog for OneNodeCatalog {
+        fn lookup(&self, node_type: &str) -> Option<&'static dyn Node> {
+            if node_type == self.node.node_type() { Some(self.node) } else { None }
+        }
+        fn all(&self) -> Vec<&'static str> { vec![self.node.node_type()] }
+    }
+
+    // ----- Tests ------------------------------------------------------------
+
+    /// Caller × bus, asserting on the journaled bus stream: the three
+    /// inbound caller messages each became a bus message, in order.
+    #[tokio::test]
+    async fn caller_to_bus_journals_each_message() {
+        // CallerToBus forwards onto a bus; a Drainer consumer registers
+        // "drain" (releasing CallerToBus's wait_for) and drains so the run
+        // reaches quiescence.
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(), "name": "caller-bus2", "description": null,
+            "nodes": [
+                { "id": "producer", "nodeType": "CallerToBus", "label": null, "config": null,
+                  "position": {"x":0.0,"y":0.0}, "inputs": [],
+                  "outputs": [{ "name": "channel", "portType": "Bus", "required": false },
+                              { "name": "done", "portType": "Boolean", "required": false }],
+                  "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] },
+                { "id": "drain", "nodeType": "Drainer", "label": null, "config": null,
+                  "position": {"x":1.0,"y":0.0},
+                  "inputs": [{ "name": "channel", "portType": "Bus", "required": true }],
+                  "outputs": [], "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] }
+            ],
+            "edges": [{ "id": "e", "source": "producer", "target": "drain", "sourceHandle": "channel", "targetHandle": "channel" }],
+            "groups": []
+        })).expect("project");
+
+        // Drainer registers "drain" (releasing CallerToBus's wait_for) and
+        // drains every message so the run reaches quiescence.
+        struct Drainer;
+        #[async_trait]
+        impl Node for Drainer {
+            fn node_type(&self) -> &'static str { "Drainer" }
+            fn metadata(&self) -> NodeMetadata { trivial_metadata("Drainer") }
+            async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+                let mut bus = ctx.bus_from_input("channel")?;
+                bus.register("drain").expect("register drain");
+                let mut cursor = bus.cursor();
+                while cursor.next().await.expect("no fellbehind").is_some() {}
+                Ok(())
+            }
+        }
+        struct TwoCatalog { a: &'static CallerToBus, b: &'static Drainer }
+        impl NodeCatalog for TwoCatalog {
+            fn lookup(&self, t: &str) -> Option<&'static dyn Node> {
+                match t { "CallerToBus" => Some(self.a), "Drainer" => Some(self.b), _ => None }
+            }
+            fn all(&self) -> Vec<&'static str> { vec!["CallerToBus", "Drainer"] }
+        }
+        let catalog: Arc<dyn NodeCatalog> = Arc::new(TwoCatalog {
+            a: Box::leak(Box::new(CallerToBus)),
+            b: Box::leak(Box::new(Drainer)),
+        });
+
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "producer").await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+        for i in 0..3 { fake.push_inbound(InboundMessage::Json(json!({ "i": i }))); }
+
+        let outcome = run_with_caller(
+            project, catalog, journal.clone(), color,
+            Some(fake.clone() as Arc<dyn CallerConnection>),
+        ).await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+
+        let msgs: Vec<i64> = journal.events.lock().unwrap().iter().filter_map(|e| match e {
+            ExecEvent::BusMessage { from, payload, .. } if from == "caller_to_bus" =>
+                payload.value().and_then(|v| v.get("i")).and_then(|v| v.as_i64()),
+            _ => None,
+        }).collect();
+        assert_eq!(msgs, vec![0, 1, 2], "all three caller messages journaled onto the bus in order");
+    }
+
+    /// Broadcast: two reader nodes on ONE caller both see every inbound
+    /// message (per-reader cursor), neither steals from the other. This is
+    /// the in-process version of the cluster broadcast check.
+    #[tokio::test]
+    async fn inbound_broadcasts_to_two_nodes() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        // Two readers wrapped so they have distinct node_type strings; each
+        // delegates to a shared `WsReader` body with its own label.
+        struct ReaderA(WsReader);
+        struct ReaderB(WsReader);
+        #[async_trait]
+        impl Node for ReaderA {
+            fn node_type(&self) -> &'static str { "ReaderA" }
+            fn metadata(&self) -> NodeMetadata { trivial_metadata("ReaderA") }
+            async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> { self.0.execute(ctx).await }
+        }
+        #[async_trait]
+        impl Node for ReaderB {
+            fn node_type(&self) -> &'static str { "ReaderB" }
+            fn metadata(&self) -> NodeMetadata { trivial_metadata("ReaderB") }
+            async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> { self.0.execute(ctx).await }
+        }
+        struct AB { a: &'static ReaderA, b: &'static ReaderB }
+        impl NodeCatalog for AB {
+            fn lookup(&self, t: &str) -> Option<&'static dyn Node> {
+                match t { "ReaderA" => Some(self.a), "ReaderB" => Some(self.b), _ => None }
+            }
+            fn all(&self) -> Vec<&'static str> { vec!["ReaderA", "ReaderB"] }
+        }
+        let catalog: Arc<dyn NodeCatalog> = Arc::new(AB {
+            a: Box::leak(Box::new(ReaderA(WsReader { label: "A", seen: seen.clone() }))),
+            b: Box::leak(Box::new(ReaderB(WsReader { label: "B", seen: seen.clone() }))),
+        });
+        // Both readers kicked at start (two entry nodes, no edges).
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(), "name": "broadcast", "description": null,
+            "nodes": [
+                { "id": "ra", "nodeType": "ReaderA", "label": null, "config": null,
+                  "position": {"x":0.0,"y":0.0}, "inputs": [],
+                  "outputs": [{ "name": "done", "portType": "Boolean", "required": false }],
+                  "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] },
+                { "id": "rb", "nodeType": "ReaderB", "label": null, "config": null,
+                  "position": {"x":1.0,"y":0.0}, "inputs": [],
+                  "outputs": [{ "name": "done", "portType": "Boolean", "required": false }],
+                  "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] }
+            ],
+            "edges": [], "groups": []
+        })).expect("broadcast project");
+
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        // Kick both reader nodes.
+        journal.record_event(&ExecEvent::ExecutionStarted {
+            color, project_id: project.id.to_string(), entry_node: "ra".into(),
+            phase: weft_core::context::Phase::Fire, definition_hash: "h".into(), at_unix: 0,
+        }, None).await.unwrap();
+        for n in ["ra", "rb"] {
+            journal.record_event(&ExecEvent::NodeKicked {
+                color, node_id: n.into(), payload: None, at_unix: 0,
+            }, None).await.unwrap();
+        }
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+        for i in 0..2 { fake.push_inbound(InboundMessage::Json(json!({ "i": i }))); }
+
+        let outcome = run_with_caller(
+            project, catalog, journal, color,
+            Some(fake.clone() as Arc<dyn CallerConnection>),
+        ).await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+
+        let got = seen.lock().unwrap().clone();
+        let a_count = got.iter().filter(|(l, _)| *l == "A").count();
+        let b_count = got.iter().filter(|(l, _)| *l == "B").count();
+        assert_eq!(a_count, 2, "reader A saw both messages (broadcast, not stolen): {got:?}");
+        assert_eq!(b_count, 2, "reader B saw both messages (broadcast, not stolen): {got:?}");
+    }
+
+    /// HTTP respond + downstream pulse in one firing: the node talks to the
+    /// caller AND emits `done`, both happen, run completes.
+    #[tokio::test]
+    async fn http_respond_and_pulse_compose() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(HttpResponder)) });
+        let project = single_node_project("HttpResponder");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Http, false));
+
+        let outcome = run_with_caller(
+            project, catalog, journal, color,
+            Some(fake.clone() as Arc<dyn CallerConnection>),
+        ).await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+
+        // The node both wrote a chunk and terminated with the final body.
+        use weft_core::caller::CallerCall;
+        let calls = fake.calls();
+        assert!(calls.iter().any(|c| matches!(c, CallerCall::SendChunk(_))), "wrote a streaming chunk: {calls:?}");
+        assert!(calls.iter().any(|c| matches!(c, CallerCall::Terminate(_))), "sent the final body / terminated: {calls:?}");
+    }
+
+    /// Caller-tied (can_suspend = false): a node that sends to a
+    /// disconnected caller surfaces an error, which cancels the execution.
+    #[tokio::test]
+    async fn caller_tied_disconnect_cancels() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(CallerSender)) });
+        let project = single_node_project("CallerSender");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+        // Caller-tied AND already disconnected: the send must error -> cancel.
+        let fake = FakeCallerConnection::disconnected(caller_cfg(Protocol::Websocket, false));
+
+        let outcome = run_with_caller(
+            project, catalog, journal, color,
+            Some(fake.clone() as Arc<dyn CallerConnection>),
+        ).await;
+        assert!(
+            matches!(outcome, ExecutionOutcome::Cancelled | ExecutionOutcome::Failed { .. }),
+            "a caller-tied run whose send hits a gone caller must not Complete; got {outcome:?}"
+        );
+    }
+
+    /// Survives (can_suspend = true): a send to a disconnected caller is a
+    /// no-op into the void; the node still completes normally.
+    #[tokio::test]
+    async fn survives_disconnect_continues() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(CallerSender)) });
+        let project = single_node_project("CallerSender");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+        let fake = FakeCallerConnection::disconnected(caller_cfg(Protocol::Websocket, true));
+
+        let outcome = run_with_caller(
+            project, catalog, journal, color,
+            Some(fake.clone() as Arc<dyn CallerConnection>),
+        ).await;
+        assert!(
+            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            "a survives run continues past a gone caller; got {outcome:?}"
+        );
+    }
+
+    /// No caller (a durable run): `ctx.caller()` is None and a node that
+    /// requires one fails loud rather than silently no-op'ing.
+    #[tokio::test]
+    async fn no_caller_run_fails_loud_when_required() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(NeedsCaller)) });
+        let project = single_node_project("NeedsCaller");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+
+        // No caller wired (None): the durable-run case.
+        let outcome = run_with_caller(project, catalog, journal, color, None).await;
+        assert!(
+            matches!(outcome, ExecutionOutcome::Failed { .. }),
+            "a node requiring a caller must fail loud on a caller-less run; got {outcome:?}"
+        );
+    }
+
+    // ----- await_signal × caller (hold-then-kill) + non-durability -------
+
+    /// Caller config with an explicit short hold, for the suspension tests
+    /// (the caller-tied hold is real wall-time, so keep it ~1s).
+    fn caller_cfg_hold(can_suspend: bool, hold_secs: u64) -> CallerRuntimeConfig {
+        let mut c = caller_cfg(Protocol::Websocket, can_suspend);
+        c.suspend.default_hold_secs = hold_secs;
+        c
+    }
+
+    /// A node that parks on `await_signal` (a human form), the durable-wait
+    /// primitive. Its interaction with a live caller is the whole point: a
+    /// caller-tied run must NOT durably suspend here.
+    struct AwaiterNode;
+    #[async_trait]
+    impl Node for AwaiterNode {
+        fn node_type(&self) -> &'static str { "Awaiter" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("Awaiter") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let _ = ctx.await_signal(human_form()).await?;
+            ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true))).await
+        }
+    }
+
+    /// Caller-tied (can_suspend = false) run hits a durable `await_signal`
+    /// with no resolving signal arriving: it holds the worker warm for the
+    /// hold window, then is KILLED (cancelled), because a tied run cannot
+    /// degrade into a caller-less background job. This is ALSO the
+    /// non-durability proof: a live tied run does not produce a resumable
+    /// suspension.
+    #[tokio::test]
+    async fn caller_tied_run_at_await_signal_is_killed_not_suspended() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
+        let project = single_node_project("Awaiter");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+        // Tied + connected + a 1s hold: no fire ever arrives, so it must
+        // cancel after the hold (not Stall, not Complete).
+        let fake = FakeCallerConnection::connected(caller_cfg_hold(false, 1));
+
+        let outcome = run_with_caller_tasks(
+            project, catalog, journal.clone(), color,
+            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
+        ).await;
+        assert!(
+            matches!(outcome, ExecutionOutcome::Cancelled),
+            "a caller-tied run at a durable wait with no fire must be killed, not suspended; got {outcome:?}"
+        );
+        // Non-durability: the terminal journal event is a cancellation, NOT
+        // a clean suspension that a later fire could resume.
+        let has_cancel = journal.events.lock().unwrap().iter().any(|e| matches!(
+            e, ExecEvent::ExecutionCancelled { color: c, .. } if *c == color));
+        assert!(has_cancel, "tied live run must journal a cancellation (non-durable)");
+    }
+
+    /// Survivable (can_suspend = true) run hits the SAME durable wait and
+    /// cleanly STALLS (suspends): the worker exits, a later fire resumes it
+    /// caller-less. The contrast with the tied case above is the lifetime
+    /// axis doing its job.
+    #[tokio::test]
+    async fn survivable_run_at_await_signal_suspends_cleanly() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
+        let project = single_node_project("Awaiter");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+        let fake = FakeCallerConnection::connected(caller_cfg_hold(true, 1));
+
+        let outcome = run_with_caller_tasks(
+            project, catalog, journal, color,
+            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
+        ).await;
+        assert!(
+            matches!(outcome, ExecutionOutcome::Stalled),
+            "a survivable run durably suspends at await_signal; got {outcome:?}"
+        );
+    }
+
+    // ----- infra × caller ------------------------------------------------
+
+    /// A node that talks to the live caller AND resolves an infra endpoint
+    /// in the same firing. With no infra (NoopInfra), endpoint resolution
+    /// errors; the node handles it gracefully AFTER the caller talk, proving
+    /// the two paths coexist without interfering. The caller send is
+    /// recorded regardless of the infra outcome.
+    struct CallerPlusEndpoint;
+    #[async_trait]
+    impl Node for CallerPlusEndpoint {
+        fn node_type(&self) -> &'static str { "CallerPlusEndpoint" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("CallerPlusEndpoint") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
+            };
+            // Talk to the caller first.
+            ws.send(OutboundChunk::Json(json!({ "hi": true }))).await?;
+            // Then attempt to resolve an endpoint; with no infra this errors,
+            // which the node tolerates (the point is the two paths compose).
+            let _ = ctx.endpoint("api").await; // Err under NoopInfra; ignored.
+            ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true))).await
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_and_endpoint_resolution_compose() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(CallerPlusEndpoint)) });
+        let project = single_node_project("CallerPlusEndpoint");
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed(&journal, color, &project, "entry").await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+
+        let outcome = run_with_caller(
+            project, catalog, journal, color,
+            Some(fake.clone() as Arc<dyn CallerConnection>),
+        ).await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        use weft_core::caller::CallerCall;
+        assert!(
+            fake.calls().iter().any(|c| matches!(c, CallerCall::SendChunk(_))),
+            "the caller send happened even though the endpoint path ran too: {:?}", fake.calls()
+        );
+    }
+
+    // ----- loop × caller -------------------------------------------------
+
+    /// A loop body node that, on each iteration, receives one message from
+    /// the live caller and emits it on the gather `out` port. Proves
+    /// `ctx.caller()` resolves for a firing INSIDE a loop frame (non-empty
+    /// frame stack), and the caller is the SAME one across iterations.
+    struct LoopBodyCaller;
+    #[async_trait]
+    impl Node for LoopBodyCaller {
+        fn node_type(&self) -> &'static str { "LoopBodyCaller" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("LoopBodyCaller") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+                return Err(weft_core::error::WeftError::NodeExecution("no ws caller in loop body".into()));
+            };
+            // The test scripts inbound before the run; read history from the
+            // window start. Each iteration mints an INDEPENDENT cursor from
+            // the floor, so every iteration sees the first retained message
+            // (broadcast semantics: a cursor is its own reader, not a shared
+            // queue) -- the property under test.
+            let msg = match ws.cursor_from_start().receive().await {
+                Ok(InboundMessage::Json(v)) => v,
+                Ok(InboundMessage::Text(s)) => Value::String(s),
+                _ => Value::Null,
+            };
+            ctx.pulse_downstream(NodeOutput::with("out", msg)).await
+        }
+    }
+
+    /// Entry node that emits the two-item list onto `items`, feeding LoopIn
+    /// (a loop is never the entry; an upstream node supplies the `over` list).
+    struct ListSource;
+    #[async_trait]
+    impl Node for ListSource {
+        fn node_type(&self) -> &'static str { "ListSource" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("ListSource") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            ctx.pulse_downstream(NodeOutput::with("items", json!(["a", "b"]))).await
+        }
+    }
+
+    /// Sink collecting the loop's gathered `List[String|Null]` output.
+    struct GatherSink { got: Arc<StdMutex<Option<Value>>> }
+    #[async_trait]
+    impl Node for GatherSink {
+        fn node_type(&self) -> &'static str { "GatherSink" }
+        fn metadata(&self) -> NodeMetadata { trivial_metadata("GatherSink") }
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let data = ctx.input.get::<Value>("data").unwrap_or(Value::Null);
+            *self.got.lock().unwrap() = Some(data);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_resolves_inside_loop_body_frames() {
+        // Sequential loop over two items; the body reads the caller once per
+        // iteration. LoopIn/LoopOut are built-in (handled inline by the
+        // driver, not the catalog), so the catalog only needs the body+sink.
+        let got = Arc::new(StdMutex::new(None));
+        struct LoopCat { src: &'static ListSource, body: &'static LoopBodyCaller, sink: &'static GatherSink }
+        impl NodeCatalog for LoopCat {
+            fn lookup(&self, t: &str) -> Option<&'static dyn Node> {
+                match t {
+                    "ListSource" => Some(self.src),
+                    "LoopBodyCaller" => Some(self.body),
+                    "GatherSink" => Some(self.sink),
+                    _ => None,
+                }
+            }
+            fn all(&self) -> Vec<&'static str> { vec!["ListSource", "LoopBodyCaller", "GatherSink"] }
+        }
+        let catalog: Arc<dyn NodeCatalog> = Arc::new(LoopCat {
+            src: Box::leak(Box::new(ListSource)),
+            body: Box::leak(Box::new(LoopBodyCaller)),
+            sink: Box::leak(Box::new(GatherSink { got: got.clone() })),
+        });
+
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(), "name": "loop-caller", "description": null,
+            "nodes": [
+                { "id": "src", "nodeType": "ListSource", "label": null, "config": null,
+                  "position": {"x":-1.0,"y":0.0}, "inputs": [],
+                  "outputs": [{ "name": "items", "portType": "List[String]", "required": false }],
+                  "scope": [], "groupBoundary": null, "features": {}, "requiresInfra": false, "images": [] },
+                { "id": "g__in", "nodeType": "LoopIn", "label": null,
+                  "config": { "parentId": "g", "parallel": false, "over": ["items"], "carry": [] },
+                  "position": {"x":0.0,"y":0.0},
+                  "groupBoundary": { "groupId": "g", "role": "In" },
+                  "inputs": [{ "name": "items", "portType": "List[String]", "required": true }],
+                  "outputs": [
+                      { "name": "items", "portType": "String", "required": false },
+                      { "name": "index", "portType": "Number", "required": false }
+                  ],
+                  "scope": [], "features": {}, "requiresInfra": false, "images": [] },
+                { "id": "body", "nodeType": "LoopBodyCaller", "label": null, "config": null,
+                  "position": {"x":1.0,"y":0.0},
+                  "inputs": [{ "name": "in", "portType": "String", "required": true }],
+                  "outputs": [{ "name": "out", "portType": "String", "required": false }],
+                  "scope": ["g"], "groupBoundary": null, "features": {}, "requiresInfra": false, "images": [] },
+                { "id": "g__out", "nodeType": "LoopOut", "label": null,
+                  "config": { "parentId": "g" },
+                  "position": {"x":2.0,"y":0.0},
+                  "groupBoundary": { "groupId": "g", "role": "Out" },
+                  "inputs": [
+                      { "name": "results", "portType": "String", "required": false },
+                      { "name": "done", "portType": "Boolean", "required": false }
+                  ],
+                  "outputs": [{ "name": "results", "portType": "List[String | Null]", "required": false }],
+                  "scope": [], "features": {}, "requiresInfra": false, "images": [] },
+                { "id": "sink", "nodeType": "GatherSink", "label": null, "config": null,
+                  "position": {"x":3.0,"y":0.0},
+                  "inputs": [{ "name": "data", "portType": "List[String | Null]", "required": true }],
+                  "outputs": [], "scope": [], "groupBoundary": null, "features": {}, "requiresInfra": false, "images": [] }
+            ],
+            "edges": [
+                { "id": "e0", "source": "src", "sourceHandle": "items", "target": "g__in", "targetHandle": "items" },
+                { "id": "e1", "source": "g__in", "sourceHandle": "items", "target": "body", "targetHandle": "in" },
+                { "id": "e2", "source": "body", "sourceHandle": "out", "target": "g__out", "targetHandle": "results" },
+                { "id": "e3", "source": "g__out", "sourceHandle": "results", "target": "sink", "targetHandle": "data" }
+            ],
+            "groups": []
+        })).expect("loop-caller project");
+
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        // Kick the entry ListSource; it pulses the two-item list onto LoopIn.
+        seed(&journal, color, &project, "src").await;
+
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+        fake.push_inbound(InboundMessage::Json(json!("from-iter-0")));
+        fake.push_inbound(InboundMessage::Json(json!("from-iter-1")));
+
+        let outcome = run_with_caller(
+            project, catalog, journal, color,
+            Some(fake.clone() as Arc<dyn CallerConnection>),
+        ).await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+
+        // One gathered entry per iteration, and every entry is a real
+        // message read from the caller. The point: `ctx.caller()` resolved
+        // for a firing INSIDE a loop frame, on every iteration. Note the
+        // broadcast semantics: each iteration's `ctx.caller()` is an
+        // independent reader with its own cursor from offset 0, so both read
+        // the FIRST message ("from-iter-0") rather than consuming
+        // sequentially. That is the documented model (a reader sees the whole
+        // stream from its start), not a per-iteration queue; sequential
+        // draining would need one handle threaded across iterations, which
+        // the loop's separate firings do not do.
+        let gathered = got.lock().unwrap().clone().expect("sink got the gather");
+        let arr = gathered.as_array().expect("gather is a list");
+        assert_eq!(arr.len(), 2, "two iterations gathered: {gathered:?}");
+        assert!(
+            arr.iter().all(|v| v.as_str() == Some("from-iter-0")),
+            "every loop iteration resolved the caller and read its first broadcast message \
+             (independent cursor per firing); got {gathered:?}"
+        );
     }
 
 }

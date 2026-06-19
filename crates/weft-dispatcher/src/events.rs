@@ -143,7 +143,7 @@ pub enum DispatcherEvent {
         at_unix: u64,
     },
     /// A `send` landed on a bus. `from` is the registered name of the
-    /// `payload` is the tagged `BusPayload` (`Journaled { value }`
+    /// `payload` is the tagged `JournaledPayload` (`Journaled { value }`
     /// for journaled buses, `Ephemeral` for ephemeral). The inspector
     /// renders metadata-only on `Ephemeral` using `payload_byte_size`
     /// and the 8-byte SHA-256 prefix. Mirrors the journal shape so
@@ -156,7 +156,7 @@ pub enum DispatcherEvent {
         offset: u64,
         from: String,
         msg_kind: String,
-        payload: weft_core::primitive::BusPayload,
+        payload: weft_core::primitive::JournaledPayload,
         payload_byte_size: u64,
         #[serde(with = "weft_core::hex_array8")]
         payload_sha256_prefix: [u8; 8],
@@ -169,6 +169,58 @@ pub enum DispatcherEvent {
         project_id: String,
         bus_id: String,
         offset: u64,
+        at_unix: u64,
+    },
+    /// A live caller attached to this execution. First event in the
+    /// caller stream; the inspector opens a "caller" panel on the run.
+    CallerConnected {
+        color: Color,
+        project_id: String,
+        offset: u64,
+        protocol: String,
+        at_unix: u64,
+    },
+    /// A message arrived from the caller. `payload` is the tagged
+    /// `JournaledPayload` (journaled value vs ephemeral metadata-only), same
+    /// shape as `BusMessage`.
+    CallerInbound {
+        color: Color,
+        project_id: String,
+        offset: u64,
+        payload: weft_core::primitive::JournaledPayload,
+        payload_byte_size: u64,
+        #[serde(with = "weft_core::hex_array8")]
+        payload_sha256_prefix: [u8; 8],
+        at_unix: u64,
+    },
+    /// A message was sent to the caller. `terminal` marks the final
+    /// outbound (HTTP respond/close, WS close).
+    CallerOutbound {
+        color: Color,
+        project_id: String,
+        offset: u64,
+        payload: weft_core::primitive::JournaledPayload,
+        payload_byte_size: u64,
+        #[serde(with = "weft_core::hex_array8")]
+        payload_sha256_prefix: [u8; 8],
+        terminal: bool,
+        at_unix: u64,
+    },
+    /// A node error surfaced to the caller.
+    CallerErrored {
+        color: Color,
+        project_id: String,
+        offset: u64,
+        message: String,
+        at_unix: u64,
+    },
+    /// The caller is gone (response complete OR disconnected). Last
+    /// event in the caller stream; replay cursors stop here.
+    CallerDisconnected {
+        color: Color,
+        project_id: String,
+        offset: u64,
+        reason: String,
         at_unix: u64,
     },
     /// Graph-level participation: a node was wired to a bus. Derived
@@ -231,6 +283,11 @@ impl DispatcherEvent {
             | Self::BusMessage { project_id, .. }
             | Self::BusClosed { project_id, .. }
             | Self::BusParticipant { project_id, .. }
+            | Self::CallerConnected { project_id, .. }
+            | Self::CallerInbound { project_id, .. }
+            | Self::CallerOutbound { project_id, .. }
+            | Self::CallerErrored { project_id, .. }
+            | Self::CallerDisconnected { project_id, .. }
             | Self::JournalCorruption { project_id, .. } => project_id,
         }
     }
@@ -259,6 +316,11 @@ impl DispatcherEvent {
             | Self::BusMessage { color, .. }
             | Self::BusClosed { color, .. }
             | Self::BusParticipant { color, .. }
+            | Self::CallerConnected { color, .. }
+            | Self::CallerInbound { color, .. }
+            | Self::CallerOutbound { color, .. }
+            | Self::CallerErrored { color, .. }
+            | Self::CallerDisconnected { color, .. }
             | Self::JournalCorruption { color, .. } => Some(*color),
             Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }

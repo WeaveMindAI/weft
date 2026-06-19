@@ -1,7 +1,7 @@
 //! Per-kind logic. One module per `Signal` impl in
 //! `weft_core::signal`. Each module:
 //!
-//!   - declares a unit struct (`WebhookHandler`, `TimerHandler`, ...)
+//!   - declares a unit struct (`TimerHandler`, `LiveCallerHandler`, ...)
 //!     implementing `KindHandler`.
 //!   - parses the spec's opaque `config` blob into the kind's typed
 //!     struct from `weft_core::signal`.
@@ -29,10 +29,13 @@
 //!     `ProcessTarget::Resume`; the kind's `process` impl is only
 //!     consulted for entry-mode (`is_resume = false`).
 
-pub mod sse;
+pub mod event_source;
+pub mod sse_subscribe;
+pub mod poll_endpoint;
+pub mod socket_listen;
 pub mod timer;
-pub mod webhook;
 pub mod form;
+pub mod live_connection;
 
 use std::sync::Arc;
 
@@ -93,7 +96,7 @@ pub trait KindHandler: Send + Sync {
 
     /// Spawn any long-running task this kind needs (timer schedule,
     /// SSE subscriber). Returns `Ok(None)` for passive kinds that
-    /// wait for an external HTTP fire (Webhook, Form). `Err` on
+    /// wait for an external HTTP fire (Form, live-caller). `Err` on
     /// malformed spec so register surfaces a 400.
     ///
     /// `kind_state` is the opaque blob persisted on the row at
@@ -118,8 +121,8 @@ pub trait KindHandler: Send + Sync {
     ) -> ProcessOutcome;
 
     /// Render the consumer-facing payload for this signal. Returns
-    /// `Ok(None)` for kinds with no consumer surface (raw Webhook,
-    /// Timer, SSE) and `Err` for malformed specs (so the caller
+    /// `Ok(None)` for kinds with no consumer surface (Timer,
+    /// SseSubscribe) and `Err` for malformed specs (so the caller
     /// surfaces a 400 instead of silently rendering empty).
     fn render(&self, token: &str, sig: &RegisteredSignal) -> Result<Option<Value>>;
 
@@ -302,7 +305,7 @@ pub fn handle_action(
 // ----- Helpers for kind impls ----------------------------------------
 
 /// Mint an opaque plaintext key. Kinds use this when generating an
-/// api-key gate (Webhook OptionalApiKey / regenerate_api_key).
+/// api-key gate (live-caller OptionalApiKey / regenerate_api_key).
 pub fn mint_api_key() -> String {
     let bytes: [u8; 32] = rand::random();
     hex::encode(bytes)
@@ -316,6 +319,44 @@ pub fn sha256_hex(s: &str) -> String {
 
 pub fn default_api_key_header() -> &'static str {
     "X-Api-Key"
+}
+
+/// Map a `PublicEntryAuth` policy onto a `SignalRouting` for the given
+/// surface, minting and hashing a key when the policy requires one.
+/// Shared by every PublicEntry kind that uses the api-key gate (the
+/// live-caller kinds): the auth-to-routing mapping is ONE concept exposed
+/// at several surfaces, not a per-kind copy. On `OptionalApiKey` the
+/// plaintext is stashed in `secret_cache` under `token` (served via
+/// `/display` until the pod restarts) and only its sha256 hash crosses the
+/// wire on the row.
+pub fn public_entry_auth_to_routing(
+    token: &str,
+    surface: weft_core::primitive::SignalSurface,
+    auth: &weft_core::signal::PublicEntryAuth,
+    secret_cache: &Arc<DashMap<String, String>>,
+) -> SignalRouting {
+    use weft_core::primitive::SignalAuth;
+    use weft_core::signal::PublicEntryAuth;
+    match auth {
+        PublicEntryAuth::None => SignalRouting {
+            surface,
+            auth: SignalAuth::None,
+            auth_config: Value::Null,
+        },
+        PublicEntryAuth::OptionalApiKey => {
+            let plaintext = mint_api_key();
+            let hash = sha256_hex(&plaintext);
+            secret_cache.insert(token.to_string(), plaintext);
+            SignalRouting {
+                surface,
+                auth: SignalAuth::ApiKey,
+                auth_config: serde_json::json!({
+                    "header_name": default_api_key_header(),
+                    "value_hash": hash,
+                }),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -335,7 +376,15 @@ mod tests {
         tags.sort_unstable();
         assert_eq!(
             tags,
-            vec!["form", "sse", "timer", "webhook"],
+            vec![
+                "api_endpoint",
+                "form",
+                "live_socket",
+                "poll_endpoint",
+                "socket_listen",
+                "sse_subscribe",
+                "timer",
+            ],
             "listener handlers must cover every core kind; update this list when adding a kind"
         );
     }

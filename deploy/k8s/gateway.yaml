@@ -1,0 +1,245 @@
+---
+# Live caller connection gateway (Envoy Gateway).
+#
+# Routes an outside caller all the way to ONE specific worker pod, by
+# encoding the pod + its namespace in the request's leftmost two DNS
+# labels: `<pod>.<namespace>.<gateway-host>`. A single GatewayClass +
+# Gateway + HTTPRoute + DynamicResolver Backend handle EVERY project and
+# EVERY pod (O(1) objects, scales flat to any pod count); per-pod routing
+# is done by a tiny Lua snippet that rewrites the upstream Host from the
+# subdomain to the pod's internal cluster DNS. The headless Service
+# (`weft-workers`, applied per project by the dispatcher) publishes that
+# DNS. TLS terminates here; the hop to the worker is plain HTTP on the
+# private cluster network, and the dispatcher-signed routing token (the
+# `wct` query param, verified inside the worker) authenticates.
+#
+# SYNC: weft-workers + port 9091 <-> crates/weft-dispatcher/src/backend/k8s_worker.rs (WORKER_CONNECTION_PORT, worker_headless_service_name), crates/weft-cli/src/commands/daemon.rs (gateway install)
+#
+# Template vars (substituted by the CLI daemon at apply, like the other
+# manifests): ${GATEWAY_HOST} is the public wildcard host suffix
+# (cloud: `live.example.com`; local: `<ip>.nip.io`-style). The listener
+# matches `*.${GATEWAY_HOST}` so any `<pod>.<ns>.${GATEWAY_HOST}` lands here.
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: weft-live
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: weft-live-gateway
+  namespace: envoy-gateway-system
+spec:
+  gatewayClassName: weft-live
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      # Wildcard host: every `<pod>.<ns>.${GATEWAY_HOST}` matches. Cloud
+      # adds an HTTPS listener (port 443) with the wildcard cert; local
+      # dev is plain HTTP (loopback), so only this listener exists.
+      hostname: "*.${GATEWAY_HOST}"
+      allowedRoutes:
+        namespaces:
+          from: All
+---
+# The dynamic-forward-proxy backend: Envoy resolves the upstream from the
+# (rewritten) Host header at request time, so no per-pod Service or route
+# is needed. Plain HTTP upstream (TLS terminated at the listener).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: weft-worker-dynamic
+  namespace: envoy-gateway-system
+spec:
+  type: DynamicResolver
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: weft-live-route
+  namespace: envoy-gateway-system
+spec:
+  parentRefs:
+    - name: weft-live-gateway
+  hostnames:
+    - "*.${GATEWAY_HOST}"
+  rules:
+    - filters:
+        # Rewrite the upstream Host from the `x-weft-upstream` header the
+        # Lua set (the pod's internal DNS). This is the supported way to
+        # steer a DynamicResolver upstream WITHOUT touching `:authority`,
+        # so HTTPRoute hostname matching still sees the original public
+        # host. The Lua cannot rewrite `:authority` directly: that
+        # re-triggers route matching against the internal DNS and yields
+        # `route_not_found`.
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: weft-live-host-rewrite-filter
+      backendRefs:
+        - group: gateway.envoyproxy.io
+          kind: Backend
+          name: weft-worker-dynamic
+---
+# Upstream host-rewrite from the Lua-set header. Composes with the
+# DynamicResolver backend (the rewritten host is what it resolves).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: weft-live-host-rewrite-filter
+  namespace: envoy-gateway-system
+spec:
+  urlRewrite:
+    hostname:
+      type: Header
+      header: x-weft-upstream
+---
+# Per-pod routing: rewrite the upstream Host from the caller's subdomain
+# (`<pod>.<ns>.${GATEWAY_HOST}`) to the pod's internal cluster DNS
+# (`<pod>.weft-workers.<ns>.svc.cluster.local`). The DynamicResolver
+# backend then forwards there. One snippet handles every pod; the routing
+# token (verified inside the worker) is what actually authorizes the
+# connection, so a forged subdomain only ever reaches a worker that
+# rejects it.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: weft-live-host-rewrite
+  namespace: envoy-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: weft-live-route
+  lua:
+    - type: Inline
+      inline: |
+        -- Map `<pod>.<suffix>` + path `/<ns>/<rest>` ->
+        -- upstream host `<pod>.weft-workers.<ns>.svc.cluster.local` and
+        -- path `/<rest>`. The POD is the leftmost DNS label (pod names are
+        -- DNS-clean: single hyphens only). The NAMESPACE rides the FIRST
+        -- PATH SEGMENT, NOT the host, because the project namespace
+        -- contains `--` and Envoy/Gateway-API reject any host label with
+        -- consecutive hyphens (IDNA punycode reservation). A single-label
+        -- `*.` wildcard listener matches `<pod>.<suffix>`. WebSocket
+        -- upgrades carry the same Host + path, so this covers both
+        -- protocols.
+        function envoy_on_request(request_handle)
+          local headers = request_handle:headers()
+          local host = headers:get(":authority")
+          local path = headers:get(":path")
+          if host == nil or path == nil then
+            return
+          end
+          -- Pod = leftmost host label (strip any port first).
+          local hostport = host
+          local colon = string.find(hostport, ":")
+          if colon ~= nil then
+            hostport = string.sub(hostport, 1, colon - 1)
+          end
+          local pod = string.match(hostport, "^([^.]+)%.")
+          if pod == nil then
+            request_handle:logWarn("weft live: unexpected caller host '" .. host .. "'")
+            return
+          end
+          -- Namespace = first path segment; the rest is the real path.
+          -- `path` is `/<ns>/<rest...>?<query>`; keep the query intact.
+          local ns, rest = string.match(path, "^/([^/?]+)(.*)$")
+          if ns == nil then
+            request_handle:logWarn("weft live: caller path missing namespace segment '" .. path .. "'")
+            return
+          end
+          if rest == "" or string.sub(rest, 1, 1) == "?" then
+            rest = "/" .. rest  -- root path under the namespace
+          end
+          -- SYNC: per-pod connection FQDN <-> crates/weft-dispatcher/src/api/signal.rs (pod_connection_fqdn). The dispatcher resolves this exact name before handing out the URL.
+          local upstream = pod .. ".weft-workers." .. ns .. ".svc.cluster.local:9091"
+          -- Set the upstream target in a header the HTTPRouteFilter
+          -- rewrites the Host from. Do NOT touch `:authority`: route
+          -- matching must keep seeing the original public host, else
+          -- Envoy re-routes against the internal DNS and 404s
+          -- (route_not_found). Strip the namespace segment from the path.
+          headers:replace("x-weft-upstream", upstream)
+          headers:replace(":path", rest)
+        end
+---
+# NO IDLE TIMEOUT on the client (caller -> gateway) connection. A live
+# caller connection (a WebSocket, or an HTTP stream the worker holds open
+# while the workflow thinks: LLM calls, human-in-the-loop pauses) can sit
+# idle for minutes or hours and MUST NOT be cut. TWO independent idle
+# timeouts must both be disabled:
+#   - `streamIdleTimeout`: the PER-STREAM idle (default 5 MINUTES). This is
+#     the one that actually cuts a quiet WebSocket or held HTTP stream: it
+#     fires when a single stream sees no bytes either way. Disabling it is
+#     the whole point of this policy. (It is listener-scoped here, which is
+#     fine: this Gateway exists solely for live caller traffic.)
+#   - `idleTimeout`: the CONNECTION-level idle (default ~1h), independent of
+#     the per-stream one; disabled too so a kept-alive connection between
+#     streams is never reaped.
+# `requestReceivedTimeout` is left at its default: it only bounds how long
+# the gateway waits to receive the request LINE, which a real caller sends
+# immediately; it does not bound the held connection.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: weft-live-no-idle-timeout
+  namespace: envoy-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: weft-live-gateway
+  timeout:
+    http:
+      # 0s disables each: a quiet live stream/connection stays open.
+      streamIdleTimeout: 0s
+      idleTimeout: 0s
+---
+# NO IDLE / DURATION / REQUEST TIMEOUT on the upstream (gateway -> worker)
+# hop either, for the same reason: the worker holds the connection for the
+# life of the live execution, which is user-controlled and can be long. The
+# default upstream request timeout (15s) and any connection idle/duration
+# cap would sever a healthy long-lived connection. WebSocket upgrades and
+# HTTP streams both ride this route, so the policy targets the route.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: weft-live-no-upstream-timeout
+  namespace: envoy-gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: weft-live-route
+  timeout:
+    http:
+      # All 0s = disabled: never cut a healthy long-lived live connection.
+      connectionIdleTimeout: 0s
+      maxConnectionDuration: 0s
+      requestTimeout: 0s
+  # DNS re-resolution rate for the DynamicResolver upstream. The bug this
+  # fixes: a worker pod is spawned on demand for a live connection, but the
+  # per-pod cluster DNS record (`<pod>.weft-workers.<ns>.svc.cluster.local`)
+  # takes a beat to propagate (EndpointSlice -> CoreDNS). If the caller
+  # connects in that gap, Envoy's resolver gets NXDOMAIN and NEGATIVE-CACHES
+  # it for `dnsFailureRefreshRate`, which (when unset) defaults to
+  # `dnsRefreshRate`. At the old default (30s) a sub-second propagation gap
+  # became a ~30s outage for the FIRST caller of every cold pod: 503 "no
+  # healthy upstream" until the cached failure expired, even though the
+  # record had since appeared. Dropping the refresh to 1s makes a transient
+  # NXDOMAIN self-heal within ~1s. `respectDnsTtl` (default true) still
+  # governs the SUCCESS path, so warm pods are not re-resolved on this short
+  # timer (they follow the record TTL).
+  dns:
+    dnsRefreshRate: 1s
+    respectDnsTtl: true
+# NOTE: the Backend API (DynamicResolver) must be enabled in the
+# controller's `envoy-gateway-config` ConfigMap (`extensionApis.enableBackend:
+# true`), NOT via a CR (`EnvoyGateway` is the config file's kind, not a
+# cluster resource). The CLI daemon patches that ConfigMap + restarts the
+# controller in `ensure_envoy_gateway`, so it is not applied here.

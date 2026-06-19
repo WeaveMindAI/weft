@@ -406,7 +406,7 @@ impl BusCoordinator {
     /// and the bus's engine hooks (liveness + journal-pump notify) are
     /// `Weak` back to this coordinator. `Weak` on the engine side lets
     /// the coordinator drop naturally at execution end; once gone, the
-    /// bus's hooks no-op. Errors on an invalid `ephemeral_window`.
+    /// bus's hooks no-op. Errors on an invalid `window`.
     pub fn new_bus(
         self: &Arc<Self>,
         opts: BusOptions,
@@ -921,8 +921,8 @@ fn bus_entry_to_event(color: Color, bus_id: &str, entry: &BusEntry) -> ExecEvent
             // from `None` (no journaled payload at all) across the
             // serde round-trip.
             payload: match payload {
-                Some(v) => weft_core::primitive::BusPayload::Journaled { value: v.clone() },
-                None => weft_core::primitive::BusPayload::Ephemeral,
+                Some(v) => weft_core::primitive::JournaledPayload::Journaled { value: v.clone() },
+                None => weft_core::primitive::JournaledPayload::Ephemeral,
             },
             payload_byte_size: *payload_byte_size,
             payload_sha256_prefix: *payload_sha256_prefix,
@@ -1172,6 +1172,13 @@ pub struct RunnerHandle {
     /// trigger; `None` for every other dispatch (regular pulse-driven
     /// firings, manual-run roots without a payload, setup-phase runs).
     wake_payload: Option<Value>,
+    /// Live caller connection for this EXECUTION. A cheap `Arc` clone of
+    /// the one connection the loop driver holds for the color, threaded
+    /// into every firing's handle so any node can reach the caller via
+    /// `ctx.caller()`. `None` for durable runs and for any worker that
+    /// did not receive a `live_connection` request. Per-execution, not
+    /// per-firing: all firings of one color share the one caller.
+    caller_connection: Option<Arc<dyn weft_core::caller::CallerConnection>>,
 }
 
 impl RunnerHandle {
@@ -1216,6 +1223,7 @@ impl RunnerHandle {
             bus_coordinator,
             declared_outputs,
             wake_payload: None,
+            caller_connection: None,
         }
     }
 
@@ -1234,6 +1242,17 @@ impl RunnerHandle {
     /// every other dispatch leaves `wake_payload` as None.
     pub fn with_wake_payload(mut self, payload: Value) -> Self {
         self.wake_payload = Some(payload);
+        self
+    }
+
+    /// Wire the execution's live caller connection. Called by the loop
+    /// driver for every firing of a color that has a caller attached, so
+    /// `ctx.caller()` resolves on any node. Left `None` otherwise.
+    pub fn with_caller_connection(
+        mut self,
+        conn: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+    ) -> Self {
+        self.caller_connection = conn;
         self
     }
 
@@ -1603,6 +1622,18 @@ impl ContextHandle for RunnerHandle {
     /// The author writes `let x = ctx.await_signal(...).await?;` N
     /// times in a row; each call is replay-instant on resume.
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
+        // Reconcile the two execution worlds. The wait policy (hold vs
+        // suspend + hold time) resolves from the run's SuspendPolicy
+        // through the general `wait` machinery; a live caller only supplies
+        // that policy. We do NOT fail here on a non-suspendable run that
+        // wants to suspend: other branches may still be running and talking
+        // to the caller, so the kill/disconnect fires ONCE later, at the
+        // true suspension point (the loop driver, when every branch is
+        // parked), never when one branch reaches a wait. The driver also
+        // owns the "hold the worker warm" decision (it treats an attached
+        // caller like a live bus). So there is nothing to special-case in
+        // this per-await path; the suspend path below runs unchanged.
+
         // A durable suspension replays the whole node body on resume.
         // Emitting (`pulse_downstream`) before a durable await is
         // unsound: the replay would re-run the body and re-emit the
@@ -2080,6 +2111,10 @@ impl ContextHandle for RunnerHandle {
 
     fn wake_payload(&self) -> Option<&Value> {
         self.wake_payload.as_ref()
+    }
+
+    fn caller_connection(&self) -> Option<Arc<dyn weft_core::caller::CallerConnection>> {
+        self.caller_connection.clone()
     }
 }
 
@@ -2582,6 +2617,72 @@ mod replay_tests {
             (1, Some(serde_json::json!({"shape": "pre-baked"})))
         );
     }
+
+    // ----- Live caller surface on the ContextHandle ------------------
+
+    use weft_core::caller::{CallerRuntimeConfig, FakeCallerConnection};
+    use weft_core::signal::{Backpressure, DataType, ErrorMode, Protocol};
+    use weft_core::wait::SuspendPolicy;
+
+    fn caller_cfg(protocol: Protocol, can_suspend: bool) -> CallerRuntimeConfig {
+        CallerRuntimeConfig {
+            protocol,
+            data_type: DataType::Json,
+            backpressure: Backpressure::Block,
+            error_mode: ErrorMode::Surface,
+            connect_timeout_secs: 5,
+            max_inbound_bytes: 1024,
+            max_session_secs: 0,
+            suspend: SuspendPolicy { can_suspend, default_hold_secs: 300 },
+            inbound_window: weft_core::caller::DEFAULT_INBOUND_WINDOW,
+        }
+    }
+
+    #[test]
+    fn queries_report_protocol_and_none_without_caller() {
+        // No caller wired: both queries false, caller() None.
+        let bare = handle_with_sequence(vec![]);
+        assert!(!bare.caller_connection().is_some());
+
+        // HTTP caller wired: protocol is Http.
+        let http = handle_with_sequence(vec![]).with_caller_connection(Some(
+            FakeCallerConnection::connected(caller_cfg(Protocol::Http, false)),
+        ));
+        assert!(http.caller_connection().is_some());
+        let proto = http.caller_connection().unwrap().config().protocol;
+        assert_eq!(proto, Protocol::Http);
+
+        let ws = handle_with_sequence(vec![]).with_caller_connection(Some(
+            FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, true)),
+        ));
+        assert_eq!(ws.caller_connection().unwrap().config().protocol, Protocol::Websocket);
+    }
+
+    #[tokio::test]
+    async fn await_signal_does_not_fail_at_the_call_in_a_tied_run() {
+        // A durable wait in a caller-tied run does NOT fail at the await
+        // call: other branches may still be running and talking to the
+        // caller, so the reconciliation (hold-then-kill) is deferred to the
+        // true suspension point in the loop driver. At the call, the await
+        // suspends as normal (returns Suspended), it does NOT raise a
+        // policy error. Use the pending-tail replay path (a pre-loaded
+        // unresolved await) so the suspend is reached without the broker.
+        let seq = vec![AwaitedEntry {
+            call_index: 0,
+            kind: AwaitedEntryKind::Await { token: "tok-pending".into(), resolved: None },
+        }];
+        let handle = handle_with_sequence(seq).with_caller_connection(Some(
+            FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false)),
+        ));
+        let spec = weft_core::signal::to_spec(weft_core::signal::Timer {
+            spec: weft_core::signal::TimerSpec::After { duration_ms: 1000 },
+        });
+        let err = handle.await_signal(spec).await.expect_err("a pending await suspends");
+        assert!(
+            matches!(err, WeftError::Suspended { ref token } if token == "tok-pending"),
+            "tied-run await must suspend at the call, not fail; got: {err:?}"
+        );
+    }
 }
 
 /// After `node.provision()` returns, the loop driver calls this to
@@ -2870,7 +2971,7 @@ mod bus_pump_tests {
             &coord,
             BusOptions {
                 ephemeral: true,
-                ephemeral_window: Some(4),
+                window: Some(4),
             },
         );
         bus.register("camera").unwrap();
@@ -2898,7 +2999,7 @@ mod bus_pump_tests {
             })
             .expect("BusMessage journaled");
         assert!(
-            matches!(message.0, weft_core::primitive::BusPayload::Ephemeral),
+            matches!(message.0, weft_core::primitive::JournaledPayload::Ephemeral),
             "ephemeral payload must be tagged Ephemeral in journal"
         );
         assert!(message.1 > 0, "byte size must be populated");

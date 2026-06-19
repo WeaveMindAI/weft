@@ -373,6 +373,7 @@ impl WorkerPodClient for BrokerWorkerPodClient {
             self.http.post("/v1/worker_pod/mark_done_if_idle", &req).await?;
         Ok(resp.exited)
     }
+
 }
 
 // ---------- Signals (listener-only rehydrate) ----------

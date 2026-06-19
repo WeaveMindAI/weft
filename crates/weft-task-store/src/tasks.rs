@@ -295,6 +295,149 @@ pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome>
     Ok(DedupOutcome::Inserted(id))
 }
 
+/// The pod a live execution was admitted to (its k8s name + namespace),
+/// returned by [`admit_live_execution`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedPod {
+    pub pod_name: String,
+    pub namespace: String,
+}
+
+/// ATOMICALLY admit a live execution: pick the least-loaded routable pod for
+/// the project whose in-flight live-execution load is under `cap`, and insert
+/// the pinned execute task for `color` on it, all in ONE transaction under a
+/// per-project advisory lock. Returns the chosen pod, or `None` if every pod
+/// is at `cap` or none is routable (the caller then spawns a fresh pod and
+/// retries).
+///
+/// This is the SINGLE SOURCE OF TRUTH for live-connection capacity: admission
+/// IS the task insert, so "admitted" and "has a task row" can never disagree.
+/// There is no separate `live_connection_count` to drift, no admit/insert
+/// window, and failure cleanup is just deleting the pending task (which by
+/// definition frees the slot). The load is COUNTED from the task table (live-
+/// execute tasks `pending`/`claimed` pinned to the pod); the advisory lock
+/// serializes admissions for the project so concurrent handshakes (across
+/// sibling dispatcher Pods) see a consistent count and cannot overshoot `cap`.
+/// `cap == 0` means no cap.
+///
+/// Dedups on `{color}:execute` (the color is freshly minted per handshake, so
+/// this only collapses a crash-retry of the same handshake).
+#[allow(clippy::too_many_arguments)]
+pub async fn admit_live_execution(
+    pool: &PgPool,
+    project_id: &str,
+    color: &str,
+    tenant_id: Option<&str>,
+    payload: &Value,
+    cap: i32,
+) -> Result<Option<AdmittedPod>> {
+    let mut tx = pool.begin().await?;
+    // Serialize admissions for this project so the load count below is
+    // consistent across concurrent handshakes (same discipline as
+    // `enqueue_dedup`'s per-dedup lock, here per-project for the cap).
+    let lock_input = format!("live-admit|{project_id}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&lock_input)
+        .execute(&mut *tx)
+        .await?;
+
+    // Pick the least-loaded routable pod under cap. Load = in-flight live-
+    // execute tasks pinned to the pod (the same predicate the orphan sweep
+    // uses). `$2 = 0` disables the cap.
+    let chosen: Option<(String, String)> = sqlx::query_as(
+        r#"SELECT wp.pod_name, wp.namespace
+           FROM worker_pod wp
+           WHERE wp.project_id = $1
+             AND wp.status IN ('spawning', 'alive')
+             AND (
+               $2 = 0 OR (
+                 SELECT COUNT(*) FROM task t
+                 WHERE t.target_pod_name = wp.pod_name
+                   AND t.kind = 'execute'
+                   AND t.status IN ('pending', 'claimed')
+                   AND t.payload -> 'live_connection' IS NOT NULL
+                   AND t.payload -> 'live_connection' != 'null'::jsonb
+               ) < $2
+             )
+           ORDER BY (
+             SELECT COUNT(*) FROM task t
+             WHERE t.target_pod_name = wp.pod_name
+               AND t.kind = 'execute'
+               AND t.status IN ('pending', 'claimed')
+               AND t.payload -> 'live_connection' IS NOT NULL
+               AND t.payload -> 'live_connection' != 'null'::jsonb
+           ) ASC, wp.pod_name ASC
+           LIMIT 1"#,
+    )
+    .bind(project_id)
+    .bind(cap)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((pod_name, namespace)) = chosen else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    // Insert the pinned execute task = the admission. Dedup on {color}:execute
+    // (a crash-retry of the same handshake collapses; the color is unique per
+    // handshake so distinct handshakes never collide).
+    let dedup = format!("{color}:execute");
+    // A retry of the same handshake finds its task already live; return the
+    // SAME pod it was admitted to, never insert a second task for the color.
+    // LEFT JOIN so a task whose pod row was already GC'd is STILL found (an
+    // inner join would miss it and let us insert a duplicate). `t.target_pod_name`
+    // is the durable pin; `wp.namespace` is NULL only if that pod row is gone.
+    let existing: Option<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT t.target_pod_name, wp.namespace
+           FROM task t LEFT JOIN worker_pod wp ON wp.pod_name = t.target_pod_name
+           WHERE t.tenant_id IS NOT DISTINCT FROM $1
+             AND t.kind = 'execute' AND t.dedup_key = $2
+             AND t.status IN ('pending', 'claimed')
+           LIMIT 1"#,
+    )
+    .bind(tenant_id)
+    .bind(&dedup)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((pod_name, namespace)) = existing {
+        tx.commit().await?;
+        return match namespace {
+            // Already admitted on a live pod: idempotent success on that pod.
+            Some(namespace) => Ok(Some(AdmittedPod { pod_name, namespace })),
+            // The original pod's row is gone (it died and was GC'd): the task
+            // is now an orphan the sweep will cancel. Fail loud rather than
+            // insert a SECOND task for the color on a fresh pod (which would
+            // leave two execute tasks for one color). The caller surfaces the
+            // error; the orphan sweep cancels the dead-pod task.
+            None => Err(anyhow::anyhow!(
+                "live execution for color {color} was admitted to pod '{pod_name}' which is gone; \
+                 the orphan sweep will cancel it"
+            )),
+        };
+    }
+
+    let id = Uuid::new_v4();
+    let now = unix_now();
+    sqlx::query(
+        r#"INSERT INTO task (
+            id, kind, status, target, project_id, dedup_key, color, tenant_id,
+            target_pod_name, payload, attempts, created_at_unix
+        ) VALUES ($1, 'execute', 'pending', 'worker', $2, $3, $4, $5, $6, $7, 0, $8)"#,
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(&dedup)
+    .bind(color)
+    .bind(tenant_id)
+    .bind(&pod_name)
+    .bind(payload)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(AdmittedPod { pod_name, namespace }))
+}
+
 /// Atomically claim one task for `pod_id`. Picks oldest pending
 /// first; also rescues claims whose lease expired (Pod died mid-work).
 pub async fn claim_one(
@@ -526,6 +669,191 @@ pub async fn sweep_terminal(pool: &PgPool) -> Result<u64> {
     .execute(pool)
     .await?;
     Ok(rows.rows_affected())
+}
+
+/// A live-caller execution that was orphaned when its pinned worker pod
+/// died before (or while) running it. The caller was gateway-routed to that
+/// exact dead pod, so the execution cannot be re-run elsewhere (the caller
+/// is gone); the dispatcher records a terminal `ExecutionCancelled` for the
+/// color so the journal does not keep a started-but-unrunnable execution.
+///
+/// The `task_id` is carried so the reaper can delete the orphan's task ONLY
+/// AFTER it has recorded the cancel: the task row is the durable marker that
+/// this color still needs cancelling. If the cancel-record fails, the task
+/// survives and the next sweep re-finds it, so a color is never stranded
+/// un-cancelled (the delete and the cancel are NOT one transaction; the task
+/// outlives the cancel attempt as the retry handle).
+pub struct OrphanedLiveExecution {
+    pub task_id: Uuid,
+    pub color: String,
+    pub project_id: Option<String>,
+}
+
+/// Recover EVERY task stranded on a worker pod that is no longer routable
+/// (its `worker_pod` row is absent, `dead`, or `done`), so no work and no
+/// journal junk is left behind. TASK-DRIVEN (scans the task table, not a
+/// specific pod), so it is self-healing: it runs on a timer and re-finds any
+/// still-stranded task regardless of which code path marked the pod dead
+/// (the stale-heartbeat reaper, the stale-image replacement, anything) and
+/// regardless of how many times it has run before. This is the durable retry
+/// surface: a task pinned to a non-routable pod IS the evidence that it still
+/// needs recovery, and it stays until recovered.
+///
+/// In one transaction:
+///   1. LIVE EXECUTE orphans (`kind='execute'` with a non-null
+///      `live_connection`, pinned to a non-routable pod): the caller was
+///      gateway-routed to that exact dead pod, so the run is unrecoverable.
+///      SELECT (do NOT delete) them and return (task_id, color); the
+///      dispatcher records `ExecutionCancelled` then deletes each via
+///      [`delete_task`], so a cancel-record failure leaves the task in place
+///      and the NEXT sweep retries (the cancel is recorded under a dedup key,
+///      so a re-record is a no-op).
+///   2. EVERY OTHER stranded task (ordinary execute/resume/cancel pinned to,
+///      or claimed by, a non-routable pod): clear the pin and requeue to
+///      `pending` so any live pod can claim it. The live-execute orphans from
+///      (1) are EXCLUDED (they are terminal, not re-runnable).
+///
+/// "Non-routable pod" = no `worker_pod` row with `status IN
+/// ('spawning','alive')` for that pod name. A task with `target_pod_name`
+/// NULL and no `claimed_by` is normal pending work, untouched.
+///
+/// Idempotent across sibling reaper Pods: (1) is a read (a second pass
+/// re-finds the same not-yet-deleted orphans; the cancel dedups), and (2) is
+/// a conditional UPDATE.
+pub async fn reclaim_orphaned_tasks(pool: &PgPool) -> Result<Vec<OrphanedLiveExecution>> {
+    // A pinned/claimed pod name is "routable" iff a spawning/alive row exists.
+    // `pinned_dead` / `claimed_dead` CTEs express "references a pod that is
+    // not routable" (the EXISTS is false: row absent OR terminal).
+    let mut tx = pool.begin().await?;
+    // 1. Live-execute orphans pinned to a non-routable pod: SELECT + report.
+    let orphans = sqlx::query(
+        r#"SELECT t.id, t.color, t.project_id
+           FROM task t
+           WHERE t.kind = 'execute'
+             AND t.status IN ('pending', 'claimed')
+             AND t.target_pod_name IS NOT NULL
+             AND t.payload -> 'live_connection' IS NOT NULL
+             AND t.payload -> 'live_connection' != 'null'::jsonb
+             AND NOT EXISTS (
+                 SELECT 1 FROM worker_pod wp
+                 WHERE wp.pod_name = t.target_pod_name
+                   AND wp.status IN ('spawning', 'alive')
+             )"#,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut orphaned = Vec::with_capacity(orphans.len());
+    for r in orphans {
+        // A decode failure is schema drift: fail loud, never silently skip a
+        // row (that would leave a started execution un-cancelled). A live
+        // execute always carries a color, so a NULL here is itself corruption.
+        let task_id: Uuid = r.try_get("id")?;
+        let color: Option<String> = r.try_get("color")?;
+        let project_id: Option<String> = r.try_get("project_id")?;
+        let Some(color) = color else {
+            anyhow::bail!("live execute orphan task {task_id} has NULL color");
+        };
+        orphaned.push(OrphanedLiveExecution { task_id, color, project_id });
+    }
+    // 2. Requeue every OTHER stranded task: pinned to OR claimed by a
+    //    non-routable pod, excluding the live-execute orphans from (1).
+    sqlx::query(
+        r#"UPDATE task t
+           SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL,
+               target_pod_name = NULL
+           WHERE t.status IN ('pending', 'claimed')
+             AND (
+                 (t.target_pod_name IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM worker_pod wp
+                     WHERE wp.pod_name = t.target_pod_name
+                       AND wp.status IN ('spawning', 'alive')
+                 ))
+                 OR
+                 (t.claimed_by IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM worker_pod wp
+                     WHERE wp.pod_name = t.claimed_by
+                       AND wp.status IN ('spawning', 'alive')
+                 ))
+             )
+             AND NOT (
+                 t.kind = 'execute'
+                 AND t.payload -> 'live_connection' IS NOT NULL
+                 AND t.payload -> 'live_connection' != 'null'::jsonb
+             )"#,
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(orphaned)
+}
+
+/// Delete a single task row by id. Used by the reaper to retire an orphaned
+/// live-execution task AFTER its `ExecutionCancelled` has been journaled, so
+/// the row survives (and the next sweep retries) if the cancel-record fails.
+pub async fn delete_task(pool: &PgPool, id: Uuid) -> Result<()> {
+    sqlx::query("DELETE FROM task WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Outcome of [`delete_pending_live_execution`]: who, if anyone, will run the
+/// live execution after a failed dispatcher-side setup. Tells the caller
+/// whether IT must journal the cancel terminal, or whether a worker owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupFailureOutcome {
+    /// The pending execute task was deleted (or never existed): NO worker will
+    /// run this color, so the caller must journal the terminal cancel.
+    NoWorkerWillRun,
+    /// An execute task is already `claimed`: a worker owns the run and will
+    /// write its own terminal. The caller must NOT cancel (that would stack a
+    /// second, contradictory terminal on the same color).
+    WorkerOwnsIt,
+}
+
+/// Clean up a live execution whose dispatcher-side setup FAILED (after
+/// [`admit_live_execution`] inserted its task). Because admission IS the task
+/// insert, the cleanup is: delete the task IF still `pending` (no worker has
+/// run it). In ONE transaction it deletes the pending task (if any) and then
+/// checks whether ANY execute task for the color still exists:
+///   - none remains (we deleted the pending one, or none ever existed) ->
+///     `NoWorkerWillRun`: the caller journals the cancel terminal.
+///   - one remains (it was already `claimed` in the commit-but-Err race) ->
+///     `WorkerOwnsIt`: the worker runs it and writes its own terminal; the
+///     caller must NOT also cancel.
+/// This is what lets the caller avoid stacking a second terminal on a color a
+/// worker is concurrently finishing. There is no slot counter to release: the
+/// task row IS the slot, so deleting it frees the slot.
+pub async fn delete_pending_live_execution(
+    pool: &PgPool,
+    color: &str,
+) -> Result<SetupFailureOutcome> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"DELETE FROM task
+           WHERE color = $1 AND kind = 'execute' AND status = 'pending'
+             AND payload -> 'live_connection' IS NOT NULL
+             AND payload -> 'live_connection' != 'null'::jsonb"#,
+    )
+    .bind(color)
+    .execute(&mut *tx)
+    .await?;
+    // `1::bigint` so sqlx's i64 expectation matches: a bare `1` is typed
+    // int4 by Postgres and would fail the decode whenever a row IS returned
+    // (the exact pitfall guarded the same way in `worker_pod`).
+    let remaining: Option<(i64,)> = sqlx::query_as(
+        r#"SELECT 1::bigint FROM task WHERE color = $1 AND kind = 'execute' LIMIT 1"#,
+    )
+    .bind(color)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(if remaining.is_some() {
+        SetupFailureOutcome::WorkerOwnsIt
+    } else {
+        SetupFailureOutcome::NoWorkerWillRun
+    })
 }
 
 /// Decode a `task` row. Every column propagates its decode error

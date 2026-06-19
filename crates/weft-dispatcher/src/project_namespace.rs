@@ -152,6 +152,12 @@ pub fn render(args: &ProjectNamespaceArgs<'_>) -> String {
     // Service/containerPort (a literal here once meant changing
     // STORAGE_PORT would silently break the data path).
     let storage_port = weft_storage::config::STORAGE_PORT;
+    // Namespace the Envoy Gateway runs in (its default install namespace);
+    // the only source allowed to reach worker connection ports. Worker
+    // port pulled from the one constant so it can't drift from the pod
+    // manifest's containerPort.
+    let gateway_namespace = crate::backend::k8s_worker::GATEWAY_NAMESPACE;
+    let connection_port = crate::backend::k8s_worker::WORKER_CONNECTION_PORT;
     format!(
         r#"---
 apiVersion: v1
@@ -199,6 +205,18 @@ spec:
   policyTypes:
     - Ingress
     - Egress
+  ingress:
+    # Live caller connections: the gateway forwards a routed caller to
+    # the worker's connection port. Only the gateway namespace may reach
+    # workers (callers never touch a worker directly; the signed routing
+    # token is the second gate inside the worker).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {gateway_namespace}
+      ports:
+        - protocol: TCP
+          port: {connection_port}
   egress:
     # Broker (cross-ns to weft-db).
     - to:

@@ -1,6 +1,6 @@
-//! Form handler. Like Webhook, the dispatcher hosts the public URL;
-//! the listener registers an in-RAM entry. Forms are TaskCallback
-//! style: each fire is a one-shot reply tied to a specific token.
+//! Form handler. Like the live-caller kinds, the dispatcher hosts the
+//! public URL; the listener registers an in-RAM entry. Forms are
+//! TaskCallback style: each fire is a one-shot reply tied to a token.
 //!
 //! Resume forms (HumanQuery style) take the resume path generically
 //! in `kinds::process`; entry forms (HumanTrigger) route to `Entry`.

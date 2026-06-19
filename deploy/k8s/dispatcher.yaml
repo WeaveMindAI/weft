@@ -181,6 +181,15 @@ spec:
             # pods use to reach the broker.
             - name: WEFT_BROKER_TOKEN_PATH
               value: "/var/run/weft/sa/token"
+            # Live caller connection handshake: the HMAC the dispatcher
+            # signs routing tokens with (same secret every worker pod
+            # verifies), and the public gateway origin callers are pointed
+            # at (the dispatcher prepends `<pod>.<ns>.` to mint per-pod
+            # URLs). Empty disables live connections.
+            - name: WEFT_CALLER_TOKEN_SECRET
+              value: "${WEFT_CALLER_TOKEN_SECRET}"
+            - name: WEFT_GATEWAY_BASE_URL
+              value: "${WEFT_GATEWAY_BASE_URL}"
           readinessProbe:
             httpGet:
               path: /health

@@ -594,6 +594,52 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
             }
             out
         }
+        // Caller events: surfaced 1:1 so the inspector replays the live
+        // caller exchange (connected / inbound / outbound / errored /
+        // disconnected) the same way it replays a bus. Payloads carry the
+        // journaled-vs-ephemeral `JournaledPayload` so high-volume streams stay
+        // metadata-only.
+        ExecEvent::CallerConnected { color, offset, protocol, at_unix } => {
+            vec![DispatcherEvent::CallerConnected {
+                color: *color, project_id, offset: *offset,
+                protocol: protocol.clone(), at_unix: *at_unix,
+            }]
+        }
+        ExecEvent::CallerInbound {
+            color, offset, payload, payload_byte_size, payload_sha256_prefix, at_unix,
+        } => {
+            vec![DispatcherEvent::CallerInbound {
+                color: *color, project_id, offset: *offset,
+                payload: payload.clone(),
+                payload_byte_size: *payload_byte_size,
+                payload_sha256_prefix: *payload_sha256_prefix,
+                at_unix: *at_unix,
+            }]
+        }
+        ExecEvent::CallerOutbound {
+            color, offset, payload, payload_byte_size, payload_sha256_prefix, terminal, at_unix,
+        } => {
+            vec![DispatcherEvent::CallerOutbound {
+                color: *color, project_id, offset: *offset,
+                payload: payload.clone(),
+                payload_byte_size: *payload_byte_size,
+                payload_sha256_prefix: *payload_sha256_prefix,
+                terminal: *terminal,
+                at_unix: *at_unix,
+            }]
+        }
+        ExecEvent::CallerErrored { color, offset, message, at_unix } => {
+            vec![DispatcherEvent::CallerErrored {
+                color: *color, project_id, offset: *offset,
+                message: message.clone(), at_unix: *at_unix,
+            }]
+        }
+        ExecEvent::CallerDisconnected { color, offset, reason, at_unix } => {
+            vec![DispatcherEvent::CallerDisconnected {
+                color: *color, project_id, offset: *offset,
+                reason: reason.clone(), at_unix: *at_unix,
+            }]
+        }
         // SuspensionRegistered / SuspensionResolved / LogLine /
         // RunOutput / NodeKicked: not surfaced through DispatcherEvent.
         // SSE consumers don't need them for live UI; they read the

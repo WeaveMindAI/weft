@@ -56,6 +56,11 @@ pub struct SpawnPodSpec {
     /// rather than fall back to `:latest` so a misconfigured CLI
     /// doesn't silently spawn the wrong image.
     pub binary_hash: Option<String>,
+    /// Hex-encoded HMAC secret the worker verifies live-connection
+    /// routing tokens with (the dispatcher signs them with the same
+    /// secret). Empty string when live connections aren't provisioned;
+    /// the worker then rejects every token loud (never accepts unsigned).
+    pub caller_token_secret_hex: String,
 }
 
 #[derive(Debug, Clone)]

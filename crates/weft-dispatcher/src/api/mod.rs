@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 use crate::state::DispatcherState;
 
 pub mod project;
-mod execution;
+pub(crate) mod execution;
 mod events;
 mod extension;
 mod extension_names;
@@ -121,11 +121,23 @@ pub fn router(state: DispatcherState) -> Router {
             "/projects/{id}/signals/{node_id}/action",
             post(signal::action_signal),
         )
+        // Live caller connection handshake: an outside caller hits
+        // `/connect/<path>` to open a held connection. The handler
+        // authenticates, ensures a worker pod is up, starts a fresh
+        // execution pinned to it, and points the caller at the gateway
+        // URL for that pod (307 for HTTP, return-URL for WebSocket).
+        // GET + POST: a WS handshake is a GET; an HTTP live request may
+        // be any method, so accept both. Registered before the catch-all
+        // so `/connect/*` never falls through to fire_public_entry.
+        .route(
+            "/connect/{*path}",
+            get(signal::connect_live).post(signal::connect_live),
+        )
         // Catch-all PublicEntry route: external HTTP fires land
         // here when no more-specific route matches. The handler
         // looks up the signal row by `mount_path`, applies the
         // auth gate (api_key check, future schemes), then
-        // forwards to dispatch_listener_outcome. Webhook + ApiPost
+        // forwards to dispatch_listener_outcome. Public-entry
         // signals fire via this route. Methods other than POST or
         // unmatched paths fall to axum's default 404.
         .route("/{*mount_path}", post(signal::fire_public_entry))

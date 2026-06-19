@@ -5,17 +5,17 @@
 //! the box is only torn down at zero bytes, when no token has
 //! anything left to fetch). Pure functions; the caller passes `now`.
 //!
-//! Wire format: `v1.<payload-b64url>.<sig-b64url>` where payload is
-//! the JSON claims and sig = HMAC-SHA256(secret, payload-b64url).
+//! The crypto + wire format live ONCE in [`weft_core::signed_token`]
+//! (HMAC-SHA256 over a base64url JSON payload, `v1.<payload>.<sig>`); this
+//! module is just the capability CLAIMS plus thin typed wrappers. The
+//! live-caller routing token is the same machinery with different claims.
 
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
+use weft_core::signed_token::{self, SignedClaims};
 
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+/// Caller-safe noun for this token's error strings (no secret leak).
+const NOUN: &str = "capability";
 
 /// What a capability grants: ONE key, until `exp` (unix seconds).
 ///
@@ -33,36 +33,23 @@ pub struct CapabilityClaims {
     pub exp: i64,
 }
 
+impl SignedClaims for CapabilityClaims {
+    fn exp(&self) -> i64 {
+        self.exp
+    }
+}
+
 pub fn mint(secret: &[u8], key: &str, expires_at_unix: i64) -> String {
-    let claims = CapabilityClaims { key: key.to_string(), exp: expires_at_unix };
-    let payload = B64.encode(serde_json::to_vec(&claims).expect("claims serialize"));
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(payload.as_bytes());
-    let sig = B64.encode(mac.finalize().into_bytes());
-    format!("v1.{payload}.{sig}")
+    signed_token::mint(
+        secret,
+        &CapabilityClaims { key: key.to_string(), exp: expires_at_unix },
+    )
 }
 
 /// Validate a capability and return its claims. Rejects on format,
 /// signature, and expiry; reasons are caller-safe (no secret leak).
 pub fn validate(secret: &[u8], capability: &str, now_unix: i64) -> Result<CapabilityClaims, String> {
-    let mut parts = capability.splitn(3, '.');
-    let (Some("v1"), Some(payload), Some(sig)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Err("malformed capability".into());
-    };
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(payload.as_bytes());
-    let sig_bytes = B64.decode(sig).map_err(|_| "malformed capability signature".to_string())?;
-    // verify_slice is constant-time.
-    mac.verify_slice(&sig_bytes).map_err(|_| "invalid capability signature".to_string())?;
-    let claims: CapabilityClaims = serde_json::from_slice(
-        &B64.decode(payload).map_err(|_| "malformed capability payload".to_string())?,
-    )
-    .map_err(|_| "malformed capability claims".to_string())?;
-    if now_unix >= claims.exp {
-        return Err("capability expired".into());
-    }
-    Ok(claims)
+    signed_token::validate(secret, capability, now_unix, NOUN)
 }
 
 #[cfg(test)]
@@ -90,13 +77,13 @@ mod tests {
     fn rejects_wrong_secret_and_tampering() {
         let cap = mint(SECRET, "exec/c1/f1", 1_000);
         assert!(validate(b"other-secret", &cap, 0).is_err());
-        // Tamper with the payload (swap the key) keeping the old sig.
-        let parts: Vec<&str> = cap.split('.').collect();
-        let forged_payload = B64.encode(
-            serde_json::to_vec(&CapabilityClaims { key: "exec/c2/f9".into(), exp: 1_000 })
-                .unwrap(),
-        );
-        let forged = format!("v1.{}.{}", forged_payload, parts[2]);
+        // Tamper: mint a different key under a DIFFERENT secret, then splice
+        // that forged payload onto the real cap's signature. The sig was
+        // computed over the original payload, so it cannot validate the swap.
+        let forged_full = mint(b"attacker-secret", "exec/c2/f9", 1_000);
+        let forged_payload = forged_full.split('.').nth(1).unwrap();
+        let real_sig = cap.split('.').nth(2).unwrap();
+        let forged = format!("v1.{forged_payload}.{real_sig}");
         assert!(validate(SECRET, &forged, 0).is_err());
     }
 

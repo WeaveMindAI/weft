@@ -117,11 +117,26 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
         let outcome = route_after_started(state, &payload, &signal, color, now).await;
         if let Err(e) = &outcome {
             // Journal the terminal ExecutionFailed so the started-but-
-            // never-run color does not haunt `running_count`. If THIS
-            // write also fails (one transient error deep), the color is
-            // genuinely stranded: surface it loud with the recovery verb
-            // so an operator can clear it, then propagate.
-            if let Err(je) = state
+            // never-run color does not haunt `running_count`. SKIP if a
+            // terminal already exists for the color: a cancel arriving during
+            // the route window writes `ExecutionCancelled` via the guarded
+            // writer, and stacking `ExecutionFailed` on top would be a second,
+            // contradictory terminal (the dedup key only collapses a duplicate
+            // ExecutionFailed, not a cancel). The keyed write stays as the
+            // single-write guard for the retry case. If THIS write fails (one
+            // transient error deep), the color is genuinely stranded: surface
+            // it loud with the recovery verb, then propagate.
+            let already_terminal = crate::api::execution::has_terminal_event(&state.pg_pool, color)
+                .await
+                .unwrap_or(false);
+            if already_terminal {
+                tracing::info!(
+                    target: "weft_dispatcher::route_entry",
+                    %color,
+                    "route_entry post-start failed but a terminal already exists; \
+                     skipping ExecutionFailed (no contradictory second terminal)"
+                );
+            } else if let Err(je) = state
                 .journal
                 .record_event_dedup(
                     &weft_journal::ExecEvent::ExecutionFailed {

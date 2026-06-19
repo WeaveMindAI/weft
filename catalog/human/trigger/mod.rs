@@ -79,7 +79,7 @@ impl Node for HumanTriggerNode {
                 // object keyed by field key). Missing or non-object
                 // means the dispatcher's form-submission delivery
                 // broke its contract: fail loud, matching the cron /
-                // ApiPost / WhatsAppReceive bar. Substituting an
+                // WhatsAppReceive bar. Substituting an
                 // empty object would silently fire a fake "all fields
                 // empty" submission downstream (which for approve/
                 // reject fields would synthesize a `rejected: true`

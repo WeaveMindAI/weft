@@ -221,6 +221,8 @@ fn write_worker_cargo_toml(
         "uuid",
         toml::Value::Table(version_with_features("1", &["v4", "serde"])),
     );
+    // Decodes the hex-encoded live-connection routing-token secret from env.
+    insert_dep(&mut deps, "hex", toml::Value::String("0.4".into()));
     // One path dep per referenced package crate.
     for pkg in packages {
         insert_dep(
@@ -677,9 +679,9 @@ fn write_registry_rs(
     Ok(())
 }
 
-/// Convert a PascalCase node type (e.g. `ApiPost`, `HumanQuery`,
+/// Convert a PascalCase node type (e.g. `ApiEndpoint`, `HumanQuery`,
 /// `LlmInference`) into a snake_case Rust module identifier
-/// (`api_post`, `human_query`, `llm_inference`). Rules: lowercase
+/// (`api_endpoint`, `human_query`, `llm_inference`). Rules: lowercase
 /// the first char; insert `_` before every subsequent uppercase.
 fn ident_for_node_type(node_type: &str) -> String {
     let mut out = String::with_capacity(node_type.len() + 4);
@@ -762,6 +764,19 @@ struct Args {{
     /// genuinely idle." Without it, the reaper races register flows.
     #[arg(long, env = "WEFT_TENANT_ID")]
     tenant_id: String,
+
+    /// TCP port the worker's live caller connection server listens on
+    /// (plain HTTP/WS; TLS terminates at the gateway). The gateway
+    /// forwards caller connections here. Default matches the worker pod
+    /// manifest's exposed port.
+    #[arg(long, env = "WEFT_CONNECTION_PORT", default_value = "9091")]
+    connection_port: u16,
+
+    /// HMAC secret the worker verifies dispatcher-signed live-connection
+    /// routing tokens with (hex-encoded). Same cluster secret the
+    /// dispatcher signs with; provisioned via the worker pod env.
+    #[arg(long, env = "WEFT_CALLER_TOKEN_SECRET", default_value = "")]
+    caller_token_secret: String,
 }}
 
 #[tokio::main]
@@ -804,6 +819,20 @@ async fn main() -> anyhow::Result<()> {{
 
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;
 
+    // Live-connection routing-token secret: hex from env. Empty means no
+    // secret provisioned (local dev without the gateway), surfaced as `None`
+    // so `run_pod` does not start the connection server at all. An empty
+    // HMAC key would validate forgeable tokens (fail-open), so we never feed
+    // one in: "empty" structurally means "no live-caller capability".
+    let caller_token_secret = if args.caller_token_secret.is_empty() {{
+        None
+    }} else {{
+        Some(
+            hex::decode(&args.caller_token_secret)
+                .map_err(|e| anyhow::anyhow!("WEFT_CALLER_TOKEN_SECRET is not valid hex: {{e}}"))?,
+        )
+    }};
+
     weft_engine::run_pod(
         catalog,
         clients,
@@ -812,6 +841,8 @@ async fn main() -> anyhow::Result<()> {{
         args.project_id,
         args.tenant_id,
         args.namespace,
+        args.connection_port,
+        caller_token_secret,
     )
     .await?;
 

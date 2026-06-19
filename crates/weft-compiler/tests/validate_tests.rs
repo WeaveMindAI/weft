@@ -218,9 +218,8 @@ t = Text
 
 #[test]
 fn required_port_unmet_is_flagged() {
-    // HumanQuery has required form schema fields; ApiPost's body is
-    // not required. We'll construct a Text with a manually-required
-    // port and no driver.
+    // We construct a Text with a manually-required port and no driver
+    // to exercise the required-port-unmet diagnostic.
     let mut project = parse_enrich(r#"# Project: R
 t = Text { value: "ok" }
 "#);
@@ -289,7 +288,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
 
 // ── declarative-rule engine (ConfigMatches) ──────────────────────────────────
 
-/// The ApiPost node carries a declarative rule:
+/// The ApiEndpoint node carries a declarative rule:
 /// `when config_matches(path, "^/") then warn`. These tests exercise the
 /// declarative-rule engine + the `ConfigMatches` condition end-to-end, including
 /// the fail-closed behavior on an absent field (the rule must NOT fire when the
@@ -297,7 +296,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
 #[test]
 fn config_matches_rule_fires_only_when_pattern_matches() {
     // path starts with `/` -> the rule fires (warning).
-    let with_slash = parse_enrich("# Project: P\n\nt = ApiPost { path: \"/hook\" }\n");
+    let with_slash = parse_enrich("# Project: P\n\nt = ApiEndpoint { path: \"/hook\" }\n");
     let d = validate(&with_slash, &catalog());
     assert!(
         d.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -305,7 +304,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     );
 
     // path without a leading slash -> no rule.
-    let no_slash = parse_enrich("# Project: P\n\nt = ApiPost { path: \"hook\" }\n");
+    let no_slash = parse_enrich("# Project: P\n\nt = ApiEndpoint { path: \"hook\" }\n");
     let d2 = validate(&no_slash, &catalog());
     assert!(
         !d2.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -315,7 +314,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     // path absent entirely -> no rule (fail-closed: an absent field is not a
     // match, matching every sibling ConfigX condition; the old `unwrap_or(true)`
     // wrongly fired this).
-    let absent = parse_enrich("# Project: P\n\nt = ApiPost {}\n");
+    let absent = parse_enrich("# Project: P\n\nt = ApiEndpoint {}\n");
     let d3 = validate(&absent, &catalog());
     assert!(
         !d3.iter().any(|x| x.message.contains("path starts with '/'")),

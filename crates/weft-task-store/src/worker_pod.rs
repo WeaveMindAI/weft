@@ -59,6 +59,15 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             -- binary (e.g. user changed a node implementation since
             -- it spawned). The dispatcher kills the stale pod and
             -- proceeds with a fresh spawn.
+            -- NOTE: live-connection load is NOT stored here. A pod's live
+            -- load IS the count of in-flight live-execute tasks pinned to it
+            -- (the task row is the capacity slot); admission and cap
+            -- enforcement happen atomically as the task insert
+            -- (`tasks::admit_live_execution`). There is no denormalized
+            -- counter to drift, and idle-exit (`mark_done_if_idle`) is gated
+            -- by its pending/claimed-task `NOT EXISTS` check (a live-execute
+            -- task is a worker task, so an in-flight live execution already
+            -- blocks idle-exit).
             binary_hash TEXT NOT NULL DEFAULT ''
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_worker_pod_project_alive
@@ -366,3 +375,13 @@ fn parse_row(row: sqlx::postgres::PgRow) -> Result<WorkerPodRow> {
         last_heartbeat_unix: row.try_get("last_heartbeat_unix")?,
     })
 }
+
+// NOTE: live-connection routing (which pod a new caller pins to + cap
+// enforcement) lives in `tasks::admit_live_execution`: in one transaction,
+// under a per-project advisory lock, it picks the least-loaded under-cap pod
+// (load = count of in-flight live-execute tasks pinned to it) and INSERTs the
+// pinned execute task on it. Admission IS the task insert, so there is no
+// separate counter to drift and no admit/insert window. The correctness
+// (no overshoot under concurrent handshakes across sibling Pods) is inherently
+// a DB concern (the advisory lock + count are the whole point), covered by the
+// Layer-4 cluster e2e, not a pure unit test.

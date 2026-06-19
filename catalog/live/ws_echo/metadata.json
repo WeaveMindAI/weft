@@ -1,0 +1,17 @@
+{
+  "type": "LiveWsEcho",
+  "label": "Live: WebSocket Echo",
+  "description": "Demo node for a WebSocket live connection. Holds a two-way conversation: echoes each message the caller sends, with a turn counter, until they close. Wire under a LiveSocket trigger.",
+  "category": "live",
+  "tags": ["live", "websocket", "demo", "chat"],
+  "icon": "MessagesSquare",
+  "color": "#06b6d4",
+  "inputs": [
+    { "name": "started", "type": "Boolean", "required": false, "description": "Kick from the LiveSocket trigger." }
+  ],
+  "outputs": [
+    { "name": "done", "type": "Boolean", "required": false, "description": "Fires true once the conversation ends (caller closed or went idle)." }
+  ],
+  "fields": [],
+  "requires_infra": false
+}

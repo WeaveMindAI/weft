@@ -25,10 +25,20 @@ reqwest = { workspace = true }
 # Stream adapters for put_from_url (TryStreamExt on the reqwest body),
 # and FutureExt::catch_unwind for the stress_test! macro in tests.
 futures = { workspace = true }
+# The worker's inbound live-caller connection server (HTTP + WS upgrade).
+# Plain HTTP/WS inside the cluster: TLS terminates at the gateway and the
+# signed routing token authenticates the connection (transport-A model,
+# same trust boundary as dispatcher<->broker). axum's `ws` feature gives
+# the WebSocketUpgrade + message types.
+axum = { workspace = true }
+# Adapts the worker's outbound queue into a chunked HTTP response body.
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [features]
 test-helpers = ["weft-storage/test-helpers"]
 
 [dev-dependencies]
 weft-storage = { workspace = true, features = ["test-helpers"] }
+weft-core = { workspace = true, features = ["test-helpers"] }
+weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 bytes = { workspace = true }

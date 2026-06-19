@@ -19,7 +19,7 @@ import * as vscode from 'vscode';
 
 import type { DispatcherClient } from './dispatcher';
 import type {
-  BusPayload,
+  JournaledPayload,
   CorruptionSite,
   HostMessage,
   LoopIteration,
@@ -74,8 +74,17 @@ export type DispatcherEvent =
   // what was sent.
   | { kind: 'bus_joined'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
   | { kind: 'bus_left'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
-  | { kind: 'bus_message'; color: string; project_id: string; bus_id: string; offset: number; from: string; msg_kind: string; payload: BusPayload; payload_byte_size: number; payload_sha256_prefix: string; at_unix: number }
+  | { kind: 'bus_message'; color: string; project_id: string; bus_id: string; offset: number; from: string; msg_kind: string; payload: JournaledPayload; payload_byte_size: number; payload_sha256_prefix: string; at_unix: number }
   | { kind: 'bus_closed'; color: string; project_id: string; bus_id: string; offset: number; at_unix: number }
+  // Live caller connection events. One caller per execution (keyed by
+  // color, no bus_id). The webview replays the caller exchange the same
+  // way it replays a bus; `payload` reuses JournaledPayload for the
+  // journaled-vs-ephemeral tradeoff.
+  | { kind: 'caller_connected'; color: string; project_id: string; offset: number; protocol: string; at_unix: number }
+  | { kind: 'caller_inbound'; color: string; project_id: string; offset: number; payload: JournaledPayload; payload_byte_size: number; payload_sha256_prefix: string; at_unix: number }
+  | { kind: 'caller_outbound'; color: string; project_id: string; offset: number; payload: JournaledPayload; payload_byte_size: number; payload_sha256_prefix: string; terminal: boolean; at_unix: number }
+  | { kind: 'caller_errored'; color: string; project_id: string; offset: number; message: string; at_unix: number }
+  | { kind: 'caller_disconnected'; color: string; project_id: string; offset: number; reason: string; at_unix: number }
   // Loop events. Carry the inspector groupId + parent_frames so
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
@@ -361,6 +370,54 @@ export class ExecutionFollower implements vscode.Disposable {
           busId: e.bus_id,
           nodeId: e.node_id,
           meta: { ephemeral: e.ephemeral },
+        });
+        break;
+      // Live caller connection: forwarded as one `callerEvent` stream
+      // (one caller per execution, keyed by color, so no busId). The
+      // webview replays it like a bus panel.
+      case 'caller_connected':
+        this.post({
+          kind: 'callerEvent',
+          event: { kind: 'connected', offset: e.offset, protocol: e.protocol, atUnix: e.at_unix },
+        });
+        break;
+      case 'caller_inbound':
+        this.post({
+          kind: 'callerEvent',
+          event: {
+            kind: 'inbound',
+            offset: e.offset,
+            payload: e.payload,
+            payloadByteSize: e.payload_byte_size,
+            payloadSha256Prefix: e.payload_sha256_prefix,
+            atUnix: e.at_unix,
+          },
+        });
+        break;
+      case 'caller_outbound':
+        this.post({
+          kind: 'callerEvent',
+          event: {
+            kind: 'outbound',
+            offset: e.offset,
+            payload: e.payload,
+            payloadByteSize: e.payload_byte_size,
+            payloadSha256Prefix: e.payload_sha256_prefix,
+            terminal: e.terminal,
+            atUnix: e.at_unix,
+          },
+        });
+        break;
+      case 'caller_errored':
+        this.post({
+          kind: 'callerEvent',
+          event: { kind: 'errored', offset: e.offset, message: e.message, atUnix: e.at_unix },
+        });
+        break;
+      case 'caller_disconnected':
+        this.post({
+          kind: 'callerEvent',
+          event: { kind: 'disconnected', offset: e.offset, reason: e.reason, atUnix: e.at_unix },
         });
         break;
       case 'loop_instantiated':

@@ -11,23 +11,24 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
+// `Duration` and backoff sleeps live in `super::event_source::Backoff`.
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
-use weft_core::signal::{Signal, Sse};
+use weft_core::signal::{Signal, SseSubscribe};
 
 use crate::config::ListenerConfig;
 use crate::fire_sink::FireSignalSink;
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
+use super::event_source::Backoff;
 use super::KindHandler;
 
-pub struct SseHandler;
+pub struct SseSubscribeHandler;
 
-impl KindHandler for SseHandler {
+impl KindHandler for SseSubscribeHandler {
     fn tag(&self) -> &'static str {
-        Sse::TAG
+        SseSubscribe::TAG
     }
 
     fn compute_routing(
@@ -51,8 +52,8 @@ impl KindHandler for SseHandler {
         sink: FireSignalSink,
         _config: Arc<ListenerConfig>,
     ) -> Result<Option<JoinHandle<()>>> {
-        let sse: Sse = serde_json::from_value(spec.config.clone())
-            .map_err(|e| anyhow::anyhow!("malformed sse spec: {e}"))?;
+        let sse: SseSubscribe = serde_json::from_value(spec.config.clone())
+            .map_err(|e| anyhow::anyhow!("malformed sse_subscribe spec: {e}"))?;
         Ok(Some(spawn_loop(token.to_string(), sse.url, sse.event_name, sink)))
     }
 
@@ -158,7 +159,7 @@ fn spawn_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let mut backoff = 1u64;
+        let mut backoff = Backoff::new();
         loop {
             let resp = match client
                 .get(&url)
@@ -167,19 +168,17 @@ fn spawn_loop(
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    info!(target: "weft_listener::sse", %url, %token, "SSE connected");
+                    info!(target: "weft_listener::sse_subscribe", %url, %token, "SSE connected");
                     r
                 }
                 Ok(r) => {
-                    warn!(target: "weft_listener::sse", %url, status = %r.status(), "non-success; retrying");
-                    sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(60);
+                    warn!(target: "weft_listener::sse_subscribe", %url, status = %r.status(), "non-success; retrying");
+                    backoff.wait_then_climb().await;
                     continue;
                 }
                 Err(e) => {
-                    warn!(target: "weft_listener::sse", %url, error = %e, "connect failed; retrying");
-                    sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(60);
+                    warn!(target: "weft_listener::sse_subscribe", %url, error = %e, "connect failed; retrying");
+                    backoff.wait_then_climb().await;
                     continue;
                 }
             };
@@ -196,11 +195,11 @@ fn spawn_loop(
                 let chunk = match stream.next().await {
                     Some(Ok(bytes)) => bytes,
                     Some(Err(e)) => {
-                        warn!(target: "weft_listener::sse", %url, error = %e, "stream error");
+                        warn!(target: "weft_listener::sse_subscribe", %url, error = %e, "stream error");
                         break;
                     }
                     None => {
-                        info!(target: "weft_listener::sse", %url, "stream ended; reconnecting");
+                        info!(target: "weft_listener::sse_subscribe", %url, "stream ended; reconnecting");
                         break;
                     }
                 };
@@ -213,7 +212,7 @@ fn spawn_loop(
                         Ok(s) => s,
                         Err(e) => {
                             warn!(
-                                target: "weft_listener::sse",
+                                target: "weft_listener::sse_subscribe",
                                 %url, error = %e,
                                 "invalid UTF-8 in SSE block; skipping"
                             );
@@ -229,37 +228,24 @@ fn spawn_loop(
                     if !event_filter.is_empty() && msg.event != event_filter {
                         continue;
                     }
-                    // Try to parse data as JSON; if it isn't JSON,
-                    // forward it as a JSON string. The fire pipeline
-                    // is JSON-typed end-to-end.
-                    let payload = serde_json::from_str::<Value>(&msg.data)
-                        .unwrap_or_else(|_| Value::String(msg.data.clone()));
-                    if let Err(e) = sink.fire(&token, payload).await {
-                        warn!(
-                            target: "weft_listener::sse",
-                            %token, error = %e,
-                            "fire enqueue failed"
-                        );
-                    }
+                    let payload = super::event_source::coerce_text_payload(msg.data);
+                    super::event_source::fire_payload(&sink, &token, payload, "sse_subscribe")
+                        .await;
                 }
             }
 
             // The stream dropped (ended or errored). Reconnect on the
             // same backoff ladder as connect failures, so a flapping
             // endpoint (accepts then immediately resets) doesn't get
-            // hammered at a fixed 1/s. Only treat the connection as
-            // healthy (reset the ladder) if it stayed up long enough
-            // to deliver, not just complete a TCP handshake.
-            if connected_at.elapsed() >= Duration::from_secs(30) {
-                backoff = 1;
-            }
-            sleep(Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(60);
+            // hammered at a fixed 1/s. A connection that stayed up long
+            // enough to be healthy resets the ladder.
+            backoff.reset_if_healthy(connected_at.elapsed());
+            backoff.wait_then_climb().await;
         }
     })
 }
 
-inventory::submit!(&SseHandler as &dyn KindHandler);
+inventory::submit!(&SseSubscribeHandler as &dyn KindHandler);
 
 #[cfg(test)]
 mod tests {

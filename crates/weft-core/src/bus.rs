@@ -42,7 +42,7 @@
 //!
 //! ## Two payload modes
 //!
-//! `BusOptions { ephemeral, ephemeral_window }` picks one at create
+//! `BusOptions { ephemeral, window }` picks one at create
 //! time:
 //!
 //! - **Journaled** (default): every send writes the full payload into
@@ -66,7 +66,7 @@
 //!
 //! The marker JSON grew a structured payload to match the stored-file markers:
 //! `{"__weft_bus__": {"id": "<uuid>", "mode": "journaled" | "ephemeral"}}`.
-//! Mode is the only field the wire surfaces; `ephemeral_window` is a
+//! Mode is the only field the wire surfaces; `window` (the in-RAM bound) is a
 //! per-creator producer-side knob and is not exposed externally.
 //!
 //! ## Identity (registration)
@@ -118,7 +118,6 @@ use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -200,22 +199,28 @@ pub enum BusEntryKind {
 /// Configuration the producer passes to `ctx.create_bus(opts)`.
 #[derive(Debug, Clone, Default)]
 pub struct BusOptions {
-    /// `true` switches the bus to ephemeral mode (payloads in a sliding
-    /// window, metadata-only in the journal, slow consumers get loud
-    /// `FellBehind`). `false` (default) is the journaled mode (full
-    /// payload in the log, no FellBehind, slow consumers just lag).
+    /// `true` switches the bus to ephemeral mode (metadata-only in the
+    /// journal, slow consumers get loud `FellBehind`). `false` (default)
+    /// is the journaled mode (full payload persisted to the journal/DB for
+    /// durability). NOTE: in EITHER mode the in-RAM log is a bounded
+    /// window (cursors only ever read RAM, never the DB); the mode only
+    /// decides whether the payload is also persisted for replay-after-
+    /// worker-death, not whether RAM is bounded.
     pub ephemeral: bool,
-    /// Per-bus ephemeral window size. Only consulted when
-    /// `ephemeral = true`. `None` falls back to
-    /// `DEFAULT_EPHEMERAL_WINDOW`. Larger windows tolerate slower
-    /// consumers at the cost of memory; smaller windows evict sooner.
-    pub ephemeral_window: Option<usize>,
+    /// Per-bus in-RAM window size. `None` falls back to
+    /// `DEFAULT_BUS_WINDOW`. Bounds RAM in BOTH modes: a journaled bus
+    /// trims log entries that are already persisted to the DB once the
+    /// window is exceeded (durability unaffected, the DB keeps them);
+    /// an ephemeral bus trims by this window with no DB backstop. Larger
+    /// windows let slower consumers reach further back in RAM at the cost
+    /// of memory.
+    pub window: Option<usize>,
 }
 
-/// Default sliding window for ephemeral payloads. 64 entries fits the
-/// common consumer-lags-a-few-messages case without bounding video-
-/// stream RAM. Override via `BusOptions::ephemeral_window`.
-pub const DEFAULT_EPHEMERAL_WINDOW: usize = 64;
+/// Default in-RAM window for a bus (both modes). 64 entries fits the
+/// common consumer-lags-a-few-messages case without growing RAM
+/// unboundedly on a long stream. Override via `BusOptions::window`.
+pub const DEFAULT_BUS_WINDOW: usize = 64;
 
 /// Default warn threshold for journaled payload size. Sends above this
 /// log a `warn!` so the author sees the cost; the send still proceeds.
@@ -233,11 +238,6 @@ pub enum SendError {
     /// to stamp the message with. Call `register` first.
     #[error("cannot send before registering a name on the bus")]
     NotRegistered,
-    /// The payload failed to JSON-serialize for size accounting (e.g.
-    /// a non-finite float). Loud, not silent. The bus never accepts a
-    /// payload it can't measure.
-    #[error("payload serialization failed: {0}")]
-    PayloadSerialization(String),
     /// The journal pump previously failed to write this JOURNALED
     /// bus's tail. The send is REJECTED BEFORE appending anything: in
     /// journaled mode the journal trail is the durability story, and
@@ -280,18 +280,27 @@ pub enum WaitError {
 /// `None`).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CursorError {
-    /// The cursor points below an ephemeral bus's retained range: the
-    /// payload window evicted (and the log truncated) past it. The
-    /// cursor advances exactly ONE offset per `FellBehind`, surfacing
-    /// one error per evicted message rather than jumping straight to the
-    /// floor: this guarantees retained membership entries that sit
-    /// inside the evicted span are still delivered, not skipped.
-    /// `oldest_resident` is diagnostic (the current floor at the time of
-    /// the error). The consumer decides how to recover from each lost
-    /// message. Membership state is unaffected (`wait_for` reads the
-    /// truncation-immune `ever_joined` set, not the log).
-    #[error("ephemeral consumer fell behind; oldest resident offset {oldest_resident}")]
-    FellBehind { oldest_resident: u64 },
+    /// The cursor's offset was trimmed out of the in-RAM window (cursors
+    /// only read RAM, never the DB). Carries TWO offsets, both absolute:
+    ///   - `resumed_at`: the next retained entry at or after the cursor's
+    ///     position. The cursor is MOVED here, so the next `next()` delivers
+    ///     that entry, no per-gap stalling, no going backward. Trimmed
+    ///     message-offsets between are silently bridged (only `Message`
+    ///     entries are ever evicted; membership entries are always retained,
+    ///     so nothing the consumer needs hides in the gap).
+    ///   - `oldest_resident`: the true window floor (earliest offset still
+    ///     in RAM), informational, so the consumer knows how far back the
+    ///     window currently reaches. May equal `resumed_at` (fell behind at
+    ///     the floor) or be smaller (already past the floor going forward).
+    /// Same RESUME contract as the caller's `CallerError::FellBehind` (move
+    /// the cursor forward to the next retained entry, surface once); the bus
+    /// carries the extra `oldest_resident` because its log is SPARSE (a
+    /// resume can land past the floor on a retained membership entry), while
+    /// the caller's dense log collapses the two into one field.
+    /// Membership state is unaffected (`wait_for` reads the truncation-immune
+    /// `ever_joined` set, not the log).
+    #[error("cursor fell behind; resuming at {resumed_at} (oldest resident {oldest_resident})")]
+    FellBehind { resumed_at: u64, oldest_resident: u64 },
 }
 
 /// Identity of one node EXECUTION: the node id plus its loop-frame
@@ -471,7 +480,7 @@ struct EphemeralStore {
 impl EphemeralStore {
     fn new(capacity: usize) -> Result<Self, &'static str> {
         if capacity == 0 {
-            return Err("ephemeral_window must be >= 1; 0 would evict every payload \
+            return Err("window must be >= 1; 0 would evict every payload \
                         before any cursor could read it");
         }
         Ok(Self {
@@ -550,14 +559,17 @@ pub struct BusInner {
     /// Left, Message, Closed) go through here. Cursors read by
     /// offset; the journal pump drains the unjournaled tail.
     ///
-    /// On EPHEMERAL buses the log is NOT contiguous: `send` drops
-    /// `Message` entries whose payload the sliding window evicted
-    /// (bounded RAM for long streams), while membership entries
-    /// (Joined / Left / Closed) are always retained (they are
-    /// load-bearing for cursors and bounded by participant churn,
-    /// not by traffic). Cursors detect the offset gaps and surface
-    /// one `FellBehind` per evicted message. Journaled buses never
-    /// drop anything (same growth contract as the journal itself).
+    /// In BOTH modes the log can be NON-contiguous: only `Message`
+    /// entries are ever trimmed (membership entries Joined / Left /
+    /// Closed are always retained, load-bearing for cursors and
+    /// bounded by participant churn, not by traffic). Ephemeral drops
+    /// a Message once the sliding window evicts its payload; journaled
+    /// drops a Message once it is BOTH past the window AND already
+    /// shipped to the DB (`offset < journaled_through`), so durability
+    /// is unaffected (the journal keeps it) but a live cursor cannot
+    /// reach it (cursors only read RAM, never the DB). Cursors detect
+    /// the offset gaps and, by default, bridge them silently
+    /// (`strict_gaps()` opts into one `FellBehind` per gap instead).
     log: Mutex<Vec<BusEntry>>,
     /// Every name that EVER registered, regardless of later `Left`
     /// entries. The single source of truth for membership waits
@@ -607,6 +619,14 @@ pub struct BusInner {
     journal_pump_notify: Weak<Notify>,
     /// Optional ephemeral payload store. `Some` iff `ephemeral`.
     ephemeral_store: Option<EphemeralStore>,
+    /// In-RAM retained-window size, in Message entries, for BOTH modes.
+    /// Cursors only ever read RAM, so this bounds how far back any cursor
+    /// can reach. Ephemeral trims by this with no DB backstop; journaled
+    /// trims only Message entries already shipped to the DB
+    /// (`offset < journaled_through`), so durability is unaffected and the
+    /// trail past the window is recoverable from the journal, just not by a
+    /// live cursor.
+    window: usize,
 }
 
 impl BusInner {
@@ -698,6 +718,49 @@ impl BusInner {
         offset
     }
 
+    /// Trim a JOURNALED bus's in-RAM log to the retained window. Caller
+    /// holds the log lock. Drops only Message entries that are BOTH already
+    /// shipped to the DB (`offset < journaled_through`) AND older than the
+    /// most recent `window` Message entries. Membership entries are always
+    /// kept. No-op until both the window AND the journaled prefix are
+    /// exceeded, so the common case (short conversation, or pump momentarily
+    /// behind) keeps everything.
+    fn trim_journaled_window(&self, log: &mut Vec<BusEntry>) {
+        let msg_count = log
+            .iter()
+            .filter(|e| matches!(e.kind, BusEntryKind::Message { .. }))
+            .count();
+        if msg_count <= self.window {
+            return;
+        }
+        // The offset floor below which Message entries may be dropped: keep
+        // the newest `window` messages. Walk messages newest->oldest,
+        // counting `window`, and take the offset of the window's oldest kept
+        // message as the floor.
+        let mut kept = 0usize;
+        let mut window_floor = 0u64;
+        for e in log.iter().rev() {
+            if matches!(e.kind, BusEntryKind::Message { .. }) {
+                kept += 1;
+                if kept == self.window {
+                    window_floor = e.offset;
+                    break;
+                }
+            }
+        }
+        let journaled_through = self.journaled_through.load(Ordering::Acquire);
+        log.retain(|e| {
+            // Always keep membership entries and anything in the window.
+            if !matches!(e.kind, BusEntryKind::Message { .. }) || e.offset >= window_floor {
+                return true;
+            }
+            // A Message below the window: drop ONLY if already journaled.
+            // An un-shipped message stays so the pump can still drain it and
+            // a fresh worker can replay it (durability before RAM bound).
+            e.offset >= journaled_through
+        });
+    }
+
     /// Close this bus. Appends a `Closed` entry (idempotent), sets the
     /// closed flag, wakes every cursor waiting on the log and the
     /// engine's liveness hook. Public so the engine's `BusCoordinator` can
@@ -726,7 +789,10 @@ impl BusInner {
     /// messages are permanently lost to the inspector trail; `send`
     /// logged that loudly at eviction time. The drain simply resumes
     /// from the next retained entry (per-entry acks then advance
-    /// `journaled_through` past the gap).
+    /// `journaled_through` past the gap). On a JOURNALED bus this
+    /// cannot lose anything: `trim_journaled_window` only ever drops
+    /// entries strictly below `journaled_through` (already drained),
+    /// so an un-shipped entry is always still resident here.
     pub fn drain_journal_tail(&self) -> Vec<BusEntry> {
         let log = self.lock_log();
         let from_offset = self.journaled_through.load(Ordering::Acquire);
@@ -773,8 +839,9 @@ impl BusInner {
         self.ephemeral
     }
 
-    pub fn ephemeral_window(&self) -> Option<usize> {
-        self.ephemeral_store.as_ref().map(|s| s.capacity)
+    /// The in-RAM retained window size (entries), for both modes.
+    pub fn window(&self) -> usize {
+        self.window
     }
 
     /// One past the highest offset ever appended. The pump compares
@@ -785,6 +852,26 @@ impl BusInner {
     pub fn log_len(&self) -> u64 {
         let log = self.lock_log();
         log.last().map(|e| e.offset + 1).unwrap_or(0)
+    }
+
+    /// The earliest offset still resident in the in-RAM log (the floor a
+    /// cursor can reach; anything below it was trimmed out of RAM and is not
+    /// readable by a cursor, by design cursors never read the DB). `0` on an
+    /// empty log.
+    pub fn retained_floor(&self) -> u64 {
+        let log = self.lock_log();
+        log.first().map(|e| e.offset).unwrap_or(0)
+    }
+
+    /// Offset of the most recent retained Message entry, if any. Used by
+    /// `cursor_including_last` to seed a forward cursor with the latest
+    /// message. Skips membership entries (Joined/Left/Closed).
+    pub fn last_message_offset(&self) -> Option<u64> {
+        let log = self.lock_log();
+        log.iter()
+            .rev()
+            .find(|e| matches!(e.kind, BusEntryKind::Message { .. }))
+            .map(|e| e.offset)
     }
 
     /// The pump's `journaled_through` cursor (one past the highest
@@ -856,7 +943,7 @@ impl BusHandle {
     }
 
     /// Create with explicit options, no engine hooks. Errors on an
-    /// invalid `ephemeral_window`.
+    /// invalid `window`.
     pub fn create_with_options(opts: BusOptions) -> Result<Self, &'static str> {
         Self::create_with_engine(
             opts,
@@ -871,14 +958,18 @@ impl BusHandle {
     /// append; the pump notify fires after every append to signal the
     /// engine's bus-journal-pump task. `node` is the minting node
     /// execution (`None` outside an engine-driven node). Errors on an
-    /// invalid `ephemeral_window` (must be >= 1 when `ephemeral=true`).
+    /// invalid `window` (must be >= 1 when `ephemeral=true`).
     pub fn create_with_engine(
         opts: BusOptions,
         liveness: Weak<dyn BusLiveness>,
         journal_pump_notify: Weak<Notify>,
         node: Option<BusParticipant>,
     ) -> Result<Self, &'static str> {
-        let window = opts.ephemeral_window.unwrap_or(DEFAULT_EPHEMERAL_WINDOW);
+        let window = opts.window.unwrap_or(DEFAULT_BUS_WINDOW);
+        if window == 0 {
+            return Err("bus window must be >= 1; 0 would evict every entry before any \
+                        cursor could read it");
+        }
         let ephemeral_store = if opts.ephemeral {
             Some(EphemeralStore::new(window)?)
         } else {
@@ -899,6 +990,7 @@ impl BusHandle {
             liveness,
             journal_pump_notify,
             ephemeral_store,
+            window,
         });
         Ok(Self {
             inner,
@@ -992,8 +1084,6 @@ impl BusHandle {
     /// Failure modes (all loud, no silent drop):
     /// - `NotRegistered`: handle has no identity.
     /// - `Closed`: bus has been closed.
-    /// - `PayloadSerialization`: payload failed to round-trip through
-    ///   `serde_json::to_vec` for size accounting.
     /// - `JournalDegraded` (journaled buses only): the pump previously
     ///   failed to write this bus's tail. The send is rejected BEFORE
     ///   appending anything; see `SendError::JournalDegraded` for the
@@ -1005,15 +1095,10 @@ impl BusHandle {
             .as_ref()
             .map(|(n, _)| n.clone())
             .ok_or(SendError::NotRegistered)?;
-        let payload_bytes = serde_json::to_vec(&payload).map_err(|e| {
-            SendError::PayloadSerialization(format!("serde_json::to_vec: {e}"))
-        })?;
-        let payload_byte_size = payload_bytes.len() as u64;
-        let mut hasher = Sha256::new();
-        hasher.update(&payload_bytes);
-        let digest = hasher.finalize();
-        let mut payload_sha256_prefix = [0u8; 8];
-        payload_sha256_prefix.copy_from_slice(&digest[..8]);
+        // Shared metadata derivation (same shape the live-caller events use);
+        // a `Value` always serializes, so this is infallible.
+        let (payload_byte_size, payload_sha256_prefix) =
+            crate::primitive::payload_metadata(&payload);
         let kind = kind.into();
         // Journaled mode keeps the payload in the log entry. Ephemeral
         // mode hides it from the log (the inspector renders the size +
@@ -1089,6 +1174,18 @@ impl BusHandle {
                     );
                 }
             }
+        } else {
+            // Journaled mode: bound the in-RAM log to `window` Message
+            // entries WITHOUT losing durability. We only ever drop Message
+            // entries that are BOTH (a) already shipped to the DB
+            // (`offset < journaled_through`, so a fresh worker can replay
+            // them) AND (b) older than the most recent `window` messages.
+            // Membership entries (Joined/Left/Closed) are always retained
+            // (load-bearing for cursors, bounded by participant churn). A
+            // cursor that had pointed into the trimmed span now reads
+            // `FellBehind`, the same RAM-only semantics ephemeral has: a
+            // cursor never reaches the DB, the window is the whole world.
+            self.inner.trim_journaled_window(&mut log);
         }
         drop(log);
         if !self.inner.ephemeral && payload_byte_size > JOURNALED_PAYLOAD_WARN_BYTES {
@@ -1141,11 +1238,49 @@ impl BusHandle {
         BusCursor::new(Arc::downgrade(&self.inner), next_offset, None, self.node.clone())
     }
 
-    /// A fresh cursor that replays from offset 0 (full retained
-    /// history; on ephemeral buses, evicted messages in between
-    /// surface as `FellBehind`).
+    /// The current "now" offset: one past the highest entry appended so
+    /// far. A forward cursor minted now starts here. Pair with
+    /// [`Self::cursor_at`] to position a cursor relative to now (e.g.
+    /// `cursor_at(now.saturating_sub(n))` to read the last `n` entries).
+    pub fn now_offset(&self) -> u64 {
+        self.inner.log_len()
+    }
+
+    /// The earliest offset still resident in RAM. A cursor cannot read
+    /// below this (older entries were trimmed out of the window; cursors
+    /// never read the DB). [`Self::cursor_from_start`] starts here.
+    pub fn retained_floor(&self) -> u64 {
+        self.inner.retained_floor()
+    }
+
+    /// A fresh cursor positioned at an explicit `offset`. The general
+    /// primitive behind the others: forward-from-now is `cursor_at(now)`,
+    /// history-from-the-window-start is `cursor_at(retained_floor)`,
+    /// last-`n` is `cursor_at(now - n)`. An `offset` below the retained
+    /// floor reads `FellBehind` for each missing entry (RAM-only: the
+    /// window is the whole readable world); an `offset` past `now` simply
+    /// waits for entries to arrive.
+    pub fn cursor_at(&self, offset: u64) -> BusCursor {
+        BusCursor::new(Arc::downgrade(&self.inner), offset, None, self.node.clone())
+    }
+
+    /// A fresh cursor from the earliest entry STILL RETAINED in RAM. Not
+    /// "offset 0": on a windowed bus the early entries may have been
+    /// trimmed (journaled ones live on in the DB, but a cursor never reads
+    /// the DB). This reads everything a cursor can still reach, oldest
+    /// first.
     pub fn cursor_from_start(&self) -> BusCursor {
-        BusCursor::new(Arc::downgrade(&self.inner), 0, None, self.node.clone())
+        self.cursor_at(self.inner.retained_floor())
+    }
+
+    /// A forward cursor that ALSO replays the single most recent message
+    /// already in the log (if any), so a late reader can grab the latest
+    /// state (e.g. a greeting / last status) without replaying all history.
+    /// Starts at the offset of the last Message entry; if there is none, it
+    /// is just a forward cursor at now.
+    pub fn cursor_including_last(&self) -> BusCursor {
+        let start = self.inner.last_message_offset().unwrap_or_else(|| self.inner.log_len());
+        self.cursor_at(start)
     }
 
     // ----- membership wait -----------------------------------------
@@ -1305,6 +1440,14 @@ pub struct BusCursor {
     /// Keys this cursor's waits in the engine's liveness map, so a node
     /// parked in `next()` is correctly attributed.
     node: Option<BusParticipant>,
+    /// When `true` (default), `next()` silently bridges trimmed-message
+    /// gaps and delivers the next retained entry, so a consumer walking old
+    /// history cruises through gaps without a `FellBehind` at each one. When
+    /// `false` (strict/audit), each gap surfaces one `FellBehind` so the
+    /// consumer learns exactly where messages were lost. Either way the
+    /// cursor only moves FORWARD and never skips a retained entry (only
+    /// `Message` entries are ever trimmed; membership is always retained).
+    skip_gaps: bool,
 }
 
 impl BusCursor {
@@ -1319,7 +1462,17 @@ impl BusCursor {
             next_offset,
             filter,
             node,
+            skip_gaps: true,
         }
+    }
+
+    /// Switch this cursor to STRICT gap handling: each trimmed-message gap
+    /// surfaces one `CursorError::FellBehind` instead of being bridged
+    /// silently. Use for an audit consumer that must learn where it lost
+    /// messages. Default is skip-gaps (bridge silently).
+    pub fn strict_gaps(mut self) -> Self {
+        self.skip_gaps = false;
+        self
     }
 
     /// Attach a filter closure. Non-matching entries are skipped (the
@@ -1385,27 +1538,46 @@ impl BusCursor {
                 let log = inner.lock_log();
                 let mut idx = log.partition_point(|e| e.offset < self.next_offset);
                 let len = log.len();
-                // `expected` walks the offset line as the scan
-                // advances; a retained entry sitting PAST it means
-                // the offsets in between were evicted ephemeral
-                // messages (only `Message` entries are ever dropped
-                // from the log). One FellBehind per missing offset,
-                // advancing one slot at a time, so retained
-                // membership entries inside an evicted span are
-                // surfaced normally on subsequent calls instead of
-                // being silently jumped.
+                // `expected` walks the offset line as the scan advances; a
+                // retained entry sitting PAST it means the offsets in between
+                // were evicted (only `Message` entries are ever dropped from
+                // the log; membership entries are always retained, so the
+                // evicted span is pure trimmed messages). On a gap, report
+                // the earliest still-available offset and JUMP the cursor
+                // straight to it, so the next read resumes at the oldest
+                // retained message. One `FellBehind` to learn you lost the
+                // gap, then you are caught up (identical to the caller's
+                // `CallerError::FellBehind` contract). Jumping is safe
+                // precisely because no membership entry can hide in the
+                // evicted span.
                 let mut expected = self.next_offset;
                 let mut chosen: Option<BusEntry> = None;
                 while idx < len {
                     let entry = &log[idx];
                     if entry.offset > expected {
-                        let oldest_resident = inner
-                            .ephemeral_store
-                            .as_ref()
-                            .and_then(|s| s.floor())
-                            .unwrap_or(entry.offset);
-                        self.next_offset = expected + 1;
-                        return Err(CursorError::FellBehind { oldest_resident });
+                        // Gap: offsets [expected, entry.offset) were trimmed
+                        // (pure messages; membership is never evicted, so
+                        // nothing the consumer needs hides here).
+                        let resumed_at = entry.offset;
+                        if self.skip_gaps {
+                            // Default: silently bridge the gap and deliver the
+                            // next retained entry, so a consumer walking old
+                            // history (e.g. all the Joined events) cruises
+                            // through message-gaps without stalling. Advance
+                            // `expected` to the retained entry and fall
+                            // through to deliver it.
+                            self.next_offset = resumed_at;
+                            expected = resumed_at;
+                            // re-enter the body for THIS entry (now at expected)
+                        } else {
+                            // Strict (audit) mode: report each gap. Resume at
+                            // the next retained entry (forward, never
+                            // backward); the true window floor rides along.
+                            let oldest_resident =
+                                log.first().map(|e| e.offset).unwrap_or(resumed_at);
+                            self.next_offset = resumed_at;
+                            return Err(CursorError::FellBehind { resumed_at, oldest_resident });
+                        }
                     }
                     if matches!(entry.kind, BusEntryKind::Closed) {
                         self.next_offset = entry.offset;
@@ -1919,7 +2091,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_send_does_not_journal_payload_in_log_entry() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, ephemeral_window: Some(8) }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8) }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "bytes": "AAAA" })).unwrap();
         // Read entries directly out of the log to confirm payload=None.
@@ -1941,7 +2113,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_cursor_returns_payload_when_window_still_has_it() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, ephemeral_window: Some(8) }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8) }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "n": 1 })).unwrap();
         let mut c = bus.cursor_from_start();
@@ -1959,29 +2131,29 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_slow_consumer_gets_loud_fell_behind() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, ephemeral_window: Some(2) }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(2) }).expect("valid options");
         let p = registered(&bus, "p");
         // Create the cursor BEFORE sends so it starts at the joined-only
         // tail; the test exercises a consumer reading slowly enough that
         // the store evicts.
-        let mut c = bus.cursor_from_start();
+        // STRICT mode: a slow consumer must be told it fell behind.
+        let mut c = bus.cursor_from_start().strict_gaps();
         for i in 0..6 {
             p.send("frame", json!({ "i": i })).unwrap();
         }
-        // First next() is the Joined entry (always retained in the log,
-        // never lived in the ephemeral store).
+        // First next() is the Joined entry (always retained, never in the
+        // ephemeral store).
         let _j = c.next().await.unwrap().unwrap();
-        // Next is the first Message at offset 1. With ephemeral_window=2
-        // and 6 sends, the store now holds offsets 5+6 (last two
-        // inserts); offsets 1..=4 have been evicted. Each evicted
-        // message yields its own FellBehind: the cursor advances one
-        // offset per FellBehind so non-Message entries between them
-        // (Joined/Left/Closed) would not be silently skipped.
+        // Offsets 1..=4 were evicted (window=2 keeps 5,6). In strict mode
+        // the gap surfaces ONE FellBehind that resumes at the next retained
+        // message (offset 5), reporting the floor too, rather than one error
+        // per evicted offset. The next read then delivers the live message.
         let mut fell_behind_count = 0;
         loop {
             match c.next().await {
-                Err(CursorError::FellBehind { .. }) => {
+                Err(CursorError::FellBehind { resumed_at, oldest_resident }) => {
                     fell_behind_count += 1;
+                    assert!(resumed_at >= oldest_resident, "resume is forward of the floor");
                 }
                 Ok(Some(entry)) => {
                     assert!(matches!(entry.kind, BusEntryKind::Message { .. }));
@@ -1991,61 +2163,124 @@ mod tests {
             }
             assert!(fell_behind_count < 10, "should land on a live message before this");
         }
-        // 4 evicted messages (offsets 1..=4) each surface their own
-        // FellBehind; offset 5 is the first live message.
-        assert_eq!(fell_behind_count, 4);
+        // One FellBehind for the whole evicted gap (resume jumps to the next
+        // retained message), then the live message at the tail.
+        assert_eq!(fell_behind_count, 1);
     }
 
-    /// Per-evicted-message FellBehind: Joined entries sitting in the
-    /// log between evicted ephemeral Messages must be surfaced to the
-    /// cursor, not silently jumped over. The earlier shape that
-    /// blindly advanced `next_offset = floor` would have skipped any
-    /// Joined entry inside the evicted offset range; the per-offset
-    /// advance preserves it.
-    #[tokio::test]
-    async fn fell_behind_preserves_intervening_joined_entries() {
+    /// A Joined entry sitting between evicted Messages must ALWAYS be
+    /// surfaced (never skipped), in BOTH gap modes. Build the sparse log:
+    /// Joined "a" (0), msg (1, evicted), Joined "b" (2), msg (3, live).
+    fn sparse_membership_bus() -> BusHandle {
         let bus = BusHandle::create_with_options(BusOptions {
             ephemeral: true,
-            ephemeral_window: Some(1),
+            window: Some(1),
         })
         .expect("valid options");
-        let mut c = bus.cursor_from_start();
-        // Producer "a" joins at offset 0, sends a message at offset 1.
-        // Producer "b" joins at offset 2 (NOT inserted into ephemeral
-        // store: only Messages live there). Producer "a" sends again
-        // at offset 3, which evicts offset 1's payload (window=1).
         let a = registered(&bus, "a");
-        a.send("first", json!({ "i": 0 })).unwrap();
-        let _b = registered(&bus, "b");
-        a.send("late", json!({ "i": 99 })).unwrap();
-        // Walk the cursor to exhaustion (no early break). The cursor
-        // must yield: Joined "a" (offset 0), FellBehind for offset 1,
-        // Joined "b" (offset 2, the load-bearing case for this test),
-        // Message live (offset 3). If the earlier `next_offset =
-        // floor` jump were in effect, Joined "b" would be silently
-        // skipped.
-        let mut joins = 0u32;
-        let mut fell_behinds = 0u32;
-        let mut live_messages = 0u32;
+        a.send("first", json!({ "i": 0 })).unwrap(); // offset 1
+        let _b = registered(&bus, "b"); // Joined offset 2
+        a.send("late", json!({ "i": 99 })).unwrap(); // offset 3, evicts offset 1
+        bus
+    }
+
+    /// DEFAULT (skip-gaps): the cursor bridges the evicted-message gap
+    /// silently, surfacing BOTH Joined entries and the live message with NO
+    /// FellBehind. The load-bearing property: Joined "b" is delivered even
+    /// though it sits past a trimmed message.
+    #[tokio::test]
+    async fn skip_gaps_default_bridges_gap_but_keeps_joined() {
+        let bus = sparse_membership_bus();
+        let mut c = bus.cursor_from_start();
+        let (mut joins, mut fell_behinds, mut live) = (0u32, 0u32, 0u32);
         for _ in 0..10 {
             match c.next().await {
                 Err(CursorError::FellBehind { .. }) => fell_behinds += 1,
                 Ok(Some(entry)) => match entry.kind {
                     BusEntryKind::Joined { .. } => joins += 1,
-                    BusEntryKind::Message { .. } => {
-                        live_messages += 1;
-                        if live_messages >= 1 {
-                            break;
-                        }
-                    }
+                    BusEntryKind::Message { .. } => { live += 1; break; }
                     _ => {}
                 },
                 Ok(None) => break,
             }
         }
-        assert_eq!(joins, 2, "both Joined entries must be surfaced");
-        assert!(fell_behinds >= 1, "evicted message must surface FellBehind");
-        assert_eq!(live_messages, 1, "must reach the live message at the tail");
+        assert_eq!(joins, 2, "both Joined entries surfaced (b not skipped across the gap)");
+        assert_eq!(fell_behinds, 0, "default bridges the gap silently");
+        assert_eq!(live, 1, "reaches the live message");
+    }
+
+    /// STRICT (`strict_gaps`): same sparse log, but each evicted-message
+    /// gap surfaces one FellBehind carrying both `resumed_at` (next retained,
+    /// forward) and `oldest_resident` (window floor). Joined "b" is STILL
+    /// delivered (never skipped). This is the audit mode.
+    #[tokio::test]
+    async fn strict_gaps_signals_fell_behind_but_keeps_joined() {
+        let bus = sparse_membership_bus();
+        let mut c = bus.cursor_from_start().strict_gaps();
+        let (mut joins, mut fell_behinds, mut live) = (0u32, 0u32, 0u32);
+        let mut saw_resume_forward = false;
+        for _ in 0..10 {
+            match c.next().await {
+                Err(CursorError::FellBehind { resumed_at, oldest_resident }) => {
+                    fell_behinds += 1;
+                    // resume is forward (the next retained entry), and the
+                    // floor is reported separately.
+                    assert!(resumed_at >= oldest_resident);
+                    saw_resume_forward = true;
+                }
+                Ok(Some(entry)) => match entry.kind {
+                    BusEntryKind::Joined { .. } => joins += 1,
+                    BusEntryKind::Message { .. } => { live += 1; break; }
+                    _ => {}
+                },
+                Ok(None) => break,
+            }
+        }
+        assert_eq!(joins, 2, "both Joined entries surfaced even in strict mode");
+        assert!(fell_behinds >= 1, "strict mode signals the evicted gap");
+        assert!(saw_resume_forward);
+        assert_eq!(live, 1, "reaches the live message");
+    }
+
+    /// The exact scenario worked through with the user: messages A,B,D,E,G,H
+    /// and Join entries C,F; all non-Join messages trimmed. A cursor sitting
+    /// at E (an evicted message, mid-log) must RESUME FORWARD at the next
+    /// retained entry (F, the Join) WITHOUT skipping it, and must NOT go
+    /// backward to the floor (C). Strict mode so we can read the offsets.
+    #[tokio::test]
+    async fn strict_resume_is_forward_to_next_retained_never_backward() {
+        // window=1 so each new message evicts the previous one's payload;
+        // Join entries are never evicted.
+        let bus = BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(1) })
+            .expect("opts");
+        let a = registered(&bus, "a");        // Joined @0
+        a.send("A", json!(0)).unwrap();        // @1 msg
+        a.send("B", json!(1)).unwrap();        // @2 msg
+        let _c = registered(&bus, "c");        // Joined @3  (this is "C"/F-like)
+        a.send("D", json!(3)).unwrap();        // @4 msg
+        a.send("E", json!(4)).unwrap();        // @5 msg
+        let _f = registered(&bus, "f");        // Joined @6  (this is "F")
+        a.send("G", json!(6)).unwrap();        // @7 msg
+        a.send("H", json!(7)).unwrap();        // @8 msg (live; window=1 keeps only this)
+        // Cursor positioned AT an evicted mid-log message offset (E == @5).
+        let mut cur = bus.cursor_from_start().strict_gaps();
+        // jump cursor to offset 5 by re-seeding there.
+        cur = bus.cursor_at(5).strict_gaps();
+        // First read: gap (5 evicted) -> FellBehind, resume FORWARD at the
+        // next retained entry, which is the Join @6 (NOT backward to @0/@3).
+        match cur.next().await {
+            Err(CursorError::FellBehind { resumed_at, oldest_resident }) => {
+                assert_eq!(resumed_at, 6, "resume forward at the next retained entry (the Join @6)");
+                assert!(oldest_resident <= resumed_at, "floor is at or before the resume point");
+                assert!(resumed_at > 5, "never resumes backward of the cursor");
+            }
+            other => panic!("expected FellBehind, got {other:?}"),
+        }
+        // Next read delivers that Join (it was NOT skipped).
+        match cur.next().await.unwrap() {
+            Some(e) => assert!(matches!(e.kind, BusEntryKind::Joined { .. }), "the Join @6 is delivered"),
+            None => panic!("expected the Join entry"),
+        }
     }
 
     #[tokio::test]
@@ -2086,7 +2321,7 @@ mod tests {
             crate::weft_type::WeftType::bus_marker_mode(&m),
             Some(BusMode::Journaled)
         );
-        let eph = BusHandle::create_with_options(BusOptions { ephemeral: true, ephemeral_window: None })
+        let eph = BusHandle::create_with_options(BusOptions { ephemeral: true, window: None })
             .expect("valid options");
         let me = eph.marker();
         assert_eq!(
@@ -2096,17 +2331,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_window_zero_is_rejected_loud() {
-        // ephemeral_window=0 would evict every payload before any
-        // cursor could read it; the only honest answer is to fail
-        // loud at construction.
+    async fn window_zero_is_rejected_loud() {
+        // window=0 would evict every entry before any cursor could read
+        // it; the only honest answer is to fail loud at construction. The
+        // window applies to both modes, so a zero is rejected regardless of
+        // `ephemeral`.
         let err = BusHandle::create_with_options(BusOptions {
             ephemeral: true,
-            ephemeral_window: Some(0),
+            window: Some(0),
         })
         .expect_err("zero window must fail loud");
         assert!(
-            err.contains("ephemeral_window"),
+            err.contains("window"),
             "error message names the offending field: {err}"
         );
     }
@@ -2289,4 +2525,108 @@ mod tests {
             }
         }
     );
+
+    // ----- windowing + cursor-positioning (the new model) ---------------
+
+    /// A journaled bus trims its in-RAM log to the window, but ONLY entries
+    /// already shipped to the DB. Here the pump never runs (journaled_through
+    /// stays 0), so nothing is trimmed even past the window: durability wins
+    /// over the RAM bound. The full history is still readable from RAM.
+    #[tokio::test]
+    async fn journaled_keeps_unshipped_entries_past_window() {
+        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2) })
+            .expect("opts");
+        let tx = registered(&bus, "tx");
+        let rx = registered(&bus, "rx");
+        for i in 0..5 {
+            tx.send("m", json!({ "i": i })).unwrap();
+        }
+        // Pump never acked, so journaled_through==0: every message is still
+        // in RAM, readable from the retained floor, despite window=2.
+        let mut cursor = rx.cursor_from_start();
+        let mut seen = Vec::new();
+        while let Some((_, _, p)) = next_message(&mut cursor).await {
+            seen.push(p["i"].as_i64().unwrap());
+            if seen.len() == 5 { break; }
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4], "un-shipped journaled entries are never trimmed");
+    }
+
+    /// Once entries are journaled (pump acked), a journaled bus DOES trim
+    /// them out of RAM past the window. A cursor that reaches into the
+    /// trimmed span reads `FellBehind` (RAM-only: the window is the whole
+    /// readable world; the DB has the data but a cursor never reads it).
+    #[tokio::test]
+    async fn journaled_trims_shipped_entries_past_window() {
+        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2) })
+            .expect("opts");
+        let tx = registered(&bus, "tx");
+        for i in 0..5 {
+            tx.send("m", json!({ "i": i })).unwrap();
+        }
+        // Simulate the pump shipping everything to the DB, then one more send
+        // triggers the trim of the now-shipped older messages.
+        let now = bus.now_offset();
+        bus.inner_arc().acknowledge_journaled_through(now);
+        tx.send("m", json!({ "i": 5 })).unwrap();
+
+        // Early MESSAGES were trimmed from RAM (membership entries always
+        // kept). A cursor reaching into the trimmed span only reaches the
+        // DB-shipped data via... nothing: cursors never read the DB.
+        // STRICT mode surfaces FellBehind for the trimmed span.
+        let mut strict = bus.new_handle().cursor_at(1).strict_gaps();
+        let mut fell_behind = false;
+        for _ in 0..10 {
+            match strict.next().await {
+                Err(CursorError::FellBehind { .. }) => { fell_behind = true; break; }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+            }
+        }
+        assert!(fell_behind, "strict cursor below the retained message floor reads FellBehind");
+        // DEFAULT mode bridges the trimmed span silently and delivers the
+        // next retained message (no FellBehind).
+        let mut def = bus.new_handle().cursor_at(1);
+        let mut got_msg = false;
+        for _ in 0..10 {
+            match def.next().await {
+                Err(CursorError::FellBehind { .. }) => panic!("default must bridge, not error"),
+                Ok(Some(e)) => {
+                    if matches!(e.kind, BusEntryKind::Message { .. }) { got_msg = true; break; }
+                }
+                Ok(None) => break,
+            }
+        }
+        assert!(got_msg, "default cursor bridges the gap and delivers a retained message");
+    }
+
+    /// `now_offset` + `cursor_at` lets a reader position relative to now:
+    /// `cursor_at(now)` is forward-only (sees only what arrives after).
+    #[tokio::test]
+    async fn cursor_at_now_is_forward_only() {
+        let bus = BusHandle::create();
+        let tx = registered(&bus, "tx");
+        let obs = bus.new_handle();
+        tx.send("m", json!({ "i": 0 })).unwrap(); // before the cursor
+        let now = obs.now_offset();
+        let mut cursor = obs.cursor_at(now);
+        tx.send("m", json!({ "i": 1 })).unwrap(); // after the cursor
+        let (_, _, p) = next_message(&mut cursor).await.unwrap();
+        assert_eq!(p["i"].as_i64().unwrap(), 1, "forward cursor skips the pre-existing message");
+    }
+
+    /// `cursor_including_last` seeds a forward cursor with the single most
+    /// recent message, so a late reader grabs the latest state.
+    #[tokio::test]
+    async fn cursor_including_last_replays_one() {
+        let bus = BusHandle::create();
+        let tx = registered(&bus, "tx");
+        let obs = bus.new_handle();
+        tx.send("m", json!({ "i": 0 })).unwrap();
+        tx.send("m", json!({ "i": 1 })).unwrap(); // this is "the last"
+        let mut cursor = obs.cursor_including_last();
+        // First read is the last pre-existing message (i=1), not i=0.
+        let (_, _, p) = next_message(&mut cursor).await.unwrap();
+        assert_eq!(p["i"].as_i64().unwrap(), 1, "includes only the most recent prior message");
+    }
 }

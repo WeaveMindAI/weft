@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Gates the Layer-3 DB tests (tests/live_admission.rs) that need a real
+# Postgres via `#[sqlx::test]` + $DATABASE_URL. OFF by default so
+# `cargo test --workspace` is green on any machine without Postgres; CI runs
+# `cargo test -p weft-task-store --features db-tests` with a Postgres up.
+db-tests = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -22,3 +29,8 @@ uuid = { workspace = true }
 # advance) so the idle-exit picker test runs deterministically
 # without real sleeps.
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+# `#[sqlx::test]` (macros + migrate features) spins up a fresh isolated
+# Postgres database per test against $DATABASE_URL and drops it after, for
+# the Layer-3 DB-logic tests (admission, cap, orphan recovery, cleanup).
+# These tests are skipped when no DATABASE_URL is set (CI provides one).
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "macros", "migrate"] }

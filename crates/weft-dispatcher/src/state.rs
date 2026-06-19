@@ -99,4 +99,15 @@ pub struct DispatcherState {
     /// trait lives in `weft-platform-traits`, shared with the
     /// supervisor crate.
     pub kube: Arc<dyn weft_platform_traits::KubeClient>,
+    /// HMAC secret the dispatcher signs live-connection routing tokens
+    /// with (the worker verifies with the same secret). Empty when live
+    /// connections aren't provisioned (`WEFT_CALLER_TOKEN_SECRET` unset);
+    /// the handshake then fails loud rather than minting unverifiable
+    /// tokens.
+    pub caller_token_secret: Arc<Vec<u8>>,
+    /// Public origin of the live-connection gateway (e.g.
+    /// `https://live.example.com` in cloud, or the nip.io-based local
+    /// origin). The handshake builds the per-pod caller URL by prefixing
+    /// the pod subdomain onto this host. Empty disables live connections.
+    pub gateway_base_url: String,
 }

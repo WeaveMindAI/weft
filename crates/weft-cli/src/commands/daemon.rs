@@ -47,6 +47,13 @@ pub struct ClusterConfig {
     /// (the dispatcher's own API): downloads stream straight from the
     /// storage box through the ingress, never through the dispatcher.
     pub ingress_port: u16,
+    /// Local port the daemon forwards the live-connection gateway (Envoy
+    /// Gateway) to. A caller's URL is minted as
+    /// `http://<pod>.<ns>.<host>:<gateway_port>/...` in local dev and
+    /// reached via this forward. Distinct from `ingress_port` (the nginx
+    /// ingress for storage downloads); the live gateway is a separate
+    /// front door.
+    pub gateway_port: u16,
     /// Cluster Service CIDR. The apiserver's ClusterIP lives in this
     /// range; the broker NetworkPolicy allows TokenReview egress to
     /// it, and the dispatcher gets it as env. kind's default is
@@ -106,6 +113,10 @@ impl ClusterConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(9998);
+        let gateway_port = std::env::var("WEFT_GATEWAY_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9097);
         // Raw here; validated where they're consumed (the manifest
         // apply, `apply_static_manifests`), not at config load: a
         // malformed CIDR should fail the apply loudly, not break
@@ -135,6 +146,7 @@ impl ClusterConfig {
             storage_image,
             dispatcher_port,
             ingress_port,
+            gateway_port,
             service_cidr,
             pod_cidr,
             backend,
@@ -223,12 +235,55 @@ fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, Stri
         }
     };
 
+    // Live connection gateway vars. GATEWAY_HOST is the public wildcard
+    // suffix the gateway listener matches (`*.<GATEWAY_HOST>`); the
+    // dispatcher prepends `<pod>.<ns>.` to it when minting a caller URL.
+    // GATEWAY_BASE_URL is the scheme + that host + the reachable port,
+    // also prepended with the pod subdomain by the dispatcher.
+    // CALLER_TOKEN_SECRET (hex) is the HMAC both the dispatcher and every
+    // worker use for the routing token.
+    let (gateway_host, gateway_base_url, caller_token_secret) = match cfg.backend {
+        ClusterBackend::Kind => {
+            // nip.io wildcard: `<anything>.127-0-0-1.nip.io` -> 127.0.0.1,
+            // reached via the daemon's gateway port-forward. A fixed dev
+            // secret keeps tokens stable across local restarts.
+            let host = std::env::var("WEFT_GATEWAY_HOST")
+                .unwrap_or_else(|_| "127-0-0-1.nip.io".to_string());
+            let base = std::env::var("WEFT_GATEWAY_BASE_URL")
+                .unwrap_or_else(|_| format!("http://{host}:{}", cfg.gateway_port));
+            let secret = std::env::var("WEFT_CALLER_TOKEN_SECRET")
+                .unwrap_or_else(|_| "6465762d6c6f63616c2d63616c6c65722d746f6b656e2d736563726574".to_string());
+            (host, base, secret)
+        }
+        ClusterBackend::K8s => {
+            let host = std::env::var("WEFT_GATEWAY_HOST").map_err(|_| {
+                anyhow::anyhow!(
+                    "WEFT_GATEWAY_HOST is required for the k8s backend; set it to the \
+                     live-connection wildcard host (e.g. live.example.com, with a \
+                     `*.live.example.com` DNS record + TLS cert pointed at the gateway)"
+                )
+            })?;
+            let base = std::env::var("WEFT_GATEWAY_BASE_URL")
+                .unwrap_or_else(|_| format!("https://{host}"));
+            let secret = std::env::var("WEFT_CALLER_TOKEN_SECRET").map_err(|_| {
+                anyhow::anyhow!(
+                    "WEFT_CALLER_TOKEN_SECRET (hex) is required for the k8s backend; it is \
+                     the HMAC the dispatcher signs live-connection routing tokens with"
+                )
+            })?;
+            (host, base, secret)
+        }
+    };
+
     Ok(vec![
         ("WEFT_CLUSTER_SERVICE_CIDR", cfg.service_cidr.clone()),
         ("WEFT_CLUSTER_POD_CIDR", cfg.pod_cidr.clone()),
         ("WEFT_APISERVER_CLUSTERIP", apiserver_ip),
         ("WEFT_DISPATCHER_PUBLIC_BASE_URL", public_base_url),
         ("WEFT_LOCAL_DEV", local_dev),
+        ("GATEWAY_HOST", gateway_host),
+        ("WEFT_GATEWAY_BASE_URL", gateway_base_url),
+        ("WEFT_CALLER_TOKEN_SECRET", caller_token_secret),
     ])
 }
 
@@ -287,6 +342,14 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         supervisor: supervisor_built,
         storage: storage_built,
     } = built;
+
+    // The Envoy Gateway controller is infrastructure both `start` and
+    // `restart` must guarantee BEFORE applying gateway.yaml (its CRs need
+    // the CRDs). Idempotent: a no-op once installed. (A restart against a
+    // cluster created before this feature existed installs it now.)
+    if cfg.backend == ClusterBackend::Kind {
+        ensure_envoy_gateway().await?;
+    }
 
     // Re-apply k8s manifests on every restart. NetworkPolicy /
     // ClusterRole / SA-label tweaks land via the manifest files in
@@ -507,6 +570,10 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
         "dispatcher.yaml",
         "ingress.yaml",
         "cluster-rbac.yaml",
+        // Live caller connection gateway (Envoy Gateway CRs). Applied
+        // after the controller install (`ensure_envoy_gateway`) so the
+        // CRDs exist. `${GATEWAY_HOST}` is substituted from template vars.
+        "gateway.yaml",
     ] {
         // Every manifest goes through the same applier with the
         // template vars; substitution is a no-op for the manifests
@@ -528,7 +595,10 @@ struct PortForward {
     /// Stable key for the pid/log filenames (e.g. "dispatcher").
     name: &'static str,
     namespace: String,
-    service: &'static str,
+    /// Service name. Most are fixed; the live gateway's data-plane
+    /// Service name is generated by Envoy Gateway, so it is resolved by
+    /// label at `port_forwards` build time (hence `String`, not `&str`).
+    service: String,
     local_port: u16,
     remote_port: u16,
 }
@@ -545,11 +615,11 @@ struct PortForward {
 ///   operator sets a real external ingress host
 ///   (WEFT_DISPATCHER_PUBLIC_BASE_URL) reachable without a forward,
 ///   and the ingress-nginx Service name may differ in their cluster.
-fn port_forwards(cfg: &ClusterConfig) -> Vec<PortForward> {
+async fn port_forwards(cfg: &ClusterConfig) -> Vec<PortForward> {
     let mut forwards = vec![PortForward {
         name: "dispatcher",
         namespace: cfg.system_namespace.clone(),
-        service: "weft-dispatcher",
+        service: "weft-dispatcher".to_string(),
         local_port: cfg.dispatcher_port,
         remote_port: 9999,
     }];
@@ -557,12 +627,61 @@ fn port_forwards(cfg: &ClusterConfig) -> Vec<PortForward> {
         forwards.push(PortForward {
             name: "ingress",
             namespace: "ingress-nginx".to_string(),
-            service: "ingress-nginx-controller",
+            service: "ingress-nginx-controller".to_string(),
             local_port: cfg.ingress_port,
             remote_port: 80,
         });
+        // Live connection gateway: forward the local gateway port to the
+        // Envoy Gateway data-plane Service. Its name is generated by Envoy
+        // Gateway, so resolve it by the owning-gateway label. Skipped if
+        // not yet present (first boot before the Gateway is programmed);
+        // the next restart picks it up.
+        if let Some(svc) = resolve_envoy_gateway_service().await {
+            forwards.push(PortForward {
+                name: "gateway",
+                namespace: "envoy-gateway-system".to_string(),
+                service: svc,
+                local_port: cfg.gateway_port,
+                remote_port: 80,
+            });
+        }
     }
     forwards
+}
+
+/// Resolve the Envoy Gateway data-plane Service name for our Gateway.
+/// Envoy Gateway generates it (e.g. `envoy-envoy-gateway-system-weft-...`),
+/// labeled with the owning gateway, so we look it up rather than hardcode.
+/// Returns `None` if not yet created (the Gateway isn't programmed yet).
+async fn resolve_envoy_gateway_service() -> Option<String> {
+    // Short request timeout: this is called from `port_forwards`, which
+    // `status` awaits BEFORE its reachability probe. Without a bound, a
+    // slow/down apiserver would hang `weft daemon status` instead of letting
+    // it report quickly. A miss (svc not yet programmed, or apiserver slow)
+    // simply means "no gateway forward yet", recovered on the next call.
+    let out = kubectl(&[
+        "--request-timeout=5s",
+        "-n",
+        "envoy-gateway-system",
+        "get",
+        "svc",
+        "-l",
+        "gateway.envoyproxy.io/owning-gateway-name=weft-live-gateway",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ])
+    .output()
+    .await
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 pub fn data_dir_pid_file(name: &str) -> PathBuf {
@@ -581,6 +700,7 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
         require_binary("kind").await?;
         ensure_cluster(cfg).await?;
         ensure_ingress_controller().await?;
+        ensure_envoy_gateway().await?;
     }
 
     provision_images(cfg, rebuild).await?;
@@ -619,6 +739,10 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // RoleBindings (created per project namespace by the dispatcher)
     // reference. Applied once during daemon boot.
     kubectl_apply_file(&manifests.join("cluster-rbac.yaml")).await?;
+    // Live caller connection gateway (Envoy Gateway CRs). The controller
+    // was installed above (`ensure_envoy_gateway`), so its CRDs exist.
+    // `${GATEWAY_HOST}` is substituted from template vars.
+    kubectl_apply_templated(&manifests.join("gateway.yaml"), &template_vars).await?;
 
     wait_for_statefulset_ready("weft-dispatcher").await?;
     // Kill any stale forwards from a previous daemon before
@@ -657,12 +781,18 @@ async fn stop() -> Result<()> {
 }
 
 /// Kill every running `kubectl port-forward` we previously spawned
-/// (dispatcher + ingress). Called on stop and before we
+/// (dispatcher + ingress + gateway). Called on stop and before we
 /// re-establish forwards after a Pod rollout. Idempotent.
+/// Stable names of every port-forward the daemon may own. Used for
+/// pid-file lifecycle (kill / liveness) without resolving live cluster
+/// state. The actual forward set (`port_forwards`) is a subset depending
+/// on backend + what's programmed yet; killing a name with no pid file is
+/// a no-op, so listing the superset here is safe.
+const PORT_FORWARD_NAMES: &[&str] = &["dispatcher", "ingress", "gateway"];
+
 fn kill_existing_port_forwards() {
-    let cfg = cluster_config();
-    for pf in port_forwards(cfg) {
-        let pid_file = data_dir_pid_file(pf.name);
+    for name in PORT_FORWARD_NAMES {
+        let pid_file = data_dir_pid_file(name);
         if let Some(pid) = read_pid(&pid_file) {
             let _ = signal_term(pid);
             let _ = fs::remove_file(&pid_file);
@@ -672,11 +802,17 @@ fn kill_existing_port_forwards() {
 
 async fn status(ctx: &Ctx) -> Result<()> {
     let cfg = cluster_config();
-    // All forwards must be alive to report "up"; if any died the
-    // operator's reachability is partially broken.
-    let pf_alive = port_forwards(cfg)
-        .iter()
-        .all(|pf| read_pid(&data_dir_pid_file(pf.name)).map(process_alive).unwrap_or(false));
+    // Every forward the daemon ACTUALLY runs must be alive to report "up".
+    // We iterate the real set (`port_forwards`), not the superset of names:
+    // the gateway forward only exists once the Gateway is programmed, so it
+    // is simply absent from the set until then and never drags liveness down,
+    // while a required forward (dispatcher, ingress) that is missing its pid
+    // correctly reports "down" (no fail-open `None => true`).
+    let pf_alive = port_forwards(&cfg).await.iter().all(|pf| {
+        read_pid(&data_dir_pid_file(pf.name))
+            .map(process_alive)
+            .unwrap_or(false)
+    });
     match ctx.client().get_json("/projects").await {
         Ok(v) => {
             let n = v.as_array().map(|a| a.len()).unwrap_or(0);
@@ -792,6 +928,147 @@ async fn ensure_ingress_controller() -> Result<()> {
     .await?;
     if !wait.success() {
         anyhow::bail!("ingress controller failed to become ready");
+    }
+    Ok(())
+}
+
+/// Envoy Gateway version installed for the live caller connection
+/// gateway. Pinned so a local install matches the manifests in
+/// `deploy/k8s/gateway.yaml` (which use Envoy Gateway CRDs).
+const ENVOY_GATEWAY_VERSION: &str = "v1.8.1";
+
+/// Install the Envoy Gateway controller (idempotent) into the cluster.
+/// This is the live caller connection front door: it routes an outside
+/// caller to a specific worker pod. Same controller local (kind) and
+/// cloud; only the public host + TLS differ (set via the gateway
+/// manifest's `${GATEWAY_HOST}`, applied by `apply_static_manifests`).
+async fn ensure_envoy_gateway() -> Result<()> {
+    let out = kubectl(&["get", "namespace", "envoy-gateway-system", "-o", "name"])
+        .output()
+        .await?;
+    if !(out.status.success() && !out.stdout.is_empty()) {
+        println!("installing Envoy Gateway controller ({ENVOY_GATEWAY_VERSION})");
+        let url = format!(
+            "https://github.com/envoyproxy/gateway/releases/download/{ENVOY_GATEWAY_VERSION}/install.yaml"
+        );
+        let status = kubectl(&["apply", "--server-side", "-f", &url]).status().await?;
+        if !status.success() {
+            anyhow::bail!("Envoy Gateway install failed with {status}");
+        }
+    }
+    // Wait for the controller before applying our Gateway/Backend CRs
+    // (a CR applied before the CRDs register would 404).
+    let wait = kubectl(&[
+        "-n",
+        "envoy-gateway-system",
+        "rollout",
+        "status",
+        "deployment/envoy-gateway",
+        "--timeout=180s",
+    ])
+    .status()
+    .await?;
+    if !wait.success() {
+        anyhow::bail!("Envoy Gateway controller failed to become ready");
+    }
+    enable_envoy_backend_api().await?;
+    Ok(())
+}
+
+/// Enable the Backend API (DynamicResolver) in the controller's config.
+/// `EnvoyGateway` is the config FILE's kind, living in the
+/// `envoy-gateway-config` ConfigMap, not a cluster CR, so we patch the
+/// ConfigMap's `extensionApis` and restart the controller to pick it up.
+/// Idempotent: a no-op once `enableBackend: true` is already present.
+async fn enable_envoy_backend_api() -> Result<()> {
+    let out = kubectl(&[
+        "-n",
+        "envoy-gateway-system",
+        "get",
+        "configmap",
+        "envoy-gateway-config",
+        "-o",
+        r"jsonpath={.data.envoy-gateway\.yaml}",
+    ])
+    .output()
+    .await?;
+    if !out.status.success() {
+        anyhow::bail!("could not read envoy-gateway-config ConfigMap");
+    }
+    let current = String::from_utf8_lossy(&out.stdout).to_string();
+    if current.contains("enableBackend: true") {
+        return Ok(()); // already enabled
+    }
+    // Replace the empty `extensionApis: {}` with the enabled block. The
+    // controller writes `extensionApis: {}` by default; if a future
+    // version changes that spelling this match misses and we bail loud
+    // rather than silently leaving the Backend API off.
+    if !current.contains("extensionApis: {}") {
+        anyhow::bail!(
+            "envoy-gateway-config has an unexpected extensionApis shape; \
+             cannot enable the Backend API automatically. Set \
+             `extensionApis.enableBackend: true` in the ConfigMap manually."
+        );
+    }
+    let patched = current.replace(
+        "extensionApis: {}",
+        "extensionApis:\n  enableBackend: true",
+    );
+    // Apply the new ConfigMap data. `kubectl patch --type merge` with the
+    // full data key replaces just that field.
+    let patch = serde_json::json!({ "data": { "envoy-gateway.yaml": patched } }).to_string();
+    let status = kubectl(&[
+        "-n",
+        "envoy-gateway-system",
+        "patch",
+        "configmap",
+        "envoy-gateway-config",
+        "--type",
+        "merge",
+        "-p",
+        &patch,
+    ])
+    .status()
+    .await?;
+    if !status.success() {
+        anyhow::bail!("failed to patch envoy-gateway-config for the Backend API");
+    }
+    // Restart the controller to reload the config, and WAIT for it to come
+    // back ready. Both must succeed: if the reload fails or never becomes
+    // ready, the Backend API (DynamicResolver) the live-caller gateway
+    // depends on is not loaded, and every live connection would 503. Fail
+    // loud at provisioning rather than ship a gateway that silently can't
+    // route live callers.
+    let restart = kubectl(&[
+        "-n",
+        "envoy-gateway-system",
+        "rollout",
+        "restart",
+        "deployment/envoy-gateway",
+    ])
+    .status()
+    .await?;
+    if !restart.success() {
+        anyhow::bail!(
+            "envoy-gateway controller restart failed; the Backend API config was patched \
+             but not reloaded, so live caller connections would not route"
+        );
+    }
+    let ready = kubectl(&[
+        "-n",
+        "envoy-gateway-system",
+        "rollout",
+        "status",
+        "deployment/envoy-gateway",
+        "--timeout=180s",
+    ])
+    .status()
+    .await?;
+    if !ready.success() {
+        anyhow::bail!(
+            "envoy-gateway controller did not become ready after the Backend API reload; \
+             live caller connections would not route"
+        );
     }
     Ok(())
 }
@@ -967,7 +1244,7 @@ async fn roll_role_deployments(role: &str, noun: &str) -> Result<()> {
 async fn start_port_forwards() -> Result<()> {
     let cfg = cluster_config();
     fs::create_dir_all(data_dir())?;
-    for pf in port_forwards(cfg) {
+    for pf in port_forwards(cfg).await {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

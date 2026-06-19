@@ -1,0 +1,17 @@
+{
+  "type": "LiveWsListener",
+  "label": "Live: WebSocket Listener",
+  "description": "Demo node that proves inbound messages broadcast to every reader. Wire two of these (or one alongside a WebSocket Echo) under the same LiveSocket trigger: each sees every message the caller sends. This one only observes and logs, never replies.",
+  "category": "live",
+  "tags": ["live", "websocket", "demo", "broadcast"],
+  "icon": "Ear",
+  "color": "#06b6d4",
+  "inputs": [
+    { "name": "started", "type": "Boolean", "required": false, "description": "Kick from the LiveSocket trigger." }
+  ],
+  "outputs": [
+    { "name": "count", "type": "Number", "required": false, "description": "How many inbound messages this listener observed." }
+  ],
+  "fields": [],
+  "requires_infra": false
+}

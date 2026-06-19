@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use weft_core::cancellation::CancellationFlag;
+use weft_core::caller::{InboundMessage, OutboundChunk};
 use weft_core::{Color, NodeCatalog, ProjectDefinition};
 use weft_task_store::executor::{run_worker_picker, WorkerTaskKind, WorkerTaskRegistry};
 use weft_task_store::tasks::Task;
@@ -93,9 +94,23 @@ struct WorkerCtx {
     /// same shape, so a small capacity (latest shape plus a few in-flight
     /// resume shapes pinning older hashes) is enough.
     project_cache: ProjectCache,
+    /// Per-pod live caller registry: the connection server attaches an
+    /// accepted socket here keyed by color; the execute path awaits it.
+    caller_registry: crate::caller_conn::CallerRegistry,
+    /// Per-color live-connection runtime config, populated by the execute
+    /// path from the task payload before the caller attaches, read by the
+    /// connection server's resolver to build the connection.
+    live_configs: LiveConfigMap,
 }
 
 type ProjectCache = Arc<Mutex<BoundedProjectCache>>;
+
+/// Per-color live-connection runtime config + heartbeat interval, set by
+/// the execute path and read by the connection server's resolver. Uses a
+/// std (sync) mutex: the resolver trait is sync and the critical section
+/// is a map lookup, never held across an await.
+type LiveConfigMap =
+    Arc<std::sync::Mutex<HashMap<Color, (weft_core::caller::CallerRuntimeConfig, u64)>>>;
 
 /// Insertion-ordered cache bounded to `CAP` entries. On overflow it
 /// evicts the oldest-inserted hash. Not a true LRU (no per-get reorder):
@@ -134,6 +149,7 @@ impl BoundedProjectCache {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pod(
     catalog: Arc<dyn NodeCatalog>,
     clients: EngineClients,
@@ -142,6 +158,18 @@ pub async fn run_pod(
     project_id: String,
     tenant_id: String,
     namespace: String,
+    // Live caller connection server: the TCP port the worker accepts
+    // gateway-forwarded connections on, and the HMAC secret it verifies
+    // dispatcher-signed routing tokens with. The generated `main` reads
+    // both from env (`WEFT_CONNECTION_PORT`, `WEFT_CALLER_TOKEN_SECRET`).
+    // `None` means no secret was provisioned (local dev without the
+    // gateway): the connection server is NOT started, so this worker simply
+    // has no live-caller capability. An EMPTY-but-`Some` secret is never
+    // constructed; an empty HMAC key validates forgeable tokens (fail-open),
+    // so the boundary collapses "empty" to `None` once and never feeds an
+    // empty key into the validator.
+    connection_port: u16,
+    token_secret: Option<Vec<u8>>,
 ) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let cancel_registry: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -155,6 +183,29 @@ pub async fn run_pod(
         shutdown.clone(),
     );
 
+    // Per-pod live caller registry + the per-color config the connection
+    // server resolves when a caller attaches. The execute path populates
+    // `live_configs` from the task payload BEFORE the caller arrives;
+    // the server reads it to build the connection.
+    let caller_registry = crate::caller_conn::CallerRegistry::new();
+    let live_configs: LiveConfigMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    match token_secret {
+        Some(secret) => spawn_connection_server(
+            caller_registry.clone(),
+            live_configs.clone(),
+            cancel_registry.clone(),
+            clients.clock.clone(),
+            clients.journal.clone(),
+            pod_name.clone(),
+            secret,
+            connection_port,
+        ),
+        None => tracing::info!(
+            target: "weft_engine::caller_conn",
+            "no caller-token secret provisioned; live caller connection server NOT started \
+             (this worker serves pull-queue work only)"
+        ),
+    }
     let picker_tasks = clients.tasks.clone();
     let ctx = WorkerCtx {
         project_id: project_id.clone(),
@@ -165,6 +216,8 @@ pub async fn run_pod(
         namespace,
         cancel_registry: cancel_registry.clone(),
         project_cache: Arc::new(Mutex::new(BoundedProjectCache::new())),
+        caller_registry,
+        live_configs,
     };
 
     let registry = WorkerTaskRegistry::builder()
@@ -267,6 +320,211 @@ fn spawn_heartbeat(
     });
 }
 
+// ----- Live caller connection wiring ---------------------------------
+
+/// Journal sink that projects caller events to `ExecEvent::Caller*` rows
+/// via the broker. Each event is recorded on a spawned task (the
+/// connection hot path stays sync + non-blocking). Live connections are
+/// non-durable, so a best-effort spawn matches the design: the exchange
+/// is observable/replayable, not a resume-critical durability story.
+struct BrokerCallerJournal {
+    journal: Arc<dyn weft_journal::JournalClient>,
+    pod_name: String,
+}
+
+impl BrokerCallerJournal {
+    fn emit(&self, event: weft_journal::ExecEvent) {
+        let journal = self.journal.clone();
+        let pod = self.pod_name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = journal.record_event(&event, Some(&pod)).await {
+                tracing::warn!(
+                    target: "weft_engine::caller_conn",
+                    error = %e,
+                    "failed to journal caller event"
+                );
+            }
+        });
+    }
+}
+
+/// Project an `OutboundChunk`/`InboundMessage` into the journal payload +
+/// size + sha prefix, mirroring the bus's metadata. Journaled mode stores
+/// the full value; ephemeral would store metadata-only (live connections
+/// default journaled today, so always full; the ephemeral window is a
+/// follow-on once big-stream triggers exist).
+fn caller_payload(
+    value: serde_json::Value,
+) -> (weft_core::primitive::JournaledPayload, u64, [u8; 8]) {
+    // Same metadata derivation the bus uses (one shared helper in core), so
+    // the size/hash shape never drifts between the two journaled-event paths.
+    let (size, prefix) = weft_core::primitive::payload_metadata(&value);
+    (weft_core::primitive::JournaledPayload::Journaled { value }, size, prefix)
+}
+
+fn inbound_to_value(msg: &InboundMessage) -> serde_json::Value {
+    match msg {
+        InboundMessage::Json(v) => v.clone(),
+        InboundMessage::Text(s) => serde_json::Value::String(s.clone()),
+        InboundMessage::Bytes(b) => serde_json::json!({ "bytes": b.len() }),
+    }
+}
+
+fn outbound_to_value(chunk: &OutboundChunk) -> serde_json::Value {
+    match chunk {
+        OutboundChunk::Json(v) => v.clone(),
+        OutboundChunk::Text(s) => serde_json::Value::String(s.clone()),
+        OutboundChunk::Bytes(b) => serde_json::json!({ "bytes": b.len() }),
+    }
+}
+
+impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
+    fn connected(&self, color: Color, offset: u64, protocol: weft_core::signal::Protocol) {
+        self.emit(weft_journal::ExecEvent::CallerConnected {
+            color,
+            offset,
+            protocol: protocol.as_wire_str().to_string(),
+            at_unix: crate::now_unix(),
+        });
+    }
+    fn inbound(&self, color: Color, offset: u64, msg: &weft_core::caller::InboundMessage) {
+        let (payload, size, prefix) = caller_payload(inbound_to_value(msg));
+        self.emit(weft_journal::ExecEvent::CallerInbound {
+            color,
+            offset,
+            payload,
+            payload_byte_size: size,
+            payload_sha256_prefix: prefix,
+            at_unix: crate::now_unix(),
+        });
+    }
+    fn outbound(
+        &self,
+        color: Color,
+        offset: u64,
+        chunk: &weft_core::caller::OutboundChunk,
+        terminal: bool,
+    ) {
+        let (payload, size, prefix) = caller_payload(outbound_to_value(chunk));
+        self.emit(weft_journal::ExecEvent::CallerOutbound {
+            color,
+            offset,
+            payload,
+            payload_byte_size: size,
+            payload_sha256_prefix: prefix,
+            terminal,
+            at_unix: crate::now_unix(),
+        });
+    }
+    fn errored(&self, color: Color, offset: u64, message: &str) {
+        self.emit(weft_journal::ExecEvent::CallerErrored {
+            color,
+            offset,
+            message: message.to_string(),
+            at_unix: crate::now_unix(),
+        });
+    }
+    fn disconnected(&self, color: Color, offset: u64, reason: &str) {
+        self.emit(weft_journal::ExecEvent::CallerDisconnected {
+            color,
+            offset,
+            reason: reason.to_string(),
+            at_unix: crate::now_unix(),
+        });
+    }
+}
+
+/// Resolver over the worker's per-color live-config map. The connection
+/// server calls this when a caller attaches to learn the protocol/caps so
+/// it can build the connection; an unknown color (caller raced ahead of,
+/// or long after, the execute task) returns `None` and the server 404s.
+struct LiveConfigResolver {
+    live_configs: LiveConfigMap,
+    journal: Arc<dyn weft_journal::JournalClient>,
+    pod_name: String,
+}
+
+impl crate::caller_conn::ConnConfigResolver for LiveConfigResolver {
+    fn resolve(
+        &self,
+        color: Color,
+    ) -> Option<(
+        weft_core::caller::CallerRuntimeConfig,
+        u64,
+        Arc<dyn crate::caller_conn::CallerJournalSink>,
+    )> {
+        let (cfg, heartbeat) = self
+            .live_configs
+            .lock()
+            .expect("live_configs poisoned")
+            .get(&color)
+            .cloned()?;
+        let sink: Arc<dyn crate::caller_conn::CallerJournalSink> = Arc::new(BrokerCallerJournal {
+            journal: self.journal.clone(),
+            pod_name: self.pod_name.clone(),
+        });
+        Some((cfg, heartbeat, sink))
+    }
+}
+
+/// Canceller over the pod-local per-color cancel registry. The connection
+/// server fires it when a caller drops in a caller-tied (cancel) run.
+struct RegistryCanceller {
+    cancel_registry: CancelRegistry,
+}
+
+impl crate::caller_conn::ExecutionCanceller for RegistryCanceller {
+    fn cancel(&self, color: Color) {
+        // Block-in-place is wrong here (sync trait method on an async
+        // mutex); use try_lock in a short spin via the blocking handle.
+        // The cancel registry is a tokio Mutex; grab it with a dedicated
+        // runtime-blocking section. In practice it's never contended.
+        let reg = self.cancel_registry.clone();
+        tokio::spawn(async move {
+            if let Some(flag) = reg.lock().await.get(&color).cloned() {
+                flag.cancel();
+            }
+        });
+    }
+}
+
+/// Start the live caller connection server on `port`. Plain HTTP/WS
+/// inside the cluster (TLS terminates at the gateway); the signed token
+/// authenticates every connection.
+#[allow(clippy::too_many_arguments)]
+fn spawn_connection_server(
+    caller_registry: crate::caller_conn::CallerRegistry,
+    live_configs: LiveConfigMap,
+    cancel_registry: CancelRegistry,
+    clock: Arc<dyn weft_platform_traits::Clock>,
+    journal: Arc<dyn weft_journal::JournalClient>,
+    pod_name: String,
+    token_secret: Vec<u8>,
+    port: u16,
+) {
+    let state = crate::caller_conn::ConnServerState {
+        registry: caller_registry,
+        token_secret: Arc::new(token_secret),
+        pod_name: pod_name.clone(),
+        resolver: Arc::new(LiveConfigResolver {
+            live_configs,
+            journal,
+            pod_name,
+        }),
+        clock,
+        canceller: Arc::new(RegistryCanceller { cancel_registry }),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = crate::caller_conn::serve(state, port).await {
+            tracing::error!(
+                target: "weft_engine::caller_conn",
+                error = %e,
+                "connection server exited"
+            );
+        }
+    });
+}
+
 /// Shared executor for `execute` and `resume`: both fold the
 /// journal and run the loop driver. The dispatcher distinguishes
 /// the two so SSE can label the event, but the worker treats them
@@ -303,6 +561,21 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             .await
             .insert(color, flag.clone());
 
+        // Live-connection executions carry their trigger's `live_connection`
+        // config. Register the runtime config so the connection server can
+        // build the connection when the caller's socket attaches, then wait
+        // (bounded by the connect timeout) for the attach so `ctx.caller()`
+        // resolves. A no-show leaves `caller = None`; the run proceeds and
+        // any node that needs the caller fails loud via the handle's
+        // `ensure_connected()`.
+        let caller = match &payload.live_connection {
+            Some(spec_json) => attach_live_caller(ctx, color, spec_json).await,
+            None => None,
+        };
+        // Keep a clone so we can surface a run failure to the caller after
+        // the execution returns (the connection itself moves into the run).
+        let caller_for_error = caller.clone();
+
         let outcome = run_one_execution(
             project,
             ctx.catalog.clone(),
@@ -312,13 +585,81 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             ctx.tenant_id.clone(),
             ctx.namespace.clone(),
             flag,
+            caller.map(|c| c as Arc<dyn weft_core::caller::CallerConnection>),
         )
         .await;
 
+        // If the run failed while a caller is attached, tell the caller why
+        // (per the error mode) instead of leaving a silently dropped socket.
+        if let (Some(conn), Err(e)) = (&caller_for_error, &outcome) {
+            conn.surface_error(&format!("execution failed: {e}")).await;
+        }
+
         ctx.cancel_registry.lock().await.remove(&color);
+        // Drop the live config + any attached connection for this color
+        // (the socket task already detaches on disconnect, but a run that
+        // finished before the caller attached must not leak the config).
+        ctx.live_configs.lock().expect("live_configs poisoned").remove(&color);
+        ctx.caller_registry.detach(color);
+        // No explicit slot release: a live execution's capacity slot IS its
+        // execute task row, and the executor flips that task terminal
+        // (complete/failed) when this handler returns. Once the task leaves
+        // pending/claimed it no longer counts toward the pod's live load, so
+        // the slot frees automatically (admission == task existence).
 
         outcome.map(|_| ())
     }
+}
+
+/// Register a live-connection execution's runtime config and wait for the
+/// caller's socket to attach. Returns the attached connection, or `None`
+/// if the trigger config is malformed (logged loud) or the caller never
+/// arrives within the connect timeout.
+async fn attach_live_caller(
+    ctx: &WorkerCtx,
+    color: Color,
+    spec_json: &serde_json::Value,
+) -> Option<Arc<crate::caller_conn::LiveCallerConnection>> {
+    // The task carries the full signal spec: the protocol is the kind (tag),
+    // the connection knobs are the config body.
+    let spec: weft_core::primitive::SignalSpec = match serde_json::from_value(spec_json.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "weft_engine::caller_conn",
+                color = %color, error = %e,
+                "live-caller spec on the execute task is malformed; running without a caller"
+            );
+            return None;
+        }
+    };
+    let Some(protocol) = weft_core::signal::protocol_for_tag(&spec.kind) else {
+        tracing::error!(
+            target: "weft_engine::caller_conn",
+            color = %color, kind = %spec.kind,
+            "execute task tagged a non-live-caller kind as live; running without a caller"
+        );
+        return None;
+    };
+    let cfg: weft_core::signal::LiveConnectionConfig = match serde_json::from_value(spec.config.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                target: "weft_engine::caller_conn",
+                color = %color, error = %e,
+                "live-caller config on the execute task is malformed; running without a caller"
+            );
+            return None;
+        }
+    };
+    let runtime = weft_core::caller::CallerRuntimeConfig::from_config(&cfg, protocol);
+    let connect_timeout = std::time::Duration::from_secs(runtime.connect_timeout_secs);
+    ctx.live_configs
+        .lock()
+        .expect("live_configs poisoned")
+        .insert(color, (runtime, cfg.heartbeat_interval_secs));
+    // Wait for the connection server to attach the socket for this color.
+    ctx.caller_registry.wait_for_attach(color, connect_timeout).await
 }
 
 /// Pod-local definition fetch: try the cache first; on miss, call

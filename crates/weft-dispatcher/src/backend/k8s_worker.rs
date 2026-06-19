@@ -18,6 +18,30 @@ use crate::project_namespace::SafeLabel;
 const PULL_WATCH_SECS: u64 = 5;
 const PULL_POLL: Duration = Duration::from_millis(500);
 
+/// TCP port the worker's live caller connection server listens on. SYNC:
+/// must match the generated worker's `WEFT_CONNECTION_PORT` default and
+/// the gateway's upstream port. One definition; the manifest sets the env
+/// and the container port, the gateway forwards here.
+// SYNC: WORKER_CONNECTION_PORT <-> crates/weft-compiler/src/codegen.rs (WEFT_CONNECTION_PORT default), deploy/k8s/gateway.yaml (Backend/route upstream port)
+pub const WORKER_CONNECTION_PORT: u16 = 9091;
+
+/// Namespace the Envoy Gateway controller + its data-plane proxies run
+/// in (Envoy Gateway's default install namespace). The only source the
+/// worker NetworkPolicy admits on the connection port. SYNC with the
+/// gateway install manifests.
+// SYNC: GATEWAY_NAMESPACE <-> deploy/k8s/gateway.yaml (gatewayClass/Gateway namespace), crates/weft-cli/src/commands/daemon.rs (gateway install)
+pub const GATEWAY_NAMESPACE: &str = "envoy-gateway-system";
+
+/// Name of the per-PROJECT headless Service that gives each worker pod a
+/// stable DNS name (`<pod-name>.<svc>.<ns>.svc.cluster.local`). ONE
+/// Service per project (not per pod): headless Services carry zero
+/// kube-proxy / iptables load and the object count is O(projects), so it
+/// scales to thousands of pods. The gateway dynamic-resolves the per-pod
+/// DNS; the Service exists only to publish the pod A-records.
+pub fn worker_headless_service_name() -> &'static str {
+    "weft-workers"
+}
+
 pub struct K8sWorkerBackend {
     /// Broker URL injected into worker Pods. Workers never speak
     /// directly to Postgres in arch-5; everything goes through the
@@ -80,14 +104,22 @@ impl WorkerBackend for K8sWorkerBackend {
         })?;
         let image = format!("weft-worker-{}:{}", spec.project_id, hash);
 
+        let project_label = SafeLabel::new(&spec.project_id, 63);
+        // Apply the per-project headless Service FIRST (idempotent), so a
+        // pod's DNS A-record is publishable the moment it is Ready. One
+        // Service per project; re-applying on every spawn is a no-op.
+        let svc = render_headless_service(&spec.namespace, &project_label);
+        self.kube.apply_yaml(&svc).await?;
+
         let manifest = render_pod_manifest(
             pod_name,
             &spec.namespace,
             &image,
-            &SafeLabel::new(&spec.project_id, 63),
+            &project_label,
             &SafeLabel::new(&spec.tenant, 63),
             &self.broker_url,
             &spec.owner_dispatcher,
+            &spec.caller_token_secret_hex,
         );
         self.kube.apply_yaml(&manifest).await?;
         self.wait_for_pull_ok(pod_name, &spec.namespace).await?;
@@ -113,6 +145,42 @@ pub(crate) fn short_project_id(project_id: &str) -> String {
         .collect()
 }
 
+/// Render the per-project headless Service. `clusterIP: None` = no
+/// virtual IP, no kube-proxy involvement; the endpoints controller
+/// publishes one DNS A-record per Ready worker pod as
+/// `<pod-name>.weft-workers.<ns>.svc.cluster.local`. `publishNotReadyAddresses`
+/// is true so a pod's record exists as soon as the pod has an IP (the
+/// caller may be routed the instant the worker is up, before k8s readiness
+/// probes would mark it Ready). The port is the connection server's port.
+fn render_headless_service(
+    namespace: &str,
+    project_label: &crate::project_namespace::SafeLabel,
+) -> String {
+    let svc = worker_headless_service_name();
+    format!(
+        r#"apiVersion: v1
+kind: Service
+metadata:
+  name: {svc}
+  namespace: {namespace}
+  labels:
+    weft.dev/role: worker-headless
+    weft.dev/project: "{project_label}"
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    weft.dev/role: worker
+    weft.dev/project: "{project_label}"
+  ports:
+    - name: caller
+      port: {port}
+      targetPort: {port}
+"#,
+        port = WORKER_CONNECTION_PORT,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_pod_manifest(
     pod_name: &str,
@@ -127,12 +195,15 @@ fn render_pod_manifest(
     tenant: &crate::project_namespace::SafeLabel,
     broker_url: &str,
     owner_dispatcher: &str,
+    caller_token_secret_hex: &str,
 ) -> String {
     // Minimal pod: SA token mount (auth) + weft labels (routing /
     // cleanup). No security context, no resource limits. Tenant
     // workloads run with whatever defaults their namespace policy
     // allows; cross-tenant isolation comes from the namespace
     // boundary + NetworkPolicies, not from per-pod hardening.
+    let headless_svc = worker_headless_service_name();
+    let conn_port = WORKER_CONNECTION_PORT;
     format!(
         r#"apiVersion: v1
 kind: Pod
@@ -144,6 +215,16 @@ metadata:
     weft.dev/tenant: "{tenant}"
     weft.dev/project: "{project_label}"
 spec:
+  # `hostname` + `subdomain` + the per-project headless Service give this
+  # pod the stable DNS name
+  # `<pod-name>.{headless_svc}.<ns>.svc.cluster.local`, the address the
+  # gateway dynamic-resolves a live caller to (per-pod pinning without a
+  # Service per pod). BOTH `hostname` and `subdomain` are required: k8s
+  # only publishes the per-pod A record when `hostname` is set (with just
+  # `subdomain`, only the Service-level record resolves, and the per-pod
+  # name 404s/DNS-fails at the gateway). The pod name is a valid DNS label.
+  hostname: {pod_name}
+  subdomain: {headless_svc}
   serviceAccountName: weft-worker-sa
   automountServiceAccountToken: false
   # `Never`: a crashed container does NOT restart in-place. The
@@ -159,6 +240,9 @@ spec:
     - name: worker
       image: {image}
       imagePullPolicy: IfNotPresent
+      ports:
+        - name: caller
+          containerPort: {conn_port}
       env:
         - name: WEFT_PROJECT_ID
           value: "{project_label}"
@@ -176,6 +260,10 @@ spec:
               fieldPath: metadata.name
         - name: WEFT_TENANT_ID
           value: "{tenant}"
+        - name: WEFT_CONNECTION_PORT
+          value: "{conn_port}"
+        - name: WEFT_CALLER_TOKEN_SECRET
+          value: "{caller_token_secret_hex}"
       volumeMounts:
         - name: weft-sa-token
           mountPath: /var/run/weft/sa
@@ -205,7 +293,36 @@ mod tests {
             namespace: "wm-p1".into(),
             owner_dispatcher: "disp-0".into(),
             binary_hash: Some("abc123".into()),
+            caller_token_secret_hex: "deadbeef".into(),
         }
+    }
+
+    /// The rendered pod manifest exposes the connection port + the
+    /// subdomain (for per-pod DNS) + the token-secret env, and the
+    /// headless Service is rendered per project. Guards the wiring the
+    /// gateway relies on.
+    #[test]
+    fn manifest_wires_connection_server() {
+        let pod = render_pod_manifest(
+            "wp-1",
+            "wm-p1",
+            "img:tag",
+            &SafeLabel::new("p1", 63),
+            &SafeLabel::new("t1", 63),
+            "http://broker",
+            "disp-0",
+            "deadbeef",
+        );
+        assert!(pod.contains("containerPort: 9091"), "port exposed");
+        assert!(pod.contains("subdomain: weft-workers"), "pod DNS subdomain");
+        assert!(pod.contains("WEFT_CONNECTION_PORT"), "port env");
+        assert!(
+            pod.contains("WEFT_CALLER_TOKEN_SECRET") && pod.contains("deadbeef"),
+            "token secret env"
+        );
+        let svc = render_headless_service("wm-p1", &SafeLabel::new("p1", 63));
+        assert!(svc.contains("clusterIP: None"), "headless");
+        assert!(svc.contains("name: weft-workers"), "per-project service name");
     }
 
     /// Happy path: no waiting-reason seeded, the 5s watch window

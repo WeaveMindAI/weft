@@ -220,36 +220,37 @@ Three primitives let a node body interact with the outside world in a
 way that survives the worker dying and a fresh worker resuming
 hours or days later.
 
-### `ctx.register_signal(spec)`
+### `ctx.register_signal(kind)`
 
 For trigger nodes during `Phase::TriggerSetup`. Tells the listener to
-watch for a wake signal (Webhook URL, cron schedule, SSE subscription,
-form). Synchronous: returns the user-facing URL (if the kind mints
-one) and the worker keeps executing. Each external fire later spawns
-a fresh execution of the project. This signal is NOT bound to the
-current execution's firing.
+watch for a wake signal. You pass a **typed signal kind** (one of the
+structs in `weft_core::signal`, see the kinds table below), not an
+untyped spec; the framework projects it onto the wire shape. Returns
+`()` once the dispatcher acknowledges. Each external fire later spawns
+a fresh execution of the project; this registration is NOT bound to the
+current execution's firing. Any public URL is derived from the signal's
+path on the dispatcher, so nodes don't get a URL handed back.
 
 ```rust
+use weft_core::signal::{ApiEndpoint, LiveConnectionConfig};
+
 async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
     match ctx.phase {
         Phase::TriggerSetup => {
-            let url = ctx.register_signal(WakeSignalSpec {
-                kind: WakeSignalKind::Webhook { path: "".into(), auth: WebhookAuth::None },
-                is_resume: false,
-                consumer_kind: None,
-                live_rendering: false,
-            }).await?;
-            // url is Some("https://dispatcher/.../signal/<token>") for webhook;
-            // None for kinds that don't expose a URL (Timer, SSE).
-            ctx.pulse_downstream(NodeOutput::with("url", json!(url))).await
+            // Build the typed kind from the node's config fields, then
+            // register it. (The live-caller kinds share a config body
+            // built by `LiveConnectionConfig::from_node_fields`.)
+            let common = LiveConnectionConfig::from_node_fields(&ctx.config.values);
+            ctx.register_signal(ApiEndpoint { common }).await?;
+            ctx.pulse_downstream(NodeOutput::with("started", json!(true))).await
         }
         Phase::Fire => {
             // Run when an external fire arrives.
             // ctx.wake_payload() returns the wake event's data (the
-            // HTTP body for webhooks, the parsed SSE event JSON, the
-            // timer info, etc.). Returns None for non-trigger nodes
-            // and for trigger setup; trigger Fire bodies that REQUIRE
-            // a payload should `ok_or_else` with a clear error.
+            // parsed SSE event JSON, the poll body, the timer info,
+            // etc.). Returns None for non-trigger nodes and for trigger
+            // setup; trigger Fire bodies that REQUIRE a payload should
+            // `ok_or_else` with a clear error.
             ...
         }
         _ => Ok(()),
@@ -257,30 +258,83 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
 }
 ```
 
-### `ctx.await_signal(spec)`
+A simpler kind takes its fields directly:
+
+```rust
+use weft_core::signal::SseSubscribe;
+
+ctx.register_signal(SseSubscribe {
+    url: events_url,
+    event_name: "message.received".into(),
+}).await?;
+```
+
+### Wake-signal kinds
+
+Each kind is a struct in `weft_core::signal`. A node constructs one and
+passes it to `register_signal` (entry trigger) or `await_signal`
+(mid-flow resume).
+
+The two FAMILIES below answer two different questions and never share a
+name (the `socket` distinction is the trap: outbound "we dial them" vs
+inbound "they dial us").
+
+**Outbound event sources** (the listener reaches OUT to something and
+fires a fresh execution per event):
+
+| Kind | What it does | Use for |
+| --- | --- | --- |
+| `SseSubscribe { url, event_name }` | Holds a one-way Server-Sent-Events stream; fires per matching event. Receive-only. | A service that pushes an SSE feed (the WhatsApp bridge). |
+| `PollEndpoint { url, interval_secs }` | Hits a URL on a timer; fires with the response body. No held connection. | A "give me what's new" endpoint (a bot getUpdates loop). |
+| `SocketListen { url, handshake?, heartbeat?, heartbeat_secs }` | Holds a bidirectional WebSocket alive, sends an optional handshake on open and an optional heartbeat frame on a schedule; fires per inbound frame. | A gateway that needs login + keepalive or it drops you (Discord, Slack socket mode). The service-specific protocol (op-codes) is YOUR concern, expressed as the literal `handshake` / `heartbeat` frames. |
+
+**Inbound live-caller endpoints** (an outside caller dials IN and holds
+the connection; nodes talk back via `ctx.caller()`, see the live-caller
+section):
+
+| Kind | What it does | Use for |
+| --- | --- | --- |
+| `ApiEndpoint { common }` | An HTTP endpoint people call; a node replies once or streams a response. | A live HTTP API a program serves. |
+| `LiveSocket { common }` | An inbound WebSocket; a node holds a two-way conversation. | A live chat / interactive socket a program serves. |
+
+Both live-caller kinds share `LiveConnectionConfig` (the `common`
+field): build it from the node's config map with
+`LiveConnectionConfig::from_node_fields(&ctx.config.values)`. The wire
+protocol is the KIND, not a config field (the runtime derives it from
+the tag), which is why there is no `protocol:` knob to set.
+
+**Plus the always-present kinds**: `Timer { spec }` (cron / after / at)
+and `Form { .. }` (human-in-the-loop submission, used with
+`await_signal`).
+
+### `ctx.await_signal(kind)`
 
 For mid-flow waits (HumanQuery and similar). Parks THIS firing until
 the signal fires. Worker exits while parked; a fresh worker spawns
 when the fire arrives. Other firings of the same execution at
-different frame stacks keep going independently.
+different frame stacks keep going independently. Like `register_signal`,
+it takes a typed `Signal` kind.
 
 ```rust
+use weft_core::signal::Form;
+
 async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    let answer = ctx.await_signal(WakeSignalSpec {
-        kind: WakeSignalKind::Form {
-            form_type: "human-query".into(),
-            schema: my_form_schema(),
-            title: Some("Approve?".into()),
-            description: None,
-        },
-        is_resume: true,
+    let answer = ctx.await_signal(Form {
+        form_type: "human-query".into(),
+        schema: my_form_schema(),
+        title: Some("Approve?".into()),
+        description: None,
         consumer_kind: Some("human_in_the_loop".into()),
-        live_rendering: false,
     }).await?;
     // After the user submits, `answer` is the form payload.
     ctx.pulse_downstream(NodeOutput::with("answer", answer)).await
 }
 ```
+
+(The exact `Form` fields are in `weft_core::signal::Form`; the point is
+you pass the typed kind, not a wrapper spec. Whether a registration is a
+fresh entry or a resume is decided by which method you call,
+`register_signal` vs `await_signal`, not by a flag on the kind.)
 
 The body unwinds via `?` when the worker has no value yet. When the
 fire arrives, the next worker re-runs the body from the top; the
@@ -380,7 +434,7 @@ desyncing.
 
 | Author intent                                       | Primitive               |
 |-----------------------------------------------------|-------------------------|
-| Trigger node declaring a persistent webhook/cron    | `ctx.register_signal`   |
+| Trigger node declaring a persistent endpoint/cron/feed | `ctx.register_signal` |
 | Mid-flow wait for human input or external event     | `ctx.await_signal`      |
 | Non-deterministic / side-effecting work between awaits | `ctx.run`            |
 | Pure logic, branching, computing from journaled values | nothing, just write Rust |
@@ -395,6 +449,129 @@ that has a fire to deliver. The body re-runs from the top; each
 prior `await_signal` and `ctx.run` returns instantly from the
 journal.
 
+
+## Live caller connections: `ctx.caller()`
+
+The durable primitives above (`await_signal`) are a DISCONNECTED wait:
+the worker parks and dies. A live caller is the opposite world. When an
+outside caller hits an `ApiEndpoint` (HTTP) or `LiveSocket` (WebSocket)
+trigger, the dispatcher routes the held connection to one worker and the
+worker stays alive on the open socket for the life of the request or
+session. Any node downstream of the trigger can talk back to that caller
+over the held connection. This is NOT durable: the connection is pinned
+to the one worker and dies with it.
+
+### Gating and the handle
+
+A node downstream of a live trigger reaches the caller via `ctx`:
+
+- `ctx.is_api_call()` / `ctx.is_websocket()`: status reads. A node may
+  branch three ways (http / websocket / neither), so these are two
+  separate queries, never one enum. A node that REQUIRES a caller fails
+  loud when neither is true.
+- `ctx.caller() -> Option<CallerHandle>`: the protocol-typed handle, or
+  `None` on a run with no live caller. `CallerHandle` is an enum over the
+  two protocol shapes, so the type is honest about what each can do.
+- `ctx.caller_data_type()`: the declared inbound/outbound shape (JSON /
+  Text / Bytes) so a node can branch on what it sends.
+
+The talk methods are protocol-specific:
+
+- **HTTP** (`CallerHandle::Http(http)`): `request_parts()` (the inbound
+  request), `write(chunk)` (stream a chunk), `respond(body)` (send the
+  final body), `close()`. Respond/close are terminal: first one wins,
+  a second errors loud.
+- **WebSocket** (`CallerHandle::Websocket(ws)`): `send(chunk)`,
+  `recv_next()` (next inbound message, or `None` when the stream ends),
+  `receive()` (the typed-error form of the same read), `request(chunk)`
+  (send then await one reply), `close()`. A read is UNBOUNDED: a node may
+  wait minutes or hours for the caller's next message; only a disconnect or
+  the trigger's session cap ends the wait.
+- Both share `is_connected()` and one `ensure_connected().await?`
+  barrier (wait for the caller's socket to actually attach before
+  talking).
+
+Inbound on a WebSocket is BROADCAST and **forward-only by default**, the
+same model as the bus:
+
+- `ws.receive()` reads messages that arrive AFTER you got the handle, not
+  prior history. The position is pinned when you obtain the handle (no
+  missed-message race between attach and your first read).
+- Every reader has its OWN position, so two nodes both see every message
+  (neither steals from the other), a responder and an observer can run off
+  the same socket.
+- To read earlier messages, mint a positioned **cursor** (same concept as
+  the bus): `ws.cursor_from_start()` (everything still retained in RAM),
+  `ws.cursor_at(offset)`, or `ws.cursor_including_last()` (forward plus the
+  single most recent message, e.g. to grab the latest state on a late
+  join). Ask `ws.now_offset()` / `ws.retained_floor()` to position
+  relative to now. Offsets are ABSOLUTE over the connection's whole life
+  (never relative to the sliding window), so a saved offset always names
+  the same message even as the window moves.
+- For the common loop, use `recv_next()`: it yields `Some(msg)` for each
+  message and `Ok(None)` when the stream ends (caller gone, session capped,
+  fell behind), so you write `while let Some(msg) = ws.recv_next().await? {}`
+  and the language does the end-of-stream classification for you. A real
+  failure (wrong protocol, transport) propagates via `?`.
+- If you need the exact outcome, `receive()` returns the TYPED
+  `CallerError` so you can `match` every case. A cursor only ever reads the
+  in-RAM window, never the DB; if your cursor's offset has been trimmed out
+  of the window you get `CallerError::FellBehind { oldest_resident }` (NOT a
+  silent substitution): the cursor is MOVED to `oldest_resident` (the
+  earliest message still retained), so your next read resumes there. One
+  field, because the inbound log is dense, the resume point and the window
+  floor are the same. (The bus's `FellBehind` carries a second `resumed_at`
+  because its log is sparse and can resume past the floor; the caller never
+  can.) The built-in forward cursor cannot hit this in normal use (it stays
+  ahead of the window).
+
+### Pattern: a WebSocket conversation
+
+```rust
+use weft_core::caller::{CallerHandle, InboundMessage, OutboundChunk};
+
+async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    if !ctx.is_websocket() {
+        return Err(WeftError::NodeExecution(
+            "wire this under a LiveSocket trigger".into()));
+    }
+    let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
+        return Err(WeftError::NodeExecution("no WebSocket caller".into()));
+    };
+    ws.ensure_connected().await?;
+    // recv_next() yields each message, or None when the stream ends (caller
+    // gone, session capped, fell behind). A real failure propagates via `?`.
+    while let Some(msg) = ws.recv_next().await? {
+        let v = match msg {
+            InboundMessage::Json(v) => v,
+            InboundMessage::Text(s) => Value::String(s),
+            InboundMessage::Bytes(b) => json!({ "bytes": b.len() }),
+        };
+        ws.send(OutboundChunk::Json(json!({ "echo": v }))).await?;
+    }
+    let _ = ws.close().await;
+    ctx.pulse_downstream(NodeOutput::with("done", json!(true))).await
+}
+```
+
+The HTTP shape is the same idea with `respond`/`write` instead of
+`send`/`receive`. Working examples: `catalog/live/http_responder`,
+`catalog/live/ws_echo`, `catalog/live/ws_listener`.
+
+### Lifetime: caller-tied vs survives
+
+The `canSuspend` field on the trigger is the single lifetime axis (it
+seeds `LiveConnectionConfig`):
+
+- **off (default)**: the run is tied to the caller. A node that hits a
+  durable `await_signal` holds the worker briefly then the run is killed;
+  a caller disconnect cancels the run. This is the interactive default.
+- **on**: the run may suspend and resume later without the caller (it
+  becomes a background job); a disconnect does not kill it, and further
+  sends go into the void.
+
+A disconnect's meaning is derived purely from this one axis, there is no
+separate disconnect setting to contradict it.
 
 ## Infra nodes: long-running backing services
 
@@ -457,10 +634,7 @@ async fn provision(&self, _ctx: InfraProvisionContext, _input: NodeInput)
 
 ### The `InfraSpec` reference
 
-Everything reachable from `InfraSpec` (in `weft-core/src/infra/types.rs`).
-Maps are `BTreeMap` (not `HashMap`) on purpose: the compiled spec is
-hashed for drift detection and HashMap iteration order would randomize
-the hash.
+The fields you fill in when you build an `InfraSpec`.
 
 **`InfraSpec`** (all fields default, so `InfraSpec::default()` is valid):
 - `units: Vec<Unit>`: pod templates. Most nodes have one.

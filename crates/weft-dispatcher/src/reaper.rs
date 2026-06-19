@@ -16,6 +16,7 @@ use crate::state::DispatcherState;
 pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(30), "worker_pod", sweep_worker_pods);
     spawn_loop(state.clone(), Duration::from_secs(30), "worker_pod_gc", sweep_terminal_worker_pods);
+    spawn_loop(state.clone(), Duration::from_secs(15), "orphaned_tasks", sweep_orphaned_tasks);
     spawn_loop(state.clone(), Duration::from_secs(3600), "tasks", sweep_tasks);
     spawn_loop(state.clone(), Duration::from_secs(10), "listener", sweep_listeners);
     spawn_loop(state.clone(), Duration::from_secs(60), "supervisor", sweep_supervisors);
@@ -101,18 +102,75 @@ async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
                 "kill_pod failed for stale worker; pod may survive in k8s until next sweep"
             );
         }
-        // Re-claim any tasks the dead Pod was holding so another
-        // Pod (or the cold-start trigger) can pick them up. MUST
-        // succeed: a silent failure here leaves tasks claimed by a
-        // dead pod forever, never picked up.
-        sqlx::query(
-            r#"UPDATE task SET status = 'pending', claimed_by = NULL,
-                   claimed_until_unix = NULL
-               WHERE claimed_by = $1 AND status = 'claimed'"#,
+        // NOTE: this loop only marks the pod dead + deletes the k8s Pod.
+        // Recovering the pod's stranded tasks is NOT done here (a pod is
+        // marked dead from several places, and a marked-dead pod is never
+        // re-listed by `list_stale`, so doing recovery here would run at most
+        // once and strand anything that failed). Task recovery is its own
+        // self-healing, task-driven sweep: `sweep_orphaned_tasks`.
+    }
+    Ok(())
+}
+
+/// Self-healing recovery of tasks stranded on a non-routable worker pod. Runs
+/// on a timer, INDEPENDENT of how a pod became dead (stale heartbeat, stale-
+/// image replacement, crash). A live-execute task pinned to a dead pod cannot
+/// re-run (its caller was gateway-routed to that exact pod), so its execution
+/// is terminally cancelled; every other stranded task is requeued. The task
+/// row is the durable retry handle: anything not fully recovered this tick is
+/// re-found next tick. See `tasks::reclaim_orphaned_tasks`.
+async fn sweep_orphaned_tasks(state: DispatcherState) -> anyhow::Result<()> {
+    let orphans = weft_task_store::tasks::reclaim_orphaned_tasks(&state.pg_pool).await?;
+    for orphan in orphans {
+        let Ok(color) = orphan.color.parse::<weft_core::Color>() else {
+            // Corrupt color: leave the task as evidence, surface loud.
+            tracing::error!(
+                target: "weft_dispatcher::reaper",
+                color = %orphan.color, task = %orphan.task_id,
+                "orphaned live execution has an unparseable color; leaving its task for inspection"
+            );
+            continue;
+        };
+        // Record the cancel through the canonical GUARDED writer, THEN delete
+        // the task. `journal_cancel_terminals` (a) SKIPS if a terminal already
+        // exists for the color, which closes the race where the worker wrote
+        // `ExecutionCompleted`/`Failed` and then the pod died before its task
+        // flipped to `complete` (a bare `ExecutionCancelled` would stack a
+        // second, contradictory terminal); and (b) writes `NodeCancelled` per
+        // still-running node so node UI state is not left stuck on "running".
+        // The task row is the durable retry handle: on failure we `continue`
+        // WITHOUT deleting, so the next tick re-finds this orphan and retries
+        // (the writer is idempotent). A per-orphan failure never strands the
+        // others. The write uses NULL pod_name, bypassing the fencing trigger.
+        if let Err(e) = crate::api::execution::journal_cancel_terminals(
+            &state,
+            color,
+            "worker pod died before the live execution completed; the caller connection was \
+             routed to that pod and is gone, so the run cannot resume elsewhere",
         )
-        .bind(&row.pod_name)
-        .execute(&state.pg_pool)
-        .await?;
+        .await
+        {
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                color = %color, error = %e,
+                "failed to record cancel terminal for orphan; task kept, will retry next tick"
+            );
+            continue;
+        }
+        tracing::warn!(
+            target: "weft_dispatcher::reaper",
+            color = %color,
+            "live execution orphaned by a dead pod; recorded ExecutionCancelled (caller is gone)"
+        );
+        if let Err(e) = weft_task_store::tasks::delete_task(&state.pg_pool, orphan.task_id).await {
+            // The cancel is durably recorded, so a leftover task only means a
+            // harmless retry next tick (re-record is a no-op).
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                color = %color, error = %e,
+                "failed to delete cancelled orphan task; harmless, next tick retries"
+            );
+        }
     }
     Ok(())
 }

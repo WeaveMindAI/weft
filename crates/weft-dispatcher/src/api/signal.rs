@@ -10,6 +10,7 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::Response,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -1003,6 +1004,41 @@ pub async fn fire_public_entry(
     apply_lifecycle_gate(&state, &token, &routing, payload).await
 }
 
+/// How the dispatcher points a live caller at the worker, decided purely
+/// from the protocol. The two protocol-specific edges of the otherwise
+/// shared live-connection machinery:
+///   - HTTP: a `307` redirect to the gateway URL (the client follows it
+///     invisibly, preserving method + body; one call from the caller's
+///     code).
+///   - WebSocket: a `200` with the gateway WS URL + token in the body
+///     (WS cannot be redirected; the client reads the URL then opens the
+///     real WebSocket to it).
+/// Pure: maps (protocol, gateway_url) to the response form. Unit tested
+/// without a router or socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HandshakeResponse {
+    /// `307 Temporary Redirect` with this `Location`.
+    Redirect { location: String },
+    /// `200 OK` with this JSON body (`{ "url": ..., "protocol": "websocket" }`).
+    ReturnUrl { url: String },
+}
+
+/// Decide the caller-pointing response. `gateway_url` already carries the
+/// routing token (the dispatcher built it after minting the token), so
+/// this step only chooses the HTTP shape per protocol.
+pub(crate) fn handshake_response(
+    protocol: weft_core::signal::Protocol,
+    gateway_url: String,
+) -> HandshakeResponse {
+    match protocol {
+        weft_core::signal::Protocol::Http => HandshakeResponse::Redirect {
+            location: gateway_url,
+        },
+        weft_core::signal::Protocol::Websocket => HandshakeResponse::ReturnUrl { url: gateway_url },
+    }
+}
+
+
 /// Apply the configured auth gate to the request. Returns Ok(())
 /// on pass, Err with appropriate status on fail. Generic in
 /// `auth_kind`; new schemes add a branch here.
@@ -1076,6 +1112,500 @@ fn ct_eq(a: &str, b: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+// ----- Live caller connection handshake ------------------------------
+
+/// How long the handshake waits for a freshly-spawned worker pod to come
+/// alive before giving the caller a "retry shortly" error. Worker spawn +
+/// register is normally a few seconds.
+const LIVE_SPAWN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const LIVE_SPAWN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long the handshake waits for the chosen pod's per-pod cluster DNS
+/// record to become resolvable before failing the connection. A pod can be
+/// DB-alive and Ready a beat before its `<pod>.weft-workers.<ns>.svc` record
+/// has propagated (EndpointSlice -> CoreDNS); handing the caller a URL the
+/// gateway cannot yet resolve produces a 503 "no healthy upstream". We gate
+/// on the SAME resolver the gateway uses (cluster CoreDNS), so once the
+/// dispatcher resolves it, the gateway's next attempt does too. This is an
+/// internal service-to-service wait the caller cannot influence, so a bounded
+/// deadline is correct (a hang here is a cluster bug, not user-controlled).
+const LIVE_DNS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const LIVE_DNS_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Routing-token lifetime. Generous: it only needs to survive the caller
+/// following the redirect / opening the socket, but a slow client (mobile,
+/// cold DNS) should not race it. The connection, once attached, is not
+/// re-validated against the token's expiry.
+const LIVE_TOKEN_TTL_SECS: i64 = 120;
+
+/// `GET|POST /connect/{*path}`: the live caller connection control
+/// handshake. Authenticates the caller, ensures a worker pod is up and
+/// routable, starts a fresh execution pinned to that pod, mints a signed
+/// routing token, and points the caller at the gateway URL for the pod
+/// (HTTP: a `307` redirect; WebSocket: a `200` with the URL in the body).
+/// The dispatcher is NEVER in the byte path; the caller's actual traffic
+/// flows caller -> gateway -> worker.
+pub async fn connect_live(
+    State(state): State<DispatcherState>,
+    headers: HeaderMap,
+    Path(mount_path): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    if state.caller_token_secret.is_empty() || state.gateway_base_url.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "live caller connections are not provisioned on this dispatcher \
+             (WEFT_CALLER_TOKEN_SECRET / WEFT_GATEWAY_BASE_URL unset)"
+                .into(),
+        ));
+    }
+    let normalized = if mount_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", mount_path)
+    };
+
+    // Resolve the live_connection signal row (kind + config + the trigger
+    // node + project), with auth fields for the gate.
+    let row = sqlx::query(
+        "SELECT s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
+                COALESCE(p.status, 'inactive') AS status \
+         FROM signal s \
+         LEFT JOIN project p ON p.id::text = s.project_id \
+         WHERE s.mount_path = $1",
+    )
+    .bind(&normalized)
+    .fetch_optional(&state.pg_pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mount lookup: {e}")))?
+    .ok_or((StatusCode::NOT_FOUND, "no live endpoint at this path".into()))?;
+
+    let project_id: String = row.try_get("project_id").map_err(row_err)?;
+    let node_id: String = row.try_get("node_id").map_err(row_err)?;
+    let spec_json: String = row.try_get("spec_json").map_err(row_err)?;
+    let status_str: String = row.try_get("status").map_err(row_err)?;
+    let auth_kind: String = row.try_get("auth_kind").map_err(row_err)?;
+    let auth_config: Option<Value> = row.try_get("auth_config").map_err(row_err)?;
+
+    // The signal spec carries the kind tag + the live-caller config. The
+    // protocol is the kind itself (ApiEndpoint -> Http, LiveSocket -> Ws),
+    // recovered from the tag; a non-live-caller tag at this route is a bug.
+    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&spec_json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec parse: {e}")))?;
+    let protocol = weft_core::signal::protocol_for_tag(&spec.kind).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("endpoint at '{normalized}' is not a live connection ({})", spec.kind),
+        )
+    })?;
+    // Validate the config body parses (fail loud on a malformed row); the
+    // body itself travels to the worker verbatim in `spec.config`.
+    serde_json::from_value::<weft_core::signal::LiveConnectionConfig>(spec.config.clone())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live config parse: {e}")))?;
+
+    // Auth gate (reuse the shared gate; same as fire_public_entry).
+    apply_auth_gate(&auth_kind, auth_config.as_ref(), &headers)?;
+
+    // Project must be Active to accept a live connection.
+    let project_uuid: uuid::Uuid = project_id
+        .parse()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bad project id: {e}")))?;
+    if crate::project_store::project_status_from_str(&status_str)
+        .map(|s| s != crate::project_store::ProjectStatus::Active)
+        .unwrap_or(true)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project is not active; cannot accept a live connection".into(),
+        ));
+    }
+
+    // Ensure at least one worker pod is up for the project (spawn + wait if
+    // none); this does NOT admit a slot, it only guarantees a routable pod
+    // exists. Admission happens atomically below as the execute-task insert.
+    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    ensure_live_worker(&state, &project_id, tenant.as_str()).await?;
+
+    // Prepare + ATOMICALLY admit the execution. `prepare_live_execution`
+    // journals ExecutionStarted/kicks and then calls `admit_live_execution`,
+    // which (in one transaction, under a per-project lock) picks the least-
+    // loaded under-cap pod and INSERTS the pinned execute task on it: admission
+    // IS the task insert, so there is no separate slot counter to drift and no
+    // admit/insert window. It returns the chosen pod, or signals "all full" so
+    // we spawn another and retry.
+    let color = uuid::Uuid::new_v4();
+    let pod = match prepare_live_execution(
+        &state,
+        &project_id,
+        project_uuid,
+        &node_id,
+        &spec,
+        tenant.as_str(),
+        color,
+    )
+    .await
+    {
+        Ok(pod) => pod,
+        Err(e) => {
+            cleanup_failed_live_setup(&state, color).await;
+            return Err(e);
+        }
+    };
+
+    // Do not hand the caller a URL the gateway cannot route yet: the pod is
+    // admitted and DB-alive, but its per-pod DNS record may not have
+    // propagated. Wait until the record resolves (through the same cluster
+    // resolver the gateway uses); on failure clean up exactly like a prepare
+    // failure, since ExecutionStarted is already journaled and the task is
+    // already admitted.
+    if let Err(e) = wait_for_pod_dns(&pod.pod_name, &pod.namespace).await {
+        cleanup_failed_live_setup(&state, color).await;
+        return Err(e);
+    }
+
+    // Mint the signed routing token (pins to the chosen pod) and build the
+    // per-pod gateway URL. The pod subdomain is `<pod>.<ns>` prepended to
+    // the gateway host.
+    let token = weft_core::caller_token::mint(
+        &state.caller_token_secret,
+        color,
+        &project_id,
+        &pod.pod_name,
+        crate::lease::now_unix() + LIVE_TOKEN_TTL_SECS,
+    );
+    let url = build_pod_gateway_url(
+        &state.gateway_base_url,
+        &pod.pod_name,
+        &pod.namespace,
+        &mount_path,
+        &token,
+    );
+
+    // Point the caller at the worker per protocol.
+    Ok(match handshake_response(protocol, url) {
+        HandshakeResponse::Redirect { location } => Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(axum::http::header::LOCATION, location)
+            .body(axum::body::Body::empty())
+            .expect("redirect response builds"),
+        HandshakeResponse::ReturnUrl { url } => {
+            let body = serde_json::json!({ "url": url, "protocol": "websocket" });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("json response builds")
+        }
+    })
+}
+
+/// Resolve the project definition, journal `ExecutionStarted` + the trigger
+/// kicks, then ATOMICALLY admit the execution by inserting the pinned execute
+/// task on the least-loaded under-cap pod (`admit_live_execution`). Returns
+/// the chosen pod. If every pod is at the cap, spawns another and retries the
+/// admit (bounded). The caller cleans up on `Err` (delete the pending task +
+/// record a terminal); since admission IS the task insert, there is no slot
+/// counter to release.
+async fn prepare_live_execution(
+    state: &DispatcherState,
+    project_id: &str,
+    project_uuid: uuid::Uuid,
+    node_id: &str,
+    spec: &weft_core::primitive::SignalSpec,
+    tenant: &str,
+    color: uuid::Uuid,
+) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
+    let definition_hash = state
+        .projects
+        .running_definition_hash(project_uuid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("hash lookup: {e}")))?
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "project has no definition_hash".into()))?;
+    let project_json = state
+        .projects
+        .definition_for_hash(project_uuid, &definition_hash)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def lookup: {e}")))?
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no definition for hash".into()))?;
+    let project_def: weft_core::ProjectDefinition = serde_json::from_str(&project_json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def parse: {e}")))?;
+
+    let kicks = crate::api::project::compute_trigger_kicks(&project_def, node_id, &Value::Null);
+    if kicks.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("live trigger '{node_id}' has nothing downstream to run"),
+        ));
+    }
+
+    let now = crate::lease::now_unix() as u64;
+    state
+        .journal
+        .record_event(&weft_journal::ExecEvent::ExecutionStarted {
+            color,
+            project_id: project_id.to_string(),
+            entry_node: node_id.to_string(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: definition_hash.clone(),
+            at_unix: now,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal start: {e}")))?;
+    for kick in &kicks {
+        state
+            .journal
+            .record_event(&weft_journal::ExecEvent::NodeKicked {
+                color,
+                node_id: kick.node_id.clone(),
+                payload: kick.payload.clone(),
+                at_unix: now,
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal kick: {e}")))?;
+    }
+    let spec_json = serde_json::to_value(spec)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec serialize: {e}")))?;
+
+    // Atomic admit-by-insert; if all pods are at the cap, spawn another and
+    // retry (bounded). The first attempt usually wins (ensure_live_worker
+    // already guaranteed a pod exists).
+    let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
+    loop {
+        if let Some(pod) = crate::task_kinds::execute::admit_live_execution(
+            &state.pg_pool,
+            project_id,
+            color,
+            &definition_hash,
+            Some(tenant),
+            spec_json.clone(),
+            LIVE_CAP,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("admit live exec: {e}")))?
+        {
+            return Ok(pod);
+        }
+        // Every pod is at the cap: spawn another and retry.
+        spawn_worker_pod(state, project_id, tenant).await?;
+        if std::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "all worker pods are at the live-connection cap and none freed up; retry shortly"
+                    .into(),
+            ));
+        }
+        tokio::time::sleep(LIVE_SPAWN_POLL).await;
+    }
+}
+
+fn row_err(e: sqlx::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}"))
+}
+
+/// Build the per-pod gateway URL: `<pod>` as the leftmost host label (a
+/// single-label `*.` wildcard listener matches it; pod names are DNS-clean
+/// with single hyphens only), and the `<namespace>` as the FIRST PATH
+/// SEGMENT (NOT the host: the project namespace contains `--` and
+/// Envoy/Gateway-API reject host labels with consecutive hyphens). The
+/// gateway's Lua rewrite reads pod from the host + namespace from the path
+/// and forwards to the pod's internal DNS with the namespace segment
+/// stripped. The signed token rides the `wct` query param. `gateway_base`
+/// is `<scheme>://<host>[:port]`.
+// SYNC: pod-in-host + ns-in-first-path-segment <-> deploy/k8s/gateway.yaml (Lua host/path rewrite)
+pub(crate) fn build_pod_gateway_url(
+    gateway_base: &str,
+    pod_name: &str,
+    namespace: &str,
+    mount_path: &str,
+    token: &str,
+) -> String {
+    // Split scheme from host so we can inject the pod label in front of
+    // the host authority.
+    let (scheme, host_port) = match gateway_base.split_once("://") {
+        Some((s, rest)) => (s, rest),
+        None => ("https", gateway_base),
+    };
+    let host_port = host_port.trim_end_matches('/');
+    let path = mount_path.trim_start_matches('/');
+    format!("{scheme}://{pod_name}.{host_port}/{namespace}/{path}?wct={token}")
+}
+
+/// Per-pod live-connection cap: how many held connections one pod multiplexes
+/// before the dispatcher fans out to (or spawns) another. A pod's load is the
+/// count of in-flight live-execute tasks pinned to it (the task row IS the
+/// slot). `0` would mean no cap; this default is a sane multiplexing ceiling.
+const LIVE_CAP: i32 = 256;
+
+/// Ensure at least one worker pod is alive/spawning for the project, spawning
+/// one and waiting (bounded) if none exist. Does NOT admit a connection; it
+/// only guarantees a routable pod exists so the atomic admit
+/// (`admit_live_execution`) has a candidate. Admission itself (which pod, cap
+/// enforcement) is the task insert, done by the caller.
+async fn ensure_live_worker(
+    state: &DispatcherState,
+    project_id: &str,
+    tenant: &str,
+) -> Result<(), (StatusCode, String)> {
+    if weft_task_store::worker_pod::has_live_for_project(&state.pg_pool, project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
+    {
+        return Ok(());
+    }
+    // None alive: spawn one and wait for it.
+    spawn_worker_pod(state, project_id, tenant).await?;
+    let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
+    loop {
+        tokio::time::sleep(LIVE_SPAWN_POLL).await;
+        if weft_task_store::worker_pod::has_live_for_project(&state.pg_pool, project_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no worker pod became available for the live connection; retry shortly".into(),
+            ));
+        }
+    }
+}
+
+/// Enqueue a `spawn_pod` task for the project (deduped on `{project}:spawn`).
+/// Enqueued DIRECTLY rather than via `cold_start::spawn`, whose scan only
+/// fires for projects with a pending WORKER TASK: on the live path the first
+/// execute task is only inserted at admission (after a pod exists), so relying
+/// on cold_start would deadlock (no pod -> no task -> no pod). The dedup key
+/// collapses concurrent callers (and a later cold_start tick) onto one spawn.
+async fn spawn_worker_pod(
+    state: &DispatcherState,
+    project_id: &str,
+    tenant: &str,
+) -> Result<(), (StatusCode, String)> {
+    let namespace = state
+        .projects
+        .project_namespace(project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("namespace lookup: {e}")))?
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project namespace not found; project may be unregistered".into(),
+        ))?;
+    weft_task_store::tasks::enqueue_dedup(
+        &state.pg_pool,
+        weft_task_store::tasks::NewTask {
+            kind: weft_task_store::TaskKind::SpawnPod,
+            target: weft_task_store::tasks::TaskTarget::Dispatcher,
+            project_id: Some(project_id.to_string()),
+            dedup_key: Some(format!("{project_id}:spawn")),
+            color: None,
+            tenant_id: Some(tenant.to_string()),
+            target_pod_name: None,
+            payload: serde_json::to_value(weft_task_store::SpawnPodPayload {
+                project_id: project_id.to_string(),
+                tenant: tenant.to_string(),
+                namespace,
+                owner_dispatcher: state.pod_id.as_str().to_string(),
+            })
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn payload: {e}")))?,
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue spawn_pod: {e}")))?;
+    Ok(())
+}
+
+/// Clean up after a live-connection setup that failed AFTER
+/// `prepare_live_execution` journaled `ExecutionStarted` and admitted the
+/// pinned execute task. Delete the still-pending execute task (the task row IS
+/// the slot, so deleting it frees the slot) and learn who, if anyone, will run
+/// this color. Then journal the cancel terminal ONLY if no worker will run it,
+/// routed through the canonical guarded writer (`journal_cancel_terminals`
+/// skips if a terminal already exists). If a worker CLAIMED the task in the
+/// commit-but-Err race, it owns the run AND its own terminal, so we record
+/// nothing (recording a cancel would stack a second, contradictory terminal on
+/// a color the worker is finishing). Shared by every post-admission failure
+/// path in `connect_live` (prepare error, DNS wait timeout).
+async fn cleanup_failed_live_setup(state: &DispatcherState, color: uuid::Uuid) {
+    use weft_task_store::tasks::SetupFailureOutcome;
+    match weft_task_store::tasks::delete_pending_live_execution(&state.pg_pool, &color.to_string())
+        .await
+    {
+        Ok(SetupFailureOutcome::NoWorkerWillRun) => {
+            if let Err(ce) = crate::api::execution::journal_cancel_terminals(
+                state,
+                color,
+                "live-connection setup failed; no worker run was created",
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "weft_dispatcher::signal",
+                    color = %color, error = %ce,
+                    "failed to journal cancel terminal for a failed live setup"
+                );
+            }
+        }
+        // A worker owns the run and its own terminal: nothing to do.
+        Ok(SetupFailureOutcome::WorkerOwnsIt) => {}
+        Err(de) => tracing::warn!(
+            target: "weft_dispatcher::signal",
+            color = %color, error = %de,
+            "failed to clean up a failed live setup; the orphan sweep reconciles if a \
+             task was left on a dead pod"
+        ),
+    }
+}
+
+/// Per-pod connection FQDN the gateway dynamic-resolves a live caller to:
+/// `<pod>.weft-workers.<ns>.svc.cluster.local:<port>`. Built from the SAME
+/// pieces the gateway's host-rewrite Lua composes (headless Service name +
+/// worker connection port), so the dispatcher resolves exactly what the
+/// gateway will. SYNC with the Lua in `deploy/k8s/gateway.yaml`.
+fn pod_connection_fqdn(pod_name: &str, namespace: &str) -> String {
+    format!(
+        "{pod}.{svc}.{ns}.svc.cluster.local:{port}",
+        pod = pod_name,
+        svc = crate::backend::k8s_worker::worker_headless_service_name(),
+        ns = namespace,
+        port = crate::backend::k8s_worker::WORKER_CONNECTION_PORT,
+    )
+}
+
+/// Block until the chosen pod's per-pod cluster DNS record resolves, so we
+/// never hand the caller a URL the gateway cannot route yet. A pod can be
+/// DB-alive a beat before its A-record has propagated (EndpointSlice ->
+/// CoreDNS); if the caller connects in that gap the gateway resolver gets
+/// NXDOMAIN and (absent the short failure-refresh on the BackendTrafficPolicy)
+/// negative-caches it into a multi-second 503. We resolve through the cluster
+/// resolver (CoreDNS, the same one the gateway uses), so a success here means
+/// the record is live for the gateway too. Bounded by `LIVE_DNS_WAIT`: this
+/// is an internal wait the caller cannot influence, so a hang is a cluster
+/// bug, not legitimate long-running user work.
+async fn wait_for_pod_dns(pod_name: &str, namespace: &str) -> Result<(), (StatusCode, String)> {
+    let host = pod_connection_fqdn(pod_name, namespace);
+    let deadline = std::time::Instant::now() + LIVE_DNS_WAIT;
+    loop {
+        // A successful lookup yielding at least one address means the record
+        // is live; zero addresses or NXDOMAIN means it has not propagated yet.
+        if let Ok(mut addrs) = tokio::net::lookup_host(&host).await {
+            if addrs.next().is_some() {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "worker pod DNS '{host}' did not become resolvable within \
+                     {}s; the pod is up but its cluster DNS record has not \
+                     propagated. Retry the connection shortly.",
+                    LIVE_DNS_WAIT.as_secs()
+                ),
+            ));
+        }
+        tokio::time::sleep(LIVE_DNS_POLL).await;
+    }
 }
 
 /// Inspector proxy: read the listener's per-signal display info.
@@ -1319,3 +1849,65 @@ mod public_url_tests {
 }
 
 
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use weft_core::signal::Protocol;
+
+    #[test]
+    fn http_points_via_redirect() {
+        let r = handshake_response(Protocol::Http, "https://gw/chat?wct=t".into());
+        assert_eq!(
+            r,
+            HandshakeResponse::Redirect { location: "https://gw/chat?wct=t".into() }
+        );
+    }
+
+    #[test]
+    fn websocket_points_via_return_url() {
+        let r = handshake_response(Protocol::Websocket, "wss://gw/chat?wct=t".into());
+        assert_eq!(
+            r,
+            HandshakeResponse::ReturnUrl { url: "wss://gw/chat?wct=t".into() }
+        );
+    }
+}
+
+#[cfg(test)]
+mod connect_url_tests {
+    use super::build_pod_gateway_url;
+
+    #[test]
+    fn builds_per_pod_subdomain_url_with_token() {
+        let url = build_pod_gateway_url(
+            "http://127-0-0-1.nip.io:9097",
+            "wp-abc",
+            "wm-project-t--p",
+            "chat",
+            "v1.aaa.bbb",
+        );
+        assert_eq!(
+            url,
+            "http://wp-abc.127-0-0-1.nip.io:9097/wm-project-t--p/chat?wct=v1.aaa.bbb"
+        );
+    }
+
+    #[test]
+    fn https_and_empty_path() {
+        let url = build_pod_gateway_url(
+            "https://live.example.com",
+            "wp-1",
+            "ns1",
+            "",
+            "tok",
+        );
+        assert_eq!(url, "https://wp-1.live.example.com/ns1/?wct=tok");
+    }
+
+    #[test]
+    fn defaults_scheme_when_missing() {
+        let url = build_pod_gateway_url("live.example.com", "p", "n", "x", "t");
+        assert_eq!(url, "https://p.live.example.com/n/x?wct=t");
+    }
+}

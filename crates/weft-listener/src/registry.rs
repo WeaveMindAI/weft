@@ -22,9 +22,9 @@ pub struct RegisteredSignal {
     /// Color of the suspended execution to resume. Set iff
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
     pub color: Option<String>,
-    /// Background task for kinds that run a loop (Timer, SSE).
+    /// Background task for kinds that run a loop (Timer, SseSubscribe).
     /// Dropping the handle via `.abort()` cancels the loop. `None`
-    /// for passive kinds (Webhook, Form).
+    /// for passive kinds (Form, live-caller).
     pub task: Option<Arc<TaskGuard>>,
     /// Routing+auth metadata computed by the kind impl at register
     /// time (or reconstructed from the durable row at rehydrate).

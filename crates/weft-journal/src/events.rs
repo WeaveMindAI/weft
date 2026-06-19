@@ -366,8 +366,8 @@ pub enum ExecEvent {
         /// shape used `Option<Value>` which silently conflated
         /// `Some(Value::Null)` (a journaled bus where the body
         /// legitimately sent `null`) with `None` (ephemeral; payload
-        /// not journaled). See `weft_core::primitive::BusPayload`.
-        payload: weft_core::primitive::BusPayload,
+        /// not journaled). See `weft_core::primitive::JournaledPayload`.
+        payload: weft_core::primitive::JournaledPayload,
         payload_byte_size: u64,
         #[serde(with = "weft_core::hex_array8")]
         payload_sha256_prefix: [u8; 8],
@@ -378,6 +378,70 @@ pub enum ExecEvent {
         color: Color,
         bus_id: String,
         offset: u64,
+        at_unix: u64,
+    },
+
+    // ----- Live caller connection (mirrors the Bus* family) ----------
+    //
+    // A live `live_connection` run holds ONE caller for the execution, so
+    // there is no `bus_id`: the color IS the connection's identity. The
+    // exchange is recorded as a replayable per-color event stream the
+    // graph view replays exactly like a bus. `offset` is the monotonic
+    // per-execution position in the caller stream. Message payloads reuse
+    // `JournaledPayload` (journaled = full value, ephemeral = metadata-only +
+    // sliding window) so a high-volume stream does not bloat the journal,
+    // identical to the bus's journaled-vs-ephemeral tradeoff.
+
+    /// The caller attached. The first event in any caller stream.
+    CallerConnected {
+        color: Color,
+        offset: u64,
+        /// `"http"` | `"websocket"` (the `Protocol` wire tag).
+        protocol: String,
+        at_unix: u64,
+    },
+
+    /// A message arrived FROM the caller (HTTP request body, WS inbound).
+    CallerInbound {
+        color: Color,
+        offset: u64,
+        payload: weft_core::primitive::JournaledPayload,
+        payload_byte_size: u64,
+        #[serde(with = "weft_core::hex_array8")]
+        payload_sha256_prefix: [u8; 8],
+        at_unix: u64,
+    },
+
+    /// A message went TO the caller (HTTP write/respond chunk, WS send).
+    /// `terminal` marks the final outbound (HTTP respond/close, WS close)
+    /// so the inspector renders "* the response completed here".
+    CallerOutbound {
+        color: Color,
+        offset: u64,
+        payload: weft_core::primitive::JournaledPayload,
+        payload_byte_size: u64,
+        #[serde(with = "weft_core::hex_array8")]
+        payload_sha256_prefix: [u8; 8],
+        terminal: bool,
+        at_unix: u64,
+    },
+
+    /// A node error surfaced to the caller (the `error_mode` path:
+    /// status/body before streaming, in-band error chunk after, WS close
+    /// frame). Recorded so the exchange replay shows where it broke.
+    CallerErrored {
+        color: Color,
+        offset: u64,
+        message: String,
+        at_unix: u64,
+    },
+
+    /// The caller is gone (response complete OR disconnected, the same
+    /// event from the run's view). Last event in the caller stream.
+    CallerDisconnected {
+        color: Color,
+        offset: u64,
+        reason: String,
         at_unix: u64,
     },
 }
@@ -445,7 +509,12 @@ impl ExecEvent {
             | Self::BusJoined { color, .. }
             | Self::BusLeft { color, .. }
             | Self::BusMessage { color, .. }
-            | Self::BusClosed { color, .. } => *color,
+            | Self::BusClosed { color, .. }
+            | Self::CallerConnected { color, .. }
+            | Self::CallerInbound { color, .. }
+            | Self::CallerOutbound { color, .. }
+            | Self::CallerErrored { color, .. }
+            | Self::CallerDisconnected { color, .. } => *color,
         }
     }
 
@@ -478,6 +547,11 @@ impl ExecEvent {
             Self::BusLeft { .. } => "bus_left",
             Self::BusMessage { .. } => "bus_message",
             Self::BusClosed { .. } => "bus_closed",
+            Self::CallerConnected { .. } => "caller_connected",
+            Self::CallerInbound { .. } => "caller_inbound",
+            Self::CallerOutbound { .. } => "caller_outbound",
+            Self::CallerErrored { .. } => "caller_errored",
+            Self::CallerDisconnected { .. } => "caller_disconnected",
         }
     }
 }
@@ -1070,6 +1144,12 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                     }
                 }
             }
+            // Observability-only events: they carry no state the resume
+            // fold needs. Bus replay and caller-exchange replay are read
+            // straight from the row stream by the inspector, not from the
+            // snapshot. Caller events are additionally non-durable by
+            // design (a live connection dies with its worker), so they
+            // never contribute to a resumed run's state.
             ExecEvent::CostReported { .. }
             | ExecEvent::LogLine { .. }
             | ExecEvent::ExecutionCompleted { .. }
@@ -1078,7 +1158,12 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
             | ExecEvent::BusJoined { .. }
             | ExecEvent::BusLeft { .. }
             | ExecEvent::BusMessage { .. }
-            | ExecEvent::BusClosed { .. } => {}
+            | ExecEvent::BusClosed { .. }
+            | ExecEvent::CallerConnected { .. }
+            | ExecEvent::CallerInbound { .. }
+            | ExecEvent::CallerOutbound { .. }
+            | ExecEvent::CallerErrored { .. }
+            | ExecEvent::CallerDisconnected { .. } => {}
         }
     }
 
@@ -2142,5 +2227,138 @@ mod fold_pulse_tests {
             }
             other => panic!("expected Await, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod caller_event_wire_tests {
+    use super::*;
+    use uuid::Uuid;
+    use weft_core::primitive::JournaledPayload;
+
+    fn color() -> Color {
+        Uuid::nil()
+    }
+
+    /// Every caller event round-trips through JSON unchanged. This is the
+    /// cross-process wire contract (worker writes the journal, dispatcher
+    /// folds and projects it); a renamed field would silently break
+    /// inspector replay.
+    fn round_trip(ev: ExecEvent) {
+        let json = serde_json::to_string(&ev).expect("serialize");
+        let back: ExecEvent = serde_json::from_str(&json).expect("deserialize");
+        // Compare via re-serialization (ExecEvent isn't PartialEq).
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::to_value(&back).unwrap(),
+            "round-trip changed the shape: {json}"
+        );
+    }
+
+    #[test]
+    fn connected_round_trips() {
+        round_trip(ExecEvent::CallerConnected {
+            color: color(),
+            offset: 0,
+            protocol: "websocket".into(),
+            at_unix: 7,
+        });
+    }
+
+    #[test]
+    fn inbound_journaled_and_ephemeral_round_trip() {
+        round_trip(ExecEvent::CallerInbound {
+            color: color(),
+            offset: 1,
+            payload: JournaledPayload::Journaled {
+                value: serde_json::json!({"q": "hi"}),
+            },
+            payload_byte_size: 10,
+            payload_sha256_prefix: [1, 2, 3, 4, 5, 6, 7, 8],
+            at_unix: 8,
+        });
+        // Ephemeral mode: metadata only, no value; must not collapse with
+        // a journaled null.
+        round_trip(ExecEvent::CallerInbound {
+            color: color(),
+            offset: 2,
+            payload: JournaledPayload::Ephemeral,
+            payload_byte_size: 999,
+            payload_sha256_prefix: [9; 8],
+            at_unix: 9,
+        });
+    }
+
+    #[test]
+    fn outbound_terminal_flag_round_trips() {
+        round_trip(ExecEvent::CallerOutbound {
+            color: color(),
+            offset: 3,
+            payload: JournaledPayload::Journaled {
+                value: serde_json::json!("chunk"),
+            },
+            payload_byte_size: 5,
+            payload_sha256_prefix: [0; 8],
+            terminal: true,
+            at_unix: 10,
+        });
+    }
+
+    #[test]
+    fn errored_and_disconnected_round_trip() {
+        round_trip(ExecEvent::CallerErrored {
+            color: color(),
+            offset: 4,
+            message: "node blew up".into(),
+            at_unix: 11,
+        });
+        round_trip(ExecEvent::CallerDisconnected {
+            color: color(),
+            offset: 5,
+            reason: "response complete".into(),
+            at_unix: 12,
+        });
+    }
+
+    #[test]
+    fn kind_str_is_stable_for_caller_events() {
+        // The kind string is the durable DB discriminant; a drift would
+        // orphan existing rows.
+        assert_eq!(
+            ExecEvent::CallerConnected {
+                color: color(), offset: 0, protocol: "http".into(), at_unix: 0,
+            }
+            .kind_str(),
+            "caller_connected"
+        );
+        assert_eq!(
+            ExecEvent::CallerDisconnected {
+                color: color(), offset: 0, reason: String::new(), at_unix: 0,
+            }
+            .kind_str(),
+            "caller_disconnected"
+        );
+    }
+
+    #[test]
+    fn caller_events_are_observability_only_in_fold() {
+        // Folding a stream of caller events must not panic and must not
+        // synthesize node/pulse state (they are non-durable, replay-only).
+        let events = vec![
+            ExecEvent::CallerConnected {
+                color: color(), offset: 0, protocol: "http".into(), at_unix: 0,
+            },
+            ExecEvent::CallerInbound {
+                color: color(), offset: 1,
+                payload: JournaledPayload::Ephemeral,
+                payload_byte_size: 1, payload_sha256_prefix: [0; 8], at_unix: 1,
+            },
+            ExecEvent::CallerDisconnected {
+                color: color(), offset: 2, reason: "done".into(), at_unix: 2,
+            },
+        ];
+        let snap = fold_to_snapshot(color(), &events);
+        assert!(snap.executions.is_empty(), "caller events create no node state");
+        assert!(snap.corruptions.is_empty(), "caller events fold cleanly");
     }
 }

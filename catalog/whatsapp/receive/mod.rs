@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
-use weft_core::signal::Sse;
+use weft_core::signal::SseSubscribe;
 use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
 
 pub struct WhatsAppReceiveNode;
@@ -54,7 +54,7 @@ async fn register(ctx: &ExecutionContext) -> WeftResult<()> {
     // `endpointUrl` is the bridge's bare endpoint URL (the bridge node
     // exports `ctx.endpoint("api").url()`, no path). Append our route.
     let events_url = format!("{}/events", bridge.trim_end_matches('/'));
-    ctx.register_signal(Sse {
+    ctx.register_signal(SseSubscribe {
         url: events_url,
         event_name: "message.received".into(),
     })

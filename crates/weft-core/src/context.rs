@@ -127,8 +127,8 @@ impl ExecutionContext {
     /// Set up a persistent wake signal that fires fresh executions.
     ///
     /// Use when the node is a trigger declaring "while I'm active,
-    /// the listener should watch for X" (Webhook, HumanTrigger form,
-    /// cron, SSE subscription). Returns synchronously with the
+    /// the listener should watch for X" (ApiEndpoint, HumanTrigger form,
+    /// cron, SseSubscribe). Returns synchronously with the
     /// user-facing URL (if the kind mints one) and the worker keeps
     /// executing. Each subsequent fire spawns a brand new execution
     /// of the project; this signal is NOT bound to the current
@@ -405,6 +405,53 @@ impl ExecutionContext {
     /// `cancelled().await`.
     pub fn cancellation(&self) -> Arc<CancellationFlag> {
         self.handle.cancellation()
+    }
+
+    // ----- Live caller connection ------------------------------------
+
+    /// Is this execution attached to a live HTTP caller? `true` only on
+    /// the worker that received an `http` `live_connection` request.
+    /// Pure status read; lets a multi-purpose node gate its behavior.
+    /// Distinct from [`Self::is_websocket`] on purpose: a node may branch
+    /// THREE ways (http / websocket / neither), so the two queries are
+    /// separate and never entangled into one enum.
+    pub fn is_api_call(&self) -> bool {
+        matches!(
+            self.handle.caller_connection().map(|c| c.config().protocol),
+            Some(crate::signal::Protocol::Http)
+        )
+    }
+
+    /// Is this execution attached to a live WebSocket caller? `true` only
+    /// on the worker that received a `websocket` `live_connection`
+    /// request. See [`Self::is_api_call`] for why these are two queries.
+    pub fn is_websocket(&self) -> bool {
+        matches!(
+            self.handle.caller_connection().map(|c| c.config().protocol),
+            Some(crate::signal::Protocol::Websocket)
+        )
+    }
+
+    /// The declared inbound/outbound data shape of the live connection,
+    /// or `None` if this run has no live caller. Queryable so a node can
+    /// branch on "do I send bytes or JSON here" (same gating spirit as
+    /// `is_api_call` / `is_websocket`).
+    pub fn caller_data_type(&self) -> Option<crate::signal::DataType> {
+        self.handle.caller_connection().map(|c| c.config().data_type)
+    }
+
+    /// The live caller connection as a protocol-typed handle, or `None`
+    /// if this run has no live caller (a durable run, or any worker that
+    /// did not receive the request). The handle's talk methods are
+    /// protocol-specific (HTTP: respond/write/close; WS:
+    /// send/receive/request/close); both share `is_connected` and the one
+    /// `ensure_connected` barrier. A node that needs the caller but may
+    /// run without one checks `is_api_call`/`is_websocket` first, or
+    /// handles `None`.
+    pub fn caller(&self) -> Option<crate::caller::CallerHandle> {
+        self.handle
+            .caller_connection()
+            .map(crate::caller::CallerHandle::from_connection)
     }
 }
 
@@ -858,6 +905,14 @@ pub trait ContextHandle: Send + Sync {
     /// `ok_or_else` with a clear error; the language doesn't impose a
     /// payload contract.
     fn wake_payload(&self) -> Option<&Value>;
+
+    /// The live caller connection attached to THIS execution, if any.
+    /// `Some` only on the one worker that received a `live_connection`
+    /// request, for the life of that worker; `None` for every durable run
+    /// and for every other worker. The engine wires the production
+    /// connection (worker<->gateway socket) here when the caller attaches;
+    /// tests wire a fake. Any node in the execution shares the one `Arc`.
+    fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>>;
 }
 
 #[cfg(test)]

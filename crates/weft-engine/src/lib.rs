@@ -5,6 +5,7 @@
 //! `ApplyInfra`) flow through the dispatcher's task queue (also via
 //! the broker).
 
+pub(crate) mod caller_conn;
 pub(crate) mod context;
 pub(crate) mod execution_driver;
 pub(crate) mod loop_runtime;
