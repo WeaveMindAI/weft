@@ -21,8 +21,20 @@ pub fn coerce_text_payload(text: String) -> Value {
 /// Fire one event payload, logging (not propagating) an enqueue failure:
 /// a dropped fire must not kill the event-source loop, but is never silent.
 /// `target` is the caller's tracing target so the log names the right kind.
-pub async fn fire_payload(sink: &FireSignalSink, token: &str, payload: Value, target: &str) {
-    if let Err(e) = sink.fire(token, payload).await {
+/// `tenant_id` is the signal's tenant, stamped on the enqueued fire (a
+/// pooled listener serves many tenants, so it travels per-signal).
+/// `placement_generation` is the generation this pod holds the signal under,
+/// stamped on the fire so the broker can fence a stale old-pod fire during a
+/// scale-down move overlap.
+pub async fn fire_payload(
+    sink: &FireSignalSink,
+    token: &str,
+    tenant_id: &str,
+    placement_generation: i64,
+    payload: Value,
+    target: &str,
+) {
+    if let Err(e) = sink.fire(token, tenant_id, placement_generation, payload).await {
         warn!(target: "weft_listener::event_source", kind = target, %token, error = %e, "fire enqueue failed");
     }
 }

@@ -1,8 +1,13 @@
-//! `register_signal` task: a dispatcher Pod runs the entire register
-//! flow inside `ListenerPool::with_listener` (so the SHARED OP-lock
-//! fences the reaper out for the spawn → POST /register → POST
-//! /render → INSERT signal row sequence), then returns the minted
-//! token to the worker that requested it.
+//! `register_signal` task: a dispatcher Pod places the signal on a
+//! pooled listener (`ListenerPool::place_signal` picks the least-loaded
+//! non-saturated pod or spawns one), registers it there, then INSERTs the
+//! durable `signal` row WITH its holder + generation (`signal_insert`
+//! takes a `SignalPlacement`, so the row is born pointing at the pod, no
+//! separate placement write), and returns the minted token to the worker.
+//! The freshly-placed pod is protected from the idle reaper by its spawn
+//! grace (`listener_pod.grace_until_unix`) for the window between
+//! placement and the `signal_insert`, so the reaper cannot tear it down
+//! mid-register.
 //!
 //! Producers: the worker calls `task_client::enqueue` (in weft-engine)
 //! when it hits `ctx.register_signal` or `ctx.await_signal`. The
@@ -86,10 +91,10 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             anyhow::bail!("invalid signal spec: {e}");
         }
 
-        // Resolve tenant + project_id, then run the entire register
-        // flow inside `with_listener` so the listener can't be reaped
-        // between spawn and `/register` POST. Token reuse for entry
-        // rows keeps the registration stable across reactivates;
+        // Resolve tenant + project_id, then place the signal on a pooled
+        // listener. The chosen pod's spawn grace keeps it from being
+        // reaped between placement and the `signal_insert`. Token reuse
+        // for entry rows keeps the registration stable across reactivates;
         // resume rows always mint fresh.
         let project_id = match state.journal.execution_project(color).await? {
             crate::journal::ColorLookup::Found(p) => p,
@@ -101,7 +106,6 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             ),
         };
         let tenant = state.tenant_router.tenant_for_project(&project_id);
-        let namespace = state.namespace_mapper.namespace_for(&tenant);
 
         let token = if payload.is_resume {
             // Derive resume token from the suspension identity so a
@@ -150,11 +154,22 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         let resume_color_owned = resume_color.clone();
         let pool_call = state.pg_pool.clone();
 
-        let (routing, kind_state, rendered) = state
+        let tenant_for_register = tenant.as_str().to_string();
+        // The generation the chosen pod will hold this signal under (a
+        // PURE READ of current + 1). A brand-new token has no row yet, so
+        // this returns 1; a reactivate that reuses an entry token's
+        // persisted row returns its prior generation + 1 (so any stale
+        // fire still in flight from before the deactivate is fenced once
+        // committed). It is committed only by `signal_insert` below (which
+        // writes the holder + generation WITH the row), so a register that
+        // fails before the insert leaves the row's generation untouched.
+        // Race-free without the per-token lock here: the token is unique
+        // and its register task is dedup'd, so no concurrent placer.
+        let placement_generation =
+            crate::listener::next_generation(&state.pg_pool, &token).await?;
+        let (listener_pod, (routing, kind_state, rendered)) = state
             .listeners
-            .with_listener(
-                &tenant,
-                &namespace,
+            .place_signal(
                 state.listener_backend.as_ref(),
                 &state.pg_pool,
                 state.pod_id.as_str(),
@@ -162,10 +177,12 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                     let (routing, kind_state) = crate::listener::register_signal(
                         &handle,
                         &token_call,
+                        &tenant_for_register,
                         &spec_call,
                         &node_id_call,
                         payload.is_resume,
                         resume_color_owned.as_deref(),
+                        placement_generation,
                     )
                     .await?;
 
@@ -300,24 +317,37 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 auth_kind: auth_kind_str,
                 auth_config: auth_config_value,
                 kind_state,
+            },
+            // Born with its holder + generation so the row is never
+            // committed with a NULL holder while the pod already holds it
+            // (that window let a fire double-place). Both are known:
+            // `listener_pod` is the pod we just registered on,
+            // `placement_generation` was reserved above.
+            &crate::journal::SignalPlacement {
+                listener_pod: listener_pod.clone(),
+                generation: placement_generation,
             })
             .await;
         if let Err(e) = insert_result {
-            // signal_insert failed AFTER the listener registered.
-            // Roll the listener side back so the in-RAM registry +
-            // any minted secret don't outlive their non-existent DB
-            // row. Best-effort: the listener may have been reaped
-            // between with_listener returning and this rollback
-            // attempt, in which case the registry is already gone
-            // (and the next rehydrate skips this token because no
-            // DB row exists).
+            // signal_insert failed AFTER the listener registered. Roll
+            // the listener side back so the in-RAM registry + any minted
+            // secret don't outlive their non-existent DB row. We know
+            // the pod we placed on (`listener_pod`); unregister there.
+            // Best-effort: the pod may have been reaped meanwhile, in
+            // which case its registry is already gone. We never wrote
+            // `signal.listener_pod` (the row insert failed), so there is
+            // no placement to clear; an emptied pod is reaped on the
+            // next idle sweep.
             let token_for_rollback = token.clone();
-            let rollback = state
-                .listeners
-                .with_listener_if_alive(&tenant, &state.pg_pool, |handle| async move {
-                    crate::listener::unregister_signal(&handle, &token_for_rollback).await
-                })
-                .await;
+            let rollback = async {
+                if let Some(handle) =
+                    state.listeners.resolve_pod(&listener_pod, &state.pg_pool).await?
+                {
+                    crate::listener::unregister_signal(&handle, &token_for_rollback).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
             if let Err(unreg_err) = rollback {
                 tracing::warn!(
                     target: "weft_dispatcher::register_signal",
@@ -329,6 +359,12 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             }
             return Err(e);
         }
+
+        // signal_insert wrote the holder + generation WITH the row (see
+        // SignalRegistration.listener_pod / placement_generation), so
+        // there is no separate placement write here: fires already
+        // resolve to `listener_pod`, and boot/rehydrate of that pod
+        // re-registers this signal.
 
         if payload.is_resume {
             // Suspension state lives on the signal row; we also

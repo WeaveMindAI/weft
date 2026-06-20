@@ -233,9 +233,33 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             surface_kind TEXT NOT NULL DEFAULT 'task_callback',
             mount_path TEXT,
             auth_kind TEXT NOT NULL DEFAULT 'none',
-            auth_config JSONB
+            auth_config JSONB,
+            -- Placement: which pooled listener pod currently holds this
+            -- signal's live in-RAM registry entry (its Timer/SSE loop).
+            -- NULL when no listener holds it yet (freshly registered
+            -- before placement, or the holding pod died and it awaits
+            -- re-placement). The fire path resolves token -> this pod's
+            -- admin URL; boot/rehydrate lists `WHERE listener_pod = me`
+            -- to rebuild a restarted pod's registry. A pooled listener
+            -- holds many tenants' signals, so placement is per-signal,
+            -- not per-tenant.
+            listener_pod TEXT,
+            -- Monotonic placement generation, bumped on EVERY (re)placement
+            -- (set_placement). The holding pod is told its generation at
+            -- register time and stamps it on every held-event fire it
+            -- enqueues. A move registers the signal on the new pod under
+            -- gen+1 BEFORE unregistering the old pod, so during the brief
+            -- both-armed overlap the old pod still fires under the OLD gen.
+            -- The broker rejects any FireSignal whose generation is below
+            -- the row's current generation: the stale (old-pod) fire from
+            -- the overlap is dropped, the new pod's fire passes. This is
+            -- the fence that prevents a self-firing kind (Timer/SSE) from
+            -- double-firing across a scale-down move.
+            placement_generation BIGINT NOT NULL DEFAULT 0
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_tenant ON signal(tenant_id)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_signal_listener_pod
+             ON signal(listener_pod) WHERE listener_pod IS NOT NULL"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_project ON signal(project_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_color ON signal(color)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_consumer_kind ON signal(consumer_kind)"#,
@@ -602,7 +626,11 @@ impl Journal for PostgresJournal {
         Ok(())
     }
 
-    async fn signal_insert(&self, sig: &SignalRegistration) -> anyhow::Result<()> {
+    async fn signal_insert(
+        &self,
+        sig: &SignalRegistration,
+        placement: &crate::journal::SignalPlacement,
+    ) -> anyhow::Result<()> {
         let payload_str = match &sig.consumer_payload {
             Some(v) => Some(serde_json::to_string(v)?),
             None => None,
@@ -616,12 +644,23 @@ impl Journal for PostgresJournal {
         // reactivate drains cleanly because the token didn't
         // change. Resume rows (is_resume=TRUE) always insert
         // fresh: their token is per-suspension.
+        // `listener_pod` + `placement_generation` are written WITH the
+        // row (not a later separate UPDATE) so a committed `signal` row
+        // never has a NULL holder while a pod already holds it in RAM,
+        // and so a register that FAILS before this insert leaves the row
+        // untouched (the generation is computed by `next_generation`, a
+        // pure read, and committed ONLY here). On reactivate (ON CONFLICT)
+        // this is the first and only write of the new generation
+        // (`prior + 1`) for this placement, applied together with the new
+        // holder.
         sqlx::query(
             "INSERT INTO signal \
              (token, tenant_id, project_id, color, node_id, is_resume, \
               spec_json, created_at, consumer_kind, tags, consumer_payload, \
-              surface_kind, mount_path, auth_kind, auth_config, kind_state) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+              surface_kind, mount_path, auth_kind, auth_config, kind_state, \
+              listener_pod, placement_generation) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                     $17, $18) \
              ON CONFLICT (token) DO UPDATE SET \
                  spec_json = EXCLUDED.spec_json, \
                  consumer_kind = EXCLUDED.consumer_kind, \
@@ -631,7 +670,9 @@ impl Journal for PostgresJournal {
                  mount_path = EXCLUDED.mount_path, \
                  auth_kind = EXCLUDED.auth_kind, \
                  auth_config = EXCLUDED.auth_config, \
-                 kind_state = EXCLUDED.kind_state",
+                 kind_state = EXCLUDED.kind_state, \
+                 listener_pod = EXCLUDED.listener_pod, \
+                 placement_generation = EXCLUDED.placement_generation",
         )
         .bind(&sig.token)
         .bind(&sig.tenant_id)
@@ -649,6 +690,8 @@ impl Journal for PostgresJournal {
         .bind(&sig.auth_kind)
         .bind(sig.auth_config.as_ref())
         .bind(&sig.kind_state)
+        .bind(&placement.listener_pod)
+        .bind(placement.generation)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -685,16 +728,6 @@ impl Journal for PostgresJournal {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(row_to_signal).collect())
-    }
-
-    async fn signal_count_for_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM signal WHERE tenant_id = $1",
-        )
-        .bind(tenant_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0 as usize)
     }
 
     async fn signal_remove_for_color(

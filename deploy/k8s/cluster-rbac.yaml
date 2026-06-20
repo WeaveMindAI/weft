@@ -1,14 +1,20 @@
 ---
-# Cluster-scoped ClusterRoles for the per-tenant infra-supervisor
-# and listener pods. The dispatcher creates RoleBindings in each
-# project namespace at register time, binding these ClusterRoles to
-# the tenant-namespace SAs `weft-infra-supervisor-sa` and
-# `weft-listener-sa`.
+# Cluster-scoped ClusterRoles for the POOLED, trusted, tenant-agnostic
+# infra-supervisor and listener (one of each, running in the control-
+# plane namespace; see system-namespace.yaml for their SAs). The
+# dispatcher creates RoleBindings in each project namespace at register
+# time, binding these ClusterRoles to the CONTROL-PLANE SAs
+# `weft-infra-supervisor-sa` and `weft-listener-sa`.
 #
-# This approach keeps the supervisor / listener blast radius
-# exactly "this tenant's project namespaces" (Roles are bound
-# per-namespace; the ClusterRole gives the verb surface, the
-# RoleBinding scopes it).
+# This keeps the verb surface to exactly the namespaced kinds the
+# supervisor can create (no cluster-scoped write), and the per-project-
+# namespace RoleBinding is what grants the control-plane SA access INTO
+# each project namespace. A pooled pod is trusted to act for many
+# tenants (it runs only our code; every manifest it applies is
+# compiled from the typed infra surface in weft-core infra::compile and
+# confined to the caller's own namespace by construction), so the
+# blast-radius control is the namespaced ClusterRole + per-namespace
+# binding, not per-pod tenant identity.
 #
 # The supervisor owns `kubectl apply` for every resource the
 # weft-core compiler can emit (Deployment, StatefulSet, Service,

@@ -40,12 +40,39 @@ pub(crate) const DISPATCHER_NS: &str = "weft-system";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    /// Pooled listener: a trusted control-plane service that holds
+    /// signals belonging to MANY tenants and fires held events for any
+    /// of them. Runs our code only (every kind handler is data-only,
+    /// never executes user code), so it is trusted to act cross-tenant.
+    /// Its scope is `ControlPlane`; per-fire it still proves the signal
+    /// exists and the task's tenant is the signal's real tenant.
     Listener,
+    /// Per-execution worker: runs the user's compiled project (including
+    /// untrusted ExecPython). Scoped to exactly its own tenant; the
+    /// broker never lets it act cross-tenant.
     Worker,
-    /// Per-tenant infra-supervisor pod. Owns health probing,
-    /// HealthProtocol evaluation, and lifecycle execution
-    /// (stop/terminate kubectl ops) for its tenant's projects.
+    /// Pooled infra-supervisor: a trusted control-plane service that
+    /// reconciles infrastructure for MANY tenants' namespaces. Runs our
+    /// code only (declarative manifests it compiled from the typed infra
+    /// surface, confined to the caller's own namespace by construction),
+    /// so it is trusted to act cross-tenant.
+    /// Its scope is `ControlPlane`; per-op it proves the project/
+    /// namespace it acts on is real and uses that resource's tenant.
     InfraSupervisor,
+}
+
+impl Role {
+    /// Whether this role is a trusted control-plane service (acts for
+    /// any tenant, scope = ControlPlane) vs a tenant-scoped pod (acts
+    /// only for its own tenant). Listener + supervisor are pooled
+    /// trusted services; the worker is tenant-scoped because it runs
+    /// untrusted user code.
+    fn is_control_plane(self) -> bool {
+        match self {
+            Self::Listener | Self::InfraSupervisor => true,
+            Self::Worker => false,
+        }
+    }
 }
 
 // NOTE: there is deliberately no `Infra` role. Pods the supervisor
@@ -63,6 +90,29 @@ impl Role {
             WORKER_SA => Some(Self::Worker),
             INFRA_SUPERVISOR_SA => Some(Self::InfraSupervisor),
             _ => None,
+        }
+    }
+}
+
+/// The tenant authority of a caller. A `Tenant` caller may act ONLY
+/// for that tenant (the worker, running untrusted user code). A
+/// `ControlPlane` caller (pooled listener / supervisor, trusted, runs
+/// our code only) may act for ANY tenant; the broker still validates
+/// per-op that the specific resource exists and uses the resource's
+/// own tenant for writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerScope {
+    Tenant(String),
+    ControlPlane,
+}
+
+impl CallerScope {
+    /// The tenant this caller is pinned to, or `None` for a
+    /// control-plane caller that is not pinned to any single tenant.
+    pub fn pinned_tenant(&self) -> Option<&str> {
+        match self {
+            Self::Tenant(t) => Some(t),
+            Self::ControlPlane => None,
         }
     }
 }
@@ -89,7 +139,10 @@ pub struct ReviewedToken {
 
 #[derive(Debug, Clone)]
 pub struct CallerIdentity {
-    pub tenant_id: String,
+    /// The caller's tenant authority. `Tenant(t)` for a worker (acts
+    /// only for t); `ControlPlane` for a pooled listener / supervisor
+    /// (acts for any tenant, validated per-op).
+    pub scope: CallerScope,
     pub role: Role,
     pub namespace: String,
     /// `pod_name` claimed inside the SA token (extra projection); the
@@ -238,9 +291,21 @@ pub async fn extract_identity(
         StatusCode::FORBIDDEN,
         format!("unknown service account '{}'", reviewed.sa_name),
     ))?;
-    let tenant_id = namespace_tenant(state, &reviewed.namespace).await?;
+    // Control-plane services (pooled listener / supervisor) run in the
+    // control-plane namespace and are not pinned to a tenant: their
+    // scope is ControlPlane and per-op validation derives the tenant
+    // from the resource being acted on. Tenant-scoped pods (worker)
+    // resolve their single tenant from the namespace they run in. The
+    // namespace -> tenant lookup is authoritative (the dispatcher
+    // registers it), so a tenant pod in an unregistered namespace is a
+    // 403.
+    let scope = if role.is_control_plane() {
+        CallerScope::ControlPlane
+    } else {
+        CallerScope::Tenant(namespace_tenant(state, &reviewed.namespace).await?)
+    };
     Ok(CallerIdentity {
-        tenant_id,
+        scope,
         role,
         namespace: reviewed.namespace,
         pod_name: reviewed.pod_name,

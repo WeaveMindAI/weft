@@ -182,23 +182,6 @@ pub trait ProjectStoreOps: Send + Sync {
     /// doesn't exist; `Err` on DB failure.
     async fn project_namespace(&self, id_str: &str) -> anyhow::Result<Option<String>>;
 
-    /// Arm the sync-in-flight sentinel under a per-tenant xact-scoped
-    /// advisory lock, in one tx. Used by `sync` to atomically:
-    ///   1. take `pg_advisory_xact_lock(advisory_key(domain, scope))`,
-    ///   2. write `sync_in_flight_until_unix = now + ttl`,
-    ///   3. COMMIT (auto-releases the lock).
-    ///
-    /// xact-scoped lock means no session-leak back into the
-    /// connection pool. The reaper takes the same key with
-    /// `pg_try_advisory_xact_lock` non-blocking; both sides see a
-    /// consistent view.
-    async fn arm_sync_with_advisory_lock(
-        &self,
-        id: uuid::Uuid,
-        advisory_key: i64,
-        until_unix: i64,
-    ) -> anyhow::Result<()>;
-
     /// Replace the per-(project, node) infra image-tag map. The CLI
     /// sends the tags in /infra/sync; the supervisor reads them
     /// back via `infra_image_tags(project_id, node_id)`. `Err` on
@@ -485,16 +468,7 @@ impl PostgresProjectStore {
                 -- Per-project health protocols overriding the weft
                 -- default. NULL = use default. Schema per
                 -- weft_infra_supervisor::protocol::HealthProtocols.
-                health_protocols_json JSONB,
-                -- Sentinel "this project has a sync handler mid-flight."
-                -- Set on entry to /infra/sync (via a short tx with an
-                -- advisory lock), heartbeated during the handler's
-                -- slow work, cleared on exit. The supervisor reaper
-                -- reads it (and pending counts + node counts) before
-                -- scaling the per-tenant supervisor to 0.
-                -- Stored per project, not per tenant: a multi-project
-                -- tenant's reaper considers every project's sentinel.
-                sync_in_flight_until_unix BIGINT
+                health_protocols_json JSONB
             )"#,
         )
         .execute(&pool)
@@ -942,25 +916,6 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.map(|(s,)| s).filter(|s| !s.is_empty()))
     }
 
-    async fn arm_sync_with_advisory_lock(
-        &self,
-        id: uuid::Uuid,
-        advisory_key: i64,
-        until_unix: i64,
-    ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(advisory_key)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE project SET sync_in_flight_until_unix = $1 WHERE id = $2")
-            .bind(until_unix)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
-    }
 
     async fn set_infra_image_tags(
         &self,
@@ -1094,7 +1049,6 @@ pub struct MockProjectStore {
     lifecycles: RwLock<HashMap<uuid::Uuid, ProjectLifecycle>>,
     tenants: RwLock<HashMap<uuid::Uuid, String>>,
     namespaces: RwLock<HashMap<uuid::Uuid, String>>,
-    sync_in_flight: RwLock<HashMap<uuid::Uuid, i64>>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -1109,7 +1063,6 @@ impl MockProjectStore {
             lifecycles: RwLock::new(HashMap::new()),
             tenants: RwLock::new(HashMap::new()),
             namespaces: RwLock::new(HashMap::new()),
-            sync_in_flight: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -1232,10 +1185,9 @@ impl ProjectStoreOps for MockProjectStore {
         // Mirror Postgres FK CASCADE: removing a project clears every
         // per-id side-map (binary/definition/infra hashes,
         // definition_versions history, lifecycles, tenants,
-        // namespaces, sync_in_flight). Without this the mock diverges
-        // from production: a test that re-registers under the same
-        // id, or asserts cleanup, would see ghost state Postgres
-        // does not have.
+        // namespaces). Without this the mock diverges from production:
+        // a test that re-registers under the same id, or asserts
+        // cleanup, would see ghost state Postgres does not have.
         let was_present = self.inner.write().await.remove(&id).is_some();
         self.binary_hashes.write().await.remove(&id);
         self.definition_hashes.write().await.remove(&id);
@@ -1244,7 +1196,6 @@ impl ProjectStoreOps for MockProjectStore {
         self.lifecycles.write().await.remove(&id);
         self.tenants.write().await.remove(&id);
         self.namespaces.write().await.remove(&id);
-        self.sync_in_flight.write().await.remove(&id);
         Ok(was_present)
     }
 
@@ -1428,19 +1379,6 @@ impl ProjectStoreOps for MockProjectStore {
             .parse::<uuid::Uuid>()
             .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
         Ok(self.namespaces.read().await.get(&id).cloned())
-    }
-
-    async fn arm_sync_with_advisory_lock(
-        &self,
-        id: uuid::Uuid,
-        _advisory_key: i64,
-        until_unix: i64,
-    ) -> anyhow::Result<()> {
-        // No advisory locking in the mock; the production impl
-        // serializes against the reaper via Postgres. Tests don't
-        // exercise that path. Just write the sentinel.
-        self.sync_in_flight.write().await.insert(id, until_unix);
-        Ok(())
     }
 
     async fn set_infra_image_tags(

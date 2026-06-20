@@ -23,6 +23,15 @@ use weft_core::primitive::{SignalRouting, SignalSpec};
 pub struct RegisterRequest {
     /// Opaque token the dispatcher minted. Used as the routing key.
     pub token: String,
+    /// Tenant this signal belongs to. A pooled listener pod holds
+    /// signals from many tenants, so tenancy is a property of each
+    /// signal, not of the pod. The listener stamps this tenant onto the
+    /// `FireSignal` task it enqueues when the signal fires, so the
+    /// broker authorizes the cross-tenant write (the listener is a
+    /// trusted control-plane caller) and the dispatcher routes the fire
+    /// to the right tenant. The dispatcher already knows the tenant at
+    /// register time (it ran `TenantRouter`); it puts it on the wire.
+    pub tenant_id: String,
     /// The resolved signal spec. Carries everything kind-specific.
     pub spec: SignalSpec,
     /// Node id this signal belongs to. Relayed back to the
@@ -39,6 +48,13 @@ pub struct RegisterRequest {
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
     #[serde(default)]
     pub color: Option<String>,
+    /// The placement generation under which this pod holds the signal.
+    /// The dispatcher bumps it on every (re)placement and tells the
+    /// holding pod its value here. The pod stamps it on every held-event
+    /// `FireSignal` it enqueues; the broker drops a fire whose generation
+    /// is below the signal row's current one, so a stale old-pod fire
+    /// during a scale-down move overlap is fenced out (no double-fire).
+    pub placement_generation: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +72,35 @@ pub struct RegisterResponse {
     /// that don't need it.
     #[serde(default)]
     pub kind_state: serde_json::Value,
+}
+
+/// Load report for `GET /load`. The dispatcher's placement reads this
+/// to decide whether a listener can accept another signal. `saturated`
+/// is the listener's OWN call from real measurements (the dispatcher
+/// never second-guesses it with a count): when true, placement skips
+/// this pod and tries another / spawns one. The raw counts are for
+/// observability and tie-breaking among non-saturated pods (prefer the
+/// least-loaded).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadReport {
+    /// True when the pod has hit its memory saturation threshold
+    /// (`mem_pressure >= SATURATION_MEM_FRACTION`) and must not accept
+    /// new signals. `/register` also returns 503 when this is true, so a
+    /// placement race that registers anyway fails loudly rather than
+    /// overloading the pod.
+    pub saturated: bool,
+    /// Real memory pressure (usage/limit) in `[0.0, 1.0]`. The metric
+    /// `saturated` is derived from, and the headroom the scale-down
+    /// planner uses to decide whether a drained pod's load fits on the
+    /// survivors. 0.0 when uncapped (local dev) or on a read glitch.
+    pub mem_pressure: f64,
+    /// Total signals held (placement count). Observability + tie-break
+    /// among non-saturated pods (prefer the least-loaded).
+    pub signals: u32,
+    /// Signals running a live held-connection loop (Timer/SSE/poll/
+    /// socket): the resource-heavy subset. Observability only now that
+    /// saturation is memory-based.
+    pub held_connections: u32,
 }
 
 /// Body for `POST /display` on the listener (admin-only). The
@@ -155,8 +200,108 @@ pub enum ProcessTarget {
     Entry,
     /// Listener consumed the fire; dispatcher does nothing. Covers
     /// Hold (multi-step protocol still in progress) AND NoOp
-    /// (duplicate fire, unknown token, stateful kind misused). The
-    /// optional `reason` is for ops logging only; the dispatcher
-    /// treats every Drop the same.
+    /// (duplicate fire, stateful kind misused). The optional `reason`
+    /// is for ops logging only; the dispatcher treats every Drop the
+    /// same.
     Drop { reason: Option<String> },
+    /// This pod does NOT hold the signal for `token` in its registry.
+    /// Distinct from `Drop` (a deliberate consume): it means the
+    /// dispatcher routed the fire to the wrong pod, which happens during
+    /// a scale-down move (the signal was re-placed onto another pod and
+    /// the routing column flipped between the dispatcher's resolve and
+    /// its POST). The dispatcher re-resolves the holder from the durable
+    /// row and retries ONCE; because a move flips the routing column to
+    /// the new pod BEFORE unregistering the old one, the re-resolve is
+    /// guaranteed to find the live holder. If the signal row is gone, the
+    /// re-resolve fails loud (a real inconsistency, not a silent drop).
+    NotHeld,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> SignalSpec {
+        SignalSpec {
+            kind: "timer".into(),
+            config: serde_json::json!({ "interval_secs": 60 }),
+            consumer_kind: None,
+        }
+    }
+
+    /// `RegisterRequest` crosses the dispatcher -> listener HTTP boundary
+    /// and gained two REQUIRED fields in the pooled rework (`tenant_id`,
+    /// `placement_generation`, neither `#[serde(default)]`). Round-trip
+    /// pins them on the wire so a rename / drop is a test failure, not a
+    /// runtime deserialize error on the listener.
+    #[test]
+    fn register_request_round_trips_with_tenant_and_generation() {
+        let req = RegisterRequest {
+            token: "tok-1".into(),
+            tenant_id: "acme".into(),
+            spec: spec(),
+            node_id: "node-1".into(),
+            is_resume: false,
+            color: Some("c-1".into()),
+            placement_generation: 7,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["tenant_id"], "acme");
+        assert_eq!(json["placement_generation"], 7);
+        let back: RegisterRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.tenant_id, "acme");
+        assert_eq!(back.placement_generation, 7);
+        assert_eq!(back.token, "tok-1");
+    }
+
+    /// A required new field must be a hard deserialize failure when
+    /// absent (the dispatcher and listener must agree on the contract).
+    #[test]
+    fn register_request_missing_generation_fails() {
+        let json = serde_json::json!({
+            "token": "tok-1",
+            "tenant_id": "acme",
+            "spec": { "kind": "timer", "config": {} },
+            "node_id": "node-1",
+            "is_resume": false,
+            "color": null
+            // placement_generation omitted
+        });
+        assert!(serde_json::from_value::<RegisterRequest>(json).is_err());
+    }
+
+    /// `LoadReport` is deserialized from the listener's `GET /load` by
+    /// the dispatcher's placement; round-trip pins every field.
+    #[test]
+    fn load_report_round_trips() {
+        let lr = LoadReport {
+            saturated: true,
+            mem_pressure: 0.83,
+            signals: 12,
+            held_connections: 3,
+        };
+        let json = serde_json::to_string(&lr).unwrap();
+        let back: LoadReport = serde_json::from_str(&json).unwrap();
+        assert!(back.saturated);
+        assert_eq!(back.mem_pressure, 0.83);
+        assert_eq!(back.signals, 12);
+        assert_eq!(back.held_connections, 3);
+    }
+
+    /// `ProcessTarget` is serialized over the fire path; the new
+    /// `NotHeld` variant and the `Drop { reason }` shape must keep their
+    /// tag spelling (the dispatcher matches on them).
+    #[test]
+    fn process_target_round_trips_including_not_held() {
+        for target in [
+            ProcessTarget::Entry,
+            ProcessTarget::Resume { color: "c-1".into() },
+            ProcessTarget::Drop { reason: Some("dup".into()) },
+            ProcessTarget::NotHeld,
+        ] {
+            let json = serde_json::to_string(&target).unwrap();
+            let back: ProcessTarget = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{target:?}"));
+        }
+    }
 }

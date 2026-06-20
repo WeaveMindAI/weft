@@ -1,24 +1,17 @@
-//! Tenant listener lease management.
+//! Lease + coordination primitives shared across the dispatcher.
 //!
-//! `tenant_listener` records the per-tenant listener Deployment +
-//! its admin URL/token. Multi-Pod dispatchers re-attach to a
-//! sibling Pod's listener via this row; restarts adopt orphan rows
-//! whose owner has gone away.
+//! This is the generic toolkit the pooled placement machinery is built
+//! on; it owns no table of its own. Two things live here:
 //!
-//! Lifecycle: `ListenerPool::with_listener` upserts the row inside
-//! a transactional advisory-lock for state transitions. Every Pod
-//! periodically calls `renew_tenant_listener` to keep the row's
-//! ownership lease alive. On hard death the lease expires after
-//! `LEASE_DURATION_SECS` and another Pod can adopt the row.
-//!
-//! Note: this row-ownership lease is distinct from the per-operation
-//! advisory locks in `ListenerPool::with_listener`. The row lease
-//! says "Pod X currently drives state transitions for this tenant";
-//! the operation locks say "someone is currently using the listener,
-//! reaper back off."
-
-use anyhow::Result;
-use sqlx::postgres::PgPool;
+//! - **Row-ownership lease helpers** (`LEASE_DURATION_SECS`,
+//!   `LEASE_RENEW_INTERVAL_SECS`, `is_lease_live`, `now_unix`). A
+//!   registry row (e.g. a `listener_pod` or `supervisor_pod` entry)
+//!   carries a `leased_until_unix`; its owning dispatcher Pod renews it
+//!   every `LEASE_RENEW_INTERVAL_SECS`, and on hard death the lease
+//!   expires after `LEASE_DURATION_SECS` so a sibling Pod can adopt it.
+//! - **Advisory-lock key derivation** (`advisory_key` + the per-regime
+//!   domain constants). Serializes cross-Pod state transitions (listener
+//!   + supervisor pick-or-spawn) without a dedicated lock table.
 
 /// How long a row-ownership lease is valid before it must be renewed.
 pub const LEASE_DURATION_SECS: i64 = 30;
@@ -27,88 +20,24 @@ pub const LEASE_DURATION_SECS: i64 = 30;
 /// expiry. Set well below `LEASE_DURATION_SECS`.
 pub const LEASE_RENEW_INTERVAL_SECS: u64 = 10;
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let stmts = [
-        r#"CREATE TABLE IF NOT EXISTS tenant_listener (
-            tenant_id TEXT PRIMARY KEY,
-            owner_pod_id TEXT NOT NULL,
-            leased_until_unix BIGINT NOT NULL,
-            namespace TEXT NOT NULL,
-            admin_url TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT 'starting',
-            -- Sentinel "an op is mid-flight on this tenant's listener,"
-            -- mirroring the supervisor coord pattern. Listener ops
-            -- (register_signal / display_signal / etc.) arm this with
-            -- a short TTL under a per-tenant xact-scoped advisory
-            -- lock; the reaper takes the same lock and reads the
-            -- sentinel before deciding to delete the row + scale down
-            -- the listener pod. No session-scoped locks anywhere.
-            op_in_flight_until_unix BIGINT
-        )"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_tenant_listener_owner ON tenant_listener(owner_pod_id)"#,
-    ];
-    for sql in stmts {
-        sqlx::query(sql).execute(pool).await?;
-    }
-    Ok(())
-}
+/// Spawn grace for a freshly-placed pool pod (listener / supervisor).
+///
+/// A new pod has a window between "spawned + registry row inserted" and
+/// "its first work is recorded in the DB" (a listener's
+/// `signal.listener_pod`, a supervisor's `infra_owner` row). During that
+/// window the idle reaper would see ZERO work on the pod and tear it
+/// down mid-setup (the "object has been deleted" race). The pod's
+/// registry row carries a `grace_until_unix`; the idle reaper skips any
+/// pod still inside its grace. Sized to comfortably cover spawn ->
+/// health-wait -> register -> first work-row write under cluster load,
+/// while still letting a pod whose placement genuinely failed get reaped
+/// shortly after. Distinct from the ownership lease: the lease says
+/// "which dispatcher drives this pod," the grace says "this pod is too
+/// young to be judged idle yet."
+pub const SPAWN_GRACE_SECS: i64 = 30;
 
 pub fn is_lease_live(leased_until_unix: i64) -> bool {
     leased_until_unix >= now_unix()
-}
-
-pub async fn renew_tenant_listener(
-    pool: &PgPool,
-    tenant_id: &str,
-    pod_id: &str,
-) -> Result<bool> {
-    let leased_until = now_unix() + LEASE_DURATION_SECS;
-    // Only renew rows that are still LIVE (starting / alive). A row left in
-    // `stopping` means a reap began and did not finish (the owner crashed
-    // between `claim_stopping` and `delete_row`, or `backend.stop` hung).
-    // Renewing such a row keeps its lease alive forever, which defeats the
-    // crash-recovery in `decide_under_lock` (it only adopts a `stopping` row
-    // once the lease lapses) and wedges every `with_listener` into waiting on a
-    // stop that never completes. Letting a stuck `stopping` lease lapse IS the
-    // recovery: the next ensure adopts it, re-runs the idempotent stop, and
-    // respawns.
-    let res = sqlx::query(
-        "UPDATE tenant_listener \
-         SET leased_until_unix = $1 \
-         WHERE tenant_id = $2 AND owner_pod_id = $3 AND state <> 'stopping'",
-    )
-    .bind(leased_until)
-    .bind(tenant_id)
-    .bind(pod_id)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected() > 0)
-}
-
-/// One row-state snapshot for the listener reaper. The reaper walks
-/// every row, takes an EXCLUSIVE per-tenant operation lock to fence
-/// off in-flight `with_listener` calls, then decides whether to kill.
-#[derive(Debug, Clone)]
-pub struct ListenerRowSnapshot {
-    pub tenant_id: String,
-    pub namespace: String,
-    pub state: String,
-}
-
-pub async fn list_tenant_listener_rows(pool: &PgPool) -> Result<Vec<ListenerRowSnapshot>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT tenant_id, namespace, state FROM tenant_listener",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(tenant_id, namespace, state)| ListenerRowSnapshot {
-            tenant_id,
-            namespace,
-            state,
-        })
-        .collect())
 }
 
 pub fn now_unix() -> i64 {
@@ -171,71 +100,118 @@ pub fn advisory_key(domain: &str, scope: &str) -> i64 {
 /// Domain strings for advisory-key derivation. Use
 /// `advisory_key(domain, scope)` at the call site.
 pub const SUPERVISOR_COORD_DOMAIN: &str = "weft_supervisor_coord";
-pub const LISTENER_OP_DOMAIN: &str = "tenant_listener_op";
-pub const LISTENER_ROW_DOMAIN: &str = "tenant_listener_row";
+/// Serializes listener pick-or-spawn so a cold-start burst of
+/// concurrent placements funnels to ONE new listener instead of each
+/// spawning its own (the thundering-herd race). One scope value
+/// (`"placement"`): the pool is global.
+pub const LISTENER_POOL_DOMAIN: &str = "weft_listener_pool";
+/// Serializes pool scale-DOWN (drain + reap) cluster-wide so two
+/// dispatcher replicas never consolidate the same pool at once (which
+/// would drain one pod twice, or drain two pods onto each other). One
+/// scope value per pool (`"listener"` / `"supervisor"`). A dispatcher
+/// that fails the try-lock simply skips this cycle; the next sweep
+/// retries. Mirrors the pick-or-spawn lock shape.
+pub const POOL_SCALEDOWN_DOMAIN: &str = "weft_pool_scaledown";
+/// Serializes the RE-PLACEMENT of a single signal (reserve generation ->
+/// register on the new pod -> write the holder) cluster-wide, keyed by
+/// signal token. Without it, two concurrent re-placements of one token
+/// (a drain racing a fire-path re-place, or two idle-signal fires on two
+/// dispatchers) can leave the holder column pointing at a pod registered
+/// under a LOWER generation than another still-live pod, defeating the
+/// broker's stale-fire fence (which assumes the row's generation is the
+/// highest any live holder carries). Holding this across the whole
+/// sequence makes "the highest reserved generation is the final holder"
+/// an invariant instead of a race outcome. The scope is the token.
+pub const SIGNAL_PLACEMENT_DOMAIN: &str = "weft_signal_placement";
 
-/// TTL on the `sync_in_flight_until_unix` sentinel and on the
-/// `tenant_listener.op_in_flight_until_unix` sentinel. Both are
-/// dispatcher-side heartbeats: a short TTL bounds "how long after
-/// the dispatcher dies before the reaper can clean up." The
-/// `TtlHeartbeat` machinery (below) re-arms the sentinel every
-/// `TTL / 3` while work runs, so user-code runtime doesn't push
-/// against this bound; only dispatcher liveness does.
-pub const SENTINEL_TTL_SECS: i64 = 30;
-
-/// Background heartbeat that re-arms a TTL sentinel column on a
-/// fixed interval. Owns the spawned task; Drop aborts it. The
-/// sentinel naturally expires `TTL` seconds after the last
-/// heartbeat (i.e. after the holder dies, panics, or releases).
+/// Run `body` while holding the TRANSACTION-SCOPED advisory lock for
+/// `key`, TRY-locking. Returns `Ok(None)` immediately if another holder
+/// has the lock (caller decides what skipping means), else runs `body`
+/// and returns `Ok(Some(result))`.
 ///
-/// One abstraction, two callers:
-///   - `ActivateKeepAlive` (listener.rs): wraps this for the
-///     per-tenant listener op-sentinel.
-///   - the `sync` handler (api/infra.rs): spawns one directly for
-///     the per-project sync-in-flight sentinel.
+/// Panic-safety is the reason this is transaction-scoped, not session-
+/// scoped. `pg_advisory_lock` (session-scoped) is NOT released when a
+/// pooled connection is returned to the pool, so a panic mid-`body`
+/// would orphan the lock on a recycled connection and wedge every future
+/// acquisition until that physical connection ages out. A
+/// `pg_try_advisory_xact_lock` is held by the transaction and released
+/// the instant the transaction ends, including the ROLLBACK that sqlx's
+/// `Transaction::drop` issues on a panic unwind. So we hold the lock via
+/// a live `Transaction` (its connection is the lock holder) while `body`
+/// runs its own work on SEPARATE pool connections, then drop the
+/// transaction to release. No `catch_unwind`, no orphaned lock.
 ///
-/// Both pass a refresh closure; the only per-call-site difference
-/// is which sentinel column gets re-armed.
-pub struct TtlHeartbeat {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl TtlHeartbeat {
-    /// `refresh` is invoked every `interval` until Drop. Failures
-    /// are logged; the sentinel falls back to TTL expiry. The
-    /// label is for tracing only.
-    pub fn spawn<F, Fut>(label: &'static str, interval: std::time::Duration, refresh: F) -> Self
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
-    {
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                if let Err(e) = refresh().await {
-                    tracing::warn!(
-                        target: "weft_dispatcher::lease",
-                        heartbeat = label,
-                        error = %e,
-                        "TtlHeartbeat refresh failed; sentinel will expire"
-                    );
-                }
-            }
-        });
-        Self { handle }
+/// The lock lives in Postgres, so it serializes across N dispatcher
+/// replicas.
+pub async fn with_advisory_lock<T, F, Fut>(
+    pg_pool: &sqlx::postgres::PgPool,
+    key: i64,
+    body: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    // The transaction's connection holds the xact lock for as long as the
+    // transaction is alive. We never write through `tx`; `body` uses the
+    // pool. Dropping `tx` (normal end OR panic unwind) rolls back and
+    // releases the lock.
+    let mut tx = pg_pool.begin().await?;
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !got {
+        return Ok(None);
     }
+    let result = body().await;
+    // Explicit rollback releases the xact lock now (rather than waiting
+    // for the implicit drop-rollback); errors here are non-fatal because
+    // the drop would release it anyway.
+    let _ = tx.rollback().await;
+    result.map(Some)
 }
 
-impl Drop for TtlHeartbeat {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
+/// Like `with_advisory_lock` but BLOCKS until the lock is acquired
+/// (`pg_advisory_xact_lock`, no try), then runs `body`. Use when the
+/// caller must serialize behind the current holder rather than skip
+/// (e.g. re-placing a single signal: the second re-placement waits for
+/// the first, then re-checks state under the lock). Same panic-safety:
+/// the xact lock dies with the transaction. While blocked it pins one
+/// pool connection, which is fine for brief, low-contention per-key
+/// serialization (one signal token / one project at a time).
+pub async fn with_advisory_lock_blocking<T, F, Fut>(
+    pg_pool: &sqlx::postgres::PgPool,
+    key: i64,
+    body: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *tx)
+        .await?;
+    let result = body().await;
+    let _ = tx.rollback().await;
+    result
 }
 
-/// Default heartbeat interval: TTL / 3 (with a 5s floor so we
-/// don't hammer Postgres for tiny TTLs).
-pub fn heartbeat_interval() -> std::time::Duration {
-    std::time::Duration::from_secs((SENTINEL_TTL_SECS / 3).max(5) as u64)
+/// Convenience wrapper: hold the cluster-wide scale-down lock for
+/// `pool_scope` (`"listener"` / `"supervisor"`). `Ok(None)` means a
+/// sibling is consolidating this pool right now; skip this cycle.
+pub async fn with_scaledown_lock<T, F, Fut>(
+    pg_pool: &sqlx::postgres::PgPool,
+    pool_scope: &str,
+    body: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    with_advisory_lock(pg_pool, advisory_key(POOL_SCALEDOWN_DOMAIN, pool_scope), body).await
 }
 
 #[cfg(test)]
@@ -255,24 +231,13 @@ mod tests {
             advisory_key(SUPERVISOR_COORD_DOMAIN, "tenant-a"),
             5099131965359238650,
         );
-        assert_eq!(
-            advisory_key(LISTENER_OP_DOMAIN, "tenant-a"),
-            -2454865506030971390,
-        );
-        assert_eq!(
-            advisory_key(LISTENER_ROW_DOMAIN, "tenant-a"),
-            8045791053396251109,
-        );
     }
 
-    /// Domain separation: same scope, different domain → different key.
+    /// Domain separation: same scope, different domain, different key.
     #[test]
     fn advisory_key_domains_separate() {
         let a = advisory_key(SUPERVISOR_COORD_DOMAIN, "tenant-a");
-        let b = advisory_key(LISTENER_OP_DOMAIN, "tenant-a");
-        let c = advisory_key(LISTENER_ROW_DOMAIN, "tenant-a");
+        let b = advisory_key("some_other_domain", "tenant-a");
         assert_ne!(a, b);
-        assert_ne!(b, c);
-        assert_ne!(a, c);
     }
 }

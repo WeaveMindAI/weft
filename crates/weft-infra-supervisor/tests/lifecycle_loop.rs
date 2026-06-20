@@ -606,3 +606,127 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
     assert_eq!(row.units.get("web").unwrap().status, Status::Running);
     assert_eq!(row.units.get("license").unwrap().status, Status::Running);
 }
+
+// ---------- ownership fence: a displaced owner must not finish its command ----------
+//
+// The supervisor's single-actor authority is the exclusive `infra_owner`
+// lease. If ownership moves to another pod mid-command (a scale-down
+// drain, or a lease takeover after this pod looked dead), every state
+// write from the old pod is rejected by the broker, so the old pod must
+// NOT complete the command: it stays uncompleted for the new owner to
+// re-run (the user never re-acts). The fake models the move with
+// `set_project_owned(false)`, which returns `Raced` from every
+// ownership-gated write exactly as the broker's `owns_project_predicate`
+// would. These tests pin "a displaced owner leaves the command for the
+// new owner" for each verb that mutates cluster state.
+
+#[tokio::test]
+async fn stop_aborts_without_completing_when_ownership_moves_mid_command() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.kube
+        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
+    // Ownership has already moved to another pod by the time the per-unit
+    // `set_status` write lands. The broker rejects it (Raced).
+    rig.broker.set_project_owned(PROJECT, false);
+    rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
+
+    let did_work = rig.tick_lifecycle().await.unwrap();
+    assert!(did_work, "the command was claimed, so the tick did work");
+
+    // The command is NOT completed: it remains for the new owner to run.
+    assert!(
+        rig.broker.completed_commands().is_empty(),
+        "a displaced owner must not complete the command; completed={:?}",
+        rig.broker.completed_commands()
+    );
+}
+
+#[tokio::test]
+async fn terminate_does_not_remove_node_when_ownership_moves_mid_command() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.kube
+        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
+    rig.broker.set_project_owned(PROJECT, false);
+    rig.broker.enqueue_command(cmd(2, Verb::Terminate, Some(NODE)));
+
+    rig.tick_lifecycle().await.unwrap();
+
+    // The cascade delete was rejected: the node row survives for the new
+    // owner to terminate, and the command is left uncompleted.
+    assert!(
+        rig.broker.infra_node(PROJECT, NODE).is_some(),
+        "remove_node must be rejected when ownership moved; the row must survive"
+    );
+    assert!(
+        rig.broker.completed_commands().is_empty(),
+        "a displaced owner must not complete the terminate; completed={:?}",
+        rig.broker.completed_commands()
+    );
+    // No `terminated` event was emitted (we aborted before it).
+    assert!(
+        !rig.broker.events().iter().any(|(_, _, k, _)| k == "terminated"),
+        "no terminated event when ownership moved mid-terminate"
+    );
+}
+
+#[tokio::test]
+async fn apply_does_not_complete_when_ownership_moves_mid_command() {
+    let rig = rig();
+    rig.broker.set_project_owned(PROJECT, false);
+    rig.broker.enqueue_command(apply_cmd(3));
+
+    rig.tick_lifecycle().await.unwrap();
+
+    // set_provisioning is rejected (Raced) before any kube apply, and the
+    // command is left uncompleted for the new owner.
+    assert!(
+        rig.broker.completed_commands().is_empty(),
+        "a displaced owner must not complete the apply; completed={:?}",
+        rig.broker.completed_commands()
+    );
+    assert!(
+        rig.broker.infra_node(PROJECT, NODE).is_none(),
+        "no Provisioning row should be committed by a displaced owner"
+    );
+}
+
+#[tokio::test]
+async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
+    // The whole point of leaving the command uncompleted: the NEW owner
+    // re-runs it and finishes it, with no user re-action. We model the
+    // same rig as the new owner: ownership is restored (it now holds the
+    // lease), the SAME command is claimed again, and this time it
+    // completes exactly once.
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.kube
+        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
+
+    // First owner: loses ownership mid-stop, leaves the command.
+    rig.broker.set_project_owned(PROJECT, false);
+    rig.broker.enqueue_command(cmd(7, Verb::Stop, Some(NODE)));
+    rig.tick_lifecycle().await.unwrap();
+    assert!(
+        rig.broker.completed_commands().is_empty(),
+        "displaced owner left the command uncompleted"
+    );
+
+    // New owner: holds the lease, the command is re-enqueued (the broker's
+    // claim re-surfaces the still-uncompleted row), runs to completion.
+    rig.broker.set_project_owned(PROJECT, true);
+    rig.broker.enqueue_command(cmd(7, Verb::Stop, Some(NODE)));
+    rig.tick_lifecycle().await.unwrap();
+
+    assert_eq!(
+        rig.broker.completed_commands(),
+        vec![(7, None)],
+        "the new owner completes the command exactly once, no user re-action"
+    );
+    let writes = rig.broker.status_writes();
+    assert!(
+        writes.iter().any(|(_, _, s)| *s == Status::Stopped),
+        "the new owner actually performed the stop"
+    );
+}

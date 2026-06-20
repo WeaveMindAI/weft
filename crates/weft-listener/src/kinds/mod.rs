@@ -105,6 +105,8 @@ pub trait KindHandler: Send + Sync {
     fn spawn_task(
         &self,
         token: &str,
+        tenant_id: &str,
+        placement_generation: i64,
         spec: &SignalSpec,
         kind_state: &Value,
         sink: FireSignalSink,
@@ -184,10 +186,12 @@ pub enum RoutingSource {
 /// in.
 pub async fn register_in_registry(
     token: String,
+    tenant_id: String,
     spec: SignalSpec,
     node_id: String,
     is_resume: bool,
     color: Option<String>,
+    placement_generation: i64,
     source: RoutingSource,
     registry: Arc<Registry>,
     sink: FireSignalSink,
@@ -202,16 +206,31 @@ pub async fn register_in_registry(
         }
         RoutingSource::Restore { routing, kind_state } => (routing, kind_state),
     };
+    // The held-event loops (Timer, SSE, poll, socket) capture the
+    // signal's tenant AND its placement generation so the fire they
+    // enqueue is stamped with both. The pod has no single tenant, so
+    // tenant travels with the signal; the generation lets the broker
+    // fence a stale old-pod fire during a scale-down move overlap.
     let task = handler
-        .spawn_task(&token, &spec, &kind_state_owned, sink.clone(), config.clone())?
+        .spawn_task(
+            &token,
+            &tenant_id,
+            placement_generation,
+            &spec,
+            &kind_state_owned,
+            sink.clone(),
+            config.clone(),
+        )?
         .map(|h| Arc::new(TaskGuard::new(h)));
     registry.insert(
         token,
         RegisteredSignal {
             spec,
             node_id,
+            tenant_id,
             is_resume,
             color,
+            placement_generation,
             task,
             routing: routing.clone(),
         },
@@ -228,11 +247,14 @@ pub async fn process(
     registry: Arc<Registry>,
 ) -> Result<ProcessOutcome> {
     let Some(signal) = registry.get(token) else {
+        // This pod does not hold the signal. Almost always means the
+        // dispatcher routed here during a scale-down move (the signal was
+        // re-placed onto another pod). Return NotHeld so the dispatcher
+        // re-resolves the holder and retries, instead of silently
+        // dropping the fire.
         return Ok(ProcessOutcome {
             value: payload,
-            target: ProcessTarget::Drop {
-                reason: Some("unknown token".into()),
-            },
+            target: ProcessTarget::NotHeld,
         });
     };
 

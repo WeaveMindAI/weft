@@ -111,10 +111,7 @@ pub async fn run_loop(state: SupervisorState) -> Result<()> {
 /// running inside `run_loop`) so integration tests can step the
 /// loop one tick at a time.
 pub async fn tick(state: &SupervisorState) -> Result<()> {
-    let projects = state
-        .broker
-        .projects_for_tenant(&state.tenant_id)
-        .await?;
+    let projects = state.broker.owned_projects(&state.pod_name).await?;
     for project in &projects {
         if let Err(e) = tick_project(state, project).await {
             tracing::warn!(
@@ -343,6 +340,7 @@ async fn tick_project(
             let outcome = state
                 .broker
                 .set_status(
+                    &state.pod_name,
                     None,
                     &project.project_id,
                     &node_id,

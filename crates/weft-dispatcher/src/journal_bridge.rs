@@ -289,7 +289,7 @@ async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> a
     let project_id = removed.first().map(|m| m.project_id.clone());
     state
         .listeners
-        .unregister_many_if_alive(&state.pg_pool, &removed)
+        .unregister_many(&state.pg_pool, &removed)
         .await;
 
     // If signal_remove_for_color found nothing (entry trigger or

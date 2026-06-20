@@ -110,28 +110,6 @@ pub struct PerNodeRequest {
 // Handlers
 // =================================================================
 
-/// Arm the sync-in-flight sentinel under a per-tenant xact-scoped
-/// advisory lock. Delegates to `ProjectStoreOps::arm_sync_with_advisory_lock`
-/// so the trait surface stays the single I/O boundary (layer-3
-/// rigs that fake `ProjectStoreOps` see the call).
-///
-/// xact-scoped means the lock auto-releases on COMMIT; no
-/// session-leak back into the connection pool.
-async fn arm_sync_sentinel(
-    state: &DispatcherState,
-    project_id: uuid::Uuid,
-    tenant_id: &str,
-) -> anyhow::Result<()> {
-    let key = crate::lease::advisory_key(
-        crate::lease::SUPERVISOR_COORD_DOMAIN,
-        tenant_id,
-    );
-    let until = crate::lease::now_unix() + crate::lease::SENTINEL_TTL_SECS;
-    state
-        .projects
-        .arm_sync_with_advisory_lock(project_id, key, until)
-        .await
-}
 
 pub async fn sync(
     State(state): State<DispatcherState>,
@@ -141,45 +119,12 @@ pub async fn sync(
     let id = parse_id(&id_str)?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Sentinel + xact lock: mark "sync in flight" so the reaper
-    // doesn't scale the tenant's supervisor down while this
-    // handler runs. The TTL is short (SENTINEL_TTL_SECS); a
-    // background TtlHeartbeat re-arms it for the duration of
-    // sync, so user-code runtime (which can be unbounded inside
-    // run_infra_setup) doesn't bump against the TTL. Dispatcher
-    // liveness alone bounds the wait: if THIS pod dies, the
-    // heartbeat stops, the sentinel expires in <= TTL, the
-    // reaper proceeds.
-    //
-    // Why xact-scoped + sentinel instead of a session-held lock:
-    // sqlx pool connections don't release session-scoped advisory
-    // locks on PoolConnection drop; they survive on the backend
-    // until the session closes. That leaks locks across unrelated
-    // pool users. Xact-scoped locks auto-release on COMMIT.
-    let tenant_id = state
-        .projects
-        .tenant_for(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tenant_for: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    arm_sync_sentinel(&state, id, &tenant_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("arm_sync_sentinel: {e}")))?;
-    let _heartbeat = {
-        let state_clone = state.clone();
-        let tenant_clone = tenant_id.clone();
-        crate::lease::TtlHeartbeat::spawn(
-            "SyncSentinel",
-            crate::lease::heartbeat_interval(),
-            move || {
-                let state = state_clone.clone();
-                let tenant = tenant_clone.clone();
-                async move {
-                    arm_sync_sentinel(&state, id, &tenant).await
-                }
-            },
-        )
-    };
+    // No sync-in-flight sentinel: the supervisor pool reaps a supervisor
+    // by OWNERSHIP (a pod owning zero projects), not by a global idle
+    // scan that a sync would need to block. A project being synced is
+    // owned by its supervisor (non-zero, so never reaped), and
+    // `ensure_supervisor` below guarantees a live pod exists; there is no
+    // reaper race for a sentinel to prevent.
     sync_inner(state, id, body).await
 }
 
@@ -284,7 +229,7 @@ async fn sync_inner(
     // Idempotent: applies the same Deployment manifest every time;
     // k8s no-ops if already present. MUST land before any code path
     // that enqueues a lifecycle command (orphan reap, run_infra_setup).
-    ensure_supervisor_for_project(&state, &project_id)
+    ensure_supervisor(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
@@ -783,36 +728,29 @@ mod tests {
 /// every `infra_*` row for the project and deletes the project
 /// namespace (which takes any leftover resources with it).
 ///
-/// Lazy supervisor spawn. Renders + applies the per-tenant
-/// `weft-infra-supervisor` Deployment in the tenant namespace.
-/// Idempotent: kubectl apply on the same manifest is a no-op when
-/// the cluster already matches. Called at the top of sync before
-/// any orphan reap or Apply command enqueue.
-async fn ensure_supervisor_for_project(
-    state: &DispatcherState,
-    project_id: &str,
-) -> anyhow::Result<()> {
-    let tenant = state.tenant_router.tenant_for_project(project_id);
-    let namespace = state.namespace_mapper.namespace_for(&tenant);
-    crate::tenant_namespace::ensure_supervisor_deployment(
-        &*state.kube,
-        &namespace,
-        tenant.as_str(),
-        &state.supervisor_image,
-    )
-    .await
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "ensure_supervisor_deployment(tenant={}): {e}",
-            tenant.as_str()
+/// Lazy supervisor spawn. Ensures AT LEAST ONE pooled infra-supervisor
+/// pod is live in the control-plane namespace (the pool scales up from
+/// there by load). Idempotent: a no-op when any live pod already exists,
+/// spawns one when the pool is empty. Called at the top of sync before
+/// any orphan reap or Apply command enqueue, so a project that just
+/// declared infra has a supervisor able to claim it.
+async fn ensure_supervisor(state: &DispatcherState) -> anyhow::Result<()> {
+    state
+        .supervisors
+        .ensure_at_least_one(
+            state.supervisor_backend.as_ref(),
+            &state.pg_pool,
+            state.pod_id.as_str(),
         )
-    })
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("ensure supervisor pool: {e}"))
 }
 
-/// Enqueue a lifecycle command AFTER making sure the per-tenant
-/// supervisor is alive. The supervisor's claim loop only runs when
-/// its Deployment has replicas=1, so an enqueue with the reaper
-/// having scaled the supervisor down would sit unclaimed forever.
+/// Enqueue a lifecycle command AFTER making sure at least one pooled
+/// supervisor is alive. A supervisor only claims a command for a project
+/// it owns, and only a live supervisor claims+owns projects, so an
+/// enqueue with an empty supervisor pool would sit unclaimed forever.
 ///
 /// Every dispatcher-side enqueue path goes through this helper.
 /// `issue_lifecycle` itself stays a plain DB-write helper (no
@@ -827,7 +765,7 @@ async fn issue_lifecycle_ensuring_supervisor(
     running_policy: RunningPolicy,
     force: bool,
 ) -> Result<i64, (StatusCode, String)> {
-    ensure_supervisor_for_project(state, project_id)
+    ensure_supervisor(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("ensure_supervisor: {e}")))?;
     let tenant = state.tenant_router.tenant_for_project(project_id);

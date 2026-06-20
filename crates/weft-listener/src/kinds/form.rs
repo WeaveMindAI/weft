@@ -44,6 +44,8 @@ impl KindHandler for FormHandler {
     fn spawn_task(
         &self,
         _token: &str,
+        _tenant_id: &str,
+        _placement_generation: i64,
         _spec: &SignalSpec,
         _kind_state: &Value,
         _sink: FireSignalSink,
@@ -139,8 +141,10 @@ mod tests {
         let sig = RegisteredSignal {
             spec,
             node_id: "node-7".into(),
+            tenant_id: "t".into(),
             is_resume: true,
             color: Some("c".into()),
+            placement_generation: 0,
             task: None,
             routing: SignalRouting {
                 surface: SignalSurface::TaskCallback,
@@ -163,8 +167,10 @@ mod tests {
         let sig = RegisteredSignal {
             spec: form_spec(),
             node_id: "n".into(),
+            tenant_id: "t".into(),
             is_resume: true,
             color: Some("c".into()),
+            placement_generation: 0,
             task: None,
             routing: SignalRouting {
                 surface: SignalSurface::TaskCallback,

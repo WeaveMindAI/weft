@@ -8,8 +8,6 @@
 //! to "does the resolved hash match what's currently applied".
 //!
 //! Design notes:
-//! - `extras: Vec<Value>` is the escape hatch for resources the typed
-//!   surface doesn't model (custom CRDs, complex Ingress, etc).
 //! - Weft labels (`weft.dev/{role,tenant,project,node,instance}`) are
 //!   stamped by the spec compiler, NOT by node authors. Specs that
 //!   include weft.dev labels manually have them overridden.
@@ -59,12 +57,6 @@ pub struct InfraSpec {
     /// What stop/upgrade/terminate mean for this node.
     #[serde(default)]
     pub lifecycle: Lifecycle,
-
-    /// Raw k8s manifests applied alongside the typed surface. Labels
-    /// are stamped by the compiler. Use for resources the typed
-    /// surface doesn't model.
-    #[serde(default)]
-    pub extras: Vec<Value>,
 }
 
 // =============================================================
@@ -936,14 +928,12 @@ pub enum ProvisionContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn empty_spec_serializes_compactly() {
         let spec = InfraSpec::default();
         let s = serde_json::to_string(&spec).unwrap();
         assert!(s.contains("\"units\":[]"));
-        assert!(s.contains("\"extras\":[]"));
     }
 
     #[test]
@@ -1001,11 +991,6 @@ mod tests {
                 egress: vec![EgressRule::ToInternet],
             },
             lifecycle: Lifecycle::default(),
-            extras: vec![json!({
-                "apiVersion": "networking.k8s.io/v1",
-                "kind": "Ingress",
-                "metadata": { "name": "extra" }
-            })],
         };
 
         let json_value = serde_json::to_value(&original).expect("serialize");

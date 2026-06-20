@@ -204,7 +204,7 @@ pub async fn run_loop(state: SupervisorState) -> Result<()> {
 pub async fn tick(state: &SupervisorState) -> Result<bool> {
     let Some(cmd) = state
         .broker
-        .claim_command(&state.tenant_id, &state.pod_name)
+        .claim_command(&state.pod_name)
         .await?
     else {
         return Ok(false);
@@ -218,18 +218,21 @@ pub async fn tick(state: &SupervisorState) -> Result<bool> {
     );
     let result = execute(state, &cmd).await;
     let error = result.as_ref().err().map(|e| e.to_string());
-    // `command_complete` returns Raced if the row was already
-    // completed (sibling pod took the claim via lease takeover,
-    // or remove_node cascade cancelled the command). Log + move
-    // on; don't propagate as a failure of this tick.
+    // `command_complete` returns Raced if the row was already completed
+    // (remove_node cascade cancelled it) OR this pod no longer owns the
+    // project (drain / lease takeover moved it mid-command). In the
+    // ownership case the command stays UNCOMPLETED on purpose, so the
+    // new owner re-runs and finishes it (the user never re-acts). Either
+    // way, log + move on; never propagate as a failure of this tick.
     let outcome = state
         .broker
-        .command_complete(cmd.id, error.as_deref())
+        .command_complete(&state.pod_name, cmd.id, error.as_deref())
         .await?;
     if outcome.is_raced() {
         tracing::info!(
             command_id = cmd.id,
-            "command_complete raced (already completed or claim reassigned); no-op"
+            "command_complete raced (already completed, or project ownership moved \
+             and the command is left for the new owner); no-op"
         );
     }
     if let Err(e) = result {
@@ -282,13 +285,15 @@ async fn execute(
         );
         return Ok(());
     }
-    // The project namespace isn't on the command row; fetch via
-    // projects_for_tenant.
-    let projects = state.broker.projects_for_tenant(&state.tenant_id).await?;
+    // The project namespace isn't on the command row; fetch via the
+    // projects this pod owns. The command was only claimable because
+    // this pod owns the project (the broker's claim ownership predicate),
+    // so it is guaranteed present in the owned set.
+    let projects = state.broker.owned_projects(&state.pod_name).await?;
     let project = projects
         .iter()
         .find(|p| p.project_id == cmd.project_id)
-        .ok_or_else(|| anyhow!("project not in tenant's set"))?;
+        .ok_or_else(|| anyhow!("project not in supervisor's owned set"))?;
     let namespace = project.project_namespace.clone();
 
     match cmd.verb {
@@ -318,6 +323,7 @@ async fn execute(
                     if let Err(e) = state
                         .broker
                         .set_status(
+                            &state.pod_name,
                             Some(cmd.id),
                             &cmd.project_id,
                             &n.node_id,
@@ -377,6 +383,7 @@ async fn execute(
                     let outcome = state
                         .broker
                         .set_status(
+                            &state.pod_name,
                             Some(cmd.id),
                             &cmd.project_id,
                             &n.node_id,
@@ -425,6 +432,7 @@ async fn execute(
                 if let Err(e) = state
                     .broker
                     .set_status(
+                        &state.pod_name,
                         Some(cmd.id),
                         &cmd.project_id,
                         &n.node_id,
@@ -454,7 +462,24 @@ async fn execute(
                     .kube
                     .delete_by_label(&namespace, &selector, &n.preserve_pvcs)
                     .await?;
-                state.broker.remove_node(&cmd.project_id, &n.node_id).await?;
+                if state
+                    .broker
+                    .remove_node(&state.pod_name, &cmd.project_id, &n.node_id)
+                    .await?
+                    .is_raced()
+                {
+                    // Lost ownership mid-Terminate (drain / lease
+                    // takeover). Abort: leave the command uncompleted so
+                    // the new owner re-runs the (idempotent) terminate.
+                    // command_complete will also be rejected for the same
+                    // reason, so `tick` won't mark it done.
+                    tracing::info!(
+                        project_id = %cmd.project_id,
+                        node_id = %n.node_id,
+                        "remove_node raced (project ownership moved); aborting terminate for re-run"
+                    );
+                    return Ok(());
+                }
                 state
                     .broker
                     .event_record(
@@ -500,15 +525,19 @@ async fn execute_apply(
         .map_err(|e| anyhow!("deserialize spec_json: {e}"))?;
 
     // Resolve project namespace + tenant. Both are needed for the
-    // compile context.
+    // compile context. The pooled supervisor has no tenant of its own,
+    // so the tenant comes from the project. The command was only
+    // claimable because this pod owns the project, so it is in the owned
+    // set.
     let project = state
         .broker
-        .projects_for_tenant(&state.tenant_id)
+        .owned_projects(&state.pod_name)
         .await?
         .into_iter()
         .find(|p| p.project_id == cmd.project_id)
-        .ok_or_else(|| anyhow!("project not in tenant's set"))?;
+        .ok_or_else(|| anyhow!("project not in supervisor's owned set"))?;
     let namespace = project.project_namespace;
+    let project_tenant = project.tenant_id;
 
     // Per-(project, node) image tag map, used to resolve
     // `Image::Local { name }` references at compile time. Converted
@@ -556,7 +585,7 @@ async fn execute_apply(
     };
 
     let compile_ctx = CompileContext {
-        tenant_id: &state.tenant_id,
+        tenant_id: &project_tenant,
         project_id: &cmd.project_id,
         node_id,
         instance_id: &instance_id,
@@ -618,6 +647,7 @@ async fn execute_apply(
     let provision_outcome = state
         .broker
         .set_provisioning(
+            &state.pod_name,
             cmd.id,
             &cmd.project_id,
             node_id,
@@ -633,10 +663,13 @@ async fn execute_apply(
         )
         .await?;
     if provision_outcome.is_raced() {
+        // Project ownership moved before we committed the Provisioning
+        // row (or the node was removed). Abort without completing; the
+        // new owner re-runs the apply from scratch.
         tracing::info!(
             project_id = %cmd.project_id,
             node_id = %node_id,
-            "set_provisioning raced; another pod owns this command"
+            "set_provisioning raced; project ownership moved, leaving apply for the new owner"
         );
         return Ok(());
     }
@@ -711,6 +744,7 @@ async fn execute_apply(
             if let Err(status_err) = state
                 .broker
                 .set_status(
+                    &state.pod_name,
                     Some(cmd.id),
                     &cmd.project_id,
                     node_id,
@@ -735,6 +769,7 @@ async fn execute_apply(
     let outcome = state
         .broker
         .set_applied(
+            &state.pod_name,
             cmd.id,
             &cmd.project_id,
             node_id,
@@ -752,13 +787,14 @@ async fn execute_apply(
         )
         .await?;
     if outcome.is_raced() {
-        // The command was reassigned (lease takeover) or the
-        // node was removed mid-apply. Don't fire the Started
-        // event; whichever pod owns the claim now is responsible.
+        // Project ownership moved mid-apply (drain / lease takeover) or
+        // the node was removed. Don't fire the Started event and don't
+        // complete the command; the new owner re-runs the (idempotent)
+        // apply and finishes it.
         tracing::info!(
             project_id = %cmd.project_id,
             node_id = %node_id,
-            "set_applied raced; another pod owns this command"
+            "set_applied raced; project ownership moved, leaving apply for the new owner"
         );
         return Ok(());
     }

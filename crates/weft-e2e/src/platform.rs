@@ -126,6 +126,78 @@ impl Platform {
         })
     }
 
+    /// Sweep test-created pooled-pod CLONES left behind by earlier runs:
+    /// the extra listener / supervisor pods a scale-down test stood up
+    /// with [`Self::add_second_listener`] / [`Self::add_second_supervisor`].
+    /// A failed run leaves its clone up (the rig preserves failure state
+    /// for inspection), so the NEXT run sweeps the stragglers at startup
+    /// to keep the cluster from accumulating idle pods across runs.
+    ///
+    /// Only e2e CLONES are touched (their names carry the `e2e` marker the
+    /// clone helpers mint); a real pooled pod the dispatcher spawned is
+    /// never matched. The registry row is deleted too so placement no
+    /// longer sees a ghost. Deployment + Service + row, by exact name.
+    pub async fn sweep_e2e_clones(&self) -> Result<()> {
+        // Names of every clone we have a registry row for (listener +
+        // supervisor). The row carries the namespace for the kubectl
+        // delete; deleting by exact name (not a label guess) keeps the
+        // sweep to e2e artifacts only.
+        let listeners: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pod_name, namespace FROM listener_pod WHERE pod_name LIKE '%e2e%'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("query leftover e2e listener clones")?;
+        let supervisors: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pod_name, namespace FROM supervisor_pod WHERE pod_name LIKE '%e2e%'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("query leftover e2e supervisor clones")?;
+
+        for (pod_name, namespace) in listeners.iter().chain(supervisors.iter()) {
+            // A clone is a Deployment (+ a Service for listeners). Delete
+            // both by name, ignoring NotFound (a half-cleaned clone may
+            // have only one). The registry row goes last so a failed
+            // kubectl delete still leaves the row for a retry next run.
+            for kind in ["deployment", "service"] {
+                self.kubectl_delete_ignore_missing(kind, namespace, pod_name)
+                    .await?;
+            }
+        }
+        sqlx::query("DELETE FROM listener_pod WHERE pod_name LIKE '%e2e%'")
+            .execute(&self.pool)
+            .await
+            .context("delete leftover e2e listener clone rows")?;
+        sqlx::query("DELETE FROM supervisor_pod WHERE pod_name LIKE '%e2e%'")
+            .execute(&self.pool)
+            .await
+            .context("delete leftover e2e supervisor clone rows")?;
+        Ok(())
+    }
+
+    /// `kubectl delete <kind> <name> -n <ns> --ignore-not-found`. A
+    /// missing resource is success (the clone's Deployment or Service may
+    /// already be gone); any other failure is surfaced.
+    async fn kubectl_delete_ignore_missing(
+        &self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<()> {
+        let out = tokio::process::Command::new("kubectl")
+            .args(["delete", kind, name, "-n", namespace, "--ignore-not-found"])
+            .output()
+            .await
+            .with_context(|| format!("kubectl delete {kind} {name}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "kubectl delete {kind} {name} -n {namespace} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    }
+
     // ---- Read surface: what the platform did underneath an execution ----
     //
     // NOTE on worker identity: a worker pod's name is DETERMINISTIC from its
@@ -366,6 +438,487 @@ impl Platform {
         .context("backdate worker_pod heartbeats")?;
         Ok(res.rows_affected())
     }
+
+    // ---- Listener pool: inspect placement + force a scale-down move ----
+
+    /// Live listener pods (name + namespace) from the `listener_pod`
+    /// registry, lease not expired. A pooled listener holds many signals;
+    /// this is the set the dispatcher places onto and consolidates.
+    pub async fn live_listener_pods(&self) -> Result<Vec<ListenerPodRow>> {
+        let rows: Vec<ListenerPodRow> = sqlx::query_as(
+            "SELECT pod_name, namespace FROM listener_pod \
+             WHERE leased_until_unix >= $1 ORDER BY pod_name",
+        )
+        .bind(now_unix())
+        .fetch_all(&self.pool)
+        .await
+        .context("query live listener_pod rows")?;
+        Ok(rows)
+    }
+
+    /// The `owner_pod_id` (the dispatcher pod that manages this listener)
+    /// for a listener pod. A clone inherits this so it is drained/reaped
+    /// by the real dispatcher rather than stranded under a synthetic owner.
+    async fn listener_pod_owner(&self, pod_name: &str) -> Result<String> {
+        let (owner,): (String,) =
+            sqlx::query_as("SELECT owner_pod_id FROM listener_pod WHERE pod_name = $1")
+                .bind(pod_name)
+                .fetch_one(&self.pool)
+                .await
+                .with_context(|| format!("read owner_pod_id of listener {pod_name}"))?;
+        Ok(owner)
+    }
+
+    /// The `owner_pod_id` for a supervisor pod (the supervisor twin of
+    /// [`Self::listener_pod_owner`]).
+    async fn supervisor_pod_owner(&self, pod_name: &str) -> Result<String> {
+        let (owner,): (String,) =
+            sqlx::query_as("SELECT owner_pod_id FROM supervisor_pod WHERE pod_name = $1")
+                .bind(pod_name)
+                .fetch_one(&self.pool)
+                .await
+                .with_context(|| format!("read owner_pod_id of supervisor {pod_name}"))?;
+        Ok(owner)
+    }
+
+    /// The pod currently holding a signal + its placement generation, by
+    /// token. `None` if the signal row is gone. Used to OBSERVE a move:
+    /// after a drain, the holder changes and the generation bumps.
+    pub async fn signal_placement(&self, token: &str) -> Result<Option<SignalPlacement>> {
+        let row: Option<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT listener_pod, placement_generation FROM signal WHERE token = $1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await
+        .context("query signal placement")?;
+        Ok(row.map(|(listener_pod, generation)| SignalPlacement {
+            listener_pod,
+            generation,
+        }))
+    }
+
+    /// Every signal token currently placed on `pod`, with its placement
+    /// generation. Lets a test pick a signal to move off a pod (e.g. to
+    /// load a freshly-cloned listener so it is not idle-reaped before the
+    /// scenario runs).
+    pub async fn signal_tokens_on_pod(&self, pod: &str) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT token, placement_generation FROM signal \
+             WHERE listener_pod = $1 ORDER BY token",
+        )
+        .bind(pod)
+        .fetch_all(&self.pool)
+        .await
+        .context("query signal tokens on pod")?;
+        Ok(rows)
+    }
+
+    /// Point a signal's placement at `pod` under `generation`: the same
+    /// END-STATE columns (`listener_pod` + `placement_generation`) the
+    /// dispatcher writes when it moves a signal. Production computes the
+    /// generation as current + 1 (`next_generation`, a pure read) and
+    /// writes the holder + generation together (`set_placement`); the rig
+    /// passes the next value directly, landing the identical row state.
+    /// Used to construct a deterministic move (combined with
+    /// `rehydrate_listener` so the target pod registers the signal through
+    /// its OWN production code), since the dispatcher's load-driven drain
+    /// cannot be steered from a test.
+    /// SYNC: signal placement columns <-> crates/weft-dispatcher/src/listener.rs (set_placement / next_generation)
+    pub async fn set_signal_placement(
+        &self,
+        token: &str,
+        pod: &str,
+        generation: i64,
+    ) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE signal SET listener_pod = $1, placement_generation = $2 WHERE token = $3",
+        )
+        .bind(pod)
+        .bind(generation)
+        .bind(token)
+        .execute(&self.pool)
+        .await
+        .context("set signal placement")?;
+        anyhow::ensure!(
+            res.rows_affected() == 1,
+            "set_signal_placement updated {} rows for token {token} (expected 1; bad token?)",
+            res.rows_affected()
+        );
+        Ok(())
+    }
+
+    /// POST a listener pod's REAL `/rehydrate` endpoint, making it
+    /// reconcile its in-RAM registry with the durable `signal` table: it
+    /// registers every signal `WHERE listener_pod = <this pod>` through
+    /// its own production register code. Reached via a short-lived
+    /// `kubectl port-forward` to the pod's Service (listeners have no
+    /// public ingress), the same operator-style access the platform layer
+    /// uses for Postgres. Lets a test make a chosen pod take over a
+    /// signal WITHOUT the test hand-building a register request: the
+    /// listener's own code reads the durable row.
+    pub async fn rehydrate_listener(&self, pod: &str, namespace: &str) -> Result<()> {
+        let local_port = pick_free_local_port()?;
+        let mut forward = tokio::process::Command::new("kubectl")
+            .args([
+                "port-forward",
+                "-n",
+                namespace,
+                &format!("svc/{pod}"),
+                &format!("{local_port}:8080"),
+            ])
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| format!("port-forward svc/{pod} for /rehydrate"))?;
+        let url = format!("http://127.0.0.1:{local_port}/rehydrate");
+        // The forward needs a moment to bind; poll the POST until it lands
+        // (or the deadline), then tear the forward down.
+        let result = poll_until(
+            &format!("listener {pod} /rehydrate to succeed"),
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+            || {
+                let url = url.clone();
+                async move {
+                    match reqwest::Client::new().post(&url).send().await {
+                        Ok(resp) if resp.status().is_success() => Ok(Some(())),
+                        // Forward not bound yet / transient: retry.
+                        Ok(_) | Err(_) => Ok(None),
+                    }
+                }
+            },
+        )
+        .await;
+        let _ = forward.kill().await;
+        result
+    }
+
+    /// Add a SECOND real listener pod by cloning the running one, creating
+    /// the 2-pod precondition a scale-down drain needs. Placement normally
+    /// spawns a second listener only under real memory saturation, which a
+    /// test cannot force; an operator with cluster credentials can instead
+    /// stand up another pod. This clones the live listener's Deployment +
+    /// Service under a fresh name (so it runs the SAME image), inserts its
+    /// `listener_pod` registry row (so the dispatcher's pool sees it), and
+    /// waits for it to become ready. Returns the new pod name.
+    ///
+    /// The clone reuses the cluster's OWN running manifest (`kubectl get`
+    /// then re-apply with a new name), so it never duplicates the
+    /// dispatcher's manifest template here, it can't drift from it.
+    pub async fn add_second_listener(&self) -> Result<String> {
+        let existing = self.live_listener_pods().await?;
+        let src = existing.first().context(
+            "no live listener pod to clone; activate a triggered project first so the \
+             dispatcher has spawned one",
+        )?;
+        let namespace = src.namespace.clone();
+        let new_name = format!("listener-e2e-clone-{}", Uuid::new_v4().simple());
+
+        // Clone the Deployment + Service: get the running manifest, rewrite
+        // every occurrence of the source name to the new name, re-apply.
+        // The source name appears as the metadata name, the Deployment +
+        // Service selectors, and the pod label; a whole-name substitution
+        // re-points all of them consistently.
+        for kind in ["deployment", "service"] {
+            let cloned = self
+                .clone_manifest(kind, &namespace, &src.pod_name, &new_name)
+                .await?;
+            self.kubectl_apply(&cloned).await?;
+        }
+
+        // Register the clone in the pool so placement + drain see it. The
+        // admin URL mirrors the dispatcher's cluster-DNS convention
+        // (`http://<name>.<ns>.svc.cluster.local:8080`).
+        // SYNC: listener admin URL <-> crates/weft-dispatcher/src/listener.rs (K8sListenerBackend::spawn)
+        //
+        // The clone's `owner_pod_id` is the SAME dispatcher that owns the
+        // source pod, NOT a synthetic id: a pod is only drained/reaped by
+        // the dispatcher that owns it (or after its lease lapses), so a
+        // synthetic owner with a long lease would be un-reapable and the
+        // scale-down could never consolidate the clone away. Inheriting
+        // the real owner makes the clone a first-class pool member the
+        // dispatcher renews + reaps like one it spawned itself.
+        let owner = self.listener_pod_owner(&src.pod_name).await?;
+        let admin_url = format!("http://{new_name}.{namespace}.svc.cluster.local:8080");
+        // `grace_until_unix` is set in the PAST: the spawn grace protects
+        // only genuinely fresh dispatcher-spawned pods from the idle
+        // reaper, and this clone stands in for a long-lived pool member
+        // that should be eligible for drain/reap immediately once empty.
+        sqlx::query(
+            "INSERT INTO listener_pod \
+             (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, grace_until_unix) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&new_name)
+        .bind(&admin_url)
+        .bind(&namespace)
+        .bind(&owner)
+        .bind(now_unix() + POOL_CLONE_LEASE_SECS)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await
+        .context("insert cloned listener_pod registry row")?;
+
+        // Wait for the clone's rollout so a follow-on drain re-places onto
+        // a pod that can actually answer /register + /load.
+        let wait = tokio::process::Command::new("kubectl")
+            .args(["rollout", "status", &format!("deployment/{new_name}"), "-n", &namespace])
+            .status()
+            .await
+            .context("kubectl rollout status for cloned listener")?;
+        anyhow::ensure!(wait.success(), "cloned listener rollout did not complete");
+        Ok(new_name)
+    }
+
+    // ---- Supervisor pool: inspect ownership + force a scale-down move ----
+
+    /// Live supervisor pods (name + namespace) from the `supervisor_pod`
+    /// registry, lease not expired. A pooled supervisor reconciles the
+    /// infra of MANY projects; this is the set the dispatcher places onto
+    /// and consolidates (the supervisor twin of `live_listener_pods`).
+    pub async fn live_supervisor_pods(&self) -> Result<Vec<SupervisorPodRow>> {
+        let rows: Vec<SupervisorPodRow> = sqlx::query_as(
+            "SELECT pod_name, namespace FROM supervisor_pod \
+             WHERE leased_until_unix >= $1 ORDER BY pod_name",
+        )
+        .bind(now_unix())
+        .fetch_all(&self.pool)
+        .await
+        .context("query live supervisor_pod rows")?;
+        Ok(rows)
+    }
+
+    /// Which supervisor pod currently OWNS a project's infra (the
+    /// exclusive `infra_owner` lease), or `None` if unowned. A project is
+    /// reconciled by exactly its owner; a test reads this before/after a
+    /// move to confirm ownership changed hands to exactly one new pod.
+    pub async fn infra_owner_of(&self, project_id: &Uuid) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT supervisor_pod FROM infra_owner \
+             WHERE project_id = $1 AND leased_until_unix >= $2",
+        )
+        .bind(project_id.to_string())
+        .bind(now_unix())
+        .fetch_optional(&self.pool)
+        .await
+        .context("query infra_owner")?;
+        Ok(row.map(|(pod,)| pod))
+    }
+
+    /// Count of LIVE `infra_owner` leases for a project: 0 (unowned) or 1
+    /// (owned). The `project_id` PRIMARY KEY makes >1 physically
+    /// impossible, so this is NOT the single-actor safety check (a real
+    /// double-actor bug surfaces as the owner VALUE flipping, which
+    /// `infra_owner_of` + an allowed-set assertion catch). It is used to
+    /// distinguish owned-vs-unowned: e.g. after a fresh pod joins, the
+    /// project must still be owned (count 1), proving the newcomer did not
+    /// drop or steal the existing lease.
+    pub async fn infra_owner_count(&self, project_id: &Uuid) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM infra_owner \
+             WHERE project_id = $1 AND leased_until_unix >= $2",
+        )
+        .bind(project_id.to_string())
+        .bind(now_unix())
+        .fetch_one(&self.pool)
+        .await
+        .context("count infra_owner leases")?;
+        Ok(n)
+    }
+
+    /// How many projects a supervisor pod currently owns. Used to confirm
+    /// a scale-down drain emptied the chosen pod (owns 0) before it is
+    /// reaped, and that the survivor adopted the released projects.
+    pub async fn projects_owned_by_supervisor(&self, pod: &str) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM infra_owner \
+             WHERE supervisor_pod = $1 AND leased_until_unix >= $2",
+        )
+        .bind(pod)
+        .bind(now_unix())
+        .fetch_one(&self.pool)
+        .await
+        .context("count projects owned by supervisor")?;
+        Ok(n)
+    }
+
+    /// Operator lever: move a project's exclusive `infra_owner` lease onto
+    /// `pod` (the supervisor twin of `set_signal_placement`). Writes the
+    /// SAME columns the broker's claim CTE writes (supervisor_pod +
+    /// renewed lease), so the post-move state is one the production code
+    /// genuinely produces. Used to set up a consolidation where the
+    /// drained pod actually OWNS the project, so the survivor's adopt
+    /// (migration) path is exercised rather than an empty pod just being
+    /// reaped.
+    pub async fn place_infra_owner_on(&self, project_id: &Uuid, pod: &str) -> Result<()> {
+        let n = sqlx::query(
+            "UPDATE infra_owner \
+             SET supervisor_pod = $1, leased_until_unix = $2 \
+             WHERE project_id = $3",
+        )
+        .bind(pod)
+        .bind(now_unix() + POOL_CLONE_LEASE_SECS)
+        .bind(project_id.to_string())
+        .execute(&self.pool)
+        .await
+        .context("move infra_owner lease onto pod")?
+        .rows_affected();
+        anyhow::ensure!(n == 1, "expected exactly one infra_owner row to move, moved {n}");
+        Ok(())
+    }
+
+    /// Add a SECOND real supervisor pod by cloning the running one, the
+    /// supervisor twin of `add_second_listener`. Placement spawns a
+    /// second supervisor only under real memory saturation (which a test
+    /// cannot force); an operator with cluster credentials stands one up
+    /// instead. The supervisor has only a Deployment (no Service: it
+    /// PULLS work from the broker, it is never dialed), so this clones
+    /// just the Deployment under a fresh name, inserts its
+    /// `supervisor_pod` registry row, and waits for readiness. Returns
+    /// the new pod name.
+    ///
+    /// The clone reuses the cluster's OWN running Deployment (`kubectl
+    /// get` then re-apply with a new name), so it runs the same image
+    /// with the same SA-token projection (its broker claim identity is
+    /// `WEFT_POD_NAME`, which the manifest pins to the Deployment name),
+    /// and can never drift from the dispatcher's manifest template.
+    pub async fn add_second_supervisor(&self) -> Result<String> {
+        let existing = self.live_supervisor_pods().await?;
+        let src = existing.first().context(
+            "no live supervisor pod to clone; provision a project's infra first so the \
+             dispatcher has spawned one",
+        )?;
+        let namespace = src.namespace.clone();
+        // Keep the `weft-infra-supervisor-` prefix (the reaper + pool
+        // queries do not key on it, but it keeps the clone recognizable),
+        // and use a SHORT random suffix: the full name is a k8s label
+        // value (selector + pod label), capped at 63 bytes, and the
+        // prefix alone is 22 chars, so a full 32-char uuid would overflow.
+        let suffix = Uuid::new_v4().simple().to_string();
+        let new_name = format!("weft-infra-supervisor-e2e-{}", &suffix[..8]);
+
+        // Clone the Deployment only (no Service). A whole-name
+        // substitution re-points the metadata name, the Deployment
+        // selector, the pod label, and WEFT_POD_NAME together.
+        let cloned = self
+            .clone_manifest("deployment", &namespace, &src.pod_name, &new_name)
+            .await?;
+        self.kubectl_apply(&cloned).await?;
+
+        // Register the clone in the pool so placement + drain + the
+        // broker's ownership claim see it. The admin URL mirrors the
+        // dispatcher's cluster-DNS convention (the supervisor is never
+        // dialed, but the row requires the column). `owner_pod_id`
+        // inherits the source pod's real owner so the clone is
+        // drained/reaped by the dispatcher (see add_second_listener).
+        // SYNC: supervisor admin URL <-> crates/weft-dispatcher/src/supervisor_pool.rs (K8sSupervisorBackend::spawn)
+        let owner = self.supervisor_pod_owner(&src.pod_name).await?;
+        let admin_url = format!("http://{new_name}.{namespace}.svc.cluster.local:8080");
+        // `grace_until_unix` is set in the PAST so the clone is treated
+        // as an established pod (the spawn grace protects only genuinely
+        // fresh dispatcher-spawned pods from the idle reaper; this clone
+        // is a test stand-in for a long-lived pod and must be eligible
+        // for drain/reap immediately once empty). `draining` defaults to
+        // FALSE (the dispatcher's scale-down sets it).
+        sqlx::query(
+            "INSERT INTO supervisor_pod \
+             (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, \
+              mem_pressure, grace_until_unix) \
+             VALUES ($1, $2, $3, $4, $5, 0, $6)",
+        )
+        .bind(&new_name)
+        .bind(&admin_url)
+        .bind(&namespace)
+        .bind(&owner)
+        .bind(now_unix() + POOL_CLONE_LEASE_SECS)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await
+        .context("insert cloned supervisor_pod registry row")?;
+
+        // Wait for the clone's rollout so it can actually claim + own
+        // projects (its claim loop needs a live pod + valid SA token).
+        let wait = tokio::process::Command::new("kubectl")
+            .args(["rollout", "status", &format!("deployment/{new_name}"), "-n", &namespace])
+            .status()
+            .await
+            .context("kubectl rollout status for cloned supervisor")?;
+        anyhow::ensure!(wait.success(), "cloned supervisor rollout did not complete");
+        Ok(new_name)
+    }
+
+    /// `kubectl get <kind> <name> -n <ns> -o json`, parsed. JSON (not
+    /// YAML) so the manifest can be sanitized + renamed by structural
+    /// edits on a real document, never line-by-line text surgery (which
+    /// cannot safely handle embedded block scalars like the
+    /// `last-applied-configuration` annotation, a multi-line JSON string).
+    async fn kubectl_get_json(
+        &self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value> {
+        let out = tokio::process::Command::new("kubectl")
+            .args(["get", kind, name, "-n", namespace, "-o", "json"])
+            .output()
+            .await
+            .with_context(|| format!("kubectl get {kind} {name} -o json"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "kubectl get {kind} {name} -o json failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout)
+            .with_context(|| format!("parse `kubectl get {kind} {name} -o json` output"))
+    }
+
+    /// Build a clean clone manifest from a live resource: fetch it as
+    /// JSON, strip every cluster-managed + status field, and rename it to
+    /// `new_name` (which re-points the metadata name, the selector, and
+    /// the pod label together). Returns the JSON string to `kubectl
+    /// apply`. Used for both pooled-pod clones (listener + supervisor).
+    async fn clone_manifest(
+        &self,
+        kind: &str,
+        namespace: &str,
+        src_name: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        let mut doc = self.kubectl_get_json(kind, namespace, src_name).await?;
+        sanitize_and_rename(&mut doc, src_name, new_name);
+        serde_json::to_string(&doc).context("serialize cloned manifest")
+    }
+
+    /// `kubectl apply -f -` with `manifest` on stdin.
+    async fn kubectl_apply(&self, manifest: &str) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = tokio::process::Command::new("kubectl")
+            .args(["apply", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("spawn kubectl apply -f -")?;
+        child
+            .stdin
+            .take()
+            .context("kubectl apply stdin not piped")?
+            .write_all(manifest.as_bytes())
+            .await
+            .context("write manifest to kubectl apply stdin")?;
+        let out = child
+            .wait_with_output()
+            .await
+            .context("wait for kubectl apply")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "kubectl apply failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    }
 }
 
 /// Is a kubectl stderr a genuine "the apiserver answered NotFound"? kubectl
@@ -400,6 +953,95 @@ pub struct WorkerPodRow {
 /// between the host and the dispatcher.
 const SLACK_SECS: i64 = 5;
 
+/// Lease window for a test-cloned pooled-pod registry row (listener or
+/// supervisor). Long enough that the dispatcher's reaper does not
+/// adopt/reap the clone out from under a test mid-scenario, short enough
+/// that a leaked clone (a crashed test) expires and gets cleaned on the
+/// next sweep.
+const POOL_CLONE_LEASE_SECS: i64 = 600;
+
+/// A live `listener_pod` registry row, as observed from the host.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ListenerPodRow {
+    pub pod_name: String,
+    pub namespace: String,
+}
+
+/// A live `supervisor_pod` registry row, as observed from the host. The
+/// supervisor twin of [`ListenerPodRow`]; same shape (the clone path and
+/// scale-down reads need only name + namespace).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SupervisorPodRow {
+    pub pod_name: String,
+    pub namespace: String,
+}
+
+/// Which pod holds a signal + its placement generation. After a scale-down
+/// move the holder changes and the generation bumps; a test reads this
+/// before/after a drain to confirm the move actually happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalPlacement {
+    /// The holding listener pod, or `None` if unplaced.
+    pub listener_pod: Option<String>,
+    pub generation: i64,
+}
+
+/// Sanitize a fetched resource document (parsed from `kubectl get -o
+/// json`) so it re-applies cleanly under a new name, by STRUCTURAL edits
+/// on the JSON, not text surgery:
+///   - drop the whole `status` block (server-computed);
+///   - drop server-assigned `metadata` fields (`resourceVersion`, `uid`,
+///     `creationTimestamp`, `generation`, `managedFields`) and the
+///     `annotations` (kubectl's `last-applied-configuration` + the
+///     deployment-revision annotation, all cluster bookkeeping);
+///   - drop the Service's live `spec.clusterIP` / `clusterIPs` so a fresh
+///     Service gets its own;
+///   - then rename: every occurrence of `old_name` becomes `new_name`
+///     throughout the document, which re-points the metadata name, the
+///     Deployment + Service selectors, the pod label, and the
+///     `WEFT_POD_NAME` env together, keeping the clone internally
+///     consistent.
+fn sanitize_and_rename(doc: &mut serde_json::Value, old_name: &str, new_name: &str) {
+    use serde_json::Value;
+    doc.as_object_mut().map(|root| root.remove("status"));
+    if let Some(meta) = doc.get_mut("metadata").and_then(Value::as_object_mut) {
+        for k in [
+            "resourceVersion",
+            "uid",
+            "creationTimestamp",
+            "generation",
+            "managedFields",
+            "annotations",
+        ] {
+            meta.remove(k);
+        }
+    }
+    if let Some(spec) = doc.get_mut("spec").and_then(Value::as_object_mut) {
+        spec.remove("clusterIP");
+        spec.remove("clusterIPs");
+    }
+    rename_in_place(doc, old_name, new_name);
+}
+
+/// Replace every string occurrence of `old` with `new` anywhere in a JSON
+/// document (object values, array elements, nested). The resource's name
+/// appears as the metadata name, selectors, the pod label, and the
+/// `WEFT_POD_NAME` env value; one whole-document substitution re-points
+/// them all consistently.
+fn rename_in_place(v: &mut serde_json::Value, old: &str, new: &str) {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => {
+            if s.contains(old) {
+                *s = s.replace(old, new);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|e| rename_in_place(e, old, new)),
+        Value::Object(o) => o.values_mut().for_each(|e| rename_in_place(e, old, new)),
+        _ => {}
+    }
+}
+
 /// Host wall clock as unix seconds. The dispatcher's reapers compare against
 /// their own `now_unix()`; the host and cluster share real time on a local
 /// kind setup, so a host-computed cutoff is valid for the dispatcher's check.
@@ -408,4 +1050,15 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is past UNIX_EPOCH")
         .as_secs() as i64
+}
+
+/// Grab a free local TCP port for a short-lived `kubectl port-forward`.
+/// Binds to port 0 (the OS picks a free one), reads it, drops the
+/// listener; a tiny TOCTOU window exists before the forward re-binds, but
+/// the rig runs single-threaded against one cluster so contention is nil.
+fn pick_free_local_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral local port")?;
+    let port = listener.local_addr().context("read ephemeral port")?.port();
+    Ok(port)
 }

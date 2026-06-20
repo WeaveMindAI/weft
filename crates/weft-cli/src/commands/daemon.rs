@@ -399,12 +399,12 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         // deployments concurrently. They are independent rollouts
         // against different controllers, so wall-clock is bounded
         // by the slowest:
-        //   - listener: every per-tenant listener Deployment the
-        //     dispatcher created dynamically. Without this they stay
-        //     on the old image and break the dispatcher↔listener
-        //     wire contract.
+        //   - listener: every pooled listener Deployment the dispatcher
+        //     created dynamically. Without this they stay on the old
+        //     image and break the dispatcher<->listener wire contract.
         //   - broker: a single Deployment under weft-db.
-        //   - supervisor: every per-tenant supervisor Deployment.
+        //   - supervisor: every pooled infra-supervisor Deployment the
+        //     dispatcher created dynamically (same rationale as listeners).
         let db_namespace = cfg.db_namespace.to_string();
         let broker_rollout = async move {
             if broker_built {
@@ -1217,7 +1217,7 @@ async fn roll_role_deployments(role: &str, noun: &str) -> Result<()> {
             line.trim().split_once(' ').map(|(ns, name)| (ns.to_string(), name.to_string()))
         })
         .collect();
-    // Roll every per-tenant pod in parallel: independent kubectl calls
+    // Roll every matching pod in parallel: independent kubectl calls
     // across different namespaces, no shared state.
     let tasks = pairs.iter().map(|(ns, name)| async move {
         let status = kubectl(&["-n", ns, "rollout", "restart", &format!("deployment/{name}")])

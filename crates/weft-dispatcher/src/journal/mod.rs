@@ -133,8 +133,15 @@ pub trait Journal: Send + Sync {
 
     // ----- Signal registry (durable replacement for in-RAM tracker) ----
 
-    /// Insert a signal registration. Caller mints the token.
-    async fn signal_insert(&self, sig: &SignalRegistration) -> anyhow::Result<()>;
+    /// Insert a signal registration, born with its placement (holder pod
+    /// + generation) so the row is never committed with a NULL holder
+    /// while a pod already holds it. Caller mints the token and resolves
+    /// the placement before calling.
+    async fn signal_insert(
+        &self,
+        sig: &SignalRegistration,
+        placement: &SignalPlacement,
+    ) -> anyhow::Result<()>;
 
     /// Look up a single signal by its token.
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
@@ -153,13 +160,6 @@ pub trait Journal: Send + Sync {
         &self,
         project_id: &str,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
-
-    /// Count signals for a tenant. Used by `/listener/inspect` to
-    /// surface a journal vs registry comparison. The reaper-side
-    /// "is the listener needed" check uses a richer SQL query
-    /// (joining `project.status`) so it doesn't go through this
-    /// method.
-    async fn signal_count_for_tenant(&self, tenant_id: &str) -> anyhow::Result<usize>;
 
     /// All signals tied to one execution color (resume signals).
     /// Used on cancel to unregister everything that was waiting.
@@ -237,6 +237,21 @@ pub struct SignalRegistration {
     /// the clock. The dispatcher treats this field as opaque
     /// JSON; only the kind's handler interprets it.
     pub kind_state: Value,
+}
+
+/// The placement an insert stamps on a new `signal` row: which pod holds
+/// it and under what generation. Passed to `signal_insert` SEPARATELY
+/// from `SignalRegistration` (the signal's identity/config) because it is
+/// WRITE-time-only data: readers resolve the live holder via dedicated
+/// SQL, never off the registration struct, so it does not belong on the
+/// read+write `SignalRegistration`. Writing it WITH the row (rather than
+/// a later UPDATE) closes the window where a committed row had a NULL
+/// holder while a pod already held the signal in RAM (a fire in that
+/// window would double-place).
+#[derive(Debug, Clone)]
+pub struct SignalPlacement {
+    pub listener_pod: String,
+    pub generation: i64,
 }
 
 impl SignalRegistration {

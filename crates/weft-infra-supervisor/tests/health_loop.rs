@@ -316,7 +316,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
     // Stop: status flips to stopped. (Simulating what lifecycle's
     // stop verb would do; we just write directly here.)
     rig.broker
-        .set_status(None, PROJECT, NODE, Some(NODE), Status::Stopped, None, None)
+        .set_status("test-pod", None, PROJECT, NODE, Some(NODE), Status::Stopped, None, None)
         .await
         .unwrap();
     rig.kube
@@ -329,7 +329,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
 
     // Start: status flips back to running, replicas come back.
     rig.broker
-        .set_status(None, PROJECT, NODE, Some(NODE), Status::Running, None, None)
+        .set_status("test-pod", None, PROJECT, NODE, Some(NODE), Status::Running, None, None)
         .await
         .unwrap();
     rig.kube

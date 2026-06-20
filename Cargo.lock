@@ -3281,6 +3281,7 @@ dependencies = [
  "weft-core",
  "weft-infra",
  "weft-journal",
+ "weft-platform-traits",
  "weft-task-store",
 ]
 
@@ -3541,6 +3542,7 @@ dependencies = [
  "tracing-subscriber",
  "weft-broker-client",
  "weft-core",
+ "weft-platform-traits",
  "weft-task-store",
 ]
 

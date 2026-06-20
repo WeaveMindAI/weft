@@ -122,8 +122,13 @@ pub struct ProjectNamespaceArgs<'a> {
     /// The ingress controller's namespace (typically `ingress-nginx`).
     pub ingress_namespace: &'a str,
     /// The tenant namespace, used in NetworkPolicy `namespaceSelector`
-    /// to allow listener / supervisor egress into this project ns.
+    /// to allow the tenant's storage box into this project ns.
     pub tenant_namespace: &'a str,
+    /// The control-plane namespace, where the pooled (trusted, tenant-
+    /// agnostic) listener + supervisor run. Their RoleBindings into this
+    /// project namespace bind the SAs HERE (not in the tenant ns), and
+    /// the NetworkPolicies allow listener/supervisor traffic FROM here.
+    pub control_plane_namespace: &'a str,
 }
 
 /// Render the project-namespace bundle as a single multi-doc YAML.
@@ -140,6 +145,7 @@ pub fn render(args: &ProjectNamespaceArgs<'_>) -> String {
         service_cidr,
         ingress_namespace,
         tenant_namespace,
+        control_plane_namespace,
     } = args;
     // Sanitize the ids for the manifest LABEL values (the raw
     // `tenant_id` is kept by `ensure` for the registry key). `_label`
@@ -282,19 +288,21 @@ spec:
         - podSelector:
             matchLabels:
               weft.dev/role: worker
-    # Tenant-namespace listener (SSE subscribes to infra /events).
+    # Pooled listener in the control-plane namespace (SSE subscribes to
+    # infra /events).
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {tenant_namespace}
+              kubernetes.io/metadata.name: {control_plane_namespace}
           podSelector:
             matchLabels:
               weft.dev/role: listener
-    # Tenant-namespace supervisor (HTTP health probes).
+    # Pooled supervisor in the control-plane namespace (HTTP health
+    # probes).
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {tenant_namespace}
+              kubernetes.io/metadata.name: {control_plane_namespace}
           podSelector:
             matchLabels:
               weft.dev/role: infra-supervisor
@@ -332,7 +340,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: weft-infra-supervisor-sa
-    namespace: {tenant_namespace}
+    namespace: {control_plane_namespace}
 roleRef:
   kind: ClusterRole
   name: weft-infra-supervisor-clusterrole
@@ -346,7 +354,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: weft-listener-sa
-    namespace: {tenant_namespace}
+    namespace: {control_plane_namespace}
 roleRef:
   kind: ClusterRole
   name: weft-listener-clusterrole
@@ -458,6 +466,7 @@ mod tests {
             service_cidr: "10.96.0.0/12",
             ingress_namespace: "ingress-nginx",
             tenant_namespace: "wm-tenant-alice",
+            control_plane_namespace: "weft-system",
         }
     }
 
@@ -483,10 +492,13 @@ mod tests {
         let yaml = render(&args());
         assert!(yaml.contains("name: weft-infra-supervisor-clusterrole"));
         assert!(yaml.contains("name: weft-listener-clusterrole"));
-        // RoleBinding subjects point at the tenant namespace's SAs.
+        // RoleBinding subjects point at the CONTROL-PLANE namespace's
+        // SAs: the pooled listener + supervisor are trusted services
+        // that run there (not per tenant) and act across all project
+        // namespaces via these per-namespace bindings.
         assert!(yaml.contains("name: weft-infra-supervisor-sa"));
         assert!(yaml.contains("name: weft-listener-sa"));
-        assert!(yaml.contains("namespace: wm-tenant-alice"));
+        assert!(yaml.contains("namespace: weft-system"));
     }
 
     #[test]

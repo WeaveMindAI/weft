@@ -131,12 +131,21 @@ pub enum ClaimFilter {
 pub enum DedupOutcome {
     Inserted(Uuid),
     AlreadyLive(Uuid),
+    /// The enqueue was fenced by the placement-generation check (a stale
+    /// held-event fire from a pod drained during a scale-down move). No
+    /// task was created; the caller treats it as a successful no-op.
+    /// Only the broker-backed FireSignal path can produce this; the
+    /// local Postgres `enqueue_dedup` never fences (it has no generation
+    /// context), so its callers never see it.
+    Fenced,
 }
 
 impl DedupOutcome {
-    pub fn id(&self) -> Uuid {
+    /// The created task id, or `None` when the enqueue was fenced.
+    pub fn id(&self) -> Option<Uuid> {
         match self {
-            Self::Inserted(id) | Self::AlreadyLive(id) => *id,
+            Self::Inserted(id) | Self::AlreadyLive(id) => Some(*id),
+            Self::Fenced => None,
         }
     }
 }

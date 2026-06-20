@@ -11,15 +11,6 @@ use std::time::Duration;
 
 use crate::state::DispatcherState;
 
-/// The per-tenant infra-supervisor Deployment's name and its
-/// `weft.dev/role` label value, as minted in `tenant_namespace.rs`.
-/// The supervisor reaper references both so its label selector and
-/// its name filter cannot drift from each other. NOT the bare `infra`
-/// role, which tags the user's infra NODES in project namespaces.
-/// SYNC: SUPERVISOR_NAME/SUPERVISOR_ROLE <-> crate::tenant_namespace (YAML literals: name `weft-infra-supervisor`, `weft.dev/role: infra-supervisor`)
-pub(crate) const SUPERVISOR_NAME: &str = "weft-infra-supervisor";
-pub(crate) const SUPERVISOR_ROLE: &str = "infra-supervisor";
-
 /// Spawn every reaper. Returns immediately; the reapers run for the
 /// lifetime of the process.
 pub fn spawn_all(state: DispatcherState) {
@@ -28,7 +19,9 @@ pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(15), "orphaned_tasks", sweep_orphaned_tasks);
     spawn_loop(state.clone(), Duration::from_secs(3600), "tasks", sweep_tasks);
     spawn_loop(state.clone(), Duration::from_secs(10), "listener", sweep_listeners);
-    spawn_loop(state.clone(), Duration::from_secs(60), "supervisor", sweep_supervisors);
+    spawn_loop(state.clone(), Duration::from_secs(60), "listener_scaledown", sweep_listener_scaledown);
+    spawn_loop(state.clone(), Duration::from_secs(30), "supervisor", sweep_supervisors);
+    spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
     // Storage plane: the durable terminate sweep (un-kept exec files)
     // and the scale-to-zero box reaper. Idempotent across pods like
     // the rest: the sweep queue deletes per-color rows only after the
@@ -244,302 +237,73 @@ async fn sweep_tasks(state: DispatcherState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Listener reaper. Every 10s, scan `tenant_listener` rows and
-/// reap any whose listener is idle. "Idle" is decided by
-/// `ListenerPool::try_reap_if_idle` under an EXCLUSIVE per-tenant
-/// OP-lock: the lock fences out concurrent `with_listener` calls,
-/// and the signal table doubles as the "is the listener semantically
-/// needed" check (zero rows for the tenant => safe to kill).
+/// Listener reaper. Every 10s, reap every pooled listener pod holding
+/// ZERO signals (per-pod idle reap). `ListenerPool::reap_idle` scans
+/// the `listener_pod` registry, claims each idle pod (ownership + lease
+/// so two dispatchers do not both reap one), tears it down, and deletes
+/// its registry row. A pod holding even one signal is kept.
 async fn sweep_listeners(state: DispatcherState) -> anyhow::Result<()> {
-    let rows = crate::lease::list_tenant_listener_rows(&state.pg_pool).await?;
-    for row in rows {
-        // Skip rows already mid-teardown on another Pod; their owner
-        // will finish the transition or its lease will lapse and we
-        // pick them up next sweep.
-        if row.state == "stopping" {
-            continue;
-        }
-        let tenant = crate::tenant::TenantId(row.tenant_id.clone());
-        match state
-            .listeners
-            .try_reap_if_idle(
-                &tenant,
-                &row.namespace,
-                state.listener_backend.as_ref(),
-                &state.pg_pool,
-                state.pod_id.as_str(),
-            )
-            .await
-        {
-            Ok(true) => tracing::info!(
-                target: "weft_dispatcher::reaper",
-                tenant = %tenant,
-                namespace = %row.namespace,
-                "reaped idle listener"
-            ),
-            Ok(false) => {} // operation in flight or signals present
-            Err(e) => tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                tenant = %tenant,
-                error = %e,
-                "listener kill failed"
-            ),
-        }
-    }
-    Ok(())
+    state
+        .listeners
+        .reap_idle(
+            state.listener_backend.as_ref(),
+            &state.pg_pool,
+            state.pod_id.as_str(),
+        )
+        .await
 }
 
-/// Supervisor reaper. Once every 60s, find tenants whose supervisor
-/// Deployment exists but has zero work to do: no `infra_node` rows
-/// AND no pending/claimed `infra_lifecycle_command` rows. Scale the
-/// Deployment to 0 so an idle tenant doesn't hold a Pod open. Next
-/// sync re-applies the Deployment (idempotent) and the supervisor
-/// is back. Mirrors the listener reaper pattern but for supervisor.
+/// Listener scale-DOWN. Every 60s (slower than the idle reap so the two
+/// do not fight), drain AT MOST ONE pod whose signals fit on the other
+/// non-saturated pods' headroom: re-place its signals elsewhere, then
+/// reap the emptied pod. The twin of spawn-on-saturation; the idle reap
+/// only catches already-empty pods, this actively consolidates a
+/// partially-loaded pool when load dropped.
+async fn sweep_listener_scaledown(state: DispatcherState) -> anyhow::Result<()> {
+    state
+        .listeners
+        .drain_one(
+            state.listener_backend.as_ref(),
+            &state.pg_pool,
+            state.pod_id.as_str(),
+        )
+        .await
+}
+
+/// Supervisor idle reaper. Every 30s, reap every pooled supervisor pod
+/// that owns ZERO projects (the supervisor twin of the listener idle
+/// reaper). A pod owning even one project is reconciling that infra and
+/// is kept; when no infra exists globally, every supervisor owns nothing
+/// and the pool drains to zero (cold-start is covered by
+/// `ensure_at_least_one` on the next sync). Ownership, not a separate
+/// node-count check, is what keeps a busy supervisor alive: a project's
+/// `infra_owner` lease IS the "this pod has work" signal.
 async fn sweep_supervisors(state: DispatcherState) -> anyhow::Result<()> {
-    // Find every tenant that has at least one project registered.
-    // The supervisor Deployment lives in `wm-<tenant>`; we only
-    // consider tenants the dispatcher knows about. `project_namespace`
-    // is NOT NULL in the schema, so every registered row is in scope.
-    let tenants: Vec<String> =
-        // Tenant identity is owned by `weft_namespace_tenant`
-        // (the registry SoT). Walking project rows would miss
-        // tenants whose supervisor is alive but whose projects
-        // have all been `weft rm`'d, leaving an idle supervisor
-        // pinned to 1 replica forever.
-        sqlx::query_scalar("SELECT DISTINCT tenant_id FROM weft_namespace_tenant")
-            .fetch_all(&state.pg_pool)
-            .await?;
-
-    for tenant_id in tenants {
-        if let Err(e) = sweep_one_tenant(&state, &tenant_id).await {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                tenant = %tenant_id,
-                error = %e,
-                "sweep_one_tenant errored; continuing with next tenant"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Decide whether to scale tenant's supervisor to 0, under a
-/// per-tenant xact-scoped advisory lock. The xact wraps:
-///   1. take `pg_try_advisory_xact_lock` keyed on the per-tenant
-///      supervisor-coord scope :
-///      non-blocking; if sync is currently in its critical section
-///      we skip this tenant for the cycle;
-///   2. read three idle signals: any project's
-///      `sync_in_flight_until_unix` in the future, any infra_node
-///      rows for this tenant's projects, any pending
-///      infra_lifecycle_command rows;
-///   3. if all idle, kubectl scale the deployment to 0;
-///   4. COMMIT (releases the lock).
-///
-/// The lock stays held across the kubectl call so a sync that
-/// arrives concurrently waits behind us. xact-scoped means the
-/// lock auto-releases on commit, no session-leak back to the pool.
-async fn sweep_one_tenant(state: &DispatcherState, tenant_id: &str) -> anyhow::Result<()> {
-    let mut tx = state.pg_pool.begin().await?;
-    let lock_key = crate::lease::advisory_key(
-        crate::lease::SUPERVISOR_COORD_DOMAIN,
-        tenant_id,
-    );
-    let got_lock: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(lock_key)
-        .fetch_one(&mut *tx)
-        .await?;
-    if !got_lock {
-        // Sync is touching this tenant right now. Drop the tx;
-        // next sweep cycle retries.
-        return Ok(());
-    }
-
-    // All three idle checks (sentinel, node_count, pending_count)
-    // run inside the same xact under the advisory lock so a sync
-    // concurrent with this sweep can't slip a sentinel + first
-    // command in between two reads on different connections. The
-    // sentinel inline-query lives here (not behind ProjectStoreOps)
-    // because the trait method takes its own pool connection,
-    // breaking snapshot consistency.
-    let now = crate::lease::now_unix();
-    let sync_in_flight: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-            SELECT 1 FROM project \
-            WHERE tenant_id = $1 \
-              AND sync_in_flight_until_unix > $2 \
-         )",
-    )
-    .bind(tenant_id)
-    .bind(now)
-    .fetch_one(&mut *tx)
-    .await?;
-    if sync_in_flight {
-        return Ok(());
-    }
-    let node_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM infra_node WHERE project_id IN \
-         (SELECT id::TEXT FROM project WHERE tenant_id = $1)",
-    )
-    .bind(tenant_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if node_count > 0 {
-        return Ok(());
-    }
-    let pending_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM infra_lifecycle_command \
-         WHERE tenant_id = $1 AND completed_at_unix IS NULL",
-    )
-    .bind(tenant_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if pending_count > 0 {
-        return Ok(());
-    }
-
-    // Idle. Scale the supervisor Deployment down. The next sync
-    // re-applies it and scales back up. We use `scale` rather
-    // than `delete` so the Deployment + its NetworkPolicies stay
-    // in the cluster; just the Pod is freed.
-    //
-    // The tx stays open across kubectl so a sync that arrives
-    // concurrently waits behind us. The tx commit below releases
-    // the lock.
-    let namespace = state
-        .namespace_mapper
-        .namespace_for(&crate::tenant::TenantId(tenant_id.to_string()));
-    // Route through `state.kube` (the shared `KubeClient` trait
-    // also used by the supervisor crate). The dispatcher no longer
-    // forks `tokio::process::Command::new("kubectl")` directly;
-    // tests fake this through `FakeKube`.
-    // Disposition rule for this fn: COMMIT only after a successful
-    // scale (that's what holds the advisory lock across the kubectl
-    // so a concurrent sync waits behind us). Every skip path drops
-    // `tx` (rollback) instead, since nothing was written and the
-    // lock should release immediately. NotFound/Errored are skips.
-    use weft_platform_traits::WorkloadKind;
-    // Read the supervisor's current replica state. Only scale (and log a reap)
-    // when it is actually UP (desired > 0). Re-scaling an already-zero
-    // deployment every 60s is a pointless kubectl call AND a lie in the log
-    // ("reaped" when nothing changed); gating on the live replica count makes
-    // the sweep a true no-op once the supervisor is down. The selector and the
-    // name filter both reference SUPERVISOR_* so they cannot drift apart, and
-    // the selector value MUST match the label the supervisor Deployment is
-    // minted with in tenant_namespace.rs (`weft.dev/role: infra-supervisor`);
-    // the bare `infra` role belongs to the user's infra NODES in project
-    // namespaces, a different concept that would match nothing here.
-    let states = match state
-        .kube
-        .list_replica_state(&namespace, &format!("weft.dev/role={SUPERVISOR_ROLE}"))
+    state
+        .supervisors
+        .reap_idle(
+            state.supervisor_backend.as_ref(),
+            &state.pg_pool,
+            state.pod_id.as_str(),
+        )
         .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                tenant = %tenant_id,
-                error = %e,
-                "list supervisor replica state errored; skipping this tenant"
-            );
-            return Ok(());
-        }
-    };
-    if !supervisor_needs_reap(&states) {
-        // Deployment absent (never provisioned / already removed) or already
-        // scaled to zero: true no-op, no scale call, no log. Drop `tx`.
-        return Ok(());
-    }
-    match state
-        .kube
-        .scale_workload(&namespace, WorkloadKind::Deployment, SUPERVISOR_NAME, 0)
+}
+
+/// Supervisor scale-DOWN. Every 60s (slower than the idle reap so the
+/// two do not fight), drain AT MOST ONE supervisor whose owned projects
+/// fit on the other pods' headroom: release its project leases for the
+/// survivors' claim loops to adopt, then reap the emptied pod. The twin
+/// of spawn-on-saturation; the idle reap only catches pods that already
+/// own nothing, this actively consolidates a partially-loaded pool when
+/// load dropped.
+async fn sweep_supervisor_scaledown(state: DispatcherState) -> anyhow::Result<()> {
+    state
+        .supervisors
+        .drain_one(
+            state.supervisor_backend.as_ref(),
+            &state.pg_pool,
+            state.pod_id.as_str(),
+        )
         .await
-    {
-        Err(e) => {
-            // Errored is a skip, like every other early return: drop `tx`
-            // (rollback) so the advisory lock releases and the next sweep
-            // retries. Committing here would persist any future write added
-            // to this tx despite the scale having failed.
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                tenant = %tenant_id,
-                error = %e,
-                "supervisor scale-to-0 failed"
-            );
-            Ok(())
-        }
-        Ok(()) => {
-            // Commit only after a successful scale (holds the lock across the
-            // kubectl call so a concurrent sync waits behind us).
-            tx.commit().await?;
-            tracing::info!(
-                target: "weft_dispatcher::reaper",
-                tenant = %tenant_id,
-                "reaped idle infra-supervisor (scaled to 0)"
-            );
-            Ok(())
-        }
-    }
 }
 
-/// Pure decision: given the replica states returned for the
-/// supervisor's role selector, should the reaper scale the supervisor
-/// Deployment down? True only when the supervisor Deployment is
-/// present AND currently up (`desired > 0`). Absent (never
-/// provisioned / already removed) or already at zero → false (no-op).
-/// Extracted from `sweep_one_tenant` so the workload-selection +
-/// desired-gate logic (where a wrong selector silently matched
-/// nothing) is unit-testable without a Postgres rig.
-fn supervisor_needs_reap(states: &[weft_platform_traits::WorkloadReplicaState]) -> bool {
-    use weft_platform_traits::WorkloadKind;
-    states
-        .iter()
-        .find(|s| s.name == SUPERVISOR_NAME && s.kind == WorkloadKind::Deployment)
-        .is_some_and(|s| s.desired > 0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use weft_platform_traits::{WorkloadKind, WorkloadReplicaState};
-
-    fn supervisor(desired: i64) -> WorkloadReplicaState {
-        let mut labels = HashMap::new();
-        labels.insert("weft.dev/role".into(), SUPERVISOR_ROLE.into());
-        WorkloadReplicaState {
-            kind: WorkloadKind::Deployment,
-            name: SUPERVISOR_NAME.into(),
-            namespace: "wm-alice".into(),
-            desired,
-            ready: desired,
-            labels,
-        }
-    }
-
-    #[test]
-    fn reaps_when_up() {
-        assert!(supervisor_needs_reap(&[supervisor(1)]));
-    }
-
-    #[test]
-    fn no_op_when_already_zero() {
-        assert!(!supervisor_needs_reap(&[supervisor(0)]));
-    }
-
-    #[test]
-    fn no_op_when_absent() {
-        assert!(!supervisor_needs_reap(&[]));
-    }
-
-    /// The selector that feeds this decision must return the supervisor by its
-    /// real role label. A decoy workload under a DIFFERENT name (e.g. a user
-    /// infra node that leaked into the same list) must never be mistaken for
-    /// the supervisor: only the exact `SUPERVISOR_NAME` Deployment counts.
-    #[test]
-    fn ignores_non_supervisor_workloads() {
-        let mut decoy = supervisor(1);
-        decoy.name = "some-user-infra-node".into();
-        assert!(!supervisor_needs_reap(&[decoy]));
-    }
-}

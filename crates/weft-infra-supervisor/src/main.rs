@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use weft_broker_client::client::BrokerSupervisorClient;
 use weft_broker_client::token::TokenSource;
-use weft_infra_supervisor::{broker_ops, health, lifecycle, SupervisorState};
+use weft_infra_supervisor::{broker_ops, health, lifecycle, ownership, SupervisorState};
 use weft_platform_traits::clock::SystemClock;
 use weft_platform_traits::kube;
 
@@ -33,10 +33,9 @@ struct Args {
         default_value = "/var/run/weft/sa/token"
     )]
     broker_token_path: String,
-    /// Tenant id this supervisor is scoped to.
-    #[arg(long, env = "WEFT_TENANT_ID")]
-    tenant_id: String,
-    /// k8s pod name (downward API).
+    /// k8s pod name (downward API). A pooled supervisor is identified
+    /// by its pod, not a tenant: it reconciles all tenants' namespaced
+    /// projects.
     #[arg(long, env = "WEFT_POD_NAME")]
     pod_name: String,
     /// How often to poll for new projects, lifecycle commands, and
@@ -56,9 +55,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     tracing::info!(
-        tenant = %args.tenant_id,
         pod = %args.pod_name,
-        "weft-infra-supervisor starting"
+        "weft-infra-supervisor starting (pooled, all-tenant)"
     );
 
     let token = TokenSource::new(std::path::PathBuf::from(&args.broker_token_path));
@@ -68,13 +66,23 @@ async fn main() -> Result<()> {
 
     let supervisor = SupervisorState {
         broker: broker_ops::production(broker),
-        tenant_id: args.tenant_id.clone(),
         pod_name: args.pod_name.clone(),
         kube: kube_client,
         clock: SystemClock::new(),
         poll_interval: Duration::from_secs(args.poll_interval_seconds),
         health: Arc::new(tokio::sync::Mutex::new(health::HealthRegistry::default())),
+        mem_pressure: weft_platform_traits::mem_pressure::CgroupMemPressure::new(),
     };
+
+    // Ownership loop: the single site that claims + renews this pod's
+    // exclusive project leases. Must run for the lifecycle/health loops
+    // to have anything to act on (they read only owned projects).
+    let ownership_state = supervisor.clone();
+    let ownership_handle = tokio::spawn(async move {
+        if let Err(e) = ownership::run_loop(ownership_state).await {
+            tracing::error!(error = %e, "ownership loop exited");
+        }
+    });
 
     let lifecycle_state = supervisor.clone();
     let lifecycle_handle = tokio::spawn(async move {
@@ -104,6 +112,7 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     tokio::select! {
+        _ = ownership_handle => died("ownership"),
         _ = lifecycle_handle => died("lifecycle"),
         _ = health_handle => died("health"),
         _ = tokio::signal::ctrl_c() => {

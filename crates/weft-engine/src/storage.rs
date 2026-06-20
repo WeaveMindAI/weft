@@ -9,9 +9,18 @@
 //!
 //! Retry policy: an UNREACHABLE error means the request never
 //! reached the box (no side effect happened), so every verb retries
-//! ONCE after a forced re-ensure, EXCEPT `put`: its body stream is
+//! after a forced re-ensure, EXCEPT `put`: its body stream is
 //! consumed by the first attempt and cannot be replayed; it
 //! re-ensures (so the caller's retry is hot) and fails loudly.
+//!
+//! The re-ensure waits for the box Deployment rollout, but a box pod
+//! RESTART (a `grow`/`shrink` disk op restarts the single pod) leaves
+//! a short window where the pod is Ready yet the Service endpoint /
+//! cluster DNS has not finished re-propagating, so the very next
+//! request still connection-fails. A single immediate retry races that
+//! window; the replayable verbs therefore retry a few times with a
+//! short backoff (a free intra-cluster call, no paid API), which is
+//! enough to cover endpoint propagation after the pod is back.
 
 use std::sync::Arc;
 
@@ -153,7 +162,10 @@ impl WorkerStorage {
             })
             .await
             .map_err(|e| WeftError::NodeExecution(format!("ensure storage box: {e}")))?
-            .id();
+            .id()
+            // Only the broker-backed FireSignal path can fence (placement
+            // generation); this ensure-storage-box enqueue never does.
+            .expect("ensure-storage-box enqueue is never fenced");
         let outcome = self
             .tasks
             .wait_for_terminal(id, crate::context::TASK_WAIT_TIMEOUT, crate::context::TASK_POLL_INTERVAL)
@@ -284,14 +296,49 @@ impl WorkerStorageOps for FakeWorkerStorage {
     }
 }
 
-/// Retry-once-on-unreachable for replayable verbs.
+/// Bounded retry-on-unreachable for replayable verbs. First attempt on
+/// the cached endpoint; on UNREACHABLE, force a re-ensure (which waits
+/// for the box rollout) and retry, then retry a few more times with a
+/// short backoff to ride out Service-endpoint / DNS re-propagation
+/// after a box pod restart. Only UNREACHABLE is retried (the request
+/// never reached the box, so no side effect to double); any other error
+/// fails immediately. The final UNREACHABLE (all retries exhausted) is
+/// surfaced loudly via `to_weft`.
 macro_rules! with_retry {
     ($self:ident, $color:ident, |$client:ident| $call:expr) => {{
+        // Backoff schedule for the retries AFTER the forced re-ensure.
+        // Total added wait ~3.5s, enough for endpoint propagation; a box
+        // that is still unreachable after this is genuinely down, which
+        // must fail loud, not hang.
+        const BACKOFF_MS: [u64; 4] = [250, 500, 1000, 1500];
         let $client = $self.client($color, false).await?;
         match $call {
             Err(StorageClientError::Unreachable(_)) => {
-                let $client = $self.client($color, true).await?;
-                $call.map_err(to_weft)
+                // Force a re-ensure (waits for rollout), then retry with
+                // backoff to cover post-restart endpoint propagation.
+                let mut last = StorageClientError::Unreachable(
+                    "box unreachable before re-ensure".into(),
+                );
+                for (i, delay) in BACKOFF_MS.iter().enumerate() {
+                    // Sleep BEFORE each retry (not after a failure), so a
+                    // genuinely-down box fails as soon as the attempts are
+                    // exhausted instead of waiting out a final backoff. The
+                    // first attempt forces a re-ensure (waits for rollout);
+                    // later ones reuse the freshly-ensured endpoint.
+                    tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
+                    let $client = match $self.client($color, i == 0).await {
+                        Ok(c) => c,
+                        Err(e) => return Err(e),
+                    };
+                    match $call {
+                        Ok(v) => return Ok(v),
+                        Err(StorageClientError::Unreachable(m)) => {
+                            last = StorageClientError::Unreachable(m);
+                        }
+                        Err(e) => return Err(to_weft(e)),
+                    }
+                }
+                Err(to_weft(last))
             }
             other => other.map_err(to_weft),
         }

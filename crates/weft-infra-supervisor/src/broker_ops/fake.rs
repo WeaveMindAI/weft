@@ -35,10 +35,16 @@ fn unit_runtime(
 
 /// One recorded broker call. Used for ordering / argument
 /// assertions in tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `SyncOwnership` carries an `f64` mem_pressure (f64 is not
+// `Eq`). `PartialEq` is enough for the `matches!`/`==` the tests use.
+#[derive(Debug, Clone, PartialEq)]
 pub enum BrokerCall {
-    ProjectsForTenant {
-        tenant_id: String,
+    SyncOwnership {
+        pod_name: String,
+        mem_pressure: f64,
+    },
+    OwnedProjects {
+        pod_name: String,
     },
     InfraNodes {
         project_id: String,
@@ -47,7 +53,6 @@ pub enum BrokerCall {
         project_id: String,
     },
     ClaimCommand {
-        tenant_id: String,
         claimer_pod: String,
     },
     EventRecord {
@@ -139,7 +144,31 @@ struct Inner {
     /// Completed lifecycle commands (id -> optional error message).
     completed_commands: Vec<(i64, Option<String>)>,
 
+    /// project_id of each claimed command, so `command_complete` (which
+    /// carries only a command_id) can apply the same per-project
+    /// ownership gate the broker does.
+    claimed_command_project: HashMap<i64, String>,
+
+    /// Per-project ownership: does THIS supervisor still hold the
+    /// exclusive `infra_owner` lease? Absent = owned (the common case for
+    /// a seeded project). A test sets `false` to simulate ownership
+    /// moving to another pod mid-command; every ownership-gated write
+    /// (set_provisioning / set_applied / set_status / remove_node /
+    /// command_complete) then returns `Raced`, exactly as the broker's
+    /// `owns_project_predicate` would, leaving the command uncompleted
+    /// for the new owner.
+    owned: HashMap<String, bool>,
+
     calls: Vec<BrokerCall>,
+}
+
+impl Inner {
+    /// Whether this supervisor still owns `project_id`. Absent = owned
+    /// (the seeded default); a test flips it false to model an
+    /// ownership move. Mirrors the broker's `owns_project_predicate`.
+    fn owns(&self, project_id: &str) -> bool {
+        self.owned.get(project_id).copied().unwrap_or(true)
+    }
 }
 
 pub struct FakeBroker {
@@ -174,10 +203,13 @@ impl FakeBroker {
         project_namespace: &str,
         status: weft_broker_client::protocol::ProjectStatus,
     ) {
-        self.inner.lock().projects.insert(
+        let mut inner = self.inner.lock();
+        let tenant_id = inner.tenant_id.clone();
+        inner.projects.insert(
             project_id.to_string(),
             SupervisorProject {
                 project_id: project_id.to_string(),
+                tenant_id,
                 project_namespace: project_namespace.to_string(),
                 status,
                 deactivated_by_health: false,
@@ -278,6 +310,17 @@ impl FakeBroker {
 
     pub fn enqueue_command(&self, cmd: SupervisorCommandRow) {
         self.inner.lock().pending_commands.push_back(cmd);
+    }
+
+    /// Simulate ownership of `project_id` moving away from (or back to)
+    /// this supervisor. With `false`, every ownership-gated write for the
+    /// project returns `Raced`, mirroring the broker's `infra_owner`
+    /// gate; the in-flight command is left uncompleted for the new owner.
+    pub fn set_project_owned(&self, project_id: &str, owned: bool) {
+        self.inner
+            .lock()
+            .owned
+            .insert(project_id.to_string(), owned);
     }
 
     pub fn set_running_count(&self, project_id: &str, n: i64) {
@@ -392,14 +435,27 @@ impl Default for FakeBroker {
 
 #[async_trait]
 impl BrokerSupervisorOps for FakeBroker {
-    async fn projects_for_tenant(&self, tenant_id: &str) -> Result<Vec<SupervisorProject>> {
+    async fn sync_ownership(
+        &self,
+        pod_name: &str,
+        mem_pressure: f64,
+    ) -> Result<Vec<SupervisorProject>> {
+        // Dumb fake: a single supervisor owns every seeded project (the
+        // fake does not model multi-pod ownership partitioning; that is
+        // covered by the broker's SQL-level tests against a real DB).
         let mut inner = self.inner.lock();
-        inner.calls.push(BrokerCall::ProjectsForTenant {
-            tenant_id: tenant_id.to_string(),
+        inner.calls.push(BrokerCall::SyncOwnership {
+            pod_name: pod_name.to_string(),
+            mem_pressure,
         });
-        if inner.tenant_id != tenant_id {
-            return Ok(Vec::new());
-        }
+        Ok(inner.projects.values().cloned().collect())
+    }
+
+    async fn owned_projects(&self, pod_name: &str) -> Result<Vec<SupervisorProject>> {
+        let mut inner = self.inner.lock();
+        inner.calls.push(BrokerCall::OwnedProjects {
+            pod_name: pod_name.to_string(),
+        });
         Ok(inner.projects.values().cloned().collect())
     }
 
@@ -432,15 +488,19 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn claim_command(
         &self,
-        tenant_id: &str,
         claimer_pod: &str,
     ) -> Result<Option<SupervisorCommandRow>> {
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::ClaimCommand {
-            tenant_id: tenant_id.to_string(),
             claimer_pod: claimer_pod.to_string(),
         });
-        Ok(inner.pending_commands.pop_front())
+        let cmd = inner.pending_commands.pop_front();
+        if let Some(c) = &cmd {
+            inner
+                .claimed_command_project
+                .insert(c.id, c.project_id.clone());
+        }
+        Ok(cmd)
     }
 
     async fn event_record(
@@ -463,6 +523,7 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn set_status(
         &self,
+        _pod_name: &str,
         command_id: Option<i64>,
         project_id: &str,
         node_id: &str,
@@ -481,6 +542,11 @@ impl BrokerSupervisorOps for FakeBroker {
             failure_stage,
             failure_message: failure_message.map(|s| s.to_string()),
         });
+        // Lifecycle-driven writes (command_id=Some) are ownership-gated,
+        // matching the broker. A lost-ownership project returns Raced.
+        if command_id.is_some() && !inner.owns(project_id) {
+            return Ok(weft_broker_client::WriteOutcome::Raced);
+        }
         if let Some(node) = inner
             .infra_nodes
             .get_mut(&(project_id.to_string(), node_id.to_string()))
@@ -511,20 +577,35 @@ impl BrokerSupervisorOps for FakeBroker {
         }
     }
 
-    async fn remove_node(&self, project_id: &str, node_id: &str) -> Result<bool> {
+    async fn remove_node(
+        &self,
+        _pod_name: &str,
+        project_id: &str,
+        node_id: &str,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>> {
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::RemoveNode {
             project_id: project_id.to_string(),
             node_id: node_id.to_string(),
         });
-        Ok(inner
+        // Ownership-gated, like the broker: a lost-ownership project
+        // does NOT cascade-delete; it returns Raced so the supervisor
+        // aborts and leaves the command for the new owner.
+        if !inner.owns(project_id) {
+            return Ok(weft_broker_client::WriteOutcome::Raced);
+        }
+        let removed = inner
             .infra_nodes
             .remove(&(project_id.to_string(), node_id.to_string()))
-            .is_some())
+            .is_some();
+        Ok(weft_broker_client::WriteOutcome::Applied(
+            weft_broker_client::protocol::SupervisorRemoveNodeResponse { removed },
+        ))
     }
 
     async fn command_complete(
         &self,
+        _pod_name: &str,
         command_id: i64,
         error: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>> {
@@ -533,6 +614,14 @@ impl BrokerSupervisorOps for FakeBroker {
             command_id,
             error: error.map(|s| s.to_string()),
         });
+        // Ownership-gated, like the broker: if this pod lost ownership of
+        // the command's project, completion is rejected (Raced) and the
+        // command stays uncompleted for the new owner to finish.
+        if let Some(project_id) = inner.claimed_command_project.get(&command_id).cloned() {
+            if !inner.owns(&project_id) {
+                return Ok(weft_broker_client::WriteOutcome::Raced);
+            }
+        }
         inner
             .completed_commands
             .push((command_id, error.map(|s| s.to_string())));
@@ -563,6 +652,7 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn set_provisioning(
         &self,
+        _pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -580,6 +670,9 @@ impl BrokerSupervisorOps for FakeBroker {
             namespace: namespace.to_string(),
             preserve_pvcs: preserve_pvcs.clone(),
         });
+        if !inner.owns(project_id) {
+            return Ok(weft_broker_client::WriteOutcome::Raced);
+        }
         let status = weft_broker_client::protocol::InfraNodeStatus::rollup(
             units.values().map(|u| &u.status),
         );
@@ -602,6 +695,7 @@ impl BrokerSupervisorOps for FakeBroker {
 
     async fn set_applied(
         &self,
+        _pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -623,6 +717,9 @@ impl BrokerSupervisorOps for FakeBroker {
             namespace: namespace.to_string(),
             preserve_pvcs: preserve_pvcs.clone(),
         });
+        if !inner.owns(project_id) {
+            return Ok(weft_broker_client::WriteOutcome::Raced);
+        }
         let status = weft_broker_client::protocol::InfraNodeStatus::rollup(
             units.values().map(|u| &u.status),
         );
@@ -679,21 +776,27 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn projects_for_tenant_returns_seeded() {
+    async fn owned_projects_returns_seeded() {
         let b = FakeBroker::new("alice");
         b.add_project("p1", "ns1");
-        let projects = b.projects_for_tenant("alice").await.unwrap();
+        let projects = b.owned_projects("sup-pod-1").await.unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].project_id, "p1");
+        assert_eq!(projects[0].tenant_id, "alice");
         assert_eq!(projects[0].project_namespace, "ns1");
     }
 
     #[tokio::test]
-    async fn projects_for_other_tenant_returns_empty() {
+    async fn sync_ownership_records_call_and_returns_seeded() {
         let b = FakeBroker::new("alice");
         b.add_project("p1", "ns1");
-        let projects = b.projects_for_tenant("bob").await.unwrap();
-        assert!(projects.is_empty());
+        let projects = b.sync_ownership("sup-pod-1", 0.42).await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert!(b.calls().iter().any(|c| matches!(
+            c,
+            BrokerCall::SyncOwnership { pod_name, mem_pressure }
+                if pod_name == "sup-pod-1" && (*mem_pressure - 0.42).abs() < 1e-9
+        )));
     }
 
     #[tokio::test]
@@ -706,6 +809,7 @@ mod tests {
             weft_broker_client::protocol::InfraNodeStatus::Provisioning,
         );
         b.set_status(
+            "sup-pod-1",
             None,
             "p1",
             "n1",
@@ -732,8 +836,13 @@ mod tests {
             "inst1",
             weft_broker_client::protocol::InfraNodeStatus::Running,
         );
-        let removed = b.remove_node("p1", "n1").await.unwrap();
-        assert!(removed);
+        let outcome = b.remove_node("sup-pod-1", "p1", "n1").await.unwrap();
+        assert!(matches!(
+            outcome,
+            weft_broker_client::WriteOutcome::Applied(
+                weft_broker_client::protocol::SupervisorRemoveNodeResponse { removed: true }
+            )
+        ));
         assert!(b.infra_node("p1", "n1").is_none());
     }
 
@@ -749,9 +858,9 @@ mod tests {
             spec_json: None,
             force: false,
         });
-        let cmd1 = b.claim_command("alice", "pod1").await.unwrap();
+        let cmd1 = b.claim_command("pod1").await.unwrap();
         assert!(cmd1.is_some());
-        let cmd2 = b.claim_command("alice", "pod1").await.unwrap();
+        let cmd2 = b.claim_command("pod1").await.unwrap();
         assert!(cmd2.is_none());
     }
 

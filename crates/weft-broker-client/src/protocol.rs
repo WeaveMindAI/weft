@@ -315,8 +315,17 @@ pub struct TaskEnqueueDedupRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskEnqueueDedupResponse {
-    pub id: Uuid,
+    /// The task id, or `None` when the enqueue was FENCED (a stale
+    /// FireSignal from a drained pod during a scale-down move overlap):
+    /// no task is created and the caller treats it as a successful
+    /// no-op, not an error.
+    pub id: Option<Uuid>,
     pub inserted: bool,
+    /// True iff the enqueue was fenced out by the placement-generation
+    /// check (a stale old-pod fire). Distinct from `inserted=false`,
+    /// which means "an identical live task already exists" (dedup hit).
+    #[serde(default)]
+    pub fenced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,14 +543,40 @@ pub enum StorageAuthorizeResponse {
 
 // ---------- Supervisor surface (tenant-scoped) ----------
 
+/// Empty: a pooled supervisor lists projects across all tenants. The
+/// request body carries nothing; the trusted caller identity is the
+/// authority.
+/// Claim + renew + report ownership in one atomic broker round-trip.
+/// The pooled supervisor calls this on its ownership tick: the broker
+/// records the pod's memory pressure, renews this pod's existing project
+/// leases, and (only while the pod is below the shared memory saturation
+/// threshold) claims a batch more unowned-or-expired projects' infra for
+/// it (the EXCLUSIVE lease that keeps two supervisors off the same
+/// project), then returns the full set this pod now owns. Both work loops
+/// (lifecycle, health) then act ONLY on the returned set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorProjectsForTenantRequest {
-    pub tenant_id: String,
+pub struct SupervisorSyncOwnershipRequest {
+    /// The pooled supervisor pod syncing its ownership.
+    pub pod_name: String,
+    /// This pod's current memory pressure (usage/limit, `[0.0, 1.0]`),
+    /// the SAME load metric the listener uses. The broker claims new
+    /// projects for this pod only while it is below the shared
+    /// saturation threshold; at or above it the pod keeps the projects it
+    /// owns but takes on no more, so the dispatcher spawns another
+    /// supervisor. Recorded on the `supervisor_pod` row so the
+    /// dispatcher's placement + scale-down read real pressure (not a
+    /// project count). 0.0 when uncapped (local dev) so locally a single
+    /// supervisor keeps claiming until the machine is genuinely squeezed.
+    pub mem_pressure: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorProject {
     pub project_id: String,
+    /// The project's tenant. A pooled supervisor serves many tenants,
+    /// so the compile context's tenant comes from the project, not from
+    /// a per-supervisor identity (it has none).
+    pub tenant_id: String,
     pub project_namespace: String,
     /// Current `project.status`. The supervisor's health protocol
     /// engine consumes this so a `HealthCondition::ProjectStatusEq`
@@ -558,8 +593,25 @@ pub struct SupervisorProject {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorProjectsForTenantResponse {
-    pub projects: Vec<SupervisorProject>,
+pub struct SupervisorSyncOwnershipResponse {
+    /// Every project this pod now owns (after renew + claim). The work
+    /// loops act only on these.
+    pub owned: Vec<SupervisorProject>,
+}
+
+/// Pure read of the projects a supervisor pod currently owns (no claim,
+/// no renew). The work loops (health, lifecycle) and per-command
+/// namespace lookups use this; ownership breadth is changed ONLY by
+/// `sync_ownership` (the ownership tick), never as a side effect of
+/// doing work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorOwnedProjectsRequest {
+    pub pod_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorOwnedProjectsResponse {
+    pub owned: Vec<SupervisorProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -603,7 +655,12 @@ pub struct SupervisorHealthProtocolsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorClaimCommandRequest {
-    pub tenant_id: String,
+    /// The pooled supervisor pod claiming work. It claims a lifecycle
+    /// command ONLY for a project whose infra it currently owns (the
+    /// `infra_owner` exclusive lease), so two supervisors never run
+    /// kubectl for the same project; among its owned projects, the
+    /// per-command claim lease keyed on this pod serializes individual
+    /// commands.
     pub claimer_pod: String,
 }
 
@@ -811,15 +868,26 @@ impl InfraEvent {
     }
 }
 
+/// The supervisor's claim identity on a lifecycle write: its
+/// `WEFT_POD_NAME` (the Deployment name, the SAME string it uses to
+/// claim commands and that keys its `infra_owner` lease). NOT the auth
+/// token's pod name (the real Pod name, with a ReplicaSet suffix) which
+/// differs; the broker's ownership gate must compare the lease against
+/// THIS, so the supervisor sends it explicitly, exactly as it does on
+/// `claim_command` / `sync_ownership`.
+// SYNC: supervisor pod_name (WEFT_POD_NAME = Deployment name, the infra_owner lease key) <-> crates/weft-infra-supervisor/src/lib.rs (SupervisorState.pod_name, sent by lifecycle.rs/health.rs/ownership.rs), crates/weft-dispatcher/src/supervisor_pool.rs (render_supervisor_manifest WEFT_POD_NAME env), crates/weft-broker-client/src/lifecycle_command.rs (owns_project_predicate, gating infra_owner.supervisor_pod = req.pod_name in weft-broker/src/handlers.rs)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetStatusRequest {
+    /// The supervisor's claim identity (`WEFT_POD_NAME`); the broker
+    /// checks it holds the project's live `infra_owner` lease.
+    pub pod_name: String,
     /// `infra_lifecycle_command.id` the supervisor is executing,
     /// if this write is part of a lifecycle command (Stop /
-    /// Terminate / Apply transitions). The broker checks the
-    /// command is still claimed by the caller's pod before
-    /// applying the write; a stale (lease-expired, reclaimed
-    /// by a sibling pod) supervisor can't stamp statuses for a
-    /// row another pod owns.
+    /// Terminate / Apply transitions). The broker checks the caller
+    /// still OWNS the project (live `infra_owner` lease for `pod_name`)
+    /// before applying the write; a supervisor that lost ownership
+    /// (drain / lease takeover) can't stamp statuses for a project
+    /// another pod now owns.
     ///
     /// `None` for autonomous writes from the health loop
     /// (`Flaky` / `Running` reconciliation) where there is no
@@ -848,11 +916,15 @@ pub struct SupervisorSetStatusResponse {}
 /// hash, endpoints map. Supervisor calls this on successful apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetAppliedRequest {
+    /// The supervisor's claim identity (`WEFT_POD_NAME`); the broker
+    /// gates the UPSERT on it holding the project's live `infra_owner`
+    /// lease. See [`SupervisorSetStatusRequest::pod_name`].
+    pub pod_name: String,
     /// `infra_lifecycle_command.id` the supervisor is executing.
-    /// The broker rejects the UPSERT if the command is no longer
-    /// claimed by the caller's pod; prevents a stale supervisor
-    /// from resurrecting a row that `remove_node` deleted, or
-    /// stamping over a sibling pod's still-running apply.
+    /// The broker rejects the UPSERT if the caller no longer OWNS the
+    /// project; prevents a displaced supervisor from resurrecting a row
+    /// that `remove_node` deleted, or stamping over the new owner's
+    /// still-running apply.
     pub command_id: i64,
     pub project_id: String,
     pub node_id: String,
@@ -887,6 +959,10 @@ pub struct SupervisorSetAppliedResponse {}
 /// Provisioning -> Running and fills endpoints + applied_spec_hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetProvisioningRequest {
+    /// The supervisor's claim identity (`WEFT_POD_NAME`); the broker
+    /// gates the write on it holding the project's live `infra_owner`
+    /// lease. See [`SupervisorSetStatusRequest::pod_name`].
+    pub pod_name: String,
     pub command_id: i64,
     pub project_id: String,
     pub node_id: String,
@@ -1121,6 +1197,10 @@ pub struct SupervisorProjectImageTagsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRemoveNodeRequest {
+    /// The supervisor's claim identity (`WEFT_POD_NAME`); the broker
+    /// gates the cascade-delete on it holding the project's live
+    /// `infra_owner` lease. See [`SupervisorSetStatusRequest::pod_name`].
+    pub pod_name: String,
     pub project_id: String,
     pub node_id: String,
 }
@@ -1132,6 +1212,11 @@ pub struct SupervisorRemoveNodeResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandCompleteRequest {
+    /// The supervisor's claim identity (`WEFT_POD_NAME`); the broker
+    /// gates the terminal write on it holding the project's live
+    /// `infra_owner` lease, so a displaced pod can't complete a command
+    /// the new owner must re-run. See [`SupervisorSetStatusRequest::pod_name`].
+    pub pod_name: String,
     pub command_id: i64,
     pub error: Option<String>,
 }
@@ -1185,12 +1270,14 @@ pub struct SupervisorInfraCommandInFlightResponse {
 // ---------- Signals ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalListForTenantRequest {
-    pub tenant_id: String,
+pub struct SignalListForPodRequest {
+    /// The pooled listener pod asking for the signals placed on it.
+    /// The broker returns rows where `signal.listener_pod = pod_name`.
+    pub pod_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalListForTenantResponse {
+pub struct SignalListForPodResponse {
     pub rows: Vec<SignalRowWire>,
 }
 
@@ -1260,6 +1347,12 @@ impl SignalRowWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalRowWire {
     pub token: String,
+    /// Tenant this signal belongs to. A pooled listener rehydrates
+    /// signals from many tenants, so each row carries its own tenant;
+    /// the listener stamps it on the registry entry (and thus on any
+    /// held-event fire). Filled per row by the `list_for_pod` path the
+    /// listener rehydrates from.
+    pub tenant_id: String,
     pub node_id: String,
     pub spec_json: String,
     pub is_resume: bool,
@@ -1276,6 +1369,11 @@ pub struct SignalRowWire {
     /// `JSONB NOT NULL DEFAULT '{}'::jsonb`, so the broker always
     /// emits a value; missing on the wire is schema drift.
     pub kind_state: Value,
+    /// The signal's current placement generation. On rehydrate the pod
+    /// re-arms the signal under this generation and stamps it on the
+    /// held-event fires it enqueues, so the broker's stale-fire fence
+    /// stays consistent across a listener restart.
+    pub placement_generation: i64,
 }
 
 #[cfg(test)]
@@ -1322,16 +1420,18 @@ mod supervisor_protocol_tests {
     }
 
     #[test]
-    fn projects_for_tenant_round_trip() {
-        let req = SupervisorProjectsForTenantRequest {
-            tenant_id: "alice".into(),
+    fn sync_ownership_round_trip() {
+        let req = SupervisorSyncOwnershipRequest {
+            pod_name: "sup-1".into(),
+            mem_pressure: 0.5,
         };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["tenant_id"], "alice");
-        let resp: SupervisorProjectsForTenantResponse = serde_json::from_value(json!({
-            "projects": [
+        assert_eq!(v, json!({ "pod_name": "sup-1", "mem_pressure": 0.5 }));
+        let resp: SupervisorSyncOwnershipResponse = serde_json::from_value(json!({
+            "owned": [
                 {
                     "project_id": "p1",
+                    "tenant_id": "alice",
                     "project_namespace": "wm-project-alice-p1",
                     "status": "active",
                     "deactivated_by_health": false,
@@ -1339,20 +1439,41 @@ mod supervisor_protocol_tests {
             ]
         }))
         .unwrap();
-        assert_eq!(resp.projects.len(), 1);
-        assert_eq!(resp.projects[0].project_id, "p1");
-        assert_eq!(resp.projects[0].project_namespace, "wm-project-alice-p1");
-        assert_eq!(resp.projects[0].status, ProjectStatus::Active);
-        assert!(!resp.projects[0].deactivated_by_health);
+        assert_eq!(resp.owned.len(), 1);
+        assert_eq!(resp.owned[0].project_id, "p1");
+        assert_eq!(resp.owned[0].status, ProjectStatus::Active);
+    }
+
+    #[test]
+    fn owned_projects_round_trip() {
+        let req = SupervisorOwnedProjectsRequest {
+            pod_name: "sup-1".into(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v, json!({ "pod_name": "sup-1" }));
+        let resp: SupervisorOwnedProjectsResponse = serde_json::from_value(json!({
+            "owned": [
+                {
+                    "project_id": "p1",
+                    "tenant_id": "alice",
+                    "project_namespace": "wm-project-alice-p1",
+                    "status": "active",
+                    "deactivated_by_health": false,
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resp.owned.len(), 1);
+        assert_eq!(resp.owned[0].tenant_id, "alice");
     }
 
     /// `SupervisorProject::status` has NO `serde(default)`, so a
     /// missing field must fail deserialize. Pin the property so a
     /// future re-add of the default would break CI.
     #[test]
-    fn projects_for_tenant_missing_status_fails() {
-        let res: Result<SupervisorProjectsForTenantResponse, _> = serde_json::from_value(json!({
-            "projects": [
+    fn owned_project_missing_status_fails() {
+        let res: Result<SupervisorOwnedProjectsResponse, _> = serde_json::from_value(json!({
+            "owned": [
                 { "project_id": "p1", "project_namespace": "wm-project-alice-p1" }
             ]
         }));
@@ -1369,9 +1490,9 @@ mod supervisor_protocol_tests {
     /// future `serde(default)` slipping in would break CI rather than
     /// silently defaulting the auto-recover gate to false.
     #[test]
-    fn projects_for_tenant_missing_deactivated_by_health_fails() {
-        let res: Result<SupervisorProjectsForTenantResponse, _> = serde_json::from_value(json!({
-            "projects": [
+    fn owned_project_missing_deactivated_by_health_fails() {
+        let res: Result<SupervisorOwnedProjectsResponse, _> = serde_json::from_value(json!({
+            "owned": [
                 { "project_id": "p1", "project_namespace": "wm-project-alice-p1", "status": "active" }
             ]
         }));
@@ -1433,6 +1554,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_applied_request_round_trip() {
         let req = SupervisorSetAppliedRequest {
+            pod_name: "weft-infra-supervisor-abc".into(),
             command_id: 7,
             project_id: "p".into(),
             node_id: "tgi".into(),
@@ -1466,6 +1588,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_provisioning_request_round_trip() {
         let req = SupervisorSetProvisioningRequest {
+            pod_name: "weft-infra-supervisor-abc".into(),
             command_id: 9,
             project_id: "p".into(),
             node_id: "tgi".into(),
@@ -1618,6 +1741,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_status_request_optional_fields_skip_when_none() {
         let r = SupervisorSetStatusRequest {
+            pod_name: "weft-infra-supervisor-abc".into(),
             command_id: None,
             project_id: "p".into(),
             node_id: "n".into(),
@@ -1635,6 +1759,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_status_request_with_command_id_round_trip() {
         let r = SupervisorSetStatusRequest {
+            pod_name: "weft-infra-supervisor-abc".into(),
             command_id: Some(42),
             project_id: "p".into(),
             node_id: "n".into(),
@@ -1696,6 +1821,7 @@ mod supervisor_protocol_tests {
     ) -> SignalRowWire {
         SignalRowWire {
             token: "t".into(),
+            tenant_id: "tenant-a".into(),
             node_id: "n".into(),
             spec_json: "{}".into(),
             is_resume: false,
@@ -1705,6 +1831,7 @@ mod supervisor_protocol_tests {
             auth_kind,
             auth_config,
             kind_state: Value::Null,
+            placement_generation: 0,
         }
     }
 

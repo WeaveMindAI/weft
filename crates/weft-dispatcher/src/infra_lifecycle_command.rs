@@ -72,15 +72,16 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_pending
               ON infra_lifecycle_command(tenant_id)
               WHERE completed_at_unix IS NULL"#,
-        // Tenant-scoped claim path for supervisor-owned verbs
-        // (apply / stop / terminate). The supervisor `claim_command`
-        // SELECT filters on this exact predicate set; a partial
-        // index keyed on (tenant_id, id) skips the dispatcher-owned
-        // rows the supervisor must not steal.
+        // Claim path for supervisor-owned verbs (apply / stop /
+        // terminate). The supervisor `claim_command` SELECT scans
+        // uncompleted rows of these verbs ordered by id and gates each
+        // on a live `infra_owner` lease (its single-actor authority); it
+        // does NOT use the `claimed_by_pod` lease (that is the
+        // dispatcher's mechanism). This partial index keyed on id covers
+        // that scan and skips dispatcher-owned + completed rows.
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_supervisor_claim
-              ON infra_lifecycle_command(tenant_id, id)
+              ON infra_lifecycle_command(id)
               WHERE completed_at_unix IS NULL
-                AND claimed_by_pod IS NULL
                 AND verb IN ('apply', 'stop', 'terminate')"#,
         // Mirror for the dispatcher claim loop (deactivate /
         // reactivate). No tenant filter: the dispatcher pool claims

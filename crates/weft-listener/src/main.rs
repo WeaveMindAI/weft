@@ -19,8 +19,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = ListenerConfig {
-        tenant_id: std::env::var("WEFT_LISTENER_TENANT_ID")
-            .context("WEFT_LISTENER_TENANT_ID")?,
+        pod_name: std::env::var("WEFT_POD_NAME").context("WEFT_POD_NAME")?,
         http_port: std::env::var("WEFT_LISTENER_PORT")
             .unwrap_or_else(|_| "8080".into())
             .parse()
@@ -40,14 +39,13 @@ async fn main() -> Result<()> {
         .context("ListenerState::new")?;
 
     // Rehydrate the in-memory registry by asking the broker for the
-    // signal rows belonging to our tenant. Synchronous: the HTTP
-    // server only starts accepting fires after the registry matches
-    // the DB.
+    // signal rows placed on this pod. Synchronous: the HTTP server
+    // only starts accepting fires after the registry matches the DB.
     weft_listener::registry::rehydrate(
         tasks.clone(),
         Arc::new(state.config.broker_url.clone()),
         token_source,
-        &state.config.tenant_id,
+        &state.config.pod_name,
         state.registry.clone(),
         state.config.clone(),
     )

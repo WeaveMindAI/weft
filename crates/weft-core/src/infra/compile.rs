@@ -66,9 +66,6 @@ pub enum CompileError {
         container: String,
         port: String,
     },
-    #[error("infra spec for node '{node}': raw `extras` manifest at index {index} is not \
-             a JSON object")]
-    ExtraNotObject { node: String, index: usize },
     #[error(
         "infra spec for node '{node}': resource name '{name}' is {len} chars, max {limit} \
          (k8s DNS-1123 label limit). Built from: {details}. Shorten the {source_kind} name."
@@ -199,14 +196,6 @@ pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>,
     // `metadata.name` per (kind, namespace): a Deployment "x"
     // and a ConfigMap "x" coexist legally. Keying by `name` alone
     // would over-enforce.
-    //
-    // The `seen` set lives past this typed-emit loop so the extras
-    // loop below can check `(kind, name)` against typed-emit
-    // collisions too. Without that, a user could write a typed
-    // Endpoint "api" (emits Service `inst1-api`) AND an extras
-    // raw manifest with the same `metadata.name` + `kind: Service`;
-    // both would compile, then kubectl would reject at apply with
-    // a vague error far from the source.
     let names = emitted_names(spec, ctx);
     let mut seen: std::collections::HashSet<(K8sKind, String)> =
         std::collections::HashSet::new();
@@ -293,46 +282,6 @@ pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>,
         stamp_weft_labels(m, ctx);
     }
 
-    // -- Escape hatch: extras applied verbatim --
-    // Extras may omit `metadata.namespace`; we backfill it during
-    // stamping. This is the ONE legitimate backfill site.
-    //
-    // Dedup against typed emits: parse the extra's `kind` +
-    // `metadata.name` and check it against `seen`. If `kind` maps
-    // to a known `K8sKind`, a name collision with a typed emit (or
-    // another extra of the same kind) is a `DuplicateName`. Kinds
-    // we don't model (CRDs, RBAC objects, etc.) are passed through
-    // without dedup; k8s validates them at apply.
-    for (i, raw) in spec.extras.iter().enumerate() {
-        if !raw.is_object() {
-            return Err(CompileError::ExtraNotObject {
-                node: ctx.node_id.to_string(),
-                index: i,
-            });
-        }
-        let extra_name = raw
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str());
-        let extra_kind_str = raw.get("kind").and_then(|k| k.as_str());
-        if let Some(name) = extra_name {
-            check_name(name, ctx, format!("extras[{i}].metadata.name"), "extras")?;
-            if let Some(kind) = extra_kind_str.and_then(K8sKind::from_extras_kind_str) {
-                if !seen.insert((kind, name.to_string())) {
-                    return Err(CompileError::DuplicateName {
-                        node: ctx.node_id.to_string(),
-                        name: name.to_string(),
-                        source_kind: "extras",
-                        k8s_kind: kind.display(),
-                    });
-                }
-            }
-        }
-        let mut extra = raw.clone();
-        stamp_weft_labels_with_namespace_backfill(&mut extra, ctx);
-        out.push(extra);
-    }
-
     Ok(out)
 }
 
@@ -351,7 +300,7 @@ fn compile_workload(
     let replicas = match unit.kind {
         // Jobs ignore replicas; k8s defaults to 1 and is governed by
         // completions/parallelism. We don't expose those yet; if a
-        // user needs them, `extras` is the path.
+        // user needs them, declare them on the Unit directly.
         UnitKind::Job => 1,
         // DaemonSet replicas is per-node; the spec.replicas field
         // doesn't apply. Use 1 as a placeholder; k8s ignores it.
@@ -1231,26 +1180,6 @@ impl K8sKind {
             UnitKind::Job => Self::Job,
         }
     }
-
-    /// Parse a `metadata.kind` string from an extras manifest.
-    /// Returns `None` for kinds we don't model (CRDs, RBAC, etc.):
-    /// those are passed through verbatim and don't participate in
-    /// the dedup check (k8s will validate them at apply).
-    fn from_extras_kind_str(s: &str) -> Option<Self> {
-        match s {
-            "Deployment" => Some(Self::Deployment),
-            "StatefulSet" => Some(Self::StatefulSet),
-            "DaemonSet" => Some(Self::DaemonSet),
-            "Job" => Some(Self::Job),
-            "HorizontalPodAutoscaler" => Some(Self::HorizontalPodAutoscaler),
-            "PersistentVolumeClaim" => Some(Self::PersistentVolumeClaim),
-            "Service" => Some(Self::Service),
-            "NetworkPolicy" => Some(Self::NetworkPolicy),
-            "Secret" => Some(Self::Secret),
-            "ConfigMap" => Some(Self::ConfigMap),
-            _ => None,
-        }
-    }
 }
 
 /// One pre-flight entry: the k8s name + kind compile() will stamp
@@ -1364,20 +1293,6 @@ fn stamp_weft_labels(manifest: &mut Value, ctx: &CompileContext<'_>) {
         "compile.rs emitted a manifest without metadata.namespace; \
          every compile_* helper must include it explicitly"
     );
-    stamp_labels_into(md, ctx);
-}
-
-/// Stamp weft.dev/* labels on a user-provided `extras` manifest and
-/// backfill `metadata.namespace` if the user omitted it. The
-/// backfill is legitimate here (the user wrote raw kubectl YAML
-/// that may not know the project namespace) and ONLY here.
-fn stamp_weft_labels_with_namespace_backfill(manifest: &mut Value, ctx: &CompileContext<'_>) {
-    let Some(md) = manifest_metadata_mut(manifest) else {
-        return;
-    };
-    if !md.contains_key("namespace") {
-        md.insert("namespace".into(), json!(ctx.namespace));
-    }
     stamp_labels_into(md, ctx);
 }
 
@@ -1588,25 +1503,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extras_pass_through_and_get_labeled() {
-        let spec = InfraSpec {
-            extras: vec![json!({
-                "apiVersion": "networking.k8s.io/v1",
-                "kind": "Ingress",
-                "metadata": { "name": "custom" },
-                "spec": {}
-            })],
-            ..Default::default()
-        };
-        let out = compile(&spec, &ctx()).expect("compile ok");
-        let ing = out
-            .iter()
-            .find(|m| m["kind"] == "Ingress")
-            .expect("Ingress present");
-        assert_eq!(ing["metadata"]["labels"]["weft.dev/instance"], "inst1");
-        assert_eq!(ing["metadata"]["namespace"], "wm-project-tenantA-projB");
-    }
 
     #[test]
     fn config_literal_names_get_length_checked() {
@@ -1896,59 +1792,4 @@ mod tests {
         );
     }
 
-    /// A typed Endpoint emits a Service named `<instance>-<endpoint>`.
-    /// An extras manifest with `kind: Service` + the same
-    /// `metadata.name` must collide in the pre-flight `seen` set
-    /// (the whole reason extras feed the same dedup set as typed
-    /// emits) rather than slipping through to a kubectl apply error.
-    #[test]
-    fn extras_vs_typed_service_name_collision_rejected() {
-        let mut unit = unit_named("api", UnitKind::Deployment);
-        // Give the container the port the endpoint references, so
-        // validate_endpoint passes and the dedup is what fires.
-        unit.containers[0].ports = vec![ContainerPort {
-            name: "http".into(),
-            port: 8080,
-            protocol: Protocol::Tcp,
-        }];
-        let spec = InfraSpec {
-            units: vec![unit],
-            endpoints: vec![Endpoint {
-                name: "web".into(),
-                unit: "api".into(),
-                container: "c".into(),
-                port: "http".into(),
-                expose: Expose::ClusterInternal,
-            }],
-            extras: vec![json!({
-                "apiVersion": "v1",
-                "kind": "Service",
-                "metadata": { "name": "inst1-web" },
-                "spec": {}
-            })],
-            ..Default::default()
-        };
-        // The endpoint emits Service `inst1-web`; the extras Service
-        // reuses that exact name + kind → DuplicateName.
-        let err = compile(&spec, &ctx()).expect_err("expected DuplicateName");
-        assert!(matches!(err, CompileError::DuplicateName { .. }), "got {err:?}");
-    }
-
-    /// An extras kind we don't model (CRD) does NOT participate in
-    /// dedup and passes through, even sharing a name with a typed
-    /// resource of a different kind.
-    #[test]
-    fn extras_unmodeled_kind_passes_through() {
-        let spec = InfraSpec {
-            units: vec![unit_named("api", UnitKind::Deployment)],
-            extras: vec![json!({
-                "apiVersion": "example.com/v1",
-                "kind": "FooCrd",
-                "metadata": { "name": "inst1" },
-                "spec": {}
-            })],
-            ..Default::default()
-        };
-        compile(&spec, &ctx()).expect("unmodeled extras kind passes through");
-    }
 }

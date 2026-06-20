@@ -200,11 +200,59 @@ impl SseFake {
         format!("{}/events", self.base_url)
     }
 
+    /// How many listener SSE connections are currently subscribed (each
+    /// live `sse_handler` holds one broadcast receiver). A test polls this
+    /// for `>= 1` before `push_event` instead of sleeping a fixed
+    /// interval: a fixed "let the subscription settle" sleep is a latent
+    /// flake (under cluster load the subscribe can take longer than the
+    /// sleep, the event is pushed into a feed nobody is listening on, and
+    /// the trigger silently misses). Polling the real subscriber count
+    /// removes the race. The `_rx` held in `start()` is dropped
+    /// immediately, so this counts only live handler subscriptions.
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
+    /// Block until at least `n` listener SSE connections are live (or the
+    /// deadline elapses, which is a real failure: the expected
+    /// subscriptions never armed). Call before `push_event` so the event
+    /// is never pushed before the connection(s) the test depends on are
+    /// live. Replaces a fixed "settle" sleep, which races the subscribe
+    /// under load. `n = 1` is the normal single-holder case; `n = 2` is
+    /// the move-overlap case (the test needs BOTH the old and new pod
+    /// subscribed so the generation fence is actually exercised).
+    pub async fn wait_for_subscribers(
+        &self,
+        n: usize,
+        deadline: std::time::Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        while self.subscriber_count() < n {
+            if start.elapsed() >= deadline {
+                anyhow::bail!(
+                    "fewer than {n} listener(s) subscribed to the SSE feed within {deadline:?} \
+                     (saw {}); the expected connection(s) never armed",
+                    self.subscriber_count()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    /// Convenience for the common single-subscriber case.
+    pub async fn wait_for_subscriber(&self, deadline: std::time::Duration) -> Result<()> {
+        self.wait_for_subscribers(1, deadline).await
+    }
+
     /// Push one SSE event with the given event name and JSON data line. Fires
     /// the listener's matching `SseSubscribe { event_name }`. The (event, data)
     /// pair is sent to the handler, which builds a single well-formed SSE frame
     /// from it (NOT a pre-formatted block: axum adds the `event:`/`data:` lines,
     /// so pre-formatting would double-wrap and corrupt the stream).
+    ///
+    /// Poll `subscriber_count() >= 1` before calling this so the event is
+    /// not pushed before the listener's SSE connection is live.
     pub fn push_event(&self, event: &str, data: &str) {
         // Ignore the "no subscribers yet" error: the test sequences push after
         // the subscription is live, but a stray early push is harmless to drop.

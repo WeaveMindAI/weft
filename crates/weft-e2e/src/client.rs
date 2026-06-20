@@ -109,6 +109,21 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// DELETE `path`, requiring 2xx. Used by the suite's startup sweep to
+    /// remove leftover projects via the real `DELETE /projects/{id}` path
+    /// (the same forced cleanup `weft rm --force` performs).
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .with_context(|| format!("DELETE {url}"))?;
+        read_ok(resp, "DELETE", &url).await?;
+        Ok(())
+    }
+
     /// GET `path` and return the raw status + body without requiring 2xx. Used
     /// where the rig must assert on a specific status code (e.g. a 404 after
     /// teardown) rather than treat non-2xx as an error.

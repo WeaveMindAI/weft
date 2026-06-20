@@ -73,12 +73,45 @@ impl Node for MiniServiceNode {
         // Resolve the endpoint, read its /outputs, and emit them plus the bare
         // URL. The `/outputs` key set (status) matches the declared output port.
         let api = ctx.endpoint("api").await?;
-        let outputs = api
-            .call(weft_core::EndpointMethod::Get, "/outputs", None)
-            .await?;
+        // The service's readiness probe gates the pod Ready, and the
+        // supervisor waits for readiness before reporting Running, but the
+        // first cross-pod call can still race the Service's network path
+        // becoming warm (especially on a loaded cluster: kube-proxy /
+        // endpoint propagation lags pod-Ready by a beat). A single call
+        // would then fail spuriously. Retry briefly until it answers or a
+        // short deadline: a genuinely-up service responds within seconds,
+        // so a timeout here is a real failure, not flakiness.
+        let outputs = call_with_warmup_retry(&api).await?;
         let out = NodeOutput::empty()
             .extend_from_object(&outputs, &["endpointUrl"])
             .set("endpointUrl", Value::String(api.url().to_string()));
         ctx.pulse_downstream(out).await
+    }
+}
+
+/// GET `/outputs`, retrying on error until it succeeds or the warmup
+/// deadline elapses. The last error is returned on timeout so a service
+/// that is genuinely down still fails loudly (the retry only smooths the
+/// brief post-Ready network-warmup window, it never hides a real outage).
+async fn call_with_warmup_retry(
+    api: &weft_core::EndpointHandle,
+) -> WeftResult<Value> {
+    use std::time::{Duration, Instant};
+    const WARMUP_DEADLINE: Duration = Duration::from_secs(30);
+    const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+    let start = Instant::now();
+    loop {
+        match api
+            .call(weft_core::EndpointMethod::Get, "/outputs", None)
+            .await
+        {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if start.elapsed() >= WARMUP_DEADLINE {
+                    return Err(e);
+                }
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+        }
     }
 }

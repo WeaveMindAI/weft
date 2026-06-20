@@ -15,6 +15,9 @@ use weft_dispatcher::{
     listener::{
         K8sListenerBackend, ListenerBackend, ListenerPool, SubprocessListenerBackend,
     },
+    supervisor_pool::{
+        K8sSupervisorBackend, SubprocessSupervisorBackend, SupervisorBackend, SupervisorPool,
+    },
     tenant::{self, NamespaceMapper, TenantRouter},
     DispatcherState,
 };
@@ -53,9 +56,12 @@ async fn main() -> anyhow::Result<()> {
     let journal = PostgresJournal::connect(&database_url)
         .await
         .with_context(|| format!("connect journal at {database_url}"))?;
-    weft_dispatcher::lease::migrate(journal.pool())
+    weft_dispatcher::listener::migrate(journal.pool())
         .await
-        .context("apply lease migrations")?;
+        .context("apply listener_pod migrations")?;
+    weft_dispatcher::supervisor_pool::migrate(journal.pool())
+        .await
+        .context("apply supervisor_pod + infra_owner migrations")?;
     weft_dispatcher::namespace_registry::migrate(journal.pool())
         .await
         .context("apply namespace_registry migrations")?;
@@ -187,8 +193,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cluster_ingress_namespace = std::env::var("WEFT_CLUSTER_INGRESS_NAMESPACE")
         .unwrap_or_else(|_| "ingress-nginx".to_string());
-    let supervisor_image = std::env::var("WEFT_SUPERVISOR_IMAGE")
-        .unwrap_or_else(|_| "weft-infra-supervisor:local".to_string());
     let storage_image = std::env::var("WEFT_STORAGE_IMAGE")
         .unwrap_or_else(|_| "weft-storage:local".to_string());
 
@@ -218,11 +222,49 @@ async fn main() -> anyhow::Result<()> {
     let pg_pool = journal.pool().clone();
     let event_bus = weft_dispatcher::EventBus::with_notify(pg_pool.clone()).await?;
 
-    // ListenerPool is stateless: every `with_listener` call reads
-    // the `tenant_listener` row through an advisory-locked transaction
-    // and returns the fresh handle. No RAM cache means no staleness
-    // possible, at the cost of one DB round-trip per listener call.
-    let listener_pool = ListenerPool::new();
+    // The control-plane namespace: where pooled, trusted, tenant-
+    // agnostic services run (the single infra-supervisor; pooled
+    // listeners). They serve many tenants, so they do not live in any
+    // one tenant's namespace. Defaults to the dispatcher's own
+    // namespace. The listener pool is stateless: placement + resolution
+    // read the `listener_pod` registry and `signal.listener_pod` per
+    // call, so no RAM cache can go stale across dispatcher pods.
+    let control_plane_namespace = std::env::var("WEFT_CONTROL_PLANE_NAMESPACE")
+        .unwrap_or_else(|_| "weft-system".to_string());
+    let listener_pool = ListenerPool::new(control_plane_namespace.clone());
+
+    // Pooled infra-supervisor backend + pool, mirroring the listener.
+    // The pool scales supervisor pods up/down by owned-project load; each
+    // pod owns the infra of a set of projects (exclusive `infra_owner`
+    // lease). Like the listener pool it is stateless: placement reads the
+    // `supervisor_pod` registry + `infra_owner` counts per call.
+    let supervisor_backend: Arc<dyn SupervisorBackend> =
+        match std::env::var("WEFT_SUPERVISOR_BACKEND").as_deref() {
+            Ok("subprocess") => {
+                let bin = std::env::var("WEFT_SUPERVISOR_BIN")
+                    .ok()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(|d| d.join("weft-infra-supervisor")))
+                            .unwrap_or_else(|| {
+                                std::path::PathBuf::from("weft-infra-supervisor")
+                            })
+                    });
+                Arc::new(SubprocessSupervisorBackend::new(bin))
+            }
+            _ => {
+                let image = std::env::var("WEFT_SUPERVISOR_IMAGE")
+                    .unwrap_or_else(|_| "weft-infra-supervisor:local".into());
+                Arc::new(K8sSupervisorBackend::new(
+                    image,
+                    broker_url.clone(),
+                    kube.clone(),
+                ))
+            }
+        };
+    let supervisor_pool = SupervisorPool::new(control_plane_namespace.clone());
 
     let in_cluster = std::env::var("KUBERNETES_SERVICE_HOST").is_ok();
     // Empty counts as unset: the k8s-backend manifest substitutes
@@ -270,13 +312,15 @@ async fn main() -> anyhow::Result<()> {
         events: event_bus,
         listener_backend,
         listeners: listener_pool,
+        supervisor_backend,
+        supervisors: supervisor_pool,
         tenant_router,
         namespace_mapper,
         public_base_url,
         cluster_pod_cidr,
         cluster_service_cidr,
         cluster_ingress_namespace,
-        supervisor_image,
+        control_plane_namespace,
         storage_image,
         internal_base_url,
         storage_admin,
@@ -300,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Infra-event bridge: same pattern for `infra_event` rows
-    // written by per-tenant supervisor pods (flaky / recovered /
+    // written by pooled supervisor pods (flaky / recovered /
     // failed / etc.).
     let infra_bridge_state = state.clone();
     tokio::spawn(async move {
@@ -398,23 +442,25 @@ async fn lease_renewer(state: DispatcherState) {
         let pool = state.pg_pool.clone();
         let pid = pod_id.clone();
 
-        let tenant_rows: Result<Vec<(String,)>, _> = sqlx::query_as(
-            "SELECT tenant_id FROM tenant_listener WHERE owner_pod_id = $1",
-        )
-        .bind(&pid)
-        .fetch_all(&pool)
-        .await;
-        if let Ok(rows) = tenant_rows {
-            for (tenant_id,) in rows {
-                if let Err(e) = lease::renew_tenant_listener(&pool, &tenant_id, &pid).await {
-                    tracing::warn!(
-                        target: "weft_dispatcher",
-                        tenant = %tenant_id,
-                        error = %e,
-                        "tenant_listener renewal failed"
-                    );
-                }
-            }
+        // Renew the lease on every pooled listener pod this dispatcher
+        // owns, so a sibling does not adopt a live pod. A failure is not
+        // recovered here; the next sweep adopts an expired lease.
+        if let Err(e) = state.listeners.renew_owned(&pool, &pid).await {
+            tracing::warn!(
+                target: "weft_dispatcher",
+                error = %e,
+                "listener_pod lease renewal failed"
+            );
+        }
+        // Same for pooled supervisor pods (the `supervisor_pod` registry
+        // lease, distinct from the per-project `infra_owner` lease the
+        // supervisor renews itself).
+        if let Err(e) = state.supervisors.renew_owned(&pool, &pid).await {
+            tracing::warn!(
+                target: "weft_dispatcher",
+                error = %e,
+                "supervisor_pod lease renewal failed"
+            );
         }
     }
 }

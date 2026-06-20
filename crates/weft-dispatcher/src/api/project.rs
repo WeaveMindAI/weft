@@ -147,12 +147,13 @@ pub async fn register(
     )
     .await
     .map_err(|e| register_internal_error(format!("ensure_tenant_namespace ({tenant_namespace}): {e}")))?;
-    // Note: we no longer spawn the per-tenant supervisor Deployment
-    // at register time. The supervisor is lazy: it gets applied the
-    // first time the project's sync handler needs to enqueue an
-    // Apply command. Projects that never use infra never spawn one.
-    // The supervisor reaper kills idle supervisor Deployments when
-    // a tenant has no live infra_node rows and no in-flight commands.
+    // Note: register-time work never touches the supervisor. Supervisors
+    // are pooled, tenant-agnostic pods placed by the dispatcher's
+    // `SupervisorPool` (in `supervisor_pool.rs`); a pod claims a
+    // project's infra via the exclusive `infra_owner` lease when it has
+    // capacity, and the `sweep_supervisor*` reapers scale the pool up and
+    // down by owned-project load. A project that never declares infra is
+    // simply never claimed.
     // Per-project namespace bundle: namespace + worker/infra SAs +
     // NetworkPolicies + RoleBindings to the supervisor/listener
     // ClusterRoles.
@@ -166,6 +167,7 @@ pub async fn register(
         service_cidr: &state.cluster_service_cidr,
         ingress_namespace: &state.cluster_ingress_namespace,
         tenant_namespace: &tenant_namespace,
+        control_plane_namespace: &state.control_plane_namespace,
     };
     // Namespace MUST land before we write the project row: every
     // downstream step (worker spawn, infra apply, listener attach)
@@ -1126,12 +1128,11 @@ pub async fn status(
         // the CLI bubbles it loudly instead of skipping the gate.
         .ok_or((StatusCode::NOT_FOUND, "project definition missing".to_string()))?;
     let project_id = id.to_string();
-    let tenant = state.tenant_router.tenant_for_project(&project_id);
     let listener_running = state
         .listeners
-        .is_alive(&tenant, &state.pg_pool)
+        .project_has_live_listener(&project_id, &state.pg_pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener is_alive: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener status: {e}")))?;
 
     let infra_rows = crate::infra_node::list_for_project(&state.pg_pool, &project_id)
         .await
@@ -1635,8 +1636,6 @@ async fn activate_trigger_setup_window(
     state: &DispatcherState,
     id: uuid::Uuid,
     project_id: &str,
-    tenant: &crate::tenant::TenantId,
-    namespace: &str,
     choice: &str,
     project: &ProjectDefinition,
     definition_hash: &str,
@@ -1649,9 +1648,11 @@ async fn activate_trigger_setup_window(
         rollback: ActivateRollback::UnstickOnly,
     };
 
-    let keep_alive = crate::listener::ActivateKeepAlive::acquire(&state.pg_pool, tenant)
-        .await
-        .map_err(|e| unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("keep-alive: {e}"))))?;
+    // No activate keep-alive: in the pooled model a listener pod is
+    // reaped only when it holds ZERO signals, and placement happens
+    // per-signal during register_signal, so there is no pre-spawned
+    // empty pod for the reaper to snipe mid-activate. The first placed
+    // signal keeps its holder alive by being on it.
 
     // Apply the reactivate choice's destructive effect now that we
     // hold the exclusive Activating transition (validated by caller).
@@ -1700,19 +1701,14 @@ async fn activate_trigger_setup_window(
         .await
         .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("drop_orphan_entry_rows: {e}"))))?;
 
-    // Reconcile the listener's in-RAM registry with the durable
-    // signal table (resume signals belong to suspended executions
-    // whose workers are gone). /rehydrate is idempotent.
+    // Reconcile the registries of every listener holding this project's
+    // signals with the durable signal table (resume signals belong to
+    // suspended executions whose workers are gone). /rehydrate is
+    // idempotent. A signal whose holder was reaped (NULL placement) is
+    // re-placed by the next fire via `ensure_placed_handle`.
     state
         .listeners
-        .with_listener(
-            tenant,
-            namespace,
-            state.listener_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-            |handle| async move { crate::listener::rehydrate(&handle).await },
-        )
+        .rehydrate_project(project_id, &state.pg_pool)
         .await
         .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("listener rehydrate: {e}"))))?;
 
@@ -1738,9 +1734,8 @@ async fn activate_trigger_setup_window(
         });
     }
 
-    // Window done: project is Active. Release the lease; the listener
-    // now stays alive on signal-row presence alone.
-    drop(keep_alive);
+    // Window done: project is Active. Its signals are placed; their
+    // holders stay alive on signal-row presence alone.
     Ok(())
 }
 
@@ -1872,11 +1867,6 @@ pub async fn activate_inner(
         ));
     }
 
-    // Tenant/namespace for the trigger-setup window (which holds the
-    // keep-alive lease internally) and the post-activate URL publish.
-    let tenant = state.tenant_router.tenant_for_project(&project_id);
-    let namespace = state.namespace_mapper.namespace_for(&tenant);
-
     // Everything from here to the Active CAS happens while the
     // project is Activating. ANY failure in this window must
     // un-stick the project (a stranded Activating locks out all
@@ -1886,7 +1876,7 @@ pub async fn activate_inner(
     // block with ONE rollback site below. A future step added here
     // can't forget the un-stick.
     let setup = activate_trigger_setup_window(
-        &state, id, &project_id, &tenant, &namespace, choice, &project,
+        &state, id, &project_id, choice, &project,
         &running_definition_hash,
     )
     .await;
@@ -2776,7 +2766,7 @@ pub async fn deactivate_project_with_mode(
         if !signals.is_empty() {
             state
                 .listeners
-                .unregister_many_if_alive(&state.pg_pool, &signals)
+                .unregister_many(&state.pg_pool, &signals)
                 .await;
         }
     }

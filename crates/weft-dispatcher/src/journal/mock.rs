@@ -20,6 +20,10 @@ struct MockState {
     events: Vec<ExecEvent>,
     api_tokens: HashMap<String, ApiToken>,
     signals: HashMap<String, SignalRegistration>,
+    /// Placement (holder pod + generation) recorded WITH each signal,
+    /// mirroring the real `signal.listener_pod` / `placement_generation`
+    /// columns, so a test can assert what a fresh insert stamped.
+    signal_placements: HashMap<String, crate::journal::SignalPlacement>,
     dedup_keys: std::collections::HashSet<String>,
     /// Mirror of the Postgres `execution_color` denormalization:
     /// seeded on `ExecutionStarted`, cleared on `delete_execution`.
@@ -37,6 +41,14 @@ pub struct MockJournal {
 impl MockJournal {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The placement (holder pod + generation) `signal_insert` recorded
+    /// for `token`, or `None` if no signal was inserted under it. Lets a
+    /// test assert the placement-born-with-row invariant: the holder is
+    /// stamped WITH the row, never left NULL for a later write.
+    pub fn signal_placement(&self, token: &str) -> Option<crate::journal::SignalPlacement> {
+        self.inner.lock().unwrap().signal_placements.get(token).cloned()
     }
 }
 
@@ -259,12 +271,16 @@ impl Journal for MockJournal {
         Ok(())
     }
 
-    async fn signal_insert(&self, sig: &SignalRegistration) -> anyhow::Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .signals
-            .insert(sig.token.clone(), sig.clone());
+    async fn signal_insert(
+        &self,
+        sig: &SignalRegistration,
+        placement: &crate::journal::SignalPlacement,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.signals.insert(sig.token.clone(), sig.clone());
+        inner
+            .signal_placements
+            .insert(sig.token.clone(), placement.clone());
         Ok(())
     }
 
@@ -301,17 +317,6 @@ impl Journal for MockJournal {
             .collect())
     }
 
-    async fn signal_count_for_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .signals
-            .values()
-            .filter(|s| s.tenant_id == tenant_id)
-            .count())
-    }
-
     async fn signal_remove_for_color(
         &self,
         color: Color,
@@ -344,5 +349,54 @@ impl Journal for MockJournal {
             .into_iter()
             .filter_map(|k| g.signals.remove(&k))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::SignalPlacement;
+
+    fn registration(token: &str) -> SignalRegistration {
+        SignalRegistration {
+            token: token.into(),
+            tenant_id: "t".into(),
+            project_id: "p".into(),
+            color: None,
+            node_id: "n".into(),
+            is_resume: false,
+            spec_json: "{}".into(),
+            consumer_kind: None,
+            tags: vec![],
+            consumer_payload: None,
+            surface_kind: "public_entry".into(),
+            mount_path: None,
+            auth_kind: "none".into(),
+            auth_config: None,
+            kind_state: serde_json::Value::Object(Default::default()),
+        }
+    }
+
+    /// `signal_insert` records the placement (holder pod + generation)
+    /// WITH the signal, never separately: the invariant the
+    /// placement-born-with-row fix guarantees (a committed signal always
+    /// has a non-NULL holder). The accessor reads back exactly what was
+    /// stamped.
+    #[tokio::test]
+    async fn signal_insert_records_placement_with_the_row() {
+        let j = MockJournal::new();
+        assert!(j.signal_placement("tok-1").is_none(), "no signal yet");
+        j.signal_insert(
+            &registration("tok-1"),
+            &SignalPlacement { listener_pod: "listener-abc".into(), generation: 3 },
+        )
+        .await
+        .unwrap();
+        let placement = j.signal_placement("tok-1").expect("placement recorded with the row");
+        assert_eq!(placement.listener_pod, "listener-abc");
+        assert_eq!(placement.generation, 3);
+        // The signal itself is also present (holder + registration land
+        // together, not in separate steps).
+        assert!(j.signal_get("tok-1").await.unwrap().is_some());
     }
 }

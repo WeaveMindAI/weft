@@ -1,10 +1,10 @@
 //! Signal-related dispatcher routes. Every endpoint here either
-//! relays a fire through the tenant's listener (via `with_listener`)
-//! or reads/writes the durable signal table.
+//! relays a fire to the pooled listener holding the signal (resolved
+//! via `signal.listener_pod`) or reads/writes the durable signal table.
 //!
 //! Diagnostic surface:
-//!   - `GET /listener/inspect`: per-tenant `signal` row counts
-//!     compared against each listener's in-process registry, to
+//!   - `GET /listener/inspect`: per-POD placed-`signal` row counts
+//!     compared against each listener pod's in-process registry, to
 //!     surface drift between the dispatcher's view and the listener's.
 
 use axum::{
@@ -111,39 +111,33 @@ pub(crate) async fn remove_parked_fire(
     Ok(updated.rows_affected())
 }
 
-/// Diagnostic: per-tenant `signal` row count alongside the
-/// listener's own registry contents. Drift between them means the
-/// cleanup pipeline went wrong somewhere; an operator can compare
-/// and decide whether to nuke a stale listener Deployment.
+/// Diagnostic: per-POD placed-signal count alongside the pod's own
+/// registry contents. Drift between them means the cleanup pipeline
+/// went wrong somewhere; an operator can compare and decide whether to
+/// nuke a stale listener Deployment. Pooled model: one entry per
+/// `listener_pod`, not per tenant (a pod holds many tenants' signals).
 pub async fn listener_inspect(
     State(state): State<DispatcherState>,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
-    let rows = sqlx::query(
-        "SELECT tenant_id, admin_url FROM tenant_listener",
-    )
-    .fetch_all(&state.pg_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tenant_listener: {e}")))?;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT pod_name, admin_url FROM listener_pod")
+            .fetch_all(&state.pg_pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener_pod: {e}")))?;
     let http = reqwest::Client::new();
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let tenant_id: String = row
-            .try_get("tenant_id")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-        let admin_url: String = row
-            .try_get("admin_url")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
+    for (pod_name, admin_url) in rows {
         // Drift-detection endpoint: the whole point is to surface
-        // mismatches between journal and listener registry. A
-        // silenced DB error or silent JSON decode failure here
-        // would defeat that. Propagate / report the failure shape.
-        let journal_count = state
-            .journal
-            .signal_count_for_tenant(&tenant_id)
-            .await
-            .map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_count_for_tenant: {e}"))
-            })?;
+        // mismatches between the placement table and the pod's
+        // registry. A silenced DB error or silent JSON decode failure
+        // here would defeat that. Propagate / report the failure shape.
+        let placed_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signal WHERE listener_pod = $1",
+        )
+        .bind(&pod_name)
+        .fetch_one(&state.pg_pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("placed_count: {e}")))?;
         let listener_registry: Value = match http
             .get(format!("{}/signals", admin_url.trim_end_matches('/')))
             .send()
@@ -159,9 +153,9 @@ pub async fn listener_inspect(
             Err(e) => serde_json::json!({ "network_error": e.to_string() }),
         };
         out.push(serde_json::json!({
-            "tenant_id": tenant_id,
+            "pod_name": pod_name,
             "listener_url": admin_url,
-            "journal_signal_count": journal_count,
+            "placed_signal_count": placed_count,
             "listener_registry": listener_registry,
         }));
     }
@@ -389,14 +383,56 @@ pub(crate) async fn lookup_signal_routing(
 /// kind-unaware: the listener owns the resume-vs-entry decision
 /// (it stored is_resume + color at register time).
 ///
-/// Runs the entire flow inside `with_listener` so the listener
-/// stays alive for both the `/process` POST AND the journal +
-/// task-enqueue work that follows.
+/// Resolves the pod holding the signal via `ensure_placed_handle`
+/// (re-placing from the durable row if the prior holder was reaped),
+/// runs `/process`, and on a `NotHeld` answer (routed to a pod mid
+/// scale-down move) re-resolves and retries once before failing loud.
 /// `dedup_nonce`: identifies one specific fire so a mid-flight crash
 /// between task-insert and the caller's commit can be safely retried
 /// without producing a duplicate execution. The drain pass supplies
 /// the per-fire UUID stamped at park time; live fires pass `None`
 /// (no retry path that could double-insert).
+///
+/// Should the fire be re-resolved + retried after this attempt? Only when
+/// the pod answered `NotHeld` (the dispatcher routed to a pod that no
+/// longer holds the signal, a scale-down move flipped the routing column
+/// between resolve and POST) AND this was the FIRST attempt. Exactly one
+/// retry: a move flips the routing column to the new pod BEFORE
+/// unregistering the old one, so a single re-resolve is guaranteed to find
+/// the live holder; a second NotHeld means the row genuinely doesn't point
+/// at a live holder and must fail loud, not loop. Pure so the retry rule
+/// is layer-1 testable without a real listener + Postgres.
+fn fire_should_retry(target: &ProcessTarget, attempt: usize) -> bool {
+    matches!(target, ProcessTarget::NotHeld) && attempt == 0
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn notheld_on_first_attempt_retries() {
+        assert!(fire_should_retry(&ProcessTarget::NotHeld, 0));
+    }
+
+    #[test]
+    fn notheld_on_second_attempt_does_not_retry() {
+        // One retry only: a persistent NotHeld must fail loud, not loop.
+        assert!(!fire_should_retry(&ProcessTarget::NotHeld, 1));
+    }
+
+    #[test]
+    fn non_notheld_outcomes_never_retry() {
+        // A real outcome (Entry/Resume/Drop) is final on the first attempt.
+        assert!(!fire_should_retry(&ProcessTarget::Entry, 0));
+        assert!(!fire_should_retry(
+            &ProcessTarget::Resume { color: "c".into() },
+            0
+        ));
+        assert!(!fire_should_retry(&ProcessTarget::Drop { reason: None }, 0));
+    }
+}
+
 pub(crate) async fn dispatch_listener_outcome(
     state: &DispatcherState,
     token: &str,
@@ -405,22 +441,51 @@ pub(crate) async fn dispatch_listener_outcome(
     dedup_nonce: Option<&str>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let tenant = state.tenant_router.tenant_for_project(project_id);
-    let namespace = state.namespace_mapper.namespace_for(&tenant);
     let token_owned = token.to_string();
     let project_owned = project_id.to_string();
     let tenant_str = tenant.as_str().to_string();
     let dedup_nonce_owned = dedup_nonce.map(|s| s.to_string());
-    state
-        .listeners
-        .with_listener(
-            &tenant,
-            &namespace,
-            state.listener_backend.as_ref(),
-            &state.pg_pool,
-            state.pod_id.as_str(),
-            |handle| async move {
-                let outcome = crate::listener::process_signal(&handle, &token_owned, &payload)
-                    .await?;
+    // Resolve the listener holding this signal, re-placing it from its
+    // durable row if the prior holder was reaped (a parked webhook may
+    // fire long after its listener idled out). A fire must always find a
+    // listener; ensure_placed_handle fails loud if the signal row is
+    // gone rather than dropping the fire.
+    let result: Result<StatusCode, anyhow::Error> = async {
+        // Resolve the holder and process. A pod that no longer holds the
+        // signal answers `NotHeld` (the dispatcher routed here during a
+        // scale-down move, the signal was re-placed onto another pod
+        // between our resolve and our POST). Re-resolve from the durable
+        // row (now pointing at the new pod, since a move flips the routing
+        // column BEFORE unregistering the old pod) and retry ONCE. One
+        // retry is sufficient and bounded: the move's flip-before-drop
+        // ordering guarantees a live holder exists by the time the old pod
+        // can answer NotHeld. A persistent NotHeld (signal row gone) falls
+        // through to the normal handling below and is not silently looped.
+        let mut outcome = None;
+        for attempt in 0..2 {
+            let handle = state
+                .listeners
+                .ensure_placed_handle(
+                    token,
+                    state.listener_backend.as_ref(),
+                    &state.pg_pool,
+                    state.pod_id.as_str(),
+                )
+                .await?;
+            let o = crate::listener::process_signal(&handle, &token_owned, &payload).await?;
+            if fire_should_retry(&o.target, attempt) {
+                tracing::debug!(
+                    target: "weft_dispatcher::signal",
+                    token = %token_owned,
+                    "holder answered NotHeld (routed mid-move); re-resolving and retrying once"
+                );
+                continue;
+            }
+            outcome = Some(o);
+            break;
+        }
+        let outcome = outcome.expect("loop sets outcome on the non-retry branch");
+        {
                 match outcome.target {
                     ProcessTarget::Resume { color, .. } => {
                         let color: weft_core::Color = color
@@ -550,16 +615,29 @@ pub(crate) async fn dispatch_listener_outcome(
                         );
                         Ok(StatusCode::OK)
                     }
+                    ProcessTarget::NotHeld => {
+                        // Still NotHeld after the re-resolve + retry. The
+                        // signal's holder genuinely doesn't have it and the
+                        // durable row didn't redirect us to a live one. This
+                        // is a real inconsistency (a holder that lost the
+                        // signal without a move, or a row pointing at a dead
+                        // pod that ensure_placed_handle couldn't re-place).
+                        // Fail loud rather than silently dropping the fire.
+                        anyhow::bail!(
+                            "fire for token '{token_owned}' still NotHeld after re-resolve + \
+                             retry; the durable signal row does not point at a live holder"
+                        )
+                    }
                 }
-            },
+        }
+    }
+    .await;
+    result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("listener dispatch: {e}"),
         )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("listener dispatch: {e}"),
-            )
-        })
+    })
 }
 
 // ---------- Signal-deletion helpers ----------
@@ -596,7 +674,7 @@ pub(crate) async fn delete_signals(
     if !deleted.is_empty() {
         state
             .listeners
-            .unregister_many_if_alive(&state.pg_pool, &deleted)
+            .unregister_many(&state.pg_pool, &deleted)
             .await;
     }
     Ok(())
@@ -617,7 +695,7 @@ pub(crate) async fn delete_signals_for_project(
     if !deleted.is_empty() {
         state
             .listeners
-            .unregister_many_if_alive(&state.pg_pool, &deleted)
+            .unregister_many(&state.pg_pool, &deleted)
             .await;
     }
     Ok(())
@@ -1619,15 +1697,18 @@ pub async fn display_signal(
     Path((project_id, node_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
-    let tenant = state.tenant_router.tenant_for_project(&project_id);
-    let display = state
+    // Resolve the pod holding this signal; if none is live (reaped while
+    // idle), 503 rather than spinning a listener up just to render the
+    // inspector display.
+    let handle = state
         .listeners
-        .with_listener_if_alive(&tenant, &state.pg_pool, |handle| async move {
-            crate::listener::display_signal(&handle, &token).await
-        })
+        .resolve_signal(&token, &state.pg_pool)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /display: {e}")))?
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "tenant listener not running".into()))?;
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener resolve: {e}")))?
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "listener not running for this signal".into()))?;
+    let display = crate::listener::display_signal(&handle, &token)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /display: {e}")))?;
     Ok(Json(display))
 }
 
@@ -1650,16 +1731,17 @@ pub async fn action_signal(
     Json(body): Json<ActionBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
-    let tenant = state.tenant_router.tenant_for_project(&project_id);
-    let token_for_call = token.clone();
-    let resp = state
+    // Resolve the pod holding this signal; 503 if reaped (actions are
+    // only meaningful against the live in-memory state of the holder).
+    let handle = state
         .listeners
-        .with_listener_if_alive(&tenant, &state.pg_pool, |handle| async move {
-            crate::listener::action_signal(&handle, &token_for_call, &body.kind, &body.payload).await
-        })
+        .resolve_signal(&token, &state.pg_pool)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /action: {e}")))?
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "tenant listener not running".into()))?;
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener resolve: {e}")))?
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "listener not running for this signal".into()))?;
+    let resp = crate::listener::action_signal(&handle, &token, &body.kind, &body.payload)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /action: {e}")))?;
     if let Some(routing) = &resp.routing {
         let auth_config = if routing.auth_config.is_null() {
             None

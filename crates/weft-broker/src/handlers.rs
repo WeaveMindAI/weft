@@ -71,7 +71,7 @@ pub async fn journal_record(
     if owner_pod != claimed_pod {
         tracing::warn!(
             target: "weft_broker::scope",
-            caller_tenant = %caller.tenant_id,
+            caller_tenant = ?caller.scope.pinned_tenant(),
             caller_pod = %claimed_pod,
             color = %color,
             owner_pod = %owner_pod,
@@ -119,6 +119,44 @@ pub async fn journal_has_terminal(
 }
 
 // ---------- Tasks ----------
+
+/// Should a held-event fire be FENCED (dropped) by the placement
+/// generation? A fire is fenced iff the signal row exists AND the fire's
+/// generation is strictly below the row's current one, meaning it came
+/// from a pod that has since been drained (a scale-down move registered
+/// the signal on a newer pod under a higher generation). A fire equal to
+/// or above the current generation is the live holder's; a signal with no
+/// row (`None`) is never fenced (no move could have happened, and the
+/// downstream scope check handles a genuinely-missing signal). Pure so
+/// the fence rule is layer-1 testable without a Postgres row.
+fn fire_is_fenced(fire_gen: i64, current_gen: Option<i64>) -> bool {
+    matches!(current_gen, Some(cur) if fire_gen < cur)
+}
+
+/// Fold a newly-resolved resource tenant into the task's anchor tenant,
+/// enforcing that every named resource agrees. A task naming resources
+/// in two different tenants (project in A, color in B) is ambiguous and
+/// a sign of a confused or malicious caller; we refuse it loudly rather
+/// than letting the last-resolved resource silently win. Pure so the
+/// agreement rule is layer-1 testable without a Postgres lookup.
+fn merge_anchor_tenant(
+    anchor: &mut Option<String>,
+    resource_tenant: String,
+) -> Result<(), (StatusCode, String)> {
+    match anchor {
+        Some(prev) if *prev != resource_tenant => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "task names resources in two different tenants ('{prev}' and \
+                 '{resource_tenant}'); refusing to guess which tenant owns the task"
+            ),
+        )),
+        _ => {
+            *anchor = Some(resource_tenant);
+            Ok(())
+        }
+    }
+}
 
 pub async fn task_enqueue_dedup(
     State(state): State<Arc<BrokerState>>,
@@ -205,47 +243,118 @@ pub async fn task_enqueue_dedup(
         ));
     }
 
-    // Tenant scope check: the payload's tenant_id, if present, must
-    // match the caller's tenant. If absent, fill it from caller; if
-    // present but mismatched, 403.
-    let claimed_tenant = req.spec.tenant_id.as_deref().unwrap_or(&caller.tenant_id);
-    scope::require_tenant_eq(&caller, claimed_tenant)?;
-
+    // Resolve the task's authoritative tenant from the resource it
+    // names, enforcing the caller's scope on every named resource. A
+    // worker (tenant-scoped) may only act for its own tenant; a pooled
+    // listener (control-plane, trusted) may fire held events for any
+    // tenant. The `require_*` helpers each return the resource's true
+    // tenant, so we never trust `req.spec.tenant_id` from the wire and a
+    // control-plane caller (which has no single tenant) still yields a
+    // correctly-tenanted task. When several resources are named they
+    // MUST agree: `merge_anchor_tenant` rejects a task that names
+    // resources in two different tenants (e.g. project P in tenant A and
+    // color C in tenant B) rather than silently picking one, so the
+    // stamped tenant is never ambiguous.
+    let mut anchor_tenant: Option<String> = None;
     if let Some(project_id) = req.spec.project_id.as_deref() {
-        scope::require_project_owned_by(
-            &state.scope_cache,
-            &state.pool,
-            &caller,
-            project_id,
-        )
-        .await?;
+        let t =
+            scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, project_id)
+                .await?;
+        merge_anchor_tenant(&mut anchor_tenant, t)?;
     }
     if let Some(color) = req.spec.color.as_deref() {
-        scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, color).await?;
+        let t = scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, color).await?;
+        merge_anchor_tenant(&mut anchor_tenant, t)?;
     }
     if kind == TaskKind::FireSignal {
-        // Listener firing a held event: the token must belong to the
-        // listener's tenant. Pull token out of payload.
+        // Listener held-event fire: the signal token is the tenant
+        // anchor. Pull it from the payload and resolve.
         let token = req
             .spec
             .payload
             .get("token")
             .and_then(|v| v.as_str())
             .ok_or((StatusCode::BAD_REQUEST, "fire_signal payload missing token".into()))?;
-        scope::require_signal_owned_by(&state.scope_cache, &state.pool, &caller, token).await?;
+        let t = scope::require_signal_owned_by(&state.scope_cache, &state.pool, &caller, token).await?;
+        merge_anchor_tenant(&mut anchor_tenant, t)?;
+
+        // Placement-generation FENCE. A held-event fire carries the
+        // generation the firing pod holds the signal under. During a
+        // scale-down move the signal is briefly armed on two pods (the
+        // new pod registered under gen+1 BEFORE the old pod is
+        // unregistered); a self-firing kind (Timer/SSE) could fire on
+        // both. The new pod's fire carries the current generation; the
+        // stale old pod's carries a LOWER one. Drop the stale fire so the
+        // event is delivered exactly once. A fire missing the field (or
+        // for a signal with no row) is treated as current (gen 0), never
+        // fenced, so non-move paths are unaffected.
+        let fire_gen = req
+            .spec
+            .payload
+            .get("placement_generation")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let current_gen: Option<(i64,)> =
+            sqlx::query_as("SELECT placement_generation FROM signal WHERE token = $1")
+                .bind(token)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|e| internal(anyhow::anyhow!("read placement_generation: {e}")))?;
+        if fire_is_fenced(fire_gen, current_gen.map(|(g,)| g)) {
+            tracing::info!(
+                target: "weft_broker::handlers",
+                %token,
+                fire_gen,
+                current_gen = ?current_gen.map(|(g,)| g),
+                "fenced stale held-event fire (old pod fired during a scale-down move overlap)"
+            );
+            return Ok(Json(TaskEnqueueDedupResponse {
+                id: None,
+                inserted: false,
+                fenced: true,
+            }));
+        }
     }
 
-    // `req.spec` IS a `NewTask` directly (the wire shape matches
-    // the type). Force tenant_id to the caller's identity: never
-    // trust what the wire claimed.
+    // A task with no tenant-bearing resource can only come from a
+    // tenant-scoped caller (its own tenant is the anchor). A
+    // control-plane caller MUST name a resource so the tenant is
+    // derivable; reject the ambiguous case rather than guess.
+    let resolved_tenant = match anchor_tenant {
+        Some(t) => t,
+        None => match caller.scope.pinned_tenant() {
+            Some(t) => t.to_string(),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "control-plane caller must name a project / color / signal so the task's \
+                     tenant can be resolved".into(),
+                ));
+            }
+        },
+    };
+
+    // `req.spec` IS a `NewTask` directly (the wire shape matches the
+    // type). Stamp the RESOLVED tenant (the resource's true tenant),
+    // never the wire value and never the caller identity.
     let mut new_task = req.spec;
-    new_task.tenant_id = Some(caller.tenant_id.clone());
+    new_task.tenant_id = Some(resolved_tenant);
     let outcome = state.tasks.enqueue_dedup(new_task).await.map_err(internal)?;
     let (id, inserted) = match outcome {
         DedupOutcome::Inserted(id) => (id, true),
         DedupOutcome::AlreadyLive(id) => (id, false),
+        // The local Postgres `enqueue_dedup` has no placement-generation
+        // context and never fences; the only fence is the explicit
+        // early-return above. Reaching here with Fenced is impossible.
+        DedupOutcome::Fenced => unreachable!(
+            "local enqueue_dedup cannot fence; the generation fence early-returns above"
+        ),
     };
-    Ok(Json(TaskEnqueueDedupResponse { id, inserted }))
+    Ok(Json(TaskEnqueueDedupResponse {
+        id: Some(id),
+        inserted,
+        fenced: false,
+    }))
 }
 
 pub async fn task_wait_terminal(
@@ -516,20 +625,170 @@ pub async fn project_fetch_definition(
 
 // ---------- Supervisor surface ----------
 
-pub async fn supervisor_projects_for_tenant(
+pub async fn supervisor_sync_ownership(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorProjectsForTenantRequest>,
-) -> Resp<SupervisorProjectsForTenantResponse> {
+    Json(req): Json<SupervisorSyncOwnershipRequest>,
+) -> Resp<SupervisorSyncOwnershipResponse> {
     require_supervisor(&caller)?;
-    scope::require_tenant_eq(&caller, &req.tenant_id)?;
+    // The pooled supervisor's ownership tick, done atomically so two
+    // supervisors never end up owning one project. Steps in one
+    // transaction:
+    //   0. Record this pod's reported memory pressure on its registry row
+    //      (the dispatcher's placement + scale-down read it).
+    //   1. Renew this pod's existing leases (it is alive and working).
+    //   2. Claim a BATCH of MORE projects, but only while the pod is
+    //      below the shared memory saturation threshold (a saturated pod
+    //      keeps what it owns and takes on no more; the dispatcher then
+    //      spawns another supervisor). Claiming is memory-gated, not
+    //      count-gated, so load is the SAME metric as the listener.
+    //      `FOR UPDATE SKIP LOCKED` + `ON CONFLICT` make concurrent
+    //      supervisors partition the free projects without double-claiming.
+    //   3. Return the full owned set (the work loops act only on these).
+    // A project is eligible only if it has a namespace (only namespaced/
+    // paid-tier projects have infra). All time comes from the DB clock
+    // (`EXTRACT(EPOCH FROM NOW())`), never the app clock, so a skewed
+    // dispatcher/broker host can't mis-judge lease expiry.
+    let lease_secs = weft_broker_client::lifecycle_command::INFRA_OWNER_LEASE_SECS;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| internal(anyhow::anyhow!("begin sync_ownership tx: {e}")))?;
+
+    // 0. Record reported memory pressure and read back whether the
+    //    dispatcher has marked this pod draining (scaled down). Best-
+    //    effort: a fresh pod's row may not exist yet if the dispatcher
+    //    spawn hasn't committed; the UPDATE then returns no row and the
+    //    next tick records it. A draining pod must renew + claim nothing
+    //    (its leases were released for re-adoption; re-grabbing them would
+    //    defeat consolidation).
+    let draining: bool = sqlx::query_scalar(
+        "UPDATE supervisor_pod SET mem_pressure = $1 WHERE pod_name = $2 RETURNING draining",
+    )
+    .bind(req.mem_pressure)
+    .bind(&req.pod_name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| internal(anyhow::anyhow!("record supervisor mem_pressure: {e}")))?
+    .unwrap_or(false);
+
+    // 1. Renew owned leases, UNLESS draining (then we want the leases to
+    //    lapse / stay released so survivors adopt them; the drain already
+    //    deleted them, this guards against a renew racing that delete).
+    if !draining {
+        sqlx::query(
+            "UPDATE infra_owner \
+             SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $1 \
+             WHERE supervisor_pod = $2",
+        )
+        .bind(lease_secs)
+        .bind(&req.pod_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal(anyhow::anyhow!("renew infra_owner leases: {e}")))?;
+    }
+
+    // 2. Claim a batch, but only while under the memory saturation
+    //    threshold AND not draining. At/above saturation, or while
+    //    draining, claim nothing (a saturated pod keeps what it owns; a
+    //    draining pod is being removed and must take on nothing).
+    let saturated = weft_platform_traits::is_saturated(
+        req.mem_pressure,
+        weft_platform_traits::SATURATION_MEM_FRACTION,
+    );
+    let headroom = if saturated || draining {
+        0
+    } else {
+        weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH
+    };
+    if headroom > 0 {
+        // Atomic claim via a CTE: `free` selects projects with no live
+        // owner and LOCKS them `FOR UPDATE OF p SKIP LOCKED`, so a
+        // sibling supervisor's concurrent claim takes a DISJOINT set
+        // (never the same row). The INSERT then takes the EXCLUSIVE
+        // `infra_owner` lease for each. ON CONFLICT covers a stale
+        // (expired-lease) row still physically present: we overwrite it
+        // ONLY if its lease is actually expired, so a live owner is
+        // never stolen. Rows we lock are guaranteed free at insert time
+        // because the lock is held to the end of the tx.
+        sqlx::query(
+            "WITH free AS ( \
+                 SELECT p.id::TEXT AS project_id, p.project_namespace, p.tenant_id \
+                 FROM project p \
+                 WHERE p.project_namespace <> '' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM infra_owner io \
+                       WHERE io.project_id = p.id::TEXT \
+                         AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
+                   ) \
+                 ORDER BY p.id \
+                 LIMIT $2 \
+                 FOR UPDATE OF p SKIP LOCKED \
+             ) \
+             INSERT INTO infra_owner \
+                 (project_id, supervisor_pod, namespace, tenant_id, leased_until_unix) \
+             SELECT project_id, $1, project_namespace, tenant_id, \
+                    EXTRACT(EPOCH FROM NOW())::BIGINT + $3 \
+             FROM free \
+             ON CONFLICT (project_id) DO UPDATE \
+               SET supervisor_pod = EXCLUDED.supervisor_pod, \
+                   namespace = EXCLUDED.namespace, \
+                   tenant_id = EXCLUDED.tenant_id, \
+                   leased_until_unix = EXCLUDED.leased_until_unix \
+               WHERE infra_owner.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT",
+        )
+        .bind(&req.pod_name)
+        .bind(headroom)
+        .bind(lease_secs)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal(anyhow::anyhow!("claim infra_owner rows: {e}")))?;
+    }
+
+    // 3. Return the full owned set (joined to current project state).
+    let projects = owned_projects_in(&mut *tx, &req.pod_name).await?;
+    tx.commit()
+        .await
+        .map_err(|e| internal(anyhow::anyhow!("commit sync_ownership tx: {e}")))?;
+    Ok(Json(SupervisorSyncOwnershipResponse { owned: projects }))
+}
+
+/// Pure read: the projects a supervisor pod currently owns, joined to
+/// live project state. No claim, no renew (ownership breadth changes
+/// only via `sync_ownership`). Used by the work loops + per-command
+/// namespace lookups.
+pub async fn supervisor_owned_projects(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SupervisorOwnedProjectsRequest>,
+) -> Resp<SupervisorOwnedProjectsResponse> {
+    require_supervisor(&caller)?;
+    let owned = owned_projects_in(&state.pool, &req.pod_name).await?;
+    Ok(Json(SupervisorOwnedProjectsResponse { owned }))
+}
+
+/// Decode the owned `SupervisorProject` set for a pod against any
+/// executor (a pool ref or a transaction). The single source of the
+/// owned-set query + row decode, shared by `sync_ownership` (inside its
+/// tx) and `owned_projects` (against the pool).
+async fn owned_projects_in<'e, E>(
+    executor: E,
+    pod_name: &str,
+) -> Result<Vec<SupervisorProject>, (StatusCode, String)>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT id::TEXT AS project_id, project_namespace, status, deactivated_by_health \
-         FROM project WHERE tenant_id = $1",
+        "SELECT p.id::TEXT AS project_id, p.tenant_id, p.project_namespace, p.status, \
+                p.deactivated_by_health \
+         FROM infra_owner io \
+         JOIN project p ON p.id::TEXT = io.project_id \
+         WHERE io.supervisor_pod = $1 AND p.project_namespace <> ''",
     )
-    .bind(&req.tenant_id)
-    .fetch_all(&state.pool)
+    .bind(pod_name)
+    .fetch_all(executor)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     let mut projects = Vec::with_capacity(rows.len());
@@ -537,6 +796,9 @@ pub async fn supervisor_projects_for_tenant(
         let project_id: String = r
             .try_get("project_id")
             .map_err(|e| internal(anyhow::anyhow!("decode project_id: {e}")))?;
+        let tenant_id: String = r
+            .try_get("tenant_id")
+            .map_err(|e| internal(anyhow::anyhow!("decode tenant_id: {e}")))?;
         let project_namespace: String = r
             .try_get("project_namespace")
             .map_err(|e| internal(anyhow::anyhow!("decode project_namespace: {e}")))?;
@@ -552,18 +814,15 @@ pub async fn supervisor_projects_for_tenant(
         let deactivated_by_health: bool = r
             .try_get("deactivated_by_health")
             .map_err(|e| internal(anyhow::anyhow!("decode deactivated_by_health: {e}")))?;
-        if project_namespace.is_empty() {
-            // Skip projects without a namespace (mid-register state).
-            continue;
-        }
         projects.push(SupervisorProject {
             project_id,
+            tenant_id,
             project_namespace,
             status,
             deactivated_by_health,
         });
     }
-    Ok(Json(SupervisorProjectsForTenantResponse { projects }))
+    Ok(projects)
 }
 
 pub async fn supervisor_infra_nodes(
@@ -681,35 +940,43 @@ pub async fn supervisor_claim_command(
     Json(req): Json<SupervisorClaimCommandRequest>,
 ) -> Resp<SupervisorClaimCommandResponse> {
     require_supervisor(&caller)?;
-    scope::require_tenant_eq(&caller, &req.tenant_id)?;
+    // A pooled supervisor claims a lifecycle command ONLY for a project
+    // whose infra it currently OWNS (the `infra_owner` exclusive lease).
+    // Ownership is the supervisor's ONE single-actor authority: it is
+    // exclusive (one pod per project), continuously renewed on each
+    // ownership tick, and the owner's work loop is sequential, so two
+    // supervisors can never run kubectl for one project. There is NO
+    // per-command claim lease here (it would be redundant with exclusive
+    // ownership, and its fixed expiry would wrongly let a sibling re-run
+    // a long command mid-flight). The command simply remains uncompleted
+    // until its owner finishes it; if ownership moves mid-command, every
+    // write from the old owner is rejected (see `owns_project_predicate`
+    // on the set_* / complete handlers) and the new owner re-runs it.
+    //
     // Verb filter: the supervisor claims only the verbs it owns.
     // Dispatcher verbs (`deactivate`, `reactivate`) are claimed by
-    // dispatcher pods directly; the supervisor MUST skip them or it
-    // would block dispatcher-owned actions behind its own loop.
+    // dispatcher pods directly (via their own `claimed_by_pod` lease);
+    // the supervisor MUST skip them.
     //
-    // The claim predicate (shared with the dispatcher's claimer) is
-    // a lease: a row claimed by a now-dead pod becomes reclaimable
-    // after `CLAIM_LEASE_TTL`. Without the lease, a `kubectl delete`
-    // of a supervisor pod mid-execution pins the row forever
-    // (claimed_by_pod = dead-pod-name, completed_at_unix IS NULL).
+    // No row UPDATE here: claiming is a pure SELECT of the oldest
+    // uncompleted owned command. No row lock is needed: the owning pod
+    // runs a sequential work loop (one command at a time), and ownership
+    // is exclusive, so no two claim queries ever target this project's
+    // commands concurrently. Re-running an already-claimed-but-unfinished
+    // command after a crash is correct and idempotent (declarative
+    // kubectl), so there is nothing to serialize against.
     let sql = format!(
-        "UPDATE infra_lifecycle_command \
-         SET claimed_by_pod = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
-         WHERE id = ( \
-            SELECT id FROM infra_lifecycle_command \
-            WHERE tenant_id = $2 \
-              AND verb IN ('apply', 'stop', 'terminate') \
-              AND {predicate} \
-            ORDER BY id ASC \
-            FOR UPDATE SKIP LOCKED \
-            LIMIT 1 \
-         ) \
-         RETURNING id, project_id, node_id, verb, running_policy, spec_json, force",
-        predicate = weft_broker_client::lifecycle_command::claimable_predicate(),
+        "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force \
+         FROM infra_lifecycle_command c \
+         WHERE c.verb IN ('apply', 'stop', 'terminate') \
+           AND c.completed_at_unix IS NULL \
+           AND {owns} \
+         ORDER BY c.id ASC \
+         LIMIT 1",
+        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$1", "c.project_id"),
     );
     let row = sqlx::query(&sql)
         .bind(&req.claimer_pod)
-        .bind(&req.tenant_id)
         .fetch_optional(&state.pool)
         .await
         .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -769,15 +1036,20 @@ pub async fn supervisor_event_record(
     Json(req): Json<SupervisorEventRecordRequest>,
 ) -> Resp<SupervisorEventRecordResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
-        .await?;
+    // The project's tenant (returned by the ownership check) is the
+    // event's tenant. A pooled supervisor is control-plane and has no
+    // tenant of its own, so the row's tenant always comes from the
+    // resource, never the caller identity.
+    let project_tenant =
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+            .await?;
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO infra_event \
          (tenant_id, project_id, node_id, kind, payload, at_unix) \
          VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT) \
          RETURNING id",
     )
-    .bind(&caller.tenant_id)
+    .bind(&project_tenant)
     .bind(&req.project_id)
     .bind(req.node_id.as_deref())
     .bind(req.kind.as_str())
@@ -871,14 +1143,15 @@ pub async fn supervisor_set_status(
     // `$1` is the unit name (or a placeholder, unused when unit=None,
     // but the jsonb_set path needs it bound regardless).
     let unit_key = req.unit.clone().unwrap_or_default();
-    let caller_pod_opt = caller.pod_name.as_deref();
     let res = if let Some(cid) = req.command_id {
-        // Lifecycle-driven write: require we still own the
-        // command's claim (and the command targets this row).
-        let caller_pod = caller_pod_opt.ok_or((
-            StatusCode::FORBIDDEN,
-            "supervisor caller missing pod_name in identity".to_string(),
-        ))?;
+        // Lifecycle-driven write: require we still OWN the project
+        // (the supervisor's single-actor authority) and that the
+        // command still applies (targets this row, not yet completed).
+        // The pod identity is the supervisor's claim id (`req.pod_name`
+        // = WEFT_POD_NAME, what keys `infra_owner`), NOT the auth token's
+        // Pod name (which carries a ReplicaSet suffix and would never
+        // match the lease). The instant ownership moves to another pod,
+        // this write is rejected and the command flows to the new owner.
         sqlx::query(&format!(
             "UPDATE infra_node SET {set_clause} \
              WHERE project_id = $5 AND node_id = $6 AND EXISTS ( \
@@ -886,9 +1159,9 @@ pub async fn supervisor_set_status(
                WHERE id = $7 \
                  AND project_id = $5 \
                  AND (node_id = $6 OR node_id IS NULL) \
-                 AND claimed_by_pod = $8 \
                  AND completed_at_unix IS NULL \
-             )"
+             ) AND {owns}",
+            owns = weft_broker_client::lifecycle_command::owns_project_predicate("$8", "$5"),
         ))
         .bind(&unit_key)
         .bind(req.status.as_str())
@@ -897,7 +1170,7 @@ pub async fn supervisor_set_status(
         .bind(&req.project_id)
         .bind(&req.node_id)
         .bind(cid)
-        .bind(caller_pod)
+        .bind(&req.pod_name)
         .execute(&state.pool)
         .await
     } else {
@@ -934,20 +1207,21 @@ pub async fn supervisor_set_status(
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     // rows_affected = 0 means one of:
     //   - the infra_node row was removed (concurrent remove_node);
-    //   - (command branch) the lifecycle command was completed or
-    //     reclaimed by a sibling pod, or named a (project, node) that
-    //     doesn't match;
+    //   - (command branch) the lifecycle command was completed, named a
+    //     (project, node) that doesn't match, OR this pod no longer owns
+    //     the project (ownership moved to another supervisor mid-command);
     //   - (autonomous branch) a user infra action's command is in
     //     flight for this node, so the health reconcile must stand
     //     down (the fence blocked it).
     // All are "this caller's view is stale or it must not write right
-    // now"; surface as 410 so the supervisor logs + skips.
+    // now"; surface as 410 so the supervisor logs + skips (and, for a
+    // lost-ownership command, leaves it uncompleted for the new owner).
     if res.rows_affected() == 0 {
         return Err((
             StatusCode::GONE,
             format!(
                 "set_status raced: infra_node row gone, command completed, \
-                 or claim reassigned (project={}, node={}, cmd={:?})",
+                 or project ownership moved (project={}, node={}, cmd={:?})",
                 req.project_id, req.node_id, req.command_id
             ),
         ));
@@ -967,12 +1241,14 @@ pub async fn supervisor_set_status(
 /// SELECT predicate and the raced-410 mapping) live here once so
 /// they can't diverge between the two writes.
 ///
-/// The INSERT pulls its values FROM `infra_lifecycle_command`
-/// filtered to the caller's still-claimed apply command, so the
-/// existence check and the write share one row snapshot (no
-/// window between "I checked" and "I wrote"). Zero rows affected
-/// → the claim was reassigned (lease takeover) or the command
-/// completed/cancelled (remove_node cascade) → 410.
+/// The INSERT pulls its values FROM the caller's still-uncompleted
+/// apply command AND requires the caller to still OWN the project
+/// (`owns_project_predicate`), so the existence check and the write
+/// share one row snapshot (no window between "I checked" and "I
+/// wrote"). Zero rows affected → ownership moved to another supervisor
+/// (drain / lease takeover) or the command completed/cancelled
+/// (remove_node cascade) → 410, and the command (if still uncompleted)
+/// flows to the new owner.
 struct ApplyRowState {
     status: &'static str,
     /// `Some` for set_applied; `None` for set_provisioning (the
@@ -994,7 +1270,7 @@ async fn write_apply_row(
     preserve_pvcs: &[String],
     units_json: serde_json::Value,
     command_id: i64,
-    caller_pod: &str,
+    owner_pod: &str,
     row: ApplyRowState,
 ) -> Result<(), (StatusCode, String)> {
     let preserve_pvcs_json = serde_json::to_value(preserve_pvcs)
@@ -1006,7 +1282,7 @@ async fn write_apply_row(
     // clock (consistent with every other timestamp write in this
     // file), gated on the bound `$7` flag via CASE.
     let res = sqlx::query(
-        "INSERT INTO infra_node \
+        &format!("INSERT INTO infra_node \
          (project_id, node_id, instance_id, namespace, status, \
           failure_stage, failure_message, applied_spec_hash, \
           applied_at_unix, endpoints_json, preserve_pvcs_json, units_json) \
@@ -1018,8 +1294,8 @@ async fn write_apply_row(
            AND project_id = $1 \
            AND node_id = $2 \
            AND verb = 'apply' \
-           AND claimed_by_pod = $12 \
            AND completed_at_unix IS NULL \
+           AND {owns} \
          ON CONFLICT (project_id, node_id) DO UPDATE SET \
             instance_id        = EXCLUDED.instance_id, \
             namespace          = EXCLUDED.namespace, \
@@ -1031,6 +1307,8 @@ async fn write_apply_row(
             endpoints_json     = EXCLUDED.endpoints_json, \
             preserve_pvcs_json = EXCLUDED.preserve_pvcs_json, \
             units_json         = EXCLUDED.units_json",
+        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$12", "$1"),
+    ),
     )
     .bind(project_id)
     .bind(node_id)
@@ -1043,7 +1321,7 @@ async fn write_apply_row(
     .bind(preserve_pvcs_json)
     .bind(units_json)
     .bind(command_id)
-    .bind(caller_pod)
+    .bind(owner_pod)
     .execute(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -1051,8 +1329,8 @@ async fn write_apply_row(
         return Err((
             StatusCode::GONE,
             format!(
-                "{op} raced: command id={command_id} no longer claimed by {caller_pod} \
-                 or already completed"
+                "{op} raced: command id={command_id} already completed, or project \
+                 ownership moved away from {owner_pod}"
             ),
         ));
     }
@@ -1068,10 +1346,6 @@ pub async fn supervisor_set_applied(
     require_node_id(&req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
         .await?;
-    let caller_pod = caller.pod_name.as_deref().ok_or((
-        StatusCode::FORBIDDEN,
-        "supervisor caller missing pod_name in identity".to_string(),
-    ))?;
     let endpoints_json = serde_json::to_value(&req.endpoints)
         .map_err(|e| internal(anyhow::anyhow!("endpoints serialize: {e}")))?;
     let units_json = serde_json::to_value(&req.units)
@@ -1086,7 +1360,7 @@ pub async fn supervisor_set_applied(
         &req.preserve_pvcs,
         units_json,
         req.command_id,
-        caller_pod,
+        &req.pod_name,
         ApplyRowState {
             status: weft_broker_client::protocol::InfraNodeStatus::Running.as_str(),
             applied_spec_hash: Some(req.applied_spec_hash.clone()),
@@ -1114,10 +1388,6 @@ pub async fn supervisor_set_provisioning(
     require_node_id(&req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
         .await?;
-    let caller_pod = caller.pod_name.as_deref().ok_or((
-        StatusCode::FORBIDDEN,
-        "supervisor caller missing pod_name in identity".to_string(),
-    ))?;
     let units_json = serde_json::to_value(&req.units)
         .map_err(|e| internal(anyhow::anyhow!("units serialize: {e}")))?;
     write_apply_row(
@@ -1130,7 +1400,7 @@ pub async fn supervisor_set_provisioning(
         &req.preserve_pvcs,
         units_json,
         req.command_id,
-        caller_pod,
+        &req.pod_name,
         ApplyRowState {
             // Not-yet-applied: NULL hash + applied_at, empty
             // endpoints. set_applied flips these on success.
@@ -1157,8 +1427,11 @@ pub async fn supervisor_enqueue_lifecycle(
     Json(req): Json<SupervisorEnqueueLifecycleRequest>,
 ) -> Resp<SupervisorEnqueueLifecycleResponse> {
     require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
-        .await?;
+    // The command's tenant is the project's tenant (control-plane
+    // supervisor has none of its own).
+    let project_tenant =
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+            .await?;
     // Verify the typed spec's (mode, policy) combo is coherent
     // before persisting. The rule lives next to `DeactivateSpec`
     // in `weft-broker-client::protocol` so every caller (this
@@ -1193,7 +1466,7 @@ pub async fn supervisor_enqueue_lifecycle(
                  EXTRACT(EPOCH FROM NOW())::BIGINT) \
          RETURNING id",
     )
-    .bind(&caller.tenant_id)
+    .bind(&project_tenant)
     .bind(&req.project_id)
     .bind(verb.as_str())
     .bind(running_policy_str)
@@ -1309,8 +1582,12 @@ pub async fn infra_enqueue_apply(
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
-        .await?;
+    // Bind the project's tenant on the row (equals the worker's tenant,
+    // since the ownership check passed). Uniform with the supervisor
+    // enqueue paths: the row tenant always comes from the resource.
+    let project_tenant =
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+            .await?;
     // Dedup against an in-flight apply for the same (project, node):
     // a worker restart that retries this call must NOT double-enqueue.
     // The partial unique index `uq_lifecycle_cmd_pending_apply`
@@ -1343,7 +1620,7 @@ pub async fn infra_enqueue_apply(
              infra_lifecycle_command.issued_at_unix \
          RETURNING id",
     )
-    .bind(&caller.tenant_id)
+    .bind(&project_tenant)
     .bind(&req.project_id)
     .bind(&req.node_id)
     .bind(weft_broker_client::protocol::InfraLifecycleVerb::Apply.as_str())
@@ -1431,6 +1708,16 @@ pub async fn supervisor_remove_node(
     require_node_id(&req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
         .await?;
+    // Ownership gate: only the pod that currently OWNS the project may
+    // cascade-delete its infra_node + cancel its pending commands. A
+    // supervisor that lost ownership mid-Terminate must NOT wipe rows
+    // out from under the new owner. 410 → the supervisor aborts the
+    // command (leaving it uncompleted for the new owner to re-run). The
+    // check runs INSIDE the cascade transaction so the ownership read
+    // and the deletes share one snapshot (no TOCTOU window). The
+    // identity is the supervisor's claim id (`req.pod_name` =
+    // WEFT_POD_NAME, what keys `infra_owner`), not the auth token's
+    // suffixed Pod name.
     // Cascade in one transaction so a remove-then-readd of the same
     // node_id starts clean: no stale events claiming "flaky" from
     // the prior generation, no pending lifecycle commands from the
@@ -1440,6 +1727,24 @@ pub async fn supervisor_remove_node(
         .begin()
         .await
         .map_err(|e| internal(anyhow::anyhow!("begin tx: {e}")))?;
+    let owns: bool = sqlx::query_scalar(&format!(
+        "SELECT {owns}",
+        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$1", "$2"),
+    ))
+    .bind(&req.pod_name)
+    .bind(&req.project_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| internal(anyhow::anyhow!("remove_node ownership check: {e}")))?;
+    if !owns {
+        return Err((
+            StatusCode::GONE,
+            format!(
+                "remove_node rejected: {} no longer owns project {}",
+                req.pod_name, req.project_id
+            ),
+        ));
+    }
     let res = sqlx::query("DELETE FROM infra_node WHERE project_id = $1 AND node_id = $2")
         .bind(&req.project_id)
         .bind(&req.node_id)
@@ -1595,7 +1900,7 @@ pub async fn supervisor_command_complete(
             .try_get("tenant_id")
             .map_err(|e| internal(anyhow::anyhow!("decode tenant_id: {e}")))?,
     };
-    scope::require_tenant_eq(&caller, &tenant_id)?;
+    scope::require_tenant_in_scope(&caller, &tenant_id)?;
     // Supervisor completions are either success (error=None) or
     // failure (error=Some). Cancellation is broker-side only
     // (remove_node); the supervisor never produces a cancelled
@@ -1605,43 +1910,44 @@ pub async fn supervisor_command_complete(
         Some(_) => LifecycleOutcome::Failed,
         None => LifecycleOutcome::Succeeded,
     };
-    // Lease ownership check: a partitioned supervisor pod whose
-    // lease expired may have been reclaimed by a sibling pod. The
-    // stale pod must not be able to stamp a terminal state over
-    // the new owner's still-running work. `AND claimed_by_pod =
-    // $caller_pod` rejects writes from anyone other than the
-    // current claimer. Combined with `completed_at_unix IS NULL`,
-    // this gives us "exactly the claimer, exactly once."
-    let caller_pod = caller.pod_name.as_deref().ok_or((
-        StatusCode::FORBIDDEN,
-        "supervisor caller missing pod_name in identity".to_string(),
-    ))?;
-    let res = sqlx::query(
+    // Ownership check: only the pod that currently OWNS the project may
+    // stamp the command terminal. A supervisor that lost ownership mid-
+    // command (drain / lease takeover) must NOT complete it: leaving it
+    // uncompleted is exactly what lets the new owner re-run and finish
+    // it (no user re-action). Combined with `completed_at_unix IS NULL`,
+    // this gives "exactly the current owner, exactly once."
+    // Ownership identity is the supervisor's claim id (`req.pod_name` =
+    // WEFT_POD_NAME, what keys `infra_owner`), not the auth token's Pod
+    // name (suffixed, never matches the lease). Tenant scope was already
+    // re-checked above via the token.
+    let res = sqlx::query(&format!(
         "UPDATE infra_lifecycle_command \
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = $1, \
              outcome_message = $2 \
          WHERE id = $3 \
            AND completed_at_unix IS NULL \
-           AND claimed_by_pod = $4",
-    )
+           AND {owns}",
+        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$4", "project_id"),
+    ))
     .bind(outcome.as_str())
     .bind(req.error.as_deref())
     .bind(req.command_id)
-    .bind(caller_pod)
+    .bind(&req.pod_name)
     .execute(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    // rows_affected=0 means the row was completed by someone else
-    // first, OR was reclaimed by a sibling pod via lease expiry.
-    // Either way, this caller's view of the world is stale.
+    // rows_affected=0 means the row was completed already, OR this pod
+    // no longer owns the project (ownership moved to a sibling). Either
+    // way this caller's view is stale; surface 410 so it aborts the
+    // command without completing it.
     if res.rows_affected() == 0 {
         return Err((
             StatusCode::GONE,
             format!(
-                "infra_lifecycle_command id={} not completable by {caller_pod}: \
-                 either already completed or claim reassigned to another pod",
-                req.command_id
+                "infra_lifecycle_command id={} not completable by {}: \
+                 either already completed or project ownership moved to another pod",
+                req.command_id, req.pod_name
             ),
         ));
     }
@@ -1668,24 +1974,26 @@ fn require_supervisor(caller: &CallerIdentity) -> Result<(), (StatusCode, String
 
 // ---------- Signals ----------
 
-pub async fn signal_list_for_tenant(
+pub async fn signal_list_for_pod(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SignalListForTenantRequest>,
-) -> Resp<SignalListForTenantResponse> {
+    Json(req): Json<SignalListForPodRequest>,
+) -> Resp<SignalListForPodResponse> {
     if caller.role != Role::Listener {
         return Err((StatusCode::FORBIDDEN, "listener only".into()));
     }
-    scope::require_tenant_eq(&caller, &req.tenant_id)?;
-
+    // The listener is a trusted control-plane caller; it rehydrates the
+    // signals placed on its own pod (mixed tenants). No per-tenant scope
+    // check: placement (`listener_pod`) is the authority for what this
+    // pod holds, and each returned row carries its own tenant.
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT token, node_id, spec_json, is_resume, color, \
+        "SELECT token, tenant_id, node_id, spec_json, is_resume, color, \
                 surface_kind, mount_path, auth_kind, auth_config, \
-                kind_state \
-         FROM signal WHERE tenant_id = $1",
+                kind_state, placement_generation \
+         FROM signal WHERE listener_pod = $1",
     )
-    .bind(&req.tenant_id)
+    .bind(&req.pod_name)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -1705,6 +2013,11 @@ pub async fn signal_list_for_tenant(
                 .ok_or_else(|| anyhow::anyhow!("unknown auth_kind '{auth_str}'"))?;
             Ok(SignalRowWire {
                 token: r.try_get("token")?,
+                // Each row carries its own tenant (the pod holds mixed
+                // tenants); the listener stamps it on the rehydrated
+                // registry entry so held-event fires are correctly
+                // tenanted.
+                tenant_id: r.try_get("tenant_id")?,
                 node_id: r.try_get("node_id")?,
                 spec_json: r.try_get("spec_json")?,
                 is_resume: r.try_get("is_resume")?,
@@ -1714,11 +2027,12 @@ pub async fn signal_list_for_tenant(
                 auth_kind,
                 auth_config: r.try_get("auth_config")?,
                 kind_state: r.try_get("kind_state")?,
+                placement_generation: r.try_get("placement_generation")?,
             })
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| internal(anyhow::anyhow!("signal row decode: {e}")))?;
-    Ok(Json(SignalListForTenantResponse { rows: out }))
+    Ok(Json(SignalListForPodResponse { rows: out }))
 }
 
 // ---------- helpers ----------
@@ -1743,7 +2057,7 @@ fn require_pod_name_matches(
     if bound != claimed {
         tracing::warn!(
             target: "weft_broker::scope",
-            caller_tenant = %caller.tenant_id,
+            caller_tenant = ?caller.scope.pinned_tenant(),
             caller_role = ?caller.role,
             bound_pod = %bound,
             claimed_pod = %claimed,
@@ -1773,7 +2087,7 @@ async fn require_task_owned_by(
         StatusCode::NOT_FOUND,
         format!("unknown task {task_id}"),
     ))?;
-    scope::require_tenant_eq(caller, &owner)
+    scope::require_tenant_in_scope(caller, &owner)
 }
 
 async fn require_worker_pod_owned_by(
@@ -1798,7 +2112,7 @@ async fn require_worker_pod_owned_by(
         // haven't yet been claimed by their legitimate owner.
         tracing::warn!(
             target: "weft_broker::scope",
-            caller_tenant = %caller.tenant_id,
+            caller_tenant = ?caller.scope.pinned_tenant(),
             caller_role = ?caller.role,
             pod_name,
             "broker rejected worker_pod op for unregistered pod"
@@ -1808,7 +2122,10 @@ async fn require_worker_pod_owned_by(
             format!("worker_pod '{pod_name}' has no register_alive row"),
         ));
     };
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, caller, &project_id).await
+    // Enforce ownership; the returned tenant is not needed here.
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, caller, &project_id)
+        .await
+        .map(|_| ())
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
@@ -1927,5 +2244,67 @@ pub async fn storage_authorize(
             StatusCode::FORBIDDEN,
             format!("service account '{other}' has no storage identity"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_fire_below_current_generation_is_fenced() {
+        // Old pod fired under gen 1 after a move bumped the row to gen 2.
+        assert!(fire_is_fenced(1, Some(2)));
+    }
+
+    #[test]
+    fn current_holders_fire_is_not_fenced() {
+        // Equal generation = the live holder; never fenced.
+        assert!(!fire_is_fenced(2, Some(2)));
+        // A higher fire generation than the row (shouldn't happen, but be
+        // safe) is also not fenced: only STRICTLY-stale fires are dropped.
+        assert!(!fire_is_fenced(3, Some(2)));
+    }
+
+    #[test]
+    fn fire_for_a_signal_with_no_row_is_not_fenced() {
+        // No row means no move could have re-placed it; the downstream
+        // scope check handles a genuinely-missing signal. Never fence on
+        // absence (which would silently drop a legitimate fire).
+        assert!(!fire_is_fenced(0, None));
+        assert!(!fire_is_fenced(5, None));
+    }
+
+    #[test]
+    fn missing_generation_field_defaults_to_zero_and_is_fenced_if_row_advanced() {
+        // A fire with no placement_generation field is read as 0 by the
+        // handler; if the row has advanced past 0 (any real placement),
+        // that ancient fire is correctly fenced.
+        assert!(fire_is_fenced(0, Some(1)));
+        // ...but against a never-advanced row (gen 0) it is NOT fenced.
+        assert!(!fire_is_fenced(0, Some(0)));
+    }
+
+    #[test]
+    fn merge_anchor_first_resource_sets_tenant() {
+        let mut anchor = None;
+        merge_anchor_tenant(&mut anchor, "acme".into()).unwrap();
+        assert_eq!(anchor.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn merge_anchor_same_tenant_agrees() {
+        let mut anchor = Some("acme".to_string());
+        merge_anchor_tenant(&mut anchor, "acme".into()).unwrap();
+        assert_eq!(anchor.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn merge_anchor_different_tenants_rejected() {
+        // A task naming a project in one tenant and a color in another is
+        // ambiguous; refuse it rather than silently stamping either.
+        let mut anchor = Some("acme".to_string());
+        let err = merge_anchor_tenant(&mut anchor, "globex".into()).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
     }
 }

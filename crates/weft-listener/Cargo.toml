@@ -11,6 +11,7 @@ path = "src/main.rs"
 weft-core = { path = "../weft-core" }
 weft-task-store = { workspace = true }
 weft-broker-client = { path = "../weft-broker-client" }
+weft-platform-traits = { workspace = true }
 
 anyhow = { workspace = true }
 axum = { workspace = true }

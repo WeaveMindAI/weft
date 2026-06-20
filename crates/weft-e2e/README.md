@@ -27,6 +27,30 @@ cargo test -p weft-e2e --features e2e -- --test-threads=1
 
 Run one area: `cargo test -p weft-e2e --features e2e --test live_chat -- --test-threads=1`.
 
+## Fresh install after a database schema change (REQUIRED)
+
+The cluster's Postgres volume is **durable across `setup.sh` runs** (only
+`--purge` wipes it). The schema is created with `CREATE TABLE IF NOT EXISTS`, so
+if you changed a table's columns (added/removed a column, changed a type) since
+the last install, a plain `setup.sh` will NOT pick up the change: the table
+already exists, the `IF NOT EXISTS` skips it, and the new column is silently
+absent. The e2e run then fails with a `column "..." does not exist` (or a write
+that hangs forever because a gate can never match).
+
+So whenever the DB schema changed, do a clean reinstall before running the e2e:
+
+```bash
+./setup.sh --uninstall --purge   # tears down the cluster AND wipes the Postgres volume
+./setup.sh                       # fresh install, recreates the full schema
+cargo test -p weft-e2e --features e2e -- --test-threads=1
+```
+
+If you only changed Rust code (no schema change), a plain `./setup.sh` (which the
+rig also runs automatically) is enough; the durable DB is fine. When in doubt
+after touching any `CREATE TABLE` / migration code, do the purge: it is the only
+way the canonical schema is guaranteed to match (this repo deliberately uses no
+`ALTER TABLE` migrations, see the "No migration cruft" rule).
+
 ## How it works
 
 A test is plain Rust. It prepares a fixture, drives it, and asserts. The shape:

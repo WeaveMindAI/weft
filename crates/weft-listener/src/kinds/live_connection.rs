@@ -56,6 +56,8 @@ impl KindHandler for LiveCallerHandler {
     fn spawn_task(
         &self,
         _token: &str,
+        _tenant_id: &str,
+        _placement_generation: i64,
         _spec: &SignalSpec,
         _kind_state: &Value,
         _sink: FireSignalSink,
@@ -159,8 +161,10 @@ mod tests {
         let sig = RegisteredSignal {
             spec: spec("chat", PublicEntryAuth::None),
             node_id: "n".into(),
+            tenant_id: "t".into(),
             is_resume: false,
             color: None,
+            placement_generation: 0,
             task: None,
             routing: SignalRouting {
                 surface: SignalSurface::PublicEntry { path: "chat".into() },

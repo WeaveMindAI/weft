@@ -50,6 +50,8 @@ impl KindHandler for SocketListenHandler {
     fn spawn_task(
         &self,
         token: &str,
+        tenant_id: &str,
+        placement_generation: i64,
         spec: &SignalSpec,
         _kind_state: &Value,
         sink: FireSignalSink,
@@ -57,7 +59,7 @@ impl KindHandler for SocketListenHandler {
     ) -> Result<Option<JoinHandle<()>>> {
         let cfg: SocketListen = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed socket_listen spec: {e}"))?;
-        Ok(Some(spawn_loop(token.to_string(), cfg, sink)))
+        Ok(Some(spawn_loop(token.to_string(), tenant_id.to_string(), placement_generation, cfg, sink)))
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -99,7 +101,7 @@ fn inbound_payload(msg: Message) -> Option<Value> {
     }
 }
 
-fn spawn_loop(token: String, cfg: SocketListen, sink: FireSignalSink) -> JoinHandle<()> {
+fn spawn_loop(token: String, tenant_id: String, placement_generation: i64, cfg: SocketListen, sink: FireSignalSink) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = Backoff::new();
         loop {
@@ -168,7 +170,7 @@ fn spawn_loop(token: String, cfg: SocketListen, sink: FireSignalSink) -> JoinHan
                         match msg {
                             Some(Ok(m)) => {
                                 if let Some(payload) = inbound_payload(m) {
-                                    super::event_source::fire_payload(&sink, &token, payload, "socket_listen").await;
+                                    super::event_source::fire_payload(&sink, &token, &tenant_id, placement_generation, payload, "socket_listen").await;
                                 }
                             }
                             Some(Err(e)) => {

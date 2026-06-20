@@ -119,10 +119,8 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # Worker / listener / infra-supervisor / storage pods reach the
-    # broker from two namespace flavors:
-    #   - `weft.dev/role=tenant` (listener, infra-supervisor, storage
-    #     box all live there)
+    # Worker / storage pods reach the broker from two namespace flavors:
+    #   - `weft.dev/role=tenant` (storage box lives there)
     #   - `weft.dev/role=project` (worker pods live there post-v2)
     # The pod label filter narrows to the roles allowed to call the
     # broker. The storage box relays caller tokens to
@@ -137,7 +135,25 @@ spec:
             matchExpressions:
               - key: weft.dev/role
                 operator: In
-                values: [worker, listener, infra-supervisor, storage]
+                values: [worker, storage]
+      ports:
+        - protocol: TCP
+          port: 9090
+    # The POOLED listener + infra-supervisor are trusted control-plane
+    # services: they run in the control-plane namespace
+    # (`weft.dev/role=system`), not per tenant, and serve all tenants.
+    # Admit them from there. The pod-role filter still constrains WHICH
+    # control-plane pods may call (not, e.g., the dispatcher, which goes
+    # direct to Postgres and never uses the broker).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              weft.dev/role: system
+          podSelector:
+            matchExpressions:
+              - key: weft.dev/role
+                operator: In
+                values: [listener, infra-supervisor]
       ports:
         - protocol: TCP
           port: 9090

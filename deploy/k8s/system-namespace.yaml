@@ -89,3 +89,70 @@ spec:
     - Egress
   egress:
     - {}
+---
+# ServiceAccounts for the pooled, trusted, tenant-agnostic services
+# (infra-supervisor pods; listener pods, both scaled up/down by their
+# dispatcher-side pools). They run in the control-plane namespace and
+# act across all tenants: the per-project-
+# namespace RoleBindings (rendered by project_namespace.rs) bind THESE
+# SAs to the listener/supervisor ClusterRoles, giving them the
+# namespaced verbs in every project namespace. The broker maps each SA
+# name to its trusted role (Listener / InfraSupervisor) via TokenReview.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weft-listener-sa
+  namespace: weft-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weft-infra-supervisor-sa
+  namespace: weft-system
+---
+# Pooled listener egress: reaches the broker (task enqueue, signal
+# rehydrate) and tenant infra pods (SSE subscribes to /events). Like
+# the dispatcher it runs trusted code we control, and its outbound set
+# (user-configured SSE/poll/socket URLs) can't be enumerated, so egress
+# is open; ingress is the controlled surface (dispatcher admin POSTs).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pooled-listener
+  namespace: weft-system
+spec:
+  podSelector:
+    matchLabels:
+      weft.dev/role: listener
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: weft-dispatcher
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - {}
+---
+# Pooled supervisor egress: reaches the kube-apiserver (kubectl apply /
+# scale / delete across tenant namespaces), the broker, and tenant
+# infra pods (health probes). Trusted control-plane code; open egress,
+# no ingress surface (nothing calls into the supervisor).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pooled-supervisor
+  namespace: weft-system
+spec:
+  podSelector:
+    matchLabels:
+      weft.dev/role: infra-supervisor
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - {}

@@ -20,7 +20,20 @@ use weft_broker_client::protocol::{
 
 #[async_trait]
 pub trait BrokerSupervisorOps: Send + Sync {
-    async fn projects_for_tenant(&self, tenant_id: &str) -> Result<Vec<SupervisorProject>>;
+    /// Sync this supervisor's project ownership and return the set it
+    /// now owns: renew its existing exclusive `infra_owner` leases, claim
+    /// up to `saturation` more unowned projects' infra, return the full
+    /// owned set. The work loops act ONLY on the returned projects, so
+    /// two supervisors never reconcile the same project.
+    async fn sync_ownership(
+        &self,
+        pod_name: &str,
+        mem_pressure: f64,
+    ) -> Result<Vec<SupervisorProject>>;
+    /// Pure read of the projects this pod owns (no claim/renew). The
+    /// work loops iterate this; ownership breadth changes only via
+    /// `sync_ownership` (the ownership tick).
+    async fn owned_projects(&self, pod_name: &str) -> Result<Vec<SupervisorProject>>;
     async fn infra_nodes(&self, project_id: &str) -> Result<Vec<SupervisorInfraNode>>;
     async fn health_protocols(
         &self,
@@ -28,7 +41,6 @@ pub trait BrokerSupervisorOps: Send + Sync {
     ) -> Result<Option<serde_json::Value>>;
     async fn claim_command(
         &self,
-        tenant_id: &str,
         claimer_pod: &str,
     ) -> Result<Option<SupervisorCommandRow>>;
     /// Record one typed infra_event. The kind + payload pair comes
@@ -51,6 +63,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// uniform transition).
     async fn set_status(
         &self,
+        pod_name: &str,
         command_id: Option<i64>,
         project_id: &str,
         node_id: &str,
@@ -59,9 +72,19 @@ pub trait BrokerSupervisorOps: Send + Sync {
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>>;
-    async fn remove_node(&self, project_id: &str, node_id: &str) -> Result<bool>;
+    /// Cascade-delete the node, gated on the caller still OWNING the
+    /// project (via `pod_name` = the supervisor's claim id). `Raced`
+    /// means ownership moved mid-Terminate; the supervisor aborts and
+    /// leaves the command for the new owner.
+    async fn remove_node(
+        &self,
+        pod_name: &str,
+        project_id: &str,
+        node_id: &str,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>>;
     async fn command_complete(
         &self,
+        pod_name: &str,
         command_id: i64,
         error: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>>;
@@ -78,6 +101,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// apply success flips Provisioning -> Running via set_applied.
     async fn set_provisioning(
         &self,
+        pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -87,11 +111,12 @@ pub trait BrokerSupervisorOps: Send + Sync {
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>>;
 
-    /// Post-apply state write. `command_id` gates the UPSERT
-    /// against lease reassignment (a stale pod can't resurrect
-    /// a `remove_node`d row).
+    /// Post-apply state write. Gated on the caller still OWNING the
+    /// project (via `pod_name`): a displaced pod can't resurrect a
+    /// `remove_node`d row or stamp over the new owner's apply.
     async fn set_applied(
         &self,
+        pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -121,8 +146,15 @@ pub trait BrokerSupervisorOps: Send + Sync {
 
 #[async_trait]
 impl BrokerSupervisorOps for BrokerSupervisorClient {
-    async fn projects_for_tenant(&self, tenant_id: &str) -> Result<Vec<SupervisorProject>> {
-        BrokerSupervisorClient::projects_for_tenant(self, tenant_id).await
+    async fn sync_ownership(
+        &self,
+        pod_name: &str,
+        mem_pressure: f64,
+    ) -> Result<Vec<SupervisorProject>> {
+        BrokerSupervisorClient::sync_ownership(self, pod_name, mem_pressure).await
+    }
+    async fn owned_projects(&self, pod_name: &str) -> Result<Vec<SupervisorProject>> {
+        BrokerSupervisorClient::owned_projects(self, pod_name).await
     }
     async fn infra_nodes(&self, project_id: &str) -> Result<Vec<SupervisorInfraNode>> {
         BrokerSupervisorClient::infra_nodes(self, project_id).await
@@ -135,10 +167,9 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn claim_command(
         &self,
-        tenant_id: &str,
         claimer_pod: &str,
     ) -> Result<Option<SupervisorCommandRow>> {
-        BrokerSupervisorClient::claim_command(self, tenant_id, claimer_pod).await
+        BrokerSupervisorClient::claim_command(self, claimer_pod).await
     }
     async fn event_record(
         &self,
@@ -150,6 +181,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn set_status(
         &self,
+        pod_name: &str,
         command_id: Option<i64>,
         project_id: &str,
         node_id: &str,
@@ -160,6 +192,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>> {
         BrokerSupervisorClient::set_status(
             self,
+            pod_name,
             command_id,
             project_id,
             node_id,
@@ -170,15 +203,21 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         )
         .await
     }
-    async fn remove_node(&self, project_id: &str, node_id: &str) -> Result<bool> {
-        BrokerSupervisorClient::remove_node(self, project_id, node_id).await
+    async fn remove_node(
+        &self,
+        pod_name: &str,
+        project_id: &str,
+        node_id: &str,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>> {
+        BrokerSupervisorClient::remove_node(self, pod_name, project_id, node_id).await
     }
     async fn command_complete(
         &self,
+        pod_name: &str,
         command_id: i64,
         error: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>> {
-        BrokerSupervisorClient::command_complete(self, command_id, error).await
+        BrokerSupervisorClient::command_complete(self, pod_name, command_id, error).await
     }
     async fn running_count(&self, project_id: &str) -> Result<i64> {
         BrokerSupervisorClient::running_count(self, project_id).await
@@ -188,6 +227,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn set_provisioning(
         &self,
+        pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -198,6 +238,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>> {
         BrokerSupervisorClient::set_provisioning(
             self,
+            pod_name,
             command_id,
             project_id,
             node_id,
@@ -210,6 +251,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn set_applied(
         &self,
+        pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -222,6 +264,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>> {
         BrokerSupervisorClient::set_applied(
             self,
+            pod_name,
             command_id,
             project_id,
             node_id,

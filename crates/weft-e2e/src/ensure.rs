@@ -33,13 +33,55 @@ pub async fn up() -> Result<Dispatcher> {
     Dispatcher::from_env()
 }
 
-/// Run `setup.sh` to bring the cluster to current code, then wait for the
-/// dispatcher to be reachable. Factored out of [`up`] so the latch wraps the
-/// whole bring-up as one unit.
+/// Run `setup.sh` to bring the cluster to current code, wait for the
+/// dispatcher to be reachable, then sweep any leftover state from earlier
+/// runs. Factored out of [`up`] so the latch wraps the whole bring-up as
+/// one unit (so the sweep runs exactly once per suite, before any test).
 async fn bring_up() -> Result<()> {
     let root = repo_root()?;
     run_setup(&root).await?;
-    wait_healthy().await
+    wait_healthy().await?;
+    sweep_leftovers().await
+}
+
+/// Remove state left behind by EARLIER runs, once at suite startup. A
+/// failed test deliberately leaves its project (and namespace, pods,
+/// clones) up so the failure can be inspected; this sweep is what keeps
+/// those stragglers from accumulating across runs and overloading the
+/// cluster (idle namespaces + pods slow pod scheduling, which can starve
+/// a fresh fixture's readiness). Run at the START, not as an aggressive
+/// per-test teardown, so the just-failed run's state survives for
+/// post-mortem but the NEXT run begins clean.
+///
+/// Two kinds of leftover:
+///   - leftover PROJECTS: removed via the real `DELETE /projects/{id}`
+///     path (forced), which deactivates, terminates infra, deletes the
+///     namespace, and drops the rows, exactly as `weft rm --force` does;
+///   - leftover pooled-pod CLONES a scale-down test stood up: swept via
+///     the platform layer (kubectl + the registry rows).
+async fn sweep_leftovers() -> Result<()> {
+    let disp = Dispatcher::from_env()?;
+    // Leftover projects. `GET /projects` lists them; delete each forced
+    // (skip the 120s supervisor-terminate wait, the project is going).
+    let projects: Vec<serde_json::Value> = disp.get_json("/projects").await?;
+    for p in &projects {
+        if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
+            disp.delete(&format!("/projects/{id}?force=true"))
+                .await
+                .with_context(|| format!("sweep leftover project {id}"))?;
+        }
+    }
+    // Leftover pooled-pod clones (reaches behind the API via kubectl +
+    // Postgres, the platform layer's job). Connect once for the sweep.
+    // The platform layer is `e2e`-gated (it pulls in sqlx), so this part
+    // compiles only under the feature; the project sweep above needs only
+    // the HTTP client and stays feature-independent.
+    #[cfg(feature = "e2e")]
+    crate::platform::Platform::connect()
+        .await?
+        .sweep_e2e_clones()
+        .await?;
+    Ok(())
 }
 
 /// Absolute path to the repo root (where `setup.sh` lives). Resolved from this

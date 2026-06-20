@@ -12,19 +12,33 @@ use sha2::{Digest, Sha256};
 use weft_task_store::tasks::{NewTask, TaskTarget};
 use weft_task_store::{TaskKind, TaskStoreClient};
 
-/// Per-listener sink. Cheap to clone (one Arc inside).
+/// Listener-wide sink. Cheap to clone (one Arc inside). NOT tenant-
+/// scoped: a pooled listener holds signals from many tenants, so the
+/// tenant travels per-fire (it is a property of the signal, read from
+/// the signal's registry entry), never baked into the sink.
 #[derive(Clone)]
 pub struct FireSignalSink {
     tasks: Arc<dyn TaskStoreClient>,
-    tenant_id: String,
 }
 
 impl FireSignalSink {
-    pub fn new(tasks: Arc<dyn TaskStoreClient>, tenant_id: String) -> Self {
-        Self { tasks, tenant_id }
+    pub fn new(tasks: Arc<dyn TaskStoreClient>) -> Self {
+        Self { tasks }
     }
 
-    /// Enqueue a FireSignal task for this fire.
+    /// Enqueue a FireSignal task for this fire. `tenant_id` is the
+    /// firing signal's tenant; the broker stamps it on the task (the
+    /// listener is a trusted control-plane caller allowed to enqueue
+    /// for any tenant, validated against the signal's real tenant).
+    ///
+    /// `placement_generation` is the generation this pod holds the signal
+    /// under. It rides on the task payload (NOT the dedup key) so the
+    /// broker can fence a stale fire: a fire whose generation is below the
+    /// signal row's current generation came from a pod that has since been
+    /// drained, and is dropped. Including it in the dedup key would be
+    /// wrong: a transport-retry of the same event must still collapse, and
+    /// a re-placement (new generation) of the same logical event must NOT
+    /// resurrect a dropped task.
     ///
     /// Dedup key is derived from `(token, payload)` so a transport-
     /// retry of the SAME event collapses onto the same task row, while
@@ -33,7 +47,13 @@ impl FireSignalSink {
     /// keys would have collapsed nothing (each retry mints a new
     /// UUID); deterministic content hashing is the only shape that
     /// makes the "dedup" name honest.
-    pub async fn fire(&self, token: &str, payload: Value) -> Result<()> {
+    pub async fn fire(
+        &self,
+        token: &str,
+        tenant_id: &str,
+        placement_generation: i64,
+        payload: Value,
+    ) -> Result<()> {
         let payload_canon = serde_json::to_string(&payload)?;
         let mut h = Sha256::new();
         h.update(token.as_bytes());
@@ -49,6 +69,7 @@ impl FireSignalSink {
         let task_payload = serde_json::json!({
             "token": token,
             "payload": payload,
+            "placement_generation": placement_generation,
         });
         self.tasks
             .enqueue_dedup(NewTask {
@@ -57,7 +78,7 @@ impl FireSignalSink {
                 project_id: None,
                 dedup_key: Some(dedup),
                 color: None,
-                tenant_id: Some(self.tenant_id.clone()),
+                tenant_id: Some(tenant_id.to_string()),
                 target_pod_name: None,
                 payload: task_payload,
             })

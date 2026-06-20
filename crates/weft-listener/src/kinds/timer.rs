@@ -63,6 +63,8 @@ impl KindHandler for TimerHandler {
     fn spawn_task(
         &self,
         token: &str,
+        tenant_id: &str,
+        placement_generation: i64,
         spec: &SignalSpec,
         kind_state: &Value,
         sink: FireSignalSink,
@@ -75,6 +77,8 @@ impl KindHandler for TimerHandler {
             .and_then(|v| v.as_i64());
         Ok(Some(spawn_loop(
             token.to_string(),
+            tenant_id.to_string(),
+            placement_generation,
             timer.spec,
             pinned_after,
             sink,
@@ -102,6 +106,8 @@ impl KindHandler for TimerHandler {
 
 fn spawn_loop(
     token: String,
+    tenant_id: String,
+    placement_generation: i64,
     spec: TimerSpec,
     pinned_after_unix: Option<i64>,
     sink: FireSignalSink,
@@ -132,7 +138,7 @@ fn spawn_loop(
                 "scheduledTime": deadline.to_rfc3339(),
                 "actualTime": Utc::now().to_rfc3339(),
             });
-            if let Err(e) = sink.fire(&token, payload).await {
+            if let Err(e) = sink.fire(&token, &tenant_id, placement_generation, payload).await {
                 tracing::warn!(
                     target: "weft_listener::timer",
                     %token, error = %e,

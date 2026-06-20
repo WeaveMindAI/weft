@@ -1,7 +1,8 @@
 //! Background loop that claims dispatcher-owned lifecycle commands
 //! (`deactivate` / `reactivate`) and runs them. The complementary
 //! supervisor-owned verbs (`apply` / `stop` / `terminate`) are
-//! claimed by the per-tenant supervisor pod via the broker.
+//! claimed by the pooled supervisor pod that owns the project, via the
+//! broker.
 //!
 //! Why a separate loop rather than reusing the supervisor's claim
 //! path: trigger-state deactivate/reactivate touches the signal

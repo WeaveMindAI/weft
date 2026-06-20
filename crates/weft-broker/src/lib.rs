@@ -69,15 +69,22 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/project/fetch_definition",
             post(handlers::project_fetch_definition),
         )
-        // Signals (listener-only rehydrate read)
+        // Signals (listener-only rehydrate read, by placement = pod)
         .route(
-            "/v1/signal/list_for_tenant",
-            post(handlers::signal_list_for_tenant),
+            "/v1/signal/list_for_pod",
+            post(handlers::signal_list_for_pod),
         )
-        // Supervisor surface (tenant-scoped; InfraSupervisor role only).
+        // Supervisor surface (pooled, trusted control-plane;
+        // InfraSupervisor role only). A supervisor acts only on the
+        // projects whose infra it owns (the `infra_owner` exclusive
+        // lease), claimed + renewed via sync_ownership.
         .route(
-            "/v1/supervisor/projects_for_tenant",
-            post(handlers::supervisor_projects_for_tenant),
+            "/v1/supervisor/sync_ownership",
+            post(handlers::supervisor_sync_ownership),
+        )
+        .route(
+            "/v1/supervisor/owned_projects",
+            post(handlers::supervisor_owned_projects),
         )
         .route(
             "/v1/supervisor/infra_nodes",

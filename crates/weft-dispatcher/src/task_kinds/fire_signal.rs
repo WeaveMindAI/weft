@@ -25,10 +25,12 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: FireSignalPayload = serde_json::from_value(task.payload.clone())?;
         // Held-event fires bypass the public lifecycle gate. Even
-        // though the listener pod may have been reaped between when
-        // the event was held and when this task runs, `with_listener`
-        // (inside `dispatch_listener_outcome`) respawns it to honor
-        // the fire; the reaper retires it again on the next sweep.
+        // though the listener pod holding this signal may have been
+        // reaped between when the event was held and when this task
+        // runs, `ensure_placed_handle` (inside `dispatch_listener_
+        // outcome`) re-places the signal from its durable row onto a
+        // live pod to honor the fire; the reaper retires the empty pod
+        // again on the next sweep.
         let signal = state
             .journal
             .signal_get(&payload.token)

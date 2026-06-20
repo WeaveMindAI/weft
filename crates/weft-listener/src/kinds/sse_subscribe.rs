@@ -47,6 +47,8 @@ impl KindHandler for SseSubscribeHandler {
     fn spawn_task(
         &self,
         token: &str,
+        tenant_id: &str,
+        placement_generation: i64,
         spec: &SignalSpec,
         _kind_state: &Value,
         sink: FireSignalSink,
@@ -54,7 +56,14 @@ impl KindHandler for SseSubscribeHandler {
     ) -> Result<Option<JoinHandle<()>>> {
         let sse: SseSubscribe = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed sse_subscribe spec: {e}"))?;
-        Ok(Some(spawn_loop(token.to_string(), sse.url, sse.event_name, sink)))
+        Ok(Some(spawn_loop(
+            token.to_string(),
+            tenant_id.to_string(),
+            placement_generation,
+            sse.url,
+            sse.event_name,
+            sink,
+        )))
     }
 
     fn process_entry(
@@ -153,6 +162,8 @@ fn parse_message(block: &str) -> Option<SseMessage> {
 
 fn spawn_loop(
     token: String,
+    tenant_id: String,
+    placement_generation: i64,
     url: String,
     event_filter: String,
     sink: FireSignalSink,
@@ -229,7 +240,7 @@ fn spawn_loop(
                         continue;
                     }
                     let payload = super::event_source::coerce_text_payload(msg.data);
-                    super::event_source::fire_payload(&sink, &token, payload, "sse_subscribe")
+                    super::event_source::fire_payload(&sink, &token, &tenant_id, placement_generation, payload, "sse_subscribe")
                         .await;
                 }
             }

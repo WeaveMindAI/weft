@@ -81,7 +81,7 @@ pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Resu
     );
     state
         .listeners
-        .unregister_many_if_alive(&state.pg_pool, &removed)
+        .unregister_many(&state.pg_pool, &removed)
         .await;
 
     let project_id = match state.journal.execution_project(color).await? {

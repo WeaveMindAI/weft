@@ -15,6 +15,11 @@ use weft_core::primitive::{SignalRouting, SignalSpec};
 pub struct RegisteredSignal {
     pub spec: SignalSpec,
     pub node_id: String,
+    /// Tenant this signal belongs to. A pooled listener holds signals
+    /// from many tenants; the held-event fire path reads this to stamp
+    /// the correct tenant on the enqueued `FireSignal` task (the pod has
+    /// no single tenant of its own).
+    pub tenant_id: String,
     /// True iff this is a mid-execution resume (HumanQuery, etc).
     /// Used by `process()` to decide which `ProcessTarget` to return
     /// for dual-use kinds like Form.
@@ -22,6 +27,11 @@ pub struct RegisteredSignal {
     /// Color of the suspended execution to resume. Set iff
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
     pub color: Option<String>,
+    /// The placement generation under which this pod holds the signal
+    /// (from the dispatcher at register time). Stamped onto every
+    /// held-event `FireSignal` this pod enqueues so the broker can fence
+    /// out a stale old-pod fire during a scale-down move overlap.
+    pub placement_generation: i64,
     /// Background task for kinds that run a loop (Timer, SseSubscribe).
     /// Dropping the handle via `.abort()` cancels the loop. `None`
     /// for passive kinds (Form, live-caller).
@@ -81,6 +91,23 @@ impl Registry {
             .collect()
     }
 
+    /// Total signals this listener holds (placement load).
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Count of signals running a live held-connection loop (Timer,
+    /// SSE, poll, socket). These are the resource-heavy entries (an
+    /// always-connected upstream socket costs far more than an idle
+    /// resume token), so the load surface reports them separately from
+    /// the raw signal count.
+    pub fn held_connection_count(&self) -> usize {
+        self.inner.iter().filter(|e| e.value().task.is_some()).count()
+    }
 }
 
 /// Reconcile the in-memory registry against the durable `signal`
@@ -89,13 +116,15 @@ impl Registry {
 /// but absent from the registry get inserted via `rehydrate_one`.
 ///
 /// Called from two places:
-///   - listener boot (registry empty, every DB row gets inserted).
+///   - listener boot (registry empty, every placed-on-me row gets
+///     inserted).
 ///   - dispatcher's activate flow via `POST /rehydrate` (registry
 ///     has some entries from earlier registers, missing entries
 ///     come from DB after a deactivate-park unregister-all).
 ///
-/// Reads through the broker's `signal/list_for_tenant` so the
-/// listener never opens a Postgres connection. Routing is REBUILT
+/// Reads through the broker's `signal/list_for_pod` (the signals whose
+/// `listener_pod` is this pod) so the listener never opens a Postgres
+/// connection. Routing is REBUILT
 /// from the persisted columns (surface_kind, mount_path, auth_kind,
 /// auth_config), NOT recomputed from the kind impl. Recomputing
 /// would mint a fresh API key on every restart and silently
@@ -112,13 +141,17 @@ pub async fn rehydrate(
     tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     broker_url: Arc<String>,
     token: weft_broker_client::TokenSource,
-    tenant_id: &str,
+    pod_name: &str,
     registry: Arc<Registry>,
     config: Arc<crate::config::ListenerConfig>,
 ) -> anyhow::Result<()> {
     let signals = weft_broker_client::BrokerSignalClient::new((*broker_url).clone(), token);
-    let rows = signals.list_for_tenant(tenant_id).await?;
-    let sink = crate::fire_sink::FireSignalSink::new(tasks, tenant_id.to_string());
+    // Rehydrate the signals PLACED on this pod (a pooled listener holds
+    // many tenants' signals; placement is per-signal, keyed by pod).
+    let rows = signals.list_for_pod(pod_name).await?;
+    // The sink is tenant-agnostic; each rehydrated signal carries its
+    // own tenant (from the row), stamped onto its held-event fires.
+    let sink = crate::fire_sink::FireSignalSink::new(tasks);
     for row in rows {
         // Skip entries the registry already holds. Re-inserting would
         // abort the existing Timer/SSE TaskGuard and spawn a fresh
@@ -134,10 +167,12 @@ pub async fn rehydrate(
         })?;
         crate::kinds::register_in_registry(
             row.token,
+            row.tenant_id,
             spec,
             row.node_id,
             row.is_resume,
             row.color,
+            row.placement_generation,
             crate::kinds::RoutingSource::Restore {
                 routing,
                 kind_state: row.kind_state,

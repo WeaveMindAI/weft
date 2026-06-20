@@ -35,6 +35,7 @@ use crate::ListenerState;
 pub fn router(state: ListenerState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/load", get(load))
         .route("/register", post(register))
         .route("/unregister", post(unregister))
         .route("/process", post(process))
@@ -60,7 +61,7 @@ async fn rehydrate_handler(
         state.tasks.clone(),
         broker_url,
         state.token_source.clone(),
-        &state.config.tenant_id,
+        &state.config.pod_name,
         state.registry.clone(),
         state.config.clone(),
     )
@@ -73,16 +74,34 @@ async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// Load surface for the dispatcher's placement. Returns the pod's
+/// current load + its own saturation call.
+async fn load(State(state): State<ListenerState>) -> Json<crate::protocol::LoadReport> {
+    Json(state.load_report())
+}
+
 async fn register(
     State(state): State<ListenerState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, (StatusCode, String)> {
+    // Admission gate: a saturated pod refuses new signals so a
+    // placement race (the dispatcher chose this pod from a stale load
+    // read) fails loudly with 503 instead of overloading it. The
+    // dispatcher retries placement onto another pod / spawns one.
+    if state.load_report().saturated {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "listener saturated; place on another pod".into(),
+        ));
+    }
     let (routing, kind_state) = kinds::register_in_registry(
         req.token,
+        req.tenant_id,
         req.spec,
         req.node_id,
         req.is_resume,
         req.color,
+        req.placement_generation,
         kinds::RoutingSource::Mint {
             secret_cache: state.secret_cache.clone(),
         },

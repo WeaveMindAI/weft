@@ -2171,7 +2171,11 @@ async fn enqueue_register_signal_task(
             payload,
         })
         .await?
-        .id();
+        .id()
+        // Only the broker-backed FireSignal path can fence (placement
+        // generation); this register-signal enqueue never does, so it
+        // always yields a task id.
+        .expect("register-signal enqueue is never fenced");
     let outcome = tasks
         .wait_for_terminal(id, TASK_WAIT_TIMEOUT, TASK_POLL_INTERVAL)
         .await?;

@@ -45,6 +45,8 @@ impl KindHandler for PollEndpointHandler {
     fn spawn_task(
         &self,
         token: &str,
+        tenant_id: &str,
+        placement_generation: i64,
         spec: &SignalSpec,
         _kind_state: &Value,
         sink: FireSignalSink,
@@ -52,7 +54,14 @@ impl KindHandler for PollEndpointHandler {
     ) -> Result<Option<JoinHandle<()>>> {
         let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
-        Ok(Some(spawn_loop(token.to_string(), poll.url, poll.interval_secs, sink)))
+        Ok(Some(spawn_loop(
+            token.to_string(),
+            tenant_id.to_string(),
+            placement_generation,
+            poll.url,
+            poll.interval_secs,
+            sink,
+        )))
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -68,6 +77,8 @@ impl KindHandler for PollEndpointHandler {
 
 fn spawn_loop(
     token: String,
+    tenant_id: String,
+    placement_generation: i64,
     url: String,
     interval_secs: u64,
     sink: FireSignalSink,
@@ -99,7 +110,7 @@ fn spawn_loop(
                 }
             };
             let payload = super::event_source::coerce_text_payload(body);
-            super::event_source::fire_payload(&sink, &token, payload, "poll_endpoint").await;
+            super::event_source::fire_payload(&sink, &token, &tenant_id, placement_generation, payload, "poll_endpoint").await;
         }
     })
 }

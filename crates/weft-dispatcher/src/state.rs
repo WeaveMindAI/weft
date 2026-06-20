@@ -5,6 +5,7 @@ use crate::events::EventBus;
 use crate::journal::Journal;
 use crate::listener::{ListenerBackend, ListenerPool};
 use crate::project_store::ProjectStore;
+use crate::supervisor_pool::{SupervisorBackend, SupervisorPool};
 use crate::tenant::{NamespaceMapper, TenantRouter};
 
 /// Stable identifier for this dispatcher Pod. Derived from
@@ -49,11 +50,18 @@ pub struct DispatcherState {
     pub workers: Arc<dyn WorkerBackend>,
     pub projects: ProjectStore,
     pub events: EventBus,
-    /// Spawns per-tenant listener instances.
+    /// Spawns pooled listener pods.
     pub listener_backend: Arc<dyn ListenerBackend>,
-    /// Per-tenant listener pool. One entry per active tenant; the
-    /// listener multiplexes every project the tenant owns.
+    /// Pooled listener placement. Each listener pod holds signals across
+    /// many tenants; placement is per-signal, load-based, with scale-up
+    /// and scale-down.
     pub listeners: ListenerPool,
+    /// Spawns pooled infra-supervisor pods.
+    pub supervisor_backend: Arc<dyn SupervisorBackend>,
+    /// Pooled infra-supervisor placement. Each supervisor pod owns the
+    /// infra of many projects (exclusive `infra_owner` lease); the pool
+    /// scales the pod count up and down by load.
+    pub supervisors: SupervisorPool,
     /// Resolves a tenant for a given project. OSS returns `local`;
     /// cloud derives from request auth.
     pub tenant_router: Arc<dyn TenantRouter>,
@@ -76,10 +84,10 @@ pub struct DispatcherState {
     /// so public-facing infra pods accept ingress from the right
     /// controller.
     pub cluster_ingress_namespace: String,
-    /// Docker tag of the per-tenant infra-supervisor pod image. The
-    /// dispatcher renders + applies a Deployment with this image to
-    /// each tenant namespace at first project register.
-    pub supervisor_image: String,
+    /// The control-plane namespace: where pooled, trusted, tenant-
+    /// agnostic services run (infra-supervisor pods; listener pods).
+    /// Defaults to the dispatcher's own namespace.
+    pub control_plane_namespace: String,
     /// Docker tag of the per-tenant storage-box image (lazy-applied
     /// on first storage use; see `storage_box`).
     pub storage_image: String,

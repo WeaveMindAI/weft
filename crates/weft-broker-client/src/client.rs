@@ -252,10 +252,13 @@ impl TaskStoreClient for BrokerTaskStoreClient {
         let req = TaskEnqueueDedupRequest { spec };
         let resp: TaskEnqueueDedupResponse =
             self.http.post("/v1/task/enqueue_dedup", &req).await?;
-        Ok(if resp.inserted {
-            DedupOutcome::Inserted(resp.id)
-        } else {
-            DedupOutcome::AlreadyLive(resp.id)
+        Ok(match (resp.fenced, resp.id) {
+            (true, _) => DedupOutcome::Fenced,
+            (false, Some(id)) if resp.inserted => DedupOutcome::Inserted(id),
+            (false, Some(id)) => DedupOutcome::AlreadyLive(id),
+            (false, None) => {
+                anyhow::bail!("enqueue_dedup response: not fenced but missing task id")
+            }
         })
     }
 
@@ -389,15 +392,15 @@ impl BrokerSignalClient {
         })
     }
 
-    pub async fn list_for_tenant(
+    pub async fn list_for_pod(
         &self,
-        tenant_id: &str,
+        pod_name: &str,
     ) -> Result<Vec<SignalRowWire>> {
-        let req = SignalListForTenantRequest {
-            tenant_id: tenant_id.to_string(),
+        let req = SignalListForPodRequest {
+            pod_name: pod_name.to_string(),
         };
-        let resp: SignalListForTenantResponse =
-            self.http.post("/v1/signal/list_for_tenant", &req).await?;
+        let resp: SignalListForPodResponse =
+            self.http.post("/v1/signal/list_for_pod", &req).await?;
         Ok(resp.rows)
     }
 }
@@ -492,18 +495,37 @@ impl BrokerSupervisorClient {
         })
     }
 
-    pub async fn projects_for_tenant(
+    /// Sync this supervisor pod's project ownership: renew its existing
+    /// leases, claim up to `saturation` more unowned projects' infra
+    /// (the exclusive `infra_owner` lease), and return the full set it
+    /// now owns. The supervisor acts ONLY on the returned projects.
+    pub async fn sync_ownership(
         &self,
-        tenant_id: &str,
+        pod_name: &str,
+        mem_pressure: f64,
     ) -> Result<Vec<SupervisorProject>> {
-        let req = SupervisorProjectsForTenantRequest {
-            tenant_id: tenant_id.to_string(),
+        let req = SupervisorSyncOwnershipRequest {
+            pod_name: pod_name.to_string(),
+            mem_pressure,
         };
-        let resp: SupervisorProjectsForTenantResponse = self
+        let resp: SupervisorSyncOwnershipResponse = self
             .http
-            .post("/v1/supervisor/projects_for_tenant", &req)
+            .post("/v1/supervisor/sync_ownership", &req)
             .await?;
-        Ok(resp.projects)
+        Ok(resp.owned)
+    }
+
+    /// Pure read of the projects this pod owns (no claim/renew). The work
+    /// loops use this; ownership breadth changes only via `sync_ownership`.
+    pub async fn owned_projects(&self, pod_name: &str) -> Result<Vec<SupervisorProject>> {
+        let req = SupervisorOwnedProjectsRequest {
+            pod_name: pod_name.to_string(),
+        };
+        let resp: SupervisorOwnedProjectsResponse = self
+            .http
+            .post("/v1/supervisor/owned_projects", &req)
+            .await?;
+        Ok(resp.owned)
     }
 
     pub async fn infra_nodes(&self, project_id: &str) -> Result<Vec<SupervisorInfraNode>> {
@@ -531,11 +553,9 @@ impl BrokerSupervisorClient {
 
     pub async fn claim_command(
         &self,
-        tenant_id: &str,
         claimer_pod: &str,
     ) -> Result<Option<SupervisorCommandRow>> {
         let req = SupervisorClaimCommandRequest {
-            tenant_id: tenant_id.to_string(),
             claimer_pod: claimer_pod.to_string(),
         };
         let resp: SupervisorClaimCommandResponse =
@@ -563,6 +583,7 @@ impl BrokerSupervisorClient {
 
     pub async fn set_status(
         &self,
+        pod_name: &str,
         command_id: Option<i64>,
         project_id: &str,
         node_id: &str,
@@ -572,6 +593,7 @@ impl BrokerSupervisorClient {
         failure_message: Option<&str>,
     ) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
         let req = SupervisorSetStatusRequest {
+            pod_name: pod_name.to_string(),
             command_id,
             project_id: project_id.to_string(),
             node_id: node_id.to_string(),
@@ -585,22 +607,33 @@ impl BrokerSupervisorClient {
             .await
     }
 
-    pub async fn remove_node(&self, project_id: &str, node_id: &str) -> Result<bool> {
+    /// `Raced` when the caller no longer owns the project (ownership
+    /// moved mid-Terminate): the supervisor aborts and leaves the
+    /// command for the new owner. `Applied(removed)` otherwise.
+    pub async fn remove_node(
+        &self,
+        pod_name: &str,
+        project_id: &str,
+        node_id: &str,
+    ) -> Result<WriteOutcome<SupervisorRemoveNodeResponse>> {
         let req = SupervisorRemoveNodeRequest {
+            pod_name: pod_name.to_string(),
             project_id: project_id.to_string(),
             node_id: node_id.to_string(),
         };
-        let resp: SupervisorRemoveNodeResponse =
-            self.http.post("/v1/supervisor/remove_node", &req).await?;
-        Ok(resp.removed)
+        self.http
+            .post_or_raced::<_, SupervisorRemoveNodeResponse>("/v1/supervisor/remove_node", &req)
+            .await
     }
 
     pub async fn command_complete(
         &self,
+        pod_name: &str,
         command_id: i64,
         error: Option<&str>,
     ) -> Result<WriteOutcome<SupervisorCommandCompleteResponse>> {
         let req = SupervisorCommandCompleteRequest {
+            pod_name: pod_name.to_string(),
             command_id,
             error: error.map(|s| s.to_string()),
         };
@@ -650,6 +683,7 @@ impl BrokerSupervisorClient {
 
     pub async fn set_applied(
         &self,
+        pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -661,6 +695,7 @@ impl BrokerSupervisorClient {
         units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
     ) -> Result<WriteOutcome<SupervisorSetAppliedResponse>> {
         let req = SupervisorSetAppliedRequest {
+            pod_name: pod_name.to_string(),
             command_id,
             project_id: project_id.to_string(),
             node_id: node_id.to_string(),
@@ -684,6 +719,7 @@ impl BrokerSupervisorClient {
     /// to Running via `set_applied`.
     pub async fn set_provisioning(
         &self,
+        pod_name: &str,
         command_id: i64,
         project_id: &str,
         node_id: &str,
@@ -693,6 +729,7 @@ impl BrokerSupervisorClient {
         units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
     ) -> Result<WriteOutcome<SupervisorSetProvisioningResponse>> {
         let req = SupervisorSetProvisioningRequest {
+            pod_name: pod_name.to_string(),
             command_id,
             project_id: project_id.to_string(),
             node_id: node_id.to_string(),
