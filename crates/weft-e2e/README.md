@@ -10,9 +10,30 @@ and asserts automatically.
 
 ## Running it
 
+Run the suite with the stop-at-first-failure runner (the sanctioned workflow):
+
 ```bash
-cargo test -p weft-e2e --features e2e -- --test-threads=1
+crates/weft-e2e/run-e2e.sh                # whole suite, stop on first failure
+crates/weft-e2e/run-e2e.sh listener_move  # just these test binaries
 ```
+
+It runs the tests one binary at a time and HALTS the instant one fails, leaving
+the cluster in exactly the state that test left it so you can investigate. Do
+NOT run the whole suite past a failure: the tests share one real cluster, so
+continuing piles more state on top of the failure and buries the evidence (and
+can cascade). A PASSING test cleans up after itself (its project is removed and
+any pooled-pod clone it created is swept on its success path); a FAILING test
+deliberately leaves its project + clones behind for inspection, which is why the
+runner stops right there.
+
+A single test binary directly (same `--test-threads=1` requirement):
+
+```bash
+cargo test -p weft-e2e --features e2e --test live_chat -- --test-threads=1
+```
+
+The bare `cargo test -p weft-e2e --features e2e -- --test-threads=1` runs every
+binary but does NOT stop at the first failure, so prefer `run-e2e.sh`.
 
 - **The `e2e` feature is OFF by default.** Without it, `cargo test --workspace`
   compiles this crate but runs none of its cluster-touching tests, so the normal
@@ -25,7 +46,50 @@ cargo test -p weft-e2e --features e2e -- --test-threads=1
   to current code, and each fixture builds its own worker image on first touch
   (a real cargo-in-Docker compile). Subsequent runs reuse the cached images.
 
-Run one area: `cargo test -p weft-e2e --features e2e --test live_chat -- --test-threads=1`.
+## Rules for driving the cluster (READ THIS)
+
+The cluster is owned by `setup.sh` and the `weft daemon`. Your ONLY sanctioned
+cluster operations are:
+
+```bash
+./setup.sh --uninstall --purge   # full teardown (cluster + Postgres volume)
+./setup.sh                       # fresh install / bring to current code
+```
+
+Everything else flows from those two. The e2e rig runs `./setup.sh` for you (via
+`ensure::up()`), waits for the dispatcher to be healthy, and reaches it through
+the port-forward the daemon owns. So the normal loop is just: (purge if the
+schema changed) then `cargo test -p weft-e2e --features e2e -- --test-threads=1`.
+
+**Do NOT hand-patch the cluster to make a test pass.** Specifically, never:
+
+- run `kubectl apply` / `kubectl delete` / `kubectl edit` / `kubectl scale` /
+  `kubectl rollout restart` against a live resource (NetworkPolicy, Deployment,
+  StatefulSet, pod, anything),
+- `DROP`/`ALTER` the live Postgres schema, or otherwise mutate the DB by hand,
+- start your own `kubectl port-forward` to the dispatcher (or set
+  `WEFT_DISPATCHER_URL` to a hand-rolled forward), or otherwise route around the
+  daemon's connection,
+- restart `kube-proxy` / the CNI / individual pods to chase a networking symptom.
+
+All of these are throwaway patches: they fix the running cluster, not the source,
+so the fix evaporates on the next install and the bug ships. They also destabilize
+the daemon (manually rolling the dispatcher kills the port-forward it manages,
+which then looks like a flaky/unreachable dispatcher, a self-inflicted failure).
+
+**If a test fails or the cluster misbehaves, the bug is in the code or in
+`setup.sh` / a manifest, fix it THERE.** A NetworkPolicy that blocks a pod is
+fixed in the manifest that renders it; a missing schema column is fixed in the
+`CREATE TABLE` plus a purge; a wedged cluster is fixed by a clean reinstall, not
+by poking it. Then validate the real way: `./setup.sh --uninstall --purge`,
+`./setup.sh`, re-run. The whole point of the purge+reinstall discipline is that
+every fix is reproducible from source, so a fresh machine (or CI) gets the same
+working system.
+
+**Time is not a constraint here.** A clean purge + reinstall + full e2e run is
+slow (cluster bring-up, per-fixture worker-image compiles, serial scenarios).
+That is expected and fine. Never take a manual shortcut to save time; always
+prefer the slow, correct, reproducible path over a fast hand-patch.
 
 ## Fresh install after a database schema change (REQUIRED)
 

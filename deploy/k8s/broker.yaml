@@ -119,9 +119,14 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # Worker / storage pods reach the broker from two namespace flavors:
+    # Worker / storage pods reach the broker from three namespace flavors:
     #   - `weft.dev/role=tenant` (storage box lives there)
-    #   - `weft.dev/role=project` (worker pods live there post-v2)
+    #   - `weft.dev/role=project` (an INFRA project's worker runs in its
+    #     own per-project namespace, next to its infra pods)
+    #   - `weft.dev/role=shared-workers` (a NO-INFRA project's worker runs
+    #     in the single shared worker namespace; that namespace maps to no
+    #     tenant, so its workers resolve their tenant per-pod, but they
+    #     still call the broker like any worker and must be admitted here)
     # The pod label filter narrows to the roles allowed to call the
     # broker. The storage box relays caller tokens to
     # /storage/authorize, so it must be admitted here like the others.
@@ -130,7 +135,7 @@ spec:
             matchExpressions:
               - key: weft.dev/role
                 operator: In
-                values: [tenant, project]
+                values: [tenant, project, shared-workers]
           podSelector:
             matchExpressions:
               - key: weft.dev/role

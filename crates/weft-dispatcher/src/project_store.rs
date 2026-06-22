@@ -35,15 +35,21 @@ pub trait ProjectStoreOps: Send + Sync {
     ///
     /// `binary_hash`, `definition_hash`, and `infra_hash` are
     /// optional: a register with only some hashes set leaves the
-    /// others unchanged. `project_namespace` is required (NOT NULL in
-    /// the schema) so the row is born with the k8s placement decided;
-    /// callers compute it via `NamespaceMapper::project_namespace_for`.
+    /// others unchanged.
+    ///
+    /// `has_infra` (derived from the definition via
+    /// `weft_core::has_infra`) is stored on the row and refreshed on
+    /// every register/sync, so it tracks edits that add or remove
+    /// infra. It is the single fact that decides worker placement: the
+    /// worker namespace is computed on demand from it
+    /// (`project_namespace::worker_namespace`), never stored, so adding
+    /// or removing infra moves the worker to the right namespace
+    /// without a stale stored value to reconcile.
     async fn register_with_hashes(
         &self,
         project: ProjectDefinition,
         name: &str,
         tenant_id: &str,
-        project_namespace: &str,
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
@@ -176,11 +182,32 @@ pub trait ProjectStoreOps: Send + Sync {
     /// to this transition already tolerates the loss and retries.
     async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
 
-    /// Look up the project namespace by string-id (used by task
-    /// executors that only see the project_id string). `Ok(Some(ns))`
-    /// for any registered project; `Ok(None)` ONLY when the project
-    /// doesn't exist; `Err` on DB failure.
+    /// Whether the project declares infrastructure, by string-id (used
+    /// by task executors that only see the project_id string to compute
+    /// the worker namespace via `project_namespace::worker_namespace`).
+    /// `Ok(Some(has_infra))` for any registered project; `Ok(None)` ONLY
+    /// when the project doesn't exist; `Err` on DB failure.
+    async fn project_has_infra(&self, id_str: &str) -> anyhow::Result<Option<bool>>;
+
+    /// The project's OWN k8s namespace (where its infra pods live), or
+    /// `Ok(Some(""))` / `Ok(None)` when it has none. EMPTY string means
+    /// "no per-project namespace provisioned" (a no-infra project, or an
+    /// infra project whose namespace hasn't been created yet); callers
+    /// that need it for infra teardown treat empty as "nothing to
+    /// delete". `Ok(None)` ONLY when the project doesn't exist. This is
+    /// the INFRA namespace, NOT the worker namespace: for worker
+    /// placement use `project_has_infra` + `worker_namespace`.
     async fn project_namespace(&self, id_str: &str) -> anyhow::Result<Option<String>>;
+
+    /// Set the project's own k8s namespace, called when the per-project
+    /// namespace is provisioned (first infra apply). Idempotent.
+    async fn set_project_namespace(&self, id: uuid::Uuid, namespace: &str) -> anyhow::Result<()>;
+
+    /// Clear the project's own k8s namespace back to empty, called when
+    /// infra is torn down (project removed, or last infra node deleted),
+    /// so the broker's supervisor-claim (`project_namespace <> ''`) stops
+    /// managing it. Idempotent.
+    async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Replace the per-(project, node) infra image-tag map. The CLI
     /// sends the tags in /infra/sync; the supervisor reads them
@@ -456,10 +483,32 @@ impl PostgresProjectStore {
                 -- non-health lifecycle write.
                 deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
                 tenant_id TEXT NOT NULL DEFAULT 'local',
-                -- Project namespace (wm-project-<tenant>--<project>).
-                -- Set on register (NOT NULL: no default; populated by
-                -- the writer at registration time).
-                project_namespace TEXT NOT NULL,
+                -- Whether this project DECLARES infrastructure (any node
+                -- with requires_infra). Derived from the definition and
+                -- refreshed on every register/sync, so it tracks edits
+                -- that add or remove infra. Decides WORKER placement: an
+                -- infra project's worker runs in the project's own k8s
+                -- namespace (next to its infra pods), a no-infra
+                -- project's worker runs in the shared worker namespace.
+                -- The worker namespace is computed from this on demand
+                -- (project_namespace::worker_namespace), never stored, so
+                -- there is no stale worker-namespace value to reconcile.
+                -- Set true the instant infra is declared, which is BEFORE
+                -- the per-project namespace below is provisioned, so it
+                -- cannot be replaced by `project_namespace <> ''`.
+                has_infra BOOLEAN NOT NULL DEFAULT FALSE,
+                -- The project's OWN k8s namespace
+                -- (wm-project-<tenant>--<project>), where its INFRA pods
+                -- and its worker live. Distinct concept from has_infra:
+                -- this is the namespace string the supervisor runs
+                -- kubectl against, EMPTY until the namespace is actually
+                -- provisioned (first infra apply) and re-emptied when
+                -- infra is torn down. The broker's supervisor-claim
+                -- filters `project_namespace <> ''` to manage only
+                -- projects whose namespace exists. A no-infra project
+                -- keeps this empty forever (its worker lives in the
+                -- shared namespace, which is not project-owned).
+                project_namespace TEXT NOT NULL DEFAULT '',
                 -- Per-(project, node) image hash maps for Image::Local
                 -- references in InfraSpecs. CLI ships these in /sync;
                 -- supervisor reads them.
@@ -588,13 +637,17 @@ impl ProjectStoreOps for PostgresProjectStore {
         project: ProjectDefinition,
         name: &str,
         tenant_id: &str,
-        project_namespace: &str,
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name = name.to_string();
+        // Derived from the definition and refreshed on every register/
+        // sync so it tracks edits that add or remove infra. The conflict
+        // arm below re-derives it from EXCLUDED, so a re-register that
+        // adds (or drops) an infra node flips placement.
+        let has_infra = weft_core::has_infra(&project);
         let project_json = serde_json::to_string(&project)?;
         let mut tx = self.pool.begin().await?;
         let now = crate::lease::now_unix();
@@ -605,14 +658,14 @@ impl ProjectStoreOps for PostgresProjectStore {
         let (status_str,): (String,) = sqlx::query_as(
             "INSERT INTO project \
                 (id, name, status, project_json, updated_at, \
-                 tenant_id, project_namespace) \
+                 tenant_id, has_infra) \
              VALUES ($1, $2, 'registered', $3, $4, $5, $6) \
              ON CONFLICT (id) DO UPDATE SET \
                 name = EXCLUDED.name, \
                 project_json = EXCLUDED.project_json, \
                 updated_at = EXCLUDED.updated_at, \
                 tenant_id = EXCLUDED.tenant_id, \
-                project_namespace = EXCLUDED.project_namespace \
+                has_infra = EXCLUDED.has_infra \
              RETURNING status",
         )
         .bind(id)
@@ -620,7 +673,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         .bind(&project_json)
         .bind(now)
         .bind(tenant_id)
-        .bind(project_namespace)
+        .bind(has_infra)
         .fetch_one(&mut *tx)
         .await?;
         if let Some(hash) = definition_hash {
@@ -904,6 +957,18 @@ impl ProjectStoreOps for PostgresProjectStore {
         }
     }
 
+    async fn project_has_infra(&self, id_str: &str) -> anyhow::Result<Option<bool>> {
+        let id = id_str
+            .parse::<uuid::Uuid>()
+            .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
+        let row: Option<(bool,)> =
+            sqlx::query_as("SELECT has_infra FROM project WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(b,)| b))
+    }
+
     async fn project_namespace(&self, id_str: &str) -> anyhow::Result<Option<String>> {
         let id = id_str
             .parse::<uuid::Uuid>()
@@ -913,7 +978,24 @@ impl ProjectStoreOps for PostgresProjectStore {
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(row.map(|(s,)| s).filter(|s| !s.is_empty()))
+        Ok(row.map(|(s,)| s))
+    }
+
+    async fn set_project_namespace(&self, id: uuid::Uuid, namespace: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE project SET project_namespace = $2 WHERE id = $1")
+            .bind(id)
+            .bind(namespace)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE project SET project_namespace = '' WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
 
@@ -1048,6 +1130,9 @@ pub struct MockProjectStore {
     definition_versions: RwLock<HashMap<(uuid::Uuid, String), String>>,
     lifecycles: RwLock<HashMap<uuid::Uuid, ProjectLifecycle>>,
     tenants: RwLock<HashMap<uuid::Uuid, String>>,
+    has_infra: RwLock<HashMap<uuid::Uuid, bool>>,
+    /// The project's own infra namespace, empty until provisioned. Set
+    /// by `set_project_namespace`, cleared by `clear_project_namespace`.
     namespaces: RwLock<HashMap<uuid::Uuid, String>>,
 }
 
@@ -1062,6 +1147,7 @@ impl MockProjectStore {
             definition_versions: RwLock::new(HashMap::new()),
             lifecycles: RwLock::new(HashMap::new()),
             tenants: RwLock::new(HashMap::new()),
+            has_infra: RwLock::new(HashMap::new()),
             namespaces: RwLock::new(HashMap::new()),
         }
     }
@@ -1082,13 +1168,16 @@ impl ProjectStoreOps for MockProjectStore {
         project: ProjectDefinition,
         name: &str,
         tenant_id: &str,
-        project_namespace: &str,
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name_owned = name.to_string();
+        // Compute before `project` is moved into `inner`. Re-derived on
+        // every register so a re-register that adds/drops infra updates
+        // it, mirroring the Postgres conflict arm.
+        let has_infra = weft_core::has_infra(&project);
         // Serialize for the history row before moving `project`.
         let project_json = serde_json::to_string(&project)?;
         // Mirror Postgres exactly: the upsert's conflict arm does NOT
@@ -1117,10 +1206,7 @@ impl ProjectStoreOps for MockProjectStore {
             });
         }
         self.tenants.write().await.insert(id, tenant_id.to_string());
-        self.namespaces
-            .write()
-            .await
-            .insert(id, project_namespace.to_string());
+        self.has_infra.write().await.insert(id, has_infra);
         if let Some(h) = binary_hash {
             self.binary_hashes.write().await.insert(id, h.to_string());
         }
@@ -1184,10 +1270,10 @@ impl ProjectStoreOps for MockProjectStore {
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         // Mirror Postgres FK CASCADE: removing a project clears every
         // per-id side-map (binary/definition/infra hashes,
-        // definition_versions history, lifecycles, tenants,
-        // namespaces). Without this the mock diverges from production:
-        // a test that re-registers under the same id, or asserts
-        // cleanup, would see ghost state Postgres does not have.
+        // definition_versions history, lifecycles, tenants, has_infra,
+        // namespaces). Without this the mock diverges from production: a
+        // test that re-registers under the same id, or asserts cleanup,
+        // would see ghost state Postgres does not have.
         let was_present = self.inner.write().await.remove(&id).is_some();
         self.binary_hashes.write().await.remove(&id);
         self.definition_hashes.write().await.remove(&id);
@@ -1195,6 +1281,7 @@ impl ProjectStoreOps for MockProjectStore {
         self.definition_versions.write().await.retain(|(p, _), _| *p != id);
         self.lifecycles.write().await.remove(&id);
         self.tenants.write().await.remove(&id);
+        self.has_infra.write().await.remove(&id);
         self.namespaces.write().await.remove(&id);
         Ok(was_present)
     }
@@ -1374,11 +1461,36 @@ impl ProjectStoreOps for MockProjectStore {
         Ok(true)
     }
 
+    async fn project_has_infra(&self, id_str: &str) -> anyhow::Result<Option<bool>> {
+        let id = id_str
+            .parse::<uuid::Uuid>()
+            .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
+        Ok(self.has_infra.read().await.get(&id).copied())
+    }
+
     async fn project_namespace(&self, id_str: &str) -> anyhow::Result<Option<String>> {
         let id = id_str
             .parse::<uuid::Uuid>()
             .map_err(|e| anyhow::anyhow!("bad project_id '{id_str}': {e}"))?;
-        Ok(self.namespaces.read().await.get(&id).cloned())
+        // Mirror Postgres: a registered project always has a row (empty
+        // string until its namespace is provisioned); only an
+        // unregistered project returns None.
+        if !self.inner.read().await.contains_key(&id) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.namespaces.read().await.get(&id).cloned().unwrap_or_default(),
+        ))
+    }
+
+    async fn set_project_namespace(&self, id: uuid::Uuid, namespace: &str) -> anyhow::Result<()> {
+        self.namespaces.write().await.insert(id, namespace.to_string());
+        Ok(())
+    }
+
+    async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        self.namespaces.write().await.insert(id, String::new());
+        Ok(())
     }
 
     async fn set_infra_image_tags(

@@ -56,7 +56,10 @@ pub trait WorkerPodClient: Send + Sync {
         project_id: &str,
     ) -> Result<()>;
 
-    async fn heartbeat(&self, pod_name: &str) -> Result<bool>;
+    /// Heartbeat + self-reported memory pressure ([0,1]) in one call.
+    /// The worker reads its own cgroup pressure each tick and reports it
+    /// so the dispatcher places / scales workers by real memory load.
+    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<bool>;
 
     async fn mark_done(&self, pod_name: &str) -> Result<()>;
 
@@ -131,8 +134,8 @@ impl WorkerPodClient for PostgresWorkerPodClient {
         crate::worker_pod::register_alive(&self.pool, pod_name, project_id).await
     }
 
-    async fn heartbeat(&self, pod_name: &str) -> Result<bool> {
-        crate::worker_pod::heartbeat(&self.pool, pod_name).await
+    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<bool> {
+        crate::worker_pod::heartbeat(&self.pool, pod_name, mem_pressure).await
     }
 
     async fn mark_done(&self, pod_name: &str) -> Result<()> {

@@ -24,6 +24,10 @@ pub async fn enqueue_execute(
     definition_hash: &str,
     tenant_id: Option<&str>,
 ) -> Result<()> {
+    // New executions are unpinned: a fresh color has no owner yet, and
+    // the atomic task claim guarantees exactly one worker picks it up
+    // (that worker becomes the owner). Pinning is only needed for resume
+    // (see `enqueue_resume`), where a live owner may already exist.
     enqueue_execution(
         pool,
         TaskKind::Execute,
@@ -31,6 +35,7 @@ pub async fn enqueue_execute(
         color,
         definition_hash,
         tenant_id,
+        None,
     )
     .await
 }
@@ -43,9 +48,22 @@ pub async fn enqueue_execute(
 /// arriving afterwards spawns a fresh resume task because the prior
 /// dedup row has transitioned to `complete`.
 ///
-/// At most one worker ever runs per color at a time. Without that
-/// invariant, multiple workers race the same journal stream and
-/// emit duplicate NodeResumed/NodeStarted/NodeCompleted events.
+/// At most one worker ever runs per color at a time. With ONE worker
+/// per project that held for free (only one pod could claim the
+/// unpinned task). Now that a project can run MULTIPLE workers, an
+/// unpinned resume could be claimed by a FRESH worker while the
+/// original owner is still driving the color (e.g. held warm by a live
+/// bus, resolving the suspension in place): the fresh worker would
+/// claim, the broker would stamp it as the new owner (latest-claim-
+/// wins), and the original's journal writes would then be rejected.
+///
+/// So we PIN the resume to the color's current owner when that owner is
+/// still alive: the `target_pod_name` claim filter then guarantees only
+/// the owner reclaims it, keeping "one active pod per color" true. When
+/// the owner is gone (crashed / idle-exited / never assigned), the
+/// resume stays unpinned: cold_start spawns a fresh pod, it claims, and
+/// it legitimately takes over ownership. That handoff is the only time
+/// ownership moves.
 pub async fn enqueue_resume(
     pool: &sqlx::PgPool,
     project_id: &str,
@@ -53,6 +71,9 @@ pub async fn enqueue_resume(
     definition_hash: &str,
     tenant_id: Option<&str>,
 ) -> Result<()> {
+    // Pin to the color's owner IFF it is still alive; a dead/absent owner
+    // leaves the resume unpinned so a fresh pod takes over.
+    let alive_owner = alive_color_owner(pool, color).await?;
     enqueue_execution(
         pool,
         TaskKind::Resume,
@@ -60,8 +81,38 @@ pub async fn enqueue_resume(
         color,
         definition_hash,
         tenant_id,
+        alive_owner,
     )
     .await
+}
+
+/// The pod that currently OWNS a color, but only if that pod is still
+/// alive (`spawning`/`alive`). `None` when the color has no owner or the
+/// owner is gone. The single source of truth for "which pod is driving
+/// this color right now," used to route any task that must reach the
+/// driver: a resume (pin so the owner reclaims, keeping one-active-pod-
+/// per-color) and a cancel (the cancel flag lives in the owner's
+/// in-RAM registry, so the cancel must land on the owner or it no-ops).
+/// Routing either to any other pod would also restamp ownership via the
+/// claim trigger and fence the real owner, which is exactly why both go
+/// through this one owner lookup rather than picking an arbitrary alive
+/// pod for the project.
+async fn alive_color_owner(
+    pool: &sqlx::PgPool,
+    color: weft_core::Color,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"SELECT ec.owner_pod_name
+           FROM execution_color ec
+           JOIN worker_pod wp ON wp.pod_name = ec.owner_pod_name
+           WHERE ec.color = $1
+             AND ec.owner_pod_name IS NOT NULL
+             AND wp.status IN ('spawning', 'alive')"#,
+    )
+    .bind(color.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(p,)| p))
 }
 
 async fn enqueue_execution(
@@ -71,6 +122,12 @@ async fn enqueue_execution(
     color: weft_core::Color,
     definition_hash: &str,
     tenant_id: Option<&str>,
+    // The pod to pin the task to, or None to let any alive worker for
+    // the project claim it. New executions pass None (a fresh color has
+    // no owner; whichever worker claims first becomes owner, and the
+    // atomic claim guarantees exactly one). Resume passes the alive
+    // owner so a sibling worker can't steal a live color.
+    target_pod_name: Option<String>,
 ) -> Result<()> {
     let color_str = color.to_string();
     let payload = ExecutionPayload {
@@ -89,7 +146,7 @@ async fn enqueue_execution(
             dedup_key: Some(dedup),
             color: Some(color_str),
             tenant_id: tenant_id.map(str::to_string),
-            target_pod_name: None,
+            target_pod_name,
             payload: serde_json::to_value(&payload)?,
         },
     )
@@ -104,11 +161,12 @@ async fn enqueue_execution(
 /// `target_pod_name` claim filter guarantees ONLY the chosen pod runs it, so
 /// the caller (routed to that same pod by the gateway) and the execution
 /// land on the same process.
-/// ATOMICALLY admit a live execution: pick the least-loaded under-cap worker
-/// pod for the project and insert the pinned execute task on it, in one
-/// transaction (admission IS the task insert; the task row is the capacity
-/// slot, so there is no separate counter to drift). Returns the chosen pod,
-/// or `None` if every pod is at `cap` (caller spawns another and retries).
+/// ATOMICALLY admit a live execution: pick the least-PRESSURED admittable
+/// worker for the project (alive, not draining, memory below `saturation`) and
+/// insert the pinned execute task on it, in one transaction (admission IS the
+/// task insert; the task row is the durable pin). Returns the chosen pod, or
+/// `None` if every worker is saturated / draining (caller spawns another and
+/// retries). Capacity is memory-bounded, not a connection count.
 pub async fn admit_live_execution(
     pool: &sqlx::PgPool,
     project_id: &str,
@@ -116,7 +174,7 @@ pub async fn admit_live_execution(
     definition_hash: &str,
     tenant_id: Option<&str>,
     live_spec: serde_json::Value,
-    cap: i32,
+    saturation: f64,
 ) -> Result<Option<weft_task_store::tasks::AdmittedPod>> {
     let color_str = color.to_string();
     let payload = ExecutionPayload {
@@ -132,31 +190,31 @@ pub async fn admit_live_execution(
         &color_str,
         tenant_id,
         &payload_json,
-        cap,
+        saturation,
     )
     .await?;
     Ok(admitted)
 }
 
-/// Enqueue a `cancel_execution` task addressed to the Pod that owns
-/// the project pool right now. The task's `target_pod_name` field
-/// is set to the owning Pod (looked up via
-/// `worker_pod::alive_pod_for_project`); the claim filter on
-/// `task.target_pod_name` ensures only that Pod can claim the row,
-/// so a sibling Pod in a multi-Pod pool can't accidentally consume
-/// the cancel.
+/// Enqueue a `cancel_execution` task addressed to the Pod that OWNS
+/// this color right now (the pod driving the execution), looked up via
+/// `alive_color_owner`. The cancel flag lives in that pod's in-RAM
+/// `cancel_registry`, so the cancel must reach the owner to have any
+/// effect; routing it to the oldest alive pod (the previous behavior)
+/// landed it on a sibling in a multi-pod pool, where it silently
+/// no-opped AND, via the claim trigger, restamped color ownership to
+/// the sibling and fenced the real owner mid-run. The
+/// `task.target_pod_name` claim filter ensures only the owner claims it.
 ///
-/// Returns `Ok(false)` if no live Pod exists for the project (the
-/// execution must already be terminal; nothing to cancel).
+/// Returns `Ok(false)` if the color has no live owner (the execution is
+/// already terminal or its worker is gone; nothing to cancel).
 pub async fn enqueue_cancel(
     pool: &sqlx::PgPool,
     project_id: &str,
     color: weft_core::Color,
     tenant_id: Option<&str>,
 ) -> Result<bool> {
-    let Some(pod_name) =
-        weft_task_store::worker_pod::alive_pod_for_project(pool, project_id).await?
-    else {
+    let Some(pod_name) = alive_color_owner(pool, color).await? else {
         return Ok(false);
     };
     let color_str = color.to_string();

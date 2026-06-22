@@ -369,6 +369,17 @@ impl EdgeIndex {
     }
 }
 
+/// Whether this project declares ANY infrastructure: true iff at least
+/// one node has `requires_infra`. The single project-level fact that
+/// decides namespace placement: an infra project gets its own k8s
+/// namespace (its worker must sit next to its infra pods), a no-infra
+/// project's worker runs in the shared worker namespace. Pure walk over
+/// the node list; the one copy of this predicate so the dispatcher and
+/// any other consumer can't drift on what "has infra" means.
+pub fn has_infra(project: &ProjectDefinition) -> bool {
+    project.nodes.iter().any(|n| n.requires_infra)
+}
+
 /// For every `requires_infra` node, find every trigger whose
 /// upstream-closure includes it. Returns `(infra_node_id,
 /// trigger_node_id)` pairs sorted by `(infra, trigger)`.
@@ -538,5 +549,55 @@ mod project_wire_tests {
         assert_eq!(back.nodes[0].node_type, "Llm");
         assert_eq!(back.groups[0].in_ports.len(), 1);
         assert_eq!(back.nodes[0].header_span, Some(Span::single_line(1, 0, 3)), "headerSpan round-trips");
+    }
+
+    fn node_with_infra(id: &str, requires_infra: bool) -> NodeDefinition {
+        NodeDefinition {
+            id: id.into(),
+            node_type: "Any".into(),
+            label: None,
+            config: default_config(),
+            position: Position { x: 0.0, y: 0.0 },
+            scope: vec![],
+            group_boundary: None,
+            inputs: vec![],
+            outputs: vec![],
+            features: Default::default(),
+            requires_infra,
+            images: vec![],
+            span: None,
+            header_span: None,
+            config_spans: Default::default(),
+            file_refs: Default::default(),
+            include_path: None,
+        }
+    }
+
+    fn project_with_nodes(nodes: Vec<NodeDefinition>) -> ProjectDefinition {
+        ProjectDefinition {
+            id: Uuid::nil(),
+            nodes,
+            edges: vec![],
+            groups: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn has_infra_is_any_node_requires_infra() {
+        assert!(!has_infra(&project_with_nodes(vec![])), "empty project has no infra");
+
+        let no_infra = project_with_nodes(vec![
+            node_with_infra("a", false),
+            node_with_infra("b", false),
+        ]);
+        assert!(!has_infra(&no_infra), "no node requires infra");
+
+        let with_infra = project_with_nodes(vec![
+            node_with_infra("a", false),
+            node_with_infra("c", true),
+        ]);
+        assert!(has_infra(&with_infra), "one infra node flips it true");
     }
 }

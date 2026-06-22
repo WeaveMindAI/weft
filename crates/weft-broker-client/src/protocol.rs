@@ -431,6 +431,10 @@ pub struct WorkerPodRegisterAliveResponse {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerPodHeartbeatRequest {
     pub pod_name: String,
+    /// The worker's current memory pressure (usage/limit, [0,1]), read
+    /// from its own cgroup each tick. The broker writes it to the
+    /// `worker_pod` row; the dispatcher places + scales workers on it.
+    pub mem_pressure: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

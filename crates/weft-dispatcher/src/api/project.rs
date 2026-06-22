@@ -154,51 +154,27 @@ pub async fn register(
     // capacity, and the `sweep_supervisor*` reapers scale the pool up and
     // down by owned-project load. A project that never declares infra is
     // simply never claimed.
-    // Per-project namespace bundle: namespace + worker/infra SAs +
-    // NetworkPolicies + RoleBindings to the supervisor/listener
-    // ClusterRoles.
-    let project_namespace =
-        crate::project_namespace::name_for(tenant.as_str(), &project_id_str);
-    let project_namespace_args = crate::project_namespace::ProjectNamespaceArgs {
-        project_id: &project_id_str,
-        tenant_id: tenant.as_str(),
-        namespace: &project_namespace,
-        pod_cidr: &state.cluster_pod_cidr,
-        service_cidr: &state.cluster_service_cidr,
-        ingress_namespace: &state.cluster_ingress_namespace,
-        tenant_namespace: &tenant_namespace,
-        control_plane_namespace: &state.control_plane_namespace,
-    };
-    // Namespace MUST land before we write the project row: every
-    // downstream step (worker spawn, infra apply, listener attach)
-    // assumes the namespace + its RBAC bundle exist. If kubectl
-    // refuses, fail register loudly rather than insert a row that
-    // points at a namespace nothing else can create.
-    crate::project_namespace::ensure(&state.pg_pool, &*state.kube, &project_namespace_args)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(RegisterError {
-                    error: format!(
-                        "ensure_project_namespace {}: {e}",
-                        project_namespace
-                    ),
-                }),
-            )
-        })?;
-    // Single atomic write: project row + history row + three
-    // running-hash pointers commit together (Postgres transaction;
-    // mock simulates in-mem). A pod crash mid-sequence can no longer
-    // leave the project row half-advanced (e.g. binary_hash set but
-    // definition_hash not).
+    //
+    // No per-project namespace is created here. A project with no infra
+    // never gets one: its worker runs in the shared worker namespace
+    // (`SHARED_WORKER_NAMESPACE`), provisioned lazily at first worker
+    // spawn. A project WITH infra gets its own namespace at first infra
+    // apply (see `api::infra`), which is also where `project_namespace`
+    // is stamped on the row. Namespace-per-project at register burned
+    // the cluster's namespace ceiling for projects that never needed one;
+    // gating it on infra is the whole point of this change.
+    //
+    // Single atomic write: project row + history row + running-hash
+    // pointers commit together (Postgres transaction; mock simulates
+    // in-mem). `has_infra` is derived from the definition inside
+    // `register_with_hashes`. A pod crash mid-sequence can no longer
+    // leave the project row half-advanced.
     let summary = state
         .projects
         .register_with_hashes(
             project,
             &name,
             tenant.as_str(),
-            &project_namespace,
             req.binary_hash.as_deref(),
             req.definition_hash.as_deref(),
             req.infra_hash.as_deref(),
@@ -2519,26 +2495,27 @@ pub async fn resync(
 /// Always wipes (preservationMode=wipe, runningPolicy=cancel).
 /// User-initiated deactivates use the parameterized variant via
 /// the API handler.
-/// Replace the project's alive worker pod when its baked-in
-/// binary_hash no longer matches the project's current
-/// `running_binary_hash`. The worker binary embeds the engine +
-/// node implementations at compile time, so a worker spawned before
-/// a node-impl edit or engine bump runs the old code. Pure
-/// definition edits (config / topology) do NOT trigger this: the
-/// worker re-fetches the definition per execution claim.
+/// Replace the project's alive worker pod when it has gone stale on
+/// EITHER axis: a stale IMAGE (its baked-in binary_hash no longer
+/// matches the project's current `running_binary_hash`, e.g. a node-impl
+/// edit or engine bump, since the worker binary embeds the engine + node
+/// implementations at compile time) OR a wrong NAMESPACE (has_infra
+/// changed, so the project moved between the shared and a per-project
+/// namespace). Pure definition edits (config / topology) trigger
+/// neither: the worker re-fetches the definition per execution claim.
 ///
-/// Order matters here. If we killed the old pod first and then waited
-/// for cold_start to spawn a replacement, the next enqueued worker
-/// task (the InfraSetup `execute`) could race the doomed pod's
-/// in-flight task picker: the pod is marked dead in the DB but still
-/// alive in k8s during its terminationGracePeriod, and the picker
-/// happily claims tasks until its own heartbeat detects the dead row.
-/// Any journal write then trips the fencing trigger and the task
-/// fails. We avoid the race by spawning the replacement FIRST, then
-/// killing the stale pod once the new one is alive.
+/// Ordering: we `mark_dead` the stale pod FIRST, then spawn the
+/// replacement and wait for it. `mark_dead` makes the journal-fencing
+/// trigger reject any write from the doomed pod immediately, so even
+/// though it survives in k8s through its terminationGracePeriod and may
+/// still claim a task, that claim's journal writes fail loudly and the
+/// task is requeued. There is therefore no window where the doomed pod
+/// can silently keep running work after we have decided to replace it.
 ///
-/// Idempotent: a no-op when hashes match or no pod is alive. Safe to
-/// call from every path that updates `running_binary_hash`.
+/// Idempotent: a no-op when the image matches AND the namespace is
+/// right, or when no pod is alive. Safe to call from every sync path
+/// (after the per-project namespace has been reconciled, so the target
+/// namespace exists before the replacement is placed in it).
 pub async fn replace_stale_worker_if_needed(
     state: &DispatcherState,
     project_id: &str,
@@ -2574,7 +2551,34 @@ pub async fn replace_stale_worker_if_needed(
                  running_binary_hash; sync ordering invariant broken"
             )
         })?;
-    if have_hash == want_hash {
+    // A worker is stale on TWO independent axes, and either one is
+    // enough to replace it:
+    //   - IMAGE: its baked-in binary_hash != the project's current
+    //     running_binary_hash (a node-impl / engine edit).
+    //   - PLACEMENT: it runs in a different namespace than where this
+    //     project's worker now belongs (has_infra changed, so the
+    //     project moved between the shared and a per-project namespace).
+    // Placement is its OWN signal, not a side effect of binary_hash:
+    // adding/removing an infra node usually also changes the node-type
+    // set (so binary_hash flips too), but not always (e.g. a second
+    // infra node of an already-present type), so relying on binary_hash
+    // to carry placement would silently leave a worker in the wrong
+    // namespace. Computing the target here and comparing makes "worker
+    // is in the wrong namespace for its current has_infra" an
+    // impossible steady state.
+    let tenant = state.tenant_router.tenant_for_project(project_id);
+    let has_infra = state
+        .projects
+        .project_has_infra(project_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("project_has_infra({project_id}) returned None; cannot place worker")
+        })?;
+    let want_namespace =
+        crate::project_namespace::worker_namespace(has_infra, tenant.as_str(), project_id);
+    let image_stale = have_hash != want_hash;
+    let misplaced = stale_namespace != want_namespace;
+    if !image_stale && !misplaced {
         return Ok(());
     }
     tracing::info!(
@@ -2583,7 +2587,11 @@ pub async fn replace_stale_worker_if_needed(
         stale_pod = %stale_pod_name,
         have_hash = %have_hash,
         want_hash = %want_hash,
-        "replacing stale-image worker pod after binary_hash change"
+        from_namespace = %stale_namespace,
+        to_namespace = %want_namespace,
+        image_stale,
+        misplaced,
+        "replacing worker pod (stale image and/or wrong namespace)"
     );
 
     // Step 1: kill the stale pod ourselves. The `spawn_pod` task
@@ -2604,23 +2612,14 @@ pub async fn replace_stale_worker_if_needed(
             )
         })?;
 
-    // Step 2: enqueue a SpawnPod task for a fresh worker. Dedup key
-    // matches cold_start's so a concurrent sweep collapses on us.
-    let tenant = state.tenant_router.tenant_for_project(project_id);
-    let namespace = state
-        .projects
-        .project_namespace(project_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "project_namespace({project_id}) returned None; cannot spawn worker"
-            )
-        })?;
+    // Step 2: enqueue a SpawnPod task for a fresh worker in the target
+    // namespace (`want_namespace`, computed above). Dedup key matches
+    // cold_start's so a concurrent sweep collapses on us.
     let dedup = format!("{project_id}:spawn");
     let payload = serde_json::json!({
         "project_id": project_id,
         "tenant": tenant.as_str(),
-        "namespace": namespace,
+        "namespace": want_namespace,
         "owner_dispatcher": state.pod_id.as_str(),
     });
     weft_task_store::tasks::enqueue_dedup(

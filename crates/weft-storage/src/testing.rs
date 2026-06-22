@@ -53,6 +53,7 @@ impl StorageTestRig {
         let state = Arc::new(ServiceState {
             store: store.clone(),
             auth: auth.clone(),
+            box_tenant: "t1".into(),
             public_base_url: "https://t1.example.test/storage".into(),
         });
         Self { pool, auth, clock, store, router: router(state) }
@@ -70,6 +71,7 @@ impl StorageTestRig {
         let state = Arc::new(ServiceState {
             store,
             auth: self.auth.clone(),
+            box_tenant: "t1".into(),
             public_base_url: "https://t1.example.test/storage".into(),
         });
         self.router = router(state);

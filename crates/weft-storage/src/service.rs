@@ -45,6 +45,14 @@ use crate::store::{Store, StoreError};
 pub struct ServiceState {
     pub store: Arc<Store>,
     pub auth: Arc<dyn BoxAuthOps>,
+    /// This box's own tenant (`WEFT_TENANT_ID`). The box is
+    /// single-tenant by deployment; `authed_caller` passes this to
+    /// `BoxAuthOps::authorize`, which denies any worker resolved to a
+    /// different tenant. That tenant wall is what every prefix scope
+    /// (including the unconditional `Shared` grant) relies on, now
+    /// that a shared-namespace worker can physically reach any
+    /// tenant's box.
+    pub box_tenant: String,
     /// Public base URL presigned links are built on (the tenant
     /// ingress host routing to this box), e.g.
     /// `https://<tenant-host>/storage`.
@@ -113,7 +121,7 @@ async fn authed_caller(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
     let color = headers.get(HDR_COLOR).and_then(|v| v.to_str().ok());
-    match state.auth.authorize(bearer, color).await.map_err(internal)? {
+    match state.auth.authorize(&state.box_tenant, bearer, color).await.map_err(internal)? {
         AuthOutcome::Allowed(caller) => Ok(caller),
         AuthOutcome::Denied(reason) => Err((StatusCode::FORBIDDEN, reason)),
     }

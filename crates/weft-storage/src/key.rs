@@ -244,7 +244,10 @@ pub fn check_key_access(caller: &CallerAuth, parsed: &KeyScope) -> Result<(), St
         }
         // Naming a shared key IS the opt-in (the grant table records
         // it for audit/listing; it never denies a worker of the
-        // tenant, since the box itself is tenant-walled).
+        // tenant). Safe because the box is tenant-walled at the auth
+        // boundary: `BoxAuthOps::authorize` denies any worker whose
+        // resolved tenant != this box's tenant BEFORE this scope check
+        // runs, so every caller that reaches here is already same-tenant.
         KeyScope::Shared { .. } => Ok(()),
     }
 }

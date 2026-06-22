@@ -32,6 +32,7 @@ pub mod pg_wake;
 pub mod project_namespace;
 pub mod project_store;
 pub mod reaper;
+pub mod shared_worker_namespace;
 pub mod state;
 pub mod storage_box;
 pub mod supervisor_pool;

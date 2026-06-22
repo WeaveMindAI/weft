@@ -46,16 +46,20 @@ async fn sse_signal_in_a_two_pod_overlap_fires_exactly_once() -> anyhow::Result<
     project.activate().await?;
 
     // The signal we will put into a two-pod overlap, and where it is placed
-    // (pod A) before we touch anything.
-    let scope = weft_e2e::signal::SignalScope::open(&disp, &pid).await?;
-    let sig = scope
-        .signal_for_node("feed")
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no signal registered for the 'feed' node"))?;
-    let token = sig
-        .token()
-        .ok_or_else(|| anyhow::anyhow!("feed signal has no token"))?
-        .to_string();
+    // (pod A) before we touch anything. `feed` is an ENTRY trigger (SSE,
+    // `is_resume=FALSE`), which the consumer-facing signal enumeration
+    // deliberately hides (that API lists only human-submittable forms /
+    // resumes), so we read its token straight from the registry at the
+    // operator layer, the same level the rest of this overlap scenario works
+    // at. A short poll covers the tiny window between `activate()` returning
+    // and the TriggerSetup registration landing the row.
+    let token = weft_e2e::client::poll_until(
+        "the 'feed' entry signal to be registered",
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        || async { platform.signal_token_for_node(&pid, "feed").await },
+    )
+    .await?;
     let before = platform
         .signal_placement(&token)
         .await?
@@ -123,9 +127,11 @@ async fn sse_signal_in_a_two_pod_overlap_fires_exactly_once() -> anyhow::Result<
     // execution results. More than one new execution fails the wait loudly
     // (double-fire); zero times out (dropped). Exactly-one is the pass.
     let b1 = run::execution_colors(&disp, &pid).await?;
-    // Wait until BOTH pods are subscribed (count >= 2): the whole point is
-    // to fire into the overlap so the generation fence is exercised. A
-    // fixed sleep could push before B subscribed, testing nothing.
+    // Wait until BOTH pods are actively READING the feed (not merely
+    // subscribed): only a reading connection is guaranteed to catch the
+    // next single emission, so this makes the one push below reach BOTH A
+    // and B exactly once each, which is what exercises the fence (A's
+    // old-gen fire and B's new-gen fire both arrive; the broker fences A's).
     feed.wait_for_subscribers(2, Duration::from_secs(30)).await?;
     feed.push_event("tick", &json!({ "value": 2 }).to_string());
     let c1 = run::wait_for_triggered_execution(&disp, &pid, &b1, Duration::from_secs(60)).await?;
@@ -145,5 +151,10 @@ async fn sse_signal_in_a_two_pod_overlap_fires_exactly_once() -> anyhow::Result<
          (a stale old-pod fire was not fenced)"
     );
 
+    // Success cleanup: remove the listener clone THIS test created (by
+    // exact name, so it never touches another test's clone). Only reached
+    // on the success path (a failing test returns earlier and KEEPS the
+    // clone for inspection, like `Project`'s Drop keeps the project).
+    platform.sweep_clone(&pod_b).await?;
     project.finish().await
 }

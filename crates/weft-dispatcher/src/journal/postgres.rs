@@ -285,14 +285,24 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             tenant_id TEXT NOT NULL,
             started_at_unix BIGINT NOT NULL,
             phase TEXT NOT NULL,
-            -- Worker pod that owns this color's writes. Set at
-            -- ExecutionStarted time and never changes. The broker
-            -- rejects any journal_record whose caller.pod_name
-            -- doesn't match, so a compromised worker can only
-            -- journal under its own bound pod, not cross-write
-            -- sibling executions in the same tenant. NULL means
-            -- "no pod assigned yet" (dispatcher-orchestrated
-            -- writes); broker writes are always pod-bound.
+            -- Worker pod that owns this color's writes. NULL until the
+            -- first worker claims a color-bearing task (the broker
+            -- stamps it in task_claim_one); thereafter it is the pod of
+            -- the LATEST claimer. The broker rejects any journal_record
+            -- whose caller.pod_name doesn't match, so a compromised
+            -- worker can only journal under its own bound pod, not
+            -- cross-write sibling executions in the same tenant.
+            --
+            -- "Latest claimer wins" is how a resume hands ownership to a
+            -- new pod when the original is gone: the resume task is
+            -- pinned to the original owner if it is still alive (so only
+            -- it reclaims and ownership stays stable), and spawns + pins
+            -- to a fresh pod only when the owner is dead (so the handoff
+            -- is the ONLY time ownership moves). Without that pinning a
+            -- fresh worker could steal a live owner's color mid-flight
+            -- now that a project can run more than one worker; see
+            -- `task_kinds::execute::enqueue_resume`.
+            -- NULL also covers dispatcher-orchestrated writes (no pod).
             owner_pod_name TEXT
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_tenant ON execution_color(tenant_id)"#,

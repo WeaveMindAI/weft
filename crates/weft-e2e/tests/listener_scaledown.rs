@@ -79,6 +79,15 @@ async fn listener_pool_consolidates_without_dropping_the_signal() -> anyhow::Res
     platform.set_signal_placement(&token, &pod_b, gen + 1).await?;
     platform.rehydrate_listener(&pod_b, &b_namespace).await?;
 
+    // The clone was created with a spawn-grace window (so the idle reaper
+    // did not delete it mid-setup). Now that it is wired up (holds a
+    // signal), expire its grace so the scale-down planner treats it as an
+    // established pool member and can consolidate it. Without this the
+    // planner skips it (it only considers past-grace pods) and the pool
+    // never folds back to one. (pod_a is the long-running original, already
+    // well past its own spawn grace, so only the clone needs expiring.)
+    platform.expire_listener_grace(&pod_b).await?;
+
     // Let the dispatcher's scale-down sweep consolidate the two
     // partially-loaded pods back to one. Both report 0 memory pressure
     // (uncapped cgroup locally), so the planner has headroom to fold one
@@ -128,6 +137,11 @@ async fn listener_pool_consolidates_without_dropping_the_signal() -> anyhow::Res
         after.difference(&b1).count()
     );
 
+    // Success cleanup: consolidation already reaped the clone (sweep_clone
+    // is then a no-op: no registry row, kubectl delete --ignore-not-found),
+    // but call it by exact name to clear any residue. Success path only; a
+    // failing test keeps state for inspection.
+    platform.sweep_clone(&pod_b).await?;
     project.finish().await
 }
 

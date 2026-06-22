@@ -402,30 +402,15 @@ pub async fn task_claim_one(
         .claim_one(&req.pod_id, filter)
         .await
         .map_err(internal)?;
-    // Latest-claim-wins binding: whenever a worker pod successfully
-    // claims a task carrying a `color`, stamp its pod_name onto
-    // execution_color.owner_pod_name. Subsequent journal_record
-    // calls verify against this binding so a compromised tenant pod
-    // can't journal events under sibling colors it never claimed.
-    // Always stamping (not "iff NULL") handles resume: the second
-    // worker pod that picks up a Resume task for a long-suspended
-    // color takes over ownership from the now-dead original. The
-    // task table's claim semantics already enforce one-active-pod-
-    // per-task, so there is no overlap window where two pods could
-    // both think they own writes.
-    if let Some(t) = task.as_ref() {
-        if let Some(color) = t.color.as_deref() {
-            sqlx::query(
-                "UPDATE execution_color SET owner_pod_name = $1 \
-                 WHERE color = $2",
-            )
-            .bind(&req.pod_id)
-            .bind(color)
-            .execute(&state.pool)
-            .await
-            .map_err(internal)?;
-        }
-    }
+    // Latest-claim-wins color ownership is bound IN the claim's own
+    // transaction by the `task_claim_binds_color_owner` DB trigger
+    // (weft-task-store worker_pod migration): claiming a color-bearing
+    // task atomically stamps execution_color.owner_pod_name to the
+    // claimer. The broker does NOT stamp it here, so "claimed by pod X"
+    // and "owned by pod X" can never disagree (a separate post-claim
+    // UPDATE could be lost to a crash, leaving the claimer's journal
+    // writes fenced). The journal_record owner check above reads what
+    // the trigger wrote.
     Ok(Json(TaskClaimOneResponse { task }))
 }
 
@@ -506,7 +491,7 @@ pub async fn worker_pod_heartbeat(
     require_worker_pod_owned_by(&state, &caller, &req.pod_name).await?;
     let renewed = state
         .worker_pods
-        .heartbeat(&req.pod_name)
+        .heartbeat(&req.pod_name, req.mem_pressure)
         .await
         .map_err(internal)?;
     Ok(Json(WorkerPodHeartbeatResponse { renewed }))
@@ -2169,35 +2154,58 @@ pub async fn storage_authorize(
             Ok(Json(StorageAuthorizeResponse::StorageBox { tenant_id }))
         }
         WORKER_SA => {
-            // Resolve project AND tenant from the ONE `project` row for
-            // this namespace, not from two independent table lookups.
-            // A worker's namespace IS its project, and the project row
-            // carries the tenant, so a single source of truth removes
-            // any chance of the namespace->tenant and project->tenant
-            // mappings disagreeing.
+            // Resolve the worker's project AND tenant. There are two
+            // worker-hosting shapes, and the namespace tells them apart:
             //
-            // SAFETY (registration gate preserved by write ordering):
-            // the dispatcher's project register path writes the
-            // `weft_namespace_tenant` registry row (via
-            // project_namespace::ensure -> namespace_registry::register)
-            // BEFORE it writes the `project` row's `project_namespace`
-            // column (register_with_hashes), both with the SAME tenant.
-            // So a `project` row whose `project_namespace` matches here
-            // could only exist if the namespace was already registered
-            // to that same tenant: trusting `project.tenant_id` is
-            // equivalent to going through the registry gate, not weaker.
-            // (If that ordering is ever reversed, restore the explicit
-            // `lookup_namespace_tenant` gate + a tenant-agreement check.)
-            let row: Option<(String, String)> = sqlx::query_as(
-                "SELECT id::text, tenant_id FROM project WHERE project_namespace = $1",
-            )
-            .bind(&reviewed.namespace)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal)?;
+            //  - PER-PROJECT namespace (an infra project): the namespace
+            //    IS the project, so the ONE `project` row whose
+            //    `project_namespace` matches gives both ids from a single
+            //    source of truth. SAFETY (registration gate preserved by
+            //    write ordering): the dispatcher writes the
+            //    `weft_namespace_tenant` registry row BEFORE it stamps the
+            //    `project_namespace` column, both with the same tenant, so
+            //    a matching `project` row could only exist if the
+            //    namespace was already registered to that tenant.
+            //
+            //  - SHARED namespace (a no-infra project): the namespace
+            //    holds many tenants and maps to no project, so we resolve
+            //    from the worker's OWN pod identity instead, the
+            //    kubelet-stamped unforgeable `pod_name` -> the
+            //    dispatcher-written `worker_pod` row -> project -> tenant.
+            //    Same trust model (dispatcher-written rows keyed on a
+            //    signed identity), keyed on pod rather than namespace.
+            //    This mirrors `auth::extract_identity`'s shared-ns branch.
+            let row: Option<(String, String)> =
+                if reviewed.namespace == crate::auth::SHARED_WORKER_NAMESPACE {
+                    let pod_name = reviewed.pod_name.as_deref().ok_or((
+                        StatusCode::FORBIDDEN,
+                        "shared-namespace worker token carries no pod_name".to_string(),
+                    ))?;
+                    sqlx::query_as(
+                        "SELECT p.id::text, p.tenant_id \
+                         FROM worker_pod wp JOIN project p ON p.id::text = wp.project_id \
+                         WHERE wp.pod_name = $1",
+                    )
+                    .bind(pod_name)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(internal)?
+                } else {
+                    sqlx::query_as(
+                        "SELECT id::text, tenant_id FROM project WHERE project_namespace = $1",
+                    )
+                    .bind(&reviewed.namespace)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(internal)?
+                };
             let (project_id, tenant_id) = row.ok_or((
                 StatusCode::FORBIDDEN,
-                format!("namespace '{}' is not a registered project namespace", reviewed.namespace),
+                format!(
+                    "could not resolve a project for worker in namespace '{}' (pod {:?}); \
+                     not a registered project namespace and no matching worker_pod row",
+                    reviewed.namespace, reviewed.pod_name
+                ),
             ))?;
             let color = match req.color {
                 None => None,

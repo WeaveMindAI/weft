@@ -153,22 +153,6 @@ async fn sync_inner(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_hashes: {e}")))?;
-    // A binary-hash change means the worker pod's baked-in
-    // engine/node code is stale. Kill it now so the next
-    // worker-target task (the InfraSetup `execute` enqueued below by
-    // `run_infra_setup`) triggers cold_start to spawn a fresh pod
-    // with the new image; definition changes don't need this (the
-    // worker re-fetches the definition per execution by hash).
-    // Without the kill, the stale pod happily claims the task before
-    // cold_start ever notices.
-    crate::api::project::replace_stale_worker_if_needed(&state, &project_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("replace_stale_worker_if_needed: {e}"),
-            )
-        })?;
     for (node_id, tags) in &body.image_hashes {
         let tags_map: std::collections::HashMap<String, String> =
             tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -241,6 +225,42 @@ async fn sync_inner(
     // alive afterwards. Hard error: leaking stale infra is silently
     // worse than asking the user to retry.
     reap_orphans(&state, id).await?;
+
+    // Per-project-namespace reconciliation is split around the worker
+    // (re)placement so the worker is never destroyed by a namespace it is
+    // still running in, and is never spawned into a namespace that does
+    // not exist yet. The ordering encodes both the add-infra and
+    // remove-infra transitions correctly:
+    //
+    //   1. ensure_project_namespace_if_infra: if the project NOW has
+    //      infra, create its namespace + RBAC (no-op otherwise). On
+    //      ADD-infra this makes the per-project namespace exist BEFORE
+    //      the worker is moved into it.
+    //   2. replace_stale_worker_if_needed: replace the worker if its
+    //      image is stale OR it is in the wrong namespace for the current
+    //      has_infra. It spawns the replacement in the target namespace
+    //      and waits for it alive BEFORE killing the old pod, so in-flight
+    //      executions requeue onto the new worker rather than dying. On
+    //      REMOVE-infra the target is the shared namespace, so the worker
+    //      LEAVES the per-project namespace here, before step 3 deletes it.
+    //   3. teardown_project_namespace_if_no_infra: if the project NO
+    //      longer has infra, delete the (now worker-less) per-project
+    //      namespace + clear the row (no-op otherwise).
+    //
+    // All three run after reap_orphans (node set final) and before
+    // run_infra_setup (so a doomed pod can't claim the InfraSetup
+    // `execute` task it enqueues, and the namespace+RBAC is in place
+    // before any infra Pod is applied).
+    ensure_project_namespace_if_infra(&state, id).await?;
+    crate::api::project::replace_stale_worker_if_needed(&state, &project_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("replace_stale_worker_if_needed: {e}"),
+            )
+        })?;
+    teardown_project_namespace_if_no_infra(&state, id).await?;
 
     // run_infra_setup short-circuits internally when the project has
     // no requires_infra nodes. It also computes the upstream-closure
@@ -747,6 +767,136 @@ async fn ensure_supervisor(state: &DispatcherState) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("ensure supervisor pool: {e}"))
 }
 
+/// CREATE half of per-project-namespace reconciliation: if the project
+/// declares infra, ensure its own namespace + RBAC bundle exists and
+/// stamp the row. No-op for a no-infra project. Split from the teardown
+/// half so the worker can be (re)placed BETWEEN them: create the
+/// namespace here, then move the worker into it (add-infra), or move the
+/// worker OUT to the shared namespace, then tear the namespace down
+/// (remove-infra). Both halves run after orphan reap, so the node set is
+/// final.
+///
+/// The namespace + RBAC bundle (worker/infra SAs, NetworkPolicies,
+/// RoleBindings to the pooled supervisor/listener ClusterRoles) is what
+/// every infra Pod the supervisor applies needs around it, so this
+/// create must run before the supervisor touches the project. The row's
+/// `project_namespace <> ''` is the broker's "this project has a
+/// namespace to manage" signal, stamped only after the namespace lands.
+async fn ensure_project_namespace_if_infra(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+) -> Result<(), (StatusCode, String)> {
+    let project = state
+        .projects
+        .project(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load project: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    if !weft_core::has_infra(&project) {
+        return Ok(());
+    }
+    let project_id_str = id.to_string();
+    let tenant = state.tenant_router.tenant_for_project(&project_id_str);
+    let tenant_namespace = state.namespace_mapper.namespace_for(&tenant);
+    let project_namespace = crate::project_namespace::name_for(tenant.as_str(), &project_id_str);
+    let args = crate::project_namespace::ProjectNamespaceArgs {
+        project_id: &project_id_str,
+        tenant_id: tenant.as_str(),
+        namespace: &project_namespace,
+        pod_cidr: &state.cluster_pod_cidr,
+        service_cidr: &state.cluster_service_cidr,
+        ingress_namespace: &state.cluster_ingress_namespace,
+        tenant_namespace: &tenant_namespace,
+        control_plane_namespace: &state.control_plane_namespace,
+    };
+    crate::project_namespace::ensure(&state.pg_pool, &*state.kube, &args)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ensure project namespace {project_namespace}: {e}"),
+            )
+        })?;
+    // Stamp only after the namespace actually landed, so
+    // `project_namespace <> ''` is never true for a namespace that
+    // doesn't exist (which would make the supervisor try to apply into a
+    // missing namespace).
+    state
+        .projects
+        .set_project_namespace(id, &project_namespace)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("set_project_namespace: {e}"),
+            )
+        })?;
+    Ok(())
+}
+
+/// TEARDOWN half: if the project no longer declares infra but still has
+/// a per-project namespace, delete it + clear the row. MUST run AFTER
+/// the worker has been relocated to the shared namespace
+/// (`replace_stale_worker_if_needed`), so we never delete a namespace
+/// that still has the project's worker running in it (that would kill
+/// in-flight executions abruptly instead of letting them requeue onto
+/// the already-up shared-namespace worker).
+///
+/// Clears the row BEFORE deleting the namespace: a cleared row pointing
+/// at a not-yet-deleted namespace is benign (the supervisor simply stops
+/// managing it), whereas a set row pointing at a DELETED namespace would
+/// make the supervisor flap kubectl against a gone namespace. So clear
+/// first, delete second; a crash between leaves only an empty orphan
+/// namespace (reclaimed on project rm or by a manual delete), never a
+/// live-advertised dead namespace.
+async fn teardown_project_namespace_if_no_infra(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+) -> Result<(), (StatusCode, String)> {
+    let project = state
+        .projects
+        .project(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load project: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    if weft_core::has_infra(&project) {
+        return Ok(());
+    }
+    let project_id_str = id.to_string();
+    let existing = state
+        .projects
+        .project_namespace(&project_id_str)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project_namespace: {e}")))?
+        .unwrap_or_default();
+    if existing.is_empty() {
+        return Ok(());
+    }
+    // Clear the row first (stop advertising the namespace to supervisors)
+    // ...
+    state
+        .projects
+        .clear_project_namespace(id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("clear_project_namespace: {e}"),
+            )
+        })?;
+    // ... then delete the now-unadvertised, now-worker-less namespace.
+    if let Err(e) = crate::project_namespace::delete(&*state.kube, &existing).await {
+        tracing::warn!(
+            target: "weft_dispatcher::api::infra",
+            error = %e,
+            project_id = %project_id_str,
+            "delete now-infra-less project namespace failed (continuing); \
+             row already cleared so no supervisor manages it"
+        );
+    }
+    Ok(())
+}
+
 /// Enqueue a lifecycle command AFTER making sure at least one pooled
 /// supervisor is alive. A supervisor only claims a command for a project
 /// it owns, and only a live supervisor claims+owns projects, so an
@@ -1029,23 +1179,41 @@ pub async fn delete_project(
                 format!("infra_lifecycle_command::remove_project: {e}"),
             )
         })?;
-    // Step 4: delete the k8s namespace. Like step 2, only logged on
-    // error: a missing namespace is a no-op, and a transient kubectl
-    // failure leaves a tenant-empty namespace that the next sync
-    // will repurpose (or the user can manually `kubectl delete ns`).
+    // Step 4: delete the project's own k8s namespace. Clear the row
+    // FIRST then delete (same ordering as the sync-time teardown): a
+    // cleared row pointing at a not-yet-deleted namespace is benign,
+    // whereas a set row pointing at a DELETED namespace makes the broker
+    // advertise a gone namespace to supervisors. Only logged on error: a
+    // missing namespace is a no-op, and a transient kubectl failure
+    // leaves a tenant-empty namespace that the next sync will repurpose
+    // (or the user can manually `kubectl delete ns`). An empty string
+    // means the project never had a per-project namespace (a no-infra
+    // project, whose worker lives in the shared namespace); nothing to
+    // delete and nothing to clear.
     let namespace = state.projects.project_namespace(&project_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("project_namespace: {e}"),
         )
     })?;
-    if let Some(ns) = namespace {
+    if let Some(ns) = namespace.filter(|n| !n.is_empty()) {
+        // Clear the row first so a re-registered project under the same
+        // id (or the broker's supervisor-claim) never sees a stale
+        // namespace, even if the delete below fails or we crash after it.
+        if let Err(e) = state.projects.clear_project_namespace(id).await {
+            tracing::warn!(
+                target: "weft_dispatcher::api::infra",
+                error = %e,
+                project_id = %project_id,
+                "clear project_namespace row failed (continuing)"
+            );
+        }
         if let Err(e) = project_namespace::delete(&*state.kube, &ns).await {
             tracing::warn!(
                 target: "weft_dispatcher::api::infra",
                 error = %e,
                 project_id = %project_id,
-                "delete project namespace failed (continuing)"
+                "delete project namespace failed (continuing); row already cleared"
             );
         }
     }

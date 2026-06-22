@@ -91,6 +91,26 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
         )
         .await?;
 
+        // Lazy shared-namespace creation. A no-infra project's worker
+        // targets the shared worker namespace (the resolver decided
+        // this at enqueue time). Unlike a per-project namespace (created
+        // at first infra apply, guaranteed present before any worker),
+        // the shared namespace is created HERE the first time any worker
+        // lands in it. Idempotent (kubectl apply); never torn down. An
+        // infra project's per-project namespace already exists, so this
+        // gate skips it.
+        if payload.namespace == crate::project_namespace::SHARED_WORKER_NAMESPACE {
+            crate::shared_worker_namespace::ensure(
+                &*state.kube,
+                &crate::shared_worker_namespace::SharedWorkerNamespaceArgs {
+                    pod_cidr: &state.cluster_pod_cidr,
+                    service_cidr: &state.cluster_service_cidr,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ensure shared worker namespace: {e}"))?;
+        }
+
         let spec = SpawnPodSpec {
             project_id: payload.project_id.clone(),
             tenant: payload.tenant,

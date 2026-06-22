@@ -676,11 +676,30 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Worker pods in ANY of this tenant's namespaces (data path).
+    # Worker pods in ANY of this tenant's OWN namespaces (data path):
+    # an infra project's worker lives in a per-project namespace labelled
+    # with this tenant.
     - from:
         - namespaceSelector:
             matchLabels:
               weft.dev/tenant: "{tenant}"
+          podSelector:
+            matchLabels:
+              weft.dev/role: worker
+      ports:
+        - protocol: TCP
+          port: {port}
+    # Worker pods in the SHARED worker namespace (a no-infra project's
+    # worker, which lives there instead of a per-project namespace). That
+    # namespace is multi-tenant so it carries no `weft.dev/tenant` label;
+    # we admit its workers by role. Network reachability alone grants
+    # nothing: the box authorizes every request against the caller's
+    # broker-issued token and rejects a wrong-tenant one, the same posture
+    # that already lets every per-project worker reach the box.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              weft.dev/role: shared-workers
           podSelector:
             matchLabels:
               weft.dev/role: worker
@@ -835,6 +854,15 @@ mod tests {
         assert!(policy.contains("weft.dev/role: dispatcher"));
         assert!(policy.contains("ingress-nginx"));
         assert!(policy.contains("weft.dev/role: broker"));
+        // A no-infra project's worker lives in the shared worker
+        // namespace (role=shared-workers, no tenant label), so the box
+        // must admit that namespace's workers too, not only this tenant's
+        // own per-project namespaces. Without this the data path (ctx
+        // storage) from a no-infra worker is firewalled off.
+        assert!(
+            policy.contains("weft.dev/role: shared-workers"),
+            "storage ingress must admit workers from the shared namespace"
+        );
         // Must carry the bundle labels so teardown's by-label sweep
         // reclaims it (else it orphans on scale-to-zero).
         let meta = policy.split("spec:").next().unwrap();

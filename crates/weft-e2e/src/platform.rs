@@ -126,8 +126,16 @@ impl Platform {
         })
     }
 
-    /// Sweep test-created pooled-pod CLONES left behind by earlier runs:
-    /// the extra listener / supervisor pods a scale-down test stood up
+    /// STARTUP-ONLY blanket sweep of pooled-pod CLONES left behind by
+    /// EARLIER runs (a failed run preserves its clone for inspection, so
+    /// the next run reaps the straggler at `ensure::up`). Matches by the
+    /// `e2e` name marker, so it deletes EVERY e2e clone in the cluster.
+    /// Do NOT call this on a test's success path: it would delete a
+    /// concurrent test's in-flight clone if the suite ever runs tests in
+    /// parallel. A passing test cleans up its OWN clone by exact name via
+    /// [`Self::sweep_clone`] instead.
+    ///
+    /// The extra listener / supervisor pods a scale-down test stood up
     /// with [`Self::add_second_listener`] / [`Self::add_second_supervisor`].
     /// A failed run leaves its clone up (the rig preserves failure state
     /// for inspection), so the NEXT run sweeps the stragglers at startup
@@ -176,6 +184,51 @@ impl Platform {
         Ok(())
     }
 
+    /// Remove ONE clone this test created, by EXACT name: its Deployment +
+    /// Service + its registry row (listener_pod or supervisor_pod,
+    /// whichever holds it). This is the success-path cleanup a passing
+    /// clone-test calls, scoped to its own artifact so it can never touch a
+    /// concurrent test's clone (unlike the blanket startup
+    /// [`Self::sweep_e2e_clones`]). The namespace comes from the registry
+    /// row; if no row matches (already reaped by the dispatcher, e.g. a
+    /// scale-down test whose clone was consolidated away), it is a no-op.
+    pub async fn sweep_clone(&self, pod_name: &str) -> Result<()> {
+        // The clone is a listener OR a supervisor; find its namespace from
+        // whichever registry row exists.
+        // A clone lives in exactly one of the two registries; LIMIT 1 makes
+        // that explicit so `fetch_optional` can't trip on a surprise 2nd row.
+        let namespace: Option<(String,)> = sqlx::query_as(
+            "SELECT namespace FROM listener_pod WHERE pod_name = $1 \
+             UNION ALL \
+             SELECT namespace FROM supervisor_pod WHERE pod_name = $1 \
+             LIMIT 1",
+        )
+        .bind(pod_name)
+        .fetch_optional(&self.pool)
+        .await
+        .context("look up clone namespace for sweep_clone")?;
+        if let Some((namespace,)) = namespace {
+            for kind in ["deployment", "service"] {
+                self.kubectl_delete_ignore_missing(kind, &namespace, pod_name)
+                    .await?;
+            }
+        }
+        // Delete the registry row(s) last (a failed kubectl delete leaves
+        // the row for the startup sweep to retry). Both tables, by exact
+        // name: harmless if one matches nothing.
+        sqlx::query("DELETE FROM listener_pod WHERE pod_name = $1")
+            .bind(pod_name)
+            .execute(&self.pool)
+            .await
+            .context("delete clone listener_pod row")?;
+        sqlx::query("DELETE FROM supervisor_pod WHERE pod_name = $1")
+            .bind(pod_name)
+            .execute(&self.pool)
+            .await
+            .context("delete clone supervisor_pod row")?;
+        Ok(())
+    }
+
     /// `kubectl delete <kind> <name> -n <ns> --ignore-not-found`. A
     /// missing resource is success (the clone's Deployment or Service may
     /// already be gone); any other failure is surfaced.
@@ -213,7 +266,7 @@ impl Platform {
     /// status / heartbeat directly (e.g. to confirm a killed pod went `dead`).
     pub async fn worker_pods_for_project(&self, project_id: &Uuid) -> Result<Vec<WorkerPodRow>> {
         let rows: Vec<WorkerPodRow> = sqlx::query_as(
-            "SELECT pod_name, project_id, status, last_heartbeat_unix, terminal_at_unix \
+            "SELECT pod_name, project_id, namespace, status, last_heartbeat_unix, terminal_at_unix \
              FROM worker_pod WHERE project_id = $1 ORDER BY created_at_unix DESC",
         )
         .bind(project_id.to_string())
@@ -221,6 +274,21 @@ impl Platform {
         .await
         .context("query worker_pod rows for project")?;
         Ok(rows)
+    }
+
+    /// The project's OWN k8s namespace as recorded on the `project` row,
+    /// empty until infra is provisioned (and re-emptied on teardown). A
+    /// no-infra project keeps this empty forever (its worker lives in the
+    /// shared namespace). Lets an e2e assert "no per-project namespace was
+    /// created" without a kubectl probe.
+    pub async fn project_namespace(&self, project_id: &Uuid) -> Result<String> {
+        let ns: Option<String> =
+            sqlx::query_scalar("SELECT project_namespace FROM project WHERE id = $1")
+                .bind(project_id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("query project_namespace")?;
+        Ok(ns.unwrap_or_default())
     }
 
     /// How many times the project's `spawn_pod` task ran. A respawn after a
@@ -481,6 +549,32 @@ impl Platform {
         Ok(owner)
     }
 
+    /// The signal token registered for a project's node, read straight from
+    /// the registry. Unlike the consumer-facing `GET /api-token/{tk}/signals`
+    /// enumeration (which only lists `is_resume=TRUE` consumer signals: forms
+    /// and human-in-the-loop resumes a person submits to), this finds ANY
+    /// registered signal including ENTRY triggers (`is_resume=FALSE`: SSE,
+    /// webhook, cron, fired by the outside world or a timer, never browsed by a
+    /// consumer). An overlap / placement test works at the operator layer and
+    /// needs the entry trigger's token, so it reads it here rather than through
+    /// the consumer API that deliberately hides entry triggers. `None` if the
+    /// node has no registered signal yet.
+    pub async fn signal_token_for_node(
+        &self,
+        project_id: &Uuid,
+        node_id: &str,
+    ) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT token FROM signal WHERE project_id = $1 AND node_id = $2",
+        )
+        .bind(project_id.to_string())
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("query signal token for node '{node_id}'"))?;
+        Ok(row.map(|(t,)| t))
+    }
+
     /// The pod currently holding a signal + its placement generation, by
     /// token. `None` if the signal row is gone. Used to OBSERVE a move:
     /// after a drain, the holder changes and the generation bumps.
@@ -642,10 +736,20 @@ impl Platform {
         // dispatcher renews + reaps like one it spawned itself.
         let owner = self.listener_pod_owner(&src.pod_name).await?;
         let admin_url = format!("http://{new_name}.{namespace}.svc.cluster.local:8080");
-        // `grace_until_unix` is set in the PAST: the spawn grace protects
-        // only genuinely fresh dispatcher-spawned pods from the idle
-        // reaper, and this clone stands in for a long-lived pool member
-        // that should be eligible for drain/reap immediately once empty.
+        // `grace_until_unix` is set to a FUTURE window (the spawn grace),
+        // exactly as the dispatcher does for a pod it spawns itself. This
+        // is load-bearing: the dispatcher's idle reaper deletes any
+        // listener pod that is past its grace AND holds zero signals
+        // (`ListenerPool::reap_idle`). A freshly-cloned pod holds zero
+        // signals until the test wires it up (places a signal / rehydrates
+        // it), which takes a moment (a kubectl rollout, a port-forwarded
+        // /rehydrate). With grace in the PAST the idle reaper (~10s) races
+        // that setup and deletes the clone mid-test, surfacing as "rollout
+        // did not complete" or an overlap that silently never fires. The
+        // grace window protects the clone through setup, just like a real
+        // spawn; it does NOT block the scale-down tests, which reap via
+        // the explicit `drain_one` path (grace-independent) once the clone
+        // is a stable, signal-holding pool member.
         sqlx::query(
             "INSERT INTO listener_pod \
              (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, grace_until_unix) \
@@ -656,7 +760,7 @@ impl Platform {
         .bind(&namespace)
         .bind(&owner)
         .bind(now_unix() + POOL_CLONE_LEASE_SECS)
-        .bind(now_unix())
+        .bind(now_unix() + POOL_CLONE_GRACE_SECS)
         .execute(&self.pool)
         .await
         .context("insert cloned listener_pod registry row")?;
@@ -670,6 +774,24 @@ impl Platform {
             .context("kubectl rollout status for cloned listener")?;
         anyhow::ensure!(wait.success(), "cloned listener rollout did not complete");
         Ok(new_name)
+    }
+
+    /// Expire a cloned listener's spawn grace (set `grace_until_unix` to
+    /// the past) so the dispatcher treats it as an ESTABLISHED pool member:
+    /// eligible for the scale-down planner's consolidation. A
+    /// scale-down test calls this AFTER it has wired the clone up (placed a
+    /// signal on it) so the clone survived setup under the grace window but
+    /// is now a genuine consolidation candidate. The move-overlap test does
+    /// NOT call this: it wants the clone to stay a fresh, non-drained
+    /// holder for the duration of the fire.
+    pub async fn expire_listener_grace(&self, pod: &str) -> Result<()> {
+        sqlx::query("UPDATE listener_pod SET grace_until_unix = $2 WHERE pod_name = $1")
+            .bind(pod)
+            .bind(now_unix() - SLACK_SECS)
+            .execute(&self.pool)
+            .await
+            .context("expire cloned listener grace")?;
+        Ok(())
     }
 
     // ---- Supervisor pool: inspect ownership + force a scale-down move ----
@@ -816,12 +938,17 @@ impl Platform {
         // SYNC: supervisor admin URL <-> crates/weft-dispatcher/src/supervisor_pool.rs (K8sSupervisorBackend::spawn)
         let owner = self.supervisor_pod_owner(&src.pod_name).await?;
         let admin_url = format!("http://{new_name}.{namespace}.svc.cluster.local:8080");
-        // `grace_until_unix` is set in the PAST so the clone is treated
-        // as an established pod (the spawn grace protects only genuinely
-        // fresh dispatcher-spawned pods from the idle reaper; this clone
-        // is a test stand-in for a long-lived pod and must be eligible
-        // for drain/reap immediately once empty). `draining` defaults to
-        // FALSE (the dispatcher's scale-down sets it).
+        // `grace_until_unix` is a FUTURE window (the spawn grace), exactly
+        // as for the cloned listener and for a pod the dispatcher spawns
+        // itself. The supervisor idle reaper (`SupervisorPool::reap_idle`)
+        // deletes any pod owning ZERO projects that is past its grace, and
+        // a freshly-cloned supervisor owns zero projects until the test
+        // calls `place_infra_owner_on`, so a past grace lets the reaper
+        // race that setup and delete the clone mid-test (the same defect
+        // the listener clone had). The grace protects the clone through
+        // setup; the scale-down tests make it drain-eligible afterward via
+        // `expire_supervisor_grace`. `draining` defaults to FALSE (the
+        // dispatcher's scale-down sets it).
         sqlx::query(
             "INSERT INTO supervisor_pod \
              (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, \
@@ -833,7 +960,7 @@ impl Platform {
         .bind(&namespace)
         .bind(&owner)
         .bind(now_unix() + POOL_CLONE_LEASE_SECS)
-        .bind(now_unix())
+        .bind(now_unix() + POOL_CLONE_GRACE_SECS)
         .execute(&self.pool)
         .await
         .context("insert cloned supervisor_pod registry row")?;
@@ -847,6 +974,24 @@ impl Platform {
             .context("kubectl rollout status for cloned supervisor")?;
         anyhow::ensure!(wait.success(), "cloned supervisor rollout did not complete");
         Ok(new_name)
+    }
+
+    /// Expire a cloned supervisor's spawn grace (the supervisor twin of
+    /// `expire_listener_grace`): set `grace_until_unix` to the past so the
+    /// dispatcher treats it as an ESTABLISHED pool member, eligible for the
+    /// scale-down planner's consolidation (whose candidate query requires
+    /// `grace_until_unix < now`). A scale-down test calls this AFTER it has
+    /// wired the clone up (given it a project to own via
+    /// `place_infra_owner_on`), so the clone survived setup under the grace
+    /// window but is now a genuine consolidation candidate.
+    pub async fn expire_supervisor_grace(&self, pod: &str) -> Result<()> {
+        sqlx::query("UPDATE supervisor_pod SET grace_until_unix = $2 WHERE pod_name = $1")
+            .bind(pod)
+            .bind(now_unix() - SLACK_SECS)
+            .execute(&self.pool)
+            .await
+            .context("expire cloned supervisor grace")?;
+        Ok(())
     }
 
     /// `kubectl get <kind> <name> -n <ns> -o json`, parsed. JSON (not
@@ -943,6 +1088,7 @@ fn is_notfound(stderr: &str) -> bool {
 pub struct WorkerPodRow {
     pub pod_name: String,
     pub project_id: String,
+    pub namespace: String,
     pub status: String,
     pub last_heartbeat_unix: i64,
     pub terminal_at_unix: Option<i64>,
@@ -959,6 +1105,18 @@ const SLACK_SECS: i64 = 5;
 /// that a leaked clone (a crashed test) expires and gets cleaned on the
 /// next sweep.
 const POOL_CLONE_LEASE_SECS: i64 = 600;
+
+/// Spawn-grace window for a test-cloned listener pod. Until it passes,
+/// the dispatcher's idle reaper leaves the clone alone even while it
+/// holds zero signals, so the clone survives the test's setup (rollout +
+/// /rehydrate + fire) instead of being deleted mid-scenario by the ~10s
+/// idle reaper. This is the SAME protection the dispatcher gives a pod it
+/// spawns itself; without it both the move-overlap and scale-down tests
+/// race the reaper. Generous because the setup (a kubectl rollout, a
+/// port-forwarded rehydrate) can take a while under cluster load; the
+/// clone is still reaped after the test via the explicit scale-down
+/// drain (grace-independent) or `sweep_e2e_clones` on the next run.
+const POOL_CLONE_GRACE_SECS: i64 = 300;
 
 /// A live `listener_pod` registry row, as observed from the host.
 #[derive(Debug, Clone, sqlx::FromRow)]

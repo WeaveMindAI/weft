@@ -38,6 +38,14 @@ pub(crate) const STORAGE_SA: &str = "weft-storage-sa";
 pub(crate) const DISPATCHER_SA: &str = "weft-dispatcher";
 pub(crate) const DISPATCHER_NS: &str = "weft-system";
 
+/// The shared worker namespace: holds no-infra workers from MANY
+/// tenants, so it maps to no single tenant and has NO
+/// `weft_namespace_tenant` row. A worker here resolves its tenant from
+/// its own pod identity (`worker_pod` row -> project -> tenant), not
+/// from the namespace. See `extract_identity`.
+// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-dispatcher/src/project_namespace.rs SHARED_WORKER_NAMESPACE, crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
+pub(crate) const SHARED_WORKER_NAMESPACE: &str = "wm-shared-workers";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// Pooled listener: a trusted control-plane service that holds
@@ -294,13 +302,28 @@ pub async fn extract_identity(
     // Control-plane services (pooled listener / supervisor) run in the
     // control-plane namespace and are not pinned to a tenant: their
     // scope is ControlPlane and per-op validation derives the tenant
-    // from the resource being acted on. Tenant-scoped pods (worker)
-    // resolve their single tenant from the namespace they run in. The
-    // namespace -> tenant lookup is authoritative (the dispatcher
-    // registers it), so a tenant pod in an unregistered namespace is a
-    // 403.
+    // from the resource being acted on.
+    //
+    // Tenant-scoped pods (worker) resolve their single tenant. A worker
+    // in a PER-PROJECT namespace resolves it from the namespace (the
+    // dispatcher registers namespace -> tenant; an unregistered
+    // namespace is a 403). A worker in the SHARED namespace can't:
+    // that namespace holds many tenants and has no registry row, so it
+    // resolves the tenant from its own pod identity instead (the
+    // kubelet-stamped, unforgeable `pod_name` -> the dispatcher-written
+    // `worker_pod` row -> project -> tenant). Both paths derive the
+    // tenant from trusted, dispatcher-written state, never from
+    // anything the pod supplies.
     let scope = if role.is_control_plane() {
         CallerScope::ControlPlane
+    } else if reviewed.namespace == SHARED_WORKER_NAMESPACE {
+        let pod_name = reviewed.pod_name.as_deref().ok_or((
+            StatusCode::FORBIDDEN,
+            "shared-namespace worker token carries no pod_name; cannot resolve tenant".to_string(),
+        ))?;
+        CallerScope::Tenant(
+            crate::scope::lookup_pod_tenant(&state.scope_cache, &state.pool, pod_name).await?,
+        )
     } else {
         CallerScope::Tenant(namespace_tenant(state, &reviewed.namespace).await?)
     };

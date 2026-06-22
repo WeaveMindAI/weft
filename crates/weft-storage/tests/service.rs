@@ -153,6 +153,34 @@ async fn shared_scope_meets_across_projects_and_records_grants() {
     assert!(grants.contains(&("p2".to_string(), "team".to_string())));
 }
 
+/// The tenant wall: a worker of a DIFFERENT tenant is denied even on a
+/// `shared/` file, the most permissive scope. This box is tenant `t1`;
+/// a `t2` worker (which can now physically reach it, since a no-infra
+/// worker shares one namespace across tenants) must be refused at the
+/// auth boundary before any scope check. Without this gate the `Shared`
+/// scope's unconditional grant would leak `t1`'s shared files to `t2`.
+#[tokio::test]
+async fn the_wall_denies_a_different_tenant_even_on_shared_scope() {
+    let rig = StorageTestRig::new().await;
+    let key = put_file(&rig, r#"{"kind":"shared","name":"team"}"#, b"t1 shared doc").await;
+
+    // A worker resolved (by the broker) to tenant t2 reaches this t1 box.
+    rig.auth.seed(
+        "t2-worker",
+        CallerAuth::Worker {
+            tenant: "t2".into(),
+            project_id: "p9".into(),
+            color: Some("c9".into()),
+        },
+    );
+    let resp = rig.router.clone().oneshot(get_req("t2-worker", "c9", &key)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a different tenant is walled out of this box, including shared scope"
+    );
+}
+
 #[tokio::test]
 async fn admin_surface_is_dispatcher_only_and_data_path_rejects_dispatcher() {
     let rig = StorageTestRig::new().await;

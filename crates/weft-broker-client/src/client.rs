@@ -350,9 +350,10 @@ impl WorkerPodClient for BrokerWorkerPodClient {
         Ok(())
     }
 
-    async fn heartbeat(&self, pod_name: &str) -> Result<bool> {
+    async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<bool> {
         let req = WorkerPodHeartbeatRequest {
             pod_name: pod_name.to_string(),
+            mem_pressure,
         };
         let resp: WorkerPodHeartbeatResponse =
             self.http.post("/v1/worker_pod/heartbeat", &req).await?;

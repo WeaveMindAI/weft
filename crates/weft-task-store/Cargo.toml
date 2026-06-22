@@ -31,6 +31,11 @@ uuid = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # `#[sqlx::test]` (macros + migrate features) spins up a fresh isolated
 # Postgres database per test against $DATABASE_URL and drops it after, for
-# the Layer-3 DB-logic tests (admission, cap, orphan recovery, cleanup).
-# These tests are skipped when no DATABASE_URL is set (CI provides one).
+# the Layer-3 DB-logic tests (admission, saturation, draining, orphan
+# recovery, cleanup). These tests are skipped when no DATABASE_URL is set
+# (CI provides one).
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "macros", "migrate"] }
+# The Layer-3 admission/placement tests drive memory pressure relative to
+# the real saturation constant; tests only (production code in this crate
+# stays free of a platform-traits dependency).
+weft-platform-traits = { workspace = true }

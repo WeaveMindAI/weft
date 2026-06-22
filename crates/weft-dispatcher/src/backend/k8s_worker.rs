@@ -105,10 +105,12 @@ impl WorkerBackend for K8sWorkerBackend {
         let image = format!("weft-worker-{}:{}", spec.project_id, hash);
 
         let project_label = SafeLabel::new(&spec.project_id, 63);
-        // Apply the per-project headless Service FIRST (idempotent), so a
-        // pod's DNS A-record is publishable the moment it is Ready. One
-        // Service per project; re-applying on every spawn is a no-op.
-        let svc = render_headless_service(&spec.namespace, &project_label);
+        // Apply the headless Service FIRST (idempotent), so a pod's DNS
+        // A-record is publishable the moment it is Ready. One Service per
+        // NAMESPACE (selecting all workers by role), so in the shared
+        // namespace every project's spawn re-applies the same Service:
+        // a no-op, never a project-scoped overwrite.
+        let svc = render_headless_service(&spec.namespace);
         self.kube.apply_yaml(&svc).await?;
 
         let manifest = render_pod_manifest(
@@ -152,11 +154,19 @@ pub(crate) fn short_project_id(project_id: &str) -> String {
 /// is true so a pod's record exists as soon as the pod has an IP (the
 /// caller may be routed the instant the worker is up, before k8s readiness
 /// probes would mark it Ready). The port is the connection server's port.
-fn render_headless_service(
-    namespace: &str,
-    project_label: &crate::project_namespace::SafeLabel,
-) -> String {
+fn render_headless_service(namespace: &str) -> String {
     let svc = worker_headless_service_name();
+    // ONE headless Service per namespace, selecting EVERY worker by role
+    // (NOT by project). The Service exists only to publish per-pod
+    // A-records (`<pod>.{svc}.<ns>.svc.cluster.local`) via the pod's
+    // `hostname`+`subdomain`; those records are keyed by pod name, so the
+    // selector just needs to make each worker an endpoint. A
+    // project-scoped selector would be actively wrong in the SHARED
+    // namespace, where many projects' workers coexist under this single
+    // (name-constant) Service: each project's apply would overwrite the
+    // selector to its own project and de-list every other project's pods
+    // from DNS. Role-only selection is correct in both the shared
+    // namespace and a per-project namespace (which holds one project).
     format!(
         r#"apiVersion: v1
 kind: Service
@@ -165,13 +175,11 @@ metadata:
   namespace: {namespace}
   labels:
     weft.dev/role: worker-headless
-    weft.dev/project: "{project_label}"
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
     weft.dev/role: worker
-    weft.dev/project: "{project_label}"
   ports:
     - name: caller
       port: {port}
@@ -198,10 +206,17 @@ fn render_pod_manifest(
     caller_token_secret_hex: &str,
 ) -> String {
     // Minimal pod: SA token mount (auth) + weft labels (routing /
-    // cleanup). No security context, no resource limits. Tenant
-    // workloads run with whatever defaults their namespace policy
-    // allows; cross-tenant isolation comes from the namespace
-    // boundary + NetworkPolicies, not from per-pod hardening.
+    // cleanup). No security context, no resource limits. Cross-tenant
+    // isolation comes from the surrounding NetworkPolicies (a per-
+    // project namespace's default-deny + worker-policy, or the shared
+    // namespace's blanket pod-to-pod deny), not from per-pod hardening.
+    //
+    // SANDBOX SEAM: per-pod sandboxing of the (untrusted) worker process
+    // itself goes HERE as a single `runtimeClassName: <gvisor|kata>`
+    // line in this pod spec, when that lands (cloud-only, closed repo).
+    // The shared namespace is the natural population to sandbox first.
+    // Adding it later is this one field plus the cluster installing the
+    // RuntimeClass; nothing in the placement/autoscale design blocks it.
     let headless_svc = worker_headless_service_name();
     let conn_port = WORKER_CONNECTION_PORT;
     format!(
@@ -215,14 +230,16 @@ metadata:
     weft.dev/tenant: "{tenant}"
     weft.dev/project: "{project_label}"
 spec:
-  # `hostname` + `subdomain` + the per-project headless Service give this
-  # pod the stable DNS name
+  # `hostname` + `subdomain` + the headless Service in this pod's
+  # namespace give it the stable DNS name
   # `<pod-name>.{headless_svc}.<ns>.svc.cluster.local`, the address the
   # gateway dynamic-resolves a live caller to (per-pod pinning without a
-  # Service per pod). BOTH `hostname` and `subdomain` are required: k8s
-  # only publishes the per-pod A record when `hostname` is set (with just
-  # `subdomain`, only the Service-level record resolves, and the per-pod
-  # name 404s/DNS-fails at the gateway). The pod name is a valid DNS label.
+  # Service per pod). The Service is applied into whichever namespace the
+  # worker lands in (per-project or shared). BOTH `hostname` and
+  # `subdomain` are required: k8s only publishes the per-pod A record
+  # when `hostname` is set (with just `subdomain`, only the Service-level
+  # record resolves, and the per-pod name 404s/DNS-fails at the gateway).
+  # The pod name is a valid DNS label.
   hostname: {pod_name}
   subdomain: {headless_svc}
   serviceAccountName: weft-worker-sa
@@ -320,9 +337,17 @@ mod tests {
             pod.contains("WEFT_CALLER_TOKEN_SECRET") && pod.contains("deadbeef"),
             "token secret env"
         );
-        let svc = render_headless_service("wm-p1", &SafeLabel::new("p1", 63));
+        let svc = render_headless_service("wm-p1");
         assert!(svc.contains("clusterIP: None"), "headless");
-        assert!(svc.contains("name: weft-workers"), "per-project service name");
+        assert!(svc.contains("name: weft-workers"), "headless service name");
+        // Selector is role-only (NOT project-scoped): one Service per
+        // namespace serving every worker, so a shared namespace's
+        // per-project spawns don't overwrite each other's selector.
+        assert!(svc.contains("weft.dev/role: worker"), "role selector");
+        assert!(
+            !svc.contains("weft.dev/project"),
+            "no project selector on the headless service"
+        );
     }
 
     /// Happy path: no waiting-reason seeded, the 5s watch window

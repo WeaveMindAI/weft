@@ -1,6 +1,13 @@
 //! Per-project k8s namespace bundle.
 //!
-//! Created by the dispatcher on `POST /projects` (registration).
+//! Created lazily the first time a project actually needs infra (the
+//! supervisor's infra-apply path), NOT on registration. A project that
+//! never declares infra never gets a per-project namespace: its worker
+//! runs in the shared worker namespace ([`SHARED_WORKER_NAMESPACE`])
+//! alongside other tenants' no-infra workers. Namespace-per-project
+//! burns the cluster's namespace ceiling, so only infra projects (whose
+//! worker MUST sit next to its infra pods to reach them) pay for one.
+//!
 //! Holds:
 //!   - the namespace itself
 //!   - ServiceAccounts: `weft-worker-sa` (project workers),
@@ -11,10 +18,35 @@
 //!     ClusterRoles (defined in cluster-rbac.yaml) into this namespace.
 //!
 //! Naming convention:
-//!   `wm-project-<tenant>-<project>` (with both ids truncated to a
-//!   stable 8-char prefix to fit in the 63-char DNS label limit).
+//!   `wm-project-<tenant>--<project>` (both ids sanitized + truncated to
+//!   a stable 12-char prefix, joined by a DOUBLE dash, to fit in the
+//!   63-char DNS label limit). See [`name_for`].
 
 use anyhow::Result;
+
+/// The single shared namespace that holds every no-infra project's
+/// worker, across all tenants. Created once, lazily, the first time a
+/// no-infra worker is placed (see `shared_worker_namespace::ensure`);
+/// never torn down (it is cluster-singleton infrastructure). Cross-
+/// tenant isolation inside it is a blanket pod-to-pod-deny
+/// NetworkPolicy: workers never talk to each other.
+// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-broker/src/auth.rs SHARED_WORKER_NAMESPACE, crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
+pub const SHARED_WORKER_NAMESPACE: &str = "wm-shared-workers";
+
+/// The k8s namespace a project's WORKER pods run in, the single source
+/// of truth for worker placement. A project with infra gets its own
+/// per-project namespace (the worker sits next to its infra pods); a
+/// project with no infra shares [`SHARED_WORKER_NAMESPACE`]. Every
+/// worker spawn, DNS computation, and teardown routes through this one
+/// function so there is no second answer to "where does this project's
+/// worker live."
+pub fn worker_namespace(has_infra: bool, tenant: &str, project_id: &str) -> String {
+    if has_infra {
+        name_for(tenant, project_id)
+    } else {
+        SHARED_WORKER_NAMESPACE.to_string()
+    }
+}
 
 /// Compute the project namespace name from tenant + project ids.
 /// Both are sanitized + truncated so the resulting name fits in 63
@@ -24,10 +56,12 @@ use anyhow::Result;
 /// The DOUBLE dash between tenant and project is the unambiguous
 /// separator: both tenant and project labels may contain single
 /// dashes (truncated UUIDs do), but `short_label` collapses all
-/// runs of dashes to one, so neither side can produce a `--`. The
-/// broker's `derive_tenant_id` parses by splitting on `--`; a
-/// single-dash split would be ambiguous and silently steal part of
-/// the project id into the tenant.
+/// runs of dashes to one, so neither side can produce a `--`. This
+/// keeps the namespace name an unambiguous join of its two parts.
+/// Tenant resolution itself does NOT parse this string: the broker
+/// looks the namespace up in the `weft_namespace_tenant` registry
+/// (written by `ensure` below), so a tenant can never forge their
+/// tenant id by crafting a namespace name.
 pub fn name_for(tenant: &str, project_id: &str) -> String {
     let t = short_label(tenant, 12);
     let p = short_label(project_id, 12);
@@ -364,11 +398,13 @@ roleRef:
 }
 
 /// Apply the project-namespace bundle. Idempotent (kubectl apply).
-/// Called on `POST /projects` and on `weft rm` cleanup retries.
-/// Writes the `(namespace, tenant_id)` row to the namespace
-/// registry alongside the kubectl apply so the broker's
-/// TokenReview path can resolve the tenant without parsing the
-/// namespace string.
+/// Called on the first infra apply for a project (`api::infra::sync`,
+/// gated on the project declaring infra) and on cleanup retries.
+/// A no-infra project never reaches here: its worker lives in the
+/// shared worker namespace, so it never gets a per-project namespace.
+/// Writes the `(namespace, tenant_id)` row to the namespace registry
+/// alongside the kubectl apply so the broker's TokenReview path can
+/// resolve the tenant without parsing the namespace string.
 pub async fn ensure(
     pool: &sqlx::PgPool,
     kube: &dyn weft_platform_traits::KubeClient,
@@ -426,6 +462,34 @@ mod tests {
     }
 
     #[test]
+    fn worker_namespace_routes_on_has_infra() {
+        // No infra: the shared namespace, regardless of tenant/project.
+        assert_eq!(
+            worker_namespace(false, "local", "p1"),
+            SHARED_WORKER_NAMESPACE
+        );
+        assert_eq!(
+            worker_namespace(false, "tenant-xyz", "p2"),
+            SHARED_WORKER_NAMESPACE
+        );
+        // Infra: the project's own namespace (== name_for).
+        assert_eq!(
+            worker_namespace(true, "local", "p1"),
+            name_for("local", "p1")
+        );
+        // Two infra projects never collide; a no-infra and an infra
+        // project never share a namespace.
+        assert_ne!(
+            worker_namespace(true, "local", "p1"),
+            worker_namespace(true, "local", "p2")
+        );
+        assert_ne!(
+            worker_namespace(false, "local", "p1"),
+            worker_namespace(true, "local", "p1")
+        );
+    }
+
+    #[test]
     fn name_for_uses_distinct_components() {
         // Different tenants for the same project id must yield
         // distinct namespaces.
@@ -442,7 +506,9 @@ mod tests {
     fn name_for_uses_double_dash_separator() {
         let n = name_for("local", "88d7eec8-6ffc-4cb4-8582-380fd65f2643");
         // The double-dash is the unambiguous separator between
-        // tenant + project for the broker's derive_tenant_id parse.
+        // tenant + project, keeping the namespace name a lossless
+        // join of its two parts (tenant resolution itself is via the
+        // weft_namespace_tenant registry, not string parsing).
         assert!(n.contains("--"), "{n}");
         assert!(n.starts_with("wm-project-local--"), "{n}");
     }

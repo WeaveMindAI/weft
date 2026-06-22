@@ -22,6 +22,7 @@ pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(60), "listener_scaledown", sweep_listener_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(30), "supervisor", sweep_supervisors);
     spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
+    spawn_loop(state.clone(), Duration::from_secs(60), "worker_scaledown", sweep_worker_scaledown);
     // Storage plane: the durable terminate sweep (un-kept exec files)
     // and the scale-to-zero box reaper. Idempotent across pods like
     // the rest: the sweep queue deletes per-color rows only after the
@@ -70,46 +71,92 @@ where
     });
 }
 
-/// Worker-pod reaper. Once every 30s, scan for `alive` rows with
-/// stale heartbeats. Mark them `dead` (which makes the fencing
-/// trigger reject any further journal writes from them) and
-/// `kubectl delete` the Pod. Pending tasks for the project pool
-/// remain claimable: the cold-start trigger spawns a fresh Pod
-/// when there's pending work and no live Pod.
+/// Worker-pod reaper. Once every 30s, mark failed pods `dead` (which
+/// makes the fencing trigger reject any further journal writes) +
+/// `kubectl delete` the Pod:
+///   - `alive` rows whose heartbeat went stale (the worker died), and
+///   - `spawning` rows that never registered `alive` within the generous
+///     boot deadline. Without sweeping the latter, a ghost `spawning` row
+///     is counted as available capacity by the scale-up check forever, so
+///     the project's pending work hangs with no live worker and no error.
+///
+/// The spawning deadline (`SPAWN_BOOT_DEADLINE_SECS`) is deliberately
+/// GENEROUS, far above any realistic boot (image pull + binary init), so
+/// a healthy worker always reaches `register_alive` (which leaves the
+/// spawning state) long before it trips: the deadline never false-
+/// positives a slow-but-healthy boot, including a Pending pod waiting for
+/// a node or a slow multi-GB pull. We do NOT try to reap a doomed boot
+/// faster off its k8s state: a genuinely-broken image is already surfaced
+/// loudly at spawn time (`wait_for_pull_ok` fails the spawn task in ~5s),
+/// and trying to classify "stuck" from the container-waiting reason can't
+/// tell an unscheduled pod (must wait) from a wedged one (reap), so it
+/// would false-positive the former. One honest generous deadline instead.
+/// Pending tasks remain claimable: cold-start respawns once the ghost is
+/// gone.
 async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
-    let threshold = crate::lease::now_unix() - weft_task_store::worker_pod::HEARTBEAT_STALE_SECS;
-    let stale = weft_task_store::worker_pod::list_stale(&state.pg_pool, threshold).await?;
-    for row in stale {
+    let now = crate::lease::now_unix();
+    let stale = weft_task_store::worker_pod::list_stale(
+        &state.pg_pool,
+        now - weft_task_store::worker_pod::HEARTBEAT_STALE_SECS,
+    )
+    .await?;
+    let stuck_spawning = weft_task_store::worker_pod::list_stale_spawning(
+        &state.pg_pool,
+        now - weft_task_store::worker_pod::SPAWN_BOOT_DEADLINE_SECS,
+    )
+    .await?;
+    // Stale-heartbeat alive pods (worker died) and over-deadline spawning
+    // pods (never registered) both reap through the same path; a dead row
+    // is not re-listed by either query, so each is reaped once.
+    for (reason, row) in stale
+        .into_iter()
+        .map(|r| ("stale heartbeat", r))
+        .chain(
+            stuck_spawning
+                .into_iter()
+                .map(|r| ("spawning past boot deadline, never registered alive", r)),
+        )
+    {
+        reap_worker_pod(&state, &row, reason).await?;
+    }
+    Ok(())
+}
+
+/// Mark a worker pod dead + kubectl-delete it. Shared by the stale-alive
+/// and failed-spawning paths. A dead row is no longer re-listed by either
+/// query, so each pod is reaped exactly once. Does NOT recover the pod's
+/// stranded tasks (that is `sweep_orphaned_tasks`' job, a self-healing
+/// task-driven sweep; doing it here would run at most once and strand
+/// anything that failed).
+async fn reap_worker_pod(
+    state: &DispatcherState,
+    row: &weft_task_store::worker_pod::WorkerPodRow,
+    reason: &str,
+) -> anyhow::Result<()> {
+    tracing::warn!(
+        target: "weft_dispatcher::reaper",
+        project = %row.project_id,
+        pod = %row.pod_name,
+        last_heartbeat = row.last_heartbeat_unix,
+        reason,
+        "marking failed worker pod dead"
+    );
+    weft_task_store::worker_pod::mark_dead(&state.pg_pool, &row.pod_name).await?;
+    // kubectl delete: log loudly on error. A failed kill leaves the pod
+    // alive in k8s while our DB says dead, which means a stale pod can
+    // keep running. Not fatal to the sweep (the next tick retries), but
+    // never silent.
+    if let Err(e) = state
+        .workers
+        .kill_pod(row.pod_name.clone(), row.namespace.clone())
+        .await
+    {
         tracing::warn!(
             target: "weft_dispatcher::reaper",
-            project = %row.project_id,
             pod = %row.pod_name,
-            last_heartbeat = row.last_heartbeat_unix,
-            "marking stale worker pod dead"
+            error = %e,
+            "kill_pod failed for failed worker; pod may survive in k8s until next sweep"
         );
-        weft_task_store::worker_pod::mark_dead(&state.pg_pool, &row.pod_name).await?;
-        // kubectl delete: log loudly on error. A failed kill leaves
-        // the pod alive in k8s while our DB says dead, which means
-        // a stale pod can keep running. Not fatal to the sweep
-        // (the next tick retries), but never silent.
-        if let Err(e) = state
-            .workers
-            .kill_pod(row.pod_name.clone(), row.namespace.clone())
-            .await
-        {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                pod = %row.pod_name,
-                error = %e,
-                "kill_pod failed for stale worker; pod may survive in k8s until next sweep"
-            );
-        }
-        // NOTE: this loop only marks the pod dead + deletes the k8s Pod.
-        // Recovering the pod's stranded tasks is NOT done here (a pod is
-        // marked dead from several places, and a marked-dead pod is never
-        // re-listed by `list_stale`, so doing recovery here would run at most
-        // once and strand anything that failed). Task recovery is its own
-        // self-healing, task-driven sweep: `sweep_orphaned_tasks`.
     }
     Ok(())
 }
@@ -307,3 +354,78 @@ async fn sweep_supervisor_scaledown(state: DispatcherState) -> anyhow::Result<()
         .await
 }
 
+/// Worker scale-DOWN. Per project running more than one worker, ask the
+/// shared `plan_memory_scaledown` whether the pool has excess memory
+/// headroom, and if so mark ONE worker draining. A draining worker stops
+/// being chosen for NEW executions (`pick_admittable_for_project` and
+/// cold_start both skip draining pods) while its in-flight executions
+/// finish; it then idle-exits itself via the normal `mark_done_if_idle`
+/// CAS and the worker-pod reaper GCs it.
+///
+/// Unlike the supervisor drain there is NO lease release and NO work
+/// hand-off: a running execution is bound to the worker driving it (one
+/// journal stream per color), so consolidation here is purely "stop
+/// admitting new work to the most-drainable pod and let it empty." That
+/// is also why we mark at most one per project per tick: draining frees
+/// memory only as the pod's executions complete, so the planner should
+/// re-measure real pressure before shedding the next.
+///
+/// Serialized cluster-wide by the shared scale-down advisory lock so two
+/// dispatchers don't both drain workers of the same project; a sibling
+/// holding the lock simply skips this tick.
+///
+/// Also emits a breadcrumb for every pod currently draining (elapsed +
+/// remaining in-flight work). A drain has no deadline (a live execution
+/// may legitimately run for hours/days, and we never time out a user's
+/// program), so a pod can sit draining a long time; the breadcrumb keeps
+/// that legible instead of silent, per the long-running-operation rule.
+async fn sweep_worker_scaledown(state: DispatcherState) -> anyhow::Result<()> {
+    crate::lease::with_scaledown_lock(&state.pg_pool, "worker", || async {
+        // Breadcrumb pass: surface every still-draining pod. Runs under
+        // the same lock (one dispatcher logs per tick, no duplicate
+        // spam) and before planning so a pod that has been draining
+        // since a prior tick is reported even if no new drain happens.
+        let now = crate::lease::now_unix();
+        for (pod, project, drained_at, in_flight) in
+            weft_task_store::worker_pod::draining_breadcrumbs(&state.pg_pool).await?
+        {
+            tracing::info!(
+                target: "weft_dispatcher::reaper",
+                project = %project,
+                pod = %pod,
+                draining_for_secs = now.saturating_sub(drained_at),
+                in_flight_tasks = in_flight,
+                "worker still draining (no deadline; will idle-exit when its in-flight work finishes)"
+            );
+        }
+        let projects =
+            weft_task_store::worker_pod::projects_with_multiple_workers(&state.pg_pool).await?;
+        for project_id in projects {
+            let loads: Vec<weft_platform_traits::PoolPodLoad> =
+                weft_task_store::worker_pod::pod_loads_for_project(&state.pg_pool, &project_id)
+                    .await?
+                    .into_iter()
+                    .map(|(pod_name, mem_pressure)| weft_platform_traits::PoolPodLoad {
+                        pod_name,
+                        mem_pressure,
+                    })
+                    .collect();
+            let Some(target) = weft_platform_traits::plan_memory_scaledown(
+                &loads,
+                weft_platform_traits::SATURATION_MEM_FRACTION,
+            ) else {
+                continue;
+            };
+            weft_task_store::worker_pod::set_draining(&state.pg_pool, &target).await?;
+            tracing::info!(
+                target: "weft_dispatcher::reaper",
+                project = %project_id,
+                drain_target = %target,
+                "worker scale-down: marked worker draining; it will finish in-flight work and idle-exit"
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map(|_| ())
+}

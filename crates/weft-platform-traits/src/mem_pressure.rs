@@ -139,14 +139,38 @@ impl CgroupMemPressure {
     }
 }
 
+/// Warn at most once per process when the cgroup looks present but
+/// unreadable (a genuinely-broken prod pod), so the fail-open-to-0.0
+/// behavior is legible instead of silent.
+static CGROUP_UNREADABLE_WARNED: std::sync::Once = std::sync::Once::new();
+
 impl MemPressure for CgroupMemPressure {
     fn fraction(&self) -> f64 {
         // v2 first (current kernels), then v1. Any failure (no cgroup,
         // unreadable, parse error) falls through to 0.0: fail-open, a
         // read glitch must never make the pod look saturated.
-        Self::read_v2()
-            .or_else(Self::read_v1)
-            .unwrap_or(0.0)
+        if let Some(f) = Self::read_v2().or_else(Self::read_v1) {
+            return f;
+        }
+        // Both readers failed. Two legitimate-looking cases collapse to
+        // 0.0 here: (a) NO cgroup filesystem at all (local / non-
+        // containerized, the expected case, stays silent), and (b) a
+        // cgroup root EXISTS but its memory files are unreadable (a
+        // containerized pod whose accounting we cannot read: a real
+        // misconfiguration). We keep fail-open in both, but (b) means the
+        // dispatcher will see 0 pressure forever and never scale this
+        // pod's project up, so make it legible with a one-shot WARN.
+        if std::path::Path::new("/sys/fs/cgroup").exists() {
+            CGROUP_UNREADABLE_WARNED.call_once(|| {
+                tracing::warn!(
+                    target: "weft_platform_traits::mem_pressure",
+                    "cgroup present but memory accounting unreadable; reporting 0.0 \
+                     pressure (fail-open). Memory-based autoscale is effectively \
+                     disabled for this pod until the cgroup is readable."
+                );
+            });
+        }
+        0.0
     }
 }
 

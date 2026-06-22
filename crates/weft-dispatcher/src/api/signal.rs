@@ -1443,9 +1443,9 @@ async fn prepare_live_execution(
     let spec_json = serde_json::to_value(spec)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec serialize: {e}")))?;
 
-    // Atomic admit-by-insert; if all pods are at the cap, spawn another and
-    // retry (bounded). The first attempt usually wins (ensure_live_worker
-    // already guaranteed a pod exists).
+    // Atomic admit-by-insert; if every worker is memory-saturated, spawn
+    // another and retry (bounded). The first attempt usually wins
+    // (ensure_live_worker already guaranteed a pod exists).
     let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
     loop {
         if let Some(pod) = crate::task_kinds::execute::admit_live_execution(
@@ -1455,20 +1455,19 @@ async fn prepare_live_execution(
             &definition_hash,
             Some(tenant),
             spec_json.clone(),
-            LIVE_CAP,
+            weft_platform_traits::SATURATION_MEM_FRACTION,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("admit live exec: {e}")))?
         {
             return Ok(pod);
         }
-        // Every pod is at the cap: spawn another and retry.
+        // Every worker is memory-saturated: spawn another and retry.
         spawn_worker_pod(state, project_id, tenant).await?;
         if std::time::Instant::now() >= deadline {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                "all worker pods are at the live-connection cap and none freed up; retry shortly"
-                    .into(),
+                "all worker pods are memory-saturated and none freed up; retry shortly".into(),
             ));
         }
         tokio::time::sleep(LIVE_SPAWN_POLL).await;
@@ -1507,17 +1506,11 @@ pub(crate) fn build_pod_gateway_url(
     format!("{scheme}://{pod_name}.{host_port}/{namespace}/{path}?wct={token}")
 }
 
-/// Per-pod live-connection cap: how many held connections one pod multiplexes
-/// before the dispatcher fans out to (or spawns) another. A pod's load is the
-/// count of in-flight live-execute tasks pinned to it (the task row IS the
-/// slot). `0` would mean no cap; this default is a sane multiplexing ceiling.
-const LIVE_CAP: i32 = 256;
-
 /// Ensure at least one worker pod is alive/spawning for the project, spawning
 /// one and waiting (bounded) if none exist. Does NOT admit a connection; it
 /// only guarantees a routable pod exists so the atomic admit
-/// (`admit_live_execution`) has a candidate. Admission itself (which pod, cap
-/// enforcement) is the task insert, done by the caller.
+/// (`admit_live_execution`) has a candidate. Admission itself (which pod,
+/// memory-saturation check) is the task insert, done by the caller.
 async fn ensure_live_worker(
     state: &DispatcherState,
     project_id: &str,
@@ -1560,15 +1553,18 @@ async fn spawn_worker_pod(
     project_id: &str,
     tenant: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let namespace = state
+    // Worker placement: shared namespace for no-infra projects, the
+    // project's own namespace for infra projects.
+    let has_infra = state
         .projects
-        .project_namespace(project_id)
+        .project_has_infra(project_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("namespace lookup: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("has_infra lookup: {e}")))?
         .ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
-            "project namespace not found; project may be unregistered".into(),
+            "project not found; may be unregistered".into(),
         ))?;
+    let namespace = crate::project_namespace::worker_namespace(has_infra, tenant, project_id);
     weft_task_store::tasks::enqueue_dedup(
         &state.pg_pool,
         weft_task_store::tasks::NewTask {

@@ -291,6 +291,37 @@ pub async fn lookup_namespace_tenant(
     Ok(tenant)
 }
 
+/// Pod -> tenant, for a worker in the shared namespace (where the
+/// namespace maps to no single tenant). The pod's `worker_pod` row,
+/// written by the dispatcher at spawn time, names the project; the
+/// project names the tenant. The token's `pod_name` is kubelet-stamped
+/// and unforgeable, and the row is dispatcher-written, so this resolves
+/// the tenant from trusted state only (never from anything the pod
+/// itself supplies). 403 on a pod with no row (forged / already GC'd).
+/// The project leg reuses the `project_to_tenant` cache.
+pub async fn lookup_pod_tenant(
+    cache: &ScopeCache,
+    pool: &PgPool,
+    pod_name: &str,
+) -> Result<String, (StatusCode, String)> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT project_id FROM worker_pod WHERE pod_name = $1")
+            .bind(pod_name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("worker_pod lookup: {e}")))?;
+    let project_id = row
+        .ok_or((
+            StatusCode::FORBIDDEN,
+            format!(
+                "pod '{pod_name}' has no worker_pod row; a shared-namespace worker must have \
+                 been spawned by the dispatcher to authenticate"
+            ),
+        ))?
+        .0;
+    lookup_project_tenant(cache, pool, &project_id).await
+}
+
 fn log_denied(caller: &CallerIdentity, kind: &str, requested: &str, owner: &str) {
     tracing::warn!(
         target: "weft_broker::scope",

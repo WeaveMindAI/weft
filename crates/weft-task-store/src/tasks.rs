@@ -312,22 +312,21 @@ pub struct AdmittedPod {
     pub namespace: String,
 }
 
-/// ATOMICALLY admit a live execution: pick the least-loaded routable pod for
-/// the project whose in-flight live-execution load is under `cap`, and insert
-/// the pinned execute task for `color` on it, all in ONE transaction under a
-/// per-project advisory lock. Returns the chosen pod, or `None` if every pod
-/// is at `cap` or none is routable (the caller then spawns a fresh pod and
-/// retries).
+/// ATOMICALLY admit a live execution: pick the least-PRESSURED admittable
+/// worker for the project (alive, not draining, memory pressure below
+/// `saturation`) and insert the pinned execute task for `color` on it, all in
+/// ONE transaction under a per-project advisory lock. Returns the chosen pod,
+/// or `None` if every worker is saturated / draining or none is alive (the
+/// caller then spawns a fresh pod and retries).
 ///
-/// This is the SINGLE SOURCE OF TRUTH for live-connection capacity: admission
-/// IS the task insert, so "admitted" and "has a task row" can never disagree.
-/// There is no separate `live_connection_count` to drift, no admit/insert
-/// window, and failure cleanup is just deleting the pending task (which by
-/// definition frees the slot). The load is COUNTED from the task table (live-
-/// execute tasks `pending`/`claimed` pinned to the pod); the advisory lock
-/// serializes admissions for the project so concurrent handshakes (across
-/// sibling dispatcher Pods) see a consistent count and cannot overshoot `cap`.
-/// `cap == 0` means no cap.
+/// Admission IS the task insert, so "admitted" and "has a task row" can never
+/// disagree; failure cleanup is just deleting the pending task. Capacity is
+/// governed by MEMORY pressure (the same metric placement and scale-down use),
+/// NOT a connection count: a worker takes live executions until its memory
+/// crosses the saturation threshold, then the next one spawns. The advisory
+/// lock serializes admissions for the project so a burst of concurrent
+/// handshakes (across sibling dispatcher Pods) doesn't all pile onto the same
+/// least-pressured pod before its next heartbeat updates the pressure reading.
 ///
 /// Dedups on `{color}:execute` (the color is freshly minted per handshake, so
 /// this only collapses a crash-retry of the same handshake).
@@ -338,48 +337,35 @@ pub async fn admit_live_execution(
     color: &str,
     tenant_id: Option<&str>,
     payload: &Value,
-    cap: i32,
+    saturation: f64,
 ) -> Result<Option<AdmittedPod>> {
     let mut tx = pool.begin().await?;
-    // Serialize admissions for this project so the load count below is
-    // consistent across concurrent handshakes (same discipline as
-    // `enqueue_dedup`'s per-dedup lock, here per-project for the cap).
+    // Serialize admissions for this project so a burst of concurrent
+    // handshakes reads a consistent pressure ordering and doesn't stampede
+    // one pod (same discipline as `enqueue_dedup`'s per-dedup lock, here
+    // per-project).
     let lock_input = format!("live-admit|{project_id}");
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&lock_input)
         .execute(&mut *tx)
         .await?;
 
-    // Pick the least-loaded routable pod under cap. Load = in-flight live-
-    // execute tasks pinned to the pod (the same predicate the orphan sweep
-    // uses). `$2 = 0` disables the cap.
+    // Pick the least-pressured admittable worker. Same predicate as
+    // `worker_pod::pick_admittable_for_project`: alive, not draining, below
+    // saturation, least-pressured first (a spawning pod reads 0 until its
+    // first heartbeat, so it is correctly preferred).
     let chosen: Option<(String, String)> = sqlx::query_as(
         r#"SELECT wp.pod_name, wp.namespace
            FROM worker_pod wp
            WHERE wp.project_id = $1
              AND wp.status IN ('spawning', 'alive')
-             AND (
-               $2 = 0 OR (
-                 SELECT COUNT(*) FROM task t
-                 WHERE t.target_pod_name = wp.pod_name
-                   AND t.kind = 'execute'
-                   AND t.status IN ('pending', 'claimed')
-                   AND t.payload -> 'live_connection' IS NOT NULL
-                   AND t.payload -> 'live_connection' != 'null'::jsonb
-               ) < $2
-             )
-           ORDER BY (
-             SELECT COUNT(*) FROM task t
-             WHERE t.target_pod_name = wp.pod_name
-               AND t.kind = 'execute'
-               AND t.status IN ('pending', 'claimed')
-               AND t.payload -> 'live_connection' IS NOT NULL
-               AND t.payload -> 'live_connection' != 'null'::jsonb
-           ) ASC, wp.pod_name ASC
+             AND NOT wp.draining
+             AND wp.mem_pressure < $2
+           ORDER BY wp.mem_pressure ASC, wp.created_at_unix ASC, wp.pod_name ASC
            LIMIT 1"#,
     )
     .bind(project_id)
-    .bind(cap)
+    .bind(saturation)
     .fetch_optional(&mut *tx)
     .await?;
     let Some((pod_name, namespace)) = chosen else {
@@ -470,22 +456,29 @@ pub async fn claim_one(
     };
 
     let mut tx = pool.begin().await?;
-    // `target_pod_name IS NULL OR target_pod_name = $pod` lets cancel
-    // tasks be addressed to one specific pod in a multi-pod pool.
-    // Tasks without an address are claimable by any pod matching
-    // the (target, project) scope.
-    // Worker-target claims must verify the picking pod is still
-    // alive in `worker_pod`. Without this, a pod that's been marked
-    // dead (e.g. by replace_stale_worker_if_needed during a sync that
-    // bumped the binary_hash) keeps claiming tasks for the up-to-10s
-    // window until its own heartbeat detects the dead row. Those
-    // claims then fail when the fencing trigger rejects the
-    // resulting journal writes. The DB has the source of truth;
-    // let it enforce.
+    // `target_pod_name IS NULL OR target_pod_name = $pod` lets cancel /
+    // resume tasks be addressed to one specific pod in a multi-pod pool.
+    // Tasks without an address are claimable by any pod matching the
+    // (target, project) scope.
     //
-    // Dispatcher-target claims aren't affected: dispatcher pods have
-    // no `worker_pod` row at all, so the EXISTS check is gated on
-    // target.
+    // Worker-target claims must verify the picking pod is still alive in
+    // `worker_pod`. Without this, a pod that's been marked dead (e.g. by
+    // replace_stale_worker_if_needed during a sync that bumped the
+    // binary_hash) keeps claiming tasks for the up-to-10s window until
+    // its own heartbeat detects the dead row. Those claims then fail
+    // when the fencing trigger rejects the resulting journal writes. The
+    // DB has the source of truth; let it enforce.
+    //
+    // DRAINING pods: a worker being scaled down must stop taking NEW,
+    // unaddressed work (else the drain never empties it), but must still
+    // run work ADDRESSED to it (a resume pinned to it because it still
+    // owns the color, or a cancel). So a draining pod may claim a task
+    // pinned to itself but not an unpinned one. Expressed as: the task
+    // is pinned to THIS pod, OR (it is unpinned AND this pod is not
+    // draining). Aliveness is required either way.
+    //
+    // Dispatcher-target claims aren't affected: dispatcher pods have no
+    // `worker_pod` row at all, so the EXISTS check is gated on target.
     let row = sqlx::query(
         r#"SELECT id, kind, status, project_id, color, tenant_id, payload
            FROM task
@@ -500,6 +493,7 @@ pub async fn claim_one(
                      SELECT 1 FROM worker_pod wp
                      WHERE wp.pod_name = $3
                        AND wp.status IN ('spawning', 'alive')
+                       AND (task.target_pod_name = $3 OR NOT wp.draining)
                  )
              )
            ORDER BY created_at_unix ASC

@@ -119,7 +119,7 @@ pub use primitive::{
     SignalRouting, SignalSpec, SignalSurface, SuspensionInfo,
 };
 pub use project::{
-    Edge, EdgeIndex, GroupBoundary, GroupBoundaryRole, GroupDefinition, GroupKind,
+    has_infra, Edge, EdgeIndex, GroupBoundary, GroupBoundaryRole, GroupDefinition, GroupKind,
     NodeDefinition, PortDefinition, Position, ProjectDefinition,
 };
 pub use pulse::Pulse;

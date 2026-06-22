@@ -41,21 +41,53 @@ pub enum AuthOutcome {
 
 #[async_trait]
 pub trait BoxAuthOps: Send + Sync {
-    async fn authorize(&self, bearer: &str, color: Option<&str>) -> Result<AuthOutcome>;
+    /// Authorize a data-path request. `box_tenant` is THIS box's own
+    /// tenant (`WEFT_TENANT_ID`): the box is single-tenant by
+    /// deployment, so a worker resolved to any OTHER tenant is denied
+    /// here, at the one boundary that turns a broker verdict into a
+    /// data-path identity. This is the tenant wall that the prefix
+    /// scopes (notably the unconditional `Shared` grant) rely on: it
+    /// used to be enforced only by network topology (a tenant box was
+    /// reachable solely by that tenant's own workers), but a no-infra
+    /// worker now shares one namespace across tenants and can reach
+    /// EVERY tenant's box, so the wall must be a real check, not a
+    /// reachability accident.
+    async fn authorize(
+        &self,
+        box_tenant: &str,
+        bearer: &str,
+        color: Option<&str>,
+    ) -> Result<AuthOutcome>;
 }
 
 #[async_trait]
 impl<T: BrokerAuthorizeOps + ?Sized> BoxAuthOps for T {
-    async fn authorize(&self, bearer: &str, color: Option<&str>) -> Result<AuthOutcome> {
+    async fn authorize(
+        &self,
+        box_tenant: &str,
+        bearer: &str,
+        color: Option<&str>,
+    ) -> Result<AuthOutcome> {
         Ok(match self.authorize_raw(bearer, color).await? {
             RawAuth::Denied(reason) => AuthOutcome::Denied(reason),
             RawAuth::Allowed(verdict) => match verdict {
                 StorageAuthorizeResponse::Worker { tenant_id, project_id, color } => {
-                    AuthOutcome::Allowed(CallerAuth::Worker {
-                        tenant: tenant_id,
-                        project_id,
-                        color,
-                    })
+                    if tenant_id != box_tenant {
+                        // A worker of a different tenant reached this box
+                        // (possible now that no-infra workers share a
+                        // cross-tenant namespace). Deny before any scope
+                        // check, so every scope inherits the tenant wall.
+                        AuthOutcome::Denied(format!(
+                            "denied: worker tenant '{tenant_id}' may not access tenant \
+                             '{box_tenant}' storage"
+                        ))
+                    } else {
+                        AuthOutcome::Allowed(CallerAuth::Worker {
+                            tenant: tenant_id,
+                            project_id,
+                            color,
+                        })
+                    }
                 }
                 StorageAuthorizeResponse::ControlPlane => {
                     AuthOutcome::Allowed(CallerAuth::ControlPlane)

@@ -98,6 +98,12 @@ async fn supervisor_cold_start_then_safe_consolidation() -> anyhow::Result<()> {
         platform.infra_owner_of(&pid2).await?.as_deref() == Some(pod_b.as_str()),
         "ownership move onto the clone did not take"
     );
+    // The clone was created with a spawn-grace window (so the idle reaper
+    // did not delete it before it owned a project). Now that it owns one,
+    // expire its grace so the scale-down planner treats it as an
+    // established member and can consolidate it (the planner only considers
+    // past-grace pods). Without this the pool never folds back to one.
+    platform.expire_supervisor_grace(&pod_b).await?;
 
     // Both pods idle (uncapped cgroup → 0 pressure), so the planner has
     // headroom to fold one onto the other. Whichever pod is drained, its
@@ -150,6 +156,10 @@ async fn supervisor_cold_start_then_safe_consolidation() -> anyhow::Result<()> {
     // ---- 4. Cleanup ----
     infra::terminate_and_wait_gone(&p1, NODE).await?;
     infra::terminate_and_wait_gone(&p2, NODE).await?;
+    // Success cleanup: remove the supervisor clone THIS test created (by
+    // exact name, so it never touches another test's clone). Success path
+    // only; a failing test keeps state for inspection.
+    platform.sweep_clone(&pod_b).await?;
     p1.finish().await?;
     p2.finish().await
 }

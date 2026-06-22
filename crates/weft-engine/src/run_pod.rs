@@ -76,10 +76,13 @@ struct WorkerCtx {
     clients: EngineClients,
     pod_name: String,
     tenant_id: String,
-    /// The k8s namespace this worker pod runs in (the project
-    /// namespace: `wm-project-{tenant}-{project}`). Threaded into
+    /// The k8s namespace this worker pod runs in. For an infra project
+    /// this is the project's own per-project namespace; for a no-infra
+    /// project it is the shared worker namespace. Threaded into
     /// `InfraProvisionContext` so `Node::provision` bodies see the
-    /// runtime namespace they're being applied into.
+    /// runtime namespace they're being applied into. (Only infra
+    /// projects provision, and those always run in their own namespace,
+    /// so a provision body never sees the shared namespace.)
     namespace: String,
     cancel_registry: CancelRegistry,
     /// Cache of fetched definitions keyed by `definition_hash`.
@@ -181,6 +184,7 @@ pub async fn run_pod(
         worker_pods.clone(),
         pod_name.clone(),
         shutdown.clone(),
+        weft_platform_traits::CgroupMemPressure::new(),
     );
 
     // Per-pod live caller registry + the per-color config the connection
@@ -270,6 +274,7 @@ fn spawn_heartbeat(
     worker_pods: Arc<dyn WorkerPodClient>,
     pod_name: String,
     shutdown: Arc<AtomicBool>,
+    mem_pressure: Arc<dyn weft_platform_traits::MemPressure>,
 ) {
     let interval = Duration::from_secs(weft_task_store::HEARTBEAT_INTERVAL_SECS);
     // After this many consecutive errors, the row's stale-recovery
@@ -285,7 +290,12 @@ fn spawn_heartbeat(
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            match worker_pods.heartbeat(&pod_name).await {
+            // Read the pod's own cgroup memory pressure each tick and
+            // report it with the heartbeat, so the dispatcher places and
+            // scales workers by real memory load (0.0 locally, where
+            // there is no cgroup limit, so one worker until squeezed).
+            let pressure = mem_pressure.fraction();
+            match worker_pods.heartbeat(&pod_name, pressure).await {
                 Ok(true) => {
                     consecutive_errors = 0;
                 }

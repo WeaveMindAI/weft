@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(ServiceState {
         store,
         auth: BrokerAuth::new(broker_url),
+        box_tenant: tenant_id.clone(),
         public_base_url,
     });
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

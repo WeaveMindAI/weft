@@ -818,8 +818,34 @@ async fn handle_connect(
     let color = claims.color;
 
     // 2. Resolve the execution's connection config (protocol, caps, data
-    //    type) + journal sink. Unknown color = nothing to attach to.
-    let Some((config, heartbeat_secs, journal)) = state.resolver.resolve(color) else {
+    //    type) + journal sink.
+    //
+    // A valid, pod-pinned token is PROOF the dispatcher admitted this color
+    // to THIS worker (it minted the token only after inserting the pinned
+    // execute task). But the worker only populates its resolver when it
+    // CLAIMS and starts that task, a beat after admission. So a caller that
+    // the dispatcher redirected here can briefly arrive before the resolver
+    // is populated. That is "not ready yet," not "unknown": poll the
+    // resolver for a bounded window before giving up. Without this, a fast
+    // caller racing the worker's task-claim gets a spurious 404 even though
+    // the execution is genuinely starting. (A token for a color this worker
+    // never gets assigned simply times out to the same 404, which is
+    // correct: nothing will ever attach.)
+    let resolved = {
+        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        let deadline = state.clock.now() + READY_WAIT;
+        loop {
+            if let Some(r) = state.resolver.resolve(color) {
+                break Some(r);
+            }
+            if state.clock.now() >= deadline {
+                break None;
+            }
+            state.clock.sleep(POLL).await;
+        }
+    };
+    let Some((config, heartbeat_secs, journal)) = resolved else {
         return (StatusCode::NOT_FOUND, "no live execution for this token").into_response();
     };
 
