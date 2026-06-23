@@ -1,5 +1,7 @@
 # Weft
 
+## Main branch is inactive because Weft is being actively rebuilt in the mvp branch, plan release August 2026. You can follow the build, feel free to send feedback on discord this would be greatly appreciated
+
 > **Building in public, two months in.** Weft is young. The language, the type system, and the durable executor are the stable parts. The node catalog is small and intentionally opinionated (a few dozen nodes across LLM, code, communication, flow, storage, and triggers). The long-term vision is to let projects define their own nodes fluently in the language itself, but that is still ahead. If you are evaluating it for production, treat it as a foundation to build on, not a finished product. Breaking changes are expected while the shape is still settling; they will be announced, and migration notes will come with them.
 >
 > **Note on the docs.** This README, `DESIGN.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, and most of the prose around the project were written fast to get the open source release out the door. They may sound a bit AI-generated in places. If you have the time and taste to rewrite any of them more cleanly, please do. A PR that improves the writing is as welcome as one that fixes a bug.
