@@ -3,7 +3,7 @@
 //! rowan trees are untyped: every node and token carries a `u16` tag. This
 //! module is that tag set (`SyntaxKind`) plus the `Language` impl that teaches
 //! rowan to convert between our enum and its raw `u16`. The kinds map 1:1 onto
-//! the grammar shapes documented in `docs/cst-node-model.md`.
+//! the grammar shapes the parser builds.
 //!
 //! The cardinal rule of the whole CST: every byte of source is a token. Trivia
 //! (whitespace, blank lines, comments) is not skipped, it is a token like any

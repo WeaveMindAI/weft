@@ -15,11 +15,10 @@
 //! path, a malformed marker, or a failed cast becomes a `CompileError`
 //! pointing at the field's source line.
 
-use std::path::Path;
-
 use weft_core::project::{ConfigFieldSpan, FileRef, Span};
 use weft_core::WeftType;
 
+use crate::file_reader::CompileFs;
 use crate::weft_compiler::CompileError;
 
 /// Recognize and parse a `@file("path"[, Type])` marker from a raw value
@@ -107,49 +106,32 @@ fn unquote(s: &str) -> Option<String> {
     }
 }
 
-/// Resolve a single `@file` marker against the project root: read the file
-/// and cast its content to the declared type. The path is resolved relative
-/// to `project_root` and must stay inside it.
-///
-/// Threat model: the project tree is TRUSTED (this runs at build time on the
-/// user's own project; referenced files are part of the project, like infra
-/// specs). The containment check guards against an accidental `../` typo leaking
-/// a host file into the build, not a hostile tree. It is robust for that:
-/// `canonicalize` resolves `..` and follows symlinks before the prefix check, so
-/// any path (including via a symlink) that lands outside the root is rejected.
-/// The only residual gap is the canonicalize→read TOCTOU window, which is
-/// irrelevant for a trusted local tree. If `@file` ever resolves UNTRUSTED input,
-/// switch to O_NOFOLLOW / per-component symlink rejection to close that window.
-pub fn resolve(file_ref: &FileRef, project_root: &Path) -> Result<serde_json::Value, String> {
-    let joined = project_root.join(&file_ref.path);
-
-    // Reject path escape: the resolved canonical path must live under the
-    // project root (canonicalize resolves `..` and symlinks, so an escaping
-    // target fails the prefix check). Trusted-tree typo guard, see fn doc.
-    let canonical_root = project_root
-        .canonicalize()
-        .map_err(|e| format!("project root {project_root:?} is unreadable: {e}"))?;
-    let canonical = joined
-        .canonicalize()
-        .map_err(|e| format!("@file path {:?} cannot be read: {e}", file_ref.path))?;
-    if !canonical.starts_with(&canonical_root) {
+/// Resolve a single `@file` marker against the filesystem view: read the
+/// referenced content (through whichever backing `fs` carries: disk, in-memory
+/// map, DB rows) and cast it to the declared type. Path resolution and the
+/// trusted-tree containment guard live in the reader (see `file_reader`), so
+/// this is just "read and cast."
+pub fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<serde_json::Value, String> {
+    let Some(base) = fs.base else {
         return Err(format!(
-            "@file path {:?} escapes the project root",
+            "@file({:?}) cannot be resolved outside a project",
             file_ref.path
         ));
-    }
-
-    let text = std::fs::read_to_string(&canonical)
-        .map_err(|e| format!("@file path {:?} cannot be read: {e}", file_ref.path))?;
-    file_ref.ty.cast_text(&text)
+    };
+    let resolved = fs
+        .reader
+        .resolve_and_read(base, std::path::Path::new(&file_ref.path))
+        .map_err(|e| format!("@file {e}"))?;
+    file_ref.ty.cast_text(&resolved.content)
 }
 
 /// Resolve every `@file(...)` marker in one node's config map in place.
 /// Errors (malformed marker, unreadable file, failed cast) are collected
-/// against the field's source line (falling back to `node_line`). When
-/// `base_dir` is `None` (parsing outside a project), a `@file` marker is an
-/// error: there is no directory to resolve it against. Resolved references
-/// are recorded in `file_refs` so the editor knows the field is file-backed.
+/// against the field's source line (falling back to `node_span`). When `fs` has
+/// no anchor (`base == None`, parsing outside a project), a `@file` marker is an
+/// error: there is no directory to resolve it against (the message comes from
+/// `resolve`). Resolved references are recorded in `file_refs` so the editor
+/// knows the field is file-backed.
 ///
 /// Called per node by the parser's recursive walk (top-level nodes and every
 /// group descendant) so `@file` inside a group body resolves too.
@@ -158,7 +140,7 @@ pub(crate) fn resolve_node_file_refs(
     config_spans: &std::collections::BTreeMap<String, ConfigFieldSpan>,
     file_refs: &mut std::collections::BTreeMap<String, FileRef>,
     node_span: Span,
-    base_dir: Option<&Path>,
+    fs: &CompileFs,
     errors: &mut Vec<CompileError>,
 ) {
     for (key, value) in config.iter_mut() {
@@ -180,14 +162,7 @@ pub(crate) fn resolve_node_file_refs(
                 continue;
             }
         };
-        let root = match base_dir {
-            Some(r) => r,
-            None => {
-                errors.push(CompileError::at(span, format!("@file({:?}) cannot be resolved outside a project", file_ref.path)));
-                continue;
-            }
-        };
-        match resolve(&file_ref, root) {
+        match resolve(&file_ref, fs) {
             Ok(resolved) => {
                 *value = resolved;
                 file_refs.insert(key.clone(), file_ref);

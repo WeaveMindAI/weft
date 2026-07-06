@@ -69,6 +69,51 @@ pub trait Journal: Send + Sync {
     /// Full ordered event log for a color.
     async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>>;
 
+    // ----- Atomic execution birth / teardown --------------------------
+    //
+    // An execution's birth is ONE atomic fact: the `ExecutionStarted` event,
+    // its `execution_color` seed, the entry kicks, AND the work item a worker
+    // will claim. Committing them together is what makes a "ghost" (a
+    // journaled live execution with no work item, which nothing would ever
+    // run or reclaim and which would wedge a later drain) impossible by
+    // construction, instead of something a failure path must remember to
+    // clean up.
+
+    /// ATOMICALLY journal an execution's birth together with its queued work
+    /// item. Either everything commits or nothing does. `start` must be
+    /// `ExecEvent::ExecutionStarted`; `kicks` are its `NodeKicked` events.
+    async fn start_execution(
+        &self,
+        start: &ExecEvent,
+        kicks: &[ExecEvent],
+        task: weft_task_store::tasks::NewTask,
+    ) -> anyhow::Result<()>;
+
+    /// The live-connection variant of [`Journal::start_execution`]: the birth
+    /// commits atomically WITH the pinned-task admission, and ONLY if a worker
+    /// admits it. `Saturated` writes nothing (the caller spawns a pod and
+    /// retries); `AlreadyAdmitted` (a crash-retry of the same handshake)
+    /// writes nothing new and returns the originally chosen pod.
+    async fn start_live_execution(
+        &self,
+        start: &ExecEvent,
+        kicks: &[ExecEvent],
+        task: weft_task_store::tasks::NewTask,
+        saturation: f64,
+    ) -> anyhow::Result<weft_task_store::tasks::LiveAdmitOutcome>;
+
+    /// ATOMICALLY tear down a live execution whose setup failed AFTER
+    /// admission: delete its still-pending task and journal the cancel
+    /// terminals (`NodeCancelled` per non-terminal node + `ExecutionCancelled`)
+    /// in one transaction, so "task deleted" and "cancel journaled" can never
+    /// disagree. `WorkerOwnsIt` means a worker already claimed the task: it
+    /// owns the run and its own terminal, so nothing was cancelled.
+    async fn cancel_never_claimed_execution(
+        &self,
+        color: Color,
+        reason: &str,
+    ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome>;
+
     /// Drop the signal row for a single-use resume token. Called
     /// when a suspension's fire is consumed (the engine has handed
     /// the value back to the waiting firing). Returns true if a row
@@ -76,23 +121,27 @@ pub trait Journal: Send + Sync {
     /// untouched; the deactivate path manages those separately.
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool>;
 
-    /// Persist an API token (token-scoped enumeration credential).
-    /// The caller owns the token string (so the api layer can pick
-    /// its shape, e.g. friendly `wm_tk_swift-falcon-23` vs hard
-    /// `wm_tk_<uuid>`); the journal stores + indexes it along with
-    /// the scope vectors. Empty scope vector = wildcard for that
-    /// dimension.
-    async fn mint_api_token(&self, token: &ApiToken) -> anyhow::Result<()>;
+    /// Persist a signal token (token-scoped enumeration credential).
+    /// Record a freshly minted signal token. The api layer generates the token
+    /// VALUE and hands the journal only its at-rest form (`token_hash` +
+    /// display `recognizer` + metadata + scope vectors); the raw value is
+    /// never stored. Empty scope vector = wildcard for that dimension.
+    async fn mint_signal_token(&self, token: &SignalToken) -> anyhow::Result<()>;
 
-    /// Read the full token row including its scope vectors. Used by
-    /// the signal-listing handler to filter visible signals.
-    async fn get_api_token(&self, token: &str) -> anyhow::Result<Option<ApiToken>>;
+    /// Read the full token row (scope vectors included) by the sha256 hex of
+    /// the PRESENTED credential. Used by the token-scoped signal handlers.
+    async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>>;
 
-    async fn list_api_tokens(&self) -> anyhow::Result<Vec<ApiToken>>;
+    /// List the signal tokens owned by `tenant` (scoped in the query, so one
+    /// tenant never sees another's tokens). Rows carry no secret: only the
+    /// hash + recognizer + metadata.
+    async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>>;
 
-    /// Delete an API token by its token string OR by its human
-    /// label. Returns true iff a row was actually removed.
-    async fn revoke_api_token(&self, identifier: &str) -> anyhow::Result<bool>;
+    /// Delete a signal token by its id, scoped to `tenant`: only the owning
+    /// tenant can revoke it. Returns true iff a row was actually removed (a
+    /// wrong-tenant id matches nothing, same as a missing one, so revoke
+    /// can't probe other tenants' tokens).
+    async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool>;
 
     // ----- Derived views over the event log --------------------------
 
@@ -100,6 +149,14 @@ pub trait Journal: Send + Sync {
     /// log for the first `ExecutionStarted` event. `NotFound` if
     /// the color is unknown; `Corrupt` if the row no longer decodes.
     async fn execution_project(&self, color: Color) -> anyhow::Result<ColorLookup<String>>;
+
+    /// The tenant a color's execution was STARTED under, from its
+    /// `execution_color` row (stamped at start, frozen for the run's life).
+    /// This is the authoritative owner for keying the execution's storage,
+    /// and it OUTLIVES a project deletion (the row is journal-side, not the
+    /// mutable project store), so a terminate sweep can resolve it even for a
+    /// since-deleted project. `NotFound` if the color is unknown.
+    async fn execution_tenant(&self, color: Color) -> anyhow::Result<ColorLookup<String>>;
 
     /// Look up the `definition_hash` an execution was STARTED with.
     /// Resume task producers use this to stamp the resume payload,
@@ -118,9 +175,25 @@ pub trait Journal: Send + Sync {
     /// `ExecEvent::LogLine` events.
     async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
 
-    /// Summary row for every execution the dispatcher has ever
-    /// seen, newest first.
-    async fn list_executions(&self, limit: u32) -> anyhow::Result<Vec<ExecutionSummary>>;
+    /// A page of `tenant`'s executions, newest first, matching `query`'s filters
+    /// (project + start-time range) with limit/offset paging, plus the total
+    /// matching count. Scoping is in the query (via the `execution_color` table's
+    /// `tenant_id`, seeded on every start), so one tenant never sees another's
+    /// executions or their count; every filter stays inside that wall.
+    async fn list_executions(
+        &self,
+        tenant: &str,
+        query: &ExecutionQuery,
+    ) -> anyhow::Result<ExecutionPage>;
+
+    /// The summary for one execution, looked up directly by color (no window
+    /// scan). `None` when no `execution_started` row exists for `color`. The
+    /// caller authorizes the color against the tenant separately; this is the
+    /// pure read.
+    async fn execution_summary(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<Option<ExecutionSummary>>;
 
     /// Every color belonging to `project_id` whose journal has no
     /// terminal event yet. Used by wipe / cancel_running to enumerate
@@ -130,6 +203,17 @@ pub trait Journal: Send + Sync {
         &self,
         project_id: &str,
     ) -> anyhow::Result<Vec<Color>>;
+
+    /// Every color belonging to `project_id` whose journal HAS a
+    /// terminal event (completed / failed / cancelled). The exact
+    /// complement of `list_non_terminal_colors_for_project` over the
+    /// project's known colors. `running_count` uses it to make sure a
+    /// stray `pending`/`claimed` task row can never resurrect a color
+    /// whose execution is already finished.
+    async fn list_terminal_colors_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<Color>>;
 
     // ----- Signal registry (durable replacement for in-RAM tracker) ----
 
@@ -198,18 +282,18 @@ pub struct SignalRegistration {
     pub spec_json: String,
     /// Free-form consumer label from `SignalSpec.consumer_kind`.
     /// `None` for fire-only signals (raw webhook entries) that
-    /// have no enumeration consumer. The api_token enumeration
+    /// have no enumeration consumer. The signal_token enumeration
     /// filter compares against this.
     pub consumer_kind: Option<String>,
     /// Tags copied from the registering node's `_tags` config.
-    /// Used by the api_token enumeration filter (allowed_tags
+    /// Used by the signal_token enumeration filter (allowed_tags
     /// overlap). Charset validated upstream by the parser.
     pub tags: Vec<String>,
     /// Rendered consumer payload (form schema, decorated webhook
     /// shape, etc). Computed once at register time on the listener
     /// `/render` endpoint; cached here so consumer enumeration is
     /// a pure SQL read with no listener round-trip. Park-mode
-    /// projects can serve `/api-token/.../signals` even with the
+    /// projects can serve `/signal-token/.../signals` even with the
     /// listener pod reaped because the payload is on the row.
     pub consumer_payload: Option<serde_json::Value>,
     /// `signal.surface_kind` discriminant: 'public_entry' or
@@ -255,21 +339,32 @@ pub struct SignalPlacement {
 }
 
 impl SignalRegistration {
-    /// Compute the public URL for this signal given a dispatcher
-    /// base URL. PublicEntry → `<base>/<mount_path>` (handling
-    /// the empty-path → root convention). TaskCallback →
-    /// `<base>/signal/<token>`. Returns None for surface kinds
-    /// that don't expose a public URL.
+    /// Compute the public URL for this signal given a dispatcher base
+    /// URL. The route depends on the surface AND, for public entries,
+    /// whether it is a LIVE connection (served only at `/connect/...`,
+    /// which starts an execution and hands the caller to the gateway)
+    /// or a plain public fire (served at the bare `/<mount_path>`
+    /// catch-all). TaskCallback → `<base>/signal/<token>`. Returns None
+    /// for surface kinds with no public URL.
     pub fn public_url(&self, dispatcher_base: &str) -> Option<String> {
         let base = dispatcher_base.trim_end_matches('/');
         match self.surface_kind.as_str() {
             "public_entry" => {
                 let path = self.mount_path.as_deref().unwrap_or("");
                 let path = path.trim_start_matches('/');
+                // Live-connection kinds (ApiEndpoint/LiveSocket) are ONLY
+                // reachable through `/connect/...`; a bare-path fire does not
+                // open the held connection. Everything else (a plain public
+                // fire) is the bare path. The kind lives in spec_json.
+                let is_live = serde_json::from_str::<weft_core::primitive::SignalSpec>(&self.spec_json)
+                    .ok()
+                    .and_then(|s| weft_core::signal::protocol_for_tag(&s.kind))
+                    .is_some();
+                let prefix = if is_live { "connect/" } else { "" };
                 if path.is_empty() {
-                    Some(format!("{base}/"))
+                    Some(format!("{base}/{prefix}"))
                 } else {
-                    Some(format!("{base}/{path}"))
+                    Some(format!("{base}/{prefix}{path}"))
                 }
             }
             "task_callback" => Some(format!("{base}/signal/{}", self.token)),
@@ -280,6 +375,8 @@ impl SignalRegistration {
 
 // ----- Public types -----------------------------------------------
 
+// SYNC: ExecutionSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
+//       extension-vscode/src/sidebar/executions.ts (ExecutionSummary)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecutionSummary {
     pub color: Color,
@@ -290,17 +387,52 @@ pub struct ExecutionSummary {
     pub completed_at: Option<u64>,
 }
 
+/// The query for a page of a tenant's executions: pagination plus optional
+/// filters. `project_id` narrows to one project; `started_after`/`started_before`
+/// (unix seconds, inclusive/exclusive respectively) narrow by start time so the
+/// website can retrieve executions around a specific date. Filtering + paging
+/// happen in SQL so a tenant with a huge history never truncates blindly; every
+/// filter stays inside the tenant wall.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionQuery {
+    pub limit: u32,
+    pub offset: u32,
+    pub project_id: Option<String>,
+    pub started_after: Option<u64>,
+    pub started_before: Option<u64>,
+}
+
+/// One page of executions plus the total number matching the same filters
+/// (ignoring limit/offset), so a consumer can render page controls without a
+/// second count round-trip.
+// SYNC: ExecutionPage <-> weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage),
+//       extension-vscode/src/sidebar/executions.ts (ExecutionPage)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionPage {
+    pub executions: Vec<ExecutionSummary>,
+    pub total: u64,
+}
+
 /// Token-scoped enumeration credential. Used by external consumers
 /// (browser extension, future Slack bot, etc.) to fetch the subset
 /// of signals they're authorized to see. Each scope vector is
 /// independent; empty = wildcard.
 #[derive(Debug, Clone)]
-pub struct ApiToken {
-    pub token: String,
+pub struct SignalToken {
+    /// The token's stable identity: what list/revoke address. Never secret.
+    pub id: uuid::Uuid,
+    /// sha256 hex of the full token value: the ONLY secret-derived thing at
+    /// rest. Lookups hash the presented credential and match this, so a DB
+    /// dump exposes no usable token.
+    pub token_hash: String,
+    /// Display recognizer (`wft-<first-word>-…`): lets a user tell tokens
+    /// apart in a list without revealing the secret.
+    pub recognizer: String,
+    /// The tenant that owns this token. Stamped at mint from the caller's
+    /// authenticated tenant; list/revoke are scoped to it so one tenant can
+    /// never see or revoke another's tokens.
+    pub tenant_id: String,
     pub name: Option<String>,
-    /// Allowed `consumer_kind` values. Empty = any kind. The
-    /// signal-listing handler filters with `consumer_kind = ANY($1)`.
-    pub allowed_kinds: Vec<String>,
     /// Allowed project ids. Empty = any project in the tenant.
     pub allowed_projects: Vec<uuid::Uuid>,
     /// Allowed signal tags. Empty = any tag (including untagged).
@@ -308,7 +440,6 @@ pub struct ApiToken {
     /// with no tags do NOT match (the array overlap operator
     /// returns false against an empty signal-side array).
     pub allowed_tags: Vec<String>,
-    pub metadata: Option<Value>,
     pub created_at: u64,
 }
 

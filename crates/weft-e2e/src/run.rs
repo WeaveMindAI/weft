@@ -27,7 +27,7 @@ use crate::project::Project;
 /// an INTERNAL transition the rig controls the inputs to (a small fixture run),
 /// so a bound is correct: a run that never settles is a bug, not legitimate
 /// long-running user work. Generous enough to cover a cold worker spawn.
-const RUN_SETTLE_DEADLINE: Duration = Duration::from_secs(120);
+pub const RUN_SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 const RUN_SETTLE_POLL: Duration = Duration::from_millis(300);
 
 /// Fire a plain (non-triggered) run of `project` via `weft run` and return its
@@ -83,13 +83,32 @@ fn parse_color(stdout: &str) -> Result<Uuid> {
 /// execution (the Fire), not a pre-existing one (e.g. the TriggerSetup run that
 /// activation created). Returns an empty set if the project has no executions.
 pub async fn execution_colors(disp: &Dispatcher, project_id: &Uuid) -> Result<HashSet<Uuid>> {
-    let all: Vec<Value> = disp.get_json("/executions").await?;
-    let pid = project_id.to_string();
-    Ok(all
-        .into_iter()
-        .filter(|e| e.get("project_id").and_then(Value::as_str) == Some(pid.as_str()))
-        .filter_map(|e| e.get("color").and_then(Value::as_str).and_then(|c| Uuid::parse_str(c).ok()))
-        .collect())
+    // `/executions` is paginated (`{ executions, total }`) with a server-side
+    // project filter; walk the pages so the snapshot is complete.
+    let mut colors = HashSet::new();
+    let mut offset = 0u32;
+    loop {
+        let page: Value = disp
+            .get_json(&format!(
+                "/executions?project_id={project_id}&limit=200&offset={offset}"
+            ))
+            .await?;
+        let batch = page
+            .get("executions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("/executions returned no `executions` array: {page}"))?;
+        let n = batch.len() as u32;
+        colors.extend(batch.iter().filter_map(|e| {
+            e.get("color")
+                .and_then(Value::as_str)
+                .and_then(|c| Uuid::parse_str(c).ok())
+        }));
+        offset += n;
+        let total = page.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
+        if n == 0 || offset >= total {
+            return Ok(colors);
+        }
+    }
 }
 
 /// Wait for a NEW execution to appear for `project_id` that is not in `known`

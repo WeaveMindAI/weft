@@ -35,6 +35,7 @@ pub fn prompt_trigger_deactivation(
     mode: Option<&str>,
     grace: Option<u32>,
     running_policy: Option<&str>,
+    drain_timeout: Option<u64>,
 ) -> anyhow::Result<serde_json::Value> {
     // Mode resolution priority: explicit --mode flag > interactive
     // prompt (human terminal only) > error (json mode).
@@ -81,6 +82,13 @@ pub fn prompt_trigger_deactivation(
     if let Some(g) = grace_minutes {
         obj.insert("graceMinutes".into(), serde_json::json!(g));
     }
+    // The drain cap only rides a wait ("wait at most N seconds, then
+    // proceed anyway"); absent = the server default.
+    if running_policy == RunningPolicy::Wait {
+        if let Some(cap) = drain_timeout {
+            obj.insert("drainTimeoutSecs".into(), serde_json::json!(cap));
+        }
+    }
     Ok(serde_json::Value::Object(obj))
 }
 
@@ -110,10 +118,12 @@ pub async fn run(
     mode: Option<String>,
     grace: Option<u32>,
     running_policy: Option<String>,
+    drain_timeout: Option<u64>,
 ) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Deactivate, |progress| async move {
-        run_inner(&ctx_inner, &progress, project, mode, grace, running_policy).await
+        run_inner(&ctx_inner, &progress, project, mode, grace, running_policy, drain_timeout)
+            .await
     })
     .await
 }
@@ -125,6 +135,7 @@ async fn run_inner(
     mode: Option<String>,
     grace: Option<u32>,
     running_policy: Option<String>,
+    drain_timeout: Option<u64>,
 ) -> anyhow::Result<()> {
     let (client, id, name) = match project {
         Some(id) => (ctx.client(), id.clone(), id),
@@ -148,6 +159,7 @@ async fn run_inner(
         resolved_mode.as_deref(),
         grace,
         running_policy.as_deref(),
+        drain_timeout,
     )?;
 
     let path = format!("/projects/{id}/deactivate");

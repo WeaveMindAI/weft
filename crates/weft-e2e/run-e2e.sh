@@ -10,8 +10,17 @@
 # this script halts right there so you can look.
 #
 # Usage:
-#   crates/weft-e2e/run-e2e.sh                # every test, in order, stop on first fail
-#   crates/weft-e2e/run-e2e.sh listener_move  # just these test binaries, in order
+#   crates/weft-e2e/run-e2e.sh                   # every test, in order, stop on first fail
+#   crates/weft-e2e/run-e2e.sh listener_move     # just these test binaries, in order
+#   crates/weft-e2e/run-e2e.sh --from storage    # the full ordered suite, but START at
+#                                                # the first test whose name contains
+#                                                # `storage`, skipping everything before it
+#
+# `--from <name>` is the "resume where it broke" switch: when a mid-suite run
+# stops on a failure, re-run with `--from <that_test>` (a substring is enough) to
+# pick up from that test through the end, in the same order, without listing the
+# rest by hand. It matches against the FULL ordered suite, so the heavy tests
+# still run last.
 #
 # On failure the script prints which test failed and exits non-zero; the cluster
 # is left as-is for investigation (see the crate README for the read-only kubectl
@@ -50,9 +59,34 @@ for t in "${DISCOVERED[@]}"; do
 done
 ALL_TESTS=("${LIGHT[@]}" "${HEAVY[@]}")
 
-TESTS=("$@")
-if [ ${#TESTS[@]} -eq 0 ]; then
-  TESTS=("${ALL_TESTS[@]}")
+# `--from <name>`: run the full ordered suite starting at the first test whose
+# name contains <name> (a substring), through the end. The "resume where it
+# broke" switch, so a mid-suite failure needs no re-listing of what's left.
+if [ "${1:-}" = "--from" ]; then
+  FROM="${2:-}"
+  if [ -z "$FROM" ]; then
+    echo "--from needs a test name (substring), e.g. --from storage_multipart" >&2
+    exit 1
+  fi
+  START=-1
+  for i in "${!ALL_TESTS[@]}"; do
+    if [[ "${ALL_TESTS[$i]}" == *"$FROM"* ]]; then
+      START=$i
+      break
+    fi
+  done
+  if [ "$START" -lt 0 ]; then
+    echo "--from: no test name contains '$FROM'. Known tests, in run order:" >&2
+    printf '  %s\n' "${ALL_TESTS[@]}" >&2
+    exit 1
+  fi
+  TESTS=("${ALL_TESTS[@]:$START}")
+  echo "Resuming from '${ALL_TESTS[$START]}' (${#TESTS[@]} test(s) remaining)."
+else
+  TESTS=("$@")
+  if [ ${#TESTS[@]} -eq 0 ]; then
+    TESTS=("${ALL_TESTS[@]}")
+  fi
 fi
 
 for t in "${TESTS[@]}"; do

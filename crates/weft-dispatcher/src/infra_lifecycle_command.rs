@@ -67,7 +67,19 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             -- unit's `on_stop` (so a NoOp unit comes down too). The
             -- explicit "I accept the downtime, take it all down so I
             -- can update it" override. Default false.
-            force             BOOLEAN NOT NULL DEFAULT FALSE
+            force             BOOLEAN NOT NULL DEFAULT FALSE,
+            -- The user requested cancellation of this command while it
+            -- was CLAIMED (in flight). The executing supervisor polls
+            -- this between kubectl steps and halts (leaving per-node
+            -- partial state visible; kubectl is not transactional).
+            -- Pending unclaimed rows are cancelled outright (outcome =
+            -- 'cancelled') instead of flagged.
+            cancel_requested  BOOLEAN NOT NULL DEFAULT FALSE,
+            -- Cap on the running_policy=wait drain before the op
+            -- proceeds anyway (loud warning). Per-command: the user
+            -- picks it with the wait choice; the default mirrors
+            -- weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS.
+            drain_timeout_secs BIGINT NOT NULL DEFAULT 600
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_pending
               ON infra_lifecycle_command(tenant_id)
@@ -115,6 +127,7 @@ pub async fn issue_lifecycle(
     verb: InfraLifecycleVerb,
     running_policy: RunningPolicy,
     force: bool,
+    drain_timeout_secs: u64,
     issued_by_pod: &str,
 ) -> Result<i64> {
     assert!(
@@ -123,8 +136,9 @@ pub async fn issue_lifecycle(
     );
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, running_policy, force, issued_by_pod, issued_at_unix) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, EXTRACT(EPOCH FROM NOW())::BIGINT) \
+         (tenant_id, project_id, node_id, verb, running_policy, force, drain_timeout_secs, \
+          issued_by_pod, issued_at_unix) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT) \
          RETURNING id",
     )
     .bind(tenant_id)
@@ -133,6 +147,7 @@ pub async fn issue_lifecycle(
     .bind(verb.as_str())
     .bind(running_policy.as_str())
     .bind(force)
+    .bind(drain_timeout_secs as i64)
     .bind(issued_by_pod)
     .fetch_one(pool)
     .await?;
@@ -386,6 +401,87 @@ pub async fn wait_for_commands(
         .iter()
         .map(|id| (*id, done.get(id).cloned().expect("loop filled every id")))
         .collect())
+}
+
+/// Whether any supervisor-verb lifecycle command (apply / stop /
+/// terminate) is uncompleted for the project. The dispatcher-side
+/// "infra operation in flight" fact: while it holds, the
+/// reconciliation treats the project as infra-transitional (only
+/// infra_cancel offered), which is what stops NEW runs from starving
+/// a stop/terminate drain (the drain waits for the running set to
+/// empty; a new run would keep refilling it). In-flight work is
+/// untouched; only new launches are gated.
+pub async fn any_in_flight(pool: &PgPool, project_id: &str) -> Result<bool> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS( \
+             SELECT 1 FROM infra_lifecycle_command \
+             WHERE project_id = $1 \
+               AND completed_at_unix IS NULL \
+               AND verb IN ('apply', 'stop', 'terminate') \
+         )",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+/// Cancel every in-flight lifecycle command for a project: flag
+/// CLAIMED rows (`cancel_requested = TRUE`; the executing supervisor
+/// polls the flag between kubectl steps and halts) and complete
+/// still-UNCLAIMED rows outright with outcome `cancelled` (nothing has
+/// touched the cluster for them yet). Flag first, then complete: a row
+/// claimed between the two statements has its flag already set, so no
+/// window exists where a command escapes the cancel. Returns how many
+/// rows were touched.
+pub async fn request_cancel_project(pool: &PgPool, project_id: &str) -> Result<u64> {
+    let flagged = sqlx::query(
+        "UPDATE infra_lifecycle_command SET cancel_requested = TRUE \
+         WHERE project_id = $1 AND completed_at_unix IS NULL",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let completed = sqlx::query(
+        "UPDATE infra_lifecycle_command \
+         SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
+             outcome = 'cancelled', \
+             outcome_message = 'cancelled by user before execution' \
+         WHERE project_id = $1 \
+           AND completed_at_unix IS NULL \
+           AND claimed_by_pod IS NULL",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    // `flagged` counted the completed ones too (they were uncompleted
+    // at flag time); the touched total is just `flagged`, `completed`
+    // is informational.
+    tracing::info!(
+        target: "weft_dispatcher::infra_lifecycle_command",
+        project_id,
+        flagged,
+        cancelled_unclaimed = completed,
+        "infra cancel requested"
+    );
+    Ok(flagged)
+}
+
+/// Whether a claimed command's cancellation was requested. Read by the
+/// broker's supervisor endpoint so the executing supervisor can poll
+/// mid-command.
+pub async fn cancel_requested(pool: &PgPool, command_id: i64) -> Result<bool> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT cancel_requested FROM infra_lifecycle_command WHERE id = $1",
+    )
+    .bind(command_id)
+    .fetch_optional(pool)
+    .await?;
+    // A missing row (removed project) reads as cancelled: the executor
+    // should stop working on it either way.
+    Ok(row.map(|(c,)| c).unwrap_or(true))
 }
 
 /// Drop every row for a project. Called on `weft rm`.

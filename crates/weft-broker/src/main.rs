@@ -30,12 +30,26 @@ async fn main() -> anyhow::Result<()> {
     let audience = std::env::var("WEFT_BROKER_AUDIENCE")
         .unwrap_or_else(|_| "weft-broker".into());
 
+    // The object-store slot (the bundled SeaweedFS in open weft / local dev).
+    // Required for the runtime-file plane; a deploy without it boots but the
+    // runtime-storage routes fail loud (set WEFT_OBJECT_STORE_ENDPOINT + creds).
+    let object_store = weft_platform_traits::object_store_from_env()
+        .await
+        .context("init object store slot")?;
+    // The storage-budget policy: a generous host-bounded default. A
+    // per-tenant source can be passed instead.
+    let entitlements =
+        std::sync::Arc::new(weft_broker::entitlement::LocalEntitlementSource::from_env());
+
     let state = weft_broker::BrokerState::new(
         &database_url,
         weft_broker::AuthConfig { audience },
+        object_store,
+        entitlements,
     )
     .await?;
 
+    weft_broker::spawn_expiry_sweep(state.clone());
     let app = weft_broker::router(state);
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = tokio::net::TcpListener::bind(addr)

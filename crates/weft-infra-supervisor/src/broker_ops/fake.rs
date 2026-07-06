@@ -77,6 +77,10 @@ pub enum BrokerCall {
     CommandComplete {
         command_id: i64,
         error: Option<String>,
+        cancelled: bool,
+    },
+    CommandCancelRequested {
+        command_id: i64,
     },
     RunningCount {
         project_id: String,
@@ -141,8 +145,14 @@ struct Inner {
     /// Per-(project, node) image tag map returned by `project_image_tags`.
     image_tags: HashMap<(String, String), HashMap<String, String>>,
 
-    /// Completed lifecycle commands (id -> optional error message).
-    completed_commands: Vec<(i64, Option<String>)>,
+    /// Completed lifecycle commands (id, optional error message,
+    /// cancelled flag).
+    completed_commands: Vec<(i64, Option<String>, bool)>,
+
+    /// Per-command `cancel_requested` flag returned by
+    /// `command_cancel_requested`. Absent = false. Tests set it to
+    /// simulate the user's `/infra/cancel` landing mid-command.
+    cancel_requested: HashMap<i64, bool>,
 
     /// project_id of each claimed command, so `command_complete` (which
     /// carries only a command_id) can apply the same per-project
@@ -410,18 +420,37 @@ impl FakeBroker {
             .cloned()
     }
 
-    /// `command_complete` calls that recorded an error.
+    /// `command_complete` calls that recorded an error (cancelled
+    /// completions excluded: a cancel is not a failure).
     pub fn failed_commands(&self) -> Vec<(i64, String)> {
         self.inner
             .lock()
             .completed_commands
             .iter()
-            .filter_map(|(id, err)| err.as_ref().map(|e| (*id, e.clone())))
+            .filter(|(_, _, cancelled)| !cancelled)
+            .filter_map(|(id, err, _)| err.as_ref().map(|e| (*id, e.clone())))
             .collect()
     }
 
-    pub fn completed_commands(&self) -> Vec<(i64, Option<String>)> {
+    pub fn completed_commands(&self) -> Vec<(i64, Option<String>, bool)> {
         self.inner.lock().completed_commands.clone()
+    }
+
+    /// Script the user's `/infra/cancel` landing mid-command: the next
+    /// `command_cancel_requested(command_id)` poll returns true.
+    pub fn set_cancel_requested(&self, command_id: i64) {
+        self.inner.lock().cancel_requested.insert(command_id, true);
+    }
+
+    /// Commands completed with the `cancelled` outcome.
+    pub fn cancelled_commands(&self) -> Vec<i64> {
+        self.inner
+            .lock()
+            .completed_commands
+            .iter()
+            .filter(|(_, _, cancelled)| *cancelled)
+            .map(|(id, _, _)| *id)
+            .collect()
     }
 }
 
@@ -608,11 +637,13 @@ impl BrokerSupervisorOps for FakeBroker {
         _pod_name: &str,
         command_id: i64,
         error: Option<&str>,
+        cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>> {
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::CommandComplete {
             command_id,
             error: error.map(|s| s.to_string()),
+            cancelled,
         });
         // Ownership-gated, like the broker: if this pod lost ownership of
         // the command's project, completion is rejected (Raced) and the
@@ -624,10 +655,18 @@ impl BrokerSupervisorOps for FakeBroker {
         }
         inner
             .completed_commands
-            .push((command_id, error.map(|s| s.to_string())));
+            .push((command_id, error.map(|s| s.to_string()), cancelled));
         Ok(weft_broker_client::WriteOutcome::Applied(
             weft_broker_client::protocol::SupervisorCommandCompleteResponse {},
         ))
+    }
+
+    async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        inner
+            .calls
+            .push(BrokerCall::CommandCancelRequested { command_id });
+        Ok(inner.cancel_requested.get(&command_id).copied().unwrap_or(false))
     }
 
     async fn running_count(&self, project_id: &str) -> Result<i64> {
@@ -857,6 +896,8 @@ mod tests {
             running_policy: Some(weft_broker_client::protocol::RunningPolicy::Wait),
             spec_json: None,
             force: false,
+            drain_timeout_secs:
+                weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
         });
         let cmd1 = b.claim_command("pod1").await.unwrap();
         assert!(cmd1.is_some());

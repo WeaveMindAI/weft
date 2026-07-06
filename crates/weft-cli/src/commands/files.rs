@@ -1,10 +1,8 @@
-//! `weft files ...` + `weft storage ...`: browse and manage the
-//! tenant's stored files, and configure the backing-disk profile.
+//! `weft files ...`: browse and manage the tenant's stored files.
 //!
-//! Download is the brokered-handshake-then-direct path: the
-//! dispatcher authenticates + returns the box's public URL with a
-//! short-lived capability; the bytes then stream STRAIGHT from the
-//! box (never through the dispatcher).
+//! Download is the brokered-handshake-then-direct path: the dispatcher
+//! authenticates + returns a short-lived PRESIGNED bucket URL; the bytes then
+//! stream STRAIGHT from the storage bucket (never through the dispatcher).
 
 use std::collections::BTreeMap;
 
@@ -22,6 +20,16 @@ fn project_query(ctx: &Ctx) -> String {
     }
 }
 
+/// The SCOPE portion of a wire key: the bucket is shared and keys
+/// are tenant-anchored (`<tenant>/<scope>/<owner>/<id>`), but the user
+/// thinks + types in the scope portion (`<scope>/<owner>/<id>`). Strip
+/// the leading tenant segment for display, matching, and prefix filters.
+/// The dispatcher re-adds the caller's tenant on the way back in, so the
+/// user never sees or types it.
+fn scope_key(wire_key: &str) -> &str {
+    wire_key.split_once('/').map(|(_tenant, rest)| rest).unwrap_or(wire_key)
+}
+
 fn fmt_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes as f64;
@@ -37,6 +45,16 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
+/// Short human duration for a remaining lifetime: "45s", "4m", "3h", "12d".
+fn fmt_remaining(secs: i64) -> String {
+    match secs {
+        s if s < 60 => format!("{}s", s.max(1)),
+        s if s < 3600 => format!("{}m", (s + 59) / 60),
+        s if s < 86400 => format!("{}h", (s + 3599) / 3600),
+        s => format!("{}d", (s + 86399) / 86400),
+    }
+}
+
 /// `weft files ls [PREFIX]`: list, organized by scope (project
 /// spaces / shared spaces / past-execution survivors + scratch).
 pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
@@ -49,7 +67,7 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
             .context("parse files listing")?;
     let files: Vec<_> = files
         .into_iter()
-        .filter(|f| prefix.as_deref().map(|p| f.key.starts_with(p)).unwrap_or(true))
+        .filter(|f| prefix.as_deref().map(|p| scope_key(&f.key).starts_with(p)).unwrap_or(true))
         .collect();
     if ctx.json() {
         println!("{}", serde_json::to_string(&files)?);
@@ -59,14 +77,14 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
         println!("(no stored files)");
         return Ok(());
     }
-    // Group by `<scope>/<owner>/`.
+    // Group by the SCOPE space `<scope>/<owner>/` (tenant stripped).
     let mut groups: BTreeMap<String, Vec<&weft_core::storage::StoredFileMeta>> = BTreeMap::new();
     for f in &files {
-        let space = f
-            .key
+        let scope = scope_key(&f.key);
+        let space = scope
             .rsplit_once('/')
             .map(|(s, _)| s.to_string())
-            .unwrap_or_else(|| f.key.clone());
+            .unwrap_or_else(|| scope.to_string());
         groups.entry(space).or_default().push(f);
     }
     for (space, entries) in groups {
@@ -80,8 +98,16 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
         println!("{label}");
         for f in entries {
             let keep = if f.keep { " keep" } else { "" };
+            // Remaining lifetime, not a raw timestamp: a kept file's TTL, or an
+            // ended run's un-kept output in its post-run linger window.
             let expiry = match f.expires_at_unix {
-                Some(t) => format!(" expires={t}"),
+                Some(t) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(t);
+                    format!(" deleted in {}", fmt_remaining(t - now))
+                }
                 None => String::new(),
             };
             println!(
@@ -103,7 +129,9 @@ pub async fn inspect(ctx: Ctx, key: String) -> anyhow::Result<()> {
         .await?;
     let files: Vec<weft_core::storage::StoredFileMeta> =
         serde_json::from_value(resp.get("files").cloned().unwrap_or_default())?;
-    let Some(meta) = files.into_iter().find(|f| f.key == key) else {
+    // The user types the scope key; match it against each wire key's
+    // scope portion (tenant stripped).
+    let Some(meta) = files.into_iter().find(|f| scope_key(&f.key) == key) else {
         anyhow::bail!("no stored file with key '{key}' (see `weft files ls`)");
     };
     println!("{}", serde_json::to_string_pretty(&meta)?);
@@ -111,7 +139,8 @@ pub async fn inspect(ctx: Ctx, key: String) -> anyhow::Result<()> {
 }
 
 /// `weft files download <KEY> [-o OUT]`: handshake with the
-/// dispatcher, then stream the bytes DIRECTLY from the box.
+/// dispatcher for a presigned URL, then stream the bytes DIRECTLY from the
+/// storage bucket.
 /// Max number of CONSECUTIVE zero-progress resumes before giving up
 /// (a resume that advances the byte count resets the counter). A
 /// download of any size and any duration survives blips: each resume
@@ -120,26 +149,41 @@ pub async fn inspect(ctx: Ctx, key: String) -> anyhow::Result<()> {
 /// offset failing over and over) is abandoned.
 const DOWNLOAD_RESUME_ATTEMPTS: u32 = 20;
 
-/// Ask the dispatcher for a fresh download pass (the brokered
-/// handshake): the dispatcher authenticates, then returns the box's
-/// public URL carrying a short-lived single-file capability. The
-/// bytes stream DIRECTLY from the box at that URL; the dispatcher is
-/// not in the byte path.
+/// The download handshake result: the presigned bucket URL + the file's name +
+/// total size. A presigned S3 GET carries no `x-weft-meta`, so the name (default
+/// output path) and size (completeness check) come from the handshake, not the
+/// byte stream's headers.
+struct DownloadHandshake {
+    url: String,
+    filename: String,
+    size_bytes: u64,
+}
+
+/// Ask the dispatcher for a fresh download pass (the brokered handshake): the
+/// dispatcher authenticates, then returns a short-lived presigned bucket URL for
+/// the single file plus its name + size. The bytes stream DIRECTLY from the
+/// storage bucket at that URL; the dispatcher is not in the byte path.
 async fn mint_download_url(
     client: &crate::client::DispatcherClient,
     key: &str,
     project: &Option<String>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<DownloadHandshake> {
     let resp = client
         .post_json(
             "/storage/files/download",
             &serde_json::json!({ "key": key, "project": project }),
         )
         .await?;
-    resp.get("url")
+    let url = resp
+        .get("url")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .context("dispatcher returned no download url")
+        .context("dispatcher returned no download url")?;
+    let filename = resp.get("filename").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let size_bytes = resp.get("sizeBytes").and_then(|v| v.as_u64()).context(
+        "download handshake returned no sizeBytes; cannot verify completeness",
+    )?;
+    Ok(DownloadHandshake { url, filename, size_bytes })
 }
 
 pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::Result<()> {
@@ -147,37 +191,74 @@ pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::
     let project = ctx.project().ok().map(|p| p.id().to_string());
     let http = reqwest::Client::new();
 
-    // First handshake: also tells us the filename (for the default
-    // output path) and the total size (so we know when we are done).
-    let mut url = mint_download_url(&client, &key, &project).await?;
-    let head = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
-    if !head.status().is_success() {
-        let status = head.status();
-        let body = head.text().await.unwrap_or_default();
-        anyhow::bail!("download failed ({status}): {body}");
-    }
-    // `x-weft-meta` carries the file's total size, which is the ONLY
-    // signal that the download is complete. The box sets it on every
-    // response, so a missing/unparseable header is a hard error: never
-    // downgrade to "no verification" (that would let a truncated body
-    // report success). Fail loud instead.
-    let meta: weft_core::storage::StoredFileMeta = head
-        .headers()
-        .get("x-weft-meta")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .context(
-            "download response missing a valid x-weft-meta header; cannot verify completeness",
-        )?;
-    let total = meta.size_bytes;
+    // First handshake: returns the presigned URL + the file's name (default
+    // output path) and total size (the completeness signal). The presigned
+    // bucket GET carries no per-file metadata header, so the size comes from the
+    // handshake, a trusted control-plane source, not the byte stream.
+    let handshake = mint_download_url(&client, &key, &project).await?;
+    let url = handshake.url;
+    let total = handshake.size_bytes;
     let out_path = output.unwrap_or_else(|| {
-        Some(meta.filename.clone())
+        Some(handshake.filename)
             .filter(|f| !f.is_empty())
             .unwrap_or_else(|| key.rsplit('/').next().unwrap_or("download.bin").to_string())
     });
-    let mut file = tokio::fs::File::create(&out_path)
+    // Download to a sibling temp file, then atomically rename onto `out_path` only
+    // after the transfer completes and passes the size check. This means (a) a
+    // failed/partial download never leaves a plausible-looking half-file at
+    // `out_path`, and (b) an existing `out_path` is untouched until success (the
+    // old code truncated it up front with `File::create`, so a mid-transfer failure
+    // destroyed the user's previous copy). The temp lives in the same directory so
+    // the rename is a same-filesystem atomic move. On any error we remove it.
+    let tmp_path = format!("{out_path}.{}.weft-partial", uuid::Uuid::new_v4().simple());
+    let result = download_to_tmp(&http, &client, &key, &project, url, total, &tmp_path).await;
+    match result {
+        Ok(written) => {
+            tokio::fs::rename(&tmp_path, &out_path)
+                .await
+                .with_context(|| format!("finalize download: rename {tmp_path} -> {out_path}"))?;
+            println!("downloaded {} ({}) -> {out_path}", key, fmt_size(written));
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort cleanup of the partial temp file; the transfer error is
+            // the one the user sees. A leftover temp (if even the remove fails) is
+            // named `.weft-partial` so it is obviously disposable.
+            if let Err(rm) = tokio::fs::remove_file(&tmp_path).await {
+                if rm.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("warning: could not remove partial download {tmp_path}: {rm}");
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Stream the download into `tmp_path`, resuming on network drops, and return the
+/// total bytes written on success. All failure surfaces (network stall, bad
+/// resume, local write error, truncated result) return `Err` and leave the temp
+/// file for the caller to clean up.
+#[allow(clippy::too_many_arguments)]
+async fn download_to_tmp(
+    http: &reqwest::Client,
+    client: &crate::client::DispatcherClient,
+    key: &str,
+    project: &Option<String>,
+    first_url: String,
+    total: u64,
+    tmp_path: &str,
+) -> anyhow::Result<u64> {
+    let mut url = first_url;
+    // The initial full-body GET (byte 0 onward). Not a HEAD: it streams the file.
+    let first = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    if !first.status().is_success() {
+        let status = first.status();
+        let body = first.text().await.unwrap_or_default();
+        anyhow::bail!("download failed ({status}): {body}");
+    }
+    let mut file = tokio::fs::File::create(tmp_path)
         .await
-        .with_context(|| format!("create {out_path}"))?;
+        .with_context(|| format!("create {tmp_path}"))?;
 
     // Stream the first response, then resume on any mid-stream drop:
     // re-handshake (fresh pass) and continue from the byte offset we
@@ -185,7 +266,7 @@ pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::
     // period would otherwise fail on an expired pass; the
     // re-handshake makes blips invisible.
     let mut written = 0u64;
-    let mut response = head;
+    let mut response = first;
     // Counts CONSECUTIVE resumes that made zero progress. Any resume
     // that advances `written` resets it, so a large file over a flaky
     // link survives unboundedly many drops as long as it keeps moving;
@@ -196,71 +277,83 @@ pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::
     loop {
         let before = written;
         let drained = drain_into(&mut response, &mut file, &mut written).await;
-        match drained {
+        let body_err = match drained {
             Ok(()) => break, // stream ended cleanly
-            Err(e) => {
-                // Done already? (A clean EOF can surface as the body
-                // ending exactly at `total`; treat that as success.)
-                if total == written {
-                    break;
-                }
-                if written > before {
-                    stalls = 0; // forward progress; reset the stall counter
-                } else {
-                    stalls += 1;
-                }
-                if stalls > DOWNLOAD_RESUME_ATTEMPTS {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "download of '{key}' stalled; gave up after \
-                             {DOWNLOAD_RESUME_ATTEMPTS} consecutive resumes made no progress, \
-                             stuck at {} of {}",
-                            fmt_size(written),
-                            fmt_size(total),
-                        )
-                    });
-                }
-                eprintln!(
-                    "download interrupted at {} ({}); resuming...",
-                    fmt_size(written),
-                    e
-                );
-                url = mint_download_url(&client, &key, &project).await?;
-                let resumed = http
-                    .get(&url)
-                    .header("range", format!("bytes={written}-"))
-                    .send()
-                    .await
-                    .with_context(|| format!("resume GET {url}"))?;
-                let status = resumed.status();
-                // A resume MUST come back as 206 Partial Content
-                // starting exactly where we stopped. A 200 (range
-                // ignored, full body from byte 0) would append a second
-                // copy onto what we already wrote, silently corrupting
-                // the file. Reject anything but a 206 at the right
-                // offset, loudly.
-                if status != reqwest::StatusCode::PARTIAL_CONTENT {
-                    let body = resumed.text().await.unwrap_or_default();
-                    anyhow::bail!(
-                        "resume of '{key}' did not return partial content (got {status}); \
-                         the server ignored the Range request, refusing to corrupt the file: {body}"
-                    );
-                }
-                let range_start = resumed
-                    .headers()
-                    .get("content-range")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(parse_content_range_start);
-                if range_start != Some(written) {
-                    anyhow::bail!(
-                        "resume of '{key}' returned the wrong byte offset \
-                         (asked for {written}, server reported {range_start:?}); \
-                         refusing to corrupt the file"
-                    );
-                }
-                response = resumed;
+            // A local write error is fatal: re-handshaking cannot fix a full or
+            // read-only disk, and looping would spin against an unfixable condition.
+            // Surface it immediately with a disk-oriented message.
+            Err(DrainError::Write(e)) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "download of '{key}' could not write to disk at {} of {} \
+                         (out of space or the path is not writable)",
+                        fmt_size(written),
+                        fmt_size(total),
+                    )
+                });
             }
+            // A network drop is resumable: fall through to the re-handshake below.
+            Err(DrainError::Body(e)) => e,
+        };
+
+        // Done already? (A clean EOF can surface as the body
+        // ending exactly at `total`; treat that as success.)
+        if total == written {
+            break;
         }
+        if written > before {
+            stalls = 0; // forward progress; reset the stall counter
+        } else {
+            stalls += 1;
+        }
+        if stalls > DOWNLOAD_RESUME_ATTEMPTS {
+            return Err(body_err).with_context(|| {
+                format!(
+                    "download of '{key}' stalled; gave up after \
+                     {DOWNLOAD_RESUME_ATTEMPTS} consecutive resumes made no progress, \
+                     stuck at {} of {}",
+                    fmt_size(written),
+                    fmt_size(total),
+                )
+            });
+        }
+        eprintln!(
+            "download interrupted at {} ({}); resuming...",
+            fmt_size(written),
+            body_err
+        );
+        url = mint_download_url(client, key, project).await?.url;
+        let resumed = http
+            .get(&url)
+            .header("range", format!("bytes={written}-"))
+            .send()
+            .await
+            .with_context(|| format!("resume GET {url}"))?;
+        let status = resumed.status();
+        // A resume MUST come back as 206 Partial Content starting exactly where we
+        // stopped. A 200 (range ignored, full body from byte 0) would append a
+        // second copy onto what we already wrote, silently corrupting the file.
+        // Reject anything but a 206 at the right offset, loudly.
+        if status != reqwest::StatusCode::PARTIAL_CONTENT {
+            let body = resumed.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "resume of '{key}' did not return partial content (got {status}); \
+                 the server ignored the Range request, refusing to corrupt the file: {body}"
+            );
+        }
+        let range_start = resumed
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range_start);
+        if range_start != Some(written) {
+            anyhow::bail!(
+                "resume of '{key}' returned the wrong byte offset \
+                 (asked for {written}, server reported {range_start:?}); \
+                 refusing to corrupt the file"
+            );
+        }
+        response = resumed;
     }
 
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
@@ -271,23 +364,44 @@ pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::
             fmt_size(total),
         );
     }
-    println!("downloaded {} ({}) -> {out_path}", key, fmt_size(written));
-    Ok(())
+    Ok(written)
 }
 
-/// Pipe a response body into `file`, advancing `written`. Returns the
-/// stream error on a mid-transfer drop (the caller resumes), or `Ok`
-/// when the body ends.
+/// Why `drain_into` stopped short of a clean body end. The two kinds are handled
+/// very differently: a `Body` error (the network dropped mid-stream) is RESUMABLE
+/// (re-handshake + Range from where we are); a `Write` error (the local disk is
+/// full / read-only) is FATAL (no amount of resuming fixes it, and re-handshaking
+/// would loop forever against an unfixable local condition).
+enum DrainError {
+    Body(reqwest::Error),
+    Write(std::io::Error),
+}
+
+/// Pipe a response body into `file`, advancing `written` by bytes ACTUALLY WRITTEN
+/// (never by bytes merely received), so a partial write can't desync the counter
+/// from the file and send a resume to the wrong offset. Returns `Ok` when the body
+/// ends cleanly, a `Body` error on a network drop (resumable), or a `Write` error
+/// on a local write failure (fatal).
 async fn drain_into(
     response: &mut reqwest::Response,
     file: &mut tokio::fs::File,
     written: &mut u64,
-) -> anyhow::Result<()> {
-    while let Some(chunk) = response.chunk().await.context("download stream")? {
-        *written += chunk.len() as u64;
-        tokio::io::AsyncWriteExt::write_all(file, &chunk).await?;
+) -> Result<(), DrainError> {
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                tokio::io::AsyncWriteExt::write_all(file, &chunk)
+                    .await
+                    .map_err(DrainError::Write)?;
+                // Only count bytes that reached the file: write_all either writes
+                // the whole chunk or returns Err (which we propagated above), so on
+                // reaching here every byte of `chunk` is on disk.
+                *written += chunk.len() as u64;
+            }
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(DrainError::Body(e)),
+        }
     }
-    Ok(())
 }
 
 /// Start offset of a `Content-Range: bytes <start>-<last>/<total>`
@@ -327,7 +441,11 @@ pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
             let files: Vec<weft_core::storage::StoredFileMeta> =
                 serde_json::from_value(resp.get("files").cloned().unwrap_or_default())
                     .context("parse files listing")?;
-            let victims: Vec<_> = files.iter().filter(|f| f.key.starts_with(&target)).collect();
+            // `target` is a scope prefix/key; match each wire key's scope
+            // portion (tenant stripped) so the preview shows the real
+            // blast radius the dispatcher will wipe.
+            let victims: Vec<_> =
+                files.iter().filter(|f| scope_key(&f.key).starts_with(&target)).collect();
             if victims.is_empty() {
                 println!("nothing under '{target}' to remove");
                 return Ok(());
@@ -368,68 +486,20 @@ pub async fn usage(ctx: Ctx) -> anyhow::Result<()> {
         println!("{resp}");
         return Ok(());
     }
-    if !resp.get("provisioned").and_then(|v| v.as_bool()).unwrap_or(false) {
-        println!("no storage box provisioned (nothing stored)");
-        return Ok(());
-    }
     let stored = resp.get("storedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
     let count = resp.get("fileCount").and_then(|v| v.as_u64()).unwrap_or(0);
-    println!("stored: {} across {count} file(s)", fmt_size(stored));
-    if let Some(disks) = resp.get("disks").and_then(|v| v.as_array()) {
-        for d in disks {
-            let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let free = d.get("freeBytes").and_then(|v| v.as_u64()).unwrap_or(0);
-            let total = d.get("totalBytes").and_then(|v| v.as_u64()).unwrap_or(0);
-            let draining = d.get("draining").and_then(|v| v.as_bool()).unwrap_or(false);
-            let tag = if draining { "  (draining)" } else { "" };
-            println!("  {name}: {} free of {}{tag}", fmt_size(free), fmt_size(total));
-        }
+    if count == 0 {
+        println!("nothing stored");
+    } else {
+        println!("stored: {} across {count} file(s)", fmt_size(stored));
     }
     Ok(())
 }
 
-/// `weft storage config [--class C] [--disk-gib N]`: view or set the
-/// per-tenant backing-disk profile (StorageClass + unit size).
-/// Applies to disks provisioned from now on.
-pub async fn config(
-    ctx: Ctx,
-    storage_class: Option<String>,
-    disk_gib: Option<u64>,
-) -> anyhow::Result<()> {
-    let client = ctx.client();
-    let q = project_query(&ctx);
-    if storage_class.is_none() && disk_gib.is_none() {
-        let resp = client.get_json(&format!("/storage/profile{q}")).await?;
-        println!("{}", serde_json::to_string_pretty(&resp)?);
-        return Ok(());
-    }
-    // Partial update: read current, overlay the provided knobs.
-    let current = client.get_json(&format!("/storage/profile{q}")).await?;
-    let class = match &storage_class {
-        // `--class default` clears the override (cluster default).
-        Some(c) if c == "default" => None,
-        Some(c) => Some(c.clone()),
-        None => current
-            .get("storage_class")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-    };
-    let unit = disk_gib
-        .map(|g| (g as i64) << 30)
-        .unwrap_or_else(|| current.get("disk_unit_bytes").and_then(|v| v.as_i64()).unwrap_or(10 << 30));
-    let resp = client
-        .put_json(
-            &format!("/storage/profile{q}"),
-            &serde_json::json!({ "storage_class": class, "disk_unit_bytes": unit }),
-        )
-        .await?;
-    println!("profile updated: {}", serde_json::to_string(&resp)?);
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
-    use super::parse_content_range_start;
+    use super::{parse_content_range_start, scope_key};
 
     #[test]
     fn content_range_start_parses_or_rejects() {
@@ -439,5 +509,17 @@ mod tests {
         assert_eq!(parse_content_range_start("100-199/2000"), None);
         assert_eq!(parse_content_range_start("bytes */2000"), None);
         assert_eq!(parse_content_range_start(""), None);
+    }
+
+    #[test]
+    fn scope_key_strips_the_leading_tenant_segment() {
+        // A wire key is `<tenant>/<scope>/<owner>/<id>`; the CLI shows the
+        // tenant-less `<scope>/<owner>/<id>`.
+        assert_eq!(scope_key("alice/exec/c1/f0"), "exec/c1/f0");
+        assert_eq!(scope_key("alice/project/p1/f0"), "project/p1/f0");
+        // No slash: nothing to strip, returned as-is.
+        assert_eq!(scope_key("bare"), "bare");
+        // Only the FIRST segment is stripped (split_once), not every one.
+        assert_eq!(scope_key("t/a/b"), "a/b");
     }
 }

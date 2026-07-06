@@ -2,8 +2,8 @@
 //! runs `weft daemon start` / `weft infra up` and the right images
 //! land in the cluster. No external shell scripts.
 //!
-//! For cloud deploy these same helpers flip to registry push; only
-//! one place changes.
+//! A registry-backed build flips these same helpers to registry push;
+//! only one place changes.
 
 use std::path::{Path, PathBuf};
 
@@ -25,14 +25,22 @@ use tokio::process::Command;
 pub async fn ensure_worker_builder_base() -> Result<String> {
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-    let hash = crate::hash::compute_builder_base_hash(&root)?;
+    let hash = weft_compiler::hash::compute_builder_base_hash(&root)?;
     let short = hash.chars().take(16).collect::<String>();
     let tag = weft_compiler::worker_image::builder_base_tag(&short);
-    let dockerfile = root.join(crate::hash::BUILDER_BASE_DOCKERFILE);
+    let dockerfile = root.join(weft_compiler::hash::BUILDER_BASE_DOCKERFILE);
     // The tag is content-addressed (the hash covers every input the
     // build context reads, via `compute_builder_base_hash`), so a
     // present tag IS the right content: no stamp file needed.
     if !image_present(&tag).await? {
+        // Generate the warm-up crate into the base build context. The base
+        // compiles it to precook the rlibs every worker reuses (see
+        // `codegen::emit_warmup_crate`). It is derived purely from
+        // `fixed_worker_deps()`, so its content changes only when the engine /
+        // dep set does, which already moves the base hash via `crates/`.
+        let warmup_dir = root.join(weft_compiler::worker_image::WARMUP_CRATE_DIR);
+        weft_compiler::codegen::emit_warmup_crate(&warmup_dir, &root)
+            .map_err(|e| anyhow::anyhow!("emit builder-base warm-up crate: {e}"))?;
         build_image(&tag, &dockerfile, &root).await?;
     }
     // Builder-base images are large (~1GB+: debian + rustup +
@@ -62,7 +70,7 @@ pub async fn ensure_system_image(
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let dockerfile = root.join("deploy/docker").join(dockerfile_name);
-    let mut inputs = crate::hash::workspace_source_inputs(&root);
+    let mut inputs = weft_compiler::hash::workspace_source_inputs(&root);
     inputs.push((dockerfile_name.to_string(), dockerfile.clone()));
     for rel in extra_input_rels {
         inputs.push((rel.to_string(), root.join(rel)));
@@ -78,7 +86,9 @@ pub async fn ensure_system_image(
 
     if image_exists && have_hash.as_deref() == Some(want_hash.as_str()) {
         let reason = if rebuild { "no source changes" } else { "image cached" };
-        println!("image {tag} up to date ({reason}); skipping rebuild");
+        // Progress to stderr so `weft build-base --quiet` can capture only the tag
+        // on stdout (data on stdout, progress on stderr).
+        eprintln!("image {tag} up to date ({reason}); skipping rebuild");
         return Ok(false);
     }
 
@@ -106,7 +116,9 @@ pub async fn ensure_system_image(
 /// content-addressed builder base and the stamp-gated system images;
 /// staleness decisions live in the callers.
 async fn build_image(tag: &str, dockerfile: &Path, context: &Path) -> Result<()> {
-    println!(
+    // Progress to stderr (data on stdout, progress on stderr) so a `--quiet`
+    // caller capturing the resulting tag gets only the tag.
+    eprintln!(
         "building image {tag} (this may take several minutes on first run; \
          subsequent builds are incremental)"
     );
@@ -150,7 +162,7 @@ fn hash_inputs(inputs: &[(String, PathBuf)]) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for (label, path) in inputs {
-        crate::hash::hash_path(&mut hasher, label, path)?;
+        weft_compiler::hash::hash_path(&mut hasher, label, path)?;
     }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(16);

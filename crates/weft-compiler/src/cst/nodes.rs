@@ -509,7 +509,7 @@ mod tests {
         let (proj, _) = crate::weft_compiler::compile_lenient(
             src,
             uuid::Uuid::nil(),
-            None,
+            crate::file_reader::CompileFs::none(),
             crate::weft_compiler::IncludeMode::Interface,
             None,
         );

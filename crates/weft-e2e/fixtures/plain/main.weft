@@ -1,4 +1,3 @@
-# Project: e2e_plain
 # The simplest program: a literal Text flows into a Debug. A plain `weft run`
 # fires it; the rig asserts the Debug node received the literal value.
 

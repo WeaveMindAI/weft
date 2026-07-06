@@ -344,7 +344,7 @@ mod tests {
         CallerIdentity {
             scope: CallerScope::Tenant(tenant.to_string()),
             role: Role::Worker,
-            namespace: format!("wm-{tenant}"),
+            namespace: format!("wft-{tenant}"),
             pod_name: Some("pod-x".into()),
         }
     }

@@ -87,7 +87,9 @@ impl Project {
 
     /// Create a new project with a fresh id and the minimal files.
     /// Used by `weft new`. Returns an error if `weft.toml` already
-    /// exists in the target directory.
+    /// exists in the target directory. Build/CLI path (it seeds the stdlib
+    /// catalog), so gated behind `build`; the WASM parse build never scaffolds.
+    #[cfg(feature = "build")]
     pub fn init(root: &Path, name: &str) -> CompileResult<Self> {
         if root.join("weft.toml").exists() {
             return Err(CompileError::Project(format!(
@@ -97,29 +99,16 @@ impl Project {
         }
         std::fs::create_dir_all(root).map_err(CompileError::Io)?;
 
-        let manifest = ProjectManifest {
-            package: PackageSection {
-                name: name.to_string(),
-                id: Uuid::new_v4(),
-                version: Some("0.1.0".into()),
-                description: None,
-            },
-            dispatcher: DispatcherSection::default(),
-            build: BuildSection::default(),
-        };
-        let raw = toml::to_string_pretty(&manifest)
-            .map_err(|e| CompileError::Project(format!("serialize manifest: {e}")))?;
-        std::fs::write(root.join("weft.toml"), raw).map_err(CompileError::Io)?;
-
-        // Minimal main.weft with a single pure graph the user can
-        // edit immediately.
-        let main_weft = format!(
-            "# Project: {name}\n\n\
-             greeting = Text {{ value: \"hello world\" }}\n\
-             out = Debug\n\n\
-             out.value = greeting.value\n"
-        );
-        std::fs::write(root.join("main.weft"), main_weft).map_err(CompileError::Io)?;
+        // The canonical starter files (weft.toml + main.weft). Defined ONCE in
+        // `scaffold_files` so every caller of `weft new` produces byte-identical
+        // projects.
+        for (rel, bytes) in scaffold_files(name, Uuid::new_v4())? {
+            let path = root.join(&rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+            }
+            std::fs::write(path, bytes).map_err(CompileError::Io)?;
+        }
 
         std::fs::create_dir_all(root.join("nodes")).map_err(CompileError::Io)?;
         std::fs::create_dir_all(root.join(".weft")).map_err(CompileError::Io)?;
@@ -157,6 +146,7 @@ impl Project {
     /// The managed stdlib mirror under `nodes/`. Seeded at `weft new`
     /// and re-synced by `weft catalog update`. The user's own nodes
     /// live elsewhere under `nodes/`, never here.
+    #[cfg(feature = "build")]
     pub fn base_catalog_dir(&self) -> PathBuf {
         base_catalog_dir(&self.root)
     }
@@ -207,6 +197,7 @@ impl Project {
 }
 
 /// `nodes/base_catalog/` under a project root.
+#[cfg(feature = "build")]
 pub fn base_catalog_dir(project_root: &Path) -> PathBuf {
     project_root.join("nodes").join("base_catalog")
 }
@@ -218,6 +209,7 @@ pub fn base_catalog_dir(project_root: &Path) -> PathBuf {
 /// `nodes/`) are untouched. Used by `weft new` and `weft catalog
 /// update`. (A future registry replaces `stdlib_root()` as the source;
 /// the destination shape stays the same.)
+#[cfg(feature = "build")]
 pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
     let dest = base_catalog_dir(project_root);
     if dest.exists() {
@@ -231,6 +223,101 @@ pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
         &dest,
         weft_catalog::NODE_TREE_EXCLUDE,
     )
+}
+
+/// The canonical starter files of a brand-new project (`weft.toml` + `main.weft`),
+/// as `(relative-path, bytes)`. This is the ONE definition of "what a new project
+/// contains" (minus the seeded catalog, which `seed_catalog_into_upload` adds):
+/// `Project::init` writes these to disk for `weft new`; a caller that instead
+/// packs a project feeds them to `seed_catalog_into_upload` then packs the result,
+/// so a disk-created and a packed project are byte-identical. `id` is the project
+/// id stamped into the manifest (each caller mints its own).
+pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8>)>> {
+    let manifest = ProjectManifest {
+        package: PackageSection {
+            name: name.to_string(),
+            id,
+            version: Some("0.1.0".into()),
+            description: None,
+        },
+        dispatcher: DispatcherSection::default(),
+        build: BuildSection::default(),
+    };
+    let toml = toml::to_string_pretty(&manifest)
+        .map_err(|e| CompileError::Project(format!("serialize manifest: {e}")))?;
+    // Minimal main.weft: a single pure graph the user can edit immediately. No
+    // `# Project:` header: the project name is authoritative in `weft.toml` (and
+    // the folder), so a name comment in the source would just be a stale
+    // duplicate. The source carries only the graph.
+    let main_weft = "greeting = Text { value: \"hello world\" }\n\
+         out = Debug\n\n\
+         out.data = greeting.value\n";
+    Ok(vec![
+        ("weft.toml".to_string(), toml.into_bytes()),
+        ("main.weft".to_string(), main_weft.as_bytes().to_vec()),
+    ])
+}
+
+/// Turn an uploaded file set (`(path, bytes)`) into the SELF-CONTAINED project
+/// folder (`path -> bytes`) that gets packed into a content tree: the upload PLUS
+/// the seeded `nodes/base_catalog/`, exactly the shape `weft new` writes to disk.
+/// Called before packing, so the stored tree carries its own node sources and the
+/// build compiles from the project's own `nodes/` with NOTHING injected
+/// out-of-folder (the same path the CLI runs).
+///
+/// Reuses `seed_base_catalog` verbatim by materializing to a temp dir; the read-back
+/// skips `NODE_TREE_EXCLUDE` names so a seed source never drags build/cache dirs in.
+#[cfg(feature = "build")]
+pub fn seed_catalog_into_upload(
+    upload: &[(String, Vec<u8>)],
+) -> CompileResult<std::collections::BTreeMap<String, Vec<u8>>> {
+    let tmp = tempfile::tempdir().map_err(CompileError::Io)?;
+    for (path, bytes) in upload {
+        let dest = tmp.path().join(path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+        }
+        std::fs::write(&dest, bytes).map_err(CompileError::Io)?;
+    }
+    seed_base_catalog(tmp.path())?;
+
+    let mut folder = std::collections::BTreeMap::new();
+    read_folder_into_map(tmp.path(), tmp.path(), &mut folder)?;
+    Ok(folder)
+}
+
+/// Recursively read every regular file under `dir` into `out` keyed by its path
+/// relative to `root` (`/`-separated), skipping `NODE_TREE_EXCLUDE` names and never
+/// following symlinks, so the packed map matches what the build reads.
+#[cfg(feature = "build")]
+fn read_folder_into_map(
+    root: &Path,
+    dir: &Path,
+    out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+) -> CompileResult<()> {
+    for entry in std::fs::read_dir(dir).map_err(CompileError::Io)? {
+        let entry = entry.map_err(CompileError::Io)?;
+        let name = entry.file_name();
+        if weft_catalog::is_node_tree_excluded(&name.to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        let ft = entry.file_type().map_err(CompileError::Io)?;
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            read_folder_into_map(root, &path, out)?;
+        } else if ft.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .expect("walked path is under root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.insert(rel, std::fs::read(&path).map_err(CompileError::Io)?);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,5 +350,28 @@ mod find_tests {
         // not an error).
         let phantom = empty.path().join("does/not/exist");
         assert!(matches!(Project::find(&phantom), Ok(None)), "unresolvable path is no-project");
+    }
+
+    /// The scaffold `main.weft` carries NO `# Project:` header: the name lives in
+    /// `weft.toml`, so a name comment in the source would be a stale duplicate.
+    /// The scaffold source is therefore name-independent; per-project identity
+    /// (and per-project storage uniqueness) rests on `weft.toml`, which bakes the
+    /// minted project id. Regression guard against re-introducing the old header.
+    #[test]
+    fn scaffold_main_weft_has_no_project_header() {
+        let main_of = |name: &str, id: Uuid| {
+            let files = scaffold_files(name, id).unwrap();
+            String::from_utf8(files.iter().find(|(p, _)| p == "main.weft").unwrap().1.clone()).unwrap()
+        };
+        let a = main_of("alpha", Uuid::new_v4());
+        assert!(!a.contains("# Project:"), "scaffold main.weft must not carry a project header: {a:?}");
+        // Name-independent source: two differently-named projects have identical
+        // scaffold main.weft (their uniqueness comes from weft.toml, not the graph).
+        let same_id = Uuid::new_v4();
+        assert_eq!(
+            main_of("alpha", same_id),
+            main_of("beta", same_id),
+            "scaffold main.weft does not depend on the project name",
+        );
     }
 }

@@ -82,12 +82,18 @@ pub trait BrokerSupervisorOps: Send + Sync {
         project_id: &str,
         node_id: &str,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>>;
+    /// `cancelled = true` records outcome `cancelled` (a user-honored
+    /// cancel), never a failure; `error` then carries the halt point.
     async fn command_complete(
         &self,
         pod_name: &str,
         command_id: i64,
         error: Option<&str>,
+        cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>>;
+    /// Whether the user requested cancellation of a claimed command.
+    /// Polled between kubectl steps and inside readiness/drain waits.
+    async fn command_cancel_requested(&self, command_id: i64) -> Result<bool>;
     async fn running_count(&self, project_id: &str) -> Result<i64>;
     /// True if a user infra action (any uncompleted
     /// infra_lifecycle_command: apply / stop / terminate) is in flight
@@ -216,8 +222,14 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         pod_name: &str,
         command_id: i64,
         error: Option<&str>,
+        cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>> {
-        BrokerSupervisorClient::command_complete(self, pod_name, command_id, error).await
+        BrokerSupervisorClient::command_complete(self, pod_name, command_id, error, cancelled)
+            .await
+    }
+
+    async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
+        BrokerSupervisorClient::command_cancel_requested(self, command_id).await
     }
     async fn running_count(&self, project_id: &str) -> Result<i64> {
         BrokerSupervisorClient::running_count(self, project_id).await

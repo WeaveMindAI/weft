@@ -232,7 +232,7 @@ pub struct JournalCorruption {
 /// new fold branch that can fail forces adding a variant here; that
 /// is the point. Serialised as the variant name on the wire so the
 /// inspector renders a stable label.
-// SYNC: CorruptionSite <-> extension-vscode/src/shared/protocol.ts CorruptionSite
+// SYNC: CorruptionSite <-> packages/weft-graph/src/protocol.ts CorruptionSite
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CorruptionSite {
     /// `ExecEvent::PulseEmitted` fold path (`push_pulse` UUID parse
@@ -399,7 +399,7 @@ impl LoopWrite {
 /// round-trip indistinguishable from an ephemeral message. The surrounding
 /// event carries `payload_byte_size` and `payload_sha256_prefix` so the
 /// inspector can render a stable identifier even on `Ephemeral`.
-// SYNC: JournaledPayload <-> extension-vscode/src/shared/protocol.ts JournaledPayload
+// SYNC: JournaledPayload <-> packages/weft-graph/src/protocol.ts JournaledPayload
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JournaledPayload {
@@ -488,7 +488,7 @@ pub struct LoopInstanceSnapshot {
     pub terminated: Option<LoopTerminationReason>,
 }
 
-// SYNC: LoopTerminationReason <-> extension-vscode/src/shared/protocol.ts LoopTerminationReason
+// SYNC: LoopTerminationReason <-> packages/weft-graph/src/protocol.ts LoopTerminationReason
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopTerminationReason {

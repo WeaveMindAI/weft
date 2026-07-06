@@ -2,7 +2,13 @@ import { fetchPendingTasks, type PendingTask, type ApiToken } from '../lib/api';
 
 const POLL_INTERVAL_MS = 30000; // 30 seconds
 
-let seenTaskIds = new Set<string>();
+// Signal tokens the user has already been notified about, grouped by the
+// api token that surfaced them. The grouping matters: a poll only refreshes
+// the entries of api tokens whose dispatcher was actually REACHED that round.
+// An unreached dispatcher's tasks are absent from the response without being
+// gone; a single flat set rebuilt from each response would forget them on a
+// transient blip and re-notify every live task when the dispatcher recovers.
+let seenByToken = new Map<string, Set<string>>();
 
 // Settings interface
 interface ExtensionSettings {
@@ -31,7 +37,7 @@ export async function saveSettings(settings: Partial<ExtensionSettings>): Promis
 }
 
 export default defineBackground(() => {
-  console.log('[WeaveMind] Background service started', { id: browser.runtime.id });
+  console.log('[weft] Background service started', { id: browser.runtime.id });
 
   // Set up polling alarm
   browser.alarms.create('poll-tasks', { periodInMinutes: 0.5 });
@@ -66,7 +72,7 @@ async function pollForTasks() {
     // the per-poll cost.
     const result = await fetchPendingTasks();
     if (!result.anyReachable) {
-      console.log('[WeaveMind] No reachable dispatcher, skipping poll');
+      console.log('[weft] No reachable dispatcher, skipping poll');
       return;
     }
     const tasks = result.tasks;
@@ -74,18 +80,35 @@ async function pollForTasks() {
     // Find tasks the user hasn't been notified about yet. Signal
     // token uniquely identifies a task; we use it as the seen-key
     // so re-fetches don't re-notify on the same task.
-    const newTasks = tasks.filter(t => !seenTaskIds.has(t.token));
+    const seen = new Set([...seenByToken.values()].flatMap(s => [...s]));
+    const newTasks = tasks.filter(t => !seen.has(t.token));
 
     if (newTasks.length > 0) {
       await showNotification(newTasks.length, newTasks[0]);
     }
 
-    seenTaskIds = new Set(tasks.map(t => t.token));
+    // Rebuild the seen-sets of the api tokens that were REACHED this poll
+    // (their absent tasks are genuinely gone); carry every other token's
+    // set forward untouched (its dispatcher just didn't answer).
+    const next = new Map<string, Set<string>>(
+      result.reachedTokens.map(apiToken => [apiToken, new Set<string>()]),
+    );
+    for (const t of tasks) {
+      const owner = (t as PendingTask & { _tokenConfig?: ApiToken })._tokenConfig?.token;
+      if (owner) next.get(owner)?.add(t.token);
+    }
+    // Carry forward only tokens the user still has configured: a deleted
+    // token's set would otherwise linger in this long-lived worker forever.
+    const configured = new Set(result.configuredTokens);
+    for (const [apiToken, set] of seenByToken) {
+      if (!next.has(apiToken) && configured.has(apiToken)) next.set(apiToken, set);
+    }
+    seenByToken = next;
 
     // Update badge
     await updateBadge(tasks.length);
   } catch (error) {
-    console.error('[WeaveMind] Poll error:', error);
+    console.error('[weft] Poll error:', error);
   }
 }
 
@@ -93,7 +116,7 @@ async function showNotification(count: number, task: PendingTask & { _tokenConfi
   try {
     const settings = await getSettings();
     if (!settings.notificationsEnabled) {
-      console.log('[WeaveMind] Notifications disabled, skipping');
+      console.log('[weft] Notifications disabled, skipping');
       return;
     }
 
@@ -123,9 +146,9 @@ async function showNotification(count: number, task: PendingTask & { _tokenConfi
       }
     }
     
-    console.log('[WeaveMind] Toast notification sent to tabs');
+    console.log('[weft] Toast notification sent to tabs');
   } catch (error) {
-    console.error('[WeaveMind] Notification error:', error);
+    console.error('[weft] Notification error:', error);
   }
 }
 
@@ -143,6 +166,6 @@ async function updateBadge(count: number) {
       await badgeApi.setBadgeText({ text: '' });
     }
   } catch (error) {
-    console.error('[WeaveMind] Badge error:', error);
+    console.error('[weft] Badge error:', error);
   }
 }

@@ -1,0 +1,22 @@
+import type { NodeInstance, Edge } from '../types';
+import { extractSubgraph, type SubgraphResult } from './subgraph';
+import { nodeIsTrigger } from './node-roles';
+
+/**
+ * Extract the trigger setup subgraph from a project.
+ *
+ * Walks backwards from every trigger node, collecting all upstream
+ * dependencies (including the trigger node itself). Returns the set
+ * of node IDs in the subgraph plus any validation errors.
+ *
+ * Infrastructure nodes upstream of triggers are allowed (e.g. WhatsApp
+ * bridge feeding a WhatsApp trigger).
+ */
+export function extractTriggerSubgraph(
+	nodes: NodeInstance[],
+	edges: Edge[],
+): SubgraphResult {
+	return extractSubgraph(nodes, edges, {
+		seedFilter: (n) => nodeIsTrigger(n),
+	});
+}

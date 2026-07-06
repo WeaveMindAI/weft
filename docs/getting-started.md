@@ -68,12 +68,10 @@ hello/
 `main.weft` starts as:
 
 ```weft
-# Project: hello
-
 greeting = Text { value: "hello world" }
 out = Debug
 
-out.value = greeting.value
+out.data = greeting.value
 ```
 
 Run it:
@@ -95,7 +93,6 @@ Make a webhook-style project:
 
 ```bash
 cat > main.weft <<'EOF'
-# Project: webhook-demo
 receive = ApiPost
 print = Debug { label: "webhook" }
 print.value = receive.body
@@ -162,7 +159,7 @@ Compose, or babysit a daemon. You drop a "WhatsApp Bridge" node onto
 the graph, hit Start, and Weft provisions a real pod, wires up its
 network, persists its state on a disk, and hands the rest of your
 workflow a URL to talk to it. Locally that runs in a `kind` cluster on
-your machine; in the cloud it's the same code against real Kubernetes:
+your machine, and the same code runs against real Kubernetes when deployed:
 **one model, no separate "local vs prod" setup.** Weft itself is the
 infrastructure layer.
 

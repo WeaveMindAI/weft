@@ -1,0 +1,4 @@
+[package]
+name = "e2e_human_trigger_enum"
+id = "00000000-0000-0000-0000-00000000000e"
+version = "0.1.0"

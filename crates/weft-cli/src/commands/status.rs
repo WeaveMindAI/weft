@@ -23,17 +23,19 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // infra-closure nodes, so both need the definition + catalog. If
     // the project can't compile, leave the desired hashes unset:
     // status is display-only and tolerates an in-progress project.
-    let short = |h: String| crate::commands::build::short_hash(&h);
+    //
+    // FULL hashes, never shortened: the dispatcher stores the full
+    // `running_*_hash` values register sends and compares by string
+    // equality, so a shortened desired hash would never match and every
+    // project would permanently report drift. Short hashes are for
+    // human log lines only.
     let (desired_binary, desired_definition, desired_infra) =
-        match crate::hash::load_enriched_project(project) {
+        match weft_compiler::hash::load_enriched_project(project) {
             Ok((def, catalog)) => (
-                crate::hash::compute_binary_hash(&def, project, &weft_root, &catalog)
-                    .ok()
-                    .map(short),
-                crate::hash::compute_definition_hash(&def).ok().map(short),
-                crate::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
-                    .ok()
-                    .map(short),
+                weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog).ok(),
+                weft_compiler::hash::compute_definition_hash(&def).ok(),
+                weft_compiler::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
+                    .ok(),
             ),
             Err(_) => (None, None, None),
         };
@@ -77,7 +79,20 @@ pub async fn run(ctx: Ctx) -> Result<()> {
 
     println!("project: {name} ({project_id})");
     println!("  registration: {status}");
+    // The build-transition axis: only worth a line while in flight.
+    if let Some(t) = data.get("transition").and_then(|v| v.as_str()) {
+        if t != "none" {
+            println!("  build: {t} (cancel with `weft cancel-build`)");
+        }
+    }
     println!("  listener: {}", if listener { "running" } else { "stopped" });
+    // Orphaned live infra: never silent (the never-lose-track rule).
+    if data.get("orphaned_infra").and_then(|v| v.as_bool()).unwrap_or(false) {
+        println!(
+            "  WARNING: live infra exists whose node was removed from the source; \
+             it keeps running (and consuming resources) until stopped/terminated via the infra verbs"
+        );
+    }
 
     if let Some(infra) = data.get("infra").and_then(|v| v.as_array()) {
         if infra.is_empty() {

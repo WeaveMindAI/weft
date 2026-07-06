@@ -18,10 +18,11 @@
 //!         Workers from different tenants share this namespace, so the
 //!         primary, explicit rule is that NO pod here may reach any
 //!         other pod here. Workers never talk to each other.
-//!       - `worker-egress`: the egress a worker legitimately needs
-//!         (broker, DNS, every tenant's storage box, internet). Same
-//!         allowances as the per-project `worker-policy`, minus the
-//!         same-namespace-infra rule (there is no infra here).
+//!       - `worker-egress`: the egress a worker legitimately needs (broker for
+//!         control, the object store for direct byte I/O, DNS, internet). Runtime
+//!         files move DIRECTLY worker<->bucket via presigned URLs (the broker signs
+//!         + records, never carries bytes). Same allowances as the per-project
+//!         `worker-policy`, minus the same-namespace-infra rule (no infra here).
 //!       - `worker-ingress`: only the gateway may reach a worker's
 //!         connection port (live caller connections). The signed routing
 //!         token is the second gate inside the worker.
@@ -57,14 +58,8 @@ pub async fn ensure(
 }
 
 pub fn render(args: &SharedWorkerNamespaceArgs<'_>) -> String {
-    let SharedWorkerNamespaceArgs {
-        pod_cidr,
-        service_cidr,
-    } = args;
+    let SharedWorkerNamespaceArgs { pod_cidr, service_cidr } = args;
     let namespace = SHARED_WORKER_NAMESPACE;
-    // Pull ports/namespaces from the one constant each so they can't
-    // drift from the worker pod manifest / storage box Service.
-    let storage_port = weft_storage::config::STORAGE_PORT;
     let gateway_namespace = crate::backend::k8s_worker::GATEWAY_NAMESPACE;
     let connection_port = crate::backend::k8s_worker::WORKER_CONNECTION_PORT;
     format!(
@@ -160,29 +155,26 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Storage boxes: a worker here may belong to ANY tenant, so it must
-    # reach ANY tenant's storage box (selected by the storage role in any
-    # tenant namespace). Network reachability alone grants nothing: the
-    # box authenticates every request against the caller's broker-issued
-    # SA token and rejects a wrong-tenant token, the same posture the
-    # per-project worker-policy relies on.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              weft.dev/role: tenant
-          podSelector:
-            matchLabels:
-              weft.dev/role: storage
-      ports:
-        - protocol: TCP
-          port: {storage_port}
-    # Internet egress (HTTP APIs, model downloads, etc).
+    # Internet egress (HTTP APIs, model downloads, AND the object store). The object
+    # store is ALWAYS external to the cluster, reached over S3 by its configured
+    # endpoint. The worker uploads/downloads
+    # runtime-file bytes DIRECTLY to it via broker-signed presigned URLs (the broker
+    # never carries the bytes), so it reaches the store over this internet egress like
+    # any other external host. The security wall is the presigned URL (per-key,
+    # per-method, short-TTL, broker-signed) plus the fact that the worker holds NO
+    # bucket credentials, NOT network reachability. The excluded CIDRs are the cluster
+    # internals a worker must never reach; the object store is never in them.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
               - {pod_cidr}
               - {service_cidr}
+              # Link-local. 169.254.169.254 is the node's cloud-provider metadata
+              # / credential endpoint (the #1 container-escape target); excluding
+              # the whole 169.254.0.0/16 keeps a compromised worker off it
+              # regardless of what the provider also blocks at the node.
+              - 169.254.0.0/16
 "#
     )
 }
@@ -220,28 +212,19 @@ mod tests {
     }
 
     #[test]
-    fn render_worker_egress_allows_broker_dns_storage_internet() {
+    fn render_worker_egress_allows_broker_dns_internet() {
         let yaml = rendered();
-        assert!(yaml.contains("weft.dev/role: broker"));
+        assert!(yaml.contains("weft.dev/role: broker"), "broker egress (control plane)");
         assert!(yaml.contains("port: 53"));
-        assert!(yaml.contains("weft.dev/role: storage"));
-        assert!(yaml.contains("cidr: 0.0.0.0/0"));
-    }
-
-    #[test]
-    fn render_storage_egress_spans_all_tenants_not_one_namespace() {
-        let yaml = rendered();
-        // Storage egress selects tenant namespaces by ROLE, not by a
-        // single namespace name: a shared-ns worker may belong to any
-        // tenant, so it must reach any tenant's box.
-        let egress = yaml
-            .split("name: worker-egress")
-            .nth(1)
-            .expect("egress policy present");
-        assert!(
-            egress.contains("weft.dev/role: tenant"),
-            "storage egress selects tenant namespaces by role"
-        );
+        // The object store is external (reached over S3 by its configured endpoint),
+        // reached over the internet egress, NOT an in-cluster pod. No object-store
+        // pod egress rule should exist.
+        assert!(yaml.contains("cidr: 0.0.0.0/0"), "internet egress (covers the external object store)");
+        assert!(!yaml.contains("weft.dev/role: object-store"), "object store is external, not a pod");
+        assert!(!yaml.contains("weft.dev/role: storage"), "no dead storage-pod role");
+        // Link-local (cloud metadata / credential endpoint, the #1 escape
+        // target) is excluded from the shared-pool worker's internet egress.
+        assert!(yaml.contains("169.254.0.0/16"), "link-local excluded");
     }
 
     #[test]

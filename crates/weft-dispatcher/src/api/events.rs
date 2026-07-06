@@ -13,22 +13,29 @@ use futures::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+use crate::authenticator::{authorize_project, CallerTenant};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 
 pub async fn project_stream(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path(id): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let project_id = id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    authorize_project(&state, &caller.0, project_id)
+        .await
+        .map_err(|(s, _)| s)?;
     let rx = state.events.subscribe_project(&id).await;
     let stream = BroadcastStream::new(rx)
         .filter_map(|res| res.ok())
         .map(to_sse);
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
 pub async fn execution_stream(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path(color): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     // Execution SSE: we don't index events by color alone (a color
@@ -55,6 +62,16 @@ pub async fn execution_stream(
         // server-side defect, not a missing execution.
         crate::journal::ColorLookup::Corrupt => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
+    // Tenant gate on the resolved project (no second color lookup): a
+    // cross-tenant color reads as NOT_FOUND, same as an unknown one above.
+    {
+        let id = project_id
+            .parse::<uuid::Uuid>()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        authorize_project(&state, &caller.0, id)
+            .await
+            .map_err(|(s, _)| s)?;
+    }
 
     let target_color = Some(target_color);
     let rx = state.events.subscribe_project(&project_id).await;

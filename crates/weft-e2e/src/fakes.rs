@@ -70,8 +70,16 @@ fn serve_axum(listener: TcpListener, app: Router) -> AbortOnDrop {
 /// the cluster name follows the daemon's default (`weft-local`) unless
 /// `WEFT_CLUSTER_NAME` overrides it.
 pub async fn cluster_host_gateway() -> Result<String> {
-    let cluster = std::env::var("WEFT_CLUSTER_NAME").unwrap_or_else(|_| "weft-local".to_string());
-    let node = format!("{cluster}-control-plane");
+    // The docker container the cluster node runs in. KIND names it
+    // `<cluster>-control-plane` (the default below); a minikube docker-driver
+    // node IS the profile name, so a minikube-based harness sets
+    // `WEFT_CLUSTER_NODE_CONTAINER=<profile>` directly. Either way we inspect
+    // the node container's docker-bridge gateway, which its pods can reach.
+    let node = std::env::var("WEFT_CLUSTER_NODE_CONTAINER").unwrap_or_else(|_| {
+        let cluster =
+            std::env::var("WEFT_CLUSTER_NAME").unwrap_or_else(|_| "weft-local".to_string());
+        format!("{cluster}-control-plane")
+    });
     let out = tokio::process::Command::new("docker")
         .args([
             "inspect",
@@ -169,6 +177,77 @@ async fn bytes_handler(State(body): State<Arc<Vec<u8>>>) -> impl IntoResponse {
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         (*body).clone(),
     )
+}
+
+/// A fake that PROMISES more bytes than it delivers, then breaks the
+/// connection mid-body: it advertises `Content-Length: <declared>` but streams
+/// only `<sent>` bytes before erroring the response body. A client streaming
+/// the body (the worker's fetch-into-storage) sees an incomplete-body transport
+/// error partway through, so a large fetch that has already uploaded one or more
+/// parts is interrupted with work in flight. Used to prove the upload path
+/// cleans up (aborts the in-flight upload, frees the quota reservation) and
+/// leaves NO leftover when a source dies mid-transfer.
+pub struct HangingBytesFake {
+    base_url: String,
+    _server: AbortOnDrop,
+}
+
+/// State for the hanging handler: how many real bytes to emit before erroring,
+/// and the full length to advertise (must exceed `sent`).
+#[derive(Clone)]
+struct HangingState {
+    sent: usize,
+    declared: usize,
+}
+
+impl HangingBytesFake {
+    /// Advertise `declared` bytes but deliver only `sent` before breaking the
+    /// body. `sent` must be < `declared` (otherwise the transfer completes).
+    pub async fn start(sent: usize, declared: usize) -> Result<Self> {
+        if sent >= declared {
+            bail!("HangingBytesFake needs sent ({sent}) < declared ({declared}) to interrupt");
+        }
+        let (gateway, listener, port) = bind_host("hanging-bytes").await?;
+        let app = Router::new()
+            .route("/bytes", get(hanging_handler))
+            .with_state(HangingState { sent, declared });
+        Ok(Self {
+            base_url: format!("http://{gateway}:{port}"),
+            _server: serve_axum(listener, app),
+        })
+    }
+
+    /// The cluster-reachable URL of the served (truncated) bytes.
+    pub fn url(&self) -> String {
+        format!("{}/bytes", self.base_url)
+    }
+}
+
+async fn hanging_handler(State(state): State<HangingState>) -> impl IntoResponse {
+    use futures::stream::StreamExt;
+
+    // Emit `sent` bytes in modest chunks, then ONE error item. axum aborts the
+    // body on the error; combined with the oversized Content-Length below, the
+    // client sees an incomplete-body transport error, exactly what a source
+    // that dies mid-transfer looks like.
+    const CHUNK: usize = 64 * 1024;
+    let chunks = (state.sent + CHUNK - 1) / CHUNK;
+    let data = futures::stream::iter((0..chunks).map(move |i| {
+        let start = i * CHUNK;
+        let end = (start + CHUNK).min(state.sent);
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![(i % 251) as u8; end - start]))
+    }));
+    let broken = futures::stream::once(async {
+        Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other("fake source dropped mid-body"))
+    });
+    let body = axum::body::Body::from_stream(data.chain(broken));
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        // Advertise MORE than we will send, so the early close is an
+        // incomplete-body error on the client, not a clean EOF.
+        .header(axum::http::header::CONTENT_LENGTH, state.declared.to_string())
+        .body(body)
+        .expect("build hanging response")
 }
 
 /// Shared state for the SSE fake: the broadcast sender plus a count of

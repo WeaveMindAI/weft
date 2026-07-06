@@ -163,7 +163,7 @@ pub async fn task_enqueue_dedup(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<TaskEnqueueDedupRequest>,
 ) -> Resp<TaskEnqueueDedupResponse> {
-    let kind = req.spec.kind;
+    let kind = req.spec.kind.clone();
     let target = req.spec.target;
 
     // Per-role allow list of kinds. Anything else is a 403.
@@ -173,23 +173,23 @@ pub async fn task_enqueue_dedup(
             // to handle: register a wake signal, provision infra,
             // and durable side-effect records (cost + log) that must
             // survive the worker pod dying.
-            if !matches!(
-                kind,
-                TaskKind::RegisterSignal
-                    | TaskKind::RecordCost
-                    | TaskKind::RecordLog
-                    | TaskKind::EnsureStorageBox
-            ) {
+            if ![
+                TaskKind::RegisterSignal.as_str(),
+                TaskKind::RecordCost.as_str(),
+                TaskKind::RecordLog.as_str(),
+            ]
+            .contains(&kind.as_str())
+            {
                 return Err((
                     StatusCode::FORBIDDEN,
-                    format!("worker may not enqueue task kind {}", kind.as_str()),
+                    format!("worker may not enqueue task kind {kind}"),
                 ));
             }
             // RecordCost payload validation: reject negative amounts
             // at enqueue time so a malicious worker can't submit a
             // negative-cost row and die before the dispatcher's
             // executor would catch it.
-            if kind == TaskKind::RecordCost {
+            if kind == TaskKind::RecordCost.as_str() {
                 let amount = req
                     .spec
                     .payload
@@ -209,10 +209,10 @@ pub async fn task_enqueue_dedup(
         }
         Role::Listener => {
             // Listeners enqueue exactly one kind: a held-event fire.
-            if kind != TaskKind::FireSignal {
+            if kind != TaskKind::FireSignal.as_str() {
                 return Err((
                     StatusCode::FORBIDDEN,
-                    format!("listener may not enqueue task kind {}", kind.as_str()),
+                    format!("listener may not enqueue task kind {kind}"),
                 ));
             }
         }
@@ -266,7 +266,7 @@ pub async fn task_enqueue_dedup(
         let t = scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, color).await?;
         merge_anchor_tenant(&mut anchor_tenant, t)?;
     }
-    if kind == TaskKind::FireSignal {
+    if kind == TaskKind::FireSignal.as_str() {
         // Listener held-event fire: the signal token is the tenant
         // anchor. Pull it from the payload and resolve.
         let token = req
@@ -951,7 +951,8 @@ pub async fn supervisor_claim_command(
     // command after a crash is correct and idempotent (declarative
     // kubectl), so there is nothing to serialize against.
     let sql = format!(
-        "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force \
+        "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force, \
+                c.drain_timeout_secs \
          FROM infra_lifecycle_command c \
          WHERE c.verb IN ('apply', 'stop', 'terminate') \
            AND c.completed_at_unix IS NULL \
@@ -1004,6 +1005,7 @@ fn decode_claimed_command(
     let spec_json: Option<serde_json::Value> =
         r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
     let force: bool = r.try_get("force")?;
+    let drain_timeout_secs: i64 = r.try_get("drain_timeout_secs")?;
     Ok(SupervisorCommandRow {
         id,
         project_id,
@@ -1012,6 +1014,7 @@ fn decode_claimed_command(
         running_policy,
         spec_json,
         force,
+        drain_timeout_secs: drain_timeout_secs.max(0) as u64,
     })
 }
 
@@ -1886,14 +1889,18 @@ pub async fn supervisor_command_complete(
             .map_err(|e| internal(anyhow::anyhow!("decode tenant_id: {e}")))?,
     };
     scope::require_tenant_in_scope(&caller, &tenant_id)?;
-    // Supervisor completions are either success (error=None) or
-    // failure (error=Some). Cancellation is broker-side only
-    // (remove_node); the supervisor never produces a cancelled
-    // outcome.
+    // Supervisor completions: success (error=None), failure
+    // (error=Some), or a user-requested cancellation the supervisor
+    // honored mid-command (`cancelled=true`; `error` then carries the
+    // halt point as the outcome message, never counted as a failure).
     use weft_broker_client::protocol::LifecycleOutcome;
-    let outcome = match req.error {
-        Some(_) => LifecycleOutcome::Failed,
-        None => LifecycleOutcome::Succeeded,
+    let outcome = if req.cancelled {
+        LifecycleOutcome::Cancelled
+    } else {
+        match req.error {
+            Some(_) => LifecycleOutcome::Failed,
+            None => LifecycleOutcome::Succeeded,
+        }
     };
     // Ownership check: only the pod that currently OWNS the project may
     // stamp the command terminal. A supervisor that lost ownership mid-
@@ -1937,6 +1944,46 @@ pub async fn supervisor_command_complete(
         ));
     }
     Ok(Json(SupervisorCommandCompleteResponse {}))
+}
+
+/// Poll target for an executing supervisor: has the user requested
+/// cancellation of the claimed command? Tenant-scoped like
+/// `supervisor_command_complete`. A missing row (project removed
+/// mid-command) reads as cancelled: the executor should stop working
+/// on it either way.
+pub async fn supervisor_command_cancel_requested(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<weft_broker_client::protocol::SupervisorCommandCancelRequestedRequest>,
+) -> Resp<weft_broker_client::protocol::SupervisorCommandCancelRequestedResponse> {
+    require_supervisor(&caller)?;
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT tenant_id, cancel_requested FROM infra_lifecycle_command WHERE id = $1",
+    )
+    .bind(req.command_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
+    let Some(row) = row else {
+        return Ok(Json(
+            weft_broker_client::protocol::SupervisorCommandCancelRequestedResponse {
+                cancel_requested: true,
+            },
+        ));
+    };
+    let tenant_id: String = row
+        .try_get("tenant_id")
+        .map_err(|e| internal(anyhow::anyhow!("decode tenant_id: {e}")))?;
+    scope::require_tenant_in_scope(&caller, &tenant_id)?;
+    let cancel_requested: bool = row
+        .try_get("cancel_requested")
+        .map_err(|e| internal(anyhow::anyhow!("decode cancel_requested: {e}")))?;
+    Ok(Json(
+        weft_broker_client::protocol::SupervisorCommandCancelRequestedResponse {
+            cancel_requested,
+        },
+    ))
 }
 
 /// Reject empty-string `node_id` at the handler boundary.
@@ -2115,144 +2162,6 @@ async fn require_worker_pod_owned_by(
 
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
-}
-
-/// `POST /storage/authorize`: the identity authority behind the
-/// storage box's prefix wall. The RELAYED bearer (the box forwards
-/// its caller's token; the dispatcher forwards a box's token) is
-/// reviewed and interpreted into the verified facts the wall needs:
-///   - worker  -> tenant + project from the token's NAMESPACE
-///     (DB-backed; nothing is claimed), color verified exactly like
-///     journal writes (`execution_color.owner_pod_name` must be the
-///     caller's pod, and the color must belong to the caller's
-///     project).
-///   - the dispatcher (`weft-dispatcher` in `weft-system`) -> the
-///     control plane.
-///   - a storage box (`weft-storage-sa` in a tenant namespace) ->
-///     StorageBox (used by the dispatcher to authenticate
-///     grow/shrink requests).
-/// This endpoint deliberately bypasses the tenant role table: its
-/// caller universe is wider than the broker's data endpoints.
-pub async fn storage_authorize(
-    State(state): State<Arc<BrokerState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<StorageAuthorizeRequest>,
-) -> Resp<StorageAuthorizeResponse> {
-    use crate::auth::{DISPATCHER_NS, DISPATCHER_SA, STORAGE_SA, WORKER_SA};
-    let reviewed = crate::auth::reviewed_token(&state, &headers).await?;
-    match reviewed.sa_name.as_str() {
-        DISPATCHER_SA if reviewed.namespace == DISPATCHER_NS => {
-            Ok(Json(StorageAuthorizeResponse::ControlPlane))
-        }
-        STORAGE_SA => {
-            let tenant_id = scope::lookup_namespace_tenant(
-                &state.scope_cache,
-                &state.pool,
-                &reviewed.namespace,
-            )
-            .await?;
-            Ok(Json(StorageAuthorizeResponse::StorageBox { tenant_id }))
-        }
-        WORKER_SA => {
-            // Resolve the worker's project AND tenant. There are two
-            // worker-hosting shapes, and the namespace tells them apart:
-            //
-            //  - PER-PROJECT namespace (an infra project): the namespace
-            //    IS the project, so the ONE `project` row whose
-            //    `project_namespace` matches gives both ids from a single
-            //    source of truth. SAFETY (registration gate preserved by
-            //    write ordering): the dispatcher writes the
-            //    `weft_namespace_tenant` registry row BEFORE it stamps the
-            //    `project_namespace` column, both with the same tenant, so
-            //    a matching `project` row could only exist if the
-            //    namespace was already registered to that tenant.
-            //
-            //  - SHARED namespace (a no-infra project): the namespace
-            //    holds many tenants and maps to no project, so we resolve
-            //    from the worker's OWN pod identity instead, the
-            //    kubelet-stamped unforgeable `pod_name` -> the
-            //    dispatcher-written `worker_pod` row -> project -> tenant.
-            //    Same trust model (dispatcher-written rows keyed on a
-            //    signed identity), keyed on pod rather than namespace.
-            //    This mirrors `auth::extract_identity`'s shared-ns branch.
-            let row: Option<(String, String)> =
-                if reviewed.namespace == crate::auth::SHARED_WORKER_NAMESPACE {
-                    let pod_name = reviewed.pod_name.as_deref().ok_or((
-                        StatusCode::FORBIDDEN,
-                        "shared-namespace worker token carries no pod_name".to_string(),
-                    ))?;
-                    sqlx::query_as(
-                        "SELECT p.id::text, p.tenant_id \
-                         FROM worker_pod wp JOIN project p ON p.id::text = wp.project_id \
-                         WHERE wp.pod_name = $1",
-                    )
-                    .bind(pod_name)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(internal)?
-                } else {
-                    sqlx::query_as(
-                        "SELECT id::text, tenant_id FROM project WHERE project_namespace = $1",
-                    )
-                    .bind(&reviewed.namespace)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(internal)?
-                };
-            let (project_id, tenant_id) = row.ok_or((
-                StatusCode::FORBIDDEN,
-                format!(
-                    "could not resolve a project for worker in namespace '{}' (pod {:?}); \
-                     not a registered project namespace and no matching worker_pod row",
-                    reviewed.namespace, reviewed.pod_name
-                ),
-            ))?;
-            let color = match req.color {
-                None => None,
-                Some(color) => {
-                    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-                        "SELECT tenant_id, project_id, owner_pod_name \
-                         FROM execution_color WHERE color = $1",
-                    )
-                    .bind(&color)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(internal)?;
-                    let Some((color_tenant, color_project, owner_pod)) = row else {
-                        return Err((StatusCode::FORBIDDEN, "unknown execution color".into()));
-                    };
-                    if color_tenant != tenant_id || color_project != project_id {
-                        tracing::warn!(
-                            target: "weft_broker::scope",
-                            caller_ns = %reviewed.namespace,
-                            color = %color,
-                            "storage authorize rejected cross-project color claim"
-                        );
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            "color belongs to a different project".into(),
-                        ));
-                    }
-                    // Same gate as journal writes: only the pod that
-                    // claimed the execution drives its color.
-                    if reviewed.pod_name.is_none()
-                        || owner_pod.as_deref() != reviewed.pod_name.as_deref()
-                    {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            "color is not owned by the calling pod".into(),
-                        ));
-                    }
-                    Some(color)
-                }
-            };
-            Ok(Json(StorageAuthorizeResponse::Worker { tenant_id, project_id, color }))
-        }
-        other => Err((
-            StatusCode::FORBIDDEN,
-            format!("service account '{other}' has no storage identity"),
-        )),
-    }
 }
 
 #[cfg(test)]

@@ -892,7 +892,7 @@ fn default_stabilization_seconds() -> u32 { 60 }
 pub struct InfraProvisionContext {
     pub project_id: String,
     pub node_id: String,
-    /// The project namespace (`wm-project-{tenant}-{project}`).
+    /// The project namespace (`wft-project-{tenant}-{project}`).
     pub namespace: String,
     pub tenant_id: String,
 }
@@ -1014,12 +1014,12 @@ mod tests {
         let ctx = InfraProvisionContext::new(
             "proj".into(),
             "node".into(),
-            "wm-project-x-y".into(),
+            "wft-project-x-y".into(),
             "x".into(),
         );
         assert_eq!(ctx.project_id, "proj");
         assert_eq!(ctx.node_id, "node");
-        assert_eq!(ctx.namespace, "wm-project-x-y");
+        assert_eq!(ctx.namespace, "wft-project-x-y");
         assert_eq!(ctx.tenant_id, "x");
     }
 

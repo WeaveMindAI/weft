@@ -91,7 +91,7 @@ fn resolve_string_verbatim() {
         ty: WeftType::Primitive(WeftPrimitive::String),
     };
     assert_eq!(
-        resolve(&fr, dir.path()).unwrap(),
+        resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).unwrap(),
         serde_json::json!("you are a helpful poet")
     );
 }
@@ -102,7 +102,7 @@ fn resolve_json_dict() {
     std::fs::write(dir.path().join("c.json"), r#"{"model": "gpt", "temp": 0.7}"#).unwrap();
     let fr = FileRef { path: "c.json".into(), ty: WeftType::JsonDict };
     assert_eq!(
-        resolve(&fr, dir.path()).unwrap(),
+        resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).unwrap(),
         serde_json::json!({"model": "gpt", "temp": 0.7})
     );
 }
@@ -114,7 +114,7 @@ fn resolve_missing_file_errors() {
         path: "nope.txt".into(),
         ty: WeftType::Primitive(WeftPrimitive::String),
     };
-    assert!(resolve(&fr, dir.path()).is_err());
+    assert!(resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).is_err());
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn resolve_rejects_path_escape() {
         path: "../secret.txt".into(),
         ty: WeftType::Primitive(WeftPrimitive::String),
     };
-    let err = resolve(&fr, &root).unwrap_err();
+    let err = resolve(&fr, &crate::file_reader::CompileFs::disk(&root)).unwrap_err();
     assert!(err.contains("escapes"), "got: {err}");
 }
 
@@ -140,5 +140,5 @@ fn resolve_failed_cast_errors() {
         path: "n.txt".into(),
         ty: WeftType::Primitive(WeftPrimitive::Number),
     };
-    assert!(resolve(&fr, dir.path()).is_err());
+    assert!(resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).is_err());
 }

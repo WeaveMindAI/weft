@@ -18,7 +18,7 @@
 //!     ClusterRoles (defined in cluster-rbac.yaml) into this namespace.
 //!
 //! Naming convention:
-//!   `wm-project-<tenant>--<project>` (both ids sanitized + truncated to
+//!   `wft-project-<tenant>--<project>` (both ids sanitized + truncated to
 //!   a stable 12-char prefix, joined by a DOUBLE dash, to fit in the
 //!   63-char DNS label limit). See [`name_for`].
 
@@ -31,7 +31,7 @@ use anyhow::Result;
 /// tenant isolation inside it is a blanket pod-to-pod-deny
 /// NetworkPolicy: workers never talk to each other.
 // SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-broker/src/auth.rs SHARED_WORKER_NAMESPACE, crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
-pub const SHARED_WORKER_NAMESPACE: &str = "wm-shared-workers";
+pub const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
 
 /// The k8s namespace a project's WORKER pods run in, the single source
 /// of truth for worker placement. A project with infra gets its own
@@ -51,7 +51,7 @@ pub fn worker_namespace(has_infra: bool, tenant: &str, project_id: &str) -> Stri
 /// Compute the project namespace name from tenant + project ids.
 /// Both are sanitized + truncated so the resulting name fits in 63
 /// chars and uses only `[a-z0-9-]`.
-/// Project namespace name: `wm-project-<tenant>--<project>`.
+/// Project namespace name: `wft-project-<tenant>--<project>`.
 ///
 /// The DOUBLE dash between tenant and project is the unambiguous
 /// separator: both tenant and project labels may contain single
@@ -65,7 +65,7 @@ pub fn worker_namespace(has_infra: bool, tenant: &str, project_id: &str) -> Stri
 pub fn name_for(tenant: &str, project_id: &str) -> String {
     let t = short_label(tenant, 12);
     let p = short_label(project_id, 12);
-    format!("wm-project-{t}--{p}")
+    format!("wft-project-{t}--{p}")
 }
 
 /// A string that has been sanitized to a k8s-label-safe form
@@ -76,8 +76,7 @@ pub fn name_for(tenant: &str, project_id: &str) -> String {
 /// id interpolated into YAML; that makes "forgot to sanitize a
 /// tenant / project id before interpolating" a COMPILE error rather
 /// than a latent YAML-injection / label-smuggling seam (a free-form
-/// cloud `tenant_id` with a newline or `"` can't reach a manifest
-/// raw).
+/// `tenant_id` with a newline or `"` can't reach a manifest raw).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafeLabel(String);
 
@@ -139,8 +138,8 @@ pub struct ProjectNamespaceArgs<'a> {
     // `render` sanitizes it for the manifest LABEL (below), but
     // `ensure` also writes it RAW to the namespace registry, which is
     // the broker's TokenReview key and MUST be the real tenant id, not
-    // a sanitized form. The two cross-module manifest renderers
-    // (k8s_worker, tenant_namespace) take `SafeLabel` because they
+    // a sanitized form. The cross-module manifest renderer
+    // (`k8s_worker`) takes `SafeLabel` because it
     // can forget to sanitize; this one is the module that owns
     // `short_label` and needs the raw value regardless, so it
     // sanitizes inline at the one interpolation point.
@@ -155,13 +154,13 @@ pub struct ProjectNamespaceArgs<'a> {
     pub service_cidr: &'a str,
     /// The ingress controller's namespace (typically `ingress-nginx`).
     pub ingress_namespace: &'a str,
-    /// The tenant namespace, used in NetworkPolicy `namespaceSelector`
-    /// to allow the tenant's storage box into this project ns.
-    pub tenant_namespace: &'a str,
-    /// The control-plane namespace, where the pooled (trusted, tenant-
-    /// agnostic) listener + supervisor run. Their RoleBindings into this
-    /// project namespace bind the SAs HERE (not in the tenant ns), and
-    /// the NetworkPolicies allow listener/supervisor traffic FROM here.
+    /// The control-plane namespace, where the pooled (trusted, tenant-agnostic)
+    /// listener + supervisor pods run. Their RoleBindings into this project
+    /// namespace bind the SAs HERE, and the NetworkPolicies allow
+    /// listener/supervisor traffic FROM here. (There is no per-tenant `storage`
+    /// pod: a worker's runtime file bytes go DIRECTLY to the object store via
+    /// presigned URLs, so the worker egress allows the broker (control) + the
+    /// object store (bytes), not a storage-pod relay.)
     pub control_plane_namespace: &'a str,
 }
 
@@ -178,7 +177,6 @@ pub fn render(args: &ProjectNamespaceArgs<'_>) -> String {
         pod_cidr,
         service_cidr,
         ingress_namespace,
-        tenant_namespace,
         control_plane_namespace,
     } = args;
     // Sanitize the ids for the manifest LABEL values (the raw
@@ -187,11 +185,6 @@ pub fn render(args: &ProjectNamespaceArgs<'_>) -> String {
     // below.
     let tenant_id = SafeLabel::new(tenant_id, 63);
     let project_id = SafeLabel::new(project_id, 63);
-    // The worker->box egress port is the box's fixed listen port; pull
-    // it from the one constant so it can never drift from the box's own
-    // Service/containerPort (a literal here once meant changing
-    // STORAGE_PORT would silently break the data path).
-    let storage_port = weft_storage::config::STORAGE_PORT;
     // Namespace the Envoy Gateway runs in (its default install namespace);
     // the only source allowed to reach worker connection ports. Worker
     // port pulled from the one constant so it can't drift from the pod
@@ -284,25 +277,24 @@ spec:
         - podSelector:
             matchLabels:
               weft.dev/role: infra
-    # Tenant-namespace storage box (the ctx.storage data path:
-    # worker<->box byte streaming).
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {tenant_namespace}
-          podSelector:
-            matchLabels:
-              weft.dev/role: storage
-      ports:
-        - protocol: TCP
-          port: {storage_port}
-    # Internet egress (HTTP APIs, model downloads, etc).
+    # Internet egress (HTTP APIs, model downloads, AND the object store). The object
+    # store is ALWAYS external to the cluster, reached over S3 by its configured
+    # endpoint. The worker uploads/downloads runtime-file
+    # bytes DIRECTLY to it via broker-signed presigned URLs (the broker never carries
+    # the bytes), reaching it over this internet egress like any external host. The
+    # security wall is the presigned URL (per-key, per-method, short-TTL) plus the
+    # worker holding NO bucket credentials, NOT network reachability.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
               - {pod_cidr}
               - {service_cidr}
+              # Link-local. 169.254.169.254 is the node's cloud-provider metadata
+              # / credential endpoint (the #1 container-escape target); excluding
+              # the whole 169.254.0.0/16 keeps a compromised pod off it
+              # regardless of what the provider also blocks at the node.
+              - 169.254.0.0/16
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -365,6 +357,11 @@ spec:
             except:
               - {pod_cidr}
               - {service_cidr}
+              # Link-local. 169.254.169.254 is the node's cloud-provider metadata
+              # / credential endpoint (the #1 container-escape target); excluding
+              # the whole 169.254.0.0/16 keeps a compromised pod off it
+              # regardless of what the provider also blocks at the node.
+              - 169.254.0.0/16
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -429,14 +426,14 @@ mod tests {
     #[test]
     fn name_for_truncates_and_normalizes() {
         let n = name_for("Tenant-FOO", "abcdef-12345678-9999");
-        assert!(n.starts_with("wm-project-"));
+        assert!(n.starts_with("wft-project-"));
         assert!(n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
         assert!(n.len() <= 63);
     }
 
     #[test]
     fn safe_label_neutralizes_yaml_injection() {
-        // A free-form (e.g. future cloud) id with characters that
+        // A free-form id with characters that
         // could break the manifest or smuggle a label/field. SafeLabel
         // is the type the manifest renderers require, so this is the
         // only form an id can take in a manifest. It must come out as
@@ -510,7 +507,7 @@ mod tests {
         // join of its two parts (tenant resolution itself is via the
         // weft_namespace_tenant registry, not string parsing).
         assert!(n.contains("--"), "{n}");
-        assert!(n.starts_with("wm-project-local--"), "{n}");
+        assert!(n.starts_with("wft-project-local--"), "{n}");
     }
 
     #[test]
@@ -520,18 +517,17 @@ mod tests {
         let n = name_for("user--x", "proj1");
         // After collapsing runs: tenant="user-x", project="proj1".
         // Separator stays "--".
-        assert_eq!(n, "wm-project-user-x--proj1");
+        assert_eq!(n, "wft-project-user-x--proj1");
     }
 
     fn args() -> ProjectNamespaceArgs<'static> {
         ProjectNamespaceArgs {
             project_id: "proj1",
             tenant_id: "alice",
-            namespace: "wm-project-alice--proj1",
+            namespace: "wft-project-alice--proj1",
             pod_cidr: "10.244.0.0/16",
             service_cidr: "10.96.0.0/12",
             ingress_namespace: "ingress-nginx",
-            tenant_namespace: "wm-tenant-alice",
             control_plane_namespace: "weft-system",
         }
     }
@@ -540,7 +536,7 @@ mod tests {
     fn render_emits_namespace_and_sas() {
         let yaml = render(&args());
         assert!(yaml.contains("kind: Namespace"));
-        assert!(yaml.contains("name: wm-project-alice--proj1"));
+        assert!(yaml.contains("name: wft-project-alice--proj1"));
         assert!(yaml.contains("name: weft-worker-sa"));
         assert!(yaml.contains("name: weft-infra-sa"));
     }
@@ -551,6 +547,27 @@ mod tests {
         assert!(yaml.contains("name: default-deny"));
         assert!(yaml.contains("name: worker-policy"));
         assert!(yaml.contains("name: infra-policy"));
+    }
+
+    #[test]
+    fn worker_egress_allows_broker_and_external_object_store() {
+        // The worker reaches the broker (control: sign + record) in-cluster, and the
+        // object store (an EXTERNAL S3, or a host S3 server locally) over the internet
+        // egress. The store is never an in-cluster pod, so there is no object-store
+        // pod egress rule. No leftover per-tenant `storage` role or namespace ref.
+        let yaml = render(&args());
+        let worker_policy = yaml
+            .split("name: worker-policy")
+            .nth(1)
+            .unwrap()
+            .split("name: infra-policy")
+            .next()
+            .unwrap();
+        assert!(worker_policy.contains("weft.dev/role: broker"), "broker (control) egress present");
+        assert!(worker_policy.contains("cidr: 0.0.0.0/0"), "internet egress covers the external object store");
+        assert!(!worker_policy.contains("weft.dev/role: object-store"), "object store is external, not a pod");
+        assert!(!worker_policy.contains("weft.dev/role: storage"), "no dead storage-pod role remains");
+        assert!(!yaml.contains("wft-tenant-"), "no per-tenant storage namespace ref remains");
     }
 
     #[test]
@@ -579,6 +596,14 @@ mod tests {
         let yaml = render(&args());
         assert!(yaml.contains("10.244.0.0/16"));
         assert!(yaml.contains("10.96.0.0/12"));
+        // Link-local (cloud metadata / credential endpoint) is excluded from
+        // BOTH egress policies (worker-policy AND infra-policy): a compromised
+        // worker or infra pod must never reach 169.254.169.254.
+        assert_eq!(
+            yaml.matches("- 169.254.0.0/16").count(),
+            2,
+            "link-local excluded in both worker-policy and infra-policy egress"
+        );
     }
 
     #[test]

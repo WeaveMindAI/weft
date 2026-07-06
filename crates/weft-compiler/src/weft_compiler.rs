@@ -9,6 +9,8 @@
 
 use uuid::Uuid;
 
+use crate::file_reader::CompileFs;
+
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
     ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, NodeDefinition,
@@ -57,6 +59,11 @@ struct ParsedPort {
     /// mirrors of the carry output; users edit the output, not this side.
     /// Never set on a user-declared port; never set on a non-loop group.
     synthesized_from_carry: bool,
+    /// A non-fatal type error: the port was declared with an invalid / unknown
+    /// type. The port is KEPT (as `MustOverride`, rendered red) so it doesn't
+    /// vanish; this carries the diagnostic the caller records as a squiggle.
+    /// `None` for a well-typed port.
+    type_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,9 +204,9 @@ pub(crate) struct ParsedInclude {
 pub fn compile(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
 ) -> Result<ProjectDefinition, Vec<CompileError>> {
-    compile_with_mode(source, project_id, base_dir, IncludeMode::Full, None)
+    compile_with_mode(source, project_id, fs, IncludeMode::Full, None)
 }
 
 /// How `@include` is resolved. `Full` inlines the referenced group's whole
@@ -215,12 +222,12 @@ pub enum IncludeMode {
 pub fn compile_with_mode(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
     include_mode: IncludeMode,
     source_name: Option<&str>,
 ) -> Result<ProjectDefinition, Vec<CompileError>> {
     // Strict: any error aborts (the build must not produce a half-project).
-    let (project, errors) = compile_lenient(source, project_id, base_dir, include_mode, source_name);
+    let (project, errors) = compile_lenient(source, project_id, fs, include_mode, source_name);
     if errors.is_empty() {
         Ok(project)
     } else {
@@ -240,7 +247,7 @@ pub fn compile_with_mode(
 pub fn compile_lenient(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
     include_mode: IncludeMode,
     source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<CompileError>) {
@@ -255,15 +262,15 @@ pub fn compile_lenient(
     let mut state = parse_weft(source, source_id);
     errors.append(&mut state.errors);
     for node in &mut state.nodes {
-        resolve_node_file_refs_in(node, base_dir, &mut errors);
+        resolve_node_file_refs_in(node, &fs, &mut errors);
     }
     for group in &mut state.groups {
-        resolve_group_file_refs(group, base_dir, &mut errors);
+        resolve_group_file_refs(group, &fs, &mut errors);
     }
 
     // Resolve `@include` declarations (Full inlines, Interface emits opaque
     // nodes), collecting errors.
-    resolve_includes(&mut state, base_dir, include_mode, &mut Vec::new(), &mut errors);
+    resolve_includes(&mut state, &fs, include_mode, &mut Vec::new(), &mut errors);
 
     // Flatten the partial state into a project. flatten builds from whatever
     // the parser produced and never fails.
@@ -276,7 +283,7 @@ pub fn compile_lenient(
 /// every file's `@file` refs resolve relative to that file's own directory.
 fn parse_and_resolve_file_refs(
     source: &str,
-    base_dir: Option<&std::path::Path>,
+    fs: &CompileFs,
     source_id: &str,
 ) -> Result<ParseState, Vec<CompileError>> {
     let mut state = parse_weft(source, source_id);
@@ -285,10 +292,10 @@ fn parse_and_resolve_file_refs(
     }
     let mut errors = Vec::new();
     for node in &mut state.nodes {
-        resolve_node_file_refs_in(node, base_dir, &mut errors);
+        resolve_node_file_refs_in(node, fs, &mut errors);
     }
     for group in &mut state.groups {
-        resolve_group_file_refs(group, base_dir, &mut errors);
+        resolve_group_file_refs(group, fs, &mut errors);
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -300,7 +307,7 @@ fn parse_and_resolve_file_refs(
 /// private `ParsedNode` fields to `file_ref::resolve_node_file_refs`).
 fn resolve_node_file_refs_in(
     node: &mut ParsedNode,
-    base_dir: Option<&std::path::Path>,
+    fs: &CompileFs,
     errors: &mut Vec<CompileError>,
 ) {
     crate::file_ref::resolve_node_file_refs(
@@ -308,7 +315,7 @@ fn resolve_node_file_refs_in(
         &node.config_spans,
         &mut node.file_refs,
         node.span.unwrap_or_default(),
-        base_dir,
+        fs,
         errors,
     );
 }
@@ -318,14 +325,14 @@ fn resolve_node_file_refs_in(
 /// file) resolves too.
 fn resolve_group_file_refs(
     group: &mut ParsedGroup,
-    base_dir: Option<&std::path::Path>,
+    fs: &CompileFs,
     errors: &mut Vec<CompileError>,
 ) {
     for node in &mut group.nodes {
-        resolve_node_file_refs_in(node, base_dir, errors);
+        resolve_node_file_refs_in(node, fs, errors);
     }
     for child in &mut group.child_groups {
-        resolve_group_file_refs(child, base_dir, errors);
+        resolve_group_file_refs(child, fs, errors);
     }
 }
 
@@ -358,18 +365,18 @@ fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -
 /// file paths currently being resolved.
 fn resolve_includes(
     state: &mut ParseState,
-    base_dir: Option<&std::path::Path>,
+    fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
     errors: &mut Vec<CompileError>,
 ) {
     let includes = std::mem::take(&mut state.includes);
     for inc in includes {
-        let Some(root) = base_dir else {
+        if fs.base.is_none() {
             errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
             continue;
-        };
-        match resolve_one_include(&inc, root, mode, in_progress) {
+        }
+        match resolve_one_include(&inc, fs, mode, in_progress) {
             Ok(IncludeResult::Group(group)) => state.groups.push(*group),
             Ok(IncludeResult::Node(node)) => state.nodes.push(*node),
             Err(msg) => errors.push(CompileError::at(inc.span, msg)),
@@ -377,7 +384,7 @@ fn resolve_includes(
     }
     // Resolve includes nested inside group bodies, anywhere in the tree.
     for group in &mut state.groups {
-        resolve_group_includes(group, base_dir, mode, in_progress, errors);
+        resolve_group_includes(group, fs, mode, in_progress, errors);
     }
 }
 
@@ -386,18 +393,18 @@ fn resolve_includes(
 /// become opaque member nodes.
 fn resolve_group_includes(
     group: &mut ParsedGroup,
-    base_dir: Option<&std::path::Path>,
+    fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
     errors: &mut Vec<CompileError>,
 ) {
     let includes = std::mem::take(&mut group.includes);
     for inc in includes {
-        let Some(root) = base_dir else {
+        if fs.base.is_none() {
             errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
             continue;
-        };
-        match resolve_one_include(&inc, root, mode, in_progress) {
+        }
+        match resolve_one_include(&inc, fs, mode, in_progress) {
             Ok(IncludeResult::Group(g)) => group.child_groups.push(*g),
             Ok(IncludeResult::Node(mut n)) => {
                 // The opaque interface node is a member of this group (its id
@@ -412,7 +419,7 @@ fn resolve_group_includes(
         }
     }
     for child in &mut group.child_groups {
-        resolve_group_includes(child, base_dir, mode, in_progress, errors);
+        resolve_group_includes(child, fs, mode, in_progress, errors);
     }
 }
 
@@ -423,27 +430,31 @@ enum IncludeResult {
 
 fn resolve_one_include(
     inc: &ParsedInclude,
-    base_dir: &std::path::Path,
+    fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
 ) -> Result<IncludeResult, String> {
-    let joined = base_dir.join(&inc.path);
-    let canonical_root = base_dir
-        .canonicalize()
-        .map_err(|e| format!("project root {base_dir:?} is unreadable: {e}"))?;
-    let canonical = joined
-        .canonicalize()
-        .map_err(|e| format!("@include path {:?} cannot be read: {e}", inc.path))?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(format!("@include path {:?} escapes the project root", inc.path));
-    }
+    // The caller has already gated `fs.base.is_none()` (an `@include` outside a
+    // project), so an anchor is present here.
+    let base = fs
+        .base
+        .expect("resolve_one_include called with no fs anchor");
+    // Resolve + read through the active backing (disk, in-memory map, DB rows):
+    // it owns join, the trusted-tree containment check, and the read, and returns
+    // the backing-agnostic identity used below for cycle detection and for
+    // deriving the included file's own directory.
+    let resolved = fs
+        .reader
+        .resolve_and_read(base, std::path::Path::new(&inc.path))
+        .map_err(|e| format!("@include {e}"))?;
+    let canonical = resolved.identity;
     if in_progress.contains(&canonical) {
         return Err(format!("@include cycle: {:?} includes itself", inc.path));
     }
 
-    let source = std::fs::read_to_string(&canonical)
-        .map_err(|e| format!("@include path {:?} cannot be read: {e}", inc.path))?;
+    let source = resolved.content;
     let included_dir = canonical.parent().map(|p| p.to_path_buf());
+    let included_fs = fs.descend(included_dir.as_deref());
 
     // Parse the included file with the CALL-SITE ALIAS as its anon-root id, so
     // its top-level group lowers directly to `{alias}` and its internals to
@@ -452,7 +463,7 @@ fn resolve_one_include(
     // SAME single-pass scoping the rest of the lowering uses; there is no second
     // string-surgery rescoping engine. (`@file` markers still resolve against the
     // included file's own directory.)
-    let mut sub = parse_and_resolve_file_refs(source.as_str(), included_dir.as_deref(), &inc.alias)
+    let mut sub = parse_and_resolve_file_refs(source.as_str(), &included_fs, &inc.alias)
         .map_err(|errs| {
             errs.into_iter()
                 .map(|e| format!("{}: {}", inc.path, e))
@@ -506,7 +517,7 @@ fn resolve_one_include(
             // composition inlines fully. Cycle stack guards self-inclusion.
             in_progress.push(canonical.clone());
             let mut errs = Vec::new();
-            resolve_group_includes(&mut group, included_dir.as_deref(), mode, in_progress, &mut errs);
+            resolve_group_includes(&mut group, &included_fs, mode, in_progress, &mut errs);
             in_progress.pop();
             if !errs.is_empty() {
                 return Err(errs
@@ -989,6 +1000,12 @@ fn lower_port_sig(
                 let span = li.span_of(&n);
                 match try_parse_port_decl(text) {
                     Ok(p) => {
+                        // A bad / unknown port TYPE is kept (as MustOverride, red in
+                        // the editor) but still surfaced as a squiggle, so the port
+                        // never silently vanishes from the canvas.
+                        if let Some(type_err) = &p.type_error {
+                            errors.push(CompileError::at(span, type_err.clone()));
+                        }
                         if ports.iter().any(|e: &ParsedPort| e.name == p.name) {
                             errors.push(CompileError::at(span, format!("Duplicate {direction} port \"{}\"", p.name)));
                         } else {
@@ -1901,7 +1918,7 @@ fn lower_grouplike_body(
         // the user did not declare the matching input, synthesize it
         // (REQUIRED: it seeds iteration 0, and a fabricated default
         // seed would silently run the whole loop on wrong data).
-        // SYNC: carry input synthesis <-> extension-vscode/src/webview/lib/
+        // SYNC: carry input synthesis <-> packages/weft-graph/src/webview/lib/
         // projection/apply.ts syncLoopCarryInputs (the editor's optimistic
         // projection derives the same ghost inputs between round-trips).
         // Everything diagnostic about carry (unknown output, type
@@ -1923,6 +1940,7 @@ fn lower_grouplike_body(
                     required: out.required,
                     port_type: out.port_type,
                     synthesized_from_carry: true,
+                    type_error: None,
                 });
             }
         }
@@ -2091,7 +2109,20 @@ fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
 
         match WeftType::parse(type_str) {
             Some(pt) => (name, pt, optional),
-            None => return Err(format!("Invalid port type '{}' on port '{}'", type_str, name)),
+            // An invalid / unknown type is RECOVERABLE: keep the port (with the
+            // `MustOverride` placeholder, which the editor renders red as
+            // "needs a type") and surface the bad type as a diagnostic, rather
+            // than dropping the port so it silently vanishes from the canvas.
+            // Mirrors the same keep-and-flag rule enrich applies to a custom port
+            // left at `MustOverride`. The error text rides on the returned port
+            // via `type_error` so the caller records the squiggle.
+            None => return Ok(ParsedPort {
+                name: name.to_string(),
+                port_type: WeftType::MustOverride,
+                required: !optional,
+                synthesized_from_carry: false,
+                type_error: Some(format!("Invalid port type '{}' on port '{}'", type_str, name)),
+            }),
         }
     } else {
         // No type annotation
@@ -2118,6 +2149,7 @@ fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
         port_type: port_type,
         required: !optional, // v2: required by default, ? makes optional
         synthesized_from_carry: false,
+        type_error: None,
     })
 }
 
@@ -2235,7 +2267,7 @@ fn parse_kv(
     // from `config` downstream); anything else with a leading underscore is
     // rejected so the user doesn't collide with a future reserved field.
     if key.starts_with('_') {
-        const ALLOWED: &[&str] = &["_is_output", "_tags"];
+        const ALLOWED: &[&str] = &["_is_output", weft_core::tag::TAGS_CONFIG_KEY];
         if !ALLOWED.contains(&key) {
             errors.push(CompileError::at(span, format!(
                 "'{key}' starts with '_' which is reserved for internal config keys. \
@@ -2324,12 +2356,24 @@ fn parse_kv(
     // enumeration). Validate the charset at parse time so the same
     // rule fires regardless of whether the project came from a
     // hand-edited .weft or from the AI builder.
-    if key == "_tags" {
+    if key == weft_core::tag::TAGS_CONFIG_KEY {
         if let Some(arr) = value.as_array() {
-            let tags: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
+            // Every element MUST be a string. `filter_map(as_str)` silently DROPPED
+            // non-string elements, so `_tags: ["ok", 5, {}]` compiled "successfully"
+            // as `["ok"]`, discarding user data with no error. Reject loudly instead.
+            let mut tags: Vec<String> = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => tags.push(s.to_string()),
+                    None => {
+                        errors.push(CompileError::at(
+                            span,
+                            format!("_tags must contain only strings; found {v}"),
+                        ));
+                        return None;
+                    }
+                }
+            }
             if let Err(e) = weft_core::tag::validate_tags(&tags) {
                 errors.push(CompileError::at(span, format!("invalid _tags: {e}")));
                 return None;

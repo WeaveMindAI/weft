@@ -10,8 +10,7 @@
 //! new source is the tree's `to_string()`, which re-emits only the changed
 //! subtree and leaves every other byte identical (structural sharing). Edits
 //! never compute text offsets: the closing `}` is a real token and a group body
-//! is a real node, so an edit cannot splice in the wrong place. See
-//! `docs/cst-node-model.md` and `docs/cst-edit-spec.md`.
+//! is a real node, so an edit cannot splice in the wrong place.
 //!
 //! The parse-server wire: `EditOp`s in, `(new_source, inverse TextEdit)` out.
 //! The CST is an internal detail of how an edit produces the new source.
@@ -24,7 +23,7 @@ use crate::cst::nodes::WeftFile;
 use crate::cst::parse;
 
 /// A structured edit intent. `serde` tag `op` matches the parse-server wire.
-// SYNC: EditOp <-> extension-vscode/src/shared/protocol.ts EditOp
+// SYNC: EditOp <-> packages/weft-graph/src/protocol.ts EditOp
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum EditOp {

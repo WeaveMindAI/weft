@@ -6,7 +6,7 @@ import './app.css';
 function initApp() {
   const target = document.getElementById('app');
   if (!target) {
-    console.error('[WeaveMind] Target element not found');
+    console.error('[weft] Target element not found');
     return;
   }
   

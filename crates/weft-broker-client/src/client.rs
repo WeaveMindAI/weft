@@ -632,11 +632,13 @@ impl BrokerSupervisorClient {
         pod_name: &str,
         command_id: i64,
         error: Option<&str>,
+        cancelled: bool,
     ) -> Result<WriteOutcome<SupervisorCommandCompleteResponse>> {
         let req = SupervisorCommandCompleteRequest {
             pod_name: pod_name.to_string(),
             command_id,
             error: error.map(|s| s.to_string()),
+            cancelled,
         };
         self.http
             .post_or_raced::<_, SupervisorCommandCompleteResponse>(
@@ -644,6 +646,17 @@ impl BrokerSupervisorClient {
                 &req,
             )
             .await
+    }
+
+    /// Whether the user requested cancellation of a claimed command.
+    /// Polled by the executing supervisor between kubectl steps.
+    pub async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
+        let req = crate::protocol::SupervisorCommandCancelRequestedRequest { command_id };
+        let resp: crate::protocol::SupervisorCommandCancelRequestedResponse = self
+            .http
+            .post("/v1/supervisor/command_cancel_requested", &req)
+            .await?;
+        Ok(resp.cancel_requested)
     }
 
     pub async fn running_count(&self, project_id: &str) -> Result<i64> {

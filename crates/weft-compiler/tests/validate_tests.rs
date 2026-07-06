@@ -5,14 +5,14 @@ use weft_catalog::{stdlib_root, FsCatalog};
 use weft_compiler::enrich::enrich;
 use weft_compiler::validate::validate;
 use weft_compiler::weft_compiler::compile;
-use weft_compiler::{Diagnostic, Severity};
+use weft_compiler::{CompileFs, Diagnostic, Severity};
 
 fn catalog() -> FsCatalog {
     FsCatalog::discover(&stdlib_root()).expect("stdlib catalog")
 }
 
 fn parse_enrich(source: &str) -> weft_core::ProjectDefinition {
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     project
 }
@@ -72,7 +72,6 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
 fn clean_program_has_no_diagnostics() {
     let project = parse_enrich(
         r#"
-# Project: Clean
 
 hi = Text { value: "hello" }
 out = Debug
@@ -87,12 +86,12 @@ out.data = hi.value
 fn node_named_after_a_type_is_flagged() {
     // Naming a node after a catalog type (`Debug`) is ambiguous: a later
     // `Debug.port` reference would parse as an inline Debug node. Flagged as a
-    // reserved-name error on the declaration line (line 3 here).
-    let project = parse_enrich("# Project: Clash\n\nDebug = Debug {}\n");
+    // reserved-name error on the declaration line (line 1 here).
+    let project = parse_enrich("Debug = Debug {}\n");
     let d = validate(&project, &catalog());
     let reserved: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("reserved-name")).collect();
     assert_eq!(reserved.len(), 1, "expected one reserved-name error, got {d:?}");
-    assert_eq!(reserved[0].line, 3, "must point at the declaration line");
+    assert_eq!(reserved[0].line, 1, "must point at the declaration line");
     assert_eq!(reserved[0].severity, Severity::Error);
 }
 
@@ -101,7 +100,7 @@ fn node_named_after_a_type_inside_a_group_is_flagged() {
     // The ambiguity is about the LOCAL name. A node `Debug` inside a group gets
     // scoped id `grp.Debug`, but the source reference is still local `Debug.port`.
     // The check must compare the local segment, not the scoped id.
-    let project = parse_enrich("# Project: Clash\n\ngrp = Group() -> () {\n  Debug = Debug {}\n}\n");
+    let project = parse_enrich("grp = Group() -> () {\n  Debug = Debug {}\n}\n");
     let d = validate(&project, &catalog());
     let reserved: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("reserved-name")).collect();
     assert_eq!(reserved.len(), 1, "nested type-named node must be flagged, got {d:?}");
@@ -115,7 +114,6 @@ fn duplicate_node_id_is_flagged() {
     // JSON import) should still be caught by validate.
     let mut project = parse_enrich(
         r#"
-# Project: Dup
 one = Text { value: "a" }
 two = Text { value: "b" }
 "#,
@@ -129,7 +127,6 @@ two = Text { value: "b" }
 fn unknown_target_port_with_suggestion() {
     let mut project = parse_enrich(
         r#"
-# Project: T
 hello = Text { value: "a" }
 out = Debug
 out.data = hello.value
@@ -153,7 +150,6 @@ out.data = hello.value
 fn duplicate_input_port_is_flagged() {
     let mut project = parse_enrich(
         r#"
-# Project: Two
 a = Text { value: "x" }
 b = Text { value: "y" }
 out = Debug
@@ -179,7 +175,6 @@ fn type_mismatch_is_flagged() {
     use weft_core::weft_type::{WeftPrimitive, WeftType};
     let mut project = parse_enrich(
         r#"
-# Project: M
 one = Text { value: "x" }
 out = Debug
 out.data = one.value
@@ -199,7 +194,7 @@ fn config_type_mismatch_is_flagged() {
     // Construct a scenario where a port IS configurable and typed:
     // manually inject an input port with a String type and set
     // config to a number. The rule flags incompatible literal.
-    let mut project = parse_enrich(r#"# Project: C
+    let mut project = parse_enrich(r#"
 t = Text
 "#);
     let t = &mut project.nodes[0];
@@ -220,7 +215,7 @@ t = Text
 fn required_port_unmet_is_flagged() {
     // We construct a Text with a manually-required port and no driver
     // to exercise the required-port-unmet diagnostic.
-    let mut project = parse_enrich(r#"# Project: R
+    let mut project = parse_enrich(r#"
 t = Text { value: "ok" }
 "#);
     project.nodes[0].inputs.push(weft_core::project::PortDefinition {
@@ -241,7 +236,6 @@ t = Text { value: "ok" }
 fn unknown_edge_node_ref_is_flagged() {
     let mut project = parse_enrich(
         r#"
-# Project: Dangling
 a = Text { value: "x" }
 out = Debug
 out.data = a.value
@@ -266,7 +260,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
 
     // No output node anywhere: must fire no-output-node.
     let src_no_out = "c = @include(\"comp.weft\")\n";
-    let mut p = compile(src_no_out, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let mut p = compile(src_no_out, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     enrich(&mut p, &catalog()).expect("enrich");
     let d = validate(&p, &catalog());
     assert!(codes(&d).contains(&"no-output-node"), "expected no-output-node, got {d:?}");
@@ -276,7 +270,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
     // input is driven by an inline node (a group port takes wiring, not a bare
     // literal).
     let src_out = "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n";
-    let mut p2 = compile(src_out, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let mut p2 = compile(src_out, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     enrich(&mut p2, &catalog()).expect("enrich");
     let d2 = validate(&p2, &catalog());
     assert!(!codes(&d2).contains(&"no-output-node"), "unexpected no-output: {d2:?}");
@@ -296,7 +290,7 @@ fn top_level_include_does_not_make_project_look_like_a_component() {
 #[test]
 fn config_matches_rule_fires_only_when_pattern_matches() {
     // path starts with `/` -> the rule fires (warning).
-    let with_slash = parse_enrich("# Project: P\n\nt = ApiEndpoint { path: \"/hook\" }\n");
+    let with_slash = parse_enrich("t = ApiEndpoint { path: \"/hook\" }\n");
     let d = validate(&with_slash, &catalog());
     assert!(
         d.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -304,7 +298,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     );
 
     // path without a leading slash -> no rule.
-    let no_slash = parse_enrich("# Project: P\n\nt = ApiEndpoint { path: \"hook\" }\n");
+    let no_slash = parse_enrich("t = ApiEndpoint { path: \"hook\" }\n");
     let d2 = validate(&no_slash, &catalog());
     assert!(
         !d2.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -314,7 +308,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     // path absent entirely -> no rule (fail-closed: an absent field is not a
     // match, matching every sibling ConfigX condition; the old `unwrap_or(true)`
     // wrongly fired this).
-    let absent = parse_enrich("# Project: P\n\nt = ApiEndpoint {}\n");
+    let absent = parse_enrich("t = ApiEndpoint {}\n");
     let d3 = validate(&absent, &catalog());
     assert!(
         !d3.iter().any(|x| x.message.contains("path starts with '/'")),
@@ -326,7 +320,7 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
 
 fn parse_enrich_lenient(source: &str) -> (weft_core::ProjectDefinition, Vec<weft_compiler::weft_compiler::CompileError>) {
     use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
-    let (mut project, errs) = compile_lenient(source, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (mut project, errs) = compile_lenient(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     // Use lenient enrich so an unknown type doesn't bail before validate runs.
     let _ = weft_compiler::enrich::enrich_with_policy(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Lenient);
     (project, errs)
@@ -747,7 +741,7 @@ my_loop = Loop(other: List[String]) -> (out: List[String | Null]) {
     over: ["other"]
 }
 "#;
-    let (_, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.iter().any(|e| e.message.contains("Duplicate id")),
         "expected Duplicate id error, got {:?}", errs);
 }
@@ -793,7 +787,7 @@ fn output_narrow_to_incompatible_type_is_rejected() {
 fetch = FetchToStorage -> (file: Number) { keep: false }
 "#,
         uuid::Uuid::new_v4(),
-        None,
+        CompileFs::none(),
     )
     .expect("compile ok");
     let err = enrich(&mut project, &catalog());

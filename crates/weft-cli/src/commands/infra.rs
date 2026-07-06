@@ -23,11 +23,14 @@ use crate::progress::{ActionVerb, Progress};
 #[derive(Clone)]
 pub enum InfraAction {
     Start,
-    Restart,
     Upgrade,
     Stop,
     Terminate,
     Status,
+    /// Cancel in-flight infra work (claimed lifecycle commands halt
+    /// between kubectl steps; unclaimed ones cancel outright; the
+    /// provisioning execution is interrupted). HALT, not rollback.
+    Cancel,
     NodeStop { node_id: String, force: bool },
     NodeTerminate { node_id: String },
 }
@@ -48,6 +51,10 @@ pub struct InfraOpts {
     pub mode: Option<String>,
     pub grace: Option<u32>,
     pub running_policy: Option<String>,
+    /// Cap on a `wait` drain in seconds (worker replacement inside
+    /// sync; the supervisor's stop drain). `None` = the server
+    /// default (`DEFAULT_DRAIN_TIMEOUT_SECS`).
+    pub drain_timeout: Option<u64>,
 }
 
 pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
@@ -56,10 +63,10 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     }
     let verb = match &action {
         InfraAction::Start => ActionVerb::InfraStart,
-        InfraAction::Restart => ActionVerb::InfraRestart,
         InfraAction::Upgrade => ActionVerb::InfraUpgrade,
         InfraAction::Stop => ActionVerb::InfraStop,
         InfraAction::Terminate => ActionVerb::InfraTerminate,
+        InfraAction::Cancel => ActionVerb::InfraCancel,
         InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
         InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
         InfraAction::Status => unreachable!(),
@@ -86,10 +93,10 @@ async fn run_inner(
     // let the bar flicker through intermediate interactive states.
     let summary = match &action {
         InfraAction::Start => "infra started",
-        InfraAction::Restart => "infra restarted",
         InfraAction::Upgrade => "infra upgraded",
         InfraAction::Stop => "infra stopped",
         InfraAction::Terminate => "infra terminated",
+        InfraAction::Cancel => "infra cancel issued",
         InfraAction::NodeStop { .. } => "infra node stopped",
         InfraAction::NodeTerminate { .. } => "infra node terminated",
         InfraAction::Status => unreachable!(),
@@ -97,18 +104,14 @@ async fn run_inner(
     match action {
         // Plain Start: just bring DOWN units up (apply skips up units).
         InfraAction::Start => infra_sync(ctx, progress, action, opts).await?,
-        // Restart / Upgrade = stop then start. The apply path leaves
-        // up units frozen, so to cycle a running unit onto a new spec
-        // we stop first (respecting each unit's on_stop: NoOp units stay
-        // up, ScaleToZero go down) then start (recreates the down ones).
-        // `infra_stop` blocks until the stop settles, so the start sees
-        // the post-stop state.
-        InfraAction::Restart | InfraAction::Upgrade => {
-            infra_stop(ctx, progress, opts.clone()).await?;
-            infra_sync(ctx, progress, InfraAction::Start, opts).await?;
-        }
+        // Upgrade: ONE `/infra/sync` POST with `upgrade: true`. The
+        // SERVER owns the decomposition (deactivate per the user's
+        // spec when active, stop leg, then apply), so every client
+        // gets the same upgrade from a single request.
+        InfraAction::Upgrade => infra_sync(ctx, progress, action, opts).await?,
         InfraAction::Stop => infra_stop(ctx, progress, opts).await?,
         InfraAction::Terminate => infra_terminate(ctx, progress, opts).await?,
+        InfraAction::Cancel => infra_cancel(ctx, progress).await?,
         InfraAction::NodeStop { node_id, force } => {
             infra_node_verb(ctx, progress, &node_id, "stop", force).await?
         }
@@ -118,6 +121,18 @@ async fn run_inner(
         InfraAction::Status => unreachable!(),
     }
     progress.complete(summary);
+    Ok(())
+}
+
+/// POST `/infra/cancel`: halt/cancel in-flight infra work. 202 on
+/// success (cancel reconciles, never asserts: poll `weft status` for
+/// where things settled); 412 when nothing is in flight.
+async fn infra_cancel(ctx: &Ctx, progress: &Progress) -> Result<()> {
+    let (client, project_id, _name) = super::resolve_project(ctx)?;
+    let path = format!("/projects/{project_id}/infra/cancel");
+    progress.dispatcher_call_start(&path);
+    client.post_empty(&path).await?;
+    progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id }));
     Ok(())
 }
 
@@ -160,90 +175,53 @@ async fn infra_sync(
     action: InfraAction,
     opts: InfraOpts,
 ) -> Result<()> {
-    use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
-
-    // The same `--running-policy` the user gave for the trigger
-    // deactivation also pre-answers the stale-binary build gate:
-    // both ask "what to do with running executions," so a single
-    // flag answers both for an infra sync.
-    let build_gate_policy = parse_running_policy_flag(opts.running_policy.as_deref())?;
-
-    // Reject an EXPLICIT `--running-policy wait --mode wipe` up front,
-    // BEFORE the build gate (which on `wait` can block UNBOUNDED in
-    // `wait_for_drain`). The combination is contradictory (you can't
-    // wait for executions you're about to wipe) and statically known
-    // the instant both flags are parsed, so catching it after a
-    // potentially-hours-long drain is the wrong moment. (A build-gate
-    // wait that wasn't explicitly paired with wipe is handled later
-    // via `trigger_policy`, which never forces wait into a wipe.)
-    if build_gate_policy == Some(RunningPolicy::Wait)
-        && opts.mode.as_deref() == Some("wipe")
-    {
-        anyhow::bail!(
-            "`--running-policy wait` contradicts `--mode wipe`: waiting for executions \
-             you're about to wipe is nonsensical. Use `--running-policy cancel` with wipe"
-        );
-    }
-
-    // reactivates_after_gate=false: infra verbs do NOT auto-reactivate
-    // (the user clicks Activate when ready). If the gate parked an active
-    // project to drain, the post-gate `project_is_active` check below
-    // sees it inactive and skips its own trigger-deactivation (already
-    // done); ensure_registered warns the user to `weft activate`.
-    let handle =
-        super::ensure::ensure_registered(ctx, progress, build_gate_policy, false).await?;
-    let image_tags = build_infra_images(progress, &handle.project, &handle.id).await?;
+    let handle = super::ensure::ensure_registered(ctx, progress).await?;
+    let image_tags = build_infra_images(progress, &handle.plan, &handle.id).await?;
     let verb_label = action_verb_label(&action);
 
-    // The build gate and the trigger-deactivation both decide what to
-    // do with running executions. Reuse the build gate's resolved
-    // CANCEL so a user who chose cancel at the gate doesn't see the
-    // executions un-cancelled by a defaulted wait. We do NOT carry a
-    // build-gate WAIT forward, for two reasons: (1) `prompt_trigger_
-    // deactivation` does NOT re-prompt for the running policy (it
-    // DEFAULTS it: wait for hibernate/park, cancel for wipe), so there
-    // is no double-prompt to avoid on the wait axis; (2) forcing a
-    // build-gate `wait` into a `--mode wipe` would hit that helper's
-    // "wipe requires cancel" bail AFTER the build already ran. Letting
-    // wait fall through to the per-mode default keeps the phases
-    // consistent (preservation modes default to wait anyway) without
-    // the post-build abort. An EXPLICIT `--running-policy wait --mode
-    // wipe` is already rejected up front (before the build), so it
-    // can't reach here.
-    let trigger_policy = match handle.resolved_running_policy {
-        Some(p @ RunningPolicy::Cancel) => Some(p.as_str().to_string()),
-        // Some(Wait) or None: let the deactivation mode's own default
-        // (or an explicit flag) decide; see above.
-        _ => opts.running_policy.clone(),
-    };
-
-    // Only Upgrade against an Active project actually needs the
-    // trigger-deactivation choice. Start / Restart fire when infra
-    // is down (project necessarily Inactive); Upgrade when infra is
-    // running (project usually Active).
-    let active = super::deactivate::project_is_active(&handle.client, &handle.id).await?;
-    let trigger_deactivation = if active {
+    // A START never deactivates: an active project's triggers stay
+    // live while infra comes up (only executions that actually touch
+    // the not-yet-running infra fail, loudly, at the node), so it asks
+    // no deactivation questions. An UPGRADE of an ACTIVE project takes
+    // live infra down (the server's stop leg), so it collects the
+    // user's deactivation choice (same picker as `weft deactivate`)
+    // and sends it with `upgrade: true`; the server decomposes.
+    let upgrade = matches!(action, InfraAction::Upgrade);
+    let trigger_deactivation = if upgrade
+        && super::deactivate::project_is_active(&handle.client, &handle.id).await?
+    {
         Some(super::deactivate::prompt_trigger_deactivation(
             ctx.json(),
             &format!("infra {verb_label}"),
             opts.mode.as_deref(),
             opts.grace,
-            trigger_policy.as_deref(),
+            opts.running_policy.as_deref(),
+            opts.drain_timeout,
         )?)
     } else {
         None
     };
 
-    // No auto-reactivate: an Upgrade/Restart leaves the project
-    // deactivated (the user invoked it, they click Activate when
-    // ready). The trigger-deactivation choice above still applies (it
-    // governs HOW triggers come down during the stop).
-
+    // SYNC: sync body keys <-> crates/weft-dispatcher/src/api/infra.rs
+    // (SyncRequest). All its fields are serde-defaulted, so a key drift here
+    // would silently become the default at the receiving end; change both together.
     let mut body = serde_json::Map::new();
     handle.inject_hash_fields(&mut body);
     body.insert("imageHashes".into(), serde_json::to_value(&image_tags)?);
+    if upgrade {
+        body.insert("upgrade".into(), true.into());
+    }
     if let Some(td) = trigger_deactivation {
         body.insert("triggerDeactivation".into(), td);
+    }
+    // Worker-replacement gating inside sync: the trigger-side
+    // running-policy choice answers the same "what about running
+    // executions" question, so reuse it; the drain cap rides along.
+    if let Some(p) = opts.running_policy.as_deref() {
+        body.insert("runningPolicy".into(), p.into());
+    }
+    if let Some(cap) = opts.drain_timeout {
+        body.insert("drainTimeoutSecs".into(), cap.into());
     }
     let path = format!("/projects/{}/infra/sync", handle.id);
     let body = serde_json::Value::Object(body);
@@ -267,11 +245,11 @@ async fn infra_sync(
 fn action_verb_label(a: &InfraAction) -> &'static str {
     match a {
         InfraAction::Start => "start",
-        InfraAction::Restart => "restart",
         InfraAction::Upgrade => "upgrade",
         InfraAction::Stop => "stop",
         InfraAction::Terminate => "terminate",
         InfraAction::Status => "status",
+        InfraAction::Cancel => "cancel",
         InfraAction::NodeStop { .. } => "node-stop",
         InfraAction::NodeTerminate { .. } => "node-terminate",
     }
@@ -306,6 +284,7 @@ async fn infra_destroy(
             opts.mode.as_deref(),
             opts.grace,
             opts.running_policy.as_deref(),
+            opts.drain_timeout,
         )?)
     } else {
         None
@@ -314,6 +293,9 @@ async fn infra_destroy(
     let mut body = serde_json::Map::new();
     if let Some(td) = trigger_deactivation {
         body.insert("triggerDeactivation".into(), td);
+    }
+    if let Some(cap) = opts.drain_timeout {
+        body.insert("drainTimeoutSecs".into(), cap.into());
     }
     let body = serde_json::Value::Object(body);
     progress.dispatcher_call_start(&path);
@@ -336,9 +318,11 @@ async fn infra_destroy(
 }
 
 /// Poll the command-status endpoint until the supervisor marks the
-/// command complete. Fails loud on a `failed` outcome; `cancelled`
-/// (e.g. the node was already gone) is treated as success ("no longer
-/// applicable"). UNBOUNDED: an infra command (stop / terminate / start)
+/// command complete. Fails loud on a `failed` outcome AND on a
+/// `cancelled` one: cancelled means `weft infra cancel` halted this
+/// command between steps, so the verb did NOT do what was asked and a
+/// zero exit would lie about it (infra is left as-is, per-node state
+/// intact). UNBOUNDED: an infra command (stop / terminate / start)
 /// can depend on draining in-flight executions, which is a user-facing
 /// wait that may legitimately last hours; a hard deadline would turn a
 /// correct slow operation into a spurious failure (same rule as
@@ -385,6 +369,13 @@ async fn wait_for_command(
                 let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
                 anyhow::bail!("infra {verb} failed: {msg}");
             }
+            if outcome == "cancelled" {
+                anyhow::bail!(
+                    "infra {verb} cancelled (`weft infra cancel`): the operation was halted \
+                     between steps and did NOT complete; infra is left as-is (check `weft infra \
+                     status`), re-run the verb to finish or act per node"
+                );
+            }
             return Ok(());
         }
         let now = std::time::Instant::now();
@@ -429,85 +420,56 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
 }
 
 /// Build the `(node_id -> { image_name -> hash_tag })` map for every
-/// `requires_infra` node in the project. Reads `metadata.images`
-/// (the list of buildable image dirs); for each image, hashes the
-/// dir, builds the docker image if missing, kind-loads in local
-/// dev. Returns the nested map shipped in the `/infra/sync` body.
+/// `requires_infra` node in the project, the nested map shipped in the
+/// `/infra/sync` body. The images come straight from the `BuildPlan`
+/// `ensure_registered` already produced (kind `Infra`, refs minted by the ONE
+/// `TagPolicy`): no second compile, no re-enumeration, no tag re-derivation
+/// that could drift from the plan. The CLI's local refs are bare
+/// `weft-infra-<name>:<content_hash>` tags it docker-builds + loads onto the
+/// node (full content hash, matching the worker tag `weft-worker:<binary_hash>`);
+/// the supplied map value is exactly the local tag the supervisor resolves
+/// `Image::Local` to.
 async fn build_infra_images(
     progress: &Progress,
-    project: &weft_compiler::project::Project,
+    plan: &weft_compiler::build_plan::BuildPlan,
     project_id: &str,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-    let (definition, catalog) = crate::hash::load_enriched_project(project)?;
-
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut seen_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for node in definition.nodes.iter().filter(|n| n.requires_infra) {
-        let Some(entry) = catalog.entry(&node.node_type) else {
-            anyhow::bail!(
-                "node '{}' has type '{}' which is not in the catalog",
-                node.id, node.node_type
-            );
+    for img in plan.images.iter().filter(|i| i.kind == weft_compiler::build_plan::ImageKind::Infra)
+    {
+        let (Some(node_id), Some(image_name)) = (&img.node_id, &img.image_name) else {
+            anyhow::bail!("planned infra image {} is missing node_id/image_name", img.image_ref);
         };
-        let mut node_tags: BTreeMap<String, String> = BTreeMap::new();
-        for image_path in &entry.metadata.images {
-            let image_dir = entry.source_dir.join(image_path);
-            // The image's local name (Image::Local.name on the
-            // InfraSpec) is the path's basename. So
-            // `images/bridge` → name `bridge`.
-            let image_name = std::path::Path::new(image_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "node type '{}' declared invalid image path '{image_path}'",
-                        node.node_type
-                    )
-                })?
-                .to_string();
-            let dockerfile = image_dir.join("Dockerfile");
-            if !dockerfile.is_file() {
-                anyhow::bail!(
-                    "node type '{}' declares image '{image_name}' but no Dockerfile at {}",
-                    node.node_type,
-                    dockerfile.display()
-                );
-            }
+        let tag = img.image_ref.clone();
+        out.entry(node_id.clone()).or_default().insert(image_name.clone(), tag.clone());
 
-            let full_hash = crate::hash::compute_image_hash(&node.node_type, &image_dir)?;
-            let short = crate::commands::build::short_hash(&full_hash);
-            let tag = format!("weft-infra-{image_name}:{short}");
-            node_tags.insert(image_name.clone(), tag.clone());
-
-            if !seen_tags.insert(tag.clone()) {
-                continue;
-            }
-
-            let exists = images::image_present(&tag).await.unwrap_or(false);
-            if exists {
-                progress.build_skip(&tag, "hash_match");
-            } else {
-                progress.build_start(&tag);
-                let label = format!("weft.dev/project={project_id}");
-                crate::commands::build::docker_build_image(
-                    &tag,
-                    &dockerfile,
-                    &image_dir,
-                    Some(&label),
-                )
-                .await?;
-                progress.build_done(&tag);
-            }
-            let cfg = cluster_config();
-            if cfg.backend == ClusterBackend::Kind {
-                progress.image_push_start(&tag);
-                images::kind_load(&cfg.cluster_name, &tag).await?;
-                progress.image_push_done(&tag);
-            }
+        if !seen_tags.insert(tag.clone()) {
+            continue;
         }
-        if !node_tags.is_empty() {
-            out.insert(node.id.clone(), node_tags);
+
+        let exists = images::image_present(&tag).await.unwrap_or(false);
+        if exists {
+            progress.build_skip(&tag, "hash_match");
+        } else {
+            progress.build_start(&tag);
+            let label = format!("weft.dev/project={project_id}");
+            let dockerfile = img.context_dir.join("Dockerfile");
+            crate::commands::build::docker_build_image(
+                &tag,
+                &dockerfile,
+                &img.context_dir,
+                Some(&label),
+            )
+            .await?;
+            progress.build_done(&tag);
+        }
+        let cfg = cluster_config();
+        if cfg.backend == ClusterBackend::Kind {
+            progress.image_push_start(&tag);
+            images::kind_load(&cfg.cluster_name, &tag).await?;
+            progress.image_push_done(&tag);
         }
     }
     Ok(out)

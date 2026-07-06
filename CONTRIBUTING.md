@@ -10,7 +10,7 @@ If anything here is wrong, unclear, or out of date, that is a bug. Open an issue
 
 ## Before you start
 
-Read [DESIGN.md](./DESIGN.md) before anything else. The design principles are the filter every pull request runs through. If a change fights one of them, it gets reshaped or dropped. Knowing them up front saves everyone time.
+The design principles are the filter every pull request runs through: if a change fights one of them, it gets reshaped or dropped. The node design rules below capture the load-bearing ones; a full design document is being rewritten.
 
 Check the [roadmap](./ROADMAP.md) and open issues. Someone might already be working on what you want to build. Ask in [Discord](https://discord.com/invite/FGwNu6mDkU) before starting a large change.
 
@@ -79,7 +79,6 @@ weft/
 ├── dashboard/              # Web UI (SvelteKit + Svelte 5)
 ├── extension/              # Browser extension (WXT)
 ├── scripts/                # Dev helpers (catalog-link, etc.)
-├── DESIGN.md               # Design principles
 ├── ROADMAP.md              # What's coming
 └── dev.sh                  # Development entry point
 ```
@@ -177,7 +176,7 @@ The `inventory` crate auto-discovers the new node at startup. The dashboard pick
 
 ### Node design rules
 
-These come from [DESIGN.md](./DESIGN.md). Do not skip them.
+Do not skip them.
 
 - **No special cases.** If your node needs a new capability, propose it as a general language feature first. Do not bolt it into a single node.
 - **Typed end to end.** Every port has a concrete type. No `Any`. No untyped dicts except `JsonDict` for genuinely opaque JSON.
@@ -200,48 +199,11 @@ Tests live alongside the code in `crates/weft-core/src/tests/`. Any change to pa
 
 ---
 
-## Infrastructure nodes and sidecars
+## Infrastructure nodes
 
-A regular node is code that runs during execution. An infrastructure node provisions a real Kubernetes workload on Start and tears it down on Stop. Postgres databases, WhatsApp bridges, browser pools, and vector stores all fit this pattern. Anything stateful that needs to outlive a single execution does.
+A regular node is code that runs during execution. An infrastructure node provisions a real Kubernetes workload on Start and tears it down on Stop. Databases, message bridges, browser pools, and vector stores all fit this pattern: anything stateful that needs to outlive a single execution.
 
-Infrastructure nodes are how Weft plugs stateful services into the graph. They are more work than a regular node, but they give you a clean abstraction, language freedom, and real isolation. The design rationale is in [DESIGN.md](./DESIGN.md) under "Infrastructure as nodes, sidecars as the bridge". Read that first.
-
-### The two pieces
-
-Every infrastructure node ships as two things:
-
-1. **The infrastructure node** in `catalog/<category>/<name>/`. Same two-file layout as a regular node (`backend.rs` and `frontend.ts`), but the backend returns an `InfrastructureSpec` in its `NodeFeatures` instead of just executing. The spec contains raw Kubernetes manifests as JSON with placeholders like `__INSTANCE_ID__` and `__SIDECAR_IMAGE__` that the platform fills at provision time.
-2. **A sidecar service** in `sidecars/<name>/`. A small HTTP service in any language that exposes three endpoints.
-    - `POST /action` accepts `{ action, payload }` and returns `{ result }`.
-    - `GET /health` is the liveness check for the Kubernetes readiness probe.
-    - `GET /outputs` returns runtime-computed values the sidecar wants to expose as output ports.
-
-The reference implementations are `sidecars/postgres-database/` (Rust) and `sidecars/whatsapp-bridge/` (Node.js). Starter templates live in `sidecars/examples/rust/` and `sidecars/examples/javascript/`. Copy whichever matches your language and work from there.
-
-### Consumer nodes
-
-On top of the infrastructure node you usually ship a family of consumer nodes, for example `MemoryStoreAdd`, `MemoryQuery`, and `MemoryDelete` for the Postgres case. Consumer nodes are regular nodes. They take an `endpointUrl` as input, build an `InfraClient` from it, and call `/action` with typed payloads. They never touch the underlying service directly.
-
-This is the point of the whole pattern. The consumer nodes talk to a capability (durable KV, send-message, whatever) through a typed action API. The sidecar is the only thing that knows about Postgres or WhatsApp, and that is the only place you would change if you wanted to swap out the backend.
-
-### The full checklist
-
-- [ ] Write the sidecar. Dockerize it. Make sure `/health` and `/outputs` work.
-- [ ] Push the image to a registry Weft can pull from. For the reference nodes this is `ghcr.io/weavemindai/sidecar-<name>:latest`. The platform uses `SIDECAR_IMAGE_REGISTRY` and the `sidecarName` from your `InfrastructureSpec` to build the image reference at provision time.
-- [ ] Write the infrastructure node in `catalog/<category>/<name>/backend.rs`. Return an `InfrastructureSpec` with your manifests, your `sidecarName`, and your `ActionEndpoint`.
-- [ ] Write the matching `frontend.ts` with `features: { isInfrastructure: true }`, output ports `instanceId` and `endpointUrl`, and whatever else your sidecar exposes via `/outputs`.
-- [ ] Write at least one consumer node that wires into the infrastructure node and calls an action.
-- [ ] Test the whole thing against a local kind cluster. Run `INFRASTRUCTURE_TARGET=local ./dev.sh server`, build a small project, click Start on the infra node, watch it provision, and verify the consumer node can talk to it.
-- [ ] Test Stop and Terminate. Stop keeps the PVC and data. Terminate destroys both.
-
-### Design rules for infrastructure nodes
-
-- **One capability per sidecar.** If your sidecar does two unrelated things, it is two sidecars.
-- **Do not leak implementation details into consumer nodes.** Consumer nodes should call `put`, not "insert into a Postgres table". If a consumer node needs to know it is talking to Postgres specifically, the abstraction is wrong.
-- **`/outputs` is authoritative.** Anything the node exposes as an output port must come from `/outputs` at provision time. Do not hardcode URLs or IDs in the node's Rust file.
-- **Manifests use placeholders.** `__INSTANCE_ID__` and `__SIDECAR_IMAGE__` are the standard ones. Do not hardcode names. Every pod has to be unique per (user, project, node) or you get collisions.
-- **Label everything.** The platform injects ownership labels (`weavemind.ai/managed-by`, `weavemind.ai/user`, `weavemind.ai/project`, `weavemind.ai/node`) into every resource you ship. Do not strip them.
-- **Readiness probes matter.** The platform polls pod readiness before calling `/outputs`. Ship realistic `readinessProbe` values for every container in your `Deployment`, or the platform will think your infra is ready before it actually is.
+> **This section is being rewritten for the v2 architecture.** The old `sidecars/` + `InfrastructureSpec` + `SIDECAR_IMAGE_REGISTRY` model is GONE. In v2 an infra node lives in `nodes/<name>/` (`mod.rs` + `metadata.json`), declares `requires_infra: true`, and returns an `InfraSpec` from `provision`; its container image is built from an `images/<name>/` dir into `weft-infra-<name>:<content_hash>`, and a pooled supervisor reconciles it (apply / health self-heal / stop / terminate). See [docs/authoring-nodes.md](docs/authoring-nodes.md) for the current, accurate shape. Do NOT follow the v1 sidecar walkthrough that used to live here; it described an interface that no longer exists.
 
 ---
 

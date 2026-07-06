@@ -17,6 +17,13 @@ use std::collections::HashMap;
 #[cfg(any(test, feature = "test-helpers"))]
 use tokio::sync::RwLock;
 
+/// The complete per-node infra image-tag map: `node_id -> { image_name ->
+/// image_ref }`. Written atomically alongside the running hashes (see
+/// `ProjectStoreOps::set_running_hashes`); the supervisor reads it per node to
+/// resolve `Image::Local { name }`.
+pub type InfraImageTags =
+    std::collections::BTreeMap<String, std::collections::HashMap<String, String>>;
+
 /// Backing store for project metadata. Implementations:
 /// - `PostgresProjectStore` (production)
 /// - `MockProjectStore` (tests, behind `test-helpers`).
@@ -45,14 +52,22 @@ pub trait ProjectStoreOps: Send + Sync {
     /// (`project_namespace::worker_namespace`), never stored, so adding
     /// or removing infra moves the worker to the right namespace
     /// without a stale stored value to reconcile.
+    /// `infra_image_tags`: the COMPLETE infra image-tag map to persist in the
+    /// SAME transaction as the row + definition history + hashes (`None` leaves
+    /// it untouched). A build that stamps the project runnable
+    /// passes it here so the runnable stamp and the infra tags land together
+    /// (never a runnable project with missing/half-written tags); plain
+    /// registration (no build) passes `None`.
     async fn register_with_hashes(
         &self,
         project: ProjectDefinition,
         name: &str,
+        description: &str,
         tenant_id: &str,
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
+        infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<StoredProjectSummary>;
 
     // Every reader returns `Result<Option<T>>` or `Result<Vec<T>>`:
@@ -64,7 +79,12 @@ pub trait ProjectStoreOps: Send + Sync {
     // etc).
 
     async fn tenant_for(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
-    async fn list(&self) -> anyhow::Result<Vec<StoredProjectSummary>>;
+    /// List the projects owned by `tenant`. Scoping is in the query (not a
+    /// post-filter) so one tenant can never see another's projects or their
+    /// count. Per-resource reads (`get`, `lifecycle`, ...) are authorized at
+    /// the handler via `authenticator::authorize_project`; only the
+    /// list-everything endpoint needs the tenant pushed into the store.
+    async fn list(&self, tenant: &str) -> anyhow::Result<Vec<StoredProjectSummary>>;
     async fn get(&self, id: uuid::Uuid) -> anyhow::Result<Option<StoredProjectSummary>>;
     /// Returns `Ok(true)` iff a row was removed. `Ok(false)` = no
     /// such row (caller decides whether to 404). `Err` = DB failure.
@@ -88,24 +108,35 @@ pub trait ProjectStoreOps: Send + Sync {
     ///   only writer of history rows).
     /// - infra: drives the upgrade drift signal.
     ///
-    /// Atomicity is the point: writing the trio as separate UPDATEs
-    /// opens a window where a crash (or a sibling Pod's `/run`
-    /// between two writes) observes a new binary hash paired with an
-    /// old definition hash, i.e. a worker image whose node-type set
-    /// may not match the definition the execution journals.
+    /// - infra_image_tags: the COMPLETE per-node infra image-tag map
+    ///   (`node_id -> { image_name -> image_ref }`) the supervisor
+    ///   reads to resolve `Image::Local { name }`. `None` leaves the
+    ///   stored map untouched; `Some(map)` REPLACES it wholesale
+    ///   (every build/apply recomputes the whole set, so a merge would
+    ///   only strand tags for nodes the current source no longer has).
+    ///
+    /// Atomicity is the point: writing the trio of hashes AND the infra
+    /// tags as separate statements opens a window where a crash (or a
+    /// sibling Pod's `/run` between two writes) observes a project
+    /// already stamped runnable (new binary hash) but with the infra
+    /// image tags absent or half-written, so a supervisor apply
+    /// resolves `Image::Local { name }` to nothing and dangles. One
+    /// UPDATE writes hashes + tags together: either the project becomes
+    /// runnable WITH its complete infra tags, or nothing changes.
     async fn set_running_hashes(
         &self,
         id: uuid::Uuid,
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
+        infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<()>;
 
     /// Read the stored binary hash. `Ok(None)` if never set
     /// (project registered but never built / activated /
     /// infra-started). `Err` ONLY on DB failure: a transient hiccup
     /// must NOT be observed as "no hash" (which would trigger an
-    /// unnecessary stale-worker kill in `replace_stale_worker_if_needed`).
+    /// unnecessary stale-worker kill in `reconcile_worker`).
     async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
     /// Read the stored definition hash. Same Result contract as
@@ -134,15 +165,17 @@ pub trait ProjectStoreOps: Send + Sync {
     /// `Ok(None)` = no such project; `Err` = DB failure.
     async fn lifecycle(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectLifecycle>>;
 
-    /// Atomically set every lifecycle field. Used by activate,
-    /// deactivate, and the journal-bridge drain-watcher when it
-    /// flips status from deactivating → inactive. `Ok(true)` iff a
-    /// row was updated.
-    async fn set_lifecycle(
+    /// Atomically set every lifecycle field, GUARDED: the write is
+    /// refused while the project is `Activating` (cancel the
+    /// activation first) or while a build transition is in flight
+    /// (cancel the build first). Deactivate's writer; there is no
+    /// blind lifecycle write anywhere (the CAS variants below cover
+    /// every other transition).
+    async fn set_lifecycle_guarded(
         &self,
         id: uuid::Uuid,
         lifecycle: &ProjectLifecycle,
-    ) -> anyhow::Result<bool>;
+    ) -> anyhow::Result<LifecycleWrite>;
 
     /// Compare-and-set on status. `Ok(true)` iff a row matched
     /// `from` and was updated to `to`. Used by the drain-watcher to
@@ -178,9 +211,58 @@ pub trait ProjectStoreOps: Send + Sync {
     /// Every other status is a legal entry: Registered/Inactive (the
     /// action bar), and Active/Deactivating (sync's auto-reactivate
     /// after an infra upgrade, which may call while a wait-mode
-    /// deactivate is still draining). A drain-watcher CAS that loses
-    /// to this transition already tolerates the loss and retries.
+    /// deactivate is still draining; the roll-forward `resume_active`
+    /// verb). A drain-watcher CAS that loses to this transition
+    /// already tolerates the loss and retries. Also refused while a
+    /// build transition is in flight (`transition <> 'none'`).
+    /// Stamps the transition heartbeat so the stuck-transition reaper
+    /// can tell a live activation (driver bumping) from an orphaned
+    /// one (driver pod died).
     async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+
+    /// Read the project's verb-transition marker (the build axis,
+    /// orthogonal to `status`). `Ok(None)` = no such project.
+    async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>>;
+
+    /// Single-flight entry into the `building` transition. Atomically
+    /// flips `transition` none → building IFF no other transition is
+    /// in flight AND the trigger lifecycle is not mid-flip
+    /// (activating / deactivating). Stamps the transition heartbeat.
+    /// `Ok(false)` = lost: another verb is building, or the lifecycle
+    /// is transitional; the caller rejects (409).
+    async fn try_begin_building(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+
+    /// Request cancellation of the in-flight build: CAS `transition`
+    /// building → cancelling_build. The pod driving the build polls
+    /// this (via `transition`) and interrupts the builder. `Ok(false)`
+    /// = no build in flight (already finished, or never started).
+    async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+
+    /// Land the build transition back at rest: `transition` → none
+    /// from either building or cancelling_build. Idempotent (a no-op
+    /// when already none, e.g. the stuck-transition reaper got there
+    /// first). `Ok(true)` iff this call performed the flip.
+    async fn finish_building(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+
+    /// Bump the transition heartbeat. Called on an interval by the
+    /// pod DRIVING an in-process transitional state (an activation
+    /// window, a build) so the stuck-transition reaper only repairs
+    /// transitions whose driver actually died.
+    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()>;
+
+    /// Projects stuck in a driver-backed transitional state (status
+    /// `activating`, or a build transition) whose heartbeat went stale
+    /// before `stale_before`: the driving pod died mid-transition.
+    /// The stuck-transition reaper repairs each, status-guarded.
+    async fn list_stuck_transitions(
+        &self,
+        stale_before: i64,
+    ) -> anyhow::Result<Vec<StuckTransition>>;
+
+    /// Projects currently in status `deactivating`. The reaper feeds
+    /// each through the drain-watcher CAS so a deactivation whose
+    /// terminal events were missed (dispatcher restart) still lands.
+    async fn list_deactivating(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
 
     /// Whether the project declares infrastructure, by string-id (used
     /// by task executors that only see the project_id string to compute
@@ -209,17 +291,10 @@ pub trait ProjectStoreOps: Send + Sync {
     /// managing it. Idempotent.
     async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()>;
 
-    /// Replace the per-(project, node) infra image-tag map. The CLI
-    /// sends the tags in /infra/sync; the supervisor reads them
-    /// back via `infra_image_tags(project_id, node_id)`. `Err` on
-    /// DB failure: a silently-dropped write means the supervisor
-    /// resolves `Image::Local` against stale tags at the next apply.
-    async fn set_infra_image_tags(
-        &self,
-        id: uuid::Uuid,
-        node_id: &str,
-        tags: std::collections::HashMap<String, String>,
-    ) -> anyhow::Result<()>;
+    // NOTE: the infra image-tag map is written ONLY through
+    // `set_running_hashes` (atomically alongside the running hashes), never
+    // as a standalone per-node write, so a project can never be stamped
+    // runnable with its infra tags missing/half-written. See that method.
 
     /// Read the per-(project, node) image-tag map. Empty map if
     /// never set. `Err` on DB failure (vs empty-map = "set to
@@ -261,6 +336,13 @@ pub struct ProjectLifecycle {
     pub accepting_fires: bool,
     pub fires_visible_to_consumers: bool,
     pub fires_deadline_unix: Option<i64>,
+    /// While `status = Deactivating` with `runningPolicy = wait`:
+    /// the unix second past which the drain gives up, cancels the
+    /// remaining executions, and lands Inactive (enforced by the
+    /// stuck-transition reaper). The user's "wait at most N, then
+    /// proceed" cap, same semantics as the infra drains. `None` on
+    /// every other state (the non-deactivating constructors clear it).
+    pub drain_deadline_unix: Option<i64>,
     /// True iff the CURRENT deactivation was performed by the health
     /// loop (autonomous park because infra broke), NOT by the user.
     /// The health loop's auto-recover reactivate fires ONLY when this
@@ -282,6 +364,7 @@ impl ProjectLifecycle {
             fires_visible_to_consumers: true,
             fires_deadline_unix: None,
             deactivated_by_health: false,
+            drain_deadline_unix: None,
         }
     }
 
@@ -298,6 +381,7 @@ impl ProjectLifecycle {
             fires_visible_to_consumers: false,
             fires_deadline_unix: None,
             deactivated_by_health: false,
+            drain_deadline_unix: None,
         }
     }
 
@@ -310,6 +394,7 @@ impl ProjectLifecycle {
             fires_visible_to_consumers: false,
             fires_deadline_unix: None,
             deactivated_by_health: false,
+            drain_deadline_unix: None,
         }
     }
 
@@ -322,6 +407,7 @@ impl ProjectLifecycle {
             fires_visible_to_consumers: false,
             fires_deadline_unix: Some(deadline_unix),
             deactivated_by_health: false,
+            drain_deadline_unix: None,
         }
     }
 
@@ -334,6 +420,7 @@ impl ProjectLifecycle {
             fires_visible_to_consumers: true,
             fires_deadline_unix: None,
             deactivated_by_health: false,
+            drain_deadline_unix: None,
         }
     }
 
@@ -352,6 +439,9 @@ impl ProjectLifecycle {
             // through Deactivating keeps `deactivated_by_health` set
             // the whole way (the gate is correct from the first write).
             deactivated_by_health: target.deactivated_by_health,
+            // Set by the deactivate path from the user's drain cap
+            // (this constructor doesn't know it).
+            drain_deadline_unix: None,
         }
     }
 
@@ -376,6 +466,71 @@ impl ProjectLifecycle {
             }
         }
     }
+}
+
+/// The verb-transition marker on the project row: the BUILD axis,
+/// orthogonal to the trigger lifecycle (`status`). A project is
+/// `Building` while a verb's image build is in flight;
+/// `CancellingBuild` after the user requested cancel and before the
+/// driving pod lands the transition back at `None`. Both are
+/// transitional: the reconciliation offers only `cancel_build`.
+///
+/// SYNC: ProjectTransition <-> packages/weft-graph/src/protocol.ts ProjectTransition,
+///       packages/weft-graph/src/status.ts VALID_TRANSITIONS,
+///       crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.transition
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectTransition {
+    None,
+    Building,
+    CancellingBuild,
+}
+
+impl ProjectTransition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Building => "building",
+            Self::CancellingBuild => "cancelling_build",
+        }
+    }
+
+    /// True while a build transition is in flight (either phase).
+    pub fn is_building(self) -> bool {
+        matches!(self, Self::Building | Self::CancellingBuild)
+    }
+}
+
+/// Decode a `project.transition` column string. Unknown values are
+/// schema drift and fail loud, mirroring `project_status_from_str`.
+pub fn project_transition_from_str(s: &str) -> anyhow::Result<ProjectTransition> {
+    match s {
+        "none" => Ok(ProjectTransition::None),
+        "building" => Ok(ProjectTransition::Building),
+        "cancelling_build" => Ok(ProjectTransition::CancellingBuild),
+        other => Err(anyhow::anyhow!("unknown project.transition column value '{other}'")),
+    }
+}
+
+/// Outcome of a guarded lifecycle write. `Rejected` carries the state
+/// that blocked it so the caller can name it in the error message.
+#[derive(Debug, Clone)]
+pub enum LifecycleWrite {
+    Applied,
+    Rejected {
+        status: ProjectStatus,
+        transition: ProjectTransition,
+    },
+    NotFound,
+}
+
+/// One project stuck in a driver-backed transitional state (stale
+/// heartbeat). What "repair" means depends on which state it is stuck
+/// in; the reaper branches on the pair.
+#[derive(Debug, Clone)]
+pub struct StuckTransition {
+    pub id: uuid::Uuid,
+    pub status: ProjectStatus,
+    pub transition: ProjectTransition,
 }
 
 /// Cloneable handle to whatever the dispatcher uses as project
@@ -409,64 +564,79 @@ pub fn project_status_from_str(s: &str) -> anyhow::Result<ProjectStatus> {
 pub struct StoredProjectSummary {
     pub id: uuid::Uuid,
     pub name: String,
+    pub description: String,
     pub status: ProjectStatus,
 }
 
 impl PostgresProjectStore {
     pub async fn new(pool: PgPool) -> anyhow::Result<Self> {
-        // project: one row per registered project. Lifecycle is the
-        // status enum plus three orthogonal axes that the gate,
-        // enumeration filter, and reaper read from a single source
-        // of truth:
-        //
-        //   accepting_fires:            gate passes/parks fires when
-        //                               true; refuses when false.
-        //   fires_visible_to_consumers: token-scoped enumeration
-        //                               returns the project's
-        //                               signals when true; hides
-        //                               them when false.
-        //   fires_deadline_unix:        Some(t) means "accepting
-        //                               only until t"; gate refuses
-        //                               after the deadline. None =
-        //                               no deadline.
-        //
-        // User-facing wipe/hibernate/park modes map onto these:
-        //   wipe          → status=inactive, accepting=false,
-        //                    visible=false, deadline=None (rows gone)
-        //   hibernate     → status=inactive, accepting=true,
-        //                    visible=false, deadline=Some(now+grace)
-        //   park          → status=inactive, accepting=true,
-        //                    visible=true,  deadline=None
-        //   active        → status=active, accepting=true,
-        //                    visible=true,  deadline=None
-        //   deactivating  → status=deactivating; accepting/visible/
-        //                    deadline already set to the target
-        //                    mode's values; new fires park
-        //                    immediately while running execs drain.
-        //                    Journal bridge CASes status to
-        //                    inactive once the running set empties.
-        //
-        // running_binary_hash / running_definition_hash /
-        // running_infra_hash drive drift detection + image tagging:
-        //   - running_binary_hash: worker docker image tag suffix.
-        //     Flips on engine / node-impl / node-type-set / weft.toml
-        //     edits; selects the image when spawning a fresh pod.
-        //   - running_definition_hash: identifies the runtime project
-        //     shape (topology + configs). Workers fetch the
-        //     definition at execution claim time keyed by
-        //     `(project_id, definition_hash)`.
-        //   - running_infra_hash: drives the Upgrade button when the
-        //     CLI's freshly-computed infra hash drifts.
-        //
-        // tenant_id pins each project to its isolation namespace.
-        // The broker uses it for scoping every user-pod-issued
-        // request: a worker / listener / infra token authenticates
-        // as a tenant, and any project_id it references must resolve
-        // to the same tenant.
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS project (
+        migrate(&pool).await?;
+        Ok(Self { pool })
+    }
+}
+
+/// Create the `project` + `project_definition` tables. The canonical CREATEs
+/// live here (edited in place, fresh DB on rebuild); `PostgresProjectStore::new`
+/// runs this, and any caller that needs `project(id)` present runs it first
+/// (idempotent, safe to repeat).
+pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    // project: one row per registered project. Lifecycle is the
+    // status enum plus three orthogonal axes that the gate,
+    // enumeration filter, and reaper read from a single source
+    // of truth:
+    //
+    //   accepting_fires:            gate passes/parks fires when
+    //                               true; refuses when false.
+    //   fires_visible_to_consumers: token-scoped enumeration
+    //                               returns the project's
+    //                               signals when true; hides
+    //                               them when false.
+    //   fires_deadline_unix:        Some(t) means "accepting
+    //                               only until t"; gate refuses
+    //                               after the deadline. None =
+    //                               no deadline.
+    //
+    // User-facing wipe/hibernate/park modes map onto these:
+    //   wipe          → status=inactive, accepting=false,
+    //                    visible=false, deadline=None (rows gone)
+    //   hibernate     → status=inactive, accepting=true,
+    //                    visible=false, deadline=Some(now+grace)
+    //   park          → status=inactive, accepting=true,
+    //                    visible=true,  deadline=None
+    //   active        → status=active, accepting=true,
+    //                    visible=true,  deadline=None
+    //   deactivating  → status=deactivating; accepting/visible/
+    //                    deadline already set to the target
+    //                    mode's values; new fires park
+    //                    immediately while running execs drain.
+    //                    Journal bridge CASes status to
+    //                    inactive once the running set empties.
+    //
+    // running_binary_hash / running_definition_hash /
+    // running_infra_hash drive drift detection + image tagging:
+    //   - running_binary_hash: worker docker image tag suffix.
+    //     Flips on engine / node-impl / node-type-set / weft.toml
+    //     edits; selects the image when spawning a fresh pod.
+    //   - running_definition_hash: identifies the runtime project
+    //     shape (topology + configs). Workers fetch the
+    //     definition at execution claim time keyed by
+    //     `(project_id, definition_hash)`.
+    //   - running_infra_hash: drives the Upgrade button when the
+    //     CLI's freshly-computed infra hash drifts.
+    //
+    // tenant_id pins each project to its isolation namespace.
+    // The broker uses it for scoping every user-pod-issued
+    // request: a worker / listener / infra token authenticates
+    // as a tenant, and any project_id it references must resolve
+    // to the same tenant.
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS project (
                 id UUID PRIMARY KEY,
                 name TEXT NOT NULL,
+                -- Free-text project description (metadata only; never affects
+                -- the graph, build, or runtime). Set at create time on the
+                -- website; empty string when unset (NOT NULL keeps reads simple).
+                description TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 project_json TEXT NOT NULL,
                 updated_at BIGINT NOT NULL,
@@ -498,7 +668,7 @@ impl PostgresProjectStore {
                 -- cannot be replaced by `project_namespace <> ''`.
                 has_infra BOOLEAN NOT NULL DEFAULT FALSE,
                 -- The project's OWN k8s namespace
-                -- (wm-project-<tenant>--<project>), where its INFRA pods
+                -- (wft-project-<tenant>--<project>), where its INFRA pods
                 -- and its worker live. Distinct concept from has_infra:
                 -- this is the namespace string the supervisor runs
                 -- kubectl against, EMPTY until the namespace is actually
@@ -517,87 +687,114 @@ impl PostgresProjectStore {
                 -- Per-project health protocols overriding the weft
                 -- default. NULL = use default. Schema per
                 -- weft_infra_supervisor::protocol::HealthProtocols.
-                health_protocols_json JSONB
+                health_protocols_json JSONB,
+                -- Verb-transition marker, orthogonal to `status` (the
+                -- BUILD axis): 'none' | 'building' | 'cancelling_build'.
+                -- Written only by its own single-flight CAS methods
+                -- (try_begin_building / request_cancel_build /
+                -- finish_building), never by lifecycle writes, so a
+                -- deactivate can't stomp an in-flight build marker.
+                transition TEXT NOT NULL DEFAULT 'none',
+                -- While status='deactivating' with runningPolicy=wait:
+                -- the unix second past which the drain gives up (the
+                -- reaper cancels the remaining executions and the
+                -- drain-watcher lands the row). NULL elsewhere.
+                drain_deadline_unix BIGINT,
+                -- Heartbeat for driver-backed transitional states
+                -- (status='activating', transition='building'/
+                -- 'cancelling_build'): the pod driving the transition
+                -- bumps this on an interval; the stuck-transition
+                -- reaper repairs rows whose heartbeat went stale
+                -- (the driver died mid-transition). Per-project and
+                -- status-guarded: this replaces the old boot-time
+                -- blind bulk downgrade, which wiped live status for
+                -- every tenant's projects on any Pod restart.
+                transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0
             )"#,
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)")
-            .execute(&pool)
-            .await?;
-
-        // Append-only definition-version history. Workers fetch by
-        // (project_id, definition_hash) so a suspended execution
-        // can always resume on the EXACT shape it was started on,
-        // even after the user has edited and re-registered. Without
-        // this, the `project.project_json` column would only carry
-        // the LATEST shape and a resume after edit would run the
-        // wrong topology against the journal's old state.
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS project_definition (
-                project_id UUID NOT NULL,
-                definition_hash TEXT NOT NULL,
-                project_json TEXT NOT NULL,
-                recorded_at_unix BIGINT NOT NULL,
-                PRIMARY KEY (project_id, definition_hash),
-                FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
-            )"#,
-        )
-        .execute(&pool)
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)")
+        .execute(pool)
         .await?;
 
-        // Downgrade in-flight rows on dispatcher restart so every
-        // project is cleanly re-activatable on the new pod:
-        // - `active`: trigger-setup must re-bootstrap (only `/activate`
-        //   fires TriggerSetup, which lives in-process).
-        // - `deactivating`: a crash mid-deactivate needs clean re-entry.
-        // - `activating`: a crash mid-activate would otherwise STRAND
-        //   the row forever, because in-process rollback never ran and
-        //   `try_begin_activating` is gated on `status <> 'activating'`,
-        //   so every future activate would 409. Status-downgrade is
-        //   sufficient: the next activate's `sweep_orphan_trigger_setup_colors`
-        //   reaps any leaked TriggerSetup color and its register tasks
-        //   UPSERT signal rows in place, so we don't duplicate that wipe
-        //   here (it would need k8s/journal access this constructor
-        //   doesn't have).
-        sqlx::query(
-            "UPDATE project SET status = 'inactive', \
-                accepting_fires = FALSE, \
-                fires_visible_to_consumers = FALSE, \
-                fires_deadline_unix = NULL \
-             WHERE status IN ('active', 'activating', 'deactivating')",
-        )
-        .execute(&pool)
-        .await?;
+    // Append-only definition-version history. Workers fetch by
+    // (project_id, definition_hash) so a suspended execution
+    // can always resume on the EXACT shape it was started on,
+    // even after the user has edited and re-registered. Without
+    // this, the `project.project_json` column would only carry
+    // the LATEST shape and a resume after edit would run the
+    // wrong topology against the journal's old state.
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS project_definition (
+            project_id UUID NOT NULL,
+            definition_hash TEXT NOT NULL,
+            project_json TEXT NOT NULL,
+            recorded_at_unix BIGINT NOT NULL,
+            PRIMARY KEY (project_id, definition_hash),
+            FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
+        )"#,
+    )
+    .execute(pool)
+    .await?;
 
-        Ok(Self { pool })
-    }
+    // A project's source lives as a folder on disk, edited via the CLI / VS
+    // Code; the dispatcher tracks no version chain for it.
+
+    // NO boot-time status touch-up here. Recovery of a project
+    // interrupted mid-transition (a pod died while activating /
+    // building / deactivating) is the stuck-transition reaper's
+    // job (`reaper::sweep_stuck_transitions`): per-project,
+    // heartbeat-gated, and status-guarded, so it never wipes
+    // another Pod's live state. A constructor-time bulk downgrade
+    // would run in EVERY replica on EVERY boot and reset live
+    // status for all tenants (a multi-Pod correctness bug).
+
+    Ok(())
 }
 
-/// THE running-hash pointer advance: ONE atomic UPDATE of the trio
-/// with the definition-history EXISTS guard. Both writers go
-/// through here: `set_running_hashes` on a pool connection,
-/// `register_with_hashes` inside its transaction (after the history
-/// INSERT, which the same-snapshot EXISTS check then sees). `None`
-/// leaves a pointer untouched. Zero rows updated fails loudly:
-/// either the project row is missing, or the definition hash has no
-/// history row (the project must be registered with that definition
-/// first; registering is the only writer of history rows).
+/// THE running-hash pointer advance: ONE atomic UPDATE of the trio of hashes
+/// PLUS the complete infra image-tag map, with the definition-history EXISTS
+/// guard. Both writers go through here: `set_running_hashes` on a pool
+/// connection, `register_with_hashes` inside its transaction (after the history
+/// INSERT, which the same-snapshot EXISTS check then sees). A `None` argument
+/// leaves that field untouched; `Some(tags)` REPLACES the whole infra tag map.
+/// Folding the tags into this one statement is what guarantees a project is
+/// never observed stamped runnable (new binary hash) with its infra tags absent
+/// or half-written. Zero rows updated fails loudly: either the project row is
+/// missing, or the definition hash has no history row (the project must be
+/// registered with that definition first; registering is the only writer of
+/// history rows).
 async fn advance_running_hashes(
     conn: &mut sqlx::PgConnection,
     id: uuid::Uuid,
     binary_hash: Option<&str>,
     definition_hash: Option<&str>,
     infra_hash: Option<&str>,
+    infra_image_tags: Option<&InfraImageTags>,
 ) -> anyhow::Result<()> {
-    if binary_hash.is_none() && definition_hash.is_none() && infra_hash.is_none() {
+    if binary_hash.is_none()
+        && definition_hash.is_none()
+        && infra_hash.is_none()
+        && infra_image_tags.is_none()
+    {
         return Ok(());
     }
+    // Serialize the tag map to JSON once (NULL when not being written, so the
+    // COALESCE leaves the stored column untouched).
+    let tags_json: Option<serde_json::Value> = match infra_image_tags {
+        Some(tags) => Some(
+            serde_json::to_value(tags)
+                .map_err(|e| anyhow::anyhow!("serialize infra_image_tags for running-hash advance: {e}"))?,
+        ),
+        None => None,
+    };
     let rows = sqlx::query(
         "UPDATE project SET \
              running_binary_hash     = COALESCE($1, running_binary_hash), \
              running_definition_hash = COALESCE($2, running_definition_hash), \
              running_infra_hash      = COALESCE($3, running_infra_hash), \
+             infra_image_tags_json   = COALESCE($6, infra_image_tags_json), \
              updated_at = $4 \
          WHERE id = $5 AND ($2 IS NULL OR EXISTS ( \
              SELECT 1 FROM project_definition \
@@ -609,6 +806,7 @@ async fn advance_running_hashes(
     .bind(infra_hash)
     .bind(crate::lease::now_unix())
     .bind(id)
+    .bind(tags_json)
     .execute(&mut *conn)
     .await?;
     if rows.rows_affected() == 0 {
@@ -636,13 +834,16 @@ impl ProjectStoreOps for PostgresProjectStore {
         &self,
         project: ProjectDefinition,
         name: &str,
+        description: &str,
         tenant_id: &str,
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
+        infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name = name.to_string();
+        let description = description.to_string();
         // Derived from the definition and refreshed on every register/
         // sync so it tracks edits that add or remove infra. The conflict
         // arm below re-derives it from EXCLUDED, so a re-register that
@@ -655,27 +856,44 @@ impl ProjectStoreOps for PostgresProjectStore {
         // Active project stays active through a re-register.
         // RETURNING the (possibly preserved) status keeps the summary
         // honest instead of hardcoding "registered".
-        let (status_str,): (String,) = sqlx::query_as(
+        //
+        // The conflict arm is GUARDED by `WHERE project.tenant_id =
+        // EXCLUDED.tenant_id`: a re-register may only update a row that already
+        // belongs to the same tenant. Without this guard the upsert would let
+        // any tenant re-register an existing project id and overwrite its
+        // `tenant_id`, seizing another tenant's project. When the tenants
+        // differ the UPDATE matches no row and (because the id already exists,
+        // so the INSERT is suppressed) the statement returns NO row; we detect
+        // that and fail loudly as a cross-tenant collision.
+        let status_str: Option<(String,)> = sqlx::query_as(
             "INSERT INTO project \
-                (id, name, status, project_json, updated_at, \
+                (id, name, description, status, project_json, updated_at, \
                  tenant_id, has_infra) \
-             VALUES ($1, $2, 'registered', $3, $4, $5, $6) \
+             VALUES ($1, $2, $3, 'registered', $4, $5, $6, $7) \
              ON CONFLICT (id) DO UPDATE SET \
                 name = EXCLUDED.name, \
+                description = EXCLUDED.description, \
                 project_json = EXCLUDED.project_json, \
                 updated_at = EXCLUDED.updated_at, \
-                tenant_id = EXCLUDED.tenant_id, \
                 has_infra = EXCLUDED.has_infra \
+             WHERE project.tenant_id = EXCLUDED.tenant_id \
              RETURNING status",
         )
         .bind(id)
         .bind(&name)
+        .bind(&description)
         .bind(&project_json)
         .bind(now)
         .bind(tenant_id)
         .bind(has_infra)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        let (status_str,) = status_str.ok_or_else(|| {
+            anyhow::anyhow!(
+                "project {id} already exists under a different tenant; \
+                 register refused (cross-tenant id collision)"
+            )
+        })?;
         if let Some(hash) = definition_hash {
             // History row FIRST (idempotent on (project_id, hash)),
             // then pointer advance. Inside the transaction the FK
@@ -694,11 +912,24 @@ impl ProjectStoreOps for PostgresProjectStore {
             .execute(&mut *tx)
             .await?;
         }
-        advance_running_hashes(&mut *tx, id, binary_hash, definition_hash, infra_hash).await?;
+        // Runnable stamp + infra tags in ONE statement inside this same tx, so a
+        // build that registers-and-stamps never leaves a runnable
+        // project with missing/half-written infra tags. Plain registration
+        // passes `infra_image_tags = None`.
+        advance_running_hashes(
+            &mut *tx,
+            id,
+            binary_hash,
+            definition_hash,
+            infra_hash,
+            infra_image_tags,
+        )
+        .await?;
         tx.commit().await?;
         Ok(StoredProjectSummary {
             id,
             name,
+            description,
             status: project_status_from_str(&status_str)?,
         })
     }
@@ -713,17 +944,19 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.map(|(t,)| t))
     }
 
-    async fn list(&self) -> anyhow::Result<Vec<StoredProjectSummary>> {
-        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, name, status FROM project ORDER BY name",
+    async fn list(&self, tenant: &str) -> anyhow::Result<Vec<StoredProjectSummary>> {
+        let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(
+            "SELECT id, name, description, status FROM project WHERE tenant_id = $1 ORDER BY name",
         )
+        .bind(tenant)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(id, name, status)| {
+            .map(|(id, name, description, status)| {
                 Ok(StoredProjectSummary {
                     id,
                     name,
+                    description,
                     status: project_status_from_str(&status)?,
                 })
             })
@@ -731,16 +964,17 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn get(&self, id: uuid::Uuid) -> anyhow::Result<Option<StoredProjectSummary>> {
-        let row: Option<(uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, name, status FROM project WHERE id = $1",
+        let row: Option<(uuid::Uuid, String, String, String)> = sqlx::query_as(
+            "SELECT id, name, description, status FROM project WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(id, name, status)| {
+        row.map(|(id, name, description, status)| {
             Ok(StoredProjectSummary {
                 id,
                 name,
+                description,
                 status: project_status_from_str(&status)?,
             })
         })
@@ -761,14 +995,24 @@ impl ProjectStoreOps for PostgresProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
+        infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<()> {
-        // ONE UPDATE = atomic trio: a crash (or a sibling Pod's /run
-        // between statements) can never observe a half-advanced
-        // pointer set. The definition-history precondition and the
-        // loud zero-rows failure live in `advance_running_hashes`,
-        // shared with `register_with_hashes`' transaction.
+        // ONE UPDATE = atomic trio of hashes PLUS the infra tag map: a crash
+        // (or a sibling Pod's /run between statements) can never observe a
+        // half-advanced pointer set, nor a runnable project whose infra tags
+        // are missing/half-written. The definition-history precondition and the
+        // loud zero-rows failure live in `advance_running_hashes`, shared with
+        // `register_with_hashes`' transaction.
         let mut conn = self.pool.acquire().await?;
-        advance_running_hashes(&mut *conn, id, binary_hash, definition_hash, infra_hash).await
+        advance_running_hashes(
+            &mut *conn,
+            id,
+            binary_hash,
+            definition_hash,
+            infra_hash,
+            infra_image_tags,
+        )
+        .await
     }
 
     async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -818,31 +1062,32 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn lifecycle(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectLifecycle>> {
-        let row: Option<(String, bool, bool, Option<i64>, bool)> = sqlx::query_as(
+        let row: Option<(String, bool, bool, Option<i64>, bool, Option<i64>)> = sqlx::query_as(
             "SELECT status, accepting_fires, fires_visible_to_consumers, fires_deadline_unix, \
-                    deactivated_by_health \
+                    deactivated_by_health, drain_deadline_unix \
              FROM project WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(status, accepting, visible, deadline, by_health)| {
+        row.map(|(status, accepting, visible, deadline, by_health, drain_deadline)| {
             Ok(ProjectLifecycle {
                 status: project_status_from_str(&status)?,
                 accepting_fires: accepting,
                 fires_visible_to_consumers: visible,
                 fires_deadline_unix: deadline,
                 deactivated_by_health: by_health,
+                drain_deadline_unix: drain_deadline,
             })
         })
         .transpose()
     }
 
-    async fn set_lifecycle(
+    async fn set_lifecycle_guarded(
         &self,
         id: uuid::Uuid,
         lifecycle: &ProjectLifecycle,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<LifecycleWrite> {
         let res = sqlx::query(
             "UPDATE project \
              SET status = $1, \
@@ -850,19 +1095,40 @@ impl ProjectStoreOps for PostgresProjectStore {
                  fires_visible_to_consumers = $3, \
                  fires_deadline_unix = $4, \
                  deactivated_by_health = $5, \
-                 updated_at = $6 \
-             WHERE id = $7",
+                 drain_deadline_unix = $6, \
+                 updated_at = $7 \
+             WHERE id = $8 \
+               AND status <> 'activating' \
+               AND transition = 'none'",
         )
         .bind(lifecycle.status.as_str())
         .bind(lifecycle.accepting_fires)
         .bind(lifecycle.fires_visible_to_consumers)
         .bind(lifecycle.fires_deadline_unix)
         .bind(lifecycle.deactivated_by_health)
+        .bind(lifecycle.drain_deadline_unix)
         .bind(crate::lease::now_unix())
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(res.rows_affected() > 0)
+        if res.rows_affected() > 0 {
+            return Ok(LifecycleWrite::Applied);
+        }
+        // Zero rows: no project, or the guard refused. Re-read to say
+        // which (and which state blocked) so the caller can 404 vs 409
+        // with a message that names the blocker.
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT status, transition FROM project WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            None => Ok(LifecycleWrite::NotFound),
+            Some((status, transition)) => Ok(LifecycleWrite::Rejected {
+                status: project_status_from_str(&status)?,
+                transition: project_transition_from_str(&transition)?,
+            }),
+        }
     }
 
     async fn cas_status(
@@ -897,14 +1163,16 @@ impl ProjectStoreOps for PostgresProjectStore {
                  fires_visible_to_consumers = $3, \
                  fires_deadline_unix = $4, \
                  deactivated_by_health = $5, \
-                 updated_at = $6 \
-             WHERE id = $7 AND status = $8",
+                 drain_deadline_unix = $6, \
+                 updated_at = $7 \
+             WHERE id = $8 AND status = $9",
         )
         .bind(to.status.as_str())
         .bind(to.accepting_fires)
         .bind(to.fires_visible_to_consumers)
         .bind(to.fires_deadline_unix)
         .bind(to.deactivated_by_health)
+        .bind(to.drain_deadline_unix)
         .bind(crate::lease::now_unix())
         .bind(id)
         .bind(from.as_str())
@@ -915,6 +1183,7 @@ impl ProjectStoreOps for PostgresProjectStore {
 
     async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let activating = ProjectLifecycle::activating();
+        let now = crate::lease::now_unix();
         let res = sqlx::query(
             "UPDATE project \
              SET status = $1, \
@@ -922,19 +1191,112 @@ impl ProjectStoreOps for PostgresProjectStore {
                  fires_visible_to_consumers = $3, \
                  fires_deadline_unix = $4, \
                  deactivated_by_health = $5, \
-                 updated_at = $6 \
-             WHERE id = $7 AND status <> 'activating'",
+                 drain_deadline_unix = NULL, \
+                 updated_at = $6, \
+                 transition_heartbeat_unix = $6 \
+             WHERE id = $7 AND status <> 'activating' AND transition = 'none'",
         )
         .bind(activating.status.as_str())
         .bind(activating.accepting_fires)
         .bind(activating.fires_visible_to_consumers)
         .bind(activating.fires_deadline_unix)
         .bind(activating.deactivated_by_health)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT transition FROM project WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|(t,)| project_transition_from_str(&t)).transpose()
+    }
+
+    async fn try_begin_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE project \
+             SET transition = 'building', transition_heartbeat_unix = $1 \
+             WHERE id = $2 \
+               AND transition = 'none' \
+               AND status NOT IN ('activating', 'deactivating')",
+        )
         .bind(crate::lease::now_unix())
         .bind(id)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE project SET transition = 'cancelling_build' \
+             WHERE id = $1 AND transition = 'building'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn finish_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE project SET transition = 'none' \
+             WHERE id = $1 AND transition IN ('building', 'cancelling_build')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE project SET transition_heartbeat_unix = $1 WHERE id = $2")
+            .bind(crate::lease::now_unix())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_stuck_transitions(
+        &self,
+        stale_before: i64,
+    ) -> anyhow::Result<Vec<StuckTransition>> {
+        // NOTE (compiler-invisible status set): this WHERE names the
+        // driver-backed transitional states by string. Adding a new
+        // driver-backed transitional state means adding it HERE too;
+        // the Rust exhaustiveness checker cannot flag this SQL.
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, status, transition FROM project \
+             WHERE (status = 'activating' \
+                    OR transition IN ('building', 'cancelling_build')) \
+               AND transition_heartbeat_unix < $1",
+        )
+        .bind(stale_before)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, status, transition)| {
+                Ok(StuckTransition {
+                    id,
+                    status: project_status_from_str(&status)?,
+                    transition: project_transition_from_str(&transition)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_deactivating(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
+        let rows: Vec<(uuid::Uuid,)> =
+            sqlx::query_as("SELECT id FROM project WHERE status = 'deactivating'")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Read-only access to the full ProjectDefinition. JSON decode
@@ -998,49 +1360,6 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(())
     }
 
-
-    async fn set_infra_image_tags(
-        &self,
-        id: uuid::Uuid,
-        node_id: &str,
-        tags: std::collections::HashMap<String, String>,
-    ) -> anyhow::Result<()> {
-        // Merge: read current map, replace just the node_id entry,
-        // write back. Idempotent. Fail loud on decode of the
-        // existing map: silently coercing to empty would overwrite
-        // every OTHER node's tags with nothing on the next write.
-        use sqlx::Row;
-        let row = sqlx::query("SELECT infra_image_tags_json FROM project WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let mut current: serde_json::Map<String, serde_json::Value> = match row {
-            None => serde_json::Map::new(),
-            Some(r) => {
-                let value: serde_json::Value = r
-                    .try_get("infra_image_tags_json")
-                    .map_err(|e| anyhow::anyhow!("decode infra_image_tags_json: {e}"))?;
-                match value {
-                    serde_json::Value::Null => serde_json::Map::new(),
-                    serde_json::Value::Object(m) => m,
-                    other => anyhow::bail!(
-                        "infra_image_tags_json is not an object for project_id={id}: {other:?}"
-                    ),
-                }
-            }
-        };
-        current.insert(
-            node_id.to_string(),
-            serde_json::to_value(&tags).expect("HashMap<String,String> serializes"),
-        );
-        let merged = serde_json::Value::Object(current);
-        sqlx::query("UPDATE project SET infra_image_tags_json = $1 WHERE id = $2")
-            .bind(merged)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
 
     async fn infra_image_tags(
         &self,
@@ -1130,10 +1449,18 @@ pub struct MockProjectStore {
     definition_versions: RwLock<HashMap<(uuid::Uuid, String), String>>,
     lifecycles: RwLock<HashMap<uuid::Uuid, ProjectLifecycle>>,
     tenants: RwLock<HashMap<uuid::Uuid, String>>,
+    /// Free-text project description, mirroring the `project.description`
+    /// column. A separate map (like `tenants` / `has_infra`) so the `inner`
+    /// tuple's many destructure sites stay untouched.
+    descriptions: RwLock<HashMap<uuid::Uuid, String>>,
     has_infra: RwLock<HashMap<uuid::Uuid, bool>>,
     /// The project's own infra namespace, empty until provisioned. Set
     /// by `set_project_namespace`, cleared by `clear_project_namespace`.
     namespaces: RwLock<HashMap<uuid::Uuid, String>>,
+    /// Mirror of the `transition` + `transition_heartbeat_unix`
+    /// columns. Missing entry = (None, 0), matching the column
+    /// defaults on a fresh row.
+    transitions: RwLock<HashMap<uuid::Uuid, (ProjectTransition, i64)>>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -1147,8 +1474,10 @@ impl MockProjectStore {
             definition_versions: RwLock::new(HashMap::new()),
             lifecycles: RwLock::new(HashMap::new()),
             tenants: RwLock::new(HashMap::new()),
+            descriptions: RwLock::new(HashMap::new()),
             has_infra: RwLock::new(HashMap::new()),
             namespaces: RwLock::new(HashMap::new()),
+            transitions: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -1167,13 +1496,29 @@ impl ProjectStoreOps for MockProjectStore {
         &self,
         project: ProjectDefinition,
         name: &str,
+        description: &str,
         tenant_id: &str,
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
+        // The mock does not model infra image tags (its reader returns empty).
+        _infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name_owned = name.to_string();
+        let description_owned = description.to_string();
+        // Cross-tenant collision guard, mirroring the Postgres conflict arm's
+        // `WHERE project.tenant_id = EXCLUDED.tenant_id`: a re-register may only
+        // touch a row already owned by the same tenant, so one tenant cannot
+        // seize another's project id. Checked before any mutation.
+        if let Some(existing) = self.tenants.read().await.get(&id) {
+            if existing != tenant_id {
+                anyhow::bail!(
+                    "project {id} already exists under a different tenant; \
+                     register refused (cross-tenant id collision)"
+                );
+            }
+        }
         // Compute before `project` is moved into `inner`. Re-derived on
         // every register so a re-register that adds/drops infra updates
         // it, mirroring the Postgres conflict arm.
@@ -1203,9 +1548,11 @@ impl ProjectStoreOps for MockProjectStore {
                 fires_visible_to_consumers: true,
                 fires_deadline_unix: None,
                 deactivated_by_health: false,
+                drain_deadline_unix: None,
             });
         }
         self.tenants.write().await.insert(id, tenant_id.to_string());
+        self.descriptions.write().await.insert(id, description_owned.clone());
         self.has_infra.write().await.insert(id, has_infra);
         if let Some(h) = binary_hash {
             self.binary_hashes.write().await.insert(id, h.to_string());
@@ -1232,6 +1579,7 @@ impl ProjectStoreOps for MockProjectStore {
         Ok(StoredProjectSummary {
             id,
             name: name_owned,
+            description: description_owned,
             status,
         })
     }
@@ -1240,21 +1588,26 @@ impl ProjectStoreOps for MockProjectStore {
         Ok(self.tenants.read().await.get(&id).cloned())
     }
 
-    async fn list(&self) -> anyhow::Result<Vec<StoredProjectSummary>> {
+    async fn list(&self, tenant: &str) -> anyhow::Result<Vec<StoredProjectSummary>> {
+        let tenants = self.tenants.read().await;
+        let descriptions = self.descriptions.read().await;
         Ok(self
             .inner
             .read()
             .await
             .iter()
+            .filter(|(id, _)| tenants.get(id).map(|t| t == tenant).unwrap_or(false))
             .map(|(id, (name, status, _))| StoredProjectSummary {
                 id: *id,
                 name: name.clone(),
+                description: descriptions.get(id).cloned().unwrap_or_default(),
                 status: *status,
             })
             .collect())
     }
 
     async fn get(&self, id: uuid::Uuid) -> anyhow::Result<Option<StoredProjectSummary>> {
+        let descriptions = self.descriptions.read().await;
         Ok(self
             .inner
             .read()
@@ -1263,6 +1616,7 @@ impl ProjectStoreOps for MockProjectStore {
             .map(|(name, status, _)| StoredProjectSummary {
                 id,
                 name: name.clone(),
+                description: descriptions.get(&id).cloned().unwrap_or_default(),
                 status: *status,
             }))
     }
@@ -1271,9 +1625,9 @@ impl ProjectStoreOps for MockProjectStore {
         // Mirror Postgres FK CASCADE: removing a project clears every
         // per-id side-map (binary/definition/infra hashes,
         // definition_versions history, lifecycles, tenants, has_infra,
-        // namespaces). Without this the mock diverges from production: a
-        // test that re-registers under the same id, or asserts cleanup,
-        // would see ghost state Postgres does not have.
+        // namespaces, transitions). Without this the mock diverges from
+        // production: a test that re-registers under the same id, or asserts
+        // cleanup, would see ghost state Postgres does not have.
         let was_present = self.inner.write().await.remove(&id).is_some();
         self.binary_hashes.write().await.remove(&id);
         self.definition_hashes.write().await.remove(&id);
@@ -1283,6 +1637,7 @@ impl ProjectStoreOps for MockProjectStore {
         self.tenants.write().await.remove(&id);
         self.has_infra.write().await.remove(&id);
         self.namespaces.write().await.remove(&id);
+        self.transitions.write().await.remove(&id);
         Ok(was_present)
     }
 
@@ -1301,6 +1656,9 @@ impl ProjectStoreOps for MockProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
+        // The mock does not model infra image tags (its `infra_image_tags`
+        // reader returns empty); accepted to satisfy the trait, ignored.
+        _infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<()> {
         if !self.inner.read().await.contains_key(&id) {
             anyhow::bail!("set_running_hashes: project {id} not found");
@@ -1378,17 +1736,42 @@ impl ProjectStoreOps for MockProjectStore {
                     fires_visible_to_consumers: true,
                     fires_deadline_unix: None,
                     deactivated_by_health: false,
+                    drain_deadline_unix: None,
                 }),
         ))
     }
 
-    async fn set_lifecycle(
+    async fn set_lifecycle_guarded(
         &self,
         id: uuid::Uuid,
         lifecycle: &ProjectLifecycle,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<LifecycleWrite> {
         if !self.inner.read().await.contains_key(&id) {
-            return Ok(false);
+            return Ok(LifecycleWrite::NotFound);
+        }
+        // Mirror the Postgres guard: refused while activating or while
+        // a build transition is in flight.
+        let current_status = self
+            .lifecycles
+            .read()
+            .await
+            .get(&id)
+            .map(|l| l.status)
+            .unwrap_or(ProjectStatus::Registered);
+        let current_transition = self
+            .transitions
+            .read()
+            .await
+            .get(&id)
+            .map(|(t, _)| *t)
+            .unwrap_or(ProjectTransition::None);
+        if current_status == ProjectStatus::Activating
+            || current_transition != ProjectTransition::None
+        {
+            return Ok(LifecycleWrite::Rejected {
+                status: current_status,
+                transition: current_transition,
+            });
         }
         // Mirror the row's `status` so callers that only consult
         // get()/list() see the correct project status without
@@ -1400,7 +1783,7 @@ impl ProjectStoreOps for MockProjectStore {
             .write()
             .await
             .insert(id, lifecycle.clone());
-        Ok(true)
+        Ok(LifecycleWrite::Applied)
     }
 
     async fn cas_status(
@@ -1448,17 +1831,132 @@ impl ProjectStoreOps for MockProjectStore {
     async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let mut lifecycles = self.lifecycles.write().await;
         let mut inner = self.inner.write().await;
+        let mut transitions = self.transitions.write().await;
         let Some(lifecycle) = lifecycles.get_mut(&id) else {
             return Ok(false);
         };
         if lifecycle.status == ProjectStatus::Activating {
             return Ok(false);
         }
+        if transitions
+            .get(&id)
+            .map(|(t, _)| *t != ProjectTransition::None)
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
         *lifecycle = ProjectLifecycle::activating();
         if let Some(entry) = inner.get_mut(&id) {
             entry.1 = ProjectStatus::Activating;
         }
+        transitions
+            .entry(id)
+            .or_insert((ProjectTransition::None, 0))
+            .1 = crate::lease::now_unix();
         Ok(true)
+    }
+
+    async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
+        if !self.inner.read().await.contains_key(&id) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.transitions
+                .read()
+                .await
+                .get(&id)
+                .map(|(t, _)| *t)
+                .unwrap_or(ProjectTransition::None),
+        ))
+    }
+
+    async fn try_begin_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let lifecycles = self.lifecycles.read().await;
+        let mut transitions = self.transitions.write().await;
+        if !self.inner.read().await.contains_key(&id) {
+            return Ok(false);
+        }
+        let status = lifecycles
+            .get(&id)
+            .map(|l| l.status)
+            .unwrap_or(ProjectStatus::Registered);
+        if matches!(status, ProjectStatus::Activating | ProjectStatus::Deactivating) {
+            return Ok(false);
+        }
+        let entry = transitions.entry(id).or_insert((ProjectTransition::None, 0));
+        if entry.0 != ProjectTransition::None {
+            return Ok(false);
+        }
+        *entry = (ProjectTransition::Building, crate::lease::now_unix());
+        Ok(true)
+    }
+
+    async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let mut transitions = self.transitions.write().await;
+        match transitions.get_mut(&id) {
+            Some(entry) if entry.0 == ProjectTransition::Building => {
+                entry.0 = ProjectTransition::CancellingBuild;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn finish_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let mut transitions = self.transitions.write().await;
+        match transitions.get_mut(&id) {
+            Some(entry) if entry.0.is_building() => {
+                entry.0 = ProjectTransition::None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        self.transitions
+            .write()
+            .await
+            .entry(id)
+            .or_insert((ProjectTransition::None, 0))
+            .1 = crate::lease::now_unix();
+        Ok(())
+    }
+
+    async fn list_stuck_transitions(
+        &self,
+        stale_before: i64,
+    ) -> anyhow::Result<Vec<StuckTransition>> {
+        let lifecycles = self.lifecycles.read().await;
+        let transitions = self.transitions.read().await;
+        let mut out = Vec::new();
+        for (id, lifecycle) in lifecycles.iter() {
+            let (transition, hb) = transitions
+                .get(id)
+                .copied()
+                .unwrap_or((ProjectTransition::None, 0));
+            let driver_backed = lifecycle.status == ProjectStatus::Activating
+                || transition.is_building();
+            if driver_backed && hb < stale_before {
+                out.push(StuckTransition {
+                    id: *id,
+                    status: lifecycle.status,
+                    transition,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_deactivating(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
+        Ok(self
+            .lifecycles
+            .read()
+            .await
+            .iter()
+            .filter(|(_, l)| l.status == ProjectStatus::Deactivating)
+            .map(|(id, _)| *id)
+            .collect())
     }
 
     async fn project_has_infra(&self, id_str: &str) -> anyhow::Result<Option<bool>> {
@@ -1490,15 +1988,6 @@ impl ProjectStoreOps for MockProjectStore {
 
     async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()> {
         self.namespaces.write().await.insert(id, String::new());
-        Ok(())
-    }
-
-    async fn set_infra_image_tags(
-        &self,
-        _id: uuid::Uuid,
-        _node_id: &str,
-        _tags: std::collections::HashMap<String, String>,
-    ) -> anyhow::Result<()> {
         Ok(())
     }
 

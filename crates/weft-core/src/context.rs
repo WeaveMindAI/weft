@@ -341,10 +341,10 @@ impl ExecutionContext {
 
     // ----- Storage primitive ------------------------------------------
 
-    /// Open a handle on the tenant's storage box, walled to `scope`
+    /// Open a handle on the tenant's storage, walled to `scope`
     /// (`StorageScope::Execution` is the default: per-run scratch,
-    /// swept on terminate unless kept). Big bytes flow worker<->box
-    /// directly; only the small self-describing stored-file reference
+    /// swept on terminate unless kept). Big bytes flow worker<->broker<->bucket;
+    /// only the small self-describing stored-file reference
     /// the handle returns ever rides edges / the journal.
     ///
     /// The scope governs WRITES and LISTS (`put` builds keys under
@@ -607,7 +607,7 @@ impl EndpointHandle {
     }
 }
 
-/// Scoped handle on the tenant's storage box, minted by
+/// Scoped handle on the tenant's storage, minted by
 /// [`ExecutionContext::storage`]. Every verb delegates to the
 /// `ContextHandle` storage methods; the handle itself only carries
 /// the chosen scope.
@@ -635,13 +635,16 @@ impl StorageHandle {
         filename: &str,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
+        let bytes = bytes.into();
+        let declared_size = Some(bytes.len() as u64);
         self.handle
             .storage_put(
                 &self.scope,
-                crate::storage::bytes_stream(bytes.into()),
+                crate::storage::bytes_stream(bytes),
                 mime_type,
                 filename,
                 keep,
+                declared_size,
             )
             .await
     }
@@ -657,7 +660,7 @@ impl StorageHandle {
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
         self.handle
-            .storage_put(&self.scope, stream, mime_type, filename, keep)
+            .storage_put(&self.scope, stream, mime_type, filename, keep, None)
             .await
     }
 
@@ -736,7 +739,7 @@ impl StorageHandle {
 
     /// Mint a TEMPORARY signed URL for handing this file to an
     /// external URL-accepting API; the external service streams
-    /// directly from the storage box. `ttl_secs: None` uses the
+    /// directly from the storage bucket. `ttl_secs: None` uses the
     /// service default (~15 min). The URL is an explicit, per-file,
     /// expiring artifact; the stored-file VALUE never carries it. Counts
     /// as access (bumps a kept file's TTL).
@@ -843,6 +846,9 @@ pub trait ContextHandle: Send + Sync {
     /// resolve the tenant's box endpoint, attach the caller's
     /// identity, and stream the body; they never buffer the whole
     /// file. `keep` only applies to `StorageScope::Execution`.
+    /// `declared_size` is the total byte size when the caller knows it
+    /// up front (a buffered payload, a sized HTTP body); `None` for a
+    /// genuinely unknown-length stream.
     async fn storage_put(
         &self,
         scope: &crate::storage::StorageScope,
@@ -850,6 +856,7 @@ pub trait ContextHandle: Send + Sync {
         mime_type: &str,
         filename: &str,
         keep: Option<crate::storage::KeepTtl>,
+        declared_size: Option<u64>,
     ) -> WeftResult<Value>;
 
     /// Stream an HTTP(S) URL straight into `scope` storage and return

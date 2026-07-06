@@ -29,6 +29,7 @@
 //! - [`human`]  : human-in-the-loop forms (discover, answer, assert resume).
 //! - [`fakes`]  : throwaway servers for triggers the system dials OUT to.
 //! - [`infra`]  : infra node lifecycle (start, poll, drive, terminate).
+//! - [`status`] : project status + available-actions observation.
 //! - [`storage`]: stored-file list / download / assert + sweep.
 //! - [`bus`]    : bus conversation assertions over the event log.
 //!
@@ -37,6 +38,19 @@
 //! Each test file targets one subsystem. A test prepares a fixture, drives it
 //! via the toolkit, and asserts via [`run::SettledRun`]. The fixtures (real
 //! weft projects) live under `fixtures/`.
+//!
+//! ## Reuse by another harness
+//!
+//! The API-driving toolkit ([`client::Dispatcher`] + the modules built on it:
+//! [`run`], [`assert`], [`event`], [`storage`], [`signal`], [`live`]) is
+//! deliberately auth-agnostic: `Dispatcher` carries an optional
+//! [`client::AuthProvider`] (None here, where there is no login). A harness that
+//! needs tokens can depend on THIS crate and reuse that toolkit, injecting a
+//! provider that signs a token per request (everything API + token, no CLI). What
+//! stays specific to this harness and is NOT reused: [`ensure`] (drives
+//! `setup.sh` on kind), `platform` (kind/Postgres direct), and
+//! [`project::Project`] (shells out to the `weft` CLI). This harness is
+//! unauthenticated by construction (its authenticator only ever issues `local`).
 
 pub mod assert;
 pub mod bus;
@@ -56,7 +70,12 @@ pub mod platform;
 pub mod project;
 pub mod run;
 pub mod signal;
+pub mod status;
 pub mod storage;
+// The teardown guard (clean-on-pass / keep-and-warn-on-fail) is backing-agnostic,
+// so both the local CLI fixture (`project::Project`) and an HTTP fixture in
+// another harness share ONE definition of the policy via this guard.
+pub mod teardown;
 
 pub use client::{cli, cli_ok, poll_until, Dispatcher};
 #[cfg(feature = "e2e")]
@@ -65,3 +84,4 @@ pub use ensure::up;
 pub use event::{Event, Replay};
 pub use project::Project;
 pub use run::SettledRun;
+pub use teardown::Teardown;

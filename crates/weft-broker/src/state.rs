@@ -13,7 +13,11 @@ use weft_task_store::{
     PostgresTaskStoreClient, PostgresWorkerPodClient, TaskStoreClient, WorkerPodClient,
 };
 
+use weft_platform_traits::ObjectStore;
+
 use crate::auth::{AuthConfig, IdentityCache};
+use crate::entitlement::EntitlementSource;
+use crate::runtime_store::RuntimeStore;
 use crate::scope::ScopeCache;
 
 pub struct BrokerState {
@@ -26,10 +30,29 @@ pub struct BrokerState {
     pub identity_cache: IdentityCache,
     pub scope_cache: ScopeCache,
     pub kube_client: kube_client::KubeClient,
+    /// The object-store slot: where runtime-file bytes live. Pointed at the
+    /// configured bucket (the bundled SeaweedFS by default, or any S3-compatible
+    /// endpoint). `None` only when no storage slot is configured, which the
+    /// runtime-file routes reject loud.
+    pub object_store: Option<Arc<dyn ObjectStore>>,
+    /// The runtime-file plane (`ctx.storage`): PG metadata + bucket bytes,
+    /// quota-enforced. `None` iff `object_store` is `None`.
+    pub runtime_store: Option<Arc<RuntimeStore>>,
+    /// Resolves a tenant's runtime-storage caps.
+    pub entitlements: Arc<dyn EntitlementSource>,
 }
 
 impl BrokerState {
-    pub async fn new(database_url: &str, auth: AuthConfig) -> anyhow::Result<Arc<Self>> {
+    /// Build the broker state. `object_store` is the deploy-time slot (from
+    /// `object_store_from_env`); `entitlements` is the budget policy (the default
+    /// binary passes the local default; a per-tenant source can be passed instead).
+    /// When the slot is set, the runtime-file plane is wired over it.
+    pub async fn new(
+        database_url: &str,
+        auth: AuthConfig,
+        object_store: Option<Arc<dyn ObjectStore>>,
+        entitlements: Arc<dyn EntitlementSource>,
+    ) -> anyhow::Result<Arc<Self>> {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let pool = loop {
             match PgPoolOptions::new()
@@ -58,6 +81,24 @@ impl BrokerState {
             Arc::new(PostgresWorkerPodClient::new(pool.clone()));
         let infra: Arc<dyn InfraReader> = Arc::new(PostgresInfraReader::new(pool.clone()));
 
+        // Wire the runtime-file plane over the slot when one is configured. The
+        // broker OWNS the `runtime_file` table (it is the only reader/writer),
+        // so it runs that table's migration here, at boot, before serving. The
+        // clock is the real system clock (the broker is the data path; the
+        // expiry math runs against wall time here, and is unit-tested against a
+        // fake clock at the store layer).
+        let runtime_store = match object_store.clone() {
+            Some(bucket) => {
+                crate::runtime_store::migrate(&pool).await.context("runtime_file migrate")?;
+                Some(Arc::new(RuntimeStore::new(
+                    pool.clone(),
+                    bucket,
+                    Arc::new(weft_platform_traits::clock::SystemClock),
+                )))
+            }
+            None => None,
+        };
+
         Ok(Arc::new(Self {
             pool,
             journal,
@@ -68,6 +109,9 @@ impl BrokerState {
             identity_cache: IdentityCache::new()?,
             scope_cache: ScopeCache::new(),
             kube_client: kube_client::KubeClient::new()?,
+            object_store,
+            runtime_store,
+            entitlements,
         }))
     }
 }

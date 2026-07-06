@@ -106,18 +106,54 @@ fn manifest_unit(manifest: &serde_json::Value) -> Option<&str> {
         .as_str()
 }
 
-/// Maximum drain time the supervisor will wait before giving up
-/// and proceeding with the lifecycle op anyway. Keeps a flaky
-/// project from blocking a user-requested stop forever.
-const DRAIN_TIMEOUT_SECONDS: u64 = 600;
-const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const READINESS_TIMEOUT_SECONDS: u64 = 180;
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How often the unbounded readiness wait logs a "still waiting" breadcrumb, so
+/// a stuck workload is legible without a hard-fail deadline killing a slow but
+/// legitimate warmup.
+const READINESS_BREADCRUMB_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Selector for weft-managed infra workloads. Used as the
 /// `-l weft.dev/role=infra` filter on every `list_replica_state`
 /// call inside the supervisor.
 pub(crate) const INFRA_SELECTOR: &str = "weft.dev/role=infra";
+
+/// How often the executing supervisor polls the command's
+/// `cancel_requested` flag while inside a wait loop (readiness /
+/// drain). Between discrete kubectl steps the check is per-step.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Marker error: the command was HALTED because the user requested
+/// cancellation. `tick` maps it to a `cancelled` outcome (never a
+/// failure). Cancel = halt, not rollback: kubectl is not
+/// transactional, so per-node partial state is left visible (the
+/// apply error path stamps `Failed("cancelled ...")` on the node so
+/// the user terminates/retries per-node from where it stopped).
+#[derive(Debug)]
+pub(crate) struct CancelledByUser {
+    /// Where execution halted, for the outcome message.
+    pub at: &'static str,
+}
+
+impl std::fmt::Display for CancelledByUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cancelled by user ({})", self.at)
+    }
+}
+
+impl std::error::Error for CancelledByUser {}
+
+/// Bail with `CancelledByUser` if the command's cancel flag is set.
+/// `at` names the step for the outcome message.
+async fn check_cancel(
+    state: &SupervisorState,
+    command_id: i64,
+    at: &'static str,
+) -> Result<()> {
+    if state.broker.command_cancel_requested(command_id).await? {
+        return Err(anyhow::Error::new(CancelledByUser { at }));
+    }
+    Ok(())
+}
 
 /// Block until every Deployment / StatefulSet with the matching
 /// instance label reports Ready, or the deadline passes. The
@@ -130,12 +166,25 @@ pub(crate) const INFRA_SELECTOR: &str = "weft.dev/role=infra";
 /// so tests can advance deterministically.
 async fn wait_for_readiness(
     state: &SupervisorState,
+    command_id: i64,
     namespace: &str,
     instance_id: &str,
 ) -> Result<()> {
-    let deadline = state.clock.now() + Duration::from_secs(READINESS_TIMEOUT_SECONDS);
     let instance_selector = format!("{INFRA_SELECTOR},weft.dev/instance={instance_id}");
+    // A user apply is a user-controlled operation: a slow-warmup workload (a
+    // model server pulling weights) can legitimately take a long time, so this
+    // wait is NOT capped by a fixed hard-fail deadline (matching the sibling
+    // drain wait, which the same theme made unbounded + cancellable). The user
+    // interrupts a workload that will never come up via cancel (polled at
+    // CANCEL_POLL_INTERVAL); a periodic breadcrumb makes a stuck readiness
+    // legible in the logs rather than a silent hang.
+    let mut next_cancel_check = state.clock.now();
+    let mut next_breadcrumb = state.clock.now() + READINESS_BREADCRUMB_INTERVAL;
     loop {
+        if state.clock.now() >= next_cancel_check {
+            check_cancel(state, command_id, "waiting for workload readiness").await?;
+            next_cancel_check = state.clock.now() + CANCEL_POLL_INTERVAL;
+        }
         // Filter by instance at the apiserver. No more in-Rust
         // filter pass.
         let workloads = state
@@ -152,33 +201,54 @@ async fn wait_for_readiness(
         if all_ready {
             return Ok(());
         }
-        if state.clock.now() >= deadline {
-            anyhow::bail!(
-                "workloads with instance={instance_id} did not become Ready within {}s",
-                READINESS_TIMEOUT_SECONDS
+        if state.clock.now() >= next_breadcrumb {
+            let (ready, desired): (i64, i64) = workloads
+                .iter()
+                .fold((0, 0), |(r, d), w| (r + w.ready, d + w.desired));
+            tracing::info!(
+                target: "weft_infra_supervisor::lifecycle",
+                instance = %instance_id,
+                ready, desired,
+                "still waiting for infra workloads to become Ready (cancel the apply to stop waiting)"
             );
+            next_breadcrumb = state.clock.now() + READINESS_BREADCRUMB_INTERVAL;
         }
         state.clock.sleep(READINESS_POLL_INTERVAL).await;
     }
 }
 
-async fn wait_for_drain(state: &SupervisorState, project_id: &str) -> Result<()> {
-    let deadline = state.clock.now() + Duration::from_secs(DRAIN_TIMEOUT_SECONDS);
-    loop {
-        let n = state.broker.running_count(project_id).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        if state.clock.now() >= deadline {
-            tracing::warn!(
-                project_id,
-                still_running = n,
-                "running_policy=wait drain timeout; proceeding with lifecycle op"
-            );
-            return Ok(());
-        }
-        state.clock.sleep(DRAIN_POLL_INTERVAL).await;
+/// Drain the project's running executions before a stop/terminate,
+/// via THE shared drain loop (`weft_platform_traits::drain_until_zero`,
+/// the same mechanism the dispatcher's worker-replacement drain uses).
+/// The cap comes from the command row (the user picked it with the
+/// wait choice); on timeout the op proceeds with a loud warning. The
+/// user's infra-cancel rides inside the count closure so a cancel
+/// landing mid-drain aborts promptly.
+async fn wait_for_drain(
+    state: &SupervisorState,
+    command_id: i64,
+    drain_timeout_secs: u64,
+    project_id: &str,
+) -> Result<()> {
+    let outcome = weft_platform_traits::drain_until_zero(
+        state.clock.as_ref(),
+        Duration::from_secs(drain_timeout_secs),
+        "infra lifecycle op",
+        || async {
+            check_cancel(state, command_id, "waiting for running executions to drain").await?;
+            state.broker.running_count(project_id).await
+        },
+    )
+    .await?;
+    if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
+        tracing::warn!(
+            project_id,
+            still_running,
+            drain_timeout_secs,
+            "running_policy=wait drain timeout; proceeding with lifecycle op"
+        );
     }
+    Ok(())
 }
 
 pub async fn run_loop(state: SupervisorState) -> Result<()> {
@@ -217,6 +287,12 @@ pub async fn tick(state: &SupervisorState) -> Result<bool> {
         "lifecycle command claimed"
     );
     let result = execute(state, &cmd).await;
+    // A user-honored cancel is its own outcome, never a failure.
+    let cancelled = result
+        .as_ref()
+        .err()
+        .map(|e| e.downcast_ref::<CancelledByUser>().is_some())
+        .unwrap_or(false);
     let error = result.as_ref().err().map(|e| e.to_string());
     // `command_complete` returns Raced if the row was already completed
     // (remove_node cascade cancelled it) OR this pod no longer owns the
@@ -226,7 +302,7 @@ pub async fn tick(state: &SupervisorState) -> Result<bool> {
     // way, log + move on; never propagate as a failure of this tick.
     let outcome = state
         .broker
-        .command_complete(&state.pod_name, cmd.id, error.as_deref())
+        .command_complete(&state.pod_name, cmd.id, error.as_deref(), cancelled)
         .await?;
     if outcome.is_raced() {
         tracing::info!(
@@ -236,11 +312,19 @@ pub async fn tick(state: &SupervisorState) -> Result<bool> {
         );
     }
     if let Err(e) = result {
-        tracing::warn!(
-            command_id = cmd.id,
-            error = %e,
-            "lifecycle command failed; marked complete with error"
-        );
+        if cancelled {
+            tracing::info!(
+                command_id = cmd.id,
+                halt = %e,
+                "lifecycle command halted by user cancel; marked cancelled"
+            );
+        } else {
+            tracing::warn!(
+                command_id = cmd.id,
+                error = %e,
+                "lifecycle command failed; marked complete with error"
+            );
+        }
     }
     Ok(true)
 }
@@ -261,7 +345,7 @@ async fn execute(
     // already ran cancel_running_non_suspended when it issued the
     // command, so any colors still alive are draining naturally.
     if cmd.running_policy == Some(RunningPolicy::Wait) {
-        wait_for_drain(state, &cmd.project_id).await?;
+        wait_for_drain(state, cmd.id, cmd.drain_timeout_secs, &cmd.project_id).await?;
     }
     let nodes = state.broker.infra_nodes(&cmd.project_id).await?;
     let targets: Vec<&weft_broker_client::protocol::SupervisorInfraNode> = match &cmd.node_id {
@@ -298,58 +382,21 @@ async fn execute(
 
     match cmd.verb {
         InfraLifecycleVerb::Stop => {
-            // Flip each unit that WILL be stopped (ScaleToZero) to
-            // `stopping` BEFORE the kubectl scale so the action bar
-            // shows the transient even on a slow cluster. NoOp units
-            // are left untouched (they survive stop). The terminal
-            // `stopped` flip lands per-unit after the scale settles.
-            // Failures here are non-fatal: a stale `stopping` row is
-            // corrected by the next supervisor tick OR on retry.
-            for n in &targets {
-                for (unit, unit_rt) in &n.units {
-                    // `force` overrides on_stop: take EVERY unit down,
-                    // including NoOp ones (the user's explicit "stop it
-                    // all so I can update it"). Without force, NoOp
-                    // units are skipped (they survive a stop).
-                    if !cmd.force
-                        && unit_rt.stop_behavior != weft_core::StopBehavior::ScaleToZero
-                    {
-                        continue;
-                    }
-                    // UI hint, not state of record: the terminal
-                    // per-unit `stopped` write below is what matters.
-                    // Log loudly so a broker outage shows up, but don't
-                    // fail the operation here.
-                    if let Err(e) = state
-                        .broker
-                        .set_status(
-                            &state.pod_name,
-                            Some(cmd.id),
-                            &cmd.project_id,
-                            &n.node_id,
-                            Some(unit),
-                            weft_broker_client::protocol::InfraNodeStatus::Stopping,
-                            None,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            project_id = %cmd.project_id,
-                            node_id = %n.node_id,
-                            unit = %unit,
-                            error = %e,
-                            "set_status(stopping) failed; continuing with scale-down"
-                        );
-                    }
-                }
-            }
-            // List workloads ONCE; iterate targets against the
-            // single snapshot. Re-listing per target would be N
-            // kube round-trips when the snapshot already covers the
-            // whole namespace.
+            // The `stopping` transient is flipped per-unit INSIDE the
+            // cancel-guarded work loop below (right before each unit's scale),
+            // NOT in an upfront flip-all loop: a cancel that lands before a unit
+            // is reached must leave it in its prior RESTING status, never stuck
+            // in the transient `stopping`.
+            //
+            // List workloads ONCE; iterate targets against the single snapshot.
+            // Re-listing per target would be N kube round-trips when the snapshot
+            // already covers the whole namespace.
             let workloads = state.kube.list_replica_state(&namespace, INFRA_SELECTOR).await?;
             for n in &targets {
+                // Interruptible between nodes: already-stopped units
+                // stay stopped (halt, not rollback); the rest keep
+                // their prior status.
+                check_cancel(state, cmd.id, "stopping infra nodes").await?;
                 // Per-unit stop: scale a unit's workloads to 0 only if
                 // its `stop_behavior` is ScaleToZero. A NoOp unit (a
                 // license server, a slow-warmup model) survives stop and
@@ -375,6 +422,34 @@ async fn execute(
                             .unwrap_or(true);
                     if !scale_to_zero {
                         continue;
+                    }
+                    // Flip THIS unit to the `stopping` transient right before its
+                    // scale (not upfront for the whole set): a cancel that landed
+                    // earlier left the not-yet-reached units in their resting
+                    // status. UI hint only (the terminal per-unit `stopped` write
+                    // below is what matters), so a broker failure here is logged,
+                    // not fatal.
+                    if let Err(e) = state
+                        .broker
+                        .set_status(
+                            &state.pod_name,
+                            Some(cmd.id),
+                            &cmd.project_id,
+                            &n.node_id,
+                            Some(unit),
+                            weft_broker_client::protocol::InfraNodeStatus::Stopping,
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            project_id = %cmd.project_id,
+                            node_id = %n.node_id,
+                            unit = %unit,
+                            error = %e,
+                            "set_status(stopping) failed; continuing with scale-down"
+                        );
                     }
                     state
                         .kube
@@ -423,12 +498,21 @@ async fn execute(
             }
         }
         InfraLifecycleVerb::Terminate => {
-            // `terminating` transient. Same pattern as stop: flip
-            // first so the UI reflects the in-flight state.
             for n in &targets {
-                // Same UI-hint rationale as `stopping`: the
-                // terminal `terminated` event after the kubectl
-                // delete is what counts.
+                // Interruptible between nodes: already-terminated
+                // nodes are gone; remaining nodes keep their rows
+                // (visible partial state the user acts on per-node).
+                //
+                // The `terminating` transient is flipped HERE, per node, right
+                // before this node's kubectl delete, NOT in an upfront flip-all
+                // loop. That way a cancel that lands before a node is reached
+                // leaves it in its prior RESTING status, never stuck in the
+                // transient `terminating` (which blocks re-apply reuse and shows
+                // a permanent spinner). Halt, not rollback: nodes already deleted
+                // stay gone; the rest keep their status. The set_status is a UI
+                // hint (the terminal `terminated` event after the delete is what
+                // counts), so a broker failure here is logged, not fatal.
+                check_cancel(state, cmd.id, "terminating infra nodes").await?;
                 if let Err(e) = state
                     .broker
                     .set_status(
@@ -450,8 +534,6 @@ async fn execute(
                         "set_status(terminating) failed; continuing with kubectl delete"
                     );
                 }
-            }
-            for n in &targets {
                 let selector = format!("weft.dev/instance={}", n.instance_id);
                 // The list of PVCs to preserve was carried on the
                 // `infra_node` row at apply time (from
@@ -687,6 +769,14 @@ async fn execute_apply(
     };
 
     let apply_result: Result<std::collections::BTreeMap<String, String>> = async {
+        // Interruptible between the phases below (sweep / apply /
+        // readiness). A cancel mid-apply bails through the error path,
+        // which stamps the node `Failed("cancelled by user (...)")`:
+        // the honest resting state for a half-applied node (kubectl is
+        // not transactional; the user terminates or retries from
+        // there), while `tick` records the COMMAND outcome as
+        // `cancelled`, not failed.
+        check_cancel(state, cmd.id, "before sweeping stale workloads").await?;
         // Orphan reap (unit-level): delete workloads for units that
         // are in the cluster (prior row) but no longer declared in the
         // spec. The node-level reap (deleted node) is the dispatcher's
@@ -717,6 +807,7 @@ async fn execute_apply(
                 )
                 .await?;
         }
+        check_cancel(state, cmd.id, "before applying manifests").await?;
         // Apply reconciled units' manifests + shared resources (no unit
         // label). Skip up units' workload manifests entirely.
         for manifest in &manifests {
@@ -725,7 +816,7 @@ async fn execute_apply(
                 _ => state.kube.apply(manifest).await?,
             }
         }
-        wait_for_readiness(state, &namespace, &instance_id).await?;
+        wait_for_readiness(state, cmd.id, &namespace, &instance_id).await?;
         compute_endpoints(&spec, &instance_id, &namespace)
     }
     .await;
@@ -956,10 +1047,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let map = compute_endpoints(&spec, "inst1", "wm-project-x-y").unwrap();
+        let map = compute_endpoints(&spec, "inst1", "wft-project-x-y").unwrap();
         assert_eq!(
             map.get("api").unwrap(),
-            "http://inst1-api.wm-project-x-y.svc.cluster.local:8080"
+            "http://inst1-api.wft-project-x-y.svc.cluster.local:8080"
         );
     }
 }

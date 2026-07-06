@@ -33,7 +33,7 @@ use crate::cst::parse;
 /// cannot be resolved (the batch then aborts and the original source is kept by
 /// the caller). The `view` carries `source_id` so every scoped-id resolution
 /// uses the SAME anon-group prefix the lowering writes.
-/// SYNC: apply_op <-> extension-vscode/src/webview/lib/projection/apply.ts applyOp (the editor's optimistic mirror of these op semantics)
+/// SYNC: apply_op <-> packages/weft-graph/src/webview/lib/projection/apply.ts applyOp (the editor's optimistic mirror of these op semantics)
 pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditError> {
     use super::EditOp::*;
     match op {
@@ -1536,7 +1536,7 @@ fn build_signature(inputs: &[PortSig], outputs: &[PortSig]) -> String {
 }
 
 /// Render a string to a `.weft` value token (quoted, or heredoc if multi-line).
-/// SYNC: format_string <-> extension-vscode/src/webview/lib/value-format.ts formatConfigValue (and parseConfigToken, its inverse)
+/// SYNC: format_string <-> packages/weft-graph/src/webview/lib/value-format.ts formatConfigValue (and parseConfigToken, its inverse)
 fn format_string(s: &str) -> Result<String, EditError> {
     if s.contains('\n') {
         // A multi-line value is emitted as a ```...``` heredoc. The heredoc has

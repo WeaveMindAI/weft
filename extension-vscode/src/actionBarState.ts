@@ -37,6 +37,7 @@ import type {
   CliEvent,
   ErrorVerb,
 } from './shared/protocol';
+import { backendFromSnapshot } from './shared/protocol';
 
 interface FollowState {
   mode: 'latest' | 'pinned';
@@ -314,6 +315,8 @@ export class ActionBarStore {
 const DEFAULT_BACKEND: BackendSnapshot = {
   available: [],
   status: 'unknown',
+  transition: 'none',
+  orphanedInfra: false,
   mode: 'unknown',
   infraRollup: 'none',
   runningCount: 0,
@@ -322,16 +325,8 @@ const DEFAULT_BACKEND: BackendSnapshot = {
 function snapshotFromSlot(slot: Slot | undefined): BackendSnapshot {
   const b = slot?.backend;
   if (!b) return DEFAULT_BACKEND;
-  return {
-    available: b.availableActions,
-    status: b.projectStatus,
-    mode: b.mode,
-    infraRollup: b.infraRollup,
-    runningCount: b.runningCount,
-    ...(b.firesDeadlineUnix !== undefined
-      ? { firesDeadlineUnix: b.firesDeadlineUnix }
-      : {}),
-  };
+  // The shared projection: one derivation for both hosts.
+  return backendFromSnapshot(b);
 }
 
 function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {

@@ -224,6 +224,8 @@ wire_enum! {
     /// Lifecycle status of a project row, written into
     /// `project.status`. Both the dispatcher (writer) and the
     /// supervisor (reader, via the broker) consume this enum.
+    /// SYNC: ProjectStatus <-> packages/weft-graph/src/protocol.ts projectStatus,
+    ///       crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.status
     pub enum ProjectStatus {
         /// Fresh row, never activated.
         Registered = "registered",
@@ -512,38 +514,11 @@ pub struct ProjectFetchDefinitionResponse {
     pub definition_hash: String,
 }
 
-/// `POST /storage/authorize`: the storage box (or the dispatcher)
-/// relays a caller's bearer token to the broker and gets back the
-/// VERIFIED identity facts the storage wall is computed from. The
-/// bearer on the request is the token being verified, not the
-/// relayer's own.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageAuthorizeRequest {
-    /// The execution color the caller claims to be driving. The
-    /// broker verifies the claim the same way it gates journal
-    /// writes: the color's `owner_pod_name` must be the caller's
-    /// pod, and the color's project must be the caller's namespace's
-    /// project. Verified -> echoed in the response; failed -> 403.
-    pub color: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StorageAuthorizeResponse {
-    /// A worker pod: tenant + project resolved from the token's
-    /// namespace (DB-backed, never parsed/claimed), color verified
-    /// per the request.
-    Worker {
-        tenant_id: String,
-        project_id: String,
-        color: Option<String>,
-    },
-    /// The dispatcher (cluster control plane, `weft-system`).
-    ControlPlane,
-    /// A tenant's storage box pod (used by the dispatcher to
-    /// authenticate grow/shrink requests FROM a box).
-    StorageBox { tenant_id: String },
-}
+// The storage caller-identity verdict (`StorageAuthorizeResponse`) used to live
+// here as a broker-relay wire type. The runtime-file plane now resolves the
+// caller IN-PROCESS in the broker (it is both the identity authority and the
+// data path), so there is no relay and no wire type: see
+// `weft_broker::auth::resolve_storage_caller`.
 
 // ---------- Supervisor surface (tenant-scoped) ----------
 
@@ -673,6 +648,19 @@ pub struct SupervisorClaimCommandResponse {
     pub command: Option<SupervisorCommandRow>,
 }
 
+/// Default cap on a `RunningPolicy::Wait` drain before the lifecycle
+/// op proceeds anyway (with a loud warning). A parameter everywhere it
+/// applies (the supervisor's stop/terminate drain, the dispatcher's
+/// worker-replacement drain); this is only the default when the
+/// request doesn't say. The trigger-side deactivate wait is NOT capped
+/// (the Deactivating state is unbounded, legible, and cancellable).
+// SYNC: DEFAULT_DRAIN_TIMEOUT_SECS <-> packages/weft-graph/src/protocol.ts DEFAULT_DRAIN_TIMEOUT_SECS
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 600;
+
+fn default_drain_timeout_secs() -> u64 {
+    DEFAULT_DRAIN_TIMEOUT_SECS
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandRow {
     pub id: i64,
@@ -697,6 +685,11 @@ pub struct SupervisorCommandRow {
     /// "take it all down so I can update it" override.
     #[serde(default)]
     pub force: bool,
+    /// Cap on the `running_policy = wait` drain before the op proceeds
+    /// anyway. Carried per command (the user picks it with the wait
+    /// choice); defaults to `DEFAULT_DRAIN_TIMEOUT_SECS`.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1145,6 +1138,14 @@ pub struct DeactivateSpec {
     pub grace_minutes: u32,
     #[serde(rename = "runningPolicy")]
     pub running_policy: RunningPolicy,
+    /// Cap in seconds on the `wait` drain: how long a deactivation
+    /// sits in `Deactivating` before the remaining executions are
+    /// cancelled and it lands. The user picks it with the wait choice
+    /// (same "wait at most N, then proceed" as the infra drains);
+    /// absent = `DEFAULT_DRAIN_TIMEOUT_SECS`. Ignored with
+    /// `runningPolicy = cancel` (nothing to wait for).
+    #[serde(default, rename = "drainTimeoutSecs", skip_serializing_if = "Option::is_none")]
+    pub drain_timeout_secs: Option<u64>,
 }
 
 fn default_grace_minutes() -> u32 {
@@ -1223,10 +1224,29 @@ pub struct SupervisorCommandCompleteRequest {
     pub pod_name: String,
     pub command_id: i64,
     pub error: Option<String>,
+    /// True when the supervisor halted the command because the user
+    /// requested cancellation (`cancel_requested` on the row). The
+    /// broker records outcome `cancelled` (never a failure); `error`
+    /// then carries the halt point for the outcome message.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandCompleteResponse {}
+
+/// Poll target for an executing supervisor: has the user requested
+/// cancellation of this claimed command? Checked between kubectl steps
+/// and inside readiness/drain waits so a cancel interrupts promptly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorCommandCancelRequestedRequest {
+    pub command_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorCommandCancelRequestedResponse {
+    pub cancel_requested: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorTriggerDepsRequest {
@@ -1436,7 +1456,7 @@ mod supervisor_protocol_tests {
                 {
                     "project_id": "p1",
                     "tenant_id": "alice",
-                    "project_namespace": "wm-project-alice-p1",
+                    "project_namespace": "wft-project-alice-p1",
                     "status": "active",
                     "deactivated_by_health": false,
                 }
@@ -1460,7 +1480,7 @@ mod supervisor_protocol_tests {
                 {
                     "project_id": "p1",
                     "tenant_id": "alice",
-                    "project_namespace": "wm-project-alice-p1",
+                    "project_namespace": "wft-project-alice-p1",
                     "status": "active",
                     "deactivated_by_health": false,
                 }
@@ -1478,7 +1498,7 @@ mod supervisor_protocol_tests {
     fn owned_project_missing_status_fails() {
         let res: Result<SupervisorOwnedProjectsResponse, _> = serde_json::from_value(json!({
             "owned": [
-                { "project_id": "p1", "project_namespace": "wm-project-alice-p1" }
+                { "project_id": "p1", "project_namespace": "wft-project-alice-p1" }
             ]
         }));
         assert!(
@@ -1497,7 +1517,7 @@ mod supervisor_protocol_tests {
     fn owned_project_missing_deactivated_by_health_fails() {
         let res: Result<SupervisorOwnedProjectsResponse, _> = serde_json::from_value(json!({
             "owned": [
-                { "project_id": "p1", "project_namespace": "wm-project-alice-p1", "status": "active" }
+                { "project_id": "p1", "project_namespace": "wft-project-alice-p1", "status": "active" }
             ]
         }));
         assert!(
@@ -1565,7 +1585,7 @@ mod supervisor_protocol_tests {
             instance_id: "wn-abc-tgi-12".into(),
             applied_spec_hash: "deadbeef".into(),
             endpoints: [("api".to_string(), "http://x".to_string())].into(),
-            namespace: "wm-x".into(),
+            namespace: "wft-x".into(),
             preserve_pvcs: vec!["data".into()],
             units: std::collections::BTreeMap::new(),
         };
@@ -1597,7 +1617,7 @@ mod supervisor_protocol_tests {
             project_id: "p".into(),
             node_id: "tgi".into(),
             instance_id: "wn-abc-tgi-12".into(),
-            namespace: "wm-x".into(),
+            namespace: "wft-x".into(),
             preserve_pvcs: vec!["data".into()],
             units: std::collections::BTreeMap::new(),
         };
@@ -1638,8 +1658,10 @@ mod supervisor_protocol_tests {
             mode: DeactivationMode::Hibernate,
             grace_minutes: 5,
             running_policy: RunningPolicy::Wait,
+            drain_timeout_secs: Some(120),
         };
         let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["drainTimeoutSecs"], 120);
         let back: DeactivateSpec = serde_json::from_value(v).unwrap();
         assert_eq!(s, back);
     }
@@ -1650,6 +1672,7 @@ mod supervisor_protocol_tests {
             mode: DeactivationMode::Park,
             grace_minutes: 0,
             running_policy: RunningPolicy::Cancel,
+            drain_timeout_secs: None,
         });
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["verb"], "deactivate");
@@ -1712,11 +1735,19 @@ mod supervisor_protocol_tests {
             running_policy: Some(RunningPolicy::Cancel),
             spec_json: None,
             force: false,
+            drain_timeout_secs: 120,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["node_id"], "n");
         assert_eq!(v["verb"], "terminate");
         assert_eq!(v["running_policy"], "cancel");
+        assert_eq!(v["drain_timeout_secs"], 120);
+        // A payload WITHOUT the field (an older writer) decodes to the
+        // shared default, never zero.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("drain_timeout_secs");
+        let back: SupervisorCommandRow = serde_json::from_value(old).unwrap();
+        assert_eq!(back.drain_timeout_secs, DEFAULT_DRAIN_TIMEOUT_SECS);
     }
 
     /// `LifecycleSpec::into_row_columns` no longer populates the
@@ -1730,6 +1761,7 @@ mod supervisor_protocol_tests {
             mode: DeactivationMode::Hibernate,
             grace_minutes: 5,
             running_policy: RunningPolicy::Wait,
+            drain_timeout_secs: None,
         })
         .into_row_columns();
         assert_eq!(verb, InfraLifecycleVerb::Deactivate);
@@ -1936,43 +1968,3 @@ mod supervisor_protocol_tests {
 }
 
 
-#[cfg(test)]
-mod storage_protocol_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn storage_authorize_request_round_trip() {
-        let req = StorageAuthorizeRequest { color: Some("c1".into()) };
-        let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["color"], "c1");
-        let none: StorageAuthorizeRequest =
-            serde_json::from_value(json!({ "color": null })).unwrap();
-        assert_eq!(none.color, None);
-    }
-
-    #[test]
-    fn storage_authorize_response_round_trips_each_variant() {
-        // The internally-tagged `kind` discriminator must round-trip
-        // for all three identities the wall depends on.
-        let worker = StorageAuthorizeResponse::Worker {
-            tenant_id: "t1".into(),
-            project_id: "p1".into(),
-            color: Some("c1".into()),
-        };
-        let v = serde_json::to_value(&worker).unwrap();
-        assert_eq!(v["kind"], "worker");
-        assert_eq!(v["tenant_id"], "t1");
-        assert_eq!(serde_json::from_value::<StorageAuthorizeResponse>(v).unwrap(), worker);
-
-        let cp = StorageAuthorizeResponse::ControlPlane;
-        let v = serde_json::to_value(&cp).unwrap();
-        assert_eq!(v["kind"], "control_plane");
-        assert_eq!(serde_json::from_value::<StorageAuthorizeResponse>(v).unwrap(), cp);
-
-        let bx = StorageAuthorizeResponse::StorageBox { tenant_id: "t1".into() };
-        let v = serde_json::to_value(&bx).unwrap();
-        assert_eq!(v["kind"], "storage_box");
-        assert_eq!(serde_json::from_value::<StorageAuthorizeResponse>(v).unwrap(), bx);
-    }
-}

@@ -10,6 +10,7 @@ pub mod stop;
 pub mod activate;
 pub mod deactivate;
 pub mod cancel_activate;
+pub mod cancel_build;
 pub mod cancel_running;
 pub mod resync;
 pub mod ps;

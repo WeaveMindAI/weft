@@ -1,8 +1,10 @@
 ---
-# Dispatcher ingress. Locally this is served by the nginx-ingress
-# controller installed into kind; traffic on
-# http://dispatcher.weft.local routes to the dispatcher service in
-# `weft-system`.
+# Dispatcher ingress: routes ALL dispatcher paths (/signal, /signal-token,
+# /connect, the public mount paths) to the dispatcher Service. No `host`
+# match: the dispatcher mints public URLs at WEFT_DISPATCHER_PUBLIC_BASE_URL (an IP or
+# any DNS name pointing at this ingress), so the rule must accept whatever
+# Host those URLs carry. A host match here would 404 every minted URL whose
+# base isn't that exact name.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -14,8 +16,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    - host: dispatcher.weft.local
-      http:
+    - http:
         paths:
           - path: /
             pathType: Prefix

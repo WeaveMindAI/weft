@@ -9,7 +9,8 @@ async fn http_endpoint_echoes_request_body() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("web_trigger", disp.clone()).await?;
 
-    // Per-run-unique mount path (mount paths are a global namespace).
+    // Per-run-unique mount path (namespaced per tenant; unique-per-run avoids
+    // same-tenant collisions). Returns the tenant-namespaced callable path.
     let path = project.unique_live_path()?;
 
     // Live HTTP triggers must be activated (build + register + mount the route).

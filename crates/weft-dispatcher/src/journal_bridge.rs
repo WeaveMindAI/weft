@@ -251,13 +251,21 @@ async fn process_one_row(
             // sweep DURABLY (workers stall-then-die, so worker-side
             // cleanup is only an eager optimization; this row is the
             // guarantee). The storage_sweep reaper drains the queue.
-            let tenant = state.tenant_router.tenant_for_project(&project_id);
-            crate::storage_box::enqueue_sweep(
-                &state.pg_pool,
-                tenant.as_str(),
-                &color.to_string(),
-            )
-            .await?;
+            //
+            // The tenant comes from the execution's OWN journal row
+            // (`execution_color.tenant_id`, frozen at start), NOT the mutable
+            // project store: it is the tenant the run actually keyed its storage
+            // under, and it survives project deletion. A missing row soft-skips like
+            // `execution_project` above (a stale terminal event for a wiped execution
+            // must advance the cursor, never poison it).
+            if let Some(tenant) = state.journal.execution_tenant(color).await?.found() {
+                crate::storage::enqueue_sweep(
+                    &state.pg_pool,
+                    &tenant,
+                    &color.to_string(),
+                )
+                .await?;
+            }
         }
         // A suspension is the running -> suspended edge of the drain
         // condition: `running_count` excludes suspended colors (the
@@ -347,6 +355,10 @@ pub(crate) async fn try_finish_drain(
             project_id,
             "drain finished: deactivating -> inactive"
         );
+        // Broadcast the landing so both frontends reconcile without a
+        // verb (the backend-owns-state rule needs the exit of a
+        // transitional state to be observable, not just its entry).
+        crate::transition::publish_transition_changed(state, id).await;
     }
     Ok(())
 }

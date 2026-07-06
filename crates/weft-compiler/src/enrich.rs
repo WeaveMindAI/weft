@@ -14,10 +14,20 @@
 use serde_json::Value;
 
 use weft_core::node::{FormFieldPort, MetadataCatalog};
-use weft_core::project::{PortDefinition, ProjectDefinition};
+use weft_core::project::{PortDefinition, ProjectDefinition, Span};
 use weft_core::weft_type::WeftType;
 
 use crate::error::{CompileError, CompileResult};
+
+/// One enrich failure carrying the SOURCE SPAN of the offending node, so a
+/// diagnostic consumer (the editor's squiggles, the CLI's error lines) points
+/// at the exact line instead of a span-less blob. The span is the node's
+/// header (`header_span_or_default`); `Span::default()` only for the rare
+/// project-level error with no node to blame.
+pub struct EnrichError {
+    pub span: Span,
+    pub message: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortDirection {
@@ -39,8 +49,9 @@ fn merge_ports(
     weft_ports: &[PortDefinition],
     can_add: bool,
     node_id: &str,
+    span: Span,
     direction: PortDirection,
-    errors: &mut Vec<String>,
+    errors: &mut Vec<EnrichError>,
 ) -> Vec<PortDefinition> {
     use std::collections::HashMap;
 
@@ -63,14 +74,14 @@ fn merge_ports(
                 {
                     merged.port_type = wp.port_type.clone();
                 } else {
-                    errors.push(format!(
+                    errors.push(EnrichError { span, message: format!(
                         "node '{}': {} port '{}' declared type {} incompatible with catalog type {}",
                         node_id,
                         direction.as_str(),
                         cp.name,
                         wp.port_type,
                         cp.port_type,
-                    ));
+                    )});
                 }
             }
             merged
@@ -90,13 +101,13 @@ fn merge_ports(
             // Not gated by EnrichPolicy: that only forgives unknown node
             // TYPES; a known type rejecting an authored port is a hard
             // authoring error in every mode.
-            errors.push(format!(
+            errors.push(EnrichError { span, message: format!(
                 "node '{}': declares custom {} port '{}' but node type does not support custom {} ports",
                 node_id,
                 direction.as_str(),
                 wp.name,
                 direction.as_str(),
-            ));
+            )});
             continue;
         }
         // A user-added port with the placeholder `MustOverride` type is the
@@ -106,12 +117,12 @@ fn merge_ports(
         // error diagnostic instead. Without this, the round-trip silently
         // ate the port and it vanished from the canvas.
         if wp.port_type.is_must_override() {
-            errors.push(format!(
+            errors.push(EnrichError { span, message: format!(
                 "node '{}': custom {} port '{}' needs a concrete type",
                 node_id,
                 direction.as_str(),
                 wp.name,
-            ));
+            )});
         }
         result.push(wp.clone());
     }
@@ -129,12 +140,35 @@ pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) ->
     enrich_with_policy(project, catalog, EnrichPolicy::Strict)
 }
 
+/// String wrapper over [`enrich_collecting`]: joins the per-node errors into
+/// one `CompileError::Enrich` for callers that only want a pass/fail (no
+/// per-error spans). Diagnostic consumers call `enrich_collecting` directly to
+/// keep each error's line.
 pub fn enrich_with_policy(
     project: &mut ProjectDefinition,
     catalog: &dyn MetadataCatalog,
     policy: EnrichPolicy,
 ) -> CompileResult<()> {
-    let mut errors = Vec::new();
+    let errors = enrich_collecting(project, catalog, policy);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CompileError::Enrich(
+            errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; "),
+        ))
+    }
+}
+
+/// Enrich, returning every failure with the SOURCE SPAN of the offending node
+/// (empty vec = clean). The span-preserving core; the string-joining
+/// `enrich_with_policy` wraps it. Diagnostic-producing callers (the editor
+/// parse, the CLI) use this so each error squiggles its own line.
+pub fn enrich_collecting(
+    project: &mut ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    policy: EnrichPolicy,
+) -> Vec<EnrichError> {
+    let mut errors: Vec<EnrichError> = Vec::new();
     // One [reserved-node-type] error per offending TYPE, not per node:
     // boundary types appear on two nodes per group, and a project full
     // of groups would otherwise report the same corrupt catalog entry
@@ -154,10 +188,10 @@ pub fn enrich_with_policy(
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(format!(
+                errors.push(EnrichError { span: node.header_span_or_default(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a built-in language type; rename the catalog node",
                     node.node_type,
-                ));
+                )});
             }
             continue;
         }
@@ -170,21 +204,26 @@ pub fn enrich_with_policy(
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(format!(
+                errors.push(EnrichError { span: node.header_span_or_default(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a reserved language keyword",
                     node.node_type,
-                ));
+                )});
             }
             continue;
         }
 
         let Some(meta) = catalog.lookup(&node.node_type) else {
             if policy == EnrichPolicy::Strict {
-                errors.push(format!("unknown node type: '{}'", node.node_type));
+                errors.push(EnrichError {
+                    span: node.header_span_or_default(),
+                    message: format!("unknown node type: '{}'", node.node_type),
+                });
             }
             continue;
         };
 
+        // The offending node's header span, so a port error squiggles its line.
+        let node_span = node.header_span_or_default();
         let weft_inputs = std::mem::take(&mut node.inputs);
         let weft_outputs = std::mem::take(&mut node.outputs);
 
@@ -200,7 +239,7 @@ pub fn enrich_with_policy(
                 synthesized_from_carry: false,
             })
             .collect();
-        let catalog_outputs: Vec<PortDefinition> = meta
+        let mut catalog_outputs: Vec<PortDefinition> = meta
             .outputs
             .iter()
             .map(|p| PortDefinition {
@@ -213,27 +252,40 @@ pub fn enrich_with_policy(
             })
             .collect();
 
-        let mut inputs = merge_ports(
+        // A form-schema node's ports are DERIVED from its `fields` config. Fold
+        // them into the catalog port set BEFORE merging the source-declared
+        // ports, so they count as known ports: a header that re-declares a
+        // derived port (the graph editor never writes these, but a hand-authored
+        // `.weft` may) merges cleanly IF it matches by name + type, and a header
+        // port that does NOT match a derived (or catalog) port is the genuine
+        // "custom port on a node that forbids them" error. Declaring them is
+        // always OPTIONAL: omitting the header is the normal case.
+        let mut catalog_inputs = catalog_inputs;
+        if meta.features.has_form_schema {
+            let specs = catalog.form_field_specs(&node.node_type);
+            let (form_inputs, form_outputs) = derive_form_ports(&node.config, specs);
+            catalog_inputs.extend(form_inputs);
+            catalog_outputs.extend(form_outputs);
+        }
+
+        let inputs = merge_ports(
             &catalog_inputs,
             &weft_inputs,
             meta.features.can_add_input_ports,
             &node.id,
+            node_span,
             PortDirection::Input,
             &mut errors,
         );
-        let mut outputs = merge_ports(
+        let outputs = merge_ports(
             &catalog_outputs,
             &weft_outputs,
             meta.features.can_add_output_ports,
             &node.id,
+            node_span,
             PortDirection::Output,
             &mut errors,
         );
-
-        if meta.features.has_form_schema {
-            let specs = catalog.form_field_specs(&node.node_type);
-            materialize_form_ports(&node.config, specs, &mut inputs, &mut outputs);
-        }
 
         node.inputs = inputs;
         node.outputs = outputs;
@@ -242,12 +294,16 @@ pub fn enrich_with_policy(
         node.images = meta.images.clone();
     }
 
-    if !errors.is_empty() {
-        return Err(CompileError::Enrich(errors.join("; ")));
+    // Port errors mean the topology is malformed; skip type resolution (it would
+    // walk a broken graph) and return them. A clean merge runs type resolution,
+    // whose failure (an unresolvable TypeVar) is a project-level enrich error
+    // with no single node to blame (`Span::default`).
+    if errors.is_empty() {
+        if let Err(e) = resolve_type_vars(project) {
+            errors.push(EnrichError { span: Span::default(), message: format!("{e}") });
+        }
     }
-
-    resolve_type_vars(project)?;
-    Ok(())
+    errors
 }
 
 fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
@@ -347,14 +403,18 @@ fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bo
     }
 }
 
-fn materialize_form_ports(
+/// The (input, output) ports a form-schema node's `fields` config derives from
+/// its specs. Pure: reads each field's `fieldType` + `key`, matches the spec,
+/// and resolves its `adds_inputs` / `adds_outputs` templates. The enricher folds
+/// these into the node's known ports (see the call site).
+fn derive_form_ports(
     config: &Value,
     specs: &[weft_core::FormFieldSpec],
-    inputs: &mut Vec<PortDefinition>,
-    outputs: &mut Vec<PortDefinition>,
-) {
+) -> (Vec<PortDefinition>, Vec<PortDefinition>) {
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
     let Some(fields) = config.get("fields").and_then(|f| f.as_array()) else {
-        return;
+        return (inputs, outputs);
     };
 
     for field in fields {
@@ -385,6 +445,7 @@ fn materialize_form_ports(
             outputs.push(materialize_port(port, key, true));
         }
     }
+    (inputs, outputs)
 }
 
 fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> PortDefinition {

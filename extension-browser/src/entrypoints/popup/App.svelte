@@ -15,7 +15,17 @@
   // tasks. Future consumer kinds (browser session, etc) would
   // render differently here based on `kind` / `consumerKind`.
   const tasks = $derived(allItems);
-  
+  // The list splits into two sections by signal kind:
+  //   - TRIGGERS (isResume false): entry points, listed the whole time the
+  //     project is active, fired repeatedly to START a run. No skip/cancel
+  //     (there's no in-flight run to skip); opening one submits its form.
+  //   - TASKS (isResume true): one-shot replies to a PAUSED execution. Skip /
+  //     cancel apply (they act on that run). Disappear once answered.
+  // A payload with no `isResume` (very old dispatcher) is treated as a task,
+  // the historical default.
+  const triggerTasks = $derived(tasks.filter((t) => t.isResume === false));
+  const resumeTasks = $derived(tasks.filter((t) => t.isResume !== false));
+
   // New token form
   let newTokenUrl = $state('');
   let newTokenName = $state('');
@@ -115,7 +125,7 @@
         try {
           await clearAll(t);
         } catch (e) {
-          console.warn('[WeaveMind] clearAll failed for', t.name, e);
+          console.warn('[weft] clearAll failed for', t.name, e);
         }
       }
       await refresh();
@@ -131,11 +141,10 @@
     error = null;
 
     try {
-      // Accepted formats:
-      //   http://host:port/api-token/TOKEN/signals  (full URL from
-      //                                              `weft token mint`)
-      //   http://host:port/api-token/TOKEN          (variant)
-      //   TOKEN                                     (uses http://localhost:9999)
+      // Accepted formats (the address the website / `weft token mint` copies):
+      //   http://host:port/signal-token/TOKEN          (server-qualified address)
+      //   http://host:port/signal-token/TOKEN/signals  (with the /signals suffix)
+      //   TOKEN                                        (uses http://localhost:9999)
       let token: string;
       let dispatcherUrl: string;
 
@@ -143,19 +152,22 @@
         const url = new URL(newTokenUrl);
         dispatcherUrl = `${url.protocol}//${url.host}`;
         const pathParts = url.pathname.split('/').filter(Boolean);
-        const idx = pathParts.indexOf('api-token');
+        const idx = pathParts.indexOf('signal-token');
         if (idx >= 0 && pathParts[idx + 1]) {
           token = pathParts[idx + 1];
         } else {
-          throw new Error('Invalid URL format. Expected: http://localhost:9999/api-token/TOKEN');
+          throw new Error('Invalid URL format. Expected: http://localhost:9999/signal-token/TOKEN');
         }
       } else {
         token = newTokenUrl.trim();
         dispatcherUrl = 'http://localhost:9999';
       }
 
-      const response = await fetch(`${dispatcherUrl}/api-token/${token}/health`, {
+      // The pasted string is parsed apart; on the wire the token only ever
+      // travels in the Authorization header, never a URL path.
+      const response = await fetch(`${dispatcherUrl}/signal-token/health`, {
         method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
         signal: AbortSignal.timeout(5000),
       });
 
@@ -400,9 +412,20 @@
         </div>
       </div>
     {:else}
+      {#if triggerTasks.length > 0}
+        <div class="section-header">
+          <span class="section-title">Triggers</span>
+          <span class="section-count">{triggerTasks.length}</span>
+        </div>
+        <div class="tasks-container">
+          {#each triggerTasks as task}
+            {@render taskCard(task, false)}
+          {/each}
+        </div>
+      {/if}
       <div class="section-header">
         <span class="section-title">Tasks</span>
-        <span class="section-count">{tasks.length}</span>
+        <span class="section-count">{resumeTasks.length}</span>
         <button
           class="clear-all-btn"
           onclick={handleClearAll}
@@ -412,43 +435,54 @@
         </button>
       </div>
       <div class="tasks-container">
-        {#each tasks as task}
-          <div class="task-card-wrapper">
-            <button class="task-card" onclick={() => openTaskInRunner(task)}>
-              <div class="task-card-header">
-                <div class="task-dot"></div>
-                <span class="task-title">{task.title}</span>
-              </div>
-              {#if task.description}
-                <p class="task-preview">{task.description}</p>
-              {/if}
-            </button>
-            <button
-              class="task-skip"
-              onclick={() => handleSkipTask(task)}
-              title="Skip: answer this task with null. The rest of the run continues."
-              aria-label="Skip task"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polygon points="5 4 15 12 5 20"/><line x1="19" y1="5" x2="19" y2="19"/>
-              </svg>
-            </button>
-            <button
-              class="task-cancel"
-              onclick={() => handleCancelRun(task)}
-              title="Cancel run: kill this entire execution. Every related task is dropped and the run is marked failed (you can still inspect it in the journal)."
-              aria-label="Cancel run"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/>
-              </svg>
-            </button>
-          </div>
+        {#each resumeTasks as task}
+          {@render taskCard(task, true)}
         {/each}
       </div>
     {/if}
   </div>
 </div>
+
+<!-- One card renderer for both sections. `showActions` gates the skip/cancel
+     buttons: a RESUME task acts on a paused run (skip = answer null, cancel =
+     kill the run), so it shows them; a TRIGGER has no in-flight run to skip or
+     cancel, so opening it (to submit its form and START a run) is the only
+     action. -->
+{#snippet taskCard(task: PendingTask, showActions: boolean)}
+  <div class="task-card-wrapper">
+    <button class="task-card" onclick={() => openTaskInRunner(task)}>
+      <div class="task-card-header">
+        <div class="task-dot"></div>
+        <span class="task-title">{task.title}</span>
+      </div>
+      {#if task.description}
+        <p class="task-preview">{task.description}</p>
+      {/if}
+    </button>
+    {#if showActions}
+      <button
+        class="task-skip"
+        onclick={() => handleSkipTask(task)}
+        title="Skip: answer this task with null. The rest of the run continues."
+        aria-label="Skip task"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="5 4 15 12 5 20"/><line x1="19" y1="5" x2="19" y2="19"/>
+        </svg>
+      </button>
+      <button
+        class="task-cancel"
+        onclick={() => handleCancelRun(task)}
+        title="Cancel run: kill this entire execution. Every related task is dropped and the run is marked failed (you can still inspect it in the journal)."
+        aria-label="Cancel run"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/>
+        </svg>
+      </button>
+    {/if}
+  </div>
+{/snippet}
 
 <style>
   /* Browser popup chrome sizing. Scoped via `:global()` so it

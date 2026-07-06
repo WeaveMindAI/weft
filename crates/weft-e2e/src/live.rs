@@ -25,10 +25,17 @@ use crate::client::Dispatcher;
 /// connection URL (as the dispatcher hands it out, `http(s)://...`). The caller
 /// then connects via [`open_ws`] (WebSocket) or by streaming the URL (HTTP).
 pub async fn handshake(disp: &Dispatcher, mount_path: &str) -> Result<String> {
-    let path = format!("/connect/{}", mount_path.trim_start_matches('/'));
-    let (status, body) = disp.get_raw(&path).await?;
+    // `/connect/{path}` is an external-CALLER endpoint: it authenticates via
+    // the per-endpoint api-key gate (or "none"), NOT the dispatcher's tenant
+    // token, so it goes through the UNAUTHED absolute-URL path, exactly like
+    // the HTTP-live `http_post` + the webhook `fire_webhook`. (Routing it
+    // through the authed `get_raw` would attach a tenant token the gate just
+    // ignores, falsely implying `/connect` is a tenant-token endpoint.)
+    let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
+    let (status, bytes) = disp.get_abs_raw(&url).await?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
     if !status.is_success() {
-        bail!("live handshake GET {path} -> HTTP {status}: {body}");
+        bail!("live handshake GET {url} -> HTTP {status}: {body}");
     }
     let v: Value =
         serde_json::from_str(&body).with_context(|| format!("handshake body not JSON: {body}"))?;

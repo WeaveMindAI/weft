@@ -30,8 +30,8 @@ pub use executor::{
     WorkerTaskKind, WorkerTaskRegistry, WorkerTaskRegistryBuilder,
 };
 pub use kinds::{
-    CancelExecutionPayload, ExecutionPayload,
-    FireSignalPayload, RecordCostPayload, RecordLogPayload, SpawnPodPayload, TaskKind,
+    CancelExecutionPayload, ExecutionPayload, FireSignalPayload, RecordCostPayload,
+    RecordLogPayload, SpawnPodPayload, TaskKind,
 };
 pub use tasks::{
     claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,

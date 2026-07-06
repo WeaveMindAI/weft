@@ -17,7 +17,7 @@
 #
 # Template vars (substituted by the CLI daemon at apply, like the other
 # manifests): ${GATEWAY_HOST} is the public wildcard host suffix
-# (cloud: `live.example.com`; local: `<ip>.nip.io`-style). The listener
+# (e.g. `live.example.com`, or an `<ip>.nip.io`-style host). The listener
 # matches `*.${GATEWAY_HOST}` so any `<pod>.<ns>.${GATEWAY_HOST}` lands here.
 
 apiVersion: gateway.networking.k8s.io/v1
@@ -38,9 +38,9 @@ spec:
     - name: http
       protocol: HTTP
       port: 80
-      # Wildcard host: every `<pod>.<ns>.${GATEWAY_HOST}` matches. Cloud
-      # adds an HTTPS listener (port 443) with the wildcard cert; local
-      # dev is plain HTTP (loopback), so only this listener exists.
+      # Wildcard host: every `<pod>.<ns>.${GATEWAY_HOST}` matches. A
+      # TLS-terminating deployment adds an HTTPS listener (port 443) with
+      # the wildcard cert; plain-HTTP (loopback) has only this listener.
       hostname: "*.${GATEWAY_HOST}"
       allowedRoutes:
         namespaces:

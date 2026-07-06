@@ -1,0 +1,16 @@
+# A HumanTrigger ENTRY form: a human submits it to START a fresh execution.
+# Its signal is registered (and enumerable) the whole time the project is
+# active, so the browser-extension list shows it under "Triggers". This fixture
+# proves an entry-trigger form appears in `GET /signal-token/signals` with
+# isResume=false and can be fired to start a run.
+
+start = HumanTrigger {
+  title: "Kick off"
+  fields: [{
+    "fieldType": "approve_reject",
+    "key": "go"
+  }]
+}
+
+out = Debug
+out.data = start.go_approved

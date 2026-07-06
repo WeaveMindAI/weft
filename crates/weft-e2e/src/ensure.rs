@@ -23,35 +23,40 @@ use crate::client::{cli_ok, poll_until, Dispatcher};
 /// poison the suite (the next test retries the bring-up).
 static READY: OnceCell<()> = OnceCell::const_new();
 
-/// Ensure the weft system is up and running current code, exactly once per
-/// test process. Returns a [`Dispatcher`] client pointed at it. Safe to call
-/// from every test; only the first call does the work.
+/// Ensure the weft system is up and running current code, then CLEAN the cluster
+/// to an empty baseline, and return a [`Dispatcher`] client pointed at it. Called
+/// at the START of every test.
+///
+/// The bring-up (`setup.sh` + health wait) is expensive and idempotent, so it runs
+/// exactly ONCE per test process, latched. The SWEEP, in contrast, runs on EVERY
+/// call (every test): the contract is "each test begins against a clean cluster,
+/// even if a PRIOR test crashed and left state behind". A failed test still leaves
+/// its own state up for post-mortem and halts the run (the runner stops at the first
+/// failure); the sweep only ever wipes state the CURRENT test is about to own, at
+/// its own start, so it never destroys the evidence of the failure that stopped the
+/// previous run.
 pub async fn up() -> Result<Dispatcher> {
     READY
         .get_or_try_init(|| async { bring_up().await })
         .await?;
+    sweep_leftovers().await?;
     Dispatcher::from_env()
 }
 
-/// Run `setup.sh` to bring the cluster to current code, wait for the
-/// dispatcher to be reachable, then sweep any leftover state from earlier
-/// runs. Factored out of [`up`] so the latch wraps the whole bring-up as
-/// one unit (so the sweep runs exactly once per suite, before any test).
+/// Run `setup.sh` to bring the cluster to current code and wait for the dispatcher
+/// to be reachable. Latched to run once per process (the sweep is NOT here: it runs
+/// per-test in [`up`]).
 async fn bring_up() -> Result<()> {
     let root = repo_root()?;
     run_setup(&root).await?;
-    wait_healthy().await?;
-    sweep_leftovers().await
+    wait_healthy().await
 }
 
-/// Remove state left behind by EARLIER runs, once at suite startup. A
-/// failed test deliberately leaves its project (and namespace, pods,
-/// clones) up so the failure can be inspected; this sweep is what keeps
-/// those stragglers from accumulating across runs and overloading the
-/// cluster (idle namespaces + pods slow pod scheduling, which can starve
-/// a fresh fixture's readiness). Run at the START, not as an aggressive
-/// per-test teardown, so the just-failed run's state survives for
-/// post-mortem but the NEXT run begins clean.
+/// Wipe the cluster to an EMPTY baseline: every leftover project + every pooled-pod
+/// clone. Run at the START of each test (see [`up`]), so a test always begins clean
+/// regardless of what a prior crashed run left. It does NOT run as a per-test
+/// TEARDOWN: a failed test's state survives (the runner halts on failure), and the
+/// next test's start-sweep is what reclaims it.
 ///
 /// Two kinds of leftover:
 ///   - leftover PROJECTS: removed via the real `DELETE /projects/{id}`
@@ -59,18 +64,9 @@ async fn bring_up() -> Result<()> {
 ///     namespace, and drops the rows, exactly as `weft rm --force` does;
 ///   - leftover pooled-pod CLONES a scale-down test stood up: swept via
 ///     the platform layer (kubectl + the registry rows).
-async fn sweep_leftovers() -> Result<()> {
-    let disp = Dispatcher::from_env()?;
-    // Leftover projects. `GET /projects` lists them; delete each forced
-    // (skip the 120s supervisor-terminate wait, the project is going).
-    let projects: Vec<serde_json::Value> = disp.get_json("/projects").await?;
-    for p in &projects {
-        if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
-            disp.delete(&format!("/projects/{id}?force=true"))
-                .await
-                .with_context(|| format!("sweep leftover project {id}"))?;
-        }
-    }
+pub async fn sweep_leftovers() -> Result<()> {
+    // Leftover PROJECTS for the (`local`) dispatcher.
+    clean_projects(&Dispatcher::from_env()?).await?;
     // Leftover pooled-pod clones (reaches behind the API via kubectl +
     // Postgres, the platform layer's job). Connect once for the sweep.
     // The platform layer is `e2e`-gated (it pulls in sqlx), so this part
@@ -81,6 +77,24 @@ async fn sweep_leftovers() -> Result<()> {
         .await?
         .sweep_e2e_clones()
         .await?;
+    Ok(())
+}
+
+/// Delete EVERY project visible to `disp` (its tenant's projects: `GET /projects`
+/// is tenant-scoped by the caller's identity), each forced so the delete skips the
+/// 120s supervisor-terminate wait. The ONE shared "wipe a tenant's projects to
+/// empty" primitive: called with the `local` dispatcher here, and (by a harness
+/// that has tokens) once per tenant with that tenant's authed dispatcher.
+/// HTTP-only, so it is feature-independent.
+pub async fn clean_projects(disp: &Dispatcher) -> Result<()> {
+    let projects: Vec<serde_json::Value> = disp.get_json("/projects").await?;
+    for p in &projects {
+        if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
+            disp.delete(&format!("/projects/{id}?force=true"))
+                .await
+                .with_context(|| format!("sweep leftover project {id}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -105,12 +119,18 @@ fn repo_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Invoke `./setup.sh` at the repo root. No component flags: the default run
-/// builds the CLI + refreshes the daemon (rebuilding images + rolling pods only
-/// when code changed), which is exactly "bring the system to current code".
-/// Inherits the rig's environment so any `WEFT_*` overrides flow through.
+/// Invoke `./setup.sh --cli --daemon` at the repo root: build the CLI + refresh
+/// the daemon (rebuild images + roll pods only when code changed), which is
+/// exactly "bring the BACKEND to current code". We pass `--cli --daemon`
+/// explicitly rather than the bare default so setup.sh SKIPS the VS Code
+/// extension build: the editor extension is a frontend artifact irrelevant to a
+/// backend e2e run, and its TypeScript compile must never gate whether the rig
+/// can stand the cluster up (a parked or mid-refactor extension would otherwise
+/// abort every backend test). Inherits the rig's environment so any `WEFT_*`
+/// overrides flow through.
 async fn run_setup(root: &Path) -> Result<()> {
     let out = tokio::process::Command::new("./setup.sh")
+        .args(["--cli", "--daemon"])
         .current_dir(root)
         .output()
         .await

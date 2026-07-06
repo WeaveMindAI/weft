@@ -1,12 +1,11 @@
 //! `weft daemon start|stop|status|restart|logs`. Owns the kind
 //! cluster lifecycle and the dispatcher deployment inside it.
 //!
-//! Local dev and cloud deploy share this shape: dispatcher runs as
-//! a Pod, listener as a Pod, worker as a Pod, infra as Pods. The
-//! only difference is that `start` locally uses `kind` to host the
-//! cluster and `kind load docker-image` to fill the image cache
-//! without a registry push. In cloud the same manifests get applied
-//! to a managed cluster and images come from a real registry.
+//! Everything runs as Pods: dispatcher, listener, worker, infra.
+//! `start` uses `kind` to host the cluster and `kind load docker-image`
+//! to fill the image cache without a registry push; a registry-backed
+//! cluster applies the same manifests with images pulled from the
+//! registry instead.
 
 use std::fs;
 use std::io::{IsTerminal, Write};
@@ -26,8 +25,8 @@ use crate::images;
 /// Two namespace concepts: `system_namespace` (where the
 /// dispatcher Pod, its Service, PVC and Ingress live) and
 /// `default_user_namespace` (where workers, listeners, infra
-/// for tenant `local` run). Cloud adds more user namespaces, one
-/// per tenant; OSS sticks to a single one.
+/// for tenant `local` run). User namespaces are per tenant; here
+/// there is one, for the `local` tenant.
 pub struct ClusterConfig {
     pub cluster_name: String,
     pub kube_context: String,
@@ -38,7 +37,6 @@ pub struct ClusterConfig {
     pub listener_image: String,
     pub broker_image: String,
     pub supervisor_image: String,
-    pub storage_image: String,
     pub dispatcher_port: u16,
     /// Local port the daemon forwards the cluster ingress controller
     /// to. Storage file downloads (and any ingress-served URL) are
@@ -54,6 +52,11 @@ pub struct ClusterConfig {
     /// ingress for storage downloads); the live gateway is a separate
     /// front door.
     pub gateway_port: u16,
+    /// Local port the daemon forwards the bundled SeaweedFS object store to.
+    /// Runtime-file downloads are presigned BUCKET urls signed for this
+    /// host-reachable address (the broker's in-cluster I/O endpoint is
+    /// unreachable from the host / a browser).
+    pub seaweed_port: u16,
     /// Cluster Service CIDR. The apiserver's ClusterIP lives in this
     /// range; the broker NetworkPolicy allows TokenReview egress to
     /// it, and the dispatcher gets it as env. kind's default is
@@ -94,7 +97,7 @@ impl ClusterConfig {
         let db_namespace = std::env::var("WEFT_DB_NAMESPACE")
             .unwrap_or_else(|_| "weft-db".into());
         let default_user_namespace = std::env::var("WEFT_DEFAULT_USER_NAMESPACE")
-            .unwrap_or_else(|_| "wm-local".into());
+            .unwrap_or_else(|_| "wft-local".into());
         let dispatcher_image = std::env::var("WEFT_DISPATCHER_IMAGE")
             .unwrap_or_else(|_| "weft-dispatcher:local".into());
         let listener_image = std::env::var("WEFT_LISTENER_IMAGE")
@@ -103,8 +106,6 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "weft-broker:local".into());
         let supervisor_image = std::env::var("WEFT_SUPERVISOR_IMAGE")
             .unwrap_or_else(|_| "weft-infra-supervisor:local".into());
-        let storage_image = std::env::var("WEFT_STORAGE_IMAGE")
-            .unwrap_or_else(|_| "weft-storage:local".into());
         let dispatcher_port = std::env::var("WEFT_DISPATCHER_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -117,6 +118,10 @@ impl ClusterConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(9097);
+        let seaweed_port = std::env::var("WEFT_SEAWEED_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9096);
         // Raw here; validated where they're consumed (the manifest
         // apply, `apply_static_manifests`), not at config load: a
         // malformed CIDR should fail the apply loudly, not break
@@ -143,10 +148,10 @@ impl ClusterConfig {
             listener_image,
             broker_image,
             supervisor_image,
-            storage_image,
             dispatcher_port,
             ingress_port,
             gateway_port,
+            seaweed_port,
             service_cidr,
             pod_cidr,
             backend,
@@ -209,7 +214,7 @@ fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 /// - K8s (real cluster): the operator MUST set
 ///   WEFT_DISPATCHER_PUBLIC_BASE_URL to the external ingress host;
 ///   WEFT_LOCAL_DEV is empty, so a loopback there fails loud.
-fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, String)>> {
+async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, String)>> {
     check_cidr(&cfg.service_cidr, true)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
     check_cidr(&cfg.pod_cidr, false)
@@ -275,6 +280,34 @@ fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, Stri
         }
     };
 
+    // Object-store slot: the broker's runtime-file plane (`ctx.storage`) writes
+    // bytes to this bucket, and workers read/write it DIRECTLY via presigned URLs.
+    // The store is ALWAYS external to the cluster, reached over S3 (endpoint from
+    // env), so both endpoints below reach OUT of the cluster. An operator can
+    // override any of these via env for their own S3.
+    //
+    // INTERNAL endpoint (the broker's I/O + the host pods reach): the object store
+    // container runs on the HOST, and in-cluster pods reach the host via the kind
+    // network's gateway IP. This is the host string presigned Internal URLs are
+    // signed for, and the host pods then connect to (the two must match for SigV4).
+    let object_store_endpoint = match std::env::var("WEFT_OBJECT_STORE_ENDPOINT") {
+        Ok(v) => v,
+        Err(_) => format!("http://{}:{}", kind_network_gateway_ipv4().await?, cfg.seaweed_port),
+    };
+    let object_store_bucket =
+        std::env::var("WEFT_OBJECT_STORE_BUCKET").unwrap_or_else(|_| "weft".to_string());
+    let object_store_region =
+        std::env::var("WEFT_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let object_store_access_key =
+        std::env::var("WEFT_OBJECT_STORE_ACCESS_KEY").unwrap_or_else(|_| "weft-local".to_string());
+    let object_store_secret_key = std::env::var("WEFT_OBJECT_STORE_SECRET_KEY")
+        .unwrap_or_else(|_| "weft-local-dev-secret".to_string());
+    // PUBLIC endpoint (the browser reaches): the store container is published on the
+    // host's loopback too, so the browser hits 127.0.0.1:<seaweed_port> directly.
+    // An operator sets this to the S3 store's public URL via env.
+    let object_store_public_endpoint = std::env::var("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", cfg.seaweed_port));
+
     Ok(vec![
         ("WEFT_CLUSTER_SERVICE_CIDR", cfg.service_cidr.clone()),
         ("WEFT_CLUSTER_POD_CIDR", cfg.pod_cidr.clone()),
@@ -284,6 +317,12 @@ fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, Stri
         ("GATEWAY_HOST", gateway_host),
         ("WEFT_GATEWAY_BASE_URL", gateway_base_url),
         ("WEFT_CALLER_TOKEN_SECRET", caller_token_secret),
+        ("WEFT_OBJECT_STORE_ENDPOINT", object_store_endpoint),
+        ("WEFT_OBJECT_STORE_BUCKET", object_store_bucket),
+        ("WEFT_OBJECT_STORE_REGION", object_store_region),
+        ("WEFT_OBJECT_STORE_ACCESS_KEY", object_store_access_key),
+        ("WEFT_OBJECT_STORE_SECRET_KEY", object_store_secret_key),
+        ("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT", object_store_public_endpoint),
     ])
 }
 
@@ -340,14 +379,23 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         listener: listener_built,
         broker: broker_built,
         supervisor: supervisor_built,
-        storage: storage_built,
     } = built;
 
-    // The Envoy Gateway controller is infrastructure both `start` and
-    // `restart` must guarantee BEFORE applying gateway.yaml (its CRs need
-    // the CRDs). Idempotent: a no-op once installed. (A restart against a
-    // cluster created before this feature existed installs it now.)
+    // The cluster + its ingress controller + the Envoy Gateway controller
+    // are infrastructure both `start` and `restart` must GUARANTEE before
+    // applying any manifests (gateway.yaml's CRs need Envoy's CRDs;
+    // everything needs a cluster to apply into). All three are idempotent:
+    // a no-op once present. `restart` runs these (not just `start`) so it
+    // is self-healing over a missing/partial cluster, e.g. a fresh machine,
+    // a `kind delete`, or `setup.sh` choosing `restart` because the daemon
+    // process is alive while its cluster is gone. Without `ensure_cluster`
+    // here, `ensure_envoy_gateway` fails with "context kind-weft-local does
+    // not exist" against the absent cluster. Mirrors `start`'s ordering.
     if cfg.backend == ClusterBackend::Kind {
+        require_binary("kind").await?;
+        ensure_cluster(cfg).await?;
+        ensure_object_store(cfg).await?;
+        ensure_ingress_controller().await?;
         ensure_envoy_gateway().await?;
     }
 
@@ -359,7 +407,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // kube-apiserver layer (resourceVersion match).
     let manifests_changed = apply_static_manifests(cfg).await?;
 
-    if dispatcher_built || listener_built || broker_built || supervisor_built || storage_built || manifests_changed {
+    if dispatcher_built || listener_built || broker_built || supervisor_built || manifests_changed {
         if cfg.backend == ClusterBackend::Kind {
             // System tags are reused (`:local`), so tag presence on the
             // kind node DOESN'T imply matching content. Use the _force
@@ -372,7 +420,6 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
                 images::kind_load_force(&cfg.cluster_name, &cfg.listener_image),
                 images::kind_load_force(&cfg.cluster_name, &cfg.broker_image),
                 images::kind_load_force(&cfg.cluster_name, &cfg.supervisor_image),
-                images::kind_load_force(&cfg.cluster_name, &cfg.storage_image),
             )?;
         }
         // Roll the dispatcher pod so it picks up the new image OR
@@ -428,38 +475,42 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
             }
             Ok::<(), anyhow::Error>(())
         };
-        // Storage boxes are per-tenant, dispatcher-created at runtime
-        // (not static manifests), so the kind-load above doesn't reach
-        // an already-running box pod; roll it explicitly like the
-        // supervisor / listener.
-        let storage_rollout = async {
-            if storage_built {
-                roll_role_deployments("storage", "storage").await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        };
         tokio::try_join!(
             listener_rollout,
             broker_rollout,
             supervisor_rollout,
-            storage_rollout
         )?;
         println!("daemon refreshed; new image / manifests rolled out");
     } else {
-        println!("daemon already running with the latest images and manifests; nothing to do");
+        // Nothing to roll out, but a port-forward the daemon owns may be missing
+        // or dead: a background `kubectl port-forward` dies if its pod restarts out
+        // of band or its port is squatted, AND the GATEWAY forward is SKIPPED on the
+        // very first boot (the Envoy Gateway Service is not programmed yet), so it
+        // is simply absent until something reconciles it. A "restart" must always
+        // leave the COMPLETE forward set working, so check EVERY desired forward
+        // (not just the dispatcher's /health): the gateway, now programmed, is in
+        // the desired set but has no live pid, so this re-establishes it.
+        let all_alive = all_forwards_alive(&cfg).await;
+        if all_alive {
+            println!("daemon already running with the latest images and manifests; nothing to do");
+        } else {
+            kill_existing_port_forwards();
+            start_port_forwards().await?;
+            wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
+            println!("daemon already on the latest images / manifests; port-forwards re-established");
+        }
     }
     let _ = ctx;
     Ok(())
 }
 
-/// Which of the four system images were actually rebuilt by a
-/// provisioning pass. Drives the "anything to roll out?" decision.
+/// Which of the system images were actually rebuilt by a provisioning pass.
+/// Drives the "anything to roll out?" decision.
 struct BuiltImages {
     dispatcher: bool,
     listener: bool,
     broker: bool,
     supervisor: bool,
-    storage: bool,
 }
 
 /// Build the daemon system images AND pre-warm the per-project
@@ -515,12 +566,11 @@ async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltIma
     };
     // Only the dispatcher stages `catalog/` (describe / compile
     // endpoints); the others must not rebuild on a catalog edit.
-    let (dispatcher, listener, broker, supervisor, storage, ()) = tokio::join!(
+    let (dispatcher, listener, broker, supervisor, ()) = tokio::join!(
         images::ensure_system_image(&cfg.dispatcher_image, "dispatcher.Dockerfile", &["catalog"], rebuild),
         images::ensure_system_image(&cfg.listener_image, "listener.Dockerfile", &[], rebuild),
         images::ensure_system_image(&cfg.broker_image, "broker.Dockerfile", &[], rebuild),
         images::ensure_system_image(&cfg.supervisor_image, "infra-supervisor.Dockerfile", &[], rebuild),
-        images::ensure_system_image(&cfg.storage_image, "storage.Dockerfile", &[], rebuild),
         worker_base_prewarm,
     );
     let mut failures: Vec<String> = Vec::new();
@@ -536,7 +586,6 @@ async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltIma
         listener: unwrap("listener", listener),
         broker: unwrap("broker", broker),
         supervisor: unwrap("supervisor", supervisor),
-        storage: unwrap("storage", storage),
     };
     if !failures.is_empty() {
         anyhow::bail!("system image build failed:\n  {}", failures.join("\n  "));
@@ -555,12 +604,13 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     // the dispatcher the public base URL + local-dev flag), all
     // substituted from `template_vars`; the others have no
     // placeholders so the same applier is a no-op substitution for
-    // them. `cluster-rbac.yaml`: ClusterRoles for the per-tenant
-    // supervisor + listener pods, bound into project namespaces by
-    // RoleBindings the dispatcher creates at register time.
-    // Cluster-scoped; in the rolling-apply list so RBAC drift (e.g.
-    // the supervisor's surface growing) stays in sync.
-    let template_vars = manifest_template_vars(cfg)?;
+    // them. `cluster-rbac.yaml`: ClusterRoles for the POOLED
+    // supervisor + listener pods (tenant-agnostic, in the control-plane
+    // namespace), bound into project namespaces by RoleBindings the
+    // dispatcher creates at first infra apply. Cluster-scoped; in the
+    // rolling-apply list so RBAC drift (e.g. the supervisor's surface
+    // growing) stays in sync.
+    let template_vars = manifest_template_vars(cfg).await?;
     let mut any_changed = false;
     for name in [
         "system-namespace.yaml",
@@ -631,6 +681,10 @@ async fn port_forwards(cfg: &ClusterConfig) -> Vec<PortForward> {
             local_port: cfg.ingress_port,
             remote_port: 80,
         });
+        // No object-store port-forward: the store runs as a HOST docker container
+        // (see `ensure_object_store`) already published on 127.0.0.1:<seaweed_port>,
+        // so the browser reaches it directly and in-cluster pods reach it via the
+        // kind gateway IP. Nothing to forward out of the cluster.
         // Live connection gateway: forward the local gateway port to the
         // Envoy Gateway data-plane Service. Its name is generated by Envoy
         // Gateway, so resolve it by the owning-gateway label. Skipped if
@@ -699,6 +753,10 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     if cfg.backend == ClusterBackend::Kind {
         require_binary("kind").await?;
         ensure_cluster(cfg).await?;
+        // The object store is a HOST docker container the cluster reaches OUT to
+        // (the local stand-in for a real S3 provider). Bring it up before anything
+        // that needs a bucket.
+        ensure_object_store(cfg).await?;
         ensure_ingress_controller().await?;
         ensure_envoy_gateway().await?;
     }
@@ -712,7 +770,6 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
         images::kind_load_force(&cfg.cluster_name, &cfg.listener_image).await?;
         images::kind_load_force(&cfg.cluster_name, &cfg.broker_image).await?;
         images::kind_load_force(&cfg.cluster_name, &cfg.supervisor_image).await?;
-        images::kind_load_force(&cfg.cluster_name, &cfg.storage_image).await?;
     }
 
     let repo_root = weft_compiler::build::resolve_weft_root()
@@ -720,9 +777,10 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     let manifests = repo_root.join("deploy/k8s");
     kubectl_apply_file(&manifests.join("system-namespace.yaml")).await?;
     kubectl_apply_file(&manifests.join("db-namespace.yaml")).await?;
-    // No static `wm-local` namespace: the dispatcher renders the
-    // per-tenant bundle (Namespace + SAs + NetworkPolicies + the
-    // supervisor pod) on first project register.
+    // No per-tenant namespace exists anymore: storage is a shared pooled
+    // pod in the control-plane namespace (placed lazily on first write),
+    // and a project gets its own namespace only at first infra apply.
+    // Register creates no namespace.
     kubectl_apply_file(&manifests.join("postgres.yaml")).await?;
     wait_for_deployment_ready_in_ns("weft-postgres", &cfg.db_namespace).await?;
     // broker + dispatcher carry cluster-specific placeholders (the
@@ -730,7 +788,7 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // dispatcher's CIDRs + public base URL + local-dev flag);
     // substitute them so a non-kind operator sets them once via env
     // instead of hand-editing manifests.
-    let template_vars = manifest_template_vars(cfg)?;
+    let template_vars = manifest_template_vars(cfg).await?;
     kubectl_apply_templated(&manifests.join("broker.yaml"), &template_vars).await?;
     wait_for_deployment_ready_in_ns("weft-broker", &cfg.db_namespace).await?;
     kubectl_apply_templated(&manifests.join("dispatcher.yaml"), &template_vars).await?;
@@ -800,19 +858,23 @@ fn kill_existing_port_forwards() {
     }
 }
 
-async fn status(ctx: &Ctx) -> Result<()> {
-    let cfg = cluster_config();
-    // Every forward the daemon ACTUALLY runs must be alive to report "up".
-    // We iterate the real set (`port_forwards`), not the superset of names:
-    // the gateway forward only exists once the Gateway is programmed, so it
-    // is simply absent from the set until then and never drags liveness down,
-    // while a required forward (dispatcher, ingress) that is missing its pid
-    // correctly reports "down" (no fail-open `None => true`).
-    let pf_alive = port_forwards(&cfg).await.iter().all(|pf| {
+/// Are ALL the daemon's CURRENTLY-DESIRED port-forwards alive (a live pid each)?
+/// Iterates the real set (`port_forwards`), not a static name list: the gateway
+/// forward is absent from the set until the Envoy Gateway is programmed, so it
+/// never drags liveness down before it exists; once it IS in the set, a missing
+/// pid correctly reports down (no fail-open). The single source of truth for both
+/// `status` (report up/down) and `restart` (decide whether to re-establish).
+async fn all_forwards_alive(cfg: &ClusterConfig) -> bool {
+    port_forwards(cfg).await.iter().all(|pf| {
         read_pid(&data_dir_pid_file(pf.name))
             .map(process_alive)
             .unwrap_or(false)
-    });
+    })
+}
+
+async fn status(ctx: &Ctx) -> Result<()> {
+    let cfg = cluster_config();
+    let pf_alive = all_forwards_alive(&cfg).await;
     match ctx.client().get_json("/projects").await {
         Ok(v) => {
             let n = v.as_array().map(|a| a.len()).unwrap_or(0);
@@ -856,6 +918,22 @@ async fn ensure_cluster(cfg: &ClusterConfig) -> Result<()> {
     let out = Command::new("kind").args(["get", "clusters"]).output().await?;
     let list = String::from_utf8_lossy(&out.stdout);
     if list.lines().any(|n| n == cfg.cluster_name) {
+        // The kind cluster exists, but the kubeconfig CONTEXT can be absent even so:
+        // a reset/rotated kubeconfig, a different `$KUBECONFIG`, or a prior partial
+        // run leaves the node running with no `kind-<name>` context. Everything
+        // after this (ingress install, Envoy, manifest apply) targets that context
+        // and fails with "context kind-<name> does not exist". Re-export the
+        // kubeconfig so the context is present; idempotent when it already is.
+        let status = Command::new("kind")
+            .args(["export", "kubeconfig", "--name", &cfg.cluster_name])
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!(
+                "kind export kubeconfig for existing cluster '{}' failed with {status}",
+                cfg.cluster_name
+            );
+        }
         return Ok(());
     }
     println!(
@@ -889,6 +967,119 @@ nodes:
         .await?;
     if !status.success() {
         anyhow::bail!("kind create cluster failed with {status}");
+    }
+    Ok(())
+}
+
+/// Docker container name for the daemon's object store. A distinct,
+/// weft-prefixed name (and a non-default host port) so it runs side by side
+/// with any other object store on the host without clashing.
+const OBJECT_STORE_CONTAINER: &str = "weft-object-store";
+
+/// The S3 identities config the object store validates signatures against: one
+/// admin identity holding the local-dev key/secret.
+fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
+    format!(
+        r#"{{
+  "identities": [
+    {{
+      "name": "weft",
+      "credentials": [ {{ "accessKey": "{access_key}", "secretKey": "{secret_key}" }} ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }}
+  ]
+}}
+"#
+    )
+}
+
+/// The IPv4 gateway of the `kind` docker network: the address IN-CLUSTER pods use
+/// to reach a service running on the HOST (the object store container). On Linux
+/// there is no `host.docker.internal` in pods, so this gateway IP is the reliable
+/// route out to the host. Discovered at runtime (it varies per machine/network).
+async fn kind_network_gateway_ipv4() -> Result<String> {
+    let out = Command::new("docker")
+        .args(["network", "inspect", "kind", "-f", "{{range .IPAM.Config}}{{.Gateway}} {{end}}"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!("docker network inspect kind failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    // The network has both an IPv6 and an IPv4 gateway; pick the IPv4 one (the one
+    // with dots and no colons).
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find(|g| g.contains('.') && !g.contains(':'))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 gateway on the kind docker network"))
+}
+
+/// Bring up the object store as a HOST docker container (SeaweedFS's S3 gateway).
+/// The cluster reaches OUT to it over S3: the store is never inside
+/// the cluster. Idempotent: a running container is left alone, a stopped one is
+/// started, else it is created. `-s3.externalUrl` is deliberately UNSET so the
+/// gateway validates each presigned request against its own incoming Host header
+/// (v3.80 behavior), letting the SAME instance accept URLs signed for the host
+/// gateway IP (pods) AND for 127.0.0.1 (the browser).
+async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
+    let running = Command::new("docker")
+        .args(["ps", "-q", "-f", &format!("name=^{OBJECT_STORE_CONTAINER}$")])
+        .output()
+        .await?;
+    if running.status.success() && !running.stdout.is_empty() {
+        return Ok(());
+    }
+    // A stopped container with our name (previous daemon run): start it, preserving
+    // its data volume.
+    let exists = Command::new("docker")
+        .args(["ps", "-aq", "-f", &format!("name=^{OBJECT_STORE_CONTAINER}$")])
+        .output()
+        .await?;
+    if exists.status.success() && !exists.stdout.is_empty() {
+        let status =
+            Command::new("docker").args(["start", OBJECT_STORE_CONTAINER]).status().await?;
+        if !status.success() {
+            anyhow::bail!("docker start {OBJECT_STORE_CONTAINER} failed with {status}");
+        }
+        return Ok(());
+    }
+    println!("starting object store container '{OBJECT_STORE_CONTAINER}' on port {}", cfg.seaweed_port);
+    // Write the s3 identities file into the daemon's data dir and bind-mount it.
+    let cfg_dir = data_dir().join("object-store");
+    std::fs::create_dir_all(&cfg_dir)?;
+    let cfg_path = cfg_dir.join("s3.config.json");
+    std::fs::write(
+        &cfg_path,
+        object_store_s3_config("weft-local", "weft-local-dev-secret"),
+    )?;
+    let port_map = format!("{}:8333", cfg.seaweed_port);
+    let mount = format!("{}:/etc/seaweedfs/s3.config.json:ro", cfg_path.display());
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            OBJECT_STORE_CONTAINER,
+            "--restart",
+            "unless-stopped",
+            "-p",
+            &port_map,
+            "-v",
+            &format!("{OBJECT_STORE_CONTAINER}-data:/data"),
+            "-v",
+            &mount,
+            "chrislusf/seaweedfs:3.80",
+            "server",
+            "-dir=/data",
+            "-s3",
+            "-s3.port=8333",
+            "-s3.config=/etc/seaweedfs/s3.config.json",
+            "-master.volumeSizeLimitMB=1024",
+        ])
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("docker run {OBJECT_STORE_CONTAINER} failed with {status}");
     }
     Ok(())
 }
@@ -939,9 +1130,8 @@ const ENVOY_GATEWAY_VERSION: &str = "v1.8.1";
 
 /// Install the Envoy Gateway controller (idempotent) into the cluster.
 /// This is the live caller connection front door: it routes an outside
-/// caller to a specific worker pod. Same controller local (kind) and
-/// cloud; only the public host + TLS differ (set via the gateway
-/// manifest's `${GATEWAY_HOST}`, applied by `apply_static_manifests`).
+/// caller to a specific worker pod. The public host + TLS are set via the
+/// gateway manifest's `${GATEWAY_HOST}` (applied by `apply_static_manifests`).
 async fn ensure_envoy_gateway() -> Result<()> {
     let out = kubectl(&["get", "namespace", "envoy-gateway-system", "-o", "name"])
         .output()
@@ -1180,7 +1370,7 @@ async fn roll_listener_deployments(cfg: &ClusterConfig) -> Result<()> {
 /// Roll every per-tenant Deployment carrying `weft.dev/role=<role>`
 /// after its image was rebuilt, so tenants pick up the new binary
 /// instead of running stale code until their pod happens to restart.
-/// These deployments live one-per-tenant across `wm-*` namespaces and
+/// These deployments live one-per-tenant across `wft-*` namespaces and
 /// are created by the DISPATCHER at runtime (not by static manifests),
 /// so the daemon-refresh kind-load alone doesn't reach an
 /// already-running pod: it must be rolled explicitly.
@@ -1346,19 +1536,47 @@ async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<b
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     print!("{stdout}");
-    Ok(apply_output_reported_change(&stdout))
+    // "changed" is decided by the CONTENT we applied, not kubectl's verb. Some
+    // server-defaulted resources (the Envoy-Gateway HTTPRoute) report
+    // "configured" on EVERY apply even when our manifest is byte-identical,
+    // which would force a needless image-reload + dispatcher restart on every
+    // `daemon restart`. We stamp the substituted manifest's hash per file and
+    // call it changed only when that hash differs from the last apply (or no
+    // stamp exists yet). We still apply unconditionally above (cheap, keeps the
+    // cluster in sync); only the change SIGNAL is stamp-gated.
+    Ok(manifest_apply_changed_by_stamp(path, &manifest))
+}
+
+/// Per-manifest content stamp: returns true iff `manifest` differs from the
+/// last applied content for `path` (or there is no prior stamp). Mirrors the
+/// image-build stamp pattern. A stamp-write failure conservatively returns
+/// true (treat as changed) so we never SKIP a real rollout on an I/O hiccup.
+fn manifest_apply_changed_by_stamp(path: &Path, manifest: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(manifest.as_bytes());
+    let want = format!("{:x}", hasher.finalize());
+    let stem = path.file_name().map(|s| s.to_string_lossy().replace(['/', ':'], "_"))
+        .unwrap_or_else(|| "manifest".into());
+    let stamp = data_dir().join("manifest-stamps").join(format!("{stem}.hash"));
+    let have = std::fs::read_to_string(&stamp).ok().map(|s| s.trim().to_string());
+    if have.as_deref() == Some(want.as_str()) {
+        return false;
+    }
+    if let Some(parent) = stamp.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&stamp, &want).is_err() {
+        // Couldn't persist the stamp: treat as changed so a real change is
+        // never silently dropped (the next run will also see "changed").
+        return true;
+    }
+    true
 }
 
 /// True iff a `kubectl apply` stdout reports at least one changed
 /// resource. Lines look like `networkpolicy.../foo created` /
 /// `configured` / `unchanged`; only `unchanged` is a no-op.
-fn apply_output_reported_change(stdout: &str) -> bool {
-    stdout.lines().any(|l| {
-        let trimmed = l.trim();
-        !trimmed.is_empty() && !trimmed.ends_with(" unchanged")
-    })
-}
-
 async fn require_binary(name: &str) -> Result<()> {
     let out = Command::new("which").arg(name).output().await;
     if matches!(out, Ok(o) if o.status.success()) {

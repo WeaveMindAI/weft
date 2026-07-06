@@ -15,7 +15,7 @@
 //! drives pods with `kubectl`. This is host-side TEST code only. It is compiled
 //! solely under the `e2e` feature and lives in `crates/weft-e2e`, which is never
 //! compiled into any shipped image, so NONE of this exists in a real
-//! deployment, local or cloud.
+//! deployment.
 //!
 //! ## Faking time = database backdating, never a clock hook
 //!
@@ -173,6 +173,22 @@ impl Platform {
                     .await?;
             }
         }
+        // Worker clones (`add_second_worker` mints `wp-e2e-clone-*`) are bare
+        // Pods, not Deployments, and a no-infra project's teardown does NOT
+        // reap shared-pool workers, so a crashed multi_worker test would leave
+        // the clone Pod + its `alive` registry row behind forever, starving a
+        // fresh fixture. Sweep them here too: delete the Pod by name, then the
+        // row (row last so a failed kubectl delete retries next run).
+        let workers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pod_name, namespace FROM worker_pod WHERE pod_name LIKE '%e2e%'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("query leftover e2e worker clones")?;
+        for (pod_name, namespace) in &workers {
+            self.kubectl_delete_ignore_missing("pod", namespace, pod_name)
+                .await?;
+        }
         sqlx::query("DELETE FROM listener_pod WHERE pod_name LIKE '%e2e%'")
             .execute(&self.pool)
             .await
@@ -181,6 +197,10 @@ impl Platform {
             .execute(&self.pool)
             .await
             .context("delete leftover e2e supervisor clone rows")?;
+        sqlx::query("DELETE FROM worker_pod WHERE pod_name LIKE '%e2e%'")
+            .execute(&self.pool)
+            .await
+            .context("delete leftover e2e worker clone rows")?;
         Ok(())
     }
 
@@ -266,7 +286,8 @@ impl Platform {
     /// status / heartbeat directly (e.g. to confirm a killed pod went `dead`).
     pub async fn worker_pods_for_project(&self, project_id: &Uuid) -> Result<Vec<WorkerPodRow>> {
         let rows: Vec<WorkerPodRow> = sqlx::query_as(
-            "SELECT pod_name, project_id, namespace, status, last_heartbeat_unix, terminal_at_unix \
+            "SELECT pod_name, project_id, namespace, status, last_heartbeat_unix, \
+                    terminal_at_unix, draining, binary_hash \
              FROM worker_pod WHERE project_id = $1 ORDER BY created_at_unix DESC",
         )
         .bind(project_id.to_string())
@@ -274,6 +295,96 @@ impl Platform {
         .await
         .context("query worker_pod rows for project")?;
         Ok(rows)
+    }
+
+    /// Clone a REAL running worker pod of the project into a SECOND worker,
+    /// exactly like `add_second_listener` clones a listener: kubectl-read the
+    /// live pod manifest, strip runtime fields, whole-name rename, insert the
+    /// `spawning` registry row (the worker's boot-time register_alive requires
+    /// it), apply. The clone boots the same project binary, self-identifies
+    /// via the downward-API `WEFT_POD_NAME`, registers alive, and CLAIMS from
+    /// the same queue: a genuine multi-worker fleet without memory saturation
+    /// (which kind cannot produce; its pods run without memory limits, so
+    /// pressure always reads 0). Waits until the clone's row is `alive`.
+    /// Cleanup is the NORMAL worker lifecycle (idle-exit / reconcile /
+    /// project teardown); no special sweep needed.
+    pub async fn add_second_worker(&self, project_id: &Uuid) -> Result<String> {
+        let rows = self.worker_pods_for_project(project_id).await?;
+        let src = rows
+            .iter()
+            .find(|p| p.status == "alive")
+            .context("no alive worker pod to clone; run something on the project first")?;
+        let (owner,): (String,) =
+            sqlx::query_as("SELECT owner_dispatcher FROM worker_pod WHERE pod_name = $1")
+                .bind(&src.pod_name)
+                .fetch_one(&self.pool)
+                .await
+                .context("read source worker's owner")?;
+        let new_name = format!("wp-e2e-clone-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        // Registry row FIRST; same image hash as the source so the claim
+        // gate admits the clone for the project's current work.
+        weft_task_store::worker_pod::insert_spawning(
+            &self.pool,
+            &new_name,
+            &src.project_id,
+            &src.namespace,
+            &owner,
+            &src.binary_hash,
+        )
+        .await
+        .context("insert clone's spawning row")?;
+        let manifest = self
+            .clone_manifest("pod", &src.namespace, &src.pod_name, &new_name)
+            .await?;
+        self.kubectl_apply(&manifest).await?;
+        crate::client::poll_until(
+            &format!("worker clone '{new_name}' to register alive"),
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_millis(500),
+            || async {
+                let rows = self.worker_pods_for_project(project_id).await?;
+                Ok(rows
+                    .iter()
+                    .any(|p| p.pod_name == new_name && p.status == "alive")
+                    .then_some(()))
+            },
+        )
+        .await?;
+        Ok(new_name)
+    }
+
+    /// Toggle a worker pod's REAL `draining` flag. Draining is the system's
+    /// own no-new-admissions mechanism (scale-down + reconcile use it); the
+    /// rig flips it directly as a STEERING lever: drain every pod except the
+    /// target, fire, and the new execution can only land on the target. That
+    /// makes "this execution runs on THAT pod" deterministic without memory
+    /// pressure. Clearing also resets `drained_at_unix` so a later genuine
+    /// drain measures from its own start.
+    pub async fn set_worker_draining(&self, pod_name: &str, draining: bool) -> Result<()> {
+        sqlx::query(
+            "UPDATE worker_pod SET draining = $2, \
+             drained_at_unix = CASE WHEN $2 THEN drained_at_unix ELSE NULL END \
+             WHERE pod_name = $1",
+        )
+        .bind(pod_name)
+        .bind(draining)
+        .execute(&self.pool)
+        .await
+        .context("toggle worker draining")?;
+        Ok(())
+    }
+
+    /// The pod that currently OWNS an execution's color (stamped by the
+    /// claim trigger), or None while unclaimed. Lets a multi-worker e2e
+    /// assert WHICH worker picked a run up.
+    pub async fn execution_owner(&self, color: &Uuid) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT owner_pod_name FROM execution_color WHERE color = $1")
+                .bind(color.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .context("read execution owner")?;
+        Ok(row.and_then(|(p,)| p))
     }
 
     /// The project's OWN k8s namespace as recorded on the `project` row,
@@ -304,6 +415,59 @@ impl Platform {
         .await
         .context("query spawn_pod attempts")?;
         Ok(attempts.unwrap_or(0))
+    }
+
+    /// How many IN-FLIGHT (pending) runtime-file uploads exist under a color's
+    /// exec scope. The runtime-file key is `<tenant>/exec/<color>/<id>`, and a
+    /// begin reserves a 'pending' row that only flips 'active' at complete, so
+    /// this counts uploads that were started but never finished. An interrupted
+    /// upload that cleaned up correctly leaves ZERO: the abort deleted the row
+    /// (and freed its quota reservation). Tenant-agnostic (matches any tenant
+    /// prefix), so it works for the OSS `local` tenant.
+    pub async fn runtime_pending_uploads_for_color(&self, color: &Uuid) -> Result<i64> {
+        let pattern = format!("%/exec/{color}/%");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runtime_file WHERE key LIKE $1 AND status = 'pending'",
+        )
+        .bind(pattern)
+        .fetch_one(&self.pool)
+        .await
+        .context("count pending runtime uploads for color")?;
+        Ok(n)
+    }
+
+    /// A tenant's CHARGED runtime-storage bytes: an ACTIVE file counts by its
+    /// size, an in-flight (pending) upload by its reserved bytes. This is the
+    /// exact number the broker's quota check enforces, so a test can assert an
+    /// interrupted upload freed its reservation (usage back to the pre-upload
+    /// value) rather than leaving phantom bytes charged. The tenant is the first
+    /// key segment; the OSS tenant is `local`.
+    pub async fn runtime_charged_bytes(&self, tenant: &str) -> Result<i64> {
+        let bytes: Option<i64> = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(CASE WHEN status = 'active' THEN size_bytes ELSE reserved_bytes END), 0)::BIGINT \
+             FROM runtime_file WHERE tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .context("sum tenant charged runtime bytes")?;
+        Ok(bytes.unwrap_or(0))
+    }
+
+    /// The tenant a color's runtime-file rows belong to (the first key
+    /// segment), or `None` if the color stored nothing. Lets a test read the
+    /// charged-bytes for the exact tenant a run used without hardcoding
+    /// `local`.
+    pub async fn runtime_tenant_for_color(&self, color: &Uuid) -> Result<Option<String>> {
+        let pattern = format!("%/exec/{color}/%");
+        let tenant: Option<String> = sqlx::query_scalar(
+            "SELECT tenant_id FROM runtime_file WHERE key LIKE $1 LIMIT 1",
+        )
+        .bind(pattern)
+        .fetch_optional(&self.pool)
+        .await
+        .context("read tenant for color's runtime files")?;
+        Ok(tenant)
     }
 
     // NOTE: there is deliberately no `assert_resumed_to_a_new_instance` here.
@@ -550,7 +714,7 @@ impl Platform {
     }
 
     /// The signal token registered for a project's node, read straight from
-    /// the registry. Unlike the consumer-facing `GET /api-token/{tk}/signals`
+    /// the registry. Unlike the consumer-facing `GET /signal-token/{tk}/signals`
     /// enumeration (which only lists `is_resume=TRUE` consumer signals: forms
     /// and human-in-the-loop resumes a person submits to), this finds ANY
     /// registered signal including ENTRY triggers (`is_resume=FALSE`: SSE,
@@ -1031,7 +1195,19 @@ impl Platform {
         src_name: &str,
         new_name: &str,
     ) -> Result<String> {
-        let mut doc = self.kubectl_get_json(kind, namespace, src_name).await?;
+        // Wait (bounded) for the source resource to EXIST before reading it. A
+        // listener pod's Deployment + Service can be transiently absent while the
+        // pool churns (a scale-down deletes-then-recreates, or a just-spawned
+        // source's Service hasn't landed yet), so a single-shot `get` races that
+        // window and fails NotFound. Poll for existence: removes the race without
+        // masking a genuinely missing resource (still fails loud past the deadline).
+        let mut doc = crate::client::poll_until(
+            &format!("source {kind} '{src_name}' exists to clone"),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(500),
+            || async { Ok(self.kubectl_get_json(kind, namespace, src_name).await.ok()) },
+        )
+        .await?;
         sanitize_and_rename(&mut doc, src_name, new_name);
         serde_json::to_string(&doc).context("serialize cloned manifest")
     }
@@ -1092,6 +1268,10 @@ pub struct WorkerPodRow {
     pub status: String,
     pub last_heartbeat_unix: i64,
     pub terminal_at_unix: Option<i64>,
+    /// The system's no-new-admissions flag (scale-down / reconcile drains).
+    pub draining: bool,
+    /// The image the pod was baked from (what the claim gate matches).
+    pub binary_hash: String,
 }
 
 /// Backdate slack: push a timestamp this much PAST a reaper's threshold so the
@@ -1177,6 +1357,9 @@ fn sanitize_and_rename(doc: &mut serde_json::Value, old_name: &str, new_name: &s
     if let Some(spec) = doc.get_mut("spec").and_then(Value::as_object_mut) {
         spec.remove("clusterIP");
         spec.remove("clusterIPs");
+        // Pod-kind clones: a live pod's manifest carries its scheduling
+        // outcome; a re-apply must let the scheduler place the clone.
+        spec.remove("nodeName");
     }
     rename_in_place(doc, old_name, new_name);
 }

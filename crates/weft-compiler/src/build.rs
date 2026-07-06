@@ -76,7 +76,7 @@ pub fn build_project(
     let definition = compile_checked(
         &source,
         project.id(),
-        Some(&project.root),
+        crate::file_reader::CompileFs::disk(&project.root),
         &catalog,
         ValidationMode::Structural,
     )?;
@@ -90,18 +90,12 @@ pub fn build_project(
     codegen::emit(&definition, project_root, &crate_root, &catalog, &crate_name)?;
     let binary_name = sanitize_crate_name(&crate_name);
 
-    // Cargo.lock cache key: the project UUID. NOT `binary_name`
-    // (user-controlled) because two projects can pick the same crate
-    // name and would then share-and-clobber the same cached lock
-    // file on the developer's machine.
-    let lock_key = definition.id.to_string();
     let dockerfile_summary = worker_image::emit(
         &project.manifest.build.worker,
         project_root,
         &catalog,
         &referenced_nodes,
         &binary_name,
-        &lock_key,
         builder_base_tag,
     )?;
     let dockerfile_path = project_root.join(".weft/target/Dockerfile.worker");
@@ -300,24 +294,32 @@ pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Com
     Ok(())
 }
 
-/// Locate the weft workspace root. Compile-time: the
-/// `CARGO_MANIFEST_DIR` of this crate is
-/// `<weft>/crates/weft-compiler`. Runtime override via
-/// `WEFT_REPO_ROOT` (used by the dispatcher container where
-/// CARGO_MANIFEST_DIR is baked to a path that doesn't exist).
-///
-/// Public so the CLI's hash + docker-build paths share one
-/// resolution function. They all need the same answer: where on
-/// disk does the user have the weft workspace.
+/// Locate the weft workspace root (honors `WEFT_REPO_ROOT`, else the repo layout).
+/// Delegates to `weft_catalog::weft_repo_root` so this and the catalog's
+/// `stdlib_root` resolve to the SAME path (they used to be two independent copies;
+/// a drift would have the stdlib seed and the build context disagree). Public so
+/// the CLI's hash + docker-build paths share one resolver.
 pub fn resolve_weft_root() -> CompileResult<PathBuf> {
-    if let Ok(p) = std::env::var("WEFT_REPO_ROOT") {
-        return Ok(PathBuf::from(p));
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
+    weft_catalog::weft_repo_root()
         .ok_or_else(|| CompileError::Build("cannot resolve weft workspace root".into()))
+}
+
+/// The repository segment for content-addressed worker images. No project id:
+/// a tag is purely a function of what was compiled, so identical builds across
+/// projects/tenants resolve to ONE image (the same shape infra images use).
+pub const WORKER_IMAGE_REPO: &str = "weft-worker";
+
+/// The bare (registry-UNqualified) content-addressed worker image tag,
+/// `weft-worker:<binary_hash>`. THE single source of truth for the worker tag,
+/// shared by the CLI (which builds + loads it onto the node) and the dispatcher
+/// (which spawns it, prepending a registry prefix when one is configured). The
+/// FULL binary hash is used (not a short prefix) so the tag is collision-free and the CLI and
+/// the dispatcher agree by construction. Lives in weft-compiler because both the
+/// CLI and the dispatcher depend on this crate; a second copy would be a drift
+/// hazard (the exact bug that had the CLI tag a 16-char prefix while the
+/// dispatcher spawned the full hash).
+pub fn worker_image_tag(binary_hash: &str) -> String {
+    format!("{WORKER_IMAGE_REPO}:{binary_hash}")
 }
 
 /// Sanitize a project name to a valid cargo crate + binary name.

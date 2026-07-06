@@ -34,7 +34,7 @@ use crate::state::DispatcherState;
 pub const LIFECYCLE_CMD_CHANNEL: &str = "weft_lifecycle_cmd";
 
 pub fn spawn(state: DispatcherState) {
-    tokio::spawn(async move {
+    crate::app::spawn_supervised("lifecycle_claimer", async move {
         pg_wake::run(
             state.pg_pool.clone(),
             LIFECYCLE_CMD_CHANNEL,
@@ -249,6 +249,8 @@ async fn run_deactivate(
         spec.mode,
         spec.grace_minutes,
         spec.running_policy,
+        spec.drain_timeout_secs
+            .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS),
         true, // health-loop autonomous park: its auto-recover MAY reactivate this
     )
     .await

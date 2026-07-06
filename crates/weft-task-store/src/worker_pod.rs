@@ -408,16 +408,26 @@ pub async fn mark_done_if_idle(pool: &PgPool, pod_name: &str) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-pub async fn has_live_for_project(pool: &PgPool, project_id: &str) -> Result<bool> {
+/// `binary_hash`: when set, only a NON-draining pod baked from that image
+/// counts as live (the "is a usable worker up?" question for NEW work: a
+/// stale-image or draining pod can't take it, so its existence must not
+/// suppress a fresh spawn). `None` counts any alive/spawning pod.
+pub async fn has_live_for_project(
+    pool: &PgPool,
+    project_id: &str,
+    binary_hash: Option<&str>,
+) -> Result<bool> {
     // Cast literal to bigint so sqlx's i64 type expectation matches.
     // PostgreSQL types untyped integer literals as INT4; the column
     // shape doesn't matter here because we throw the value away.
     let row: Option<(i64,)> = sqlx::query_as(
         r#"SELECT 1::bigint FROM worker_pod
            WHERE project_id = $1 AND status IN ('spawning', 'alive')
+             AND ($2::TEXT IS NULL OR (binary_hash = $2 AND NOT draining))
            LIMIT 1"#,
     )
     .bind(project_id)
+    .bind(binary_hash)
     .fetch_optional(pool)
     .await?;
     Ok(row.is_some())
@@ -444,6 +454,40 @@ pub async fn alive_pod_for_project_full(
     Ok(row)
 }
 
+/// EVERY currently-alive worker pod for `project_id` as
+/// `(pod_name, namespace, binary_hash)` rows. A project under
+/// parallel load runs N workers; reconciliation (stale image / wrong
+/// namespace) must consider all of them, never just the first.
+pub async fn alive_pods_for_project_full(
+    pool: &PgPool,
+    project_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        r#"SELECT pod_name, namespace, binary_hash FROM worker_pod
+           WHERE project_id = $1 AND status IN ('spawning', 'alive')
+           ORDER BY created_at_unix ASC"#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// How many of the named pods are still alive (spawning|alive). The
+/// drain-progress probe for a gated worker replacement: doomed pods
+/// are marked draining, finish their in-flight work and idle-exit;
+/// this counts the stragglers.
+pub async fn count_alive_named(pool: &PgPool, pod_names: &[String]) -> Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM worker_pod
+           WHERE pod_name = ANY($1) AND status IN ('spawning', 'alive')"#,
+    )
+    .bind(pod_names)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
 /// Pick the least-pressured ADMITTABLE worker pod for a project, or
 /// None when there is no admittable pod (none alive, or every alive pod
 /// is saturated / draining). "Admittable" = alive (spawning|alive), not
@@ -455,10 +499,15 @@ pub async fn alive_pod_for_project_full(
 /// A `spawning` pod reports 0 pressure until its first heartbeat, so it
 /// is correctly preferred (it is empty). The caller spawns a fresh pod
 /// and retries when this returns None (every pod saturated).
+///
+/// `binary_hash`: when set, only pods baked from that image qualify
+/// (new work must never land on a stale-image worker whose binary lacks
+/// the current graph's node impls); `None` skips the check.
 pub async fn pick_admittable_for_project(
     pool: &PgPool,
     project_id: &str,
     saturation: f64,
+    binary_hash: Option<&str>,
 ) -> Result<Option<(String, String)>> {
     let row: Option<(String, String)> = sqlx::query_as(
         r#"SELECT pod_name, namespace FROM worker_pod
@@ -466,11 +515,13 @@ pub async fn pick_admittable_for_project(
              AND status IN ('spawning', 'alive')
              AND NOT draining
              AND mem_pressure < $2
+             AND ($3::TEXT IS NULL OR binary_hash = $3)
            ORDER BY mem_pressure ASC, created_at_unix ASC
            LIMIT 1"#,
     )
     .bind(project_id)
     .bind(saturation)
+    .bind(binary_hash)
     .fetch_optional(pool)
     .await?;
     Ok(row)

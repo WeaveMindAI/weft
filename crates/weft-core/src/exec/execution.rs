@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::frames::LoopFrames;
 use crate::Color;
 
-// SYNC: NodeExecutionStatus <-> extension-vscode/src/shared/protocol.ts NodeExecutionStatus
+// SYNC: NodeExecutionStatus <-> packages/weft-graph/src/protocol.ts NodeExecutionStatus
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeExecutionStatus {
@@ -84,7 +84,7 @@ pub struct NodeExecution {
 
 /// A non-terminal, per-port problem on a single firing. Today the sole
 /// kind is an output-type mismatch (see `NodeExecution::port_warnings`).
-// SYNC: PortWarning <-> extension-vscode/src/webview/lib/types/index.ts PortWarning
+// SYNC: PortWarning <-> packages/weft-graph/src/webview/lib/types/index.ts PortWarning
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PortWarning {
     pub port: String,

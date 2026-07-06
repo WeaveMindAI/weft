@@ -1,0 +1,149 @@
+import type { PortDefinition, PortType } from '../types';
+import { parseWeftType, weftTypeToString, type WeftType } from '../types';
+
+/** Generic render descriptor, tells the task review page HOW to render a field
+ *  without knowing anything about the field type itself. */
+export interface FormFieldRender {
+	/** UI primitive: 'readonly' | 'buttons' | 'select' | 'text' | 'textarea' */
+	component: string;
+	/** Where options come from: 'static' (config.options) or 'input' (field.value) */
+	source?: 'static' | 'input';
+	/** For select: allow multiple selections */
+	multiple?: boolean;
+	/** For textarea: pre-fill from input port value */
+	prefilled?: boolean;
+}
+
+/** Port template emitted by a field type. The dispatcher ships
+ *  `{nameTemplate: "{key}_approved", portType: "Boolean"}`; the
+ *  resolver substitutes `{key}` with the field's user-supplied
+ *  key to get the concrete port name. */
+export interface FormFieldPort {
+	nameTemplate: string;
+	portType: PortType;
+}
+
+export interface FormFieldSpec {
+	fieldType: string;
+	label: string;
+	render: FormFieldRender;
+	requiredConfig: string[];
+	optionalConfig: string[];
+	addsInputs: FormFieldPort[];
+	addsOutputs: FormFieldPort[];
+}
+
+export interface FormFieldDef {
+	fieldType: string;
+	key: string;
+	render?: FormFieldRender;
+	config?: Record<string, unknown>;
+	required?: boolean;
+}
+
+/** Helper for constructing a FormFieldPort inline (used by tests
+ *  and by code paths that synthesize specs in TS rather than
+ *  reading them from the dispatcher). */
+export function port(nameTemplate: string, portType: PortType): FormFieldPort {
+	return { nameTemplate, portType };
+}
+
+/** Is `key` a legal weft bare identifier (`[A-Za-z_][A-Za-z0-9_]*`)?
+ *  A field key becomes a PORT NAME (`{key}_approved`, etc.), and the
+ *  parser rejects any port name outside that grammar, so the add-field
+ *  form gates on this: a key with spaces or punctuation (`what do you
+ *  want?`) is refused before it can emit an unparseable port.
+ *  SYNC: keep in step with try_parse_port_decl in
+ *  weft/crates/weft-compiler/src/weft_compiler.rs (the port-name grammar). */
+export function isValidFieldKey(key: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key);
+}
+
+function resolvePortName(template: string, key: string): string {
+	return template.replace('{key}', key);
+}
+
+/** Sentinel TypeVar name used by form-field specs to request an auto-scoped
+ *  per-port TypeVar. Mirrors AUTO_TYPE_VAR_MARKER in the Rust enricher.
+ *  Catalog authors write `port('{key}', 'T_Auto')` for ports that should
+ *  accept any type independently from sibling ports. Explicit TypeVars like
+ *  `T`, `T1` are left alone, so authors can still express shared-type
+ *  constraints when that is the right semantics. */
+const AUTO_TYPE_VAR_MARKER = 'T_Auto';
+
+/** Recursively replace every `T_Auto` marker in a parsed WeftType with a
+ *  TypeVar scoped to the field key. */
+function materializeAutoTypeVars(t: WeftType, key: string): WeftType {
+	switch (t.kind) {
+		case 'typevar':
+			if (t.name === AUTO_TYPE_VAR_MARKER) {
+				return { kind: 'typevar', name: `T__${key}` };
+			}
+			return t;
+		case 'list':
+			return { kind: 'list', inner: materializeAutoTypeVars(t.inner, key) };
+		case 'dict':
+			return {
+				kind: 'dict',
+				key: materializeAutoTypeVars(t.key, key),
+				value: materializeAutoTypeVars(t.value, key),
+			};
+		case 'union':
+			return { kind: 'union', types: t.types.map(x => materializeAutoTypeVars(x, key)) };
+		default:
+			return t;
+	}
+}
+
+/** Replace T_Auto markers in a port type string with key-scoped TypeVar names.
+ *  Returns the original string if parsing fails or no markers are present. */
+function resolveAutoTypeVars(portType: PortType, key: string): PortType {
+	const parsed = parseWeftType(portType);
+	if (!parsed) return portType;
+	const materialized = materializeAutoTypeVars(parsed, key);
+	return weftTypeToString(materialized);
+}
+
+export function buildSpecMap(specs: FormFieldSpec[]): Record<string, FormFieldSpec> {
+	return Object.fromEntries(specs.map(s => [s.fieldType, s]));
+}
+
+export function deriveInputsFromFields(
+	fields: FormFieldDef[],
+	specMap: Record<string, FormFieldSpec>,
+): PortDefinition[] {
+	const ports: PortDefinition[] = [];
+	for (const f of fields) {
+		const spec = specMap[f.fieldType];
+		if (!spec || !f.key) continue;
+		for (const t of spec.addsInputs) {
+			ports.push({
+				name: resolvePortName(t.nameTemplate, f.key),
+				portType: resolveAutoTypeVars(t.portType, f.key),
+				// Form field ports default to required (same as the language default).
+				// Set "required": false explicitly to make a port optional.
+				required: f.required !== false,
+			});
+		}
+	}
+	return ports;
+}
+
+export function deriveOutputsFromFields(
+	fields: FormFieldDef[],
+	specMap: Record<string, FormFieldSpec>,
+): PortDefinition[] {
+	const ports: PortDefinition[] = [];
+	for (const f of fields) {
+		const spec = specMap[f.fieldType];
+		if (!spec || !f.key) continue;
+		for (const t of spec.addsOutputs) {
+			ports.push({
+				name: resolvePortName(t.nameTemplate, f.key),
+				portType: resolveAutoTypeVars(t.portType, f.key),
+				required: false,
+			});
+		}
+	}
+	return ports;
+}

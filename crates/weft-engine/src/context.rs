@@ -1292,13 +1292,14 @@ impl RunnerHandle {
         self.clients
             .tasks
             .enqueue_dedup(weft_task_store::NewTask {
-                kind,
+                kind: kind.into(),
                 target: weft_task_store::TaskTarget::Dispatcher,
                 project_id: Some(self.project_id.clone()),
                 dedup_key: Some(dedup_key),
                 color: Some(self.color.to_string()),
                 tenant_id: Some(self.tenant_id.clone()),
                 target_pod_name: None,
+                binary_hash: None,
                 payload: payload_json,
             })
             .await
@@ -1805,10 +1806,11 @@ impl ContextHandle for RunnerHandle {
         mime_type: &str,
         filename: &str,
         keep: Option<weft_core::storage::KeepTtl>,
+        declared_size: Option<u64>,
     ) -> WeftResult<Value> {
         self.clients
             .storage
-            .put(self.color, scope, mime_type, filename, keep, data)
+            .put(self.color, scope, mime_type, filename, keep, declared_size, data)
             .await
     }
 
@@ -1841,13 +1843,16 @@ impl ContextHandle for RunnerHandle {
             .filter(|f| !f.is_empty())
             .map(String::from)
             .unwrap_or_else(|| weft_core::storage::filename_from_url(url));
+        // A sized response body (Content-Length) is declared up front so the
+        // whole quota charge happens before the first byte moves.
+        let declared_size = resp.content_length();
         // Stream the body straight through (never buffer the whole
         // file), so a multi-gigabyte download stays bounded-memory.
         let stream: weft_core::storage::ByteStream = Box::pin(
             resp.bytes_stream()
                 .map_err(|e| std::io::Error::other(format!("fetch stream: {e}"))),
         );
-        self.clients.storage.put(self.color, scope, &mime, &name, keep, stream).await
+        self.clients.storage.put(self.color, scope, &mime, &name, keep, declared_size, stream).await
     }
 
     async fn storage_get(
@@ -2161,13 +2166,14 @@ async fn enqueue_register_signal_task(
     });
     let id = tasks
         .enqueue_dedup(task_store::NewTask {
-            kind: TaskKind::RegisterSignal,
+            kind: TaskKind::RegisterSignal.into(),
             target: task_store::TaskTarget::Dispatcher,
             project_id: None,
             dedup_key: Some(dedup_key),
             color: Some(color.to_string()),
             tenant_id: Some(tenant_id.to_string()),
             target_pod_name: None,
+            binary_hash: None,
             payload,
         })
         .await?
@@ -2316,11 +2322,14 @@ mod replay_tests {
                 "audio/ogg",
                 "clip.ogg",
                 None,
+                Some(7),
             )
             .await
             .expect("put");
         let stored = StoredFile::from_value(&file).expect("self-describing value");
-        assert!(stored.key.starts_with("exec/c1/"), "{}", stored.key);
+        // Keys are tenant-anchored now (`<tenant>/<scope>/...`); the fake
+        // worker storage is seeded as tenant `t1`.
+        assert!(stored.key.starts_with("t1/exec/c1/"), "{}", stored.key);
         assert_eq!(stored.size_bytes, 7);
 
         let (meta, stream) = handle.storage_get(&stored.key, None).await.expect("get");
@@ -2328,37 +2337,22 @@ mod replay_tests {
         let bytes = weft_core::storage::collect_stream(stream).await.unwrap();
         assert_eq!(&bytes[..], b"payload");
 
-        // The wall: another color's exec key is denied.
-        let err = match handle.storage_get("exec/OTHER/f0", None).await {
+        // The wall: another color's exec key (under the same tenant) is denied.
+        let err = match handle.storage_get("t1/exec/OTHER/f0", None).await {
             Err(e) => e,
             Ok(_) => panic!("cross-color get must be denied"),
         };
         assert!(err.to_string().contains("denied"), "{err}");
 
-        // Keep + eager sweep: kept survives, un-kept goes.
+        // Keep marks the file to survive the broker's terminate sweep (the
+        // sweep itself is broker-side, covered by the broker's db tests;
+        // the worker has no sweep verb).
         handle.storage_keep(&stored.key, KeepTtl::Default).await.expect("keep");
-        let scratch = handle
-            .storage_put(
-                &StorageScope::Execution,
-                weft_core::storage::bytes_stream(bytes::Bytes::from_static(b"tmp")),
-                "text/plain",
-                "t.txt",
-                None,
-            )
-            .await
-            .expect("put scratch");
-        let scratch_key = StoredFile::from_value(&scratch).unwrap().key;
-        handle.clients.storage.eager_sweep(handle.color).await;
-        assert!(handle.storage_get(&stored.key, None).await.is_ok(), "kept survives");
-        let err = match handle.storage_get(&scratch_key, None).await {
-            Err(e) => e,
-            Ok(_) => panic!("un-kept scratch must be swept"),
-        };
-        assert!(err.to_string().contains("not found"), "{err}");
+        assert!(handle.storage_get(&stored.key, None).await.is_ok(), "kept file still readable");
 
-        // Presign mints a URL for an owned file.
+        // Presign mints a (bucket) URL for an owned file.
         let url = handle.storage_presign(&stored.key, Some(60)).await.expect("presign");
-        assert!(url.contains("cap="), "{url}");
+        assert!(url.starts_with("http") && url.contains(&stored.key), "{url}");
     }
 
     struct NoopJournal;

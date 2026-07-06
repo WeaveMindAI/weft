@@ -402,12 +402,12 @@ pub async fn run_one_execution(
         }
         ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck => {
             journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
-            // Eager storage sweep: delete this run's un-kept exec
-            // files right away. PURELY an optimization (errors only
-            // log): the dispatcher's durable terminate sweep is the
-            // guarantee, since a stall-killed worker never reaches
-            // this line.
-            clients.storage.eager_sweep(color).await;
+            // No worker-side storage cleanup here: the dispatcher's durable
+            // terminate sweep owns the run's un-kept exec files. It reaps
+            // crashed uploads and grants completed files a short post-run
+            // linger (so the user can still download a run's output), then
+            // the broker's expiry sweep deletes them. A worker-side eager
+            // delete would defeat that linger.
         }
         ExecutionOutcome::Stalled => {
             // Worker exits cleanly without writing a terminal event.
@@ -5463,7 +5463,7 @@ mod bus_comm_tests {
         ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
             assert_eq!(
                 t.kind,
-                weft_task_store::TaskKind::RegisterSignal,
+                weft_task_store::TaskKind::RegisterSignal.as_str(),
                 "await tests only enqueue RegisterSignal"
             );
             let id = uuid::Uuid::new_v4();

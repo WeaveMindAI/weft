@@ -15,7 +15,6 @@ members = [
     "crates/weft-infra",
     "crates/weft-infra-supervisor",
     "crates/weft-platform-traits",
-    "crates/weft-storage",
     "crates/weft-e2e",
 ]
 
@@ -37,6 +36,14 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+
+# S3-compatible object storage (the ObjectStore slot: GCS / SeaweedFS / AWS /
+# any S3 endpoint via an endpoint-URL override). rustls so we don't drag in
+# a native TLS toolchain, matching reqwest above.
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "sigv4a"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-smithy-types = "1"
 
 # serialization
 serde = { version = "1", features = ["derive"] }
@@ -70,9 +77,6 @@ tempfile = "3"
 parking_lot = "0.12"
 ipnet = "2"
 filetime = "0.2"
-# Per-disk blob I/O for the storage box (LocalFileSystem per mounted
-# backing PVC: streaming put/get/delete/list).
-object_store = "0.12"
 base64 = "0.22"
 
 # internal workspace crates
@@ -83,4 +87,3 @@ weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
 weft-platform-traits = { path = "crates/weft-platform-traits" }
-weft-storage = { path = "crates/weft-storage" }

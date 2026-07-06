@@ -5,8 +5,7 @@
 //! nothing is dropped and concatenation reproduces the source exactly. The three
 //! opaque kinds (HEREDOC, JSON_VALUE, MARKER) are lexed as
 //! single tokens spanning their full extent, because the edit protocol works on
-//! whole values (see `docs/cst-node-model.md` §6); their interior is never Weft
-//! syntax.
+//! whole values; their interior is never Weft syntax.
 //!
 //! The lexer is context-free and total: any byte that fits no rule becomes a
 //! one-char ERROR token, so it never panics and never loses a byte. The parser

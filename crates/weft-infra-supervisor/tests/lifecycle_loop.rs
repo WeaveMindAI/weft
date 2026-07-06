@@ -15,7 +15,7 @@ use weft_platform_traits::kube::{WorkloadKind, WorkloadReplicaState};
 
 const TENANT: &str = "tenant-test";
 const PROJECT: &str = "proj1";
-const NAMESPACE: &str = "wm-project-test-proj1";
+const NAMESPACE: &str = "wft-project-test-proj1";
 const NODE: &str = "bridge";
 
 fn rig() -> SupervisorTestRig {
@@ -71,6 +71,7 @@ fn cmd(id: i64, verb: Verb, node: Option<&str>) -> SupervisorCommandRow {
         running_policy: Some(Policy::Cancel),
         spec_json: None,
         force: false,
+        drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
     }
 }
 
@@ -128,7 +129,30 @@ async fn stop_flips_status_then_scales_then_emits_stopped() {
     }));
 
     // Command was marked complete with no error.
-    assert_eq!(rig.broker.completed_commands(), vec![(1, None)]);
+    assert_eq!(rig.broker.completed_commands(), vec![(1, None, false)]);
+}
+
+#[tokio::test]
+async fn cancel_requested_halts_stop_and_records_cancelled_outcome() {
+    // The user's `/infra/cancel` flagged the command before the
+    // supervisor got to the per-node work: the tick halts (no scale
+    // calls) and completes the command with the CANCELLED outcome,
+    // never as a failure.
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![workload_for("inst1", "inst1-bridge", 1, 1)],
+    );
+    rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
+    rig.broker.set_cancel_requested(1);
+
+    let did_work = rig.tick_lifecycle().await.unwrap();
+    assert!(did_work);
+
+    assert!(rig.kube.scale_calls().is_empty(), "halted before any kubectl scale");
+    assert_eq!(rig.broker.cancelled_commands(), vec![1]);
+    assert!(rig.broker.failed_commands().is_empty(), "a cancel is not a failure");
 }
 
 #[tokio::test]
@@ -297,7 +321,7 @@ async fn stop_with_no_matching_infra_node_completes_cleanly() {
 
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
-    assert_eq!(rig.broker.completed_commands(), vec![(3, None)]);
+    assert_eq!(rig.broker.completed_commands(), vec![(3, None, false)]);
     // No scale issued.
     assert!(rig.kube.scale_calls().is_empty());
 }
@@ -344,7 +368,7 @@ async fn running_policy_wait_drains_then_proceeds() {
 
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
-    assert_eq!(rig.broker.completed_commands(), vec![(5, None)]);
+    assert_eq!(rig.broker.completed_commands(), vec![(5, None, false)]);
 }
 
 #[tokio::test]
@@ -367,7 +391,7 @@ async fn running_policy_wait_times_out_after_deadline() {
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
     // Stop should still complete (timeout proceeds).
-    assert_eq!(rig.broker.completed_commands(), vec![(6, None)]);
+    assert_eq!(rig.broker.completed_commands(), vec![(6, None, false)]);
     let writes = rig.broker.status_writes();
     assert!(writes.iter().any(|(_, _, s)| *s == Status::Stopped));
 }
@@ -397,6 +421,7 @@ fn apply_cmd(id: i64) -> SupervisorCommandRow {
         running_policy: None,
         spec_json: Some(spec),
         force: false,
+        drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
     }
 }
 
@@ -442,7 +467,7 @@ async fn apply_writes_provisioning_before_kube_apply_then_applied() {
     );
 
     // Command completed with no error.
-    assert_eq!(rig.broker.completed_commands(), vec![(1, None)]);
+    assert_eq!(rig.broker.completed_commands(), vec![(1, None, false)]);
 }
 
 #[tokio::test]
@@ -721,7 +746,7 @@ async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
 
     assert_eq!(
         rig.broker.completed_commands(),
-        vec![(7, None)],
+        vec![(7, None, false)],
         "the new owner completes the command exactly once, no user re-action"
     );
     let writes = rig.broker.status_writes();

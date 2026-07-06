@@ -23,17 +23,17 @@ pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(30), "supervisor", sweep_supervisors);
     spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(60), "worker_scaledown", sweep_worker_scaledown);
-    // Storage plane: the durable terminate sweep (un-kept exec files)
-    // and the scale-to-zero box reaper. Idempotent across pods like
-    // the rest: the sweep queue deletes per-color rows only after the
-    // box confirms; teardown re-checks live usage first.
+    spawn_loop(state.clone(), Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions);
+    // Storage plane: the durable terminate sweep (un-kept exec files of a
+    // terminated color). Idempotent across pods: the queue deletes a color's
+    // row only after the broker confirms the sweep. The kept-file expiry sweep
+    // is the broker's own loop (it owns the bucket + metadata), not here.
     spawn_loop(
-        state.clone(),
+        state,
         Duration::from_secs(15),
         "storage_sweep",
-        crate::storage_box::process_sweep_queue,
+        crate::storage::process_sweep_queue,
     );
-    spawn_loop(state, Duration::from_secs(60), "storage_box", crate::storage_box::sweep_boxes);
 }
 
 /// Grace before a terminal (`done`/`dead`) worker_pod's k8s Pod
@@ -56,7 +56,7 @@ where
     F: Fn(DispatcherState) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
 {
-    tokio::spawn(async move {
+    crate::app::spawn_supervised(name, async move {
         loop {
             tokio::time::sleep(interval).await;
             if let Err(e) = sweep(state.clone()).await {
@@ -157,6 +157,111 @@ async fn reap_worker_pod(
             error = %e,
             "kill_pod failed for failed worker; pod may survive in k8s until next sweep"
         );
+    }
+    Ok(())
+}
+
+/// Stuck-transition reaper: the crash-recovery half of the project
+/// transitional-state model. A transition driven in-process by one
+/// dispatcher Pod (an activation window, a build) carries
+/// a heartbeat the driver bumps; when the driver dies, the heartbeat
+/// goes stale and this sweep repairs the row per-transition,
+/// status-guarded (safe under N Pods; a live driver's row is never
+/// touched because its heartbeat is fresh):
+///
+///   - stuck `activating` -> the same wipe the activate rollback /
+///     cancel-activate performs (unstick the status + cancel the
+///     leaked TriggerSetup color + drop half-registered signals).
+///   - stuck `building` / `cancelling_build` -> clear the marker; the
+///     builder job died with its pod (or keeps running harmlessly to
+///     a content-addressed tag); the next verb rebuilds or cache-hits.
+///   - `deactivating` -> re-drive the drain-watcher CAS: a
+///     deactivation whose terminal events were missed (dispatcher
+///     restart between the last execution finishing and the CAS)
+///     lands at Inactive here. No heartbeat needed: the check itself
+///     is idempotent and cheap.
+///
+/// This replaces the old constructor-time blind bulk downgrade, which
+/// reset live status for every tenant's projects on any Pod boot.
+async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
+    use crate::project_store::ProjectStatus;
+    let stale_before = crate::lease::now_unix() - crate::transition::HEARTBEAT_STALE_SECS;
+    for stuck in state.projects.list_stuck_transitions(stale_before).await? {
+        let project_id = stuck.id.to_string();
+        if stuck.transition.is_building() {
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                project_id = %project_id,
+                transition = stuck.transition.as_str(),
+                "build transition orphaned (driver heartbeat stale); clearing marker"
+            );
+            if state.projects.finish_building(stuck.id).await? {
+                crate::transition::publish_transition_changed(&state, stuck.id).await;
+            }
+        }
+        if stuck.status == ProjectStatus::Activating {
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                project_id = %project_id,
+                "activation orphaned (driver heartbeat stale); wiping activating state"
+            );
+            if let Err((code, msg)) =
+                crate::api::project::wipe_activating_state(&state, stuck.id, &project_id, None)
+                    .await
+            {
+                tracing::warn!(
+                    target: "weft_dispatcher::reaper",
+                    project_id = %project_id,
+                    code = %code,
+                    error = %msg,
+                    "wipe of orphaned activation failed; retrying next sweep"
+                );
+                continue;
+            }
+            crate::transition::publish_transition_changed(&state, stuck.id).await;
+        }
+    }
+    // Deactivating landings. Two steps, both idempotent, both the
+    // SAME building blocks every other drain path uses:
+    //   1. If the user's drain cap expired ("wait at most N, then
+    //      proceed"), cancel the remaining executions via the ONE
+    //      cancel helper (`cancel_running_non_suspended`).
+    //   2. Re-drive the ONE landing CAS (`try_finish_drain`); it
+    //      flips Deactivating -> Inactive iff the running set is
+    //      empty. This also covers deactivations whose terminal
+    //      events were missed across a restart.
+    let now = crate::lease::now_unix();
+    for id in state.projects.list_deactivating().await? {
+        let project_id = id.to_string();
+        if let Some(lifecycle) = state.projects.lifecycle(id).await? {
+            if let Some(deadline) = lifecycle.drain_deadline_unix {
+                if now >= deadline {
+                    tracing::warn!(
+                        target: "weft_dispatcher::reaper",
+                        project_id = %project_id,
+                        "deactivation drain cap expired; cancelling remaining executions"
+                    );
+                    if let Err((code, msg)) =
+                        crate::api::project::cancel_running_non_suspended(
+                            &state,
+                            &project_id,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "weft_dispatcher::reaper",
+                            project_id = %project_id,
+                            code = %code,
+                            error = %msg,
+                            "drain-cap cancel failed; retrying next sweep"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+        crate::journal_bridge::try_finish_drain(&state, &project_id, None).await?;
     }
     Ok(())
 }

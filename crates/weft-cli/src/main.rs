@@ -6,11 +6,9 @@ use clap::{Parser, Subcommand};
 
 mod client;
 mod commands;
-pub mod hash;
 pub mod images;
 pub mod progress;
 pub mod prompt;
-mod walk;
 
 #[derive(Debug, Parser)]
 #[command(name = "weft", version, about = "Weft CLI")]
@@ -37,26 +35,24 @@ enum Cmd {
     New { name: String },
     /// Compile the current project to a native rust binary.
     Build,
+    /// Build (if stale) the shared worker builder-base image and print its
+    /// content-addressed tag. The base bakes the precompiled engine + deps that
+    /// every per-project worker build reuses; this is the same base-ensure a
+    /// `weft build` runs, exposed so a cluster setup can build + load it into its
+    /// registry. `--quiet` prints ONLY the tag (for scripting).
+    BuildBase {
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Run the current project via the dispatcher. Streams logs until
     /// completion or suspension unless `--detach` is set.
     ///
-    /// If the build's binary changes from the running deployment AND
-    /// executions are still in flight, the run is gated by a dialog
-    /// (interactive TTY) or a structured error (`--json`). Use
-    /// `--running-policy wait` to let in-flight executions finish on
-    /// the old image, or `--running-policy cancel` to kill them
-    /// immediately. The same flag works at the API boundary so the
-    /// VS Code extension can collect the choice in its own dialog
-    /// and pass it back.
+    /// Rebuilding while executions are in flight is non-disruptive:
+    /// in-flight work finishes on workers baked from its own image,
+    /// and this run lands on a fresh current-image worker.
     Run {
         #[arg(long)]
         detach: bool,
-        /// `wait` | `cancel`. Tells the build gate what to do when
-        /// the new binary differs and the project has running
-        /// executions. Omit to be prompted (TTY) or to receive a
-        /// structured error (`--json`).
-        #[arg(long, value_name = "POLICY")]
-        running_policy: Option<String>,
     },
     /// Subscribe to the dispatcher's SSE stream for a project.
     Follow { project: String },
@@ -75,13 +71,6 @@ enum Cmd {
         project: Option<String>,
         #[arg(long = "reactivate-choice", value_name = "choice")]
         reactivate_choice: Option<String>,
-        /// `wait` | `cancel`. Pre-answers the stale-binary build
-        /// gate when activating the cwd project rebuilds the worker
-        /// while executions are in flight. Ignored on activate-by-id
-        /// (no build step). Omit to be prompted (TTY) or to receive
-        /// a structured error (`--json`).
-        #[arg(long = "running-policy", value_name = "wait|cancel")]
-        running_policy: Option<String>,
     },
     /// Deactivate a registered project. By default WIPEs (drops
     /// signals + cancels suspended runs); pass `--mode hibernate`
@@ -105,6 +94,14 @@ enum Cmd {
     CancelActivate {
         project: Option<String>,
     },
+    /// Cancel an in-flight build (transition=building).
+    /// The dispatcher pod driving the build interrupts the builder
+    /// job; the verb that was building errs "cancelled". 412 if no
+    /// build is in flight.
+    #[command(name = "cancel-build")]
+    CancelBuild {
+        project: Option<String>,
+    },
     /// Force-cancel running executions while a deactivate-with-wait
     /// is draining. Idempotent: if the project isn't currently in
     /// `deactivating`, this is a no-op.
@@ -117,12 +114,12 @@ enum Cmd {
     /// signals, rebuilds if needed, re-registers everything against
     /// the new binary in one shot.
     Resync {
-        /// `wait` | `cancel`. Pre-answers the stale-binary build
-        /// gate when the rebuild lands while executions are in
-        /// flight. Omit to be prompted (TTY) or to receive a
-        /// structured error (`--json`).
-        #[arg(long = "running-policy", value_name = "wait|cancel")]
-        running_policy: Option<String>,
+        /// Trigger-deactivation choice (mode / grace / running-policy /
+        /// drain cap): resync deactivates with YOUR spec before
+        /// re-registering, exactly like the standalone Deactivate.
+        /// Missing flags prompt on a TTY or error in `--json`.
+        #[command(flatten)]
+        opts: TriggerDeactivationOpts,
     },
     /// List every project registered with the dispatcher.
     Ps,
@@ -178,9 +175,15 @@ enum Cmd {
     },
     /// Add an external node package (git-backed).
     Add { source: String },
-    /// Print the per-project catalog as JSON (for Tangle, VS Code,
-    /// dashboard introspection).
-    DescribeNodes,
+    /// Print the per-project catalog as JSON (for editor / tooling
+    /// introspection).
+    DescribeNodes {
+        /// Describe the bundled stdlib catalog instead of a project's
+        /// `nodes/`. Needs no project on disk; used to produce the browser
+        /// parser's catalog asset.
+        #[arg(long)]
+        stdlib: bool,
+    },
     /// Parse weft source (read from stdin) against the project's
     /// `nodes/` catalog and print the project + referenced catalog +
     /// diagnostics as JSON. The editor's live graph feedback. Lenient:
@@ -215,7 +218,8 @@ enum Cmd {
         #[command(subcommand)]
         action: CatalogAction,
     },
-    /// Manage extension tokens (browser extension auth).
+    /// Manage signal tokens: scoped credentials that let an external
+    /// client listen for + reply to a project's waiting nodes.
     Token {
         #[command(subcommand)]
         action: TokenAction,
@@ -237,16 +241,11 @@ enum Cmd {
         #[command(subcommand)]
         action: ListenerAction,
     },
-    /// Browse + manage stored files (the tenant's storage box):
+    /// Browse + manage stored files (the tenant's runtime storage):
     /// project files, shared spaces, past-execution survivors.
     Files {
         #[command(subcommand)]
         action: FilesAction,
-    },
-    /// Storage configuration (per-tenant backing-disk profile).
-    Storage {
-        #[command(subcommand)]
-        action: StorageAction,
     },
     /// Remove stale state. Default subject is the journal: with no
     /// flags, deletes executions older than --keep-days (30). Pass
@@ -294,25 +293,15 @@ enum CatalogAction {
 
 #[derive(Debug, Subcommand)]
 enum TokenAction {
-    /// Mint a new API token. Tokens grant scoped access to the
-    /// dispatcher's signal enumeration surface. All scope flags
-    /// are optional; an unscoped token sees every signal in the
-    /// tenant.
+    /// Mint a new signal token. A signal token grants scoped access
+    /// to the dispatcher's signal enumeration + reply surface. All
+    /// scope flags are optional; an unscoped token sees every signal
+    /// in the tenant.
     Mint {
-        /// Optional human label, separate from the token itself.
-        /// Shown by `weft token ls`. Defaults to the token's own
-        /// readable suffix when omitted.
+        /// Optional human label, pure metadata (never part of the
+        /// token value). Shown by `weft token ls`.
         #[arg(long)]
         name: Option<String>,
-        /// Use a high-entropy token (`wm_tk_<32-hex>`) instead of
-        /// the friendly default.
-        #[arg(long)]
-        hard: bool,
-        /// Restrict to specific consumer kinds (e.g.
-        /// `--kinds human_in_the_loop`). Repeat to allow multiple.
-        /// Empty = any kind.
-        #[arg(long, value_name = "kind")]
-        kinds: Vec<String>,
         /// Restrict to specific project ids. Repeat for multiple.
         /// Empty = any project in the tenant.
         #[arg(long, value_name = "uuid")]
@@ -323,20 +312,21 @@ enum TokenAction {
         #[arg(long, value_name = "tag")]
         tags: Vec<String>,
     },
-    /// List existing API tokens.
+    /// List existing signal tokens (metadata + recognizer; the full
+    /// value is shown only once, at mint).
     Ls,
-    /// Revoke an API token.
-    Revoke { token: String },
+    /// Revoke a signal token by its id (from mint output or `ls`).
+    Revoke { id: String },
 }
 
 impl From<TokenAction> for commands::token::TokenAction {
     fn from(value: TokenAction) -> Self {
         match value {
-            TokenAction::Mint { name, hard, kinds, projects, tags } => {
-                commands::token::TokenAction::Mint { name, hard, kinds, projects, tags }
+            TokenAction::Mint { name, projects, tags } => {
+                commands::token::TokenAction::Mint { name, projects, tags }
             }
             TokenAction::Ls => commands::token::TokenAction::Ls,
-            TokenAction::Revoke { token } => commands::token::TokenAction::Revoke { token },
+            TokenAction::Revoke { id } => commands::token::TokenAction::Revoke { id },
         }
     }
 }
@@ -359,6 +349,23 @@ struct TriggerDeactivationOpts {
     /// What to do with in-flight executions: wait | cancel.
     #[arg(long = "running-policy", value_name = "wait|cancel")]
     running_policy: Option<String>,
+    /// Cap in seconds on a `--running-policy wait` drain ("wait at
+    /// most N, then proceed anyway": the deactivation cancels the
+    /// stragglers; a worker replacement kills them with the old
+    /// workers). Default: the server's 600s.
+    #[arg(long = "drain-timeout", value_name = "seconds")]
+    drain_timeout: Option<u64>,
+}
+
+/// The bare drain cap for `weft infra start` (which takes no
+/// trigger-deactivation flags: infra start fires when the project is
+/// inactive, but its worker reconciliation can still drain).
+#[derive(Debug, clap::Args)]
+struct DrainOpts {
+    /// Cap in seconds on a `--running-policy wait` drain before the
+    /// operation proceeds anyway. Default: the server's 600s.
+    #[arg(long = "drain-timeout", value_name = "seconds")]
+    drain_timeout: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -366,11 +373,10 @@ enum InfraAction {
     /// Run the InfraSetup subworkflow: per-node either skip-apply
     /// (hash match) or fresh apply. Use when starting infra from
     /// scratch.
-    Start,
-    /// Same endpoint as start; labeled differently to acknowledge a
-    /// prior partial-state. Cheap when most nodes are already
-    /// healthy (hash match short-circuits).
-    Restart,
+    Start {
+        #[command(flatten)]
+        drain: DrainOpts,
+    },
     /// Re-apply against current images / sources (stop then start).
     /// When the project is Active, triggers deactivate (same picker as
     /// `weft deactivate`) for the duration. The project is left
@@ -394,6 +400,13 @@ enum InfraAction {
     },
     /// Print the current lifecycle state of each infra node.
     Status,
+    /// Cancel in-flight infra work: halt claimed lifecycle commands
+    /// (the supervisor stops between kubectl steps), cancel unclaimed
+    /// ones outright, interrupt the provisioning execution. HALT, not
+    /// rollback: per-node partial state stays visible; terminate or
+    /// retry per-node from where it stopped. 412 if nothing is in
+    /// flight.
+    Cancel,
     /// Per-node stop. Targets one infra node by id, leaves the rest
     /// of the project's infra untouched. Used from the graph's per-
     /// node menu (the trash icon's siblings).
@@ -433,8 +446,8 @@ enum FilesAction {
     },
     /// Show one file's full metadata.
     Inspect { key: String },
-    /// Download a file: handshake with the dispatcher, then stream
-    /// the bytes DIRECTLY from the storage box.
+    /// Download a file: handshake with the dispatcher for a presigned URL,
+    /// then stream the bytes DIRECTLY from the storage bucket.
     Download {
         key: String,
         /// Output path; defaults to the stored filename.
@@ -451,24 +464,8 @@ enum FilesAction {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Stored bytes + per-disk usage of the tenant's storage box.
+    /// Stored bytes + file count of the tenant's runtime storage.
     Usage,
-}
-
-#[derive(Debug, Subcommand)]
-enum StorageAction {
-    /// View or set the backing-disk profile (StorageClass + unit
-    /// size). With no flags, prints the current profile. Applies to
-    /// disks provisioned from now on.
-    Config {
-        /// Kubernetes StorageClass for new backing disks
-        /// (`default` clears the override).
-        #[arg(long)]
-        class: Option<String>,
-        /// Backing-disk unit size in GiB (grow/shrink granularity).
-        #[arg(long)]
-        disk_gib: Option<u64>,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -509,10 +506,16 @@ impl InfraAction {
             mode: t.mode,
             grace: t.grace,
             running_policy: t.running_policy,
+            drain_timeout: t.drain_timeout,
         };
         match self {
-            InfraAction::Start => (commands::infra::InfraAction::Start, Default::default()),
-            InfraAction::Restart => (commands::infra::InfraAction::Restart, Default::default()),
+            InfraAction::Start { drain } => (
+                commands::infra::InfraAction::Start,
+                commands::infra::InfraOpts {
+                    drain_timeout: drain.drain_timeout,
+                    ..Default::default()
+                },
+            ),
             InfraAction::Stop { opts } => {
                 (commands::infra::InfraAction::Stop, opts_from(opts))
             }
@@ -523,6 +526,7 @@ impl InfraAction {
                 (commands::infra::InfraAction::Upgrade, opts_from(opts))
             }
             InfraAction::Status => (commands::infra::InfraAction::Status, Default::default()),
+            InfraAction::Cancel => (commands::infra::InfraAction::Cancel, Default::default()),
             InfraAction::NodeStop { node_id, force } => (
                 commands::infra::InfraAction::NodeStop { node_id, force },
                 Default::default(),
@@ -566,11 +570,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::New { name } => commands::new::run(ctx, name).await,
         Cmd::Build => commands::build::run(ctx).await,
-        Cmd::Run { detach, running_policy } => commands::run::run(ctx, detach, running_policy).await,
+        Cmd::BuildBase { quiet } => commands::build::run_build_base(quiet).await,
+        Cmd::Run { detach } => commands::run::run(ctx, detach).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,
-        Cmd::Activate { project, reactivate_choice, running_policy } => {
-            commands::activate::run(ctx, project, reactivate_choice, running_policy).await
+        Cmd::Activate { project, reactivate_choice } => {
+            commands::activate::run(ctx, project, reactivate_choice).await
         }
         Cmd::Deactivate { project, opts } => {
             commands::deactivate::run(
@@ -579,16 +584,31 @@ async fn main() -> anyhow::Result<()> {
                 opts.mode,
                 opts.grace,
                 opts.running_policy,
+                opts.drain_timeout,
             )
             .await
         }
         Cmd::CancelActivate { project } => {
             commands::cancel_activate::run(ctx, project).await
         }
+        Cmd::CancelBuild { project } => {
+            commands::cancel_build::run(ctx, project).await
+        }
         Cmd::CancelRunning { project } => {
             commands::cancel_running::run(ctx, project).await
         }
-        Cmd::Resync { running_policy } => commands::resync::run(ctx, running_policy).await,
+        Cmd::Resync { opts } => {
+            commands::resync::run(
+                ctx,
+                commands::infra::InfraOpts {
+                    mode: opts.mode,
+                    grace: opts.grace,
+                    running_policy: opts.running_policy,
+                    drain_timeout: opts.drain_timeout,
+                },
+            )
+            .await
+        }
         Cmd::Ps => commands::ps::run(ctx).await,
         Cmd::Rm { project, infra, journal, image, local, all, force } => {
             commands::rm::run(
@@ -605,7 +625,7 @@ async fn main() -> anyhow::Result<()> {
             commands::infra::run(ctx, verb, opts).await
         }
         Cmd::Add { source } => commands::add::run(ctx, source).await,
-        Cmd::DescribeNodes => commands::describe_nodes::run(ctx).await,
+        Cmd::DescribeNodes { stdlib } => commands::describe_nodes::run(ctx, stdlib).await,
         Cmd::Parse { file } => commands::parse::parse(file).await,
         Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
         Cmd::ParseServer => commands::parse::serve(ctx).await,
@@ -626,11 +646,6 @@ async fn main() -> anyhow::Result<()> {
             }
             FilesAction::Rm { target, yes } => commands::files::rm(ctx, target, yes).await,
             FilesAction::Usage => commands::files::usage(ctx).await,
-        },
-        Cmd::Storage { action } => match action {
-            StorageAction::Config { class, disk_gib } => {
-                commands::files::config(ctx, class, disk_gib).await
-            }
         },
         Cmd::Clean { color, keep_days, all, images, build_cache } => {
             commands::executions::clean(ctx, color, keep_days, all, images, build_cache).await

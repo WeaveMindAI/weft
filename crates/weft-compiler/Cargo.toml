@@ -6,10 +6,30 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-weft-core = { workspace = true }
-weft-catalog = { workspace = true }
+# weft-core's `runtime` feature is enabled ONLY by our `build` feature (which
+# needs the runtime `Node`/`NodeCatalog` types for codegen). The parse/validate
+# path uses only the pure type layer, so a parse-only consumer (the browser
+# WASM build) sets `default-features = false` and weft-core builds without
+# tokio/mio, which has no wasm32 support. Note the parse surface carries no
+# native-only deps, but a wasm32 build additionally needs the consumer crate
+# to supply uuid's getrandom backend (the `js` feature); that is the wasm
+# wrapper crate's concern, not configured here.
+# Direct path dep (NOT `workspace = true`): `default-features = false` must take
+# effect so the parse path doesn't pull weft-core's runtime layer, and cargo
+# ignores a member-level `default-features = false` on a `workspace = true`
+# inherited dep.
+weft-core = { path = "../weft-core", default-features = false }
+# Used only by the build path (codegen / worker_image read the on-disk node
+# tree via FsCatalog). The parse path takes a `&dyn MetadataCatalog` the caller
+# supplies, so it needs no catalog crate. Gated behind `build`.
+weft-catalog = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Project source / drift hashing (the `hash` module). The pure
+# `compute_definition_hash` / `compute_source_hash` are always available
+# (the browser WASM parse build needs `compute_definition_hash`); the
+# filesystem-bound hashes are gated behind `build`.
+sha2 = { workspace = true }
 rowan = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -18,7 +38,20 @@ regex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-filetime = { workspace = true }
+# Native-only; used by the codegen mtime-preservation path. Gated behind `build`.
+filetime = { workspace = true, optional = true }
+# Temp dir for `seed_catalog_into_upload` (server-side create: materialize the
+# upload, seed the catalog, read the self-contained folder back). Gated behind
+# `build`.
+tempfile = { workspace = true, optional = true }
+
+[features]
+default = ["build"]
+# The image-build path: codegen (emit a cargo crate), the worker Dockerfile, and
+# the docker build invocation. Pulls weft-core's runtime layer (codegen names
+# the runtime `Node`/`NodeCatalog`) + filetime (native). The browser WASM parse
+# build turns this off; it needs only parse + enrich + validate.
+build = ["weft-core/runtime", "dep:filetime", "dep:weft-catalog", "dep:tempfile"]
 
 [dev-dependencies]
 uuid = { workspace = true }

@@ -1,4 +1,3 @@
-# Project: e2e_storage_file
 # Fetch a file into storage and keep it. A Text node supplies the source URL the
 # rig injects (a fake server serving known bytes); FetchToStorage downloads it
 # into execution-scoped storage; `keep: true` flags the file to survive the

@@ -3,6 +3,7 @@
 use weft_catalog::{stdlib_root, FsCatalog};
 use weft_compiler::enrich::enrich;
 use weft_compiler::weft_compiler::compile;
+use weft_compiler::CompileFs;
 
 fn catalog() -> FsCatalog {
     FsCatalog::discover(&stdlib_root()).expect("stdlib")
@@ -11,14 +12,13 @@ fn catalog() -> FsCatalog {
 #[test]
 fn enrich_text_debug_chain() {
     let source = r#"
-# Project: Pure
 
 greeting = Text { value: "hello" }
 out = Debug
 
 out.data = greeting.value
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
 
     let text = project.nodes.iter().find(|n| n.id == "greeting").unwrap();
@@ -35,14 +35,13 @@ out.data = greeting.value
 #[test]
 fn enrich_resolves_typevar_through_edge() {
     let source = r#"
-# Project: Resolve
 
 hello = Text { value: "hi" }
 sink = Debug
 
 sink.data = hello.value
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
 
     let sink = project.nodes.iter().find(|n| n.id == "sink").unwrap();
@@ -60,11 +59,10 @@ sink.data = hello.value
 #[test]
 fn enrich_rejects_unknown_node_type() {
     let source = r#"
-# Project: Bad
 
 bad = NotARealNode
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("NotARealNode"), "expected NotARealNode in error, got: {msg}");
@@ -77,11 +75,10 @@ fn enrich_rejects_custom_port_on_node_that_disallows_it() {
     // carries a concrete type so it reaches the can-add check (a
     // MustOverride placeholder would trip the needs-a-type error first).
     let source = r#"
-# Project: Bad
 
 t = Text() -> (bogus: String) { value: "hi" }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -107,7 +104,7 @@ my = Loop(items: List[String], threshold: Number) -> (results: List[String | Nul
     self.acc = p.value
 }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
 
     // Round-trip the full project through serde to pin the wire shape.
@@ -168,7 +165,7 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
     self.results = p.value
 }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     let in_node = project.nodes.iter().find(|n| n.node_type == "LoopIn").expect("LoopIn");
     // outer-in items: List[String].
@@ -195,7 +192,7 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
     self.results = p.value
 }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
     let in_node = project.nodes.iter().find(|n| n.node_type == "LoopIn").expect("LoopIn");
     assert!(in_node.config.get("max_iters").is_none(), "unset max_iters absent from wire");
@@ -222,7 +219,7 @@ outer = Group() {
     }
 }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     // The inner Loop lowers to a LoopIn/LoopOut pair scoped under `outer`.
     let loop_in_id = "outer.inner__in";
@@ -256,7 +253,7 @@ outer = Loop(rows: List[String]) -> (results: List[String | Null]) {
     self.results = inner.results
 }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     assert!(project.nodes.iter().any(|n| n.id == "outer__in" && n.node_type == "LoopIn"));
     assert!(project.nodes.iter().any(|n| n.id == "outer__out" && n.node_type == "LoopOut"));
@@ -276,7 +273,7 @@ outer = Loop(items: List[String]) -> (results: List[String | Null]) {
     self.results = self.items
 }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     // Group lowers to Passthrough boundary nodes.
     assert!(
@@ -312,7 +309,7 @@ l1 = Loop(items: List[String]) -> (results: List[String | Null]) {
     self.results = self.items
 }
 "#;
-    let mut project = compile(source, uuid::Uuid::new_v4(), None).expect("compile ok");
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
     let want_ids = [
         ("l1__in", "LoopIn"),
@@ -335,4 +332,105 @@ l1 = Loop(items: List[String]) -> (results: List[String | Null]) {
             "missing {want_id} ({want_type}) in nested lowering; got: {ids:?}"
         );
     }
+}
+
+#[test]
+fn human_trigger_derives_ports_from_minimal_fields() {
+    // The editor emits fields as `{ fieldType, key }` ONLY: render + config
+    // are inherited from the node's form_field_specs at enrich time, never
+    // duplicated into the source. This proves the minimal shape derives the
+    // full set of ports (approve_reject -> {key}_approved/{key}_rejected
+    // Booleans; text_input -> {key} String), so a lean source is not a lossy
+    // one. Regression guard for the "emit render/config baggage" bug.
+    let source = r#"
+
+human = HumanTrigger() {
+  fields: [
+    { "fieldType": "text_input", "key": "answer" },
+    { "fieldType": "approve_reject", "key": "review" }
+  ]
+}
+out = Debug
+
+out.data = human.answer
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+
+    let human = project.nodes.iter().find(|n| n.id == "human").unwrap();
+    let out_names: Vec<&str> = human.outputs.iter().map(|p| p.name.as_str()).collect();
+    // text_input adds a String OUTPUT named after the key; approve_reject adds
+    // the two Boolean decision outputs.
+    assert!(out_names.contains(&"answer"), "text_input output missing; got {out_names:?}");
+    assert!(out_names.contains(&"review_approved"), "approve output missing; got {out_names:?}");
+    assert!(out_names.contains(&"review_rejected"), "reject output missing; got {out_names:?}");
+
+    let approved = human.outputs.iter().find(|p| p.name == "review_approved").unwrap();
+    assert_eq!(approved.port_type.to_string(), "Boolean");
+    let answer = human.outputs.iter().find(|p| p.name == "answer").unwrap();
+    assert_eq!(answer.port_type.to_string(), "String");
+}
+
+#[test]
+fn human_trigger_accepts_a_matching_declared_port_header() {
+    // A hand-authored `.weft` MAY re-declare the form-derived ports in the
+    // header. That is optional, and accepted IFF each declared port matches a
+    // derived one by name AND type (here `test_approved`/`test_rejected` are
+    // exactly the Booleans `approve_reject` derives). This must NOT error as a
+    // "custom output port" even though HumanTrigger forbids custom ports.
+    let source = r#"
+
+human = HumanTrigger() -> (test_approved: Boolean?, test_rejected: Boolean?) {
+  fields: [ { "fieldType": "approve_reject", "key": "test" } ]
+}
+out = Debug
+
+out.data = human.test_approved
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("a matching header must enrich cleanly");
+
+    let human = project.nodes.iter().find(|n| n.id == "human").unwrap();
+    let out_names: Vec<&str> = human.outputs.iter().map(|p| p.name.as_str()).collect();
+    // No duplicate ports from the redeclaration.
+    assert_eq!(
+        out_names.iter().filter(|n| **n == "test_approved").count(),
+        1,
+        "declared port must merge with the derived one, not duplicate; got {out_names:?}"
+    );
+    assert!(out_names.contains(&"test_rejected"));
+}
+
+#[test]
+fn human_trigger_rejects_a_mismatched_declared_port() {
+    // A header port whose NAME matches a derived port but whose TYPE does not
+    // (String vs the derived Boolean) is a real authoring error, not a silent
+    // coercion. And a header port whose name matches NOTHING derived is the
+    // genuine custom-port error. Both must surface.
+    let wrong_type = r#"
+
+human = HumanTrigger() -> (test_approved: String) {
+  fields: [ { "fieldType": "approve_reject", "key": "test" } ]
+}
+out = Debug
+out.data = human.test_rejected
+"#;
+    let mut project = compile(wrong_type, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    let err = enrich(&mut project, &catalog()).unwrap_err();
+    assert!(format!("{err}").contains("incompatible"), "type mismatch must error: {err}");
+
+    let unknown_port = r#"
+
+human = HumanTrigger() -> (not_a_field: Boolean) {
+  fields: [ { "fieldType": "approve_reject", "key": "test" } ]
+}
+out = Debug
+out.data = human.test_approved
+"#;
+    let mut project = compile(unknown_port, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    let err = enrich(&mut project, &catalog()).unwrap_err();
+    assert!(
+        format!("{err}").contains("custom") && format!("{err}").contains("not_a_field"),
+        "a header port matching no derived port must be a custom-port error: {err}"
+    );
 }

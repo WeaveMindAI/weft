@@ -1,10 +1,10 @@
 //! Per-project infra registry, backed by Postgres `infra_node` rows.
 //!
 //! One row per `(project_id, infra_node_id)` pair tracking the
-//! desired-vs-applied state of one infra node. The `ApplyInfra` task
-//! writes status transitions; the supervisor pod writes runtime
-//! events (Flaky / Recovered) and may flip status as part of its
-//! lifecycle-command execution.
+//! desired-vs-applied state of one infra node. The supervisor pod
+//! writes status transitions as it executes a claimed
+//! `infra_lifecycle_command`, and writes runtime events (Flaky /
+//! Recovered) and may flip status as part of that execution.
 //!
 //! Workers / listeners read `endpoints_json` via the broker's
 //! `/v1/infra/endpoint_url` endpoint (NOT via this module).
@@ -30,7 +30,7 @@ pub struct InfraNodeRow {
     /// Stable per-apply id (Deployment name etc). Empty string when
     /// status is `Failed` and the apply never produced one.
     pub instance_id: String,
-    /// Project namespace (`wm-project-<tenant>-<project>`).
+    /// Project namespace (`wft-project-<tenant>-<project>`).
     pub namespace: String,
     pub status: InfraNodeStatus,
     pub failure_stage: Option<FailureStage>,
@@ -183,6 +183,21 @@ pub async fn list_for_project(
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(parse_row).collect()
+}
+
+/// Whether ANY infra_node row exists for the project (regardless of
+/// status). The "live infra state exists" fact worker placement keys
+/// on: a project whose infra was never provisioned (or fully
+/// terminated) has no rows, so its worker (including the InfraSetup
+/// provisioning execution) runs in the shared pool; the first apply
+/// writes a row and subsequent workers land in the project namespace.
+pub async fn any_for_project(pool: &PgPool, project_id: &str) -> Result<bool> {
+    let (exists,): (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM infra_node WHERE project_id = $1)")
+            .bind(project_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(exists)
 }
 
 /// Delete a row by (project, node). Idempotent. Called by the

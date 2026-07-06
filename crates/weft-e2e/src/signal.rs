@@ -7,7 +7,8 @@
 //!   - Token signals (forms, human-in-the-loop resumes): fired by
 //!     `POST /signal/{signal_token}`.
 //!
-//! Discovery is via an API token: `GET /api-token/{token}/signals` returns the
+//! Discovery is via a signal token (in `Authorization: Bearer`):
+//! `GET /signal-token/signals` returns the
 //! consumer payload of every signal the token can see (each a
 //! `{ token, nodeId, kind, mount_path?, auth?, formSchema?, ... }` object). The
 //! rig mints a PROJECT-SCOPED token (via [`SignalScope`]), so the dispatcher's
@@ -20,7 +21,7 @@ use serde_json::{json, Value};
 
 use crate::client::Dispatcher;
 
-/// A registered signal, as seen through the api-token enumeration. Thin typed
+/// A registered signal, as seen through the signal-token enumeration. Thin typed
 /// accessor over the consumer payload JSON (read by name; SYNC by string with
 /// the listener's render output).
 #[derive(Debug, Clone)]
@@ -58,6 +59,12 @@ impl DiscoveredSignal {
     pub fn form_schema(&self) -> Option<&Value> {
         self.0.get("formSchema").or_else(|| self.0.get("form_schema"))
     }
+    /// True for a RESUME signal (a one-shot reply to a paused execution), false
+    /// for an ENTRY trigger (fireable repeatedly to start a run). The consumer
+    /// splits its list on this: "Triggers" vs "Tasks".
+    pub fn is_resume(&self) -> Option<bool> {
+        self.0.get("isResume").and_then(Value::as_bool)
+    }
 }
 
 /// Mint an api token scoped to a single project, so enumeration through it
@@ -76,21 +83,21 @@ pub async fn mint_project_token(
     let body = json!({
         "name": name,
         "style": "hard",
-        "allowedKinds": [],
         "allowedProjects": [project_id.to_string()],
         "allowedTags": [],
     });
-    let resp: Value = disp.post_json("/api-tokens", &body).await?;
+    let resp: Value = disp.post_json("/signal-tokens", &body).await?;
     resp.get("token")
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("mint token response missing `token`")
 }
 
-/// Enumerate every signal an api token can see.
-pub async fn list_signals(disp: &Dispatcher, api_token: &str) -> Result<Vec<DiscoveredSignal>> {
+/// Enumerate every signal a signal token can see. The token authenticates via
+/// the `Authorization: Bearer` header (never a URL path).
+pub async fn list_signals(disp: &Dispatcher, signal_token: &str) -> Result<Vec<DiscoveredSignal>> {
     let arr: Vec<Value> = disp
-        .get_json(&format!("/api-token/{api_token}/signals"))
+        .get_json_bearer("/signal-token/signals", signal_token)
         .await?;
     Ok(arr.into_iter().map(DiscoveredSignal).collect())
 }

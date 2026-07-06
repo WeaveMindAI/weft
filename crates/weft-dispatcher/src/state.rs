@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use crate::backend::WorkerBackend;
+use crate::authenticator::Authenticator;
+use crate::backend::{ProjectBuilder, WorkerBackend};
 use crate::events::EventBus;
 use crate::journal::Journal;
 use crate::listener::{ListenerBackend, ListenerPool};
 use crate::project_store::ProjectStore;
 use crate::supervisor_pool::{SupervisorBackend, SupervisorPool};
-use crate::tenant::{NamespaceMapper, TenantRouter};
+use crate::tenant::TenantRouter;
 
 /// Stable identifier for this dispatcher Pod. Derived from
 /// `WEFT_POD_ID` (set explicitly), or from `HOSTNAME` (StatefulSet
@@ -48,6 +49,14 @@ pub struct DispatcherState {
     /// extending the Journal trait into a kitchen sink.
     pub pg_pool: sqlx::PgPool,
     pub workers: Arc<dyn WorkerBackend>,
+    /// Builds a project's latest saved source on demand so a verb (`run` /
+    /// `activate` / infra start) can just be clicked on a not-yet-built (or
+    /// edited-since-built) project and it builds first. `None` when a runnable
+    /// definition is already registered before the verb (nothing to build): the
+    /// generic seam a source-tree build path fills. Whatever that impl needs to do
+    /// its work (a builder, a bucket, a registry) it carries itself; the dispatcher
+    /// does not hold those.
+    pub ensure_built: Option<Arc<dyn ProjectBuilder>>,
     pub projects: ProjectStore,
     pub events: EventBus,
     /// Spawns pooled listener pods.
@@ -62,11 +71,26 @@ pub struct DispatcherState {
     /// infra of many projects (exclusive `infra_owner` lease); the pool
     /// scales the pod count up and down by load.
     pub supervisors: SupervisorPool,
-    /// Resolves a tenant for a given project. OSS returns `local`;
-    /// cloud derives from request auth.
+    /// Authenticates a user-facing request to the tenant making it. The default
+    /// returns `local` for every request (no token); a token-verifying impl reads
+    /// the caller's signed token.
+    pub authenticator: Arc<dyn Authenticator>,
+    /// Resolves the owning tenant for a given project. The default returns
+    /// `local`.
     pub tenant_router: Arc<dyn TenantRouter>,
-    /// Resolves a tenant to its kubernetes namespace.
-    pub namespace_mapper: Arc<dyn NamespaceMapper>,
+    /// Decides the worker namespace for a project. The default is the structural
+    /// has-infra rule. The 3 worker-placement sites route through this so there is
+    /// one answer to "where does this worker live."
+    pub placement: Arc<dyn crate::placement::PlacementPolicy>,
+    /// Decides the sandbox runtime (`runtimeClassName`) for a pod, or none. The
+    /// default runs on the host runtime. Held here so any pod spawner shares the
+    /// same decision the worker backend uses.
+    pub sandbox: Arc<dyn crate::placement::SandboxPolicy>,
+    /// Frees a deleted project's stored data, run as the project is removed
+    /// (before the project row is dropped). The default (`WipeProjectFiles`)
+    /// frees the project's `project/`-scoped runtime files from the object
+    /// store. Canonical doc on the `ProjectReclaimer` trait in `placement.rs`.
+    pub project_reclaimer: Arc<dyn crate::placement::ProjectReclaimer>,
     /// Externally-reachable base URL of this dispatcher. Used to
     /// mint user-facing signal URLs (`<base>/signal/<token>`) at
     /// register time. Architecture-4: the dispatcher hosts every
@@ -88,19 +112,16 @@ pub struct DispatcherState {
     /// agnostic services run (infra-supervisor pods; listener pods).
     /// Defaults to the dispatcher's own namespace.
     pub control_plane_namespace: String,
-    /// Docker tag of the per-tenant storage-box image (lazy-applied
-    /// on first storage use; see `storage_box`).
-    pub storage_image: String,
-    /// In-cluster base URL of THIS dispatcher service (what tenant
-    /// pods, e.g. the storage box's grow/shrink requests, call).
-    pub internal_base_url: String,
-    /// Control-plane client for tenant storage boxes (mint, sweeps,
-    /// usage, wipes). Never carries file bytes.
-    pub storage_admin: Arc<dyn weft_storage::client::StorageAdminOps>,
-    /// Relay to the broker's `/storage/authorize`: how the
-    /// dispatcher verifies a storage box's bearer on the internal
-    /// grow/shrink endpoints.
-    pub broker_authorize: Arc<dyn weft_storage::auth::BrokerAuthorizeOps>,
+    /// The in-cluster broker URL the dispatcher proxies the CLI `weft files`
+    /// verbs to (the broker owns the runtime-file bucket + metadata; the
+    /// dispatcher never touches bytes, it just fronts the CLI as the control
+    /// plane). Same URL the worker pods use for the journal.
+    pub broker_url: String,
+    /// The dispatcher's own projected SA token path, signed onto the broker
+    /// storage-admin requests so the broker resolves it to the control plane.
+    pub broker_token_path: std::path::PathBuf,
+    /// Shared HTTP client for the broker storage-admin proxy.
+    pub http: reqwest::Client,
     /// kube client used by the reaper (supervisor scale-down). The
     /// listener and worker backends hold their own clones of the
     /// same `Arc<dyn KubeClient>` (constructed once in main). The
@@ -114,8 +135,8 @@ pub struct DispatcherState {
     /// tokens.
     pub caller_token_secret: Arc<Vec<u8>>,
     /// Public origin of the live-connection gateway (e.g.
-    /// `https://live.example.com` in cloud, or the nip.io-based local
-    /// origin). The handshake builds the per-pod caller URL by prefixing
+    /// `https://live.example.com`, or a nip.io-based origin). The
+    /// handshake builds the per-pod caller URL by prefixing
     /// the pod subdomain onto this host. Empty disables live connections.
     pub gateway_base_url: String,
 }

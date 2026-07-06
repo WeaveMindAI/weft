@@ -11,7 +11,10 @@
 //!     namespace `weft-db` with k8s NetworkPolicy.
 
 pub mod auth;
+pub mod entitlement;
 pub mod handlers;
+pub mod runtime_storage;
+pub mod runtime_store;
 pub mod scope;
 pub mod state;
 
@@ -21,6 +24,35 @@ use axum::{routing::post, Router};
 
 pub use auth::AuthConfig;
 pub use state::BrokerState;
+
+/// Spawn the kept-file expiry sweep: periodically delete runtime files whose
+/// access-bumped TTL has passed. The broker owns the bucket + metadata, so it
+/// runs this itself (not the dispatcher). Stateless + idempotent, so every
+/// broker replica may run it concurrently. A no-op when no object-store slot is
+/// configured (no runtime plane).
+pub fn spawn_expiry_sweep(state: Arc<BrokerState>) {
+    let Some(store) = state.runtime_store.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        // The sweep cadence: kept files are access-bumped, so only genuinely
+        // idle survivors expire; a minute's granularity is plenty.
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match store.sweep_expired().await {
+                Ok(n) if n > 0 => tracing::info!(
+                    target: "weft_broker::runtime_store", swept = n, "expired kept runtime files"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    target: "weft_broker::runtime_store", error = %format!("{e:#}"),
+                    "runtime-file expiry sweep failed; will retry next tick"
+                ),
+            }
+        }
+    });
+}
 
 pub fn router(state: Arc<BrokerState>) -> Router {
     Router::new()
@@ -115,6 +147,10 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             post(handlers::supervisor_command_complete),
         )
         .route(
+            "/v1/supervisor/command_cancel_requested",
+            post(handlers::supervisor_command_cancel_requested),
+        )
+        .route(
             "/v1/supervisor/running_count",
             post(handlers::supervisor_running_count),
         )
@@ -150,6 +186,10 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/infra/wait_apply",
             post(handlers::infra_wait_apply),
         )
-        .route("/storage/authorize", post(handlers::storage_authorize))
+        // Runtime-file plane (`ctx.storage`): worker data path + the
+        // control-plane admin verbs the CLI proxies through the dispatcher.
+        // The broker is the single gatekeeper (resolves the caller in-process,
+        // runs the key wall, enforces quota, signs the bucket).
+        .merge(runtime_storage::router())
         .with_state(state)
 }

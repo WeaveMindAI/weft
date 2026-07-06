@@ -19,6 +19,14 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+bytes = { workspace = true }
+# S3-compatible object-store client (the production `ObjectStore` impl).
+# Works against any S3 endpoint (GCS, SeaweedFS, AWS, a client's bucket)
+# via an endpoint-URL override, which is exactly the deploy-time slot.
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-smithy-types = { workspace = true }
 # Fake-only lock. parking_lot's Mutex never poisons and lints cleanly
 # against accidental cross-await holding (vs std's Mutex which clippy
 # warns on but doesn't prevent). Behind the feature so production

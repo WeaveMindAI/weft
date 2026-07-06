@@ -38,7 +38,7 @@ fn unit_map(
 
 const TENANT: &str = "tenant-test";
 const PROJECT: &str = "proj1";
-const NAMESPACE: &str = "wm-project-test-proj1";
+const NAMESPACE: &str = "wft-project-test-proj1";
 const NODE: &str = "bridge";
 
 fn rig() -> SupervisorTestRig {
@@ -713,12 +713,12 @@ async fn default_protocol_parks_active_project_on_infra_broken() {
     // Project starts Active.
     rig.broker.add_project_with_status(
         "proj-active",
-        "wm-project-test-active",
+        "wft-project-test-active",
         weft_broker_client::protocol::ProjectStatus::Active,
     );
     rig.broker.add_infra_node("proj-active", NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
-        "wm-project-test-active",
+        "wft-project-test-active",
         vec![workload("inst1-bridge", NODE, 1, 0)],
     );
     rig.advance(Duration::from_secs(35));
@@ -745,14 +745,14 @@ async fn default_protocol_auto_recovers_inactive_project_on_infra_healthy() {
     let rig = rig();
     rig.broker.add_project_with_status(
         "proj-inactive",
-        "wm-project-test-inactive",
+        "wft-project-test-inactive",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
     // The health loop parked it: auto-recover is allowed to undo it.
     rig.broker.set_deactivated_by_health("proj-inactive", true);
     rig.broker.add_infra_node("proj-inactive", NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
-        "wm-project-test-inactive",
+        "wft-project-test-inactive",
         vec![workload("inst1-bridge", NODE, 1, 1)],
     );
 
@@ -785,13 +785,13 @@ async fn default_protocol_does_not_reactivate_user_deactivated_project() {
     let rig = rig();
     rig.broker.add_project_with_status(
         "proj-user-off",
-        "wm-project-test-user-off",
+        "wft-project-test-user-off",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
     // The USER deactivated: the flag stays false (default).
     rig.broker.add_infra_node("proj-user-off", NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
-        "wm-project-test-user-off",
+        "wft-project-test-user-off",
         vec![workload("inst1-bridge", NODE, 1, 1)], // pods still healthy
     );
 
@@ -821,24 +821,24 @@ async fn default_protocol_does_not_fire_when_status_mismatches() {
     let rig = rig();
     rig.broker.add_project_with_status(
         "active-healthy",
-        "wm-active-healthy",
+        "wft-active-healthy",
         weft_broker_client::protocol::ProjectStatus::Active,
     );
     rig.broker.add_infra_node("active-healthy", NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
-        "wm-active-healthy",
+        "wft-active-healthy",
         vec![workload("inst1-bridge", NODE, 1, 1)],
     );
     rig.tick_health().await.unwrap();
 
     rig.broker.add_project_with_status(
         "inactive-broken",
-        "wm-inactive-broken",
+        "wft-inactive-broken",
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
     rig.broker.add_infra_node("inactive-broken", NODE, "inst1", Status::Running);
     rig.kube.set_workloads(
-        "wm-inactive-broken",
+        "wft-inactive-broken",
         vec![workload("inst1-bridge", NODE, 1, 0)],
     );
     rig.advance(Duration::from_secs(35));

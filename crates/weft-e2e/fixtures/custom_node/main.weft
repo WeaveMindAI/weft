@@ -1,4 +1,3 @@
-# Project: e2e_custom_node
 # Uses a project-local custom node (Multiply, defined under nodes/multiply/).
 # ExecPython supplies the two operands; Multiply produces the product; Debug
 # receives it. Proves a user-authored node compiles into the worker and runs.

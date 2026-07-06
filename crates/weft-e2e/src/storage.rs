@@ -52,7 +52,11 @@ pub async fn list(disp: &Dispatcher, project_id: &Uuid) -> Result<Vec<StoredFile
     Ok(files.into_iter().map(StoredFile).collect())
 }
 
-/// Find files under a key prefix (e.g. `exec/<color>/` for one run's scratch).
+/// Find files under a SCOPE key prefix (e.g. `exec/<color>/` for one run's
+/// scratch). Wire keys are tenant-anchored (`<tenant>/<scope>/<owner>/<id>`),
+/// but tests think in the scope portion, so match the key with its leading
+/// `<tenant>/` segment stripped. Tenant-agnostic, so it works for any
+/// tenant, `local` included.
 pub async fn list_prefix(
     disp: &Dispatcher,
     project_id: &Uuid,
@@ -61,35 +65,35 @@ pub async fn list_prefix(
     Ok(list(disp, project_id)
         .await?
         .into_iter()
-        .filter(|f| f.key().map(|k| k.starts_with(prefix)).unwrap_or(false))
+        .filter(|f| {
+            f.key()
+                .and_then(|k| k.split_once('/'))
+                .map(|(_tenant, scope_key)| scope_key.starts_with(prefix))
+                .unwrap_or(false)
+        })
         .collect())
 }
 
-/// Download a stored file's bytes by key: handshake for a capability URL, then
-/// stream the bytes from the box's public ingress.
+/// Download a stored file's bytes by key: handshake for a presigned bucket URL,
+/// then stream the bytes directly from the storage bucket.
 ///
-/// The box is a SCALE-TO-ZERO service behind nginx. The dispatcher's
-/// `ensure_box` waits for the box process, but there is still a short window,
-/// after a cold wake, where nginx has not yet registered the box's endpoint and
-/// the public route answers `503`/`502`/`504` ("no healthy upstream"). That is a
-/// transient not-ready state, not a download failure, so we poll through those
-/// gateway codes until the box is actually serving (bounded; a user-controlled
-/// operation legitimately running long is not the case here, this is internal
-/// box-wake readiness). Any OTHER non-success (403 denied, 404 gone) fails fast.
+/// The bucket (SeaweedFS) is reached over a port-forward in the local emulation.
+/// A freshly-(re)started forward, or the bucket pod still settling, can
+/// transiently answer `502`/`503`/`504` or refuse the connection. That is a
+/// not-ready state, not a download failure, so we poll through those codes +
+/// transport errors until the bucket is serving (bounded). Any OTHER non-success
+/// (403 denied/expired signature, 404 gone) fails fast.
 pub async fn download(disp: &Dispatcher, project_id: &Uuid, key: &str) -> Result<Vec<u8>> {
     // Gateway "upstream not ready yet" codes: retry these, fail fast on the rest.
     const NOT_READY: [u16; 3] = [502, 503, 504];
     let deadline = Duration::from_secs(60);
     let interval = Duration::from_millis(500);
 
-    // Mint the capability URL ONCE, not per attempt. Minting is NOT free: it
-    // calls the box's `touch_access`, which on a KEPT file rewrites the file's
-    // metadata on disk and pushes its TTL forward; re-minting every poll would
-    // do that up to ~120 times. A stale URL is never the cause of a
-    // gateway-not-ready code (those are nginx-has-no-upstream, independent of
-    // the capability), so one mint suffices. Give it a TTL well above the poll
-    // deadline so it cannot expire mid-wait. (Same mint-once-then-reuse
-    // discipline as `signal.rs`, which avoids littering the token table.)
+    // Mint the presigned URL ONCE, not per attempt. The presign counts as an
+    // access (it bumps a KEPT file's TTL); re-minting every poll would bump it
+    // up to ~120 times. A not-ready bucket response is independent of the URL,
+    // so one mint suffices. Give it a TTL well above the poll deadline so the
+    // signed URL cannot expire mid-wait.
     let body = json!({
         "key": key,
         "project": project_id.to_string(),

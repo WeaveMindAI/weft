@@ -1,0 +1,24 @@
+{
+  "type": "HoldGate",
+  "label": "Hold Gate",
+  "description": "Hold the execution open until a release URL says go. Polls the configured URL until its body contains 'release', then emits. The e2e rig's lever for a real, controllable long-running execution: the rig starts a run, watches it sit in `running`, drives lifecycle verbs against it (drain, cancel, resume), and releases it on cue.",
+  "category": "Custom",
+  "tags": ["e2e", "gate", "hold"],
+  "icon": "Hand",
+  "color": "#f59e0b",
+  "inputs": [
+    { "name": "arm", "type": "T", "required": true }
+  ],
+  "outputs": [
+    { "name": "done", "type": "String" }
+  ],
+  "fields": [
+    {
+      "key": "url",
+      "label": "Release URL",
+      "field_type": { "kind": "text" },
+      "required": true
+    }
+  ],
+  "requires_infra": false
+}

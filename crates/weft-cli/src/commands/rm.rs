@@ -98,8 +98,11 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
             format!("/projects/{project_id}")
         };
         progress.dispatcher_call_start(&unregister_path);
+        // Idempotent: a marker-404 ("no such project") on a delete means the
+        // project is already gone, which is rm's desired end state (a retry
+        // after a lost success response must not fail).
         client
-            .delete(&unregister_path)
+            .delete_idempotent(&unregister_path)
             .await
             .context("dispatcher unregister")?;
         progress.dispatcher_call_done(serde_json::json!({ "step": "unregister" }));
@@ -126,27 +129,31 @@ async fn drop_journal_rows(
 ) -> Result<()> {
     // Walk the execution list and delete colors individually (the
     // dispatcher has no bulk DELETE for a project's journal rows).
-    let execs: serde_json::Value = client
-        .get_json("/executions")
-        .await
-        .context("list executions")?;
-    let Some(arr) = execs.as_array() else {
-        anyhow::bail!("/executions returned non-array: {execs}");
-    };
+    // `/executions` is paginated (`{ executions, total }`) with a server-side
+    // project filter; deleting shifts offsets, so re-fetch the FIRST page
+    // after each batch until it comes back empty.
     let mut dropped = 0u32;
-    for e in arr {
-        let pid = e.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-        if pid != project_id {
-            continue;
-        }
-        let Some(color) = e.get("color").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        client
-            .delete(&format!("/executions/{color}"))
+    loop {
+        let page: serde_json::Value = client
+            .get_json(&format!("/executions?project_id={project_id}&limit=200"))
             .await
-            .with_context(|| format!("delete execution {color}"))?;
-        dropped += 1;
+            .context("list executions")?;
+        let Some(arr) = page.get("executions").and_then(|v| v.as_array()) else {
+            anyhow::bail!("/executions returned no `executions` array: {page}");
+        };
+        if arr.is_empty() {
+            break;
+        }
+        for e in arr {
+            let Some(color) = e.get("color").and_then(|v| v.as_str()) else {
+                anyhow::bail!("/executions row without a color: {e}");
+            };
+            client
+                .delete(&format!("/executions/{color}"))
+                .await
+                .with_context(|| format!("delete execution {color}"))?;
+            dropped += 1;
+        }
     }
     progress.dispatcher_call_done(serde_json::json!({
         "step": "journal_drop",

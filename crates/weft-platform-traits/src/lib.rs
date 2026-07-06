@@ -17,13 +17,16 @@
 //! keeps fakes out of release binaries.
 
 pub mod clock;
+pub mod drain;
 pub mod kube;
 pub mod mem_pressure;
+pub mod object_store;
 
 // Re-export the trait surface at the crate root so consumers can
 // write `use weft_platform_traits::{Clock, KubeClient, ...};`
 // without leaking the internal module layout. Fakes stay gated.
 pub use clock::{Clock, SystemClock};
+pub use drain::{drain_until_zero, DrainOutcome, DRAIN_POLL_INTERVAL};
 pub use kube::{
     DeleteOpts, KubeClient, KubeReader, KubeWriter, WorkloadKind, WorkloadReplicaState,
 };
@@ -31,6 +34,12 @@ pub use mem_pressure::{
     is_saturated, plan_memory_scaledown, CgroupMemPressure, MemPressure, PoolPodLoad,
     SATURATION_MEM_FRACTION,
 };
+pub use object_store::{
+    object_store_from_env, ObjectEntry, ObjectStore, ObjectStoreConfig, PresignAudience,
+    S3ObjectStore, SharedObjectStore,
+};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use object_store::fake::{FakeCall as ObjectStoreFakeCall, FakeObjectStore};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use clock::FakeClock;
 #[cfg(any(test, feature = "test-helpers"))]

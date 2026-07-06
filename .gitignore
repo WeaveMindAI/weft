@@ -21,6 +21,10 @@ __pycache__
 node_modules/
 .DS_Store
 
+# Codegen-emitted builder-base warm-up crate (emitted by
+# `codegen::emit_warmup_crate` at build time; regenerated, never hand-edited).
+.weft-warmup/
+
 # VS Code extension build output
 extension-vscode/out/
 extension-vscode/.vscode-test/
@@ -40,4 +44,7 @@ dashboard-v1/static/projects
 
 # AI agent scratch
 .claude/agents/prompt-engineering.md
+# The agent memory index is private working notes, not part of the public repo.
+.claude/MEMORY.md
 CODE_QUALITY_TRIAGE.md
+packages/weft-graph/node_modules

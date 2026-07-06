@@ -48,20 +48,6 @@ spec:
       ports:
         - protocol: TCP
           port: 9999
-    # Per-tenant storage boxes call the dispatcher's internal
-    # grow/shrink endpoints (/internal/storage/.../disks/add|remove).
-    # They live in tenant namespaces (weft.dev/role=tenant) with pod
-    # role `storage`.
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              weft.dev/role: tenant
-          podSelector:
-            matchLabels:
-              weft.dev/role: storage
-      ports:
-        - protocol: TCP
-          port: 9999
 ---
 # Dispatcher egress: god mode. The dispatcher is the control plane:
 # it reaches every tenant listener (admin POSTs to /register, /process,

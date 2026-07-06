@@ -57,17 +57,28 @@ pub struct RegisterSignalResult {
 
 pub struct RegisterSignalExecutor;
 
-/// Normalize the public mount path for a `SignalSurface`. Empty
-/// string ⇒ "/", non-empty ⇒ "/<path>" with one leading slash.
-/// Returns `None` for surfaces that don't expose a mount path
-/// (`TaskCallback`, `Internal`).
-fn mount_path_for(surface: &weft_core::primitive::SignalSurface) -> Option<String> {
+/// The stored mount path for a public-entry surface, namespaced by the owning
+/// tenant: `/<tenant>/<path>`. The tenant prefix walls each account into its own
+/// path space, so two tenants can both claim `chat` without colliding, and one
+/// tenant claiming a path never blocks another (the old global unique index
+/// did both wrong). Callers reach it at `/connect/<tenant>/<path>` (live) or
+/// `POST /<tenant>/<path>` (public fire), the tenant segment is in the URL.
+/// A guessable URL is fine here: live/public endpoints are API surfaces whose
+/// callers bring their own auth; the tenant prefix is for COLLISION, not
+/// secrecy.
+fn mount_path_for(
+    surface: &weft_core::primitive::SignalSurface,
+    tenant: &str,
+) -> Option<String> {
     match surface {
-        weft_core::primitive::SignalSurface::PublicEntry { path } => Some(if path.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", path.trim_start_matches('/'))
-        }),
+        weft_core::primitive::SignalSurface::PublicEntry { path } => {
+            let path = path.trim_start_matches('/');
+            Some(if path.is_empty() {
+                format!("/{tenant}")
+            } else {
+                format!("/{tenant}/{path}")
+            })
+        }
         weft_core::primitive::SignalSurface::TaskCallback
         | weft_core::primitive::SignalSurface::Internal => None,
     }
@@ -105,7 +116,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 "journal row for color {color} is corrupt; see dispatcher logs"
             ),
         };
-        let tenant = state.tenant_router.tenant_for_project(&project_id);
+        let tenant = state.tenant_router.tenant_for_project(&project_id).await?;
 
         let token = if payload.is_resume {
             // Derive resume token from the suspension identity so a
@@ -201,7 +212,14 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                         // SQL error. Same (project, node) reclaiming
                         // the path on reactivate is fine because we
                         // reused the existing token above.
-                        if let Some(mp) = mount_path_for(&routing.surface) {
+                        if let Some(mp) = mount_path_for(&routing.surface, &tenant_for_register) {
+                            // Single-claim within THIS tenant: the mount path is
+                            // already tenant-prefixed, so this query only ever
+                            // sees the caller's own account. A different (project,
+                            // node) of the SAME tenant owning the path is the
+                            // conflict (e.g. two of the user's projects both
+                            // claim `chat`); another tenant's identical path has a
+                            // different prefix and cannot appear here.
                             if let Some((existing_project, existing_node)) =
                                 sqlx::query_as::<_, (String, String)>(
                                     "SELECT project_id, node_id FROM signal \
@@ -216,7 +234,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                                 .await?
                             {
                                 anyhow::bail!(
-                                    "mount path '{mp}' already registered \
+                                    "you already registered this path \
                                      (project='{existing_project}', node='{existing_node}'); \
                                      change `path` config or unregister the existing node"
                                 );
@@ -254,7 +272,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             .await?;
 
         let surface_kind_str = routing.surface.kind_tag().to_string();
-        let mount_path = mount_path_for(&routing.surface);
+        let mount_path = mount_path_for(&routing.surface, tenant.as_str());
         let auth_kind_str = routing.auth.kind_tag().to_string();
         let auth_config_value = if routing.auth_config.is_null() {
             None
@@ -271,7 +289,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
 
         // Look up the registering node's _tags from the project
         // definition so the signal row carries them. Tags drive the
-        // api_token enumeration filter; charset already validated
+        // signal-token enumeration filter; charset already validated
         // at parse time.
         let project_uuid: uuid::Uuid = project_id
             .parse()
@@ -407,5 +425,37 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         }
 
         Ok(serde_json::to_value(RegisterSignalResult { token })?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mount_path_for;
+    use weft_core::primitive::SignalSurface;
+
+    #[test]
+    fn public_entry_path_is_tenant_namespaced() {
+        let s = SignalSurface::PublicEntry { path: "chat".into() };
+        assert_eq!(mount_path_for(&s, "alice").as_deref(), Some("/alice/chat"));
+        // Same path, different tenant -> different mount path (no collision).
+        assert_eq!(mount_path_for(&s, "bob").as_deref(), Some("/bob/chat"));
+    }
+
+    #[test]
+    fn public_entry_empty_path_is_just_the_tenant() {
+        let s = SignalSurface::PublicEntry { path: String::new() };
+        assert_eq!(mount_path_for(&s, "alice").as_deref(), Some("/alice"));
+    }
+
+    #[test]
+    fn leading_slash_in_path_is_normalized() {
+        let s = SignalSurface::PublicEntry { path: "/webhooks/stripe".into() };
+        assert_eq!(mount_path_for(&s, "acme").as_deref(), Some("/acme/webhooks/stripe"));
+    }
+
+    #[test]
+    fn non_public_surfaces_have_no_mount_path() {
+        assert!(mount_path_for(&SignalSurface::TaskCallback, "alice").is_none());
+        assert!(mount_path_for(&SignalSurface::Internal, "alice").is_none());
     }
 }

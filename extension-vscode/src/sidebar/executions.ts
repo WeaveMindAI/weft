@@ -14,6 +14,7 @@ import * as vscode from 'vscode';
 import type { DispatcherClient, SseSubscription } from '../dispatcher';
 import type { WeftProject } from './projects';
 
+// SYNC: ExecutionSummary <-> crates/weft-dispatcher/src/journal/mod.rs (ExecutionSummary), weavemind/website/src/routes/(app)/executions/+page.ts (Execution)
 export interface ExecutionSummary {
   color: string;
   project_id: string;
@@ -23,11 +24,17 @@ export interface ExecutionSummary {
   completed_at?: number | null;
 }
 
-export class ExecutionsProvider implements vscode.TreeDataProvider<ExecutionNode> {
+export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this._onDidChange.event;
 
+  static readonly PAGE_SIZE = 50;
   private cache: ExecutionSummary[] = [];
+  private total = 0;
+  // How many rows the tree currently requests. A "Load more" node bumps this by
+  // a page; a refresh keeps the expanded count so live updates do not collapse
+  // the list the user grew.
+  private loaded = ExecutionsProvider.PAGE_SIZE;
   private pinnedProject: WeftProject | undefined;
   private eventSubscription: SseSubscription | undefined;
   // Tight refresh burst after an event: avoids piling a second
@@ -77,12 +84,66 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<ExecutionNode
     if (this.refreshDebounceTimer) clearTimeout(this.refreshDebounceTimer);
   }
 
+  /** Fetch ONE page (`PAGE_SIZE` rows at `offset`, newest first, filtered to the
+   *  pinned project). Kept to PAGE_SIZE so a single request never exceeds the
+   *  dispatcher's per-request page cap (which is why growing one window's `limit`
+   *  past the cap silently stopped returning more). */
+  private async fetchPage(offset: number): Promise<ExecutionPage> {
+    const params = new URLSearchParams({
+      limit: String(ExecutionsProvider.PAGE_SIZE),
+      offset: String(offset),
+    });
+    if (this.pinnedProject) params.set('project_id', this.pinnedProject.id);
+    return this.client.get<ExecutionPage>(`/executions?${params}`);
+  }
+
+  /** Re-fetch the whole currently-loaded span, page by page (so no single
+   *  request exceeds the server cap), rebuilding the cache newest-first with no
+   *  duplicate colors (a live insert can shift the window between pages). */
   async refresh(): Promise<void> {
     try {
-      this.cache = await this.client.get<ExecutionSummary[]>('/executions');
+      const rebuilt: ExecutionSummary[] = [];
+      const seen = new Set<string>();
+      let total = 0;
+      for (let offset = 0; offset < this.loaded; offset += ExecutionsProvider.PAGE_SIZE) {
+        const page = await this.fetchPage(offset);
+        total = page.total;
+        for (const e of page.executions) {
+          if (!seen.has(e.color)) {
+            seen.add(e.color);
+            rebuilt.push(e);
+          }
+        }
+        // Fewer rows than requested => we reached the end; stop early.
+        if (page.executions.length < ExecutionsProvider.PAGE_SIZE) break;
+      }
+      this.cache = rebuilt;
+      this.total = total;
     } catch (err) {
       console.warn('[weft/executions] list failed', err);
       this.cache = [];
+      this.total = 0;
+    }
+    this._onDidChange.fire();
+  }
+
+  /** Fetch the NEXT page beyond what is loaded and append it (true offset
+   *  pagination, so there is no ceiling). Bound to the "Load more" node's
+   *  command. */
+  async loadMore(): Promise<void> {
+    try {
+      const page = await this.fetchPage(this.cache.length);
+      const seen = new Set(this.cache.map((e) => e.color));
+      for (const e of page.executions) {
+        if (!seen.has(e.color)) {
+          seen.add(e.color);
+          this.cache.push(e);
+        }
+      }
+      this.total = page.total;
+      this.loaded = this.cache.length;
+    } catch (err) {
+      console.warn('[weft/executions] load-more failed', err);
     }
     this._onDidChange.fire();
   }
@@ -91,15 +152,37 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<ExecutionNode
     return this.cache;
   }
 
-  getTreeItem(n: ExecutionNode): vscode.TreeItem {
+  getTreeItem(n: vscode.TreeItem): vscode.TreeItem {
     return n;
   }
 
-  async getChildren(): Promise<ExecutionNode[]> {
+  async getChildren(): Promise<vscode.TreeItem[]> {
     if (this.cache.length === 0) await this.refresh();
-    const sorted = [...this.cache].sort((a, b) => b.started_at - a.started_at);
-    return sorted.map((s) => new ExecutionNode(s, this.pinnedProject?.id === s.project_id));
+    // The server already ordered newest-first; no client sort.
+    const nodes: vscode.TreeItem[] = this.cache.map(
+      (s) => new ExecutionNode(s, this.pinnedProject?.id === s.project_id),
+    );
+    if (this.cache.length < this.total) nodes.push(new LoadMoreNode(this.total - this.cache.length));
+    return nodes;
   }
+}
+
+/** A trailing "Load more" tree item, shown when the server has more executions
+ *  than the currently loaded window. Its command grows the window. */
+export class LoadMoreNode extends vscode.TreeItem {
+  constructor(remaining: number) {
+    super(`Load more (${remaining} more)`, vscode.TreeItemCollapsibleState.None);
+    this.iconPath = new vscode.ThemeIcon('ellipsis');
+    this.contextValue = 'weftExecutionLoadMore';
+    this.command = { command: 'weft.loadMoreExecutions', title: 'Load more' };
+  }
+}
+
+/** The `/executions` response: a page plus the total matching count. */
+// SYNC: ExecutionPage <-> crates/weft-dispatcher/src/journal/mod.rs (ExecutionPage), weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage)
+interface ExecutionPage {
+  executions: ExecutionSummary[];
+  total: number;
 }
 
 export class ExecutionNode extends vscode.TreeItem {

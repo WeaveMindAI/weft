@@ -26,7 +26,7 @@ use std::sync::Arc;
 /// 100% on purpose: a pod calls itself full with headroom to spare so
 /// it is not already in trouble when it sheds load. Shared by BOTH
 /// pooled pods (listener + supervisor) so their saturation thresholds
-/// cannot drift. An honest standalone default; cloud may tune it.
+/// cannot drift. An honest default; a deployment may tune it.
 pub const SATURATION_MEM_FRACTION: f64 = 0.75;
 
 /// Pure saturation decision: is `fraction` at or above `threshold`?

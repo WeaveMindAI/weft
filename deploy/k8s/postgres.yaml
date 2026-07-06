@@ -18,12 +18,11 @@ spec:
       storage: 5Gi
 ---
 # LOCAL-DEV ONLY. The password below is committed to the repo for
-# kind/setup.sh boostrap. Production / cloud deployments MUST NOT
-# apply this manifest; they create the same-named Secret out-of-band
+# kind/setup.sh boostrap. Production deployments MUST NOT apply this
+# manifest; they create the same-named Secret out-of-band
 # (sealed-secrets, external-secrets, or a manual `kubectl create
 # secret`) before applying the rest of the bundle. The Deployment
-# below references this Secret by name and is identical between
-# local and cloud.
+# below references this Secret by name and does not change.
 #
 # Why `data` (base64) instead of `stringData`: kubectl rewrites
 # `stringData` into `data` server-side, but the client-side
@@ -57,8 +56,8 @@ data:
 # the dispatcher (which runs there) can `secretKeyRef` against a
 # local copy. Kubernetes Secrets are namespace-scoped; this is the
 # canonical way to share. Prod operators must rotate BOTH copies in
-# lockstep; cloud deployments should drive this via a real secret
-# manager rather than a static replica.
+# lockstep, ideally driven by a real secret manager rather than a
+# static replica.
 apiVersion: v1
 kind: Secret
 metadata:

@@ -102,6 +102,15 @@ pub enum DispatcherEvent {
     ProjectRegistered { project_id: String, name: String },
     ProjectActivated { project_id: String },
     ProjectDeactivated { project_id: String },
+    /// A project lifecycle axis flipped: entering/leaving a
+    /// transitional state (activating, deactivating, building,
+    /// cancelling_build) or landing at rest. Carries both axes so a
+    /// client can render the new state without a round-trip; clients
+    /// that prefer one code path just refetch `/status` on receipt.
+    /// This is what makes backend-owned transitional state observable
+    /// in near-real-time (the backend-owns-state rule has no teeth
+    /// without it).
+    ProjectTransitionChanged { project_id: String, status: String, transition: String },
     /// Infra node transitioned between status values. Catch-all for
     /// supervisor-driven state changes the extension renders as a
     /// per-node badge.
@@ -273,6 +282,7 @@ impl DispatcherEvent {
             | Self::ProjectRegistered { project_id, .. }
             | Self::ProjectActivated { project_id }
             | Self::ProjectDeactivated { project_id }
+            | Self::ProjectTransitionChanged { project_id, .. }
             | Self::InfraStatusChanged { project_id, .. }
             | Self::InfraFlaky { project_id, .. }
             | Self::InfraRecovered { project_id, .. }
@@ -326,6 +336,7 @@ impl DispatcherEvent {
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }
             | Self::ProjectDeactivated { .. }
+            | Self::ProjectTransitionChanged { .. }
             | Self::InfraStatusChanged { .. }
             | Self::InfraFlaky { .. }
             | Self::InfraRecovered { .. }

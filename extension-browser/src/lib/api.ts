@@ -1,16 +1,17 @@
-// API client for the WeaveMind dispatcher's general signal surface.
+// API client for the weft dispatcher's general signal surface.
 //
-// Architecture-4: the dispatcher exposes ONE generic enumeration
-// route per api_token (`GET /api-token/{tk}/signals`) and ONE
+// The dispatcher exposes ONE generic enumeration route
+// (`GET /signal-token/signals`, the signal token in `Authorization:
+// Bearer`, never in the URL where logs would capture it) and ONE
 // generic per-signal route (`POST /signal/{signal_token}`,
-// `DELETE /signal/{signal_token}`). Per-kind rendering happens
+// `DELETE /signal/{signal_token}`, addressed by the per-signal fire
+// token, whose whole job is to be a URL). Per-kind rendering happens
 // inside the listener. The browser extension is the consumer that
-// renders Form-kind signals; future consumers (Slack bot, etc)
-// would render their kinds the same way against the same routes.
+// renders Form-kind signals; future consumers (Slack bot, etc) would
+// render their kinds the same way against the same routes.
 //
-// Each token in storage is scoped server-side (kinds + projects +
-// tags). The extension just uses the token; scope checks happen on
-// the dispatcher.
+// Each token is scoped by the dispatcher (projects + tags). The extension
+// just uses the token; scope + tenant checks happen on the dispatcher.
 
 export interface PendingTask {
   /// Per-signal token. Identifies the signal end-to-end:
@@ -23,9 +24,9 @@ export interface PendingTask {
   /// Wake-signal kind tag (e.g. `form`, `timer`, `api_endpoint`).
   /// Useful for the extension to skip kinds it can't render.
   kind: string;
-  /// Free-form consumer label (e.g. `human_in_the_loop`). Set by
-  /// the registering node; the extension's allowed_kinds must
-  /// include it for the dispatcher to surface this signal.
+  /// Free-form consumer label (e.g. `human_in_the_loop`). Set by the
+  /// registering node; descriptive metadata the extension can use to
+  /// pick a renderer. (No longer a token filter dimension.)
   consumerKind?: string;
   /// Display text. Listener picks a sensible default if the node
   /// didn't set a title.
@@ -33,16 +34,26 @@ export interface PendingTask {
   description?: string;
   /// Form schema, present for Form-kind signals.
   formSchema?: unknown;
+  /// TRIGGER (false) vs RESUME task (true). A trigger is an entry point: it
+  /// stays listed while the project is active and can be fired repeatedly to
+  /// START a run. A resume is a one-shot reply to a paused execution: it
+  /// disappears once answered. The list groups on this. Stamped by the
+  /// dispatcher's enumeration; absent on very old payloads (treated as a
+  /// resume task, the historical behavior).
+  isResume?: boolean;
 }
 
 export interface ApiToken {
-  /// The api_token string (e.g. `wm_tk_swift-falcon-23`).
+  /// The signal-token string (e.g. `wft-azure-otter-brave-summit-river-maple`).
+  /// Shown ONCE at mint; the extension keeps it locally and presents it via
+  /// `Authorization: Bearer`.
   token: string;
   /// User-facing name shown in the popup.
   name: string;
   /// Base URL of the dispatcher this token belongs to. Allows the
-  /// extension to point at multiple dispatchers (e.g. local + cloud)
-  /// from one browser.
+  /// extension to point at more than one dispatcher from one browser.
+  /// Parsed out of the pasted server-qualified address
+  /// (`<base>/signal-token/<token>`).
   dispatcherUrl: string;
 }
 
@@ -73,8 +84,15 @@ export interface FetchTasksResult {
   /// True iff at least one configured token successfully reached
   /// its dispatcher. Drives the popup's "connected" indicator.
   anyReachable: boolean;
-  tokenCount: number;
-  successCount: number;
+  /// Every api-token string currently configured, reached or not. A consumer
+  /// carrying per-token state across polls prunes to this set, so a token the
+  /// user deleted does not leave its state lingering forever.
+  configuredTokens: string[];
+  /// The api-token strings whose dispatcher WAS reached this fetch. Tasks of
+  /// an unreached token are absent from `tasks` without being gone, so a
+  /// consumer tracking per-task state (e.g. already-notified tasks) must only
+  /// refresh the state of reached tokens and carry the rest forward.
+  reachedTokens: string[];
 }
 
 /// Fetch pending tasks from every configured api_token IN PARALLEL.
@@ -84,12 +102,15 @@ export async function fetchPendingTasks(
 ): Promise<FetchTasksResult> {
   const tokens = await getTokens();
   if (tokens.length === 0) {
-    return { tasks: [], anyReachable: false, tokenCount: 0, successCount: 0 };
+    return { tasks: [], anyReachable: false, configuredTokens: [], reachedTokens: [] };
   }
 
   const fetchOne = async (tokenConfig: ApiToken): Promise<PendingTask[]> => {
-    const url = `${tokenConfig.dispatcherUrl}/api-token/${tokenConfig.token}/signals`;
-    const opts: RequestInit = { method: 'GET' };
+    const url = `${tokenConfig.dispatcherUrl}/signal-token/signals`;
+    const opts: RequestInit = {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${tokenConfig.token}` },
+    };
     if (timeoutMs) opts.signal = AbortSignal.timeout(timeoutMs);
     const resp = await fetch(url, opts);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -103,23 +124,23 @@ export async function fetchPendingTasks(
 
   const results = await Promise.allSettled(tokens.map(fetchOne));
   const allTasks: PendingTask[] = [];
-  let successCount = 0;
+  const reachedTokens: string[] = [];
   results.forEach((res, i) => {
     if (res.status === 'fulfilled') {
       allTasks.push(...res.value);
-      successCount += 1;
+      reachedTokens.push(tokens[i].token);
     } else {
       console.warn(
-        `[WeaveMind] Failed to fetch tasks for token ${tokens[i].name}:`,
+        `[weft] Failed to fetch tasks for token ${tokens[i].name}:`,
         res.reason,
       );
     }
   });
   return {
     tasks: allTasks,
-    anyReachable: successCount > 0,
-    tokenCount: tokens.length,
-    successCount,
+    anyReachable: reachedTokens.length > 0,
+    configuredTokens: tokens.map(t => t.token),
+    reachedTokens,
   };
 }
 
@@ -197,8 +218,11 @@ export async function clearAll(token: ApiToken): Promise<{
   colorsCancelled: number;
   entrySignalsDropped: number;
 }> {
-  const url = `${token.dispatcherUrl}/api-token/${token.token}/signals`;
-  const resp = await fetch(url, { method: 'DELETE' });
+  const url = `${token.dispatcherUrl}/signal-token/signals`;
+  const resp = await fetch(url, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token.token}` },
+  });
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`HTTP ${resp.status}: ${text}`);

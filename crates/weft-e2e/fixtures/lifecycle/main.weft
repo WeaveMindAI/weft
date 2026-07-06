@@ -1,0 +1,22 @@
+# The transition-coverage fixture. The committed graph is the simplest
+# HoldGate chain: a Text kick arms a HoldGate that polls the rig's release
+# URL until the rig flips it, then a Debug receives "released". The gate is
+# the rig's lever for a REAL running execution it can hold open and release
+# on cue, which is what every drain / transitional-state test needs.
+#
+# Tests rewrite this file mid-test (via Project::set_main) to evolve the
+# project through graph shapes: add/remove MiniService infra, add a
+# TestSseTrigger entry, exactly as a user editing source would. The nodes
+# those shapes need are pulled in from their owning fixtures via
+# Project::add_node_from_fixture, so each custom node has ONE committed
+# source.
+#
+# __E2E_FAKE_URL__ is substituted by the test with the release fake's URL.
+
+kick = Text { value: "go" }
+
+hold = HoldGate { url: "__E2E_FAKE_URL__" }
+hold.arm = kick.value
+
+out = Debug
+out.data = hold.done

@@ -21,8 +21,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_task_store::tasks::{
-    self, admit_live_execution, claim_one, delete_pending_live_execution, reclaim_orphaned_tasks,
-    ClaimFilter, SetupFailureOutcome,
+    self, claim_one, reclaim_orphaned_tasks, AdmittedPod, ClaimFilter, LiveAdmitOutcome,
+    SetupFailureOutcome,
 };
 use weft_task_store::worker_pod::{
     self, has_live_for_project, mark_dead, mark_done_if_idle, pick_admittable_for_project,
@@ -138,6 +138,52 @@ fn live_payload(color: &str) -> Value {
     })
 }
 
+/// Test rig over `tasks::admit_live_execution_in`: runs the admission inside
+/// its own transaction (the production caller commits the journal birth in the
+/// same transaction; these tests exercise the admission SQL alone). Keeps the
+/// suite's Option shape: `Some(pod)` for a fresh or idempotent-retry
+/// admission, `None` when saturated.
+async fn admit_live_execution(
+    pool: &PgPool,
+    project: &str,
+    color: &str,
+    tenant: Option<&str>,
+    binary_hash: Option<&str>,
+    payload: &Value,
+    saturation: f64,
+) -> anyhow::Result<Option<AdmittedPod>> {
+    let mut tx = pool.begin().await?;
+    let spec = tasks::NewTask {
+        kind: TaskKind::Execute.into(),
+        target: TaskTarget::Worker,
+        project_id: Some(project.to_string()),
+        dedup_key: Some(format!("{color}:execute")),
+        color: Some(color.to_string()),
+        tenant_id: tenant.map(str::to_string),
+        target_pod_name: None,
+        binary_hash: binary_hash.map(str::to_string),
+        payload: payload.clone(),
+    };
+    let outcome = tasks::admit_live_execution_in(&mut tx, &spec, saturation).await?;
+    tx.commit().await?;
+    Ok(match outcome {
+        LiveAdmitOutcome::Admitted(pod) | LiveAdmitOutcome::AlreadyAdmitted(pod) => Some(pod),
+        LiveAdmitOutcome::Saturated => None,
+    })
+}
+
+/// Test rig over `tasks::delete_pending_live_execution_in`, in its own
+/// transaction (production commits the cancel terminals with it).
+async fn delete_pending_live_execution(
+    pool: &PgPool,
+    color: &str,
+) -> anyhow::Result<SetupFailureOutcome> {
+    let mut tx = pool.begin().await?;
+    let outcome = tasks::delete_pending_live_execution_in(&mut tx, color).await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
 /// Count in-flight (pending/claimed) live-execute tasks pinned to a pod.
 async fn live_load(pool: &PgPool, pod: &str) -> i64 {
     let (n,): (i64,) = sqlx::query_as(
@@ -164,7 +210,7 @@ async fn admit_inserts_pinned_task(pool: PgPool) {
     alive_pod(&pool, "pod-a").await;
     let color = Uuid::new_v4().to_string();
 
-    let admitted = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    let admitted = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("a pod was chosen");
@@ -182,7 +228,7 @@ async fn admit_refuses_saturated_pod(pool: PgPool) {
     set_pressure(&pool, "pod-a", SAT + 0.01).await;
 
     let color = Uuid::new_v4().to_string();
-    let got = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    let got = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit");
     assert!(got.is_none(), "a memory-saturated pod is not admittable");
@@ -198,7 +244,7 @@ async fn admit_unbounded_below_saturation(pool: PgPool) {
     set_pressure(&pool, "pod-a", SAT - 0.1).await;
     for _ in 0..5 {
         let color = Uuid::new_v4().to_string();
-        let got = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+        let got = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
             .await
             .expect("admit");
         assert!(got.is_some(), "under saturation, count never refuses");
@@ -217,7 +263,7 @@ async fn admit_picks_least_pressured(pool: PgPool) {
     set_pressure(&pool, "pod-b", 0.1).await;
 
     let color = Uuid::new_v4().to_string();
-    let chosen = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    let chosen = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
@@ -233,7 +279,7 @@ async fn admit_skips_draining_pod(pool: PgPool) {
     set_draining(&pool, "pod-a").await.expect("drain");
 
     let color = Uuid::new_v4().to_string();
-    let got = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    let got = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit");
     assert!(got.is_none(), "a draining pod is not admittable");
@@ -244,7 +290,7 @@ async fn admit_skips_draining_pod(pool: PgPool) {
 async fn admit_no_pod_returns_none(pool: PgPool) {
     setup(&pool).await;
     let color = Uuid::new_v4().to_string();
-    let got = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    let got = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit");
     assert!(got.is_none(), "no pod -> no admission");
@@ -258,11 +304,11 @@ async fn admit_is_idempotent_per_color(pool: PgPool) {
     alive_pod(&pool, "pod-a").await;
     let color = Uuid::new_v4().to_string();
 
-    let first = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    let first = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
-    let retry = admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    let retry = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
@@ -285,7 +331,7 @@ async fn pick_admittable_prefers_low_pressure_skips_saturated_and_draining(pool:
     set_pressure(&pool, "pod-drain", 0.0).await;
     set_draining(&pool, "pod-drain").await.expect("drain");
 
-    let picked = pick_admittable_for_project(&pool, PROJECT, SAT)
+    let picked = pick_admittable_for_project(&pool, PROJECT, SAT, None)
         .await
         .expect("pick")
         .expect("a pod");
@@ -294,7 +340,7 @@ async fn pick_admittable_prefers_low_pressure_skips_saturated_and_draining(pool:
     // Saturate every non-draining pod: now nothing is admittable.
     set_pressure(&pool, "pod-low", SAT + 0.01).await;
     set_pressure(&pool, "pod-high", SAT + 0.01).await;
-    let none = pick_admittable_for_project(&pool, PROJECT, SAT)
+    let none = pick_admittable_for_project(&pool, PROJECT, SAT, None)
         .await
         .expect("pick");
     assert!(none.is_none(), "all saturated/draining -> no admittable pod");
@@ -410,13 +456,14 @@ async fn draining_pod_does_not_claim_unpinned(pool: PgPool) {
     tasks::enqueue(
         &pool,
         tasks::NewTask {
-            kind: TaskKind::Execute,
+            kind: TaskKind::Execute.into(),
             target: TaskTarget::Worker,
             project_id: Some(PROJECT.to_string()),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
             target_pod_name: None,
+            binary_hash: None,
             payload: json!({ "live_connection": Value::Null }),
         },
     )
@@ -457,13 +504,14 @@ async fn draining_pod_still_claims_pinned_to_it(pool: PgPool) {
     tasks::enqueue(
         &pool,
         tasks::NewTask {
-            kind: TaskKind::Resume,
+            kind: TaskKind::Resume.into(),
             target: TaskTarget::Worker,
             project_id: Some(PROJECT.to_string()),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
             target_pod_name: Some("pod-drain".to_string()),
+            binary_hash: None,
             payload: json!({ "live_connection": Value::Null }),
         },
     )
@@ -495,7 +543,7 @@ async fn claim_binds_color_owner(pool: PgPool) {
     seed_color(&pool, &color).await;
     assert_eq!(color_owner(&pool, &color).await, None, "unowned before any claim");
 
-    admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
@@ -527,13 +575,14 @@ async fn reclaim_moves_color_owner_to_fresh_pod(pool: PgPool) {
     tasks::enqueue(
         &pool,
         tasks::NewTask {
-            kind: TaskKind::Resume,
+            kind: TaskKind::Resume.into(),
             target: TaskTarget::Worker,
             project_id: Some(PROJECT.to_string()),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
             target_pod_name: None,
+            binary_hash: None,
             payload: json!({ "live_connection": Value::Null }),
         },
     )
@@ -575,16 +624,21 @@ async fn cancel_claim_does_not_move_color_owner(pool: PgPool) {
     setup(&pool).await;
     alive_pod(&pool, "pod-owner").await;
     alive_pod(&pool, "pod-other").await;
+    // Make the admit pick DETERMINISTIC: with two zero-pressure pods
+    // created in the same second, the tiebreak is pod_name ASC and
+    // "pod-other" sorts before "pod-owner". Nudge pod-other's pressure
+    // up so least-pressured is unambiguously pod-owner.
+    set_pressure(&pool, "pod-other", 0.1).await;
     let color = Uuid::new_v4().to_string();
     seed_color(&pool, &color).await;
 
     // pod-owner claims the driving execute task -> owns the color.
-    admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
-        .await
-        .expect("admit")
-        .expect("chosen");
-    // Force the live execute task onto pod-owner by pinning was done at admit;
-    // claim it as pod-owner.
+    let admitted =
+        admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
+            .await
+            .expect("admit")
+            .expect("chosen");
+    assert_eq!(admitted.pod_name, "pod-owner", "admit must pin to the least-pressured pod");
     claim_one(&pool, "pod-owner", ClaimFilter::Worker { project_id: PROJECT.to_string() })
         .await
         .expect("claim")
@@ -597,13 +651,14 @@ async fn cancel_claim_does_not_move_color_owner(pool: PgPool) {
     tasks::enqueue(
         &pool,
         tasks::NewTask {
-            kind: TaskKind::CancelExecution,
+            kind: TaskKind::CancelExecution.into(),
             target: TaskTarget::Worker,
             project_id: Some(PROJECT.to_string()),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
             target_pod_name: Some("pod-other".to_string()),
+            binary_hash: None,
             payload: json!({ "live_connection": Value::Null }),
         },
     )
@@ -628,14 +683,14 @@ async fn idle_exit_blocked_by_live_execution(pool: PgPool) {
     setup(&pool).await;
     alive_pod(&pool, "pod-a").await;
     let color = Uuid::new_v4().to_string();
-    admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
 
     let exited = mark_done_if_idle(&pool, "pod-a").await.expect("idle check");
     assert!(!exited, "pod with a live execution must not idle-exit");
-    assert!(has_live_for_project(&pool, PROJECT).await.expect("has_live"));
+    assert!(has_live_for_project(&pool, PROJECT, None).await.expect("has_live"));
 }
 
 /// An idle non-draining pod DOES idle-exit.
@@ -645,6 +700,32 @@ async fn idle_exit_allowed_when_no_work(pool: PgPool) {
     alive_pod(&pool, "pod-a").await;
     let exited = mark_done_if_idle(&pool, "pod-a").await.expect("idle check");
     assert!(exited, "an idle pod self-exits");
+}
+
+/// `has_live_for_project(Some(hash))` gates on the pod's binary_hash: a pod baked
+/// from a DIFFERENT image than the one new work needs is NOT "live for" that work,
+/// so the cold-start / ensure-live-worker path spawns a fresh, current-image pod
+/// instead of routing to the stale one. `alive_pod` stamps binary_hash `bin-1`.
+#[sqlx::test]
+async fn has_live_for_project_filters_on_binary_hash(pool: PgPool) {
+    setup(&pool).await;
+    alive_pod(&pool, "pod-a").await; // bin-1
+
+    // No hash filter: the pod is live for the project.
+    assert!(
+        has_live_for_project(&pool, PROJECT, None).await.expect("has_live None"),
+        "an alive pod is live for the project with no hash filter"
+    );
+    // Matching hash: still live.
+    assert!(
+        has_live_for_project(&pool, PROJECT, Some("bin-1")).await.expect("has_live match"),
+        "an alive bin-1 pod is live for bin-1 work"
+    );
+    // Mismatched hash (stale image): NOT live, so new work spawns a fresh pod.
+    assert!(
+        !has_live_for_project(&pool, PROJECT, Some("bin-2")).await.expect("has_live mismatch"),
+        "a bin-1 pod must NOT count as live for bin-2 work (stale image)"
+    );
 }
 
 /// THE drain-completion case: a DRAINING pod with no work of its OWN idle-exits
@@ -661,7 +742,7 @@ async fn draining_pod_exits_despite_busy_sibling(pool: PgPool) {
     // The sibling holds an in-flight live execution (project has work), but it
     // is the SIBLING's, claimed by pod-busy.
     let color = Uuid::new_v4().to_string();
-    admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen on a non-draining pod");
@@ -692,7 +773,7 @@ async fn cleanup_pending_is_no_worker_will_run(pool: PgPool) {
     setup(&pool).await;
     alive_pod(&pool, "pod-a").await;
     let color = Uuid::new_v4().to_string();
-    admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
@@ -710,7 +791,7 @@ async fn cleanup_claimed_is_worker_owns_it(pool: PgPool) {
     setup(&pool).await;
     alive_pod(&pool, "pod-a").await;
     let color = Uuid::new_v4().to_string();
-    admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
@@ -755,7 +836,7 @@ async fn orphan_sweep_reports_dead_pod_live_execution(pool: PgPool) {
     setup(&pool).await;
     alive_pod(&pool, "pod-a").await;
     let color = Uuid::new_v4().to_string();
-    admit_live_execution(&pool, PROJECT, &color, TENANT, &live_payload(&color), SAT)
+    admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
         .await
         .expect("admit")
         .expect("chosen");
@@ -784,13 +865,14 @@ async fn orphan_sweep_requeues_non_live_task(pool: PgPool) {
     tasks::enqueue(
         &pool,
         tasks::NewTask {
-            kind: TaskKind::Resume,
+            kind: TaskKind::Resume.into(),
             target: TaskTarget::Worker,
             project_id: Some(PROJECT.to_string()),
             dedup_key: None,
             color: Some(color.clone()),
             tenant_id: TENANT.map(str::to_string),
             target_pod_name: Some("pod-a".to_string()),
+            binary_hash: None,
             payload: json!({ "live_connection": Value::Null }),
         },
     )
@@ -808,4 +890,139 @@ async fn orphan_sweep_requeues_non_live_task(pool: PgPool) {
             .expect("row");
     assert_eq!(pin, None, "resume pin cleared (requeued) when owner died");
     assert_eq!(status, "pending");
+}
+
+// ----- current-image gating (stale-image pods take no NEW work) ------------
+
+/// An UNPINNED worker task stamped with a `binary_hash` is invisible to a
+/// pod baked from a different image: the stale pod's claim returns None
+/// even though it is alive, undrained, and unsaturated. A pod on the
+/// stamped image claims it normally. This is the invariant that stops a
+/// still-alive worker built for the previous source from claiming a run
+/// for the new source (which its binary cannot execute).
+#[sqlx::test]
+async fn stale_image_pod_cannot_claim_stamped_task(pool: PgPool) {
+    setup(&pool).await;
+    alive_pod(&pool, "pod-stale").await; // baked "bin-1" (the helper's image)
+    let color = Uuid::new_v4().to_string();
+    seed_color(&pool, &color).await;
+    tasks::enqueue(
+        &pool,
+        tasks::NewTask {
+            kind: TaskKind::Execute.into(),
+            target: TaskTarget::Worker,
+            project_id: Some(PROJECT.to_string()),
+            dedup_key: None,
+            color: Some(color.clone()),
+            tenant_id: TENANT.map(str::to_string),
+            target_pod_name: None,
+            binary_hash: Some("bin-2".to_string()),
+            payload: json!({ "live_connection": Value::Null }),
+        },
+    )
+    .await
+    .expect("enqueue");
+
+    let stale_claim = claim_one(
+        &pool,
+        "pod-stale",
+        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+    )
+    .await
+    .expect("claim");
+    assert!(
+        stale_claim.is_none(),
+        "a bin-1 pod must not claim a task stamped bin-2"
+    );
+
+    // A pod on the CURRENT image claims it.
+    worker_pod::insert_spawning(&pool, "pod-fresh", PROJECT, "ns-1", "disp-1", "bin-2")
+        .await
+        .expect("insert fresh");
+    register_alive(&pool, "pod-fresh", PROJECT).await.expect("alive");
+    let fresh_claim = claim_one(
+        &pool,
+        "pod-fresh",
+        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+    )
+    .await
+    .expect("claim");
+    assert_eq!(
+        fresh_claim.map(|t| t.color),
+        Some(Some(color)),
+        "the current-image pod claims the stamped task"
+    );
+}
+
+/// A PINNED task bypasses the image check: a cancel/resume addressed to
+/// the color's owner must reach that pod whatever image it runs.
+#[sqlx::test]
+async fn pinned_task_bypasses_image_check(pool: PgPool) {
+    setup(&pool).await;
+    alive_pod(&pool, "pod-owner").await; // baked "bin-1"
+    let color = Uuid::new_v4().to_string();
+    seed_color(&pool, &color).await;
+    tasks::enqueue(
+        &pool,
+        tasks::NewTask {
+            kind: TaskKind::CancelExecution.into(),
+            target: TaskTarget::Worker,
+            project_id: Some(PROJECT.to_string()),
+            dedup_key: None,
+            color: Some(color.clone()),
+            tenant_id: TENANT.map(str::to_string),
+            target_pod_name: Some("pod-owner".to_string()),
+            binary_hash: Some("bin-2".to_string()),
+            payload: json!({ "live_connection": Value::Null }),
+        },
+    )
+    .await
+    .expect("enqueue");
+
+    let claim = claim_one(
+        &pool,
+        "pod-owner",
+        ClaimFilter::Worker { project_id: PROJECT.to_string() },
+    )
+    .await
+    .expect("claim");
+    assert!(
+        claim.is_some(),
+        "a task pinned to this pod is claimable regardless of image stamp"
+    );
+}
+
+/// `pick_admittable_for_project` with a required image skips stale pods
+/// (returns None when only stale ones exist), and `admit_live_execution`
+/// applies the same predicate so a live handshake never pins to a stale
+/// pod (the caller then spawns a fresh one and retries).
+#[sqlx::test]
+async fn pick_and_admit_require_the_current_image(pool: PgPool) {
+    setup(&pool).await;
+    alive_pod(&pool, "pod-stale").await; // baked "bin-1"
+
+    let picked = pick_admittable_for_project(&pool, PROJECT, SAT, Some("bin-2"))
+        .await
+        .expect("pick");
+    assert_eq!(picked, None, "a stale-image pod is not admittable for bin-2");
+
+    let color = Uuid::new_v4().to_string();
+    let admitted =
+        admit_live_execution(&pool, PROJECT, &color, TENANT, Some("bin-2"), &live_payload(&color), SAT)
+            .await
+            .expect("admit");
+    assert_eq!(admitted, None, "admission must not pin a live execution to a stale pod");
+
+    // The same calls with the pod's own image succeed.
+    let picked = pick_admittable_for_project(&pool, PROJECT, SAT, Some("bin-1"))
+        .await
+        .expect("pick")
+        .map(|(pod, _ns)| pod);
+    assert_eq!(picked.as_deref(), Some("pod-stale"));
+    let admitted =
+        admit_live_execution(&pool, PROJECT, &color, TENANT, Some("bin-1"), &live_payload(&color), SAT)
+            .await
+            .expect("admit")
+            .map(|p| p.pod_name);
+    assert_eq!(admitted.as_deref(), Some("pod-stale"));
 }

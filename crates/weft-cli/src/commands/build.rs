@@ -15,7 +15,6 @@ use super::Ctx;
 use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::images;
 use crate::progress::{ActionVerb, Progress};
-use weft_compiler::build::{build_project, BuildResult};
 use weft_compiler::project::Project;
 
 pub async fn run(ctx: Ctx) -> Result<()> {
@@ -23,17 +22,52 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         let cwd = env::current_dir()?;
         let project = Project::discover(&cwd)
             .map_err(|e| anyhow::anyhow!("locate project: {e}"))?;
-        let weft_root = weft_compiler::build::resolve_weft_root()
-            .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
-        let (definition, catalog) = crate::hash::load_enriched_project(&project)?;
-        let binary_hash =
-            crate::hash::compute_binary_hash(&definition, &project, &weft_root, &catalog)?;
-        let image_tag = worker_image_tag(&project, &binary_hash);
-        ensure_worker_image_with_progress(&progress, &project, &image_tag).await?;
-        progress.complete(&format!("worker image {}", short_hash(&binary_hash)));
+        // The shared build brain: compile once + stage the worker context. The base
+        // is ensured inside the image build; pass its tag through here so the staged
+        // Dockerfile FROMs it.
+        let builder_base_tag = crate::images::ensure_worker_builder_base().await?;
+        let plan = weft_compiler::build_plan::plan_build(&project.root, &builder_base_tag, &CliTagPolicy)
+            .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
+        let worker = worker_planned_image(&plan)?;
+        ensure_worker_image_with_progress(
+            &progress,
+            &project.id().to_string(),
+            &worker.image_ref,
+            &worker.context_dir,
+        )
+        .await?;
+        progress.complete(&format!("worker image {}", short_hash(&plan.binary_hash)));
         Ok(())
     })
     .await
+}
+
+/// The worker `PlannedImage` from a `BuildPlan` (there is always exactly one worker
+/// image). A helper so callers don't re-scan `plan.images`.
+pub fn worker_planned_image(
+    plan: &weft_compiler::build_plan::BuildPlan,
+) -> Result<&weft_compiler::build_plan::PlannedImage> {
+    plan.images
+        .iter()
+        .find(|i| i.kind == weft_compiler::build_plan::ImageKind::Worker)
+        .ok_or_else(|| anyhow::anyhow!("build plan has no worker image"))
+}
+
+/// `weft build-base`: ensure the shared worker builder-base image exists (build it
+/// if stale) and print its content-addressed tag. Wraps the same
+/// `ensure_worker_builder_base` a per-project `weft build` runs, exposed as a verb
+/// so a cluster setup can build + load the base into its in-cluster registry. With
+/// `quiet`, prints ONLY the tag on stdout (the rest goes to stderr) so a script can
+/// capture it; otherwise prints a human line.
+pub async fn run_build_base(quiet: bool) -> Result<()> {
+    let tag = crate::images::ensure_worker_builder_base().await?;
+    if quiet {
+        // Tag on stdout (capturable), nothing else.
+        println!("{tag}");
+    } else {
+        println!("builder-base ready: {tag}");
+    }
+    Ok(())
 }
 
 /// Top-level helper used by every verb that needs the worker image
@@ -44,8 +78,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
 /// loaded.
 pub async fn ensure_worker_image_with_progress(
     progress: &Progress,
-    project: &Project,
+    project_id: &str,
     image_tag: &str,
+    worker_context_dir: &std::path::Path,
 ) -> Result<()> {
     if crate::images::image_present(image_tag).await? {
         progress.build_skip(image_tag, "hash_match");
@@ -62,34 +97,40 @@ pub async fn ensure_worker_image_with_progress(
         return Ok(());
     }
 
-    // Per-project builds FROM the shared builder base. Ensure it
-    // exists FIRST (may be a no-op cache hit) so the per-project
-    // build's `FROM weft-builder-base:<hash>` resolves locally. On
-    // a clean machine this is the only "minutes" step the user sees;
-    // every subsequent per-project build is fast.
-    let builder_base_tag = crate::images::ensure_worker_builder_base().await?;
+    // Build from the ALREADY-STAGED worker context (produced once by
+    // `weft_compiler::build_plan::plan_build`, shared with the hashing above so the
+    // project compiles once per verb, not twice). The context's Dockerfile
+    // `FROM weft-builder-base:<hash>`s the shared base; ensure it exists first (a
+    // no-op cache hit after the first clean-machine build).
+    crate::images::ensure_worker_builder_base().await?;
 
     progress.build_start(image_tag);
-    let build = build_project(&project.root, true, &builder_base_tag)
-        .map_err(|e| anyhow::anyhow!("build failed: {e}"))?;
-    docker_build_and_kind_load(progress, image_tag, &build).await?;
+    docker_build_and_kind_load(progress, image_tag, project_id, worker_context_dir).await?;
     progress.build_done(image_tag);
     Ok(())
 }
 
-/// Compose a hash-tagged worker image name. The hash is the binary
-/// hash from `crate::hash::compute_binary_hash`; the dispatcher
-/// reads the same hash from the project row when picking the image
-/// to spawn.
-pub fn worker_image_tag(project: &Project, binary_hash: &str) -> String {
-    format!("weft-worker-{}:{}", project.id(), short_hash(binary_hash))
+
+/// The CLI's image-ref naming for the shared build brain
+/// (`weft_compiler::build_plan`): BARE content-addressed tags (`weft-worker:<hash>`,
+/// `weft-infra-<name>:<hash>`) built with local docker and loaded onto the node, no
+/// registry prefix. A registry-backed build uses the same tag SUFFIX with a
+/// registry prefix (`RegistryConfig`), so both mint identical identities from
+/// one source of truth.
+pub struct CliTagPolicy;
+
+impl weft_compiler::build_plan::TagPolicy for CliTagPolicy {
+    fn worker_ref(&self, binary_hash: &str) -> String {
+        weft_compiler::build::worker_image_tag(binary_hash)
+    }
+    fn infra_ref(&self, image_name: &str, content_hash: &str) -> String {
+        weft_compiler::image_set::infra_image_tag(image_name, content_hash)
+    }
 }
 
-/// 16-char prefix of the SHA-256 hash. Enough collision resistance
-/// for a per-project image namespace; short enough to keep tag
-/// strings legible. The dispatcher uses the SAME prefix (consumes
-/// the hash the CLI sent in /projects body and uses it verbatim as
-/// the tag).
+/// 16-char prefix of the SHA-256 hash, for human-facing log lines ONLY (never the
+/// image tag, which uses the full hash). Short enough to keep progress output
+/// legible.
 pub fn short_hash(hash: &str) -> String {
     hash.chars().take(16).collect()
 }
@@ -117,16 +158,18 @@ fn bail_k8s_push_needed(tag: &str) -> anyhow::Error {
 async fn docker_build_and_kind_load(
     progress: &Progress,
     tag: &str,
-    build: &BuildResult,
+    project_id: &str,
+    context_dir: &std::path::Path,
 ) -> Result<()> {
-    let project_id = project_id_from_tag(tag);
-    docker_build(tag, &build.build_context, &project_id).await?;
-    // After a successful rebuild the previous content of the same
-    // tag is now a dangling `<none>:<none>` image. Prune those
-    // labelled with this project's id so accumulating rebuilds
-    // don't leave a trail of orphaned images. Cargo build cache
-    // (the heavy part) lives in BuildKit and survives this.
-    prune_dangling_for_project(&project_id).await;
+    docker_build(tag, context_dir, project_id).await?;
+    // Stamp the build with the project that triggered it (the
+    // `weft.dev/project` label, still read by `weft clean --images`)
+    // and prune that project's dangling `<none>:<none>` leftovers. The
+    // worker tag is content-addressed (`weft-worker:<hash>`) and shared
+    // across projects, so the project id rides on the LABEL, not the
+    // tag. Cargo build cache (the heavy part) lives in the baked base +
+    // BuildKit and survives this.
+    prune_dangling_for_project(project_id).await;
     let cfg = cluster_config();
     match cfg.backend {
         ClusterBackend::Kind if kind_available(&cfg.cluster_name).await => {
@@ -176,15 +219,6 @@ pub async fn docker_build_image(
         anyhow::bail!("docker build {tag} exited {status}");
     }
     Ok(())
-}
-
-/// `weft-worker-<id>:<short-hash>` -> `<id>`. Used as the docker
-/// label value so we can prune dangling images for one project
-/// without touching others.
-fn project_id_from_tag(tag: &str) -> String {
-    let prefix = "weft-worker-";
-    let stripped = tag.strip_prefix(prefix).unwrap_or(tag);
-    stripped.split(':').next().unwrap_or(stripped).to_string()
 }
 
 /// Remove every dangling image labelled with this project. Best

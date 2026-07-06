@@ -1,0 +1,31 @@
+# Three FetchToStorage nodes run in parallel, each pulling a DISTINCT file from
+# its own fake server into execution storage and keeping it. With no data
+# dependencies between them, the engine schedules the three fetches
+# concurrently, so their multipart uploads reserve + upload against the broker
+# at the same time. The rig downloads each file back and asserts byte-exact
+# content (no cross-contamination) and consistent tenant usage.
+#
+# Each __E2E_FAKE_URL_N__ is substituted with a distinct fake server's URL. Each
+# fetch has its own Debug sink so all three are terminal and execute.
+
+src_a = Text { value: "__E2E_FAKE_URL_A__" }
+src_b = Text { value: "__E2E_FAKE_URL_B__" }
+src_c = Text { value: "__E2E_FAKE_URL_C__" }
+
+fetch_a = FetchToStorage { keep: true }
+fetch_a.url = src_a.value
+
+fetch_b = FetchToStorage { keep: true }
+fetch_b.url = src_b.value
+
+fetch_c = FetchToStorage { keep: true }
+fetch_c.url = src_c.value
+
+out_a = Debug
+out_a.data = fetch_a.file
+
+out_b = Debug
+out_b.data = fetch_b.file
+
+out_c = Debug
+out_c.data = fetch_c.file

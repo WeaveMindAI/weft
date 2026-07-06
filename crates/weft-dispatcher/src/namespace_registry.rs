@@ -7,7 +7,7 @@
 //! unambiguous separator), but it relies on a k8s RBAC invariant
 //! that tenant pods can't create their own namespaces. If that
 //! invariant ever leaks, an attacker could hand-craft a
-//! `wm-project-eve--alice--proj1` namespace and the parser would
+//! `wft-project-eve--alice--proj1` namespace and the parser would
 //! happily call them tenant `eve` with project `alice--proj1`.
 //!
 //! This table is the database of record. Dispatcher writes a row
@@ -38,9 +38,11 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 }
 
 /// Register a namespace as belonging to `tenant_id`. Idempotent
-/// (UPSERT). Called from `tenant_namespace::ensure_tenant_namespace`
-/// and `project_namespace::ensure` so the registry is updated
-/// alongside every kubectl apply.
+/// (UPSERT). Called from `project_namespace::ensure` so the registry is
+/// updated alongside the kubectl apply (the broker's TokenReview path
+/// resolves a project-namespace worker's tenant from this row). The old
+/// per-tenant storage namespace is gone, so this is now written only for
+/// project namespaces.
 ///
 /// Re-registering the same namespace with a DIFFERENT tenant_id
 /// is rejected: the namespace's identity is fixed at creation.
@@ -64,6 +66,19 @@ pub async fn register(pool: &PgPool, namespace: &str, tenant_id: &str) -> Result
              refusing to rebind"
         );
     }
+    Ok(())
+}
+
+/// Delete a namespace's registry row. Called when the namespace
+/// itself is torn down (infra removed on sync; project rm), AFTER the
+/// k8s namespace object is deleted: while the namespace exists, its
+/// row must exist (the broker's TokenReview resolves pod tenancy from
+/// it). Idempotent; a missing row is a no-op.
+pub async fn delete(pool: &PgPool, namespace: &str) -> Result<()> {
+    sqlx::query("DELETE FROM weft_namespace_tenant WHERE namespace = $1")
+        .bind(namespace)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

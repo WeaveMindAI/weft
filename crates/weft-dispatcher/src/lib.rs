@@ -4,8 +4,9 @@
 //! - Event routing (webhook URLs, form URLs, cron, infra events).
 //! - Worker lifecycle (via pluggable `WorkerBackend`).
 //! - Infrastructure orchestration: per-project namespace creation,
-//!   the `ApplyInfra` task executor, and a polling bridge that fans
-//!   supervisor-emitted `infra_event` rows out over SSE.
+//!   the `infra_lifecycle_command` table the per-project supervisor
+//!   claims, and a polling bridge that fans supervisor-emitted
+//!   `infra_event` rows out over SSE.
 //! - Journal (Postgres-backed; `weft-journal` crate).
 //! - Ops dashboard (HTTP + SSE).
 //! - Cost aggregation.
@@ -15,6 +16,8 @@
 //! runtime health probing of infra; that's the supervisor's job.
 
 pub mod api;
+pub mod app;
+pub mod authenticator;
 pub mod backend;
 pub mod cold_start;
 pub mod events;
@@ -29,16 +32,18 @@ pub mod lifecycle_claimer;
 pub mod listener;
 pub mod namespace_registry;
 pub mod pg_wake;
+pub mod placement;
 pub mod project_namespace;
 pub mod project_store;
 pub mod reaper;
+pub mod registry;
 pub mod shared_worker_namespace;
 pub mod state;
-pub mod storage_box;
+pub mod storage;
 pub mod supervisor_pool;
 pub mod task_kinds;
 pub mod tenant;
-pub mod tenant_namespace;
+pub mod transition;
 
 /// Dispatcher-side aliases over the shared task-store surface.
 /// Executors `impl TaskExecutor<DispatcherState>` directly using the

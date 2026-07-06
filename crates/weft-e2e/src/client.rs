@@ -29,19 +29,35 @@ use serde_json::Value;
 /// non-default `WEFT_HTTP_PORT`.
 pub const DEFAULT_DISPATCHER_URL: &str = "http://127.0.0.1:9999";
 
+/// Mints the bearer a request authenticates with. With no auth, the default is
+/// `None` (no `Authorization` header). A harness that needs a token injects a
+/// provider that signs a fresh Ed25519 JWT for the tenant under test: every call
+/// carries a signed token, no CLI. Sync (JWT signing is sync) and called per
+/// request so a short-lived token is always fresh. `Send + Sync` so a
+/// `Dispatcher` stays cheaply cloneable + usable across the rig's spawned tasks.
+pub trait AuthProvider: Send + Sync {
+    /// The `Authorization` header VALUE for the next request (e.g.
+    /// `"Bearer <jwt>"`), or `None` for an unauthenticated call.
+    fn authorization(&self) -> Option<String>;
+}
+
 /// Thin HTTP client over the dispatcher's public API. Clone is cheap
-/// (reqwest::Client is an Arc internally).
+/// (reqwest::Client is an Arc internally; the auth provider is an Arc).
 #[derive(Clone)]
 pub struct Dispatcher {
     base: String,
     http: reqwest::Client,
+    /// Mints the per-request bearer. `None` => unauthenticated; `Some` => a
+    /// harness signs a token per call.
+    auth: Option<std::sync::Arc<dyn AuthProvider>>,
 }
 
 impl Dispatcher {
-    /// Build a client against `WEFT_DISPATCHER_URL` or the default. The inner
-    /// reqwest client carries no global request timeout: live-caller and
-    /// long-running operations are driven through here and a deadline belongs
-    /// on the specific call (the rig's wait loops), not on every request.
+    /// Build an UNAUTHENTICATED client against `WEFT_DISPATCHER_URL` or the
+    /// default (no login). The inner reqwest client carries no global request
+    /// timeout: live-caller and long-running operations are driven through here
+    /// and a deadline belongs on the specific call (the rig's wait loops), not on
+    /// every request.
     pub fn from_env() -> Result<Self> {
         let base = std::env::var("WEFT_DISPATCHER_URL")
             .unwrap_or_else(|_| DEFAULT_DISPATCHER_URL.to_string());
@@ -51,7 +67,26 @@ impl Dispatcher {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
+            auth: None,
         })
+    }
+
+    /// A clone of this client that authenticates every request via `auth`. A
+    /// harness that needs tokens builds the base from env, then attaches a
+    /// per-tenant signer; unauthenticated tests never call this.
+    pub fn with_auth(mut self, auth: std::sync::Arc<dyn AuthProvider>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Apply the auth header (if any) to a request builder. Every verb routes
+    /// through here so an authed client signs uniformly and an unauthed one
+    /// adds nothing.
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.auth.as_ref().and_then(|a| a.authorization()) {
+            Some(value) => req.header("authorization", value),
+            None => req,
+        }
     }
 
     /// The base URL (no trailing slash), e.g. for building sub-URLs the rig
@@ -64,13 +99,33 @@ impl Dispatcher {
         format!("{}/{}", self.base, path.trim_start_matches('/'))
     }
 
+    /// GET `path` presenting a SIGNAL TOKEN as the bearer credential
+    /// (`Authorization: Bearer <token>`), overriding the client's own auth for
+    /// this one request: the token-scoped signal routes authenticate by the
+    /// token itself, never by the tenant credential.
+    pub async fn get_json_bearer<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        bearer: &str,
+    ) -> Result<T> {
+        let url = self.url(path);
+        let resp = self
+            .http
+            .get(&url)
+            .header("authorization", format!("Bearer {bearer}"))
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let body = read_ok(resp, "GET", &url).await?;
+        serde_json::from_str(&body).with_context(|| format!("GET {url}: decode body: {body}"))
+    }
+
     /// GET `path`, deserialize the JSON body into `T`. Errors on non-2xx with
     /// the response body in the message.
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.url(path);
         let resp = self
-            .http
-            .get(&url)
+            .authed(self.http.get(&url))
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
@@ -82,8 +137,7 @@ impl Dispatcher {
     pub async fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
         let url = self.url(path);
         let resp = self
-            .http
-            .post(&url)
+            .authed(self.http.post(&url))
             .json(body)
             .send()
             .await
@@ -99,8 +153,7 @@ impl Dispatcher {
     pub async fn post_empty(&self, path: &str, body: &Value) -> Result<()> {
         let url = self.url(path);
         let resp = self
-            .http
-            .post(&url)
+            .authed(self.http.post(&url))
             .json(body)
             .send()
             .await
@@ -115,13 +168,29 @@ impl Dispatcher {
     pub async fn delete(&self, path: &str) -> Result<()> {
         let url = self.url(path);
         let resp = self
-            .http
-            .delete(&url)
+            .authed(self.http.delete(&url))
             .send()
             .await
             .with_context(|| format!("DELETE {url}"))?;
         read_ok(resp, "DELETE", &url).await?;
         Ok(())
+    }
+
+    /// POST `body` as JSON to `path` and return the raw status + body without
+    /// requiring 2xx. Used by negative transition tests that assert a verb is
+    /// REJECTED with a specific status (the reconciliation table's REJ cells),
+    /// where a 2xx would be the failure.
+    pub async fn post_raw(&self, path: &str, body: &Value) -> Result<(reqwest::StatusCode, String)> {
+        let url = self.url(path);
+        let resp = self
+            .authed(self.http.post(&url))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status, text))
     }
 
     /// GET `path` and return the raw status + body without requiring 2xx. Used
@@ -130,8 +199,7 @@ impl Dispatcher {
     pub async fn get_raw(&self, path: &str) -> Result<(reqwest::StatusCode, String)> {
         let url = self.url(path);
         let resp = self
-            .http
-            .get(&url)
+            .authed(self.http.get(&url))
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
@@ -178,6 +246,12 @@ pub async fn cli(dir: &Path, args: &[&str]) -> Result<CliOutput> {
     let mut cmd = tokio::process::Command::new("weft");
     cmd.current_dir(dir);
     cmd.args(args);
+    // The rig is non-interactive by construction: a verb that wants a
+    // prompt must receive its answer via flags. With an inherited stdin
+    // (the developer's terminal) a prompt would READ from the terminal
+    // while its text went to the captured pipe: an invisible hang. A
+    // null stdin makes the CLI's prompt guard bail loudly instead.
+    cmd.stdin(std::process::Stdio::null());
     let out: Output = cmd
         .output()
         .await

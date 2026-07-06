@@ -55,6 +55,11 @@ export type DispatcherEvent =
   | { kind: 'project_registered'; project_id: string; name: string }
   | { kind: 'project_activated'; project_id: string }
   | { kind: 'project_deactivated'; project_id: string }
+  // A lifecycle axis flipped (entering/leaving activating /
+  // deactivating / building / cancelling_build, or landing at rest).
+  // Carries both axes; the host treats it as a status-refresh signal
+  // like every other project_* event.
+  | { kind: 'project_transition_changed'; project_id: string; status: string; transition: string }
   // External-URL invalidation. Trigger nodes that mint a tenant-
   // public URL emit this when the URL changes (re-activate, new
   // mount path, etc.). UI invalidates any cached chip.
@@ -486,6 +491,7 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'project_registered':
       case 'project_activated':
       case 'project_deactivated':
+      case 'project_transition_changed':
       case 'trigger_url_changed':
       case 'cost_reported':
       case 'infra_config_error':

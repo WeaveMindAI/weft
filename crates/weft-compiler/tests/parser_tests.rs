@@ -1,11 +1,55 @@
 use weft_compiler::weft_compiler::*;
+use weft_compiler::CompileFs;
 use weft_core::weft_type::{WeftPrimitive, WeftType};
+use weft_core::node::{MetadataCatalog, NodeMetadata};
 
+/// A catalog that knows no node types. The lenient parse path (`parse_only`,
+/// which the editor renders from) keeps unknown nodes + ports + surfaces
+/// diagnostics, so an empty catalog is enough to exercise the keep-and-flag
+/// behavior for a bad port type.
+struct EmptyCatalog;
+impl MetadataCatalog for EmptyCatalog {
+    fn lookup(&self, _node_type: &str) -> Option<&NodeMetadata> {
+        None
+    }
+    fn all(&self) -> Vec<&NodeMetadata> {
+        vec![]
+    }
+}
+
+/// A port declared with an invalid / unknown type must be KEPT (rendered red as
+/// MustOverride in the editor) and surfaced as a diagnostic, NOT dropped so it
+/// silently vanishes from the canvas. Regression for "the port vanishes when I
+/// mistype its type instead of going red".
+#[test]
+fn invalid_port_type_keeps_the_port_as_must_override_with_a_diagnostic() {
+    let source = "n = SomeNode -> (result: Nonexistent)\n";
+    let (project, diagnostics) =
+        weft_compiler::parse_only(source, uuid::Uuid::nil(), CompileFs::none(), &EmptyCatalog, None);
+
+    // The node survived and STILL HAS the port (it did not vanish).
+    let node = project.nodes.iter().find(|n| n.id == "n").expect("node 'n' kept");
+    let port = node
+        .outputs
+        .iter()
+        .find(|p| p.name == "result")
+        .expect("the bad-typed port is KEPT, not dropped");
+    // It is the red 'needs a type' placeholder, which the editor renders as
+    // must-override (the same signal the user described as "should be red").
+    assert!(port.port_type.is_must_override(), "bad type becomes MustOverride (red)");
+
+    // The bad type is surfaced as a diagnostic so the user knows to fix it.
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("Invalid port type")
+            && d.message.contains("Nonexistent")),
+        "expected an 'Invalid port type Nonexistent' diagnostic, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
 
 #[test]
 fn test_basic_project() {
     let source = r#"
-# Project: Test
 # Description: A test project
 
 config = LlmConfig {
@@ -18,7 +62,7 @@ llm = Llm {
 
 llm.config = config.value
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     // `# Project:` / file-level `# Description:` are ordinary comments: the
     // parsed definition carries no name/description (identity is the manifest
     // filename; descriptions are per-group).
@@ -35,10 +79,9 @@ llm.config = config.value
 #[test]
 fn test_bare_node() {
     let source = r#"
-# Project: Bare
 node = Debug
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile bare node");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile bare node");
     assert_eq!(result.nodes.len(), 1);
     assert_eq!(result.nodes[0].id, "node");
     assert_eq!(result.nodes[0].node_type, "Debug");
@@ -47,7 +90,6 @@ node = Debug
 #[test]
 fn test_node_with_ports() {
     let source = r#"
-# Project: Ports
 worker = ExecPython(
     data: String,
     context: String?
@@ -58,7 +100,7 @@ worker = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile node with ports");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile node with ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 2);
     assert_eq!(node.inputs[0].name, "data");
@@ -74,10 +116,9 @@ worker = ExecPython(
 #[test]
 fn test_node_with_ports_no_config() {
     let source = r#"
-# Project: PortsNoConfig
 pass = ExecPython(data: String) -> (result: String)
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 1);
     assert_eq!(node.outputs.len(), 1);
@@ -87,12 +128,11 @@ pass = ExecPython(data: String) -> (result: String)
 #[test]
 fn test_node_empty_inputs() {
     let source = r#"
-# Project: EmptyInputs
 gen = ExecPython() -> (result: String) {
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile node with empty inputs");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile node with empty inputs");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 0);
     assert_eq!(node.outputs.len(), 1);
@@ -101,7 +141,6 @@ gen = ExecPython() -> (result: String) {
 #[test]
 fn test_group_basic() {
     let source = r#"
-# Project: Group Test
 
 input = Text { value: "hello" }
 
@@ -121,7 +160,7 @@ preprocessor.raw = input.value
 output = Debug {}
 output.data = preprocessor.result
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     // input, preprocessor__in, preprocessor__out, preprocessor.clean, output = 5
     assert_eq!(result.nodes.len(), 5);
 
@@ -148,7 +187,6 @@ output.data = preprocessor.result
 #[test]
 fn test_nested_groups() {
     let source = r#"
-# Project: Nested
 
 outer = Group(data: String) -> (result: String) {
     inner = Group(x: String) -> (y: String) {
@@ -164,7 +202,7 @@ outer = Group(data: String) -> (result: String) {
     self.result = inner.y
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     // outer__in + outer__out + outer.inner__in + outer.inner__out + outer.inner.proc = 5
     assert_eq!(result.nodes.len(), 5);
 
@@ -180,35 +218,33 @@ outer = Group(data: String) -> (result: String) {
 #[test]
 fn test_self_reserved() {
     let source = r#"
-# Project: Reserved
 self = Debug {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "'self' should be a reserved word");
 }
 
 #[test]
 fn test_reserved_type_keyword_as_name() {
     // Naming a group with the reserved `Group` keyword must fail loudly ON the
-    // declaration line (line 3 here), not only cryptically where it's later
+    // declaration line (line 1 here), not only cryptically where it's later
     // referenced.
-    let source = "# Project: Reserved\n\nGroup = Group() -> (test: MustOverride?) {\n}\n";
-    let errors = compile(source, uuid::Uuid::new_v4(), None).unwrap_err();
+    let source = "Group = Group() -> (test: MustOverride?) {\n}\n";
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
     let reserved = errors.iter().find(|e| e.message.contains("reserved type keyword"));
     assert!(reserved.is_some(), "expected a reserved-keyword error, got {errors:?}");
-    assert_eq!(reserved.unwrap().line(), 3, "error must point at the declaration line");
+    assert_eq!(reserved.unwrap().line(), 1, "error must point at the declaration line");
 }
 
 #[test]
 fn test_connection_direction() {
     // target.input = source.output
     let source = r#"
-# Project: Direction
 a = Text { value: "hi" }
 b = Debug {}
 b.data = a.value
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let edge = &result.edges[0];
     assert_eq!(edge.target, "b");
     assert_eq!(edge.target_handle.as_deref(), Some("data"));
@@ -219,14 +255,13 @@ b.data = a.value
 #[test]
 fn test_group_self_connections() {
     let source = r#"
-# Project: Self
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "{{data}}" }
     worker.value = self.data
     self.result = worker.output
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     // self.data on right = group input = grp__in
     let edge_in = result.edges.iter().find(|e| e.source == "grp__in").expect("self input edge");
     assert_eq!(edge_in.target, "grp.worker");
@@ -243,7 +278,6 @@ grp = Group(data: String) -> (result: String) {
 #[test]
 fn test_triple_backtick_multiline() {
     let source = "
-# Project: Backtick
 
 node = ExecPython {
     code: ```
@@ -252,7 +286,7 @@ print(\"line2\")
     ```
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile triple backtick");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile triple backtick");
     let node = result.nodes.iter().find(|n| n.id == "node").unwrap();
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.contains("print(\"line1\")"));
@@ -262,12 +296,11 @@ print(\"line2\")
 #[test]
 fn test_triple_backtick_inline() {
     let source = "
-# Project: BacktickInline
 node = ExecPython {
     code: ```print(\"hello\")```
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile inline backtick");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile inline backtick");
     let node = result.nodes.iter().find(|n| n.id == "node").unwrap();
     assert_eq!(node.config.get("code").unwrap().as_str().unwrap(), "print(\"hello\")");
 }
@@ -275,12 +308,11 @@ node = ExecPython {
 #[test]
 fn test_triple_backtick_inline_with_braces() {
     let source = "
-# Project: InlineBraces
 node = ExecPython {
     code: ```return {\"result\": f\"{name} ({email})\"}```
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile inline backtick with braces");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile inline backtick with braces");
     let node = result.nodes.iter().find(|n| n.id == "node").unwrap();
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.contains("return"), "code should contain return: got {:?}", code);
@@ -290,7 +322,6 @@ node = ExecPython {
 #[test]
 fn test_port_types() {
     let source = r#"
-# Project: Types
 node = ExecPython(
     img: Image,
     text: String,
@@ -301,7 +332,7 @@ node = ExecPython(
     items: List[List[String]]
 ) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile typed ports");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile typed ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].port_type, WeftType::Primitive(WeftPrimitive::Image));
     assert_eq!(node.inputs[1].port_type, WeftType::Primitive(WeftPrimitive::String));
@@ -317,14 +348,13 @@ node = ExecPython(
 fn test_group_ports_types() {
     // Types are declared as-is in the signature.
     let source = r#"
-# Project: GroupPorts
 batch = Group(items: List[String]) -> (results: List[String]) {
     worker = Llm {}
     worker.prompt = self.items
     self.results = worker.response
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile group ports");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile group ports");
     let pt_in = result.nodes.iter().find(|n| n.id == "batch__in").unwrap();
     assert_eq!(pt_in.inputs[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
 
@@ -336,7 +366,6 @@ batch = Group(items: List[String]) -> (results: List[String]) {
 #[test]
 fn test_require_one_of() {
     let source = r#"
-# Project: RequireOneOf
 resolver = ExecPython(
     text: String?,
     audio: Audio?,
@@ -345,7 +374,7 @@ resolver = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile @require_one_of");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile @require_one_of");
     let node = &result.nodes[0];
     assert_eq!(node.features.one_of_required.len(), 1);
     assert_eq!(node.features.one_of_required[0], vec!["text", "audio"]);
@@ -356,14 +385,13 @@ resolver = ExecPython(
 #[test]
 fn test_mock_rejected() {
     let source = r#"
-# Project: Mock
 node = HttpRequest {
     url: "https://api.test.com"
     mock: {"body": "hello", "status": 200}
     mocked: true
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "mock/mocked should be rejected as compile errors");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("'mock' is not a valid config key")));
@@ -371,11 +399,42 @@ node = HttpRequest {
 }
 
 #[test]
+fn test_tags_non_string_element_rejected() {
+    // A non-string element in `_tags` was SILENTLY DROPPED (filter_map on as_str),
+    // so `_tags: ["ok", 5]` compiled as `["ok"]`, discarding user data with no
+    // error. It must now fail loudly.
+    let source = r#"
+node = ExecPython {
+    _tags: ["ok", 5]
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
+    assert!(result.is_err(), "a non-string _tags element must be a compile error");
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.message.contains("_tags must contain only strings")),
+        "expected the non-string-tag diagnostic, got {errors:?}"
+    );
+}
+
+#[test]
+fn test_tags_all_strings_compiles() {
+    // The valid case still compiles and keeps every tag.
+    let source = r#"
+node = ExecPython {
+    _tags: ["support", "billing"]
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("valid _tags compiles");
+    let node = &result.nodes[0];
+    assert_eq!(node.config.get("_tags").unwrap(), &serde_json::json!(["support", "billing"]));
+}
+
+#[test]
 fn test_group_description_from_comments() {
     // First comment block inside group body is the description (like a docstring)
     // The compiler skips it like any other comment
     let source = r#"
-# Project: Desc
 grp = Group(data: String) -> (result: String) {
     # This is the group description
     # It can be multiple lines
@@ -385,21 +444,20 @@ grp = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile with group description");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile with group description");
     assert_eq!(result.nodes.len(), 3); // grp__in, grp__out, grp.worker
 }
 
 #[test]
 fn test_typevar_ports() {
     let source = r#"
-# Project: TypeVar
 node = ExecPython(
     data: T
 ) -> (
     result: T
 ) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile TypeVar ports");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile TypeVar ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].port_type, WeftType::TypeVar("T".to_string()));
     assert_eq!(node.outputs[0].port_type, WeftType::TypeVar("T".to_string()));
@@ -408,10 +466,9 @@ node = ExecPython(
 #[test]
 fn test_must_override_port() {
     let source = r#"
-# Project: MustOverride
 node = ExecPython(data) -> (result) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile MustOverride ports");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile MustOverride ports");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].port_type, WeftType::MustOverride);
     assert_eq!(node.outputs[0].port_type, WeftType::MustOverride);
@@ -420,7 +477,6 @@ node = ExecPython(data) -> (result) {}
 #[test]
 fn test_triple_nested_groups() {
     let source = r#"
-# Project: Triple Nested
 
 input_text = Text { value: "hello" }
 
@@ -455,7 +511,7 @@ level1.data = input_text.value
 output = Debug {}
 output.data = level1.result
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile triple nested");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile triple nested");
 
     // The critical edge: input_text -> level1__in must exist
     let has_input_to_l1 = result.edges.iter().any(|e| {
@@ -487,7 +543,6 @@ output.data = level1.result
 #[test]
 fn test_duplicate_inner_node_names_scoped() {
     let source = r#"
-# Project: ScopedNames
 group_a = Group(data: String) -> (result: String) {
     worker = Template { template: "A" }
     worker.value = self.data
@@ -499,7 +554,7 @@ group_b = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile scoped names");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile scoped names");
     let a_worker = result.nodes.iter().find(|n| n.id == "group_a.worker").unwrap();
     let b_worker = result.nodes.iter().find(|n| n.id == "group_b.worker").unwrap();
     assert_eq!(a_worker.config.get("template").unwrap().as_str().unwrap(), "A");
@@ -509,7 +564,6 @@ group_b = Group(data: String) -> (result: String) {
 #[test]
 fn test_nested_node_with_multiline_signature_in_group() {
     let source = "
-# Project: Nested Multi
 # Description: Test
 
 outer = Group(
@@ -533,7 +587,7 @@ return {\"output\": \"hello\"}
   self.result = inner_node.output
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     if let Err(ref errors) = result {
         for e in errors { eprintln!("COMPILE ERROR: {}", e); }
     }
@@ -554,7 +608,6 @@ return {\"output\": \"hello\"}
 #[test]
 fn test_complex_types_in_ports() {
     let source = r#"
-# Project: ComplexTypes
 node = ExecPython(
     a: Dict[String, Number],
     b: Dict[String, List[String] | Number],
@@ -563,7 +616,7 @@ node = ExecPython(
     d: Dict[String, Dict[String, List[String] | Number] | String]
 ) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile complex types");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile complex types");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 3);
     assert_eq!(node.outputs.len(), 1);
@@ -577,10 +630,9 @@ node = ExecPython(
 #[test]
 fn test_media_type_alias() {
     let source = r#"
-# Project: Media
 node = ExecPython(input: Media) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile Media alias");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile Media alias");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].port_type, WeftType::media());
 }
@@ -589,13 +641,12 @@ node = ExecPython(input: Media) -> (result: String) {}
 fn test_mock_always_rejected() {
     // Even with invalid JSON, mock key itself is rejected before JSON parsing
     let source = r#"
-# Project: BadMock
 node = HttpRequest {
     url: "https://api.test.com"
     mock: {broken json
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "mock should be rejected as compile error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("'mock' is not a valid config key")));
@@ -604,30 +655,27 @@ node = HttpRequest {
 #[test]
 fn test_reject_invalid_type() {
     let source = r#"
-# Project: BadType
 node = ExecPython(data: Foo) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Unknown type 'Foo' should produce an error");
 }
 
 #[test]
 fn test_reject_any_type() {
     let source = r#"
-# Project: NoAny
 node = ExecPython(data: Any) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "'Any' is not a valid type");
 }
 
 #[test]
 fn test_group_with_no_body() {
     let source = r#"
-# Project: EmptyGroup
 grp = Group(data: String) -> (result: String)
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile group with no body");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile group with no body");
     // Should still create passthrough nodes
     let pt_in = result.nodes.iter().find(|n| n.id == "grp__in");
     assert!(pt_in.is_some());
@@ -636,21 +684,19 @@ grp = Group(data: String) -> (result: String)
 #[test]
 fn test_multiple_connections() {
     let source = r#"
-# Project: Multi
 a = Text { value: "hi" }
 b = Llm {}
 c = Debug {}
 b.prompt = a.value
 c.data = b.response
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile multiple connections");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile multiple connections");
     assert_eq!(result.edges.len(), 2);
 }
 
 #[test]
 fn test_pack_with_require_one_of_in_group() {
     let source = "
-# Project: Pack Test
 # Description: Test
 
 grp = Group(
@@ -675,7 +721,7 @@ grp = Group(
   self.metadata = pack_node.out
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     if let Err(ref errors) = result {
         for e in errors { eprintln!("ERR: {}", e); }
     }
@@ -687,7 +733,6 @@ grp = Group(
 #[test]
 fn test_multiline_json_array_in_config() {
     let source = r#"
-# Project: Test JSON
 # Description: Test
 
 review = HumanQuery {
@@ -701,7 +746,7 @@ review = HumanQuery {
   }]
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     if let Err(ref errors) = result {
         for e in errors { eprintln!("ERR: {}", e); }
     }
@@ -716,12 +761,11 @@ review = HumanQuery {
 #[test]
 fn test_post_config_duplicate_output_port_error() {
     let source = r#"
-# Project: PostConfigDup
 node = ExecPython() -> (result: String) {
     code: "return {}"
 } -> (result: Number)
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Duplicate output port 'result' should produce error");
 }
 
@@ -732,10 +776,9 @@ node = ExecPython() -> (result: String) {
 fn test_output_only_no_inputs_no_config() {
     // Pattern: id = Type -> (output: String)
     let source = r#"
-# Project: OutputOnly
 node = ExecPython -> (result: String)
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile output-only declaration");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile output-only declaration");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 0);
     assert_eq!(node.outputs.len(), 1);
@@ -747,13 +790,12 @@ node = ExecPython -> (result: String)
 #[test]
 fn test_config_boolean_values() {
     let source = r#"
-# Project: Bool
 node = ExecPython {
     enabled: true
     disabled: false
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile booleans");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile booleans");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("enabled").unwrap(), &serde_json::json!(true));
     assert_eq!(node.config.get("disabled").unwrap(), &serde_json::json!(false));
@@ -762,14 +804,13 @@ node = ExecPython {
 #[test]
 fn test_config_numeric_values() {
     let source = r#"
-# Project: Numbers
 node = ExecPython {
     count: 42
     rate: 0.75
     negative: -10
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile numbers");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile numbers");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("count").unwrap(), &serde_json::json!(42));
     assert_eq!(node.config.get("rate").unwrap(), &serde_json::json!(0.75));
@@ -779,12 +820,11 @@ node = ExecPython {
 #[test]
 fn test_config_escaped_string() {
     let source = r#"
-# Project: Escaped
 node = ExecPython {
     prompt: "line1\nline2\ttab"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile escaped strings");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile escaped strings");
     let node = &result.nodes[0];
     let prompt = node.config.get("prompt").unwrap().as_str().unwrap();
     assert!(prompt.contains('\n'));
@@ -794,12 +834,11 @@ node = ExecPython {
 #[test]
 fn test_config_json_array_inline() {
     let source = r#"
-# Project: JsonArr
 node = ExecPython {
     items: ["a", "b", "c"]
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile inline JSON array");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile inline JSON array");
     let node = &result.nodes[0];
     let items = node.config.get("items").unwrap();
     assert!(items.is_array());
@@ -809,12 +848,11 @@ node = ExecPython {
 #[test]
 fn test_config_json_object_inline() {
     let source = r#"
-# Project: JsonObj
 node = ExecPython {
     headers: {"Authorization": "Bearer token", "Content-Type": "application/json"}
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile inline JSON object");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile inline JSON object");
     let node = &result.nodes[0];
     let headers = node.config.get("headers").unwrap();
     assert!(headers.is_object());
@@ -828,15 +866,15 @@ fn bare_unquoted_value_is_loud() {
     // a type expression is not assignable. A bare identifier was silently coerced
     // into the string `"streaming"` (and a bare port name like `text = raw` into
     // the string `"raw"`, dropping the intended wire). It must fail loud.
-    let source = "# Project: Bare\nnode = ExecPython {\n    mode: streaming\n}\n";
-    let errs = compile(source, uuid::Uuid::new_v4(), None).unwrap_err();
+    let source = "node = ExecPython {\n    mode: streaming\n}\n";
+    let errs = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
     assert!(
         errs.iter().any(|e| e.message.contains("has an invalid value `streaming`")),
         "bare unquoted value must be a loud error: {errs:?}"
     );
     // The quoted form is the valid way to write the same literal.
-    let quoted = "# Project: Bare\nnode = ExecPython {\n    mode: \"streaming\"\n}\n";
-    let p = compile(quoted, uuid::Uuid::new_v4(), None).expect("quoted value compiles");
+    let quoted = "node = ExecPython {\n    mode: \"streaming\"\n}\n";
+    let p = compile(quoted, uuid::Uuid::new_v4(), CompileFs::none()).expect("quoted value compiles");
     assert_eq!(p.nodes[0].config.get("mode").unwrap().as_str().unwrap(), "streaming");
 }
 
@@ -847,7 +885,7 @@ fn non_file_marker_value_is_loud() {
     // stored as a literal string; now it fails loud.
     let bare = |v: &str| {
         let src = format!("u = Text {{\n  value: {v}\n}}\n");
-        compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None).1
+        compile_lenient(&src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None).1
     };
     for v in ["@bogus(x)", "@include(\"x.weft\")", "@require_one_of(a, b)", "@x"] {
         let errs = bare(v);
@@ -862,7 +900,7 @@ fn malformed_json_value_is_loud() {
     // valid JSON still parses.
     let errs = |v: &str| {
         let src = format!("u = Text {{\n  value: {v}\n}}\n");
-        compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None).1
+        compile_lenient(&src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None).1
     };
     for v in ["{bad}", "[a, b]", "{\"k\": }", "[1, 2,]"] {
         assert!(errs(v).iter().any(|e| e.message.contains("invalid JSON value")), "`{v}` must be loud: {:?}", errs(v));
@@ -880,14 +918,14 @@ fn out_of_range_number_is_loud_not_null() {
     // it must fail loud instead of storing a `null` the user never wrote.
     let nines = "9".repeat(320);
     let src = format!("u = Text {{\n  value: {nines}\n}}\n");
-    let (project, errs) = compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (project, errs) = compile_lenient(&src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.iter().any(|e| e.message.contains("out-of-range numeric value")), "huge number must be loud: {errs:?}");
     // And it must NOT have been stored as a null in the node's config.
     if let Some(n) = project.nodes.iter().find(|n| n.id == "u") {
         assert!(!n.config.get("value").is_some_and(|v| v.is_null()), "out-of-range number must never become a silent null: {:?}", n.config.get("value"));
     }
     // A normal number still parses fine (regression guard for the happy path).
-    let (_, ok) = compile_lenient("u = Text {\n  value: 42\n}\n", uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_, ok) = compile_lenient("u = Text {\n  value: 42\n}\n", uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(ok.is_empty(), "normal integer parses: {ok:?}");
 }
 
@@ -897,13 +935,13 @@ fn label_must_be_a_quoted_string_or_heredoc() {
     // forms are valid. (The label path used to bypass the value gate entirely.)
     let errs = |label: &str| {
         let src = format!("u = Text {{\n  _label: {label}\n  value: \"x\"\n}}\n");
-        compile_lenient(&src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None).1
+        compile_lenient(&src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None).1
     };
     assert!(errs("raw").iter().any(|e| e.message.contains("'_label' has an invalid value")), "bare label loud: {:?}", errs("raw"));
     assert!(errs("42").iter().any(|e| e.message.contains("'_label' has an invalid value")), "numeric label loud: {:?}", errs("42"));
     assert!(errs("\"Name\"").is_empty(), "quoted label valid: {:?}", errs("\"Name\""));
     // Heredoc label is valid (the editor emits one for a multiline label).
-    let (p, herr) = compile_lenient("u = Text {\n  _label: ```\nMulti\nLine\n```\n  value: \"x\"\n}\n", uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (p, herr) = compile_lenient("u = Text {\n  _label: ```\nMulti\nLine\n```\n  value: \"x\"\n}\n", uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(herr.is_empty(), "heredoc label valid: {herr:?}");
     assert_eq!(p.nodes.iter().find(|n| n.id == "u").and_then(|n| n.label.as_deref()), Some("Multi\nLine"));
 }
@@ -920,7 +958,7 @@ g = Group(items: List[String]) -> (out: String) {
     self.out = t.value
 }
 "#;
-    let (_, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(
         errs.iter().any(|e| e.message.contains("groups do not take config fields")),
         "stray group config field must error loudly: {errs:?}"
@@ -930,12 +968,11 @@ g = Group(items: List[String]) -> (out: String) {
 #[test]
 fn test_config_empty_quoted_string() {
     let source = r#"
-# Project: EmptyStr
 node = ExecPython {
     prefix: ""
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile empty string");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile empty string");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("prefix").unwrap().as_str().unwrap(), "");
 }
@@ -945,13 +982,12 @@ node = ExecPython {
 #[test]
 fn test_label_quoted() {
     let source = r#"
-# Project: Label
 node = ExecPython {
     _label: "My Worker Node"
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = &result.nodes[0];
     assert_eq!(node.label.as_deref(), Some("My Worker Node"));
 }
@@ -961,13 +997,13 @@ fn unquoted_label_is_loud() {
     // A label is a STRING: it must be quoted. A bare `_label: Worker` used to be
     // silently coerced to the string "Worker"; now it fails loud like any other
     // unquoted value.
-    let bare = "# Project: LabelBare\nnode = ExecPython {\n    _label: Worker\n    code: \"return {}\"\n}\n";
-    let errs = compile(bare, uuid::Uuid::new_v4(), None).unwrap_err();
+    let bare = "node = ExecPython {\n    _label: Worker\n    code: \"return {}\"\n}\n";
+    let errs = compile(bare, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("'_label' has an invalid value")), "bare label must be loud: {errs:?}");
 
     // The quoted form is valid.
-    let quoted = "# Project: LabelBare\nnode = ExecPython {\n    _label: \"Worker\"\n    code: \"return {}\"\n}\n";
-    let p = compile(quoted, uuid::Uuid::new_v4(), None).expect("quoted label compiles");
+    let quoted = "node = ExecPython {\n    _label: \"Worker\"\n    code: \"return {}\"\n}\n";
+    let p = compile(quoted, uuid::Uuid::new_v4(), CompileFs::none()).expect("quoted label compiles");
     assert_eq!(p.nodes[0].label.as_deref(), Some("Worker"));
 }
 
@@ -979,11 +1015,11 @@ fn label_has_one_home_and_one_syntax() {
     // `n._label = "x"` silently landed in `config["_label"]` (where nothing reads
     // it) while `node.label` stayed empty. Both must fail loud.
     let dup = "n = Text {\n  _label: \"a\"\n  _label: \"b\"\n}\n";
-    let (_p, errs) = compile_lenient(dup, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p, errs) = compile_lenient(dup, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.iter().any(|e| e.message.contains("duplicate '_label'")), "dup label loud: {errs:?}");
 
     let conn = "n = Text {}\nn._label = \"viaconn\"\n";
-    let (p2, errs2) = compile_lenient(conn, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (p2, errs2) = compile_lenient(conn, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs2.iter().any(|e| e.message.contains("a node's label is set with a body field")), "conn-origin label loud: {errs2:?}");
     // And it did NOT silently land in config.
     let n = p2.nodes.iter().find(|n| n.id == "n").expect("node n");
@@ -1001,7 +1037,7 @@ fn flatten_never_ships_duplicate_node_ids() {
     std::fs::write(dir.path().join("coll.weft"),
         "Group(x: String) -> (y: String) {\n  m = Text { value: \"v\" }\n  self.y = m.value\n}\n").unwrap();
     let src = "root = Group() {\n  c = @include(\"coll.weft\")\n  c = Group() -> (z: String) {}\n}\n";
-    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Full, None);
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Full, None);
     // The collision IS reported loudly.
     assert!(errs.iter().any(|e| e.message.contains("Duplicate id")), "collision reported: {errs:?}");
     // But the rendered node set has NO duplicate id.
@@ -1013,13 +1049,12 @@ fn flatten_never_ships_duplicate_node_ids() {
 #[test]
 fn test_label_with_escapes() {
     let source = r#"
-# Project: LabelEsc
 node = ExecPython {
     _label: "Has \"quotes\" inside"
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile escaped label");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile escaped label");
     let node = &result.nodes[0];
     assert_eq!(node.label.as_deref(), Some("Has \"quotes\" inside"));
 }
@@ -1027,10 +1062,9 @@ node = ExecPython {
 #[test]
 fn test_label_in_oneliner() {
     let source = r#"
-# Project: LabelOneLiner
 node = ExecPython { _label: "Quick", code: "return {}" }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = &result.nodes[0];
     assert_eq!(node.label.as_deref(), Some("Quick"));
     assert!(node.config.get("code").is_some());
@@ -1041,11 +1075,10 @@ node = ExecPython { _label: "Quick", code: "return {}" }
 #[test]
 fn test_error_unclosed_config_block() {
     let source = r#"
-# Project: UnclosedConfig
 node = ExecPython {
     code: "return {}"
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Unclosed config block should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Unclosed config block")));
@@ -1054,11 +1087,10 @@ node = ExecPython {
 #[test]
 fn test_error_unclosed_group() {
     let source = r#"
-# Project: UnclosedGroup
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "hi" }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Unclosed group should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Unclosed group")));
@@ -1067,11 +1099,10 @@ grp = Group(data: String) -> (result: String) {
 #[test]
 fn test_error_duplicate_root_node_id() {
     let source = r#"
-# Project: DupNode
 node = Text { value: "a" }
 node = Text { value: "b" }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Duplicate node ID should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate id 'node'")));
@@ -1080,11 +1111,10 @@ node = Text { value: "b" }
 #[test]
 fn test_error_duplicate_group_name() {
     let source = r#"
-# Project: DupGroup
 grp = Group() -> ()
 grp = Group() -> ()
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Duplicate group name should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate id 'grp'")));
@@ -1093,7 +1123,6 @@ grp = Group() -> ()
 #[test]
 fn test_error_duplicate_node_in_group() {
     let source = r#"
-# Project: DupInGroup
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "a" }
     worker = Template { template: "b" }
@@ -1101,7 +1130,7 @@ grp = Group(data: String) -> (result: String) {
     self.result = worker.output
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Duplicate node in group should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate id") && e.message.contains("worker")));
@@ -1110,14 +1139,13 @@ grp = Group(data: String) -> (result: String) {
 #[test]
 fn test_error_require_one_of_in_outputs() {
     let source = r#"
-# Project: OorOutput
 node = ExecPython() -> (
     a: String?,
     b: String?,
     @require_one_of(a, b)
 ) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "@require_one_of in outputs should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("@require_one_of is only valid in input")));
@@ -1126,14 +1154,13 @@ node = ExecPython() -> (
 #[test]
 fn test_error_require_one_of_missing_paren() {
     let source = r#"
-# Project: OorBad
 node = ExecPython(
     a: String?,
     b: String?,
     @require_one_of(a, b
 ) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "@require_one_of missing ) should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("missing closing parenthesis")));
@@ -1142,20 +1169,18 @@ node = ExecPython(
 #[test]
 fn test_error_invalid_port_type() {
     let source = r#"
-# Project: BadPortType
 node = ExecPython(data: Foo) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Invalid type 'Foo' should error");
 }
 
 #[test]
 fn test_error_duplicate_port_name() {
     let source = r#"
-# Project: DupPort
 node = ExecPython(data: String, data: Number) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Duplicate port name should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Duplicate")));
@@ -1164,21 +1189,19 @@ node = ExecPython(data: String, data: Number) -> (result: String) {}
 #[test]
 fn test_error_port_name_starts_with_number() {
     let source = r#"
-# Project: BadPortName
 node = ExecPython(1data: String) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Port name starting with number should error");
 }
 
 #[test]
 fn test_error_unexpected_root_content() {
     let source = r#"
-# Project: Unexpected
 node = Text { value: "hi" }
 this is not valid syntax
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Random text should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Unexpected")));
@@ -1187,14 +1210,13 @@ this is not valid syntax
 #[test]
 fn test_error_broken_multiline_json() {
     let source = r#"
-# Project: BrokenJson
 node = ExecPython {
     data: [{
         "key": "value"
 
 node2 = Text { value: "hi" }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None);
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none());
     assert!(result.is_err(), "Broken JSON should error");
     let errors = result.unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("Broken JSON") || e.message.contains("Unclosed")));
@@ -1205,20 +1227,19 @@ node2 = Text { value: "hi" }
 #[test]
 fn test_empty_source() {
     let source = "";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("empty project should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("empty project should compile");
     assert_eq!(result.nodes.len(), 0);
 }
 
 #[test]
 fn test_comments_only() {
     let source = r#"
-# Project: CommentsOnly
 # Description: Nothing here
 
 # Just comments
 # More comments
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     // `# Project:` is now an ordinary comment, not a name source.
     assert_eq!(result.nodes.len(), 0);
     assert_eq!(result.edges.len(), 0);
@@ -1229,7 +1250,6 @@ fn test_comments_only() {
 #[test]
 fn test_multiline_inputs_and_outputs_on_separate_lines() {
     let source = r#"
-# Project: MultiLine
 node = ExecPython(
     input1: String,
     input2: Number
@@ -1239,7 +1259,7 @@ node = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile multiline sig");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile multiline sig");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 2);
     assert_eq!(node.outputs.len(), 1);
@@ -1248,13 +1268,12 @@ node = ExecPython(
 #[test]
 fn test_arrow_on_next_line() {
     let source = "
-# Project: ArrowNext
 node = ExecPython(data: String)
 -> (result: String) {
     code: \"return {}\"
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile arrow on next line");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile arrow on next line");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 1);
     assert_eq!(node.outputs.len(), 1);
@@ -1263,7 +1282,6 @@ node = ExecPython(data: String)
 #[test]
 fn test_deeply_split_signature() {
     let source = r#"
-# Project: DeeplySplit
 node = ExecPython(
     a: String,
     b: Number,
@@ -1275,7 +1293,7 @@ node = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile deeply split sig");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile deeply split sig");
     let node = &result.nodes[0];
     assert_eq!(node.inputs.len(), 3);
     assert_eq!(node.outputs.len(), 2);
@@ -1288,7 +1306,6 @@ node = ExecPython(
 fn test_triple_backtick_dedent() {
     // Indented content should be dedented
     let source = "
-# Project: Dedent
 node = ExecPython {
     code: ```
         line1
@@ -1296,7 +1313,7 @@ node = ExecPython {
     ```
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
     // After dedenting, 4 spaces of common indent removed
@@ -1309,13 +1326,12 @@ node = ExecPython {
 #[test]
 fn test_triple_backtick_empty_value() {
     let source = "
-# Project: EmptyBT
 node = ExecPython {
     code: ```
     ```
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile empty triple backtick");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile empty triple backtick");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.trim().is_empty(), "empty backtick should produce empty string");
@@ -1324,14 +1340,13 @@ node = ExecPython {
 #[test]
 fn test_triple_backtick_with_escaped_backticks() {
     let source = "
-# Project: EscBT
 node = ExecPython {
     code: ```
 print(\"\\`\\`\\`\")
     ```
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile escaped backticks");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile escaped backticks");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
     assert!(code.contains("```"), "escaped backticks should become real backticks");
@@ -1342,10 +1357,9 @@ print(\"\\`\\`\\`\")
 #[test]
 fn test_oneliner_config() {
     let source = r#"
-# Project: OneLiner
 node = ExecPython { code: "return {}", mode: "fast" }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile one-liner config");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile one-liner config");
     let node = &result.nodes[0];
     assert_eq!(node.config.get("code").unwrap().as_str().unwrap(), "return {}");
     assert_eq!(node.config.get("mode").unwrap().as_str().unwrap(), "fast");
@@ -1354,10 +1368,9 @@ node = ExecPython { code: "return {}", mode: "fast" }
 #[test]
 fn test_empty_config_block() {
     let source = r#"
-# Project: EmptyConfig
 node = ExecPython(data: String) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile empty config");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile empty config");
     let node = &result.nodes[0];
     assert!(node.config.as_object().unwrap().is_empty());
 }
@@ -1367,7 +1380,6 @@ node = ExecPython(data: String) -> (result: String) {}
 #[test]
 fn test_comments_between_declarations() {
     let source = r#"
-# Project: Comments
 a = Text { value: "one" }
 
 # This is a comment between nodes
@@ -1375,19 +1387,18 @@ a = Text { value: "one" }
 
 b = Text { value: "two" }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     assert_eq!(result.nodes.len(), 2);
 }
 
 #[test]
 fn test_comment_after_opening_brace() {
     let source = "
-# Project: BraceComment
 node = ExecPython(data: String) -> (result: String) { # This is a config block
     code: \"return {}\"
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile with comment after {");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile with comment after {");
     let node = &result.nodes[0];
     assert!(node.config.get("code").is_some());
 }
@@ -1397,7 +1408,6 @@ node = ExecPython(data: String) -> (result: String) { # This is a config block
 #[test]
 fn test_multiple_require_one_of_groups() {
     let source = r#"
-# Project: MultiOor
 node = ExecPython(
     text: String?,
     audio: Audio?,
@@ -1407,7 +1417,7 @@ node = ExecPython(
     @require_one_of(url, file)
 ) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile multiple @require_one_of");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile multiple @require_one_of");
     let node = &result.nodes[0];
     assert_eq!(node.features.one_of_required.len(), 2);
     assert_eq!(node.features.one_of_required[0], vec!["text", "audio"]);
@@ -1417,10 +1427,9 @@ node = ExecPython(
 #[test]
 fn test_port_underscore_name() {
     let source = r#"
-# Project: UnderscorePort
 node = ExecPython(_internal: String) -> (_result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile underscore port names");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile underscore port names");
     let node = &result.nodes[0];
     assert_eq!(node.inputs[0].name, "_internal");
     assert_eq!(node.outputs[0].name, "_result");
@@ -1429,10 +1438,9 @@ node = ExecPython(_internal: String) -> (_result: String) {}
 #[test]
 fn test_port_must_override_optional() {
     let source = r#"
-# Project: MustOverrideOpt
 node = ExecPython(data?, required_data) -> (result) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = &result.nodes[0];
     assert!(!node.inputs[0].required, "data? should be optional");
     assert!(node.inputs[1].required, "required_data should be required (default)");
@@ -1444,10 +1452,9 @@ node = ExecPython(data?, required_data) -> (result) {}
 #[test]
 fn test_null_in_union_type() {
     let source = r#"
-# Project: NullType
 node = ExecPython(data: String | Null) -> (result: String | Null) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile Null in union");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile Null in union");
     let node = &result.nodes[0];
     // Both should be union types containing Null
     match &node.inputs[0].port_type {
@@ -1463,12 +1470,11 @@ node = ExecPython(data: String | Null) -> (result: String | Null) {}
 #[test]
 fn test_connections_with_whitespace() {
     let source = r#"
-# Project: WsConn
 a = Text { value: "hi" }
 b = Debug {}
 b.data   =   a.value
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile connections with whitespace");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile connections with whitespace");
     assert_eq!(result.edges.len(), 1);
     assert_eq!(result.edges[0].target, "b");
     assert_eq!(result.edges[0].source, "a");
@@ -1477,7 +1483,6 @@ b.data   =   a.value
 #[test]
 fn test_multiple_connections_to_same_node() {
     let source = r#"
-# Project: MultiConn
 src1 = Text { value: "a" }
 src2 = Text { value: "b" }
 target = ExecPython(x: String, y: String) -> (result: String) {
@@ -1486,7 +1491,7 @@ target = ExecPython(x: String, y: String) -> (result: String) {
 target.x = src1.value
 target.y = src2.value
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     assert_eq!(result.edges.len(), 2);
 }
 
@@ -1495,10 +1500,9 @@ target.y = src2.value
 #[test]
 fn test_group_empty_body() {
     let source = r#"
-# Project: EmptyBody
 grp = Group(data: String) -> (result: String) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile empty group body");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile empty group body");
     let pt_in = result.nodes.iter().find(|n| n.id == "grp__in").unwrap();
     let pt_out = result.nodes.iter().find(|n| n.id == "grp__out").unwrap();
     assert_eq!(pt_in.node_type, "Passthrough");
@@ -1508,12 +1512,11 @@ grp = Group(data: String) -> (result: String) {}
 #[test]
 fn test_group_with_only_connections() {
     let source = r#"
-# Project: ConnOnly
 grp = Group(data: String) -> (result: String) {
     self.result = self.data
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile group with passthrough wiring");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile group with passthrough wiring");
     // Only passthrough nodes, no child nodes
     assert_eq!(result.nodes.len(), 2); // grp__in, grp__out
     // Connection from __in to __out
@@ -1523,7 +1526,6 @@ grp = Group(data: String) -> (result: String) {
 #[test]
 fn test_same_node_id_in_different_groups_allowed() {
     let source = r#"
-# Project: SameIdDiffGroup
 a = Group(data: String) -> (result: String) {
     proc = Template { template: "A" }
     proc.value = self.data
@@ -1535,7 +1537,7 @@ b = Group(data: String) -> (result: String) {
     self.result = proc.output
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile: same node ID in different groups is allowed");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile: same node ID in different groups is allowed");
     assert!(result.nodes.iter().any(|n| n.id == "a.proc"));
     assert!(result.nodes.iter().any(|n| n.id == "b.proc"));
 }
@@ -1545,7 +1547,6 @@ b = Group(data: String) -> (result: String) {
 #[test]
 fn test_require_one_of_in_config_block() {
     let source = r#"
-# Project: OorConfig
 node = ExecPython(
     a: String?,
     b: String?
@@ -1554,7 +1555,7 @@ node = ExecPython(
     code: "return {}"
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile @require_one_of in config");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile @require_one_of in config");
     let node = &result.nodes[0];
     assert_eq!(node.features.one_of_required.len(), 1);
     assert_eq!(node.features.one_of_required[0], vec!["a", "b"]);
@@ -1565,7 +1566,6 @@ node = ExecPython(
 #[test]
 fn test_full_workflow_small() {
     let source = r#"
-# Project: Full Workflow
 # Description: Small end-to-end test
 
 input = Text { value: "Hello world" }
@@ -1592,7 +1592,7 @@ llm.prompt = processor.clean
 output = Debug {}
 output.data = llm.response
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile full workflow");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile full workflow");
     // input + processor__in + processor__out + processor.trimmer + llm + output = 6
     assert_eq!(result.nodes.len(), 6);
     // input->processor__in, processor__in->trimmer, trimmer->processor__out,
@@ -1610,11 +1610,10 @@ output.data = llm.response
 #[test]
 fn test_scope_top_level_nodes() {
     let source = r#"
-# Project: Scope
 a = Text { value: "hello" }
 b = Template { template: "{{data}}" }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     for node in &result.nodes {
         assert!(node.scope.is_empty(), "top-level node '{}' should have empty scope", node.id);
         assert!(node.group_boundary.is_none(), "top-level node '{}' should not be a boundary", node.id);
@@ -1624,14 +1623,13 @@ b = Template { template: "{{data}}" }
 #[test]
 fn test_scope_simple_group() {
     let source = r#"
-# Project: Scope
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "{{data}}" }
     worker.value = self.data
     self.result = worker.output
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
 
     // __in passthrough: boundary In, scope = [] (parent is top-level)
     let pt_in = result.nodes.iter().find(|n| n.id == "grp__in").unwrap();
@@ -1656,7 +1654,6 @@ grp = Group(data: String) -> (result: String) {
 #[test]
 fn test_scope_nested_groups() {
     let source = r#"
-# Project: Nested
 outer = Group(data: String) -> (result: String) {
     inner = Group(data: String) -> (result: String) {
         worker = Template { template: "{{data}}" }
@@ -1667,7 +1664,7 @@ outer = Group(data: String) -> (result: String) {
     self.result = inner.result
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile nested groups");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile nested groups");
 
     // outer__in: scope = [], boundary In for "outer"
     let outer_in = result.nodes.iter().find(|n| n.id == "outer__in").unwrap();
@@ -1699,7 +1696,6 @@ outer = Group(data: String) -> (result: String) {
 #[test]
 fn test_scope_triple_nested() {
     let source = r#"
-# Project: Triple
 a = Group(x: String) -> (y: String) {
     b = Group(x: String) -> (y: String) {
         c = Group(x: String) -> (y: String) {
@@ -1714,7 +1710,7 @@ a = Group(x: String) -> (y: String) {
     self.y = b.y
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile triple nested");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile triple nested");
 
     let node = result.nodes.iter().find(|n| n.id == "a.b.c.node").unwrap();
     assert_eq!(node.scope, vec!["a", "a.b", "a.b.c"]);
@@ -1739,7 +1735,6 @@ fn test_scope_mocking_inner_group_skips_only_inner() {
     // If "outer.inner" is mocked, only nodes with "outer.inner" in their scope should be skipped.
     // Nodes with just "outer" in scope (but not "outer.inner") should NOT be skipped.
     let source = r#"
-# Project: SelectiveMock
 outer = Group(data: String) -> (result: String) {
     pre = Template { template: "pre" }
     inner = Group(data: String) -> (result: String) {
@@ -1751,7 +1746,7 @@ outer = Group(data: String) -> (result: String) {
     self.result = inner.result
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
 
     let pre = result.nodes.iter().find(|n| n.id == "outer.pre").unwrap();
     let deep = result.nodes.iter().find(|n| n.id == "outer.inner.deep").unwrap();
@@ -1785,7 +1780,7 @@ poet = LlmConfig {
     systemPrompt: @file("system.txt")
 }
 "#;
-    let project = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).expect("should compile");
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("should compile");
     let poet = project.nodes.iter().find(|n| n.id == "poet").expect("poet node");
     assert_eq!(
         poet.config.get("systemPrompt").and_then(|v| v.as_str()),
@@ -1806,7 +1801,7 @@ g = Group() -> () {
     poet.systemPrompt = @file("sys.txt")
 }
 "#;
-    let project = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).expect("should compile");
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("should compile");
     let poet = project.nodes.iter().find(|n| n.id == "g.poet").expect("g.poet node");
     assert_eq!(
         poet.config.get("systemPrompt").and_then(|v| v.as_str()),
@@ -1824,7 +1819,7 @@ node = SomeNode {
     cfg: @file("cfg.json", JsonDict)
 }
 "#;
-    let project = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).expect("should compile");
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("should compile");
     let node = project.nodes.iter().find(|n| n.id == "node").expect("node");
     assert_eq!(node.config.get("cfg"), Some(&serde_json::json!({"a": 1, "b": 2})));
 }
@@ -1839,7 +1834,7 @@ poet = LlmConfig {
     systemPrompt: @file("system.txt")
 }
 "#;
-    let project = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let poet = project.nodes.iter().find(|n| n.id == "poet").expect("poet");
 
     // config holds the resolved value (build/run use this).
@@ -1868,7 +1863,7 @@ g = Group -> (out: String) {
     self.out = inner.value
 }
 "#;
-    let project = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let inner = project.nodes.iter().find(|n| n.id == "g.inner").expect("g.inner");
     assert_eq!(inner.config.get("value").and_then(|v| v.as_str()), Some("grouped prompt"));
 }
@@ -1881,7 +1876,7 @@ node = SomeNode {
     x: @file("nope.txt")
 }
 "#;
-    let errors = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("nope.txt")), "errors: {errors:?}");
 }
 
@@ -1904,7 +1899,7 @@ c = @include("cleaner.weft")
 "#;
     // Full mode (build): the group inlines, flattening to c__in / c__out
     // boundary Passthroughs plus the internal node, all scoped under `c`.
-    let project = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     assert!(project.nodes.iter().any(|n| n.id == "c__in"), "missing c__in: {:?}", project.nodes.iter().map(|n| &n.id).collect::<Vec<_>>());
     assert!(project.nodes.iter().any(|n| n.id == "c__out"));
     assert!(project.nodes.iter().any(|n| n.id == "c.strip"));
@@ -1921,7 +1916,7 @@ fn include_with_nested_group_scopes_under_alias() {
         dir.path().join("comp.weft"),
         "Group(raw: String) -> (cleaned: String) {\n  sub = Group(i: String) -> (o: String) {\n    inner = Text { value: \"y\" }\n    self.o = inner.value\n  }\n  pick = Text { value: Upper { text: \"z\" }.out }\n  self.cleaned = sub.o\n}\n",
     ).unwrap();
-    let project = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let project = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let ids: std::collections::HashSet<&str> = project.nodes.iter().map(|n| n.id.as_str()).collect();
     // Boundary passthroughs of the included root and the nested sub-group, all
     // scoped under the alias `c` in one pass.
@@ -1944,7 +1939,7 @@ fn include_interface_emits_opaque_node() {
 c = @include("cleaner.weft")
 "#;
     // Interface mode (editor): one opaque node carrying the group's ports.
-    let project = compile_with_mode(source, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface, None)
+    let project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None)
         .expect("compile");
     let c = project.nodes.iter().find(|n| n.id == "c").expect("opaque include node");
     assert_eq!(c.node_type, INCLUDE_NODE_TYPE);
@@ -1971,7 +1966,7 @@ g = Group -> (out: String) {
     self.out = inc.cleaned
 }
 "#;
-    let project = compile_with_mode(source, uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface, None)
+    let project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None)
         .expect("compile (sibling edge into opaque include must stay in-scope)");
     let inc = project.nodes.iter().find(|n| n.id == "g.inc").expect("g.inc opaque node");
     assert_eq!(inc.scope, vec!["g".to_string()]);
@@ -1996,7 +1991,7 @@ Group(raw: String) -> (cleaned: String) {
     self.cleaned = sub.out
 }
 "#;
-    let project = compile_with_mode(source, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Cleaner"))
+    let project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, Some("Cleaner"))
         .expect("compile");
 
     let blob = serde_json::to_string(&project).unwrap();
@@ -2020,7 +2015,7 @@ Group(raw: String) -> (cleaned: String) {
 #[test]
 fn double_underscore_user_names_rejected_loud() {
     let needs = |src: &str, what: &str| {
-        let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+        let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
         assert!(
             errs.iter().any(|e| e.message.contains("reserved for compiler-generated ids")),
             "{what}: must reject `__` loudly: {errs:?}"
@@ -2041,7 +2036,7 @@ fn double_underscore_user_names_rejected_loud() {
     needs("a__b = Debug\n", "node-name");
 
     // A plausible legit name WITHOUT `__` still compiles fine (no false positive).
-    let (_p, errs) = compile_lenient("my_node = Debug\n", uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p, errs) = compile_lenient("my_node = Debug\n", uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.is_empty(), "single underscore is fine: {errs:?}");
 }
 
@@ -2054,7 +2049,7 @@ fn include_requires_single_group() {
         "a = Group -> (x: String) { n = Text { value: \"1\" }\n self.x = n.value }\nb = Group -> (y: String) { m = Text { value: \"2\" }\n self.y = m.value }\n",
     ).unwrap();
     let source = "c = @include(\"bad.weft\")\n";
-    let errs = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("anonymous top-level Group")), "errs: {errs:?}");
 }
 
@@ -2064,7 +2059,7 @@ fn include_rejects_loose_nodes() {
     // Loose node, no Group wrapper.
     std::fs::write(dir.path().join("loose.weft"), "n = Text { value: \"hi\" }\n").unwrap();
     let source = "c = @include(\"loose.weft\")\n";
-    let errs = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("anonymous top-level Group")), "errs: {errs:?}");
 }
 
@@ -2079,7 +2074,7 @@ fn include_rejects_loose_top_level_connection() {
         dir.path().join("comp.weft"),
         "Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\nlost_src.out = lost_tgt.in\n",
     ).unwrap();
-    let errs = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("anonymous top-level Group")), "loose connection must be rejected: {errs:?}");
 }
 
@@ -2090,11 +2085,11 @@ fn duplicate_config_key_is_loud() {
     // Last-write-wins let the editor's per-key SetConfig/RemoveConfig touch only
     // one of the two values and strand the other.
     let body_then_conn = "t = Text {\n  value: \"a\"\n}\nt.value = \"b\"\n";
-    let (_p, errs) = compile_lenient(body_then_conn, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p, errs) = compile_lenient(body_then_conn, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.iter().any(|e| e.message.contains("duplicate config field 'value'")), "body+conn dup: {errs:?}");
 
     let two_body = "t = Text {\n  value: \"a\"\n  value: \"b\"\n}\n";
-    let (_p2, errs2) = compile_lenient(two_body, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p2, errs2) = compile_lenient(two_body, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs2.iter().any(|e| e.message.contains("duplicate config field 'value'")), "two body fields dup: {errs2:?}");
 }
 
@@ -2106,8 +2101,8 @@ fn literal_to_non_node_port_is_loud() {
     // targets must fail loud: a group boundary (`self.out`), and a group/include
     // alias port (`c.raw`). A node config fill (`n.port = "v"`) and an inline
     // node (`c.raw = Text{...}.value`) are still valid.
-    let assert_loud = |src: &str, base: Option<&std::path::Path>, what: &str| {
-        let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), base, IncludeMode::Interface, None);
+    let assert_loud = |src: &str, fs: CompileFs, what: &str| {
+        let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), fs, IncludeMode::Interface, None);
         assert!(
             errs.iter().any(|e| e.message.contains("only a node's own port takes a literal config value")),
             "{what}: literal to a non-node port must be loud: {errs:?}"
@@ -2115,18 +2110,18 @@ fn literal_to_non_node_port_is_loud() {
         assert!(!p.edges.iter().any(|e| e.source.is_empty()), "{what}: no empty-source edge: {:?}", p.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>());
     };
     // Literal to a group's own boundary output.
-    assert_loud("g = Group() -> (out: String) {\n  self.out = \"lit\"\n}\n", None, "self-boundary");
+    assert_loud("g = Group() -> (out: String) {\n  self.out = \"lit\"\n}\n", CompileFs::none(), "self-boundary");
     // Literal to an @include alias's input port (a group has no visual config).
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("comp.weft"),
         "Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\n").unwrap();
-    assert_loud("c = @include(\"comp.weft\")\nc.raw = \"hi\"\n", Some(dir.path()), "include-alias-port");
+    assert_loud("c = @include(\"comp.weft\")\nc.raw = \"hi\"\n", CompileFs::disk(dir.path()), "include-alias-port");
 
     // BUT an inline node driving the include port is still valid (it's wiring,
     // not a literal): a real node is synthesized and wired, no error.
     let (_p, errs) = compile_lenient(
         "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n",
-        uuid::Uuid::new_v4(), Some(dir.path()), IncludeMode::Interface, None,
+        uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None,
     );
     assert!(!errs.iter().any(|e| e.message.contains("only a node's own port takes")), "inline node to a group port is valid: {errs:?}");
 }
@@ -2139,7 +2134,7 @@ fn bare_port_name_reference_is_loud_not_a_literal() {
     // the group input was left unwired and the user's intent vanished with no
     // diagnostic. A bare identifier RHS must now fail loud.
     let bare = "g = Group(raw: String) -> (o: String) {\n  u = Upper {}\n  u.text = raw\n  self.o = u.out\n}\n";
-    let (p, errs) = compile_lenient(bare, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Top"));
+    let (p, errs) = compile_lenient(bare, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, Some("Top"));
     assert!(
         errs.iter().any(|e| e.message.contains("has an invalid value `raw`")),
         "bare port-name reference must be a loud error: {errs:?}"
@@ -2150,7 +2145,7 @@ fn bare_port_name_reference_is_loud_not_a_literal() {
 
     // The correct `self.raw` form wires the group input boundary into the node.
     let wired = "g = Group(raw: String) -> (o: String) {\n  u = Upper {}\n  u.text = self.raw\n  self.o = u.out\n}\n";
-    let (p2, errs2) = compile_lenient(wired, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Top"));
+    let (p2, errs2) = compile_lenient(wired, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, Some("Top"));
     assert!(!errs2.iter().any(|e| e.message.contains("invalid value")), "self.raw is valid: {errs2:?}");
     assert!(
         p2.edges.iter().any(|e| e.source == "g__in" && e.target == "g.u"),
@@ -2166,11 +2161,11 @@ fn duplicate_id_across_kinds_is_error() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("comp.weft"), CLEANER_WEFT).unwrap();
     let inc_then_node = "c = @include(\"comp.weft\")\nc = Debug\n";
-    let errs = compile(inc_then_node, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile(inc_then_node, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("Duplicate id 'c'")), "inc-then-node: {errs:?}");
 
     let node_then_inc = "c = Debug\nc = @include(\"comp.weft\")\n";
-    let errs = compile(node_then_inc, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile(node_then_inc, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("Duplicate id 'c'")), "node-then-inc: {errs:?}");
 }
 
@@ -2184,7 +2179,7 @@ fn include_two_anonymous_groups_reports_shape_not_sentinel() {
         dir.path().join("two.weft"),
         "Group -> (a: String) { n = Text { value: \"1\" }\n self.a = n.value }\nGroup -> (b: String) { m = Text { value: \"2\" }\n self.b = m.value }\n",
     ).unwrap();
-    let errs = compile("c = @include(\"two.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile("c = @include(\"two.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("exactly one anonymous top-level Group")), "errs: {errs:?}");
     assert!(!errs.iter().any(|e| e.message.contains("__include_root__")), "sentinel leaked: {errs:?}");
 }
@@ -2204,7 +2199,7 @@ fn nested_include_error_keeps_line() {
         dir.path().join("outer.weft"),
         "Group -> (x: String) {\n inner = @include(\"inner.weft\")\n self.x = inner.x\n}\n",
     ).unwrap();
-    let errs = compile("c = @include(\"outer.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile("c = @include(\"outer.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     // The error path carries the inner file + its line (`inner.weft: 2:...`),
     // not a bare message with the location dropped.
     assert!(errs.iter().any(|e| e.message.contains("inner.weft: 2:")), "errs: {errs:?}");
@@ -2219,7 +2214,7 @@ fn include_rejects_named_top_level_group() {
         "thing = Group(raw: String) -> (cleaned: String) {\n n = Text { value: \"x\" }\n self.cleaned = n.value\n}\n",
     ).unwrap();
     let source = "c = @include(\"named.weft\")\n";
-    let errs = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("anonymous top-level Group")), "errs: {errs:?}");
 }
 
@@ -2232,7 +2227,7 @@ fn include_detects_cycle() {
         "Group -> (x: String) {\n inner = @include(\"a.weft\")\n self.x = inner.x\n}\n",
     ).unwrap();
     let source = "c = @include(\"a.weft\")\n";
-    let errs = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("cycle")), "errs: {errs:?}");
 }
 
@@ -2243,7 +2238,7 @@ fn include_rejects_path_escape() {
     let root = dir.path().join("project");
     std::fs::create_dir(&root).unwrap();
     let source = "c = @include(\"../secret.weft\")\n";
-    let errs = compile(source, uuid::Uuid::new_v4(), Some(&root)).unwrap_err();
+    let errs = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(&root)).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("escapes")), "errs: {errs:?}");
 }
 
@@ -2262,7 +2257,7 @@ fn file_and_include_compose_in_one_project() {
 cfg = LlmConfig { systemPrompt: @file("system.txt") }
 clean = @include("cleaner.weft")
 "#;
-    let project = compile(source, uuid::Uuid::new_v4(), Some(dir.path())).expect("compile");
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let cfg = project.nodes.iter().find(|n| n.id == "cfg").expect("cfg");
     assert_eq!(cfg.config.get("systemPrompt").and_then(|v| v.as_str()), Some("be concise"));
     assert!(project.nodes.iter().any(|n| n.id == "clean__in"));
@@ -2277,7 +2272,7 @@ node = SomeNode {
 }
 "#;
     // No project root: a @file marker cannot resolve, must error loudly.
-    let errors = compile(source, uuid::Uuid::new_v4(), None).unwrap_err();
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
     assert!(
         errors.iter().any(|e| e.message.contains("outside a project")),
         "errors: {errors:?}"
@@ -2290,14 +2285,14 @@ fn config_spans_record_inline_and_connection_origin() {
     // `value` is set inline in the node body; `template` is set on a
     // connection line after the node. The editor needs both spans with the
     // right origin to rewrite each field in place.
-    let source = r#"# Project: Spans
+    let source = r#"
 
 t = Template {
   value: "hello"
 }
 t.template = "world"
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = result.nodes.iter().find(|n| n.id == "t").expect("node t");
 
     let value_span = node.config_spans.get("value").expect("value span");
@@ -2312,12 +2307,12 @@ t.template = "world"
 #[test]
 fn config_spans_one_liner_node() {
     use weft_core::project::ConfigOrigin;
-    let source = "# Project: OneLiner\n\nt = Text { value: \"hi\" }\n";
-    let result = compile(source, uuid::Uuid::new_v4(), None).expect("should compile");
+    let source = "t = Text { value: \"hi\" }\n";
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = result.nodes.iter().find(|n| n.id == "t").expect("node t");
     let span = node.config_spans.get("value").expect("value span");
     assert_eq!(span.origin, ConfigOrigin::Inline);
-    assert_eq!(span.span.start_line, 3, "one-liner field on its declaration line");
+    assert_eq!(span.span.start_line, 1, "one-liner field on its declaration line");
 }
 
 #[test]
@@ -2326,7 +2321,7 @@ fn lenient_parse_keeps_valid_nodes_around_a_bad_line() {
     // around it still parse, the bad line is just an error. (compile_lenient +
     // IncludeMode come from the `use weft_compiler::weft_compiler::*` glob.)
     let src = "a = Text {\n  value: \"hi\"\n}\nb = Debug\nb.data = a.value\ndebug\n";
-    let (project, errors) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (project, errors) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     let ids: Vec<&str> = project.nodes.iter().map(|n| n.id.as_str()).collect();
     assert!(ids.contains(&"a") && ids.contains(&"b"), "valid nodes survive: {ids:?}");
     assert!(errors.iter().any(|e| e.line() == 6), "bad line reported: {errors:?}");
@@ -2339,7 +2334,7 @@ fn literal_config_to_undeclared_node_fails_loud() {
     // Regression: `ghost.temperature = 0.7` with no `ghost` node must be a loud
     // error, never a phantom edge with an empty source that discards the value.
     let src = "ghost.temperature = 0.7\nn = Llm { model: \"x\" }\n";
-    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.iter().any(|e| e.message.contains("ghost.temperature")), "loud error: {errs:?}");
     assert!(!proj.edges.iter().any(|e| e.source.is_empty()), "no empty-source phantom edge: {:?}", proj.edges);
 }
@@ -2349,7 +2344,7 @@ fn literal_config_to_group_or_include_port_is_not_an_error() {
     // A literal to a GROUP's input port (resolved downstream) is legitimate, not
     // the undeclared-node error above.
     let src = "g = Group(inp: String) -> () {\n  d = Debug\n  d.data = self.inp\n}\ng.inp = \"hi\"\n";
-    let (_proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(!errs.iter().any(|e| e.message.contains("is not a declared node")), "group port config must not error: {errs:?}");
 }
 
@@ -2362,7 +2357,7 @@ fn include_alias_colliding_with_sibling_in_group_is_duplicate() {
     std::fs::write(dir.path().join("sub.weft"),
         "Group(raw: String) -> (cleaned: String) {\n s = Text { value: \"x\" }\n self.cleaned = s.value\n}\n").unwrap();
     let src = "g = Group() -> () {\n  a = Llm { model: \"x\" }\n  a = @include(\"sub.weft\")\n}\n";
-    let errs = compile(src, uuid::Uuid::new_v4(), Some(dir.path())).unwrap_err();
+    let errs = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
     assert!(errs.iter().any(|e| e.message.contains("Duplicate id 'a'") || e.message.contains("Duplicate id 'g.a'")), "errs: {errs:?}");
 }
 
@@ -2381,7 +2376,7 @@ fn strict_classifier_rejects_malformed_forms() {
         "x = @includes_other(\"a\")\n", // include-prefix marker, not @include
     ] {
         assert_eq!(parse(src).to_string(), src, "must round-trip: {src:?}");
-        let (_p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+        let (_p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
         assert!(!errs.is_empty(), "must be a loud error: {src:?} -> {errs:?}");
     }
 }
@@ -2391,7 +2386,7 @@ fn strict_classifier_rejects_malformed_forms() {
 #[test]
 fn inline_expr_in_group_has_no_dangling_edge() {
     let src = "g = Group() -> () {\n  b = Debug\n  b.data = Other { foo: \"y\" }.out\n}\n";
-    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.is_empty(), "no errors: {errs:?}");
     let ids: std::collections::HashSet<&str> = proj.nodes.iter().map(|n| n.id.as_str()).collect();
     for e in &proj.edges {
@@ -2411,7 +2406,7 @@ fn inline_expr_in_group_has_no_dangling_edge() {
 fn inline_expr_node_scope_matches_its_id() {
     // config-field path: `key: Type{}.port` and connection path: `b.in = Type{}.port`
     let src = "g = Group() -> () {\n  b = Sink { data: Make { x: \"1\" }.out }\n  c = Debug\n  c.data = Other { y: \"2\" }.out\n}\n";
-    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (proj, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.is_empty(), "no errors: {errs:?}");
     for anon in ["g.b__data", "g.c__data"] {
         let node = proj.nodes.iter().find(|n| n.id == anon).unwrap_or_else(|| panic!("missing {anon}: {:?}", proj.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()));
@@ -2424,7 +2419,7 @@ fn inline_expr_node_scope_matches_its_id() {
 #[test]
 fn inline_expr_id_collision_is_loud() {
     let dup = "n = Foo {\n  x: Bar { k: 1 }.out\n}\nn.x = Baz { k: 2 }.out\n";
-    let (_p, e) = compile_lenient(dup, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p, e) = compile_lenient(dup, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(e.iter().any(|d| d.message.contains("duplicate id")), "dup inline loud: {e:?}");
 }
 
@@ -2447,7 +2442,7 @@ fn malformed_numeric_is_not_a_number() {
 fn error_span_bounds_the_culprit() {
     // `ghost.temperature` (cols 0..17 on line 1) is the undeclared config target.
     let src = "ghost.temperature = 0.7\nn = Llm { model: \"x\" }\n";
-    let (_p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     let e = errs.iter().find(|e| e.message.contains("ghost.temperature")).expect("the error");
     assert_eq!(e.span.start_line, 1);
     assert_eq!(e.span.start_column, 0, "starts at the culprit, not the line");
@@ -2461,7 +2456,7 @@ fn error_span_bounds_the_culprit() {
 #[test]
 fn child_named_like_group_not_double_scoped() {
     let src = "g = Group() -> () {\n  g = Debug\n  other = Debug\n  other.in = g.out\n}\n";
-    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.is_empty(), "no errors: {errs:?}");
     let ids: std::collections::HashSet<&str> = p.nodes.iter().map(|n| n.id.as_str()).collect();
     assert!(ids.contains("g.g") && ids.contains("g.other"), "single-scoped: {ids:?}");
@@ -2499,7 +2494,7 @@ fn group_keyword_misuse_is_one_error() {
 #[test]
 fn require_one_of_with_space_before_paren_fails_loud() {
     let with_space = "g = Group(a: String, b: String) -> () {\n  @require_one_of (a, b)\n  n = Debug\n  n.data = self.a\n}\n";
-    let (_p, errs) = compile_lenient(with_space, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p, errs) = compile_lenient(with_space, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(
         errs.iter().any(|e| e.message.contains("@require_one_of needs a parenthesized port list")),
         "space before `(` must be a loud, actionable error: {errs:?}"
@@ -2512,14 +2507,14 @@ fn require_one_of_with_space_before_paren_fails_loud() {
 
     // The well-formed form carries the constraint with no errors.
     let no_space = "g = Group(a: String, b: String) -> () {\n  @require_one_of(a, b)\n  n = Debug\n  n.data = self.a\n}\n";
-    let (p2, errs2) = compile_lenient(no_space, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (p2, errs2) = compile_lenient(no_space, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs2.is_empty(), "well-formed @require_one_of has no errors: {errs2:?}");
     let g = p2.groups.iter().find(|g| g.id == "g").expect("group g");
     assert_eq!(g.one_of_required, vec![vec!["a".to_string(), "b".to_string()]], "constraint carried");
 
     // An empty `@require_one_of()` is also a loud error (not a silent no-op).
     let empty = "g = Group(a: String) -> () {\n  @require_one_of()\n  n = Debug\n  n.data = self.a\n}\n";
-    let (_p3, errs3) = compile_lenient(empty, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (_p3, errs3) = compile_lenient(empty, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(
         errs3.iter().any(|e| e.message.contains("@require_one_of needs a parenthesized port list")),
         "empty @require_one_of() must fail loud: {errs3:?}"
@@ -2532,7 +2527,7 @@ fn require_one_of_with_space_before_paren_fails_loud() {
 #[test]
 fn nested_anonymous_group_fails_loud() {
     let src = "Group(a: String) -> (o: String) {\n  Group(b: String) -> (p: String) {\n    n = Debug\n    self.p = n.data\n  }\n  self.o = a\n}\n";
-    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Root"));
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, Some("Root"));
     assert!(
         errs.iter().any(|e| e.message.contains("nested group must be named")),
         "nested anonymous group must be a loud error: {errs:?}"
@@ -2545,7 +2540,7 @@ fn nested_anonymous_group_fails_loud() {
     );
     // The top-level anonymous group is still fine on its own.
     let solo = "Group(a: String) -> (o: String) {\n  n = Debug\n  self.o = n.data\n}\n";
-    let (_p2, errs2) = compile_lenient(solo, uuid::Uuid::new_v4(), None, IncludeMode::Interface, Some("Root"));
+    let (_p2, errs2) = compile_lenient(solo, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, Some("Root"));
     assert!(errs2.is_empty(), "top-level anon group is valid: {errs2:?}");
 }
 
@@ -2557,7 +2552,7 @@ fn nested_anonymous_group_fails_loud() {
 #[test]
 fn inline_expr_host_shadowing_group_name_no_double_scope() {
     let src = "g = Group() -> () {\n  g = Sink { data: Make { x: \"1\" }.out }\n}\n";
-    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.is_empty(), "no errors: {errs:?}");
     // The child node is `g.g`; its inline anon is `g.g__data`, both scoped ONCE.
     assert!(p.nodes.iter().any(|n| n.id == "g.g" && n.scope == ["g"]), "child scoped once: {:?}", p.nodes.iter().map(|n| (&n.id, &n.scope)).collect::<Vec<_>>());
@@ -2584,7 +2579,7 @@ fn inline_expr_host_shadowing_group_name_no_double_scope() {
 #[test]
 fn post_body_output_syntax_is_no_longer_accepted() {
     let src = "n = Llm { value: \"x\" } -> (out: String)\n";
-    let (project, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (project, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     let n = project.nodes.iter().find(|x| x.id == "n").expect("node n must exist");
     let has_out = n.outputs.iter().any(|p| p.name == "out");
     // BOTH must hold: an `||` here would let a regression that silently
@@ -2601,7 +2596,7 @@ fn post_body_output_syntax_is_no_longer_accepted() {
 #[test]
 fn separate_line_post_body_output_syntax_is_no_longer_accepted() {
     let src = "n = Llm {\n  value: \"x\"\n}\n-> (out: String)\n";
-    let (project, errs) = compile_lenient(src, uuid::Uuid::new_v4(), None, IncludeMode::Interface, None);
+    let (project, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     let n = project.nodes.iter().find(|x| x.id == "n").expect("node n must exist");
     let has_out = n.outputs.iter().any(|p| p.name == "out");
     assert!(
@@ -2633,7 +2628,7 @@ fn include_with_internal_loop_lowers() {
          self.results = doit.results\n\
          }\n",
     ).unwrap();
-    let project = compile("c = @include(\"inner.weft\")\n", uuid::Uuid::new_v4(), Some(dir.path()))
+    let project = compile("c = @include(\"inner.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path()))
         .expect("compile with loop inside include");
     let ids: std::collections::HashSet<(String, String)> = project
         .nodes

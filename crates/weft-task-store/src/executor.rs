@@ -102,6 +102,15 @@ impl<Ctx: Send + Sync> TaskRegistryBuilder<Ctx> {
         self
     }
 
+    /// Register an executor by its raw kind STRING. For task kinds that live
+    /// OUTSIDE the built-in `TaskKind` enum (e.g. an in-cluster image build):
+    /// dispatch is string-keyed on `Task.kind`, so an added executor slots in
+    /// without widening the built-in enum.
+    pub fn register_str(mut self, kind: impl Into<String>, exec: Arc<dyn TaskExecutor<Ctx>>) -> Self {
+        self.map.insert(kind.into(), exec);
+        self
+    }
+
     pub fn build(self) -> TaskRegistry<Ctx> {
         TaskRegistry {
             inner: self.map,
@@ -154,14 +163,27 @@ impl<Ctx: Send + Sync> WorkerTaskRegistryBuilder<Ctx> {
         self
     }
 
+    /// Register a worker kind by its raw kind STRING, the same add-a-string-kind
+    /// seam the dispatcher-side builder exposes: dispatch on both sides is
+    /// string-keyed on `Task.kind`, so an added worker-target kind slots in
+    /// without widening the built-in enum.
+    pub fn register_str(
+        mut self,
+        kind: impl Into<String>,
+        kind_impl: Arc<dyn WorkerTaskKind<Ctx>>,
+    ) -> Self {
+        self.map.insert(kind.into(), kind_impl);
+        self
+    }
+
     pub fn build(self) -> WorkerTaskRegistry<Ctx> {
         WorkerTaskRegistry { inner: self.map }
     }
 }
 
 /// Maximum concurrent dispatcher tasks per Pod. Tasks like
-/// `register_signal` (HTTP to listener) and `apply_infra`
-/// (image pull + kubectl apply + readiness wait) can take seconds;
+/// `register_signal` (HTTP to listener) and `spawn_pod`
+/// (image pull + kubectl apply + boot wait) can take seconds;
 /// running them sequentially would head-of-line-block the picker. 8
 /// is enough that one slow op doesn't park everything else, low
 /// enough that we don't open arbitrarily many DB connections at once.
@@ -267,7 +289,7 @@ fn spawn_dispatcher_task<Ctx>(
 /// before the executor finishes, abandon the executor and synthesize
 /// a fail outcome. The sibling pod that re-claims will redo the work
 /// idempotently (every dispatcher task kind is idempotent on retry,
-/// e.g. RegisterSignal / ApplyInfra / RouteEntry).
+/// e.g. RegisterSignal / RouteEntry / FireSignal).
 async fn run_with_lease_guard<F>(
     fut: F,
     lease_lost: CancellationToken,

@@ -12,25 +12,37 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
-cron = "0.12"
 sha2 = { workspace = true }
+# Runtime-only deps, gated behind the `runtime` feature (default on). The
+# language TYPE layer (project/node/weft_type/...) that the compiler's
+# parse+validate path needs does NOT use any of these, so a parse-only consumer
+# (the browser WASM build) turns `runtime` off and builds without tokio/mio,
+# which has no wasm32 support. Native consumers keep the default and are
+# unaffected.
+tokio = { workspace = true, optional = true }
 # Storage-plane byte streaming: `storage::ByteStream` is a
 # `futures::stream::BoxStream` of Bytes, named in the `ContextHandle`
 # storage methods (a core trait), so the alias must live in core.
-futures = { workspace = true }
-bytes = { workspace = true }
+futures = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+cron = { version = "0.12", optional = true }
 # Signed routing-token mint/verify (`caller_token`): the dispatcher signs
 # a (color, project, pod) token at the control handshake; the worker
 # verifies it before accepting a live connection. HMAC-SHA256 over a
-# base64url payload, mirroring `weft-storage::capability`.
-hmac = { workspace = true }
-base64 = { workspace = true }
+# base64url payload.
+hmac = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 [features]
+default = ["runtime"]
+# The runtime layer: the execution context, buses, storage streaming, caller
+# connections, cancellation, timer signals, and signed routing tokens. Pulls
+# tokio/futures/bytes (no wasm32 support). Default on; the WASM parse build is
+# the only consumer that turns it off (it needs only the pure type layer).
+runtime = ["dep:tokio", "dep:futures", "dep:bytes", "dep:cron", "dep:hmac", "dep:base64"]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into
 # layer-3 tests. Off by default; consumers enable it in `[dev-dependencies]`.

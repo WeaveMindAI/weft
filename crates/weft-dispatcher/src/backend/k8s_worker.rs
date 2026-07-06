@@ -1,6 +1,7 @@
 //! K8s worker backend. Spawns one Pod per project pool. Each Pod
-//! multiplexes N concurrent executions for `weft-worker-<project_id>`
-//! and idle-shuts itself down. The dispatcher's cold-start trigger
+//! multiplexes N concurrent executions for its project (running the
+//! content-addressed `weft-worker:<binary_hash>` image) and idle-shuts
+//! itself down. The dispatcher's cold-start trigger
 //! ensures a Pod exists whenever there's pending worker-target work
 //! for a project.
 
@@ -56,11 +57,46 @@ pub struct K8sWorkerBackend {
     /// in tests (FakeClock fast-forwards the 5s watch window to
     /// microseconds). Production passes `SystemClock`.
     clock: Arc<dyn Clock>,
+    /// Decides whether a worker pod runs under a sandbox runtime
+    /// (`runtimeClassName`). The default returns none (host runtime); a sandbox
+    /// class applies to shared-pool workers. The worker backend owns this because
+    /// it is the one that renders the pod manifest.
+    sandbox: Arc<dyn crate::placement::SandboxPolicy>,
+    /// Worker-image registry config, present iff worker images are pulled from a
+    /// registry they were pushed to. When set, the worker image is the
+    /// registry-qualified CONTENT-addressed ref (`<registry>/weft-worker:<hash>`,
+    /// the SAME ref the build pushed) and the pod references the registry pull
+    /// secret. When `None`, the image is the bare content-addressed tag the CLI
+    /// built + `kind load`ed (`weft-worker:<hash>`), pulled `IfNotPresent` from the
+    /// node, no registry, no pull secret. Both forms are content-addressed and
+    /// project-independent,
+    /// so a build is shared across every project with the same binary hash.
+    registry: Option<crate::registry::RegistryConfig>,
 }
 
 impl K8sWorkerBackend {
-    pub fn new(broker_url: String, kube: Arc<dyn KubeClient>, clock: Arc<dyn Clock>) -> Self {
-        Self { broker_url, kube, clock }
+    pub fn new(
+        broker_url: String,
+        kube: Arc<dyn KubeClient>,
+        clock: Arc<dyn Clock>,
+        sandbox: Arc<dyn crate::placement::SandboxPolicy>,
+        registry: Option<crate::registry::RegistryConfig>,
+    ) -> Self {
+        Self { broker_url, kube, clock, sandbox, registry }
+    }
+
+    /// The image ref to spawn at `binary_hash`. Registry-qualified
+    /// content-addressed ref when a registry is configured (matches what the build
+    /// pushed); the bare content-addressed tag otherwise (matches what the CLI
+    /// built + loaded onto the node). Both are project-INDEPENDENT and content-addressed
+    /// (`weft-worker:<hash>`), so byte-identical builds across projects resolve to
+    /// ONE image. The single source of truth for "which image does the worker
+    /// pull", mirroring the build's mint so push and pull never disagree.
+    fn worker_image_ref(&self, binary_hash: &str) -> String {
+        match &self.registry {
+            Some(reg) => reg.worker_image_ref(binary_hash),
+            None => crate::registry::bare_worker_image_ref(binary_hash),
+        }
     }
 
     /// Poll the pod's first-container waiting reason for ~5s; bail on
@@ -102,7 +138,8 @@ impl WorkerBackend for K8sWorkerBackend {
                 spec.project_id,
             )
         })?;
-        let image = format!("weft-worker-{}:{}", spec.project_id, hash);
+        let image = self.worker_image_ref(hash);
+        let pull_secret = self.registry.as_ref().and_then(|r| r.pull_secret.as_deref());
 
         let project_label = SafeLabel::new(&spec.project_id, 63);
         // Apply the headless Service FIRST (idempotent), so a pod's DNS
@@ -113,6 +150,10 @@ impl WorkerBackend for K8sWorkerBackend {
         let svc = render_headless_service(&spec.namespace);
         self.kube.apply_yaml(&svc).await?;
 
+        // Sandbox decision: the policy returns a sandbox runtime class for the
+        // namespaces it chooses to isolate, or none (host runtime). The namespace
+        // is the policy's discriminator.
+        let runtime_class = self.sandbox.runtime_class(&spec.namespace);
         let manifest = render_pod_manifest(
             pod_name,
             &spec.namespace,
@@ -122,6 +163,8 @@ impl WorkerBackend for K8sWorkerBackend {
             &self.broker_url,
             &spec.owner_dispatcher,
             &spec.caller_token_secret_hex,
+            runtime_class.as_deref(),
+            pull_secret,
         );
         self.kube.apply_yaml(&manifest).await?;
         self.wait_for_pull_ok(pod_name, &spec.namespace).await?;
@@ -195,30 +238,49 @@ fn render_pod_manifest(
     namespace: &str,
     image: &str,
     // SafeLabel (not &str): the type forces the caller to sanitize
-    // these ids before they reach the YAML. A free-form cloud
-    // `tenant_id` with a newline / `"` therefore can't break the
-    // manifest or smuggle a label. OSS ids (UUID project_id, `local`
+    // these ids before they reach the YAML. A free-form `tenant_id`
+    // with a newline / `"` therefore can't break the manifest or
+    // smuggle a label. Single-tenant ids (UUID project_id, `local`
     // tenant) sanitize to themselves, so it's a no-op for them.
     project_label: &crate::project_namespace::SafeLabel,
     tenant: &crate::project_namespace::SafeLabel,
     broker_url: &str,
     owner_dispatcher: &str,
     caller_token_secret_hex: &str,
+    // The sandbox runtime class for this worker, or `None` for the host runtime.
+    // Resolved by the `SandboxPolicy`: the default is always `None`; a sandbox
+    // class applies to shared-pool workers.
+    runtime_class: Option<&str>,
+    // The k8s imagePullSecret to pull the worker image, or `None` when the cluster
+    // authenticates pulls implicitly (a node service account) or the image is
+    // loaded onto the node directly (no registry).
+    pull_secret: Option<&str>,
 ) -> String {
     // Minimal pod: SA token mount (auth) + weft labels (routing /
     // cleanup). No security context, no resource limits. Cross-tenant
     // isolation comes from the surrounding NetworkPolicies (a per-
     // project namespace's default-deny + worker-policy, or the shared
     // namespace's blanket pod-to-pod deny), not from per-pod hardening.
-    //
-    // SANDBOX SEAM: per-pod sandboxing of the (untrusted) worker process
-    // itself goes HERE as a single `runtimeClassName: <gvisor|kata>`
-    // line in this pod spec, when that lands (cloud-only, closed repo).
-    // The shared namespace is the natural population to sandbox first.
-    // Adding it later is this one field plus the cluster installing the
-    // RuntimeClass; nothing in the placement/autoscale design blocks it.
+    // Per-pod sandboxing of the worker process, when a deployment wants it,
+    // arrives as the `runtimeClassName` line below; the shared namespace is the
+    // natural population to sandbox first.
     let headless_svc = worker_headless_service_name();
     let conn_port = WORKER_CONNECTION_PORT;
+    // The sandbox runtime line, emitted only when the policy selected one. A
+    // trailing newline keeps the rest of the spec aligned whether or not it is
+    // present, and an absent class leaves the pod on the host runtime.
+    let runtime_class_line = match runtime_class {
+        Some(rc) => format!("  runtimeClassName: {rc}\n"),
+        None => String::new(),
+    };
+    // The image-pull secret line, emitted only when a registry credential is
+    // configured. Absent when the image is loaded onto the node directly and for
+    // clusters that authenticate pulls implicitly (a node service account).
+    // Trailing newline keeps the spec aligned whether or not it is present.
+    let image_pull_secrets_line = match pull_secret {
+        Some(secret) => format!("  imagePullSecrets:\n    - name: {secret}\n"),
+        None => String::new(),
+    };
     format!(
         r#"apiVersion: v1
 kind: Pod
@@ -230,7 +292,7 @@ metadata:
     weft.dev/tenant: "{tenant}"
     weft.dev/project: "{project_label}"
 spec:
-  # `hostname` + `subdomain` + the headless Service in this pod's
+{runtime_class_line}{image_pull_secrets_line}  # `hostname` + `subdomain` + the headless Service in this pod's
   # namespace give it the stable DNS name
   # `<pod-name>.{headless_svc}.<ns>.svc.cluster.local`, the address the
   # gateway dynamic-resolves a live caller to (per-pod pinning without a
@@ -307,7 +369,7 @@ mod tests {
         SpawnPodSpec {
             project_id: "p1".into(),
             tenant: "t1".into(),
-            namespace: "wm-p1".into(),
+            namespace: "wft-p1".into(),
             owner_dispatcher: "disp-0".into(),
             binary_hash: Some("abc123".into()),
             caller_token_secret_hex: "deadbeef".into(),
@@ -322,14 +384,20 @@ mod tests {
     fn manifest_wires_connection_server() {
         let pod = render_pod_manifest(
             "wp-1",
-            "wm-p1",
+            "wft-p1",
             "img:tag",
             &SafeLabel::new("p1", 63),
             &SafeLabel::new("t1", 63),
             "http://broker",
             "disp-0",
             "deadbeef",
+            None,
+            None,
         );
+        // No sandbox by default: the pod spec carries no runtimeClassName.
+        assert!(!pod.contains("runtimeClassName"), "no sandbox by default");
+        // No registry pull secret by default (image loaded onto the node).
+        assert!(!pod.contains("imagePullSecrets"), "no pull secret by default");
         assert!(pod.contains("containerPort: 9091"), "port exposed");
         assert!(pod.contains("subdomain: weft-workers"), "pod DNS subdomain");
         assert!(pod.contains("WEFT_CONNECTION_PORT"), "port env");
@@ -337,7 +405,7 @@ mod tests {
             pod.contains("WEFT_CALLER_TOKEN_SECRET") && pod.contains("deadbeef"),
             "token secret env"
         );
-        let svc = render_headless_service("wm-p1");
+        let svc = render_headless_service("wft-p1");
         assert!(svc.contains("clusterIP: None"), "headless");
         assert!(svc.contains("name: weft-workers"), "headless service name");
         // Selector is role-only (NOT project-scoped): one Service per
@@ -350,6 +418,36 @@ mod tests {
         );
     }
 
+    /// When the sandbox policy selects a runtime, the pod spec carries exactly
+    /// that `runtimeClassName` line, placed in the pod spec so kubernetes routes
+    /// the pod to it.
+    #[test]
+    fn manifest_emits_runtime_class_when_sandboxed() {
+        let pod = render_pod_manifest(
+            "wp-1",
+            "wft-shared-workers",
+            "img:tag",
+            &SafeLabel::new("p1", 63),
+            &SafeLabel::new("t1", 63),
+            "http://broker",
+            "disp-0",
+            "deadbeef",
+            Some("gvisor"),
+            Some("weft-registry-pull"),
+        );
+        assert!(pod.contains("runtimeClassName: gvisor"), "sandbox runtime set");
+        // The pull secret is emitted when configured.
+        assert!(
+            pod.contains("imagePullSecrets:") && pod.contains("name: weft-registry-pull"),
+            "pull secret set when configured"
+        );
+        // It sits in the pod spec (after `spec:`), before the containers.
+        let spec_idx = pod.find("\nspec:").expect("has spec");
+        let rc_idx = pod.find("runtimeClassName").expect("has runtimeClassName");
+        let containers_idx = pod.find("containers:").expect("has containers");
+        assert!(spec_idx < rc_idx && rc_idx < containers_idx, "runtimeClassName in pod spec");
+    }
+
     /// Happy path: no waiting-reason seeded, the 5s watch window
     /// elapses (FakeClock fast-forwards), spawn returns a handle.
     #[tokio::test]
@@ -359,6 +457,8 @@ mod tests {
             "http://broker".into(),
             kube.clone(),
             FakeClock::new(),
+            crate::placement::no_sandbox(),
+            None,
         );
         let handle = backend.spawn_pod("wp-1", spec()).await.unwrap();
         assert_eq!(handle.pod_name, "wp-1");
@@ -369,11 +469,13 @@ mod tests {
     #[tokio::test]
     async fn spawn_bails_on_image_pull_backoff() {
         let kube = FakeKube::new();
-        kube.set_pod_waiting_reason("wm-p1", "wp-1", "ImagePullBackOff");
+        kube.set_pod_waiting_reason("wft-p1", "wp-1", "ImagePullBackOff");
         let backend = K8sWorkerBackend::new(
             "http://broker".into(),
             kube.clone(),
             FakeClock::new(),
+            crate::placement::no_sandbox(),
+            None,
         );
         let err = backend.spawn_pod("wp-1", spec()).await.unwrap_err();
         assert!(
@@ -390,6 +492,8 @@ mod tests {
             "http://broker".into(),
             kube,
             FakeClock::new(),
+            crate::placement::no_sandbox(),
+            None,
         );
         let mut s = spec();
         s.binary_hash = None;

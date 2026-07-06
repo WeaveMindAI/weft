@@ -15,19 +15,21 @@
     "types": ["svelte", "vite/client"],
     "baseUrl": ".",
     "paths": {
-      "$lib": ["src/webview/lib"],
-      "$lib/utils": ["src/webview/lib/utils.ts"],
-      "$app/environment": ["src/webview/shims/app-environment.ts"],
-      // Svelte-5 rune modules live in `index.svelte.ts`, which TS's bundler
-      // resolution won't pick up as a bare directory index (it looks for
-      // index.ts). Vite resolves them via its `.svelte.ts` extension; mirror
-      // that here so svelte-check resolves the same modules vite bundles.
-      "$lib/nodes": ["src/webview/lib/nodes/index.svelte.ts"],
-      "$lib/*": ["src/webview/lib/*"]
+      // The webview lives in the shared `weft-graph` package now (extracted so the
+      // website shares one renderer). The extension bundles that package source
+      // into its own webview bundle via vite (using THIS app's node_modules through
+      // resolve.dedupe), so its typecheck must run over the SAME package source,
+      // resolving `$app/environment` to the package's shim exactly as vite does.
+      "$app/environment": ["../packages/weft-graph/src/webview/shims/app-environment.ts"]
     }
   },
-  "include": ["src/webview/**/*.ts", "src/webview/**/*.svelte", "src/shared/**/*.ts"],
+  "include": [
+    "../packages/weft-graph/src/webview/**/*.ts",
+    "../packages/weft-graph/src/webview/**/*.svelte",
+    "../packages/weft-graph/src/index.ts",
+    "../packages/weft-graph/src/protocol.ts"
+  ],
   // Vitest specs are run by vitest (its own tsconfig/globals), not bundled into
   // the webview, so they don't belong to this typecheck.
-  "exclude": ["src/webview/**/*.test.ts"]
+  "exclude": ["../packages/weft-graph/src/webview/**/*.test.ts"]
 }

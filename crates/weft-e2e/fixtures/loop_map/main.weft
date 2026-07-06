@@ -1,4 +1,3 @@
-# Project: e2e_loop_map
 # A sequential map loop: Range produces [0,1,2,3,4]; the loop doubles each
 # element; the assembled List[Number | Null] flows to Debug.
 #

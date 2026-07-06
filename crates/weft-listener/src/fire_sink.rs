@@ -73,13 +73,14 @@ impl FireSignalSink {
         });
         self.tasks
             .enqueue_dedup(NewTask {
-                kind: TaskKind::FireSignal,
+                kind: TaskKind::FireSignal.into(),
                 target: TaskTarget::Dispatcher,
                 project_id: None,
                 dedup_key: Some(dedup),
                 color: None,
                 tenant_id: Some(tenant_id.to_string()),
                 target_pod_name: None,
+                binary_hash: None,
                 payload: task_payload,
             })
             .await?;

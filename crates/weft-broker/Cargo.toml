@@ -37,3 +37,17 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 getrandom = "0.2"
 parking_lot = { workspace = true }
+bytes = { workspace = true }
+
+[features]
+# Layer-3 contract tests of the runtime-file plane against a real Postgres.
+# Gated like the other db-backed test suites so a plain `cargo test` stays
+# pure-function fast; CI / local-with-PG runs `--features db-tests`.
+db-tests = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+futures = { workspace = true }
+# `#[sqlx::test]` provisions a fresh isolated DB per test for the Layer-3 suite.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate"] }

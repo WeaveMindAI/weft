@@ -17,12 +17,35 @@ pub mod source_name;
 pub mod weft_compiler;
 pub mod cst;
 pub mod edit;
+pub mod file_reader;
 pub mod file_ref;
 pub mod enrich;
 pub mod validate;
+// Project source / drift hashing. `compute_definition_hash` /
+// `compute_source_hash` are pure (no filesystem) and always available
+// (the browser WASM build computes `definition_hash` for live preview);
+// the filesystem-bound hashes (binary / infra / image / builder-base,
+// the workspace walks, and the enriched-project loader) are gated behind
+// `build` INSIDE the module.
+pub mod hash;
+// The image-build path. Gated behind the `build` feature (default on) because it
+// pulls weft-core's runtime types + native filetime; the browser WASM parse
+// build turns it off.
+#[cfg(feature = "build")]
 pub mod codegen;
+#[cfg(feature = "build")]
 pub mod worker_image;
+#[cfg(feature = "build")]
 pub mod build;
+// The infra-image set a project needs (worker + per-node infra images). Reads the
+// FsCatalog + hashes image source dirs, so it rides the `build` feature.
+#[cfg(feature = "build")]
+pub mod image_set;
+// The shared build-freshness brain: compile -> 3 hashes -> enumerate + stage every
+// image -> mint refs -> report the stale set. One path regardless of build
+// strategy; only the ref/tag naming + existence probe differ.
+#[cfg(feature = "build")]
+pub mod build_plan;
 pub mod error;
 
 pub use error::{CompileError as ProjectError, CompileResult};
@@ -31,10 +54,11 @@ pub use weft_compiler::{compile as compile_source, CompileError as SourceError};
 use uuid::Uuid;
 use weft_core::{MetadataCatalog, ProjectDefinition};
 
+pub use file_reader::{CompileFs, DiskFileReader, FileReader, MapFileReader, ResolvedFile};
+
 // Re-export weft_core's Diagnostic/Severity so downstream callers
 // keep using weft_compiler::Diagnostic without touching node impls.
 pub use weft_core::node::{Diagnostic, Severity};
-use weft_core::project::Span;
 
 /// Fast-path parse for interactive editing (IDE, live preview). Runs
 /// lex + parse + flatten + lenient enrich. Does NOT run validation:
@@ -46,7 +70,7 @@ use weft_core::project::Span;
 pub fn parse_only(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
     catalog: &dyn MetadataCatalog,
     source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
@@ -62,7 +86,7 @@ pub fn parse_only(
     let (mut project, parse_errors) = weft_compiler::compile_lenient(
         source,
         project_id,
-        base_dir,
+        fs,
         weft_compiler::IncludeMode::Interface,
         source_name,
     );
@@ -71,9 +95,12 @@ pub fn parse_only(
     }
 
     // Stage 3: enrich (lenient). Unknown types / catalog misses become
-    // empty-port placeholders, not aborts.
-    if let Err(e) = enrich::enrich_with_policy(&mut project, catalog, enrich::EnrichPolicy::Lenient) {
-        diagnostics.push(Diagnostic::at(Span::default(), Severity::Warning, "enrich", format!("{e}")));
+    // empty-port placeholders, not aborts. The failures that SURVIVE lenient
+    // mode (a bad-type port, a custom port on a node that forbids them) are real
+    // authoring errors the build would reject, so surface each as an ERROR
+    // diagnostic at the offending node's line, not a single span-less warning.
+    for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Lenient) {
+        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message));
     }
 
     // Surface unknown node types as warnings so the IDE can paint a
@@ -127,13 +154,13 @@ pub fn parse_only(
 pub fn compile_strict(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
     catalog: &dyn MetadataCatalog,
     mode: validate::ValidationMode,
     source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
     let (project, mut diagnostics) =
-        compile_and_enrich(source, project_id, base_dir, catalog, source_name);
+        compile_and_enrich(source, project_id, fs, catalog, source_name);
     diagnostics.extend(validate::validate_with_mode(&project, catalog, mode));
     (project, diagnostics)
 }
@@ -145,13 +172,13 @@ pub fn compile_strict(
 pub fn compile_checked(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
     catalog: &dyn MetadataCatalog,
     mode: validate::ValidationMode,
 ) -> CompileResult<ProjectDefinition> {
     // Build path: a real project with a named main group (no anonymous root), so
     // the source name is irrelevant; `None` falls back to `Untitled`, unused.
-    let (project, diagnostics) = compile_strict(source, project_id, base_dir, catalog, mode, None);
+    let (project, diagnostics) = compile_strict(source, project_id, fs, catalog, mode, None);
     bail_on_errors(diagnostics)?;
     Ok(project)
 }
@@ -164,10 +191,10 @@ pub fn compile_checked(
 pub fn compile_enriched_with_diagnostics(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
     catalog: &dyn MetadataCatalog,
 ) -> Result<ProjectDefinition, Vec<Diagnostic>> {
-    let (project, diagnostics) = compile_and_enrich(source, project_id, base_dir, catalog, None);
+    let (project, diagnostics) = compile_and_enrich(source, project_id, fs, catalog, None);
     let any_errors = diagnostics
         .iter()
         .any(|d| matches!(d.severity, Severity::Error));
@@ -187,7 +214,7 @@ pub fn compile_enriched_with_diagnostics(
 fn compile_and_enrich(
     source: &str,
     project_id: Uuid,
-    base_dir: Option<&std::path::Path>,
+    fs: CompileFs,
     catalog: &dyn MetadataCatalog,
     source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
@@ -195,7 +222,7 @@ fn compile_and_enrich(
     let mut project = match weft_compiler::compile_with_mode(
         source,
         project_id,
-        base_dir,
+        fs,
         weft_compiler::IncludeMode::Full,
         source_name,
     ) {
@@ -207,8 +234,10 @@ fn compile_and_enrich(
             return (empty_project(project_id), diagnostics);
         }
     };
-    if let Err(e) = enrich::enrich(&mut project, catalog) {
-        diagnostics.push(Diagnostic::at(Span::default(), Severity::Error, "enrich", format!("{e}")));
+    // Strict enrich: one Error diagnostic PER failure, at the offending node's
+    // span (so the editor squiggles the exact line), not a single span-less blob.
+    for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Strict) {
+        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message));
     }
     (project, diagnostics)
 }

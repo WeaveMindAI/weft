@@ -21,8 +21,6 @@ use sqlx::postgres::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::kinds::TaskKind;
-
 /// How long a claim is valid before another Pod can steal it. Pods
 /// heartbeat the claim while they work.
 pub const CLAIM_DURATION_SECS: i64 = 60;
@@ -95,7 +93,11 @@ pub struct Task {
 /// `/v1/task/enqueue_dedup`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewTask {
-    pub kind: TaskKind,
+    /// The task kind as its raw STRING (the value stored on `task.kind` and
+    /// dispatched on). Built-in producers pass `TaskKind::X.into()`; a deployment
+    /// with its own task kinds passes its own kind string (e.g. `"build_image"`)
+    /// directly, so an added kind never has to widen the built-in `TaskKind` enum.
+    pub kind: String,
     pub target: TaskTarget,
     pub project_id: Option<String>,
     pub dedup_key: Option<String>,
@@ -107,6 +109,19 @@ pub struct NewTask {
     /// claims first. NULL means any pod in the (target, project)
     /// scope can claim.
     pub target_pod_name: Option<String>,
+    /// The worker IMAGE this task must run on: the project's
+    /// `running_binary_hash` at enqueue time. An UNPINNED worker task
+    /// is only claimable by a pod whose baked `worker_pod.binary_hash`
+    /// matches, so new work never lands on a stale-image worker (which
+    /// would run a binary missing the current graph's node impls); the
+    /// cold-start sweep sees a project whose only pods are stale as
+    /// having NO admittable pod and spawns a fresh one, and the stale
+    /// pods idle-exit on their own. Pinned tasks bypass the check (a
+    /// cancel/resume addressed to the color's owner must reach THAT
+    /// pod regardless of its image). NULL = any pod (dispatcher-target
+    /// tasks, and worker tasks with no image requirement).
+    #[serde(default)]
+    pub binary_hash: Option<String>,
     pub payload: Value,
 }
 
@@ -163,6 +178,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             color TEXT,
             tenant_id TEXT,
             target_pod_name TEXT,
+            binary_hash TEXT,
             payload JSONB NOT NULL,
             claimed_by TEXT,
             claimed_until_unix BIGINT,
@@ -216,8 +232,8 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     sqlx::query(
         r#"INSERT INTO task (
             id, kind, status, target, project_id, dedup_key, color, tenant_id,
-            target_pod_name, payload, attempts, created_at_unix
-        ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, 0, $10)"#,
+            target_pod_name, binary_hash, payload, attempts, created_at_unix
+        ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)"#,
     )
     .bind(id)
     .bind(spec.kind.as_str())
@@ -227,6 +243,7 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     .bind(spec.color.as_deref())
     .bind(spec.tenant_id.as_deref())
     .bind(spec.target_pod_name.as_deref())
+    .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
     .execute(pool)
@@ -246,12 +263,25 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
 /// a unique-violation on the partial index instead of returning
 /// AlreadyLive.
 pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome> {
+    let mut tx = pool.begin().await?;
+    let outcome = enqueue_dedup_in(&mut tx, spec).await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// [`enqueue_dedup`] on a caller-owned connection. MUST run inside a
+/// transaction: the advisory lock is xact-scoped (it releases when the
+/// caller's transaction ends), and the insert's atomicity with whatever else
+/// the caller writes is the whole point of taking a connection.
+pub async fn enqueue_dedup_in(
+    conn: &mut sqlx::PgConnection,
+    spec: NewTask,
+) -> Result<DedupOutcome> {
     let dedup = spec
         .dedup_key
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("enqueue_dedup requires dedup_key"))?;
 
-    let mut tx = pool.begin().await?;
     // Lock + SELECT are scoped by tenant_id to match the
     // `(tenant_id, kind, dedup_key)` unique index: dedup never crosses
     // a tenant boundary. (`tenant_id IS NOT DISTINCT FROM $3` so a
@@ -261,7 +291,7 @@ pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome>
     let lock_input = format!("{}|{}|{}", tenant, spec.kind.as_str(), dedup);
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&lock_input)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     let existing: Option<(Uuid,)> = sqlx::query_as(
@@ -273,10 +303,9 @@ pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome>
     .bind(spec.tenant_id.as_deref())
     .bind(spec.kind.as_str())
     .bind(dedup)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
     if let Some((id,)) = existing {
-        tx.commit().await?;
         return Ok(DedupOutcome::AlreadyLive(id));
     }
 
@@ -285,8 +314,8 @@ pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome>
     sqlx::query(
         r#"INSERT INTO task (
             id, kind, status, target, project_id, dedup_key, color, tenant_id,
-            target_pod_name, payload, attempts, created_at_unix
-        ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, 0, $10)"#,
+            target_pod_name, binary_hash, payload, attempts, created_at_unix
+        ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)"#,
     )
     .bind(id)
     .bind(spec.kind.as_str())
@@ -296,11 +325,11 @@ pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome>
     .bind(spec.color.as_deref())
     .bind(spec.tenant_id.as_deref())
     .bind(spec.target_pod_name.as_deref())
+    .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(DedupOutcome::Inserted(id))
 }
 
@@ -312,34 +341,60 @@ pub struct AdmittedPod {
     pub namespace: String,
 }
 
+/// [`admit_live_execution_in`]'s outcome. `Admitted` = THIS call inserted the
+/// pinned task (the caller's transaction now owns a fresh admission and should
+/// write whatever must commit atomically with it). `AlreadyAdmitted` = an
+/// earlier call for the same color already inserted it (idempotent retry;
+/// nothing new to commit). `Saturated` = every worker is at capacity, nothing
+/// was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveAdmitOutcome {
+    Admitted(AdmittedPod),
+    AlreadyAdmitted(AdmittedPod),
+    Saturated,
+}
+
 /// ATOMICALLY admit a live execution: pick the least-PRESSURED admittable
 /// worker for the project (alive, not draining, memory pressure below
-/// `saturation`) and insert the pinned execute task for `color` on it, all in
-/// ONE transaction under a per-project advisory lock. Returns the chosen pod,
-/// or `None` if every worker is saturated / draining or none is alive (the
-/// caller then spawns a fresh pod and retries).
+/// `saturation`) and insert the pinned execute task for the spec's color on
+/// it, under a per-project advisory lock. `Saturated` when every worker is
+/// saturated / draining or none is alive (the caller then spawns a fresh pod
+/// and retries).
 ///
+/// MUST run inside a caller-owned transaction: the advisory lock is
+/// xact-scoped, and the caller writes the execution's journal birth in the
+/// same transaction so "admitted" and "journaled" can never disagree.
 /// Admission IS the task insert, so "admitted" and "has a task row" can never
-/// disagree; failure cleanup is just deleting the pending task. Capacity is
-/// governed by MEMORY pressure (the same metric placement and scale-down use),
-/// NOT a connection count: a worker takes live executions until its memory
-/// crosses the saturation threshold, then the next one spawns. The advisory
-/// lock serializes admissions for the project so a burst of concurrent
-/// handshakes (across sibling dispatcher Pods) doesn't all pile onto the same
-/// least-pressured pod before its next heartbeat updates the pressure reading.
+/// disagree either. Capacity is governed by MEMORY pressure (the same metric
+/// placement and scale-down use), NOT a connection count: a worker takes live
+/// executions until its memory crosses the saturation threshold, then the
+/// next one spawns. The advisory lock serializes admissions for the project
+/// so a burst of concurrent handshakes (across sibling dispatcher Pods)
+/// doesn't all pile onto the same least-pressured pod before its next
+/// heartbeat updates the pressure reading.
 ///
-/// Dedups on `{color}:execute` (the color is freshly minted per handshake, so
-/// this only collapses a crash-retry of the same handshake).
-#[allow(clippy::too_many_arguments)]
-pub async fn admit_live_execution(
-    pool: &PgPool,
-    project_id: &str,
-    color: &str,
-    tenant_id: Option<&str>,
-    payload: &Value,
+/// The spec's `dedup_key` (`{color}:execute`) collapses a crash-retry of the
+/// same handshake; the spec's `binary_hash` is the project's current
+/// `running_binary_hash` (only a pod baked from that image is admittable; a
+/// stale-image pod would run a binary missing the current graph's node impls).
+/// The spec's `target_pod_name` must be `None`: the pin IS what this picks.
+pub async fn admit_live_execution_in(
+    conn: &mut sqlx::PgConnection,
+    spec: &NewTask,
     saturation: f64,
-) -> Result<Option<AdmittedPod>> {
-    let mut tx = pool.begin().await?;
+) -> Result<LiveAdmitOutcome> {
+    let project_id = spec
+        .project_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("live admission requires project_id"))?;
+    let color = spec
+        .color
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("live admission requires color"))?;
+    let dedup = spec
+        .dedup_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("live admission requires dedup_key"))?;
     // Serialize admissions for this project so a burst of concurrent
     // handshakes reads a consistent pressure ordering and doesn't stampede
     // one pod (same discipline as `enqueue_dedup`'s per-dedup lock, here
@@ -347,13 +402,13 @@ pub async fn admit_live_execution(
     let lock_input = format!("live-admit|{project_id}");
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(&lock_input)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     // Pick the least-pressured admittable worker. Same predicate as
     // `worker_pod::pick_admittable_for_project`: alive, not draining, below
-    // saturation, least-pressured first (a spawning pod reads 0 until its
-    // first heartbeat, so it is correctly preferred).
+    // saturation, on the CURRENT image, least-pressured first (a spawning
+    // pod reads 0 until its first heartbeat, so it is correctly preferred).
     let chosen: Option<(String, String)> = sqlx::query_as(
         r#"SELECT wp.pod_name, wp.namespace
            FROM worker_pod wp
@@ -361,22 +416,19 @@ pub async fn admit_live_execution(
              AND wp.status IN ('spawning', 'alive')
              AND NOT wp.draining
              AND wp.mem_pressure < $2
+             AND ($3::TEXT IS NULL OR wp.binary_hash = $3)
            ORDER BY wp.mem_pressure ASC, wp.created_at_unix ASC, wp.pod_name ASC
            LIMIT 1"#,
     )
     .bind(project_id)
     .bind(saturation)
-    .fetch_optional(&mut *tx)
+    .bind(spec.binary_hash.as_deref())
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((pod_name, namespace)) = chosen else {
-        tx.commit().await?;
-        return Ok(None);
+        return Ok(LiveAdmitOutcome::Saturated);
     };
 
-    // Insert the pinned execute task = the admission. Dedup on {color}:execute
-    // (a crash-retry of the same handshake collapses; the color is unique per
-    // handshake so distinct handshakes never collide).
-    let dedup = format!("{color}:execute");
     // A retry of the same handshake finds its task already live; return the
     // SAME pod it was admitted to, never insert a second task for the color.
     // LEFT JOIN so a task whose pod row was already GC'd is STILL found (an
@@ -390,15 +442,14 @@ pub async fn admit_live_execution(
              AND t.status IN ('pending', 'claimed')
            LIMIT 1"#,
     )
-    .bind(tenant_id)
-    .bind(&dedup)
-    .fetch_optional(&mut *tx)
+    .bind(spec.tenant_id.as_deref())
+    .bind(dedup)
+    .fetch_optional(&mut *conn)
     .await?;
     if let Some((pod_name, namespace)) = existing {
-        tx.commit().await?;
         return match namespace {
             // Already admitted on a live pod: idempotent success on that pod.
-            Some(namespace) => Ok(Some(AdmittedPod { pod_name, namespace })),
+            Some(namespace) => Ok(LiveAdmitOutcome::AlreadyAdmitted(AdmittedPod { pod_name, namespace })),
             // The original pod's row is gone (it died and was GC'd): the task
             // is now an orphan the sweep will cancel. Fail loud rather than
             // insert a SECOND task for the color on a fresh pod (which would
@@ -416,21 +467,21 @@ pub async fn admit_live_execution(
     sqlx::query(
         r#"INSERT INTO task (
             id, kind, status, target, project_id, dedup_key, color, tenant_id,
-            target_pod_name, payload, attempts, created_at_unix
-        ) VALUES ($1, 'execute', 'pending', 'worker', $2, $3, $4, $5, $6, $7, 0, $8)"#,
+            target_pod_name, binary_hash, payload, attempts, created_at_unix
+        ) VALUES ($1, 'execute', 'pending', 'worker', $2, $3, $4, $5, $6, $7, $8, 0, $9)"#,
     )
     .bind(id)
     .bind(project_id)
-    .bind(&dedup)
+    .bind(dedup)
     .bind(color)
-    .bind(tenant_id)
+    .bind(spec.tenant_id.as_deref())
     .bind(&pod_name)
-    .bind(payload)
+    .bind(spec.binary_hash.as_deref())
+    .bind(&spec.payload)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
-    Ok(Some(AdmittedPod { pod_name, namespace }))
+    Ok(LiveAdmitOutcome::Admitted(AdmittedPod { pod_name, namespace }))
 }
 
 /// Atomically claim one task for `pod_id`. Picks oldest pending
@@ -463,7 +514,7 @@ pub async fn claim_one(
     //
     // Worker-target claims must verify the picking pod is still alive in
     // `worker_pod`. Without this, a pod that's been marked dead (e.g. by
-    // replace_stale_worker_if_needed during a sync that bumped the
+    // reconcile_worker during a sync that bumped the
     // binary_hash) keeps claiming tasks for the up-to-10s window until
     // its own heartbeat detects the dead row. Those claims then fail
     // when the fencing trigger rejects the resulting journal writes. The
@@ -476,6 +527,15 @@ pub async fn claim_one(
     // pinned to itself but not an unpinned one. Expressed as: the task
     // is pinned to THIS pod, OR (it is unpinned AND this pod is not
     // draining). Aliveness is required either way.
+    //
+    // STALE-IMAGE pods: an unpinned task stamped with a `binary_hash`
+    // is only claimable by a pod baked from THAT image. Without this, a
+    // still-alive worker built for the previous source claims a run for
+    // the new source and fails at runtime with "unknown node type" (its
+    // binary lacks the new node impls). The cold-start sweep applies
+    // the same predicate, so a project whose only pods are stale gets a
+    // fresh spawn; the stale pods stop receiving work and idle-exit.
+    // Pinned tasks bypass (they must reach their addressed pod).
     //
     // Dispatcher-target claims aren't affected: dispatcher pods have no
     // `worker_pod` row at all, so the EXISTS check is gated on target.
@@ -493,7 +553,10 @@ pub async fn claim_one(
                      SELECT 1 FROM worker_pod wp
                      WHERE wp.pod_name = $3
                        AND wp.status IN ('spawning', 'alive')
-                       AND (task.target_pod_name = $3 OR NOT wp.draining)
+                       AND (task.target_pod_name = $3
+                            OR (NOT wp.draining
+                                AND (task.binary_hash IS NULL
+                                     OR task.binary_hash = wp.binary_hash)))
                  )
              )
            ORDER BY created_at_unix ASC
@@ -579,6 +642,27 @@ pub async fn complete(
         anyhow::bail!("complete: task {task_id} no longer claimed by {pod_id}");
     }
     Ok(())
+}
+
+/// Fail a task that is still PENDING (never claimed): the sweep-side
+/// terminal for work that can no longer run at all, e.g. a task stamped
+/// with a superseded image once no pod of that image remains (nothing
+/// will ever claim it; leaving it pending is an invisible forever-wait).
+/// Returns false if the task moved on (claimed / completed) in the
+/// meantime: someone IS handling it, so the caller backs off.
+pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<bool> {
+    let now = unix_now();
+    let updated = sqlx::query(
+        r#"UPDATE task
+           SET status = 'failed', error = $1, completed_at_unix = $2
+           WHERE id = $3 AND status = 'pending'"#,
+    )
+    .bind(error)
+    .bind(now)
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() > 0)
 }
 
 /// Mark a claim failed with an error. Bails on lost claim like
@@ -801,8 +885,8 @@ pub async fn delete_task(pool: &PgPool, id: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Outcome of [`delete_pending_live_execution`]: who, if anyone, will run the
-/// live execution after a failed dispatcher-side setup. Tells the caller
+/// Outcome of [`delete_pending_live_execution_in`]: who, if anyone, will run
+/// the live execution after a failed dispatcher-side setup. Tells the caller
 /// whether IT must journal the cancel terminal, or whether a worker owns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupFailureOutcome {
@@ -816,10 +900,10 @@ pub enum SetupFailureOutcome {
 }
 
 /// Clean up a live execution whose dispatcher-side setup FAILED (after
-/// [`admit_live_execution`] inserted its task). Because admission IS the task
-/// insert, the cleanup is: delete the task IF still `pending` (no worker has
-/// run it). In ONE transaction it deletes the pending task (if any) and then
-/// checks whether ANY execute task for the color still exists:
+/// [`admit_live_execution_in`] inserted its task). Because admission IS the
+/// task insert, the cleanup is: delete the task IF still `pending` (no worker
+/// has run it), then check whether ANY execute task for the color still
+/// exists:
 ///   - none remains (we deleted the pending one, or none ever existed) ->
 ///     `NoWorkerWillRun`: the caller journals the cancel terminal.
 ///   - one remains (it was already `claimed` in the commit-but-Err race) ->
@@ -828,11 +912,15 @@ pub enum SetupFailureOutcome {
 /// This is what lets the caller avoid stacking a second terminal on a color a
 /// worker is concurrently finishing. There is no slot counter to release: the
 /// task row IS the slot, so deleting it frees the slot.
-pub async fn delete_pending_live_execution(
-    pool: &PgPool,
+///
+/// MUST run inside a caller-owned transaction: the caller writes the cancel
+/// terminals in the same transaction, so "task deleted" and "terminal
+/// journaled" can never disagree (a crash between the two would otherwise
+/// leave a live-looking execution nothing will ever run or reclaim).
+pub async fn delete_pending_live_execution_in(
+    conn: &mut sqlx::PgConnection,
     color: &str,
 ) -> Result<SetupFailureOutcome> {
-    let mut tx = pool.begin().await?;
     sqlx::query(
         r#"DELETE FROM task
            WHERE color = $1 AND kind = 'execute' AND status = 'pending'
@@ -840,7 +928,7 @@ pub async fn delete_pending_live_execution(
              AND payload -> 'live_connection' != 'null'::jsonb"#,
     )
     .bind(color)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     // `1::bigint` so sqlx's i64 expectation matches: a bare `1` is typed
     // int4 by Postgres and would fail the decode whenever a row IS returned
@@ -849,9 +937,8 @@ pub async fn delete_pending_live_execution(
         r#"SELECT 1::bigint FROM task WHERE color = $1 AND kind = 'execute' LIMIT 1"#,
     )
     .bind(color)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(if remaining.is_some() {
         SetupFailureOutcome::WorkerOwnsIt
     } else {
@@ -891,4 +978,87 @@ pub(crate) fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock past UNIX_EPOCH")
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod wire_tests {
+    // Layer-2 wire-shape tests: NewTask and Task are the JSON contract on
+    // `/v1/task/enqueue_dedup` (producer sends NewTask, the row round-trips as
+    // Task). Round-trip them through serde_json so a renamed/retyped field breaks
+    // the test, not a live enqueue. `kind` is a free String so a deployment can add
+    // its own task kinds without widening the built-in TaskKind enum.
+    use super::*;
+
+    #[test]
+    fn new_task_json_round_trips() {
+        let original = NewTask {
+            kind: "build_image".to_string(),
+            target: TaskTarget::Worker,
+            project_id: Some("p1".to_string()),
+            dedup_key: Some("d1".to_string()),
+            color: Some("c1".to_string()),
+            tenant_id: Some("t1".to_string()),
+            target_pod_name: Some("pod-0".to_string()),
+            binary_hash: Some("abc123".to_string()),
+            payload: serde_json::json!({ "a": 1, "nested": [true, null] }),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: NewTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, original.kind);
+        assert_eq!(back.target, original.target);
+        assert_eq!(back.project_id, original.project_id);
+        assert_eq!(back.dedup_key, original.dedup_key);
+        assert_eq!(back.color, original.color);
+        assert_eq!(back.tenant_id, original.tenant_id);
+        assert_eq!(back.target_pod_name, original.target_pod_name);
+        assert_eq!(back.binary_hash, original.binary_hash);
+        assert_eq!(back.payload, original.payload);
+        // The kind travels as a raw string, not a tagged enum.
+        assert!(json.contains("\"kind\":\"build_image\""));
+        // snake_case target on the wire.
+        assert!(json.contains("\"target\":\"worker\""));
+    }
+
+    #[test]
+    fn new_task_tolerates_an_omitted_binary_hash() {
+        // The one behavior `#[serde(default)]` on `binary_hash` guarantees: a
+        // producer that omits the field entirely (not `null`, ABSENT) still
+        // deserializes, to None. This is the wire contract the attribute exists
+        // for; without this test its removal would pass the round-trip above.
+        let json = r#"{
+            "kind": "fire_signal",
+            "target": "dispatcher",
+            "project_id": null,
+            "dedup_key": null,
+            "color": null,
+            "tenant_id": null,
+            "target_pod_name": null,
+            "payload": {}
+        }"#;
+        let back: NewTask = serde_json::from_str(json).unwrap();
+        assert_eq!(back.binary_hash, None);
+    }
+
+    #[test]
+    fn task_json_round_trips_with_null_optionals() {
+        let original = Task {
+            id: Uuid::nil(),
+            kind: "register_signal".to_string(),
+            status: TaskStatus::Pending,
+            project_id: None,
+            color: None,
+            tenant_id: None,
+            payload: serde_json::json!(null),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, original.id);
+        assert_eq!(back.kind, original.kind);
+        assert_eq!(back.status, original.status);
+        assert_eq!(back.project_id, original.project_id);
+        assert_eq!(back.color, original.color);
+        assert_eq!(back.tenant_id, original.tenant_id);
+        assert_eq!(back.payload, original.payload);
+        assert!(json.contains("\"status\":\"pending\""));
+    }
 }

@@ -1,70 +1,64 @@
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::context::{ExecutionContext, InputBag};
-use crate::error::{WeftError, WeftResult};
-use crate::infra::{InfraProvisionContext, InfraSpec};
 use crate::weft_type::WeftType;
 
-/// The core trait every node implements. Stdlib nodes in `catalog/`
-/// and user-defined nodes under `myproject/nodes/` both implement this.
-///
-/// Infra nodes (those with `metadata.requires_infra == true`)
-/// additionally implement `provision`, which returns an [`InfraSpec`]
-/// the dispatcher applies BEFORE calling `execute(phase=InfraSetup)`.
-/// Non-infra nodes leave `provision` as the default Err impl; the
-/// dispatcher never calls it for them.
-#[async_trait]
-pub trait Node: Send + Sync {
-    /// Stable identifier for this node type. Must be unique across the
-    /// project's full catalog (stdlib + user + vendored).
-    fn node_type(&self) -> &'static str;
+// The `Node` trait is the RUNTIME node interface (it runs against the execution
+// context + infra provision context), so it is gated behind `runtime`. The
+// browser WASM parse build needs only the node METADATA layer
+// (`NodeMetadata` / `MetadataCatalog`), which is pure and stays below.
+#[cfg(feature = "runtime")]
+mod node_trait {
+    use async_trait::async_trait;
 
-    /// Metadata describing ports, fields, entry primitives. Usually
-    /// loaded from a co-located `metadata.json` via `include_str!`.
-    fn metadata(&self) -> NodeMetadata;
+    use super::NodeMetadata;
+    use crate::context::{ExecutionContext, InputBag};
+    use crate::error::{WeftError, WeftResult};
+    use crate::infra::{InfraProvisionContext, InfraSpec};
 
-    /// Build the desired infrastructure for this node. Called by the
-    /// engine in `Phase::InfraSetup` BEFORE `execute`. Pure-ish: same
-    /// inputs as `execute`, returns the desired k8s state as a typed
-    /// value. Side effects beyond constructing the spec (registry
-    /// lookups, etc) are allowed because provision is async.
+    /// The core trait every node implements. Stdlib nodes in `catalog/`
+    /// and user-defined nodes under `myproject/nodes/` both implement this.
     ///
-    /// Pulse outputs are NOT emitted from `provision`; they come
-    /// from the subsequent `execute` call in the same node task.
-    /// This keeps the trait surface honest about which method owns
-    /// each concern: provision = infra shape, execute = pulses.
-    ///
-    /// The default impl returns Err. It is only ever invoked by the
-    /// dispatcher when `metadata().requires_infra == true`; nodes
-    /// that opt in MUST override.
-    async fn provision(
-        &self,
-        _ctx: InfraProvisionContext,
-        _input: InputBag,
-    ) -> WeftResult<InfraSpec> {
-        Err(WeftError::Config(format!(
-            "node '{}' declared requires_infra=true but did not implement Node::provision",
-            self.node_type()
-        )))
+    /// Infra nodes (those with `metadata.requires_infra == true`)
+    /// additionally implement `provision`, which returns an [`InfraSpec`]
+    /// the dispatcher applies BEFORE calling `execute(phase=InfraSetup)`.
+    /// Non-infra nodes leave `provision` as the default Err impl; the
+    /// dispatcher never calls it for them.
+    #[async_trait]
+    pub trait Node: Send + Sync {
+        /// Stable identifier for this node type. Must be unique across the
+        /// project's full catalog (stdlib + user + vendored).
+        fn node_type(&self) -> &'static str;
+
+        /// Metadata describing ports, fields, entry primitives. Usually
+        /// loaded from a co-located `metadata.json` via `include_str!`.
+        fn metadata(&self) -> NodeMetadata;
+
+        /// Build the desired infrastructure for this node. Called by the
+        /// engine in `Phase::InfraSetup` BEFORE `execute`. Returns the desired
+        /// k8s state as a typed value. The default impl returns Err; nodes that
+        /// declare `requires_infra=true` MUST override.
+        async fn provision(
+            &self,
+            _ctx: InfraProvisionContext,
+            _input: InputBag,
+        ) -> WeftResult<InfraSpec> {
+            Err(WeftError::Config(format!(
+                "node '{}' declared requires_infra=true but did not implement Node::provision",
+                self.node_type()
+            )))
+        }
+
+        /// Run this node. `ctx` provides language primitives
+        /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
+        /// `report_cost`, `log`, `endpoint`). The ONLY way to fire downstream is
+        /// `ctx.pulse_downstream(output)`.
+        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
     }
-
-    /// Run this node. `ctx` provides language primitives
-    /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
-    /// `report_cost`, `log`, `endpoint`). Input values are pre-resolved
-    /// on ctx.
-    ///
-    /// The ONLY way to fire downstream is `ctx.pulse_downstream(output)`.
-    /// Returning does NOT emit anything by itself. A node typically calls
-    /// `pulse_downstream` once at the end (the common case); a co-alive
-    /// node emits a bus early (releasing downstream) and keeps running;
-    /// a node may emit on disjoint ports across several calls (release
-    /// incrementally). A port the node never mentions gets a CLOSURE
-    /// pulse at termination so downstream consumers learn nothing is
-    /// coming for that port.
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
 }
+
+#[cfg(feature = "runtime")]
+pub use node_trait::Node;
 
 /// Validation diagnostic. Emitted by the generic validate pass and
 /// per-node validators. Mirrored by the VS Code extension's
@@ -112,6 +106,8 @@ pub enum Severity {
 
 /// Metadata returned from `Node::metadata`. Describes the node's
 /// surface to the compiler, the dispatcher, and tooling.
+// SYNC: NodeMetadata (describe-nodes serialization) <-> packages/weft-graph/src/protocol.ts
+//       CatalogEntry/FieldDef/FieldType/PortDef
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMetadata {
     /// Stable type identifier (matches `Node::node_type`).
@@ -297,7 +293,7 @@ pub enum Condition {
 ///   1. Add the matching camelCase field to `NodeFeaturesWire` in
 ///      protocol.ts.
 ///   2. Update any webview code that switches on the new feature.
-// SYNC: NodeFeatures <-> extension-vscode/src/shared/protocol.ts NodeFeaturesWire
+// SYNC: NodeFeatures <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeFeatures {
     /// Each inner list is a port group where at least ONE port must
@@ -329,14 +325,14 @@ pub struct NodeFeatures {
     /// reference, render the picture inline on the node body, fetched
     /// through the authenticated download handshake. Used by
     /// ImageDisplay.
-    // SYNC: showImagePreview <-> extension-vscode/src/shared/protocol.ts NodeFeaturesWire.showImagePreview
+    // SYNC: showImagePreview <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire.showImagePreview
     #[serde(default, rename = "showImagePreview")]
     pub show_image_preview: bool,
     /// Webview hint: when the node's input is a stored-file
     /// reference, render a download button inline on the node body
     /// (the click runs the same handshake a CLI download uses). Used
     /// by DownloadLink.
-    // SYNC: showDownloadLink <-> extension-vscode/src/shared/protocol.ts NodeFeaturesWire.showDownloadLink
+    // SYNC: showDownloadLink <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire.showDownloadLink
     #[serde(default, rename = "showDownloadLink")]
     pub show_download_link: bool,
     /// Default value of the node's `is_output` config flag. Nodes that
@@ -371,7 +367,7 @@ pub struct NodeFeatures {
 /// `has_form_schema` (HumanQuery, runner triggers). The enrich pass
 /// reads this, iterates the configured fields, and materializes
 /// inputs/outputs on the NodeDefinition.
-// SYNC: FormFieldSpec <-> extension-vscode/src/shared/protocol.ts FormFieldSpecWire
+// SYNC: FormFieldSpec <-> packages/weft-graph/src/protocol.ts FormFieldSpecWire
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormFieldSpec {
     /// Value of the field's `field_type` (or `field_type.kind`)
@@ -457,7 +453,9 @@ pub trait MetadataCatalog: Send + Sync {
 /// Runtime node catalog. Produced by codegen inside the emitted
 /// project binary. Users of metadata should use [`MetadataCatalog`]
 /// instead; this trait is only for runtime dispatch (the engine's
-/// pulse loop calls `lookup(...)?.execute(ctx)`).
+/// pulse loop calls `lookup(...)?.execute(ctx)`). Runtime-gated because
+/// `lookup` returns the runtime `Node` trait.
+#[cfg(feature = "runtime")]
 pub trait NodeCatalog: Send + Sync {
     /// Return a 'static reference to the node implementation. All
     /// emitted project binaries back their catalog with static
@@ -515,7 +513,7 @@ pub enum FieldType {
     /// value becomes the stored-file reference (see
     /// `crate::storage::StoredFile`).
     /// `accept` is an HTML-accept-style filter (e.g. "audio/*").
-    // SYNC: FieldType::FileDrop <-> extension-vscode/src/shared/protocol.ts FieldKind 'file_drop'
+    // SYNC: FieldType::FileDrop <-> packages/weft-graph/src/protocol.ts FieldKind 'file_drop'
     FileDrop { accept: Option<String> },
 }
 

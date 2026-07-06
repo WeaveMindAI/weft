@@ -182,7 +182,8 @@ fn is_dns1123_label(name: &str) -> bool {
 /// (without the `preserve_order` feature) emits object keys sorted,
 /// so the output is byte-stable across calls with the same input.
 /// This is what makes the infra hash a reliable drift key; see
-/// `hash.rs` and `spec_serializes_map_keys_in_sorted_order`.
+/// `weft-compiler/src/hash.rs` (`compute_infra_hash`) and
+/// `spec_serializes_map_keys_in_sorted_order`.
 pub fn compile(spec: &InfraSpec, ctx: &CompileContext<'_>) -> Result<Vec<Value>, CompileError> {
     // Pre-flight: every name we will stamp on a `metadata.name` is
     // enumerated by `emitted_names`. Length-check the lot here so
@@ -1332,7 +1333,7 @@ mod tests {
             project_id: "projB",
             node_id: "nodeC",
             instance_id: "inst1",
-            namespace: "wm-project-tenantA-projB",
+            namespace: "wft-project-tenantA-projB",
             local_image_tags: empty,
         }
     }
@@ -1347,7 +1348,7 @@ mod tests {
             project_id: "projB",
             node_id: "nodeC",
             instance_id: "inst1",
-            namespace: "wm-project-tenantA-projB",
+            namespace: "wft-project-tenantA-projB",
             local_image_tags: leaked,
         }
     }
@@ -1629,7 +1630,7 @@ mod tests {
             .iter()
             .find(|m| m["kind"] == "ConfigMap")
             .expect("ConfigMap emitted");
-        assert_eq!(cm["metadata"]["namespace"], "wm-project-tenantA-projB");
+        assert_eq!(cm["metadata"]["namespace"], "wft-project-tenantA-projB");
     }
 
     /// Per-Unit replicas: a 2-Unit spec with different replica

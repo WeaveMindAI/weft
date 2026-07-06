@@ -48,7 +48,7 @@
 #                 projects + history come back instantly.
 #   --purge       TRUE clean slate. Deletes the kind cluster, every
 #                 weft-built docker image (dispatcher, listener,
-#                 every weft-worker-*), every weavemind infra
+#                 every weft-worker-*), every weft infra
 #                 image, the BuildKit cache, the workspace target/
 #                 cargo cache, ~/.local/share/weft (image-hash
 #                 stamps, port-forward state, etc), and every
@@ -509,26 +509,33 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     # 2. Reclaim every weft-related host docker image.
     if command -v docker >/dev/null 2>&1; then
       for tag in weft-dispatcher:local weft-listener:local weft-broker:local \
-                 weft-infra-supervisor:local weft-storage:local; do
+                 weft-infra-supervisor:local; do
         docker image rm -f "${tag}" >/dev/null 2>&1 || true
       done
-      ok "removed dispatcher + listener + broker + supervisor + storage images"
+      ok "removed dispatcher + listener + broker + supervisor images"
 
       docker image prune --force \
         --filter "label=weft.dev/project" >/dev/null 2>&1 || true
-      stale_worker_ids="$(docker images 'weft-worker-*' -q 2>/dev/null | sort -u)"
-      if [[ -n "${stale_worker_ids}" ]]; then
-        echo "${stale_worker_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
+      # Remove every CONTENT-ADDRESSED image the build builds, by REPOSITORY (the
+      # `<repo>:<hash>` form has no hyphen, so a `<repo>-*` glob silently matches
+      # nothing). These accumulate with no implicit GC, so a purge must clear ALL:
+      #   - `weft-worker`        : one per project build.
+      #   - `weft-builder-base`  : one 1.37GB image per engine version.
+      #   - `weft-infra-<name>`  : one per infra node, built locally by the CLI as
+      #                            `weft-infra-<name>:<hash>` (see weft-compiler
+      #                            `infra_image_repo`). A tagged image is NOT
+      #                            dangling, so the `image prune --filter label`
+      #                            above does NOT remove these; match the repo.
+      #     SYNC: weft-infra-<name> repo <-> crates/weft-compiler/src/image_set.rs
+      #           (infra_image_repo). Sidecar images are a REMOVED concept; the
+      #           current code builds no `weft-sidecar-*`, so none is matched here.
+      bp_ids="$(docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
+        | awk '$1=="weft-worker" || $1=="weft-builder-base" || $1 ~ /^weft-infra-/ {print $2}' \
+        | sort -u)"
+      if [[ -n "${bp_ids}" ]]; then
+        echo "${bp_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
       fi
-      ok "removed every weft-worker-* image"
-
-      infra_image_ids="$(
-        docker images 'ghcr.io/weavemindai/infra-*' -q 2>/dev/null | sort -u
-      )"
-      if [[ -n "${infra_image_ids}" ]]; then
-        echo "${infra_image_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
-        ok "removed infra images"
-      fi
+      ok "removed every weft-worker + weft-builder-base + weft-infra-* image"
 
       # Shared base images, gated.
       if [[ $purge_postgres -eq 1 ]]; then
@@ -647,14 +654,17 @@ if [[ $build_cli -eq 1 ]]; then
   if [[ "${pre_mtime}" != "${post_mtime}" ]]; then
     # CLI binary actually changed → engine/core source likely
     # changed too. Worker images bake those crates in at
-    # `weft build` time, so cached images (host docker + kind
-    # containerd) are now stale. BuildKit cache is preserved;
-    # only the final tagged images go, so the next `weft build`
-    # is fast but produces a fresh worker.
-    stale_worker_ids="$(docker images 'weft-worker-*' -q 2>/dev/null | sort -u)"
-    if [[ -n "${stale_worker_ids}" ]]; then
-      echo "${stale_worker_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
-      ok "removed cached weft-worker-* images on host docker"
+    # `weft build` time, and the builder-base bakes the engine, so cached
+    # build-plane images (host docker + kind containerd) are now stale. BuildKit
+    # cache is preserved; only the final tagged images go, so the next
+    # `weft build` is fast but produces a fresh base + worker. Match by REPOSITORY
+    # (the `weft-worker:<hash>` form has no hyphen, so the old `weft-worker-*`
+    # glob silently matched nothing).
+    stale_bp_ids="$(docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
+      | awk '$1=="weft-worker" || $1=="weft-builder-base" {print $2}' | sort -u)"
+    if [[ -n "${stale_bp_ids}" ]]; then
+      echo "${stale_bp_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
+      ok "removed stale weft-worker + weft-builder-base images on host docker"
     fi
     if command -v kind >/dev/null 2>&1; then
       kind_node=""
@@ -666,15 +676,20 @@ if [[ $build_cli -eq 1 ]]; then
         fi
       done
       if [[ -n "${kind_node}" ]]; then
+        # Match the build-plane repos exactly (the image ref column is the FULL
+        # `repo:tag`; the bare repo is everything before the last ':'). The new
+        # worker form `weft-worker:<hash>` has no hyphen, so the old
+        # `weft-worker-` substring matched nothing.
         kind_worker_tags="$(
           docker exec "${kind_node}" crictl images 2>/dev/null \
-            | awk 'NR>1 && $1 ~ /weft-worker-/ {print $1":"$2}' \
+            | awk 'NR>1 {n=split($1,p,":"); repo=$1; sub(/:[^:]*$/,"",repo); \
+                   if (repo=="weft-worker" || repo=="weft-builder-base") print $1":"$2}' \
             | sort -u
         )"
         if [[ -n "${kind_worker_tags}" ]]; then
           # shellcheck disable=SC2086
           docker exec "${kind_node}" crictl rmi ${kind_worker_tags} >/dev/null 2>&1 || true
-          ok "removed cached weft-worker-* images in kind containerd"
+          ok "removed cached weft-worker + weft-builder-base images in kind containerd"
         fi
       fi
     fi
@@ -739,6 +754,15 @@ if [[ $build_vscode -eq 1 ]]; then
 
   pushd "${ext_dir}" >/dev/null
 
+  # The shared graph webview lives in the sibling `../packages/weft-graph` package,
+  # consumed FROM SOURCE (one renderer for the extension + the website). It has no
+  # install of its own; the extension bundles it through vite's `resolve.dedupe`
+  # (its bare deps resolve to THIS app's node_modules). svelte-check
+  # (check:webview) needs the same redirect, so point the package's node_modules at
+  # the extension's install. Created up-front (not inside the rebuild branch) so a
+  # bare `pnpm run check:webview` resolves too. One symlink, no dep-list dup.
+  ln -sfn ../../extension-vscode/node_modules ../packages/weft-graph/node_modules
+
   # Skip rebuild if nothing under src/ + config + package.json has
   # changed since the last successful build. We hash inputs and
   # compare to a stamp file. The .vsix from the last run is reused
@@ -747,7 +771,12 @@ if [[ $build_vscode -eq 1 ]]; then
   hash_file="${hash_dir}/extension.hash"
   current_hash="$(
     {
-      find src -type f \( -name '*.ts' -o -name '*.svelte' -o -name '*.css' \) -print0 \
+      # The extension's own host code lives in `src`; the webview it bundles was
+      # extracted into the shared `../packages/weft-graph` package (one renderer
+      # for the extension + the website). Both are real build inputs, so the
+      # fingerprint must cover BOTH trees, else a webview-only change leaves a
+      # stale cached .vsix that installs old code.
+      find src ../packages/weft-graph/src -type f \( -name '*.ts' -o -name '*.svelte' -o -name '*.css' \) -print0 \
         2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
       # package.json WITHOUT its version field: every build bumps the version
       # (so VS Code reinstalls), and that bump must not itself count as a source
@@ -772,7 +801,7 @@ if [[ $build_vscode -eq 1 ]]; then
     # version (touching its mtime), so it would always look "newer" than the
     # vsix and defeat the skip. The version-stripped content hash above already
     # catches any real package.json change.
-    newest_src="$(find src pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs tsconfig.json tsconfig.webview.json -type f -newer "${existing_vsix}" -print -quit 2>/dev/null)"
+    newest_src="$(find src ../packages/weft-graph/src pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs tsconfig.json tsconfig.webview.json -type f -newer "${existing_vsix}" -print -quit 2>/dev/null)"
     [[ -z "${newest_src}" ]] && vsix_is_fresh="yes"
   fi
 

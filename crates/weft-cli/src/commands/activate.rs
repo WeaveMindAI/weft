@@ -10,19 +10,16 @@
 
 
 use super::Ctx;
-use crate::commands::ensure::{parse_running_policy_flag, RunningPolicy};
 use crate::progress::ActionVerb;
 
 pub async fn run(
     ctx: Ctx,
     project: Option<String>,
     reactivate_choice_flag: Option<String>,
-    running_policy: Option<String>,
 ) -> anyhow::Result<()> {
-    let policy = parse_running_policy_flag(running_policy.as_deref())?;
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Activate, |progress| async move {
-        run_inner(&ctx_inner, &progress, project, reactivate_choice_flag, policy).await
+        run_inner(&ctx_inner, &progress, project, reactivate_choice_flag).await
     })
     .await
 }
@@ -32,25 +29,19 @@ async fn run_inner(
     progress: &crate::progress::Progress,
     project: Option<String>,
     reactivate_choice_flag: Option<String>,
-    running_policy: Option<RunningPolicy>,
 ) -> anyhow::Result<()> {
     let (client, id, name, binary_hash, definition_hash, infra_hash) = match project {
-        // Activate-by-id skips the build/discover step entirely, so
-        // there's no build gate and the policy can't apply.
+        // Activate-by-id skips the build/discover step entirely.
         Some(id) => (ctx.client(), id.clone(), id, None, None, None),
         None => {
-            // reactivates_after_gate=true: the activate POST below
-            // re-enables triggers and replays any parked fires, so a
-            // gate-park needs no user warning.
-            let handle =
-                super::ensure::ensure_registered(ctx, progress, running_policy, true).await?;
+            let handle = super::ensure::ensure_registered(ctx, progress).await?;
             (
                 handle.client,
                 handle.id,
                 handle.name,
-                Some(handle.binary_hash),
-                Some(handle.definition_hash),
-                Some(handle.infra_hash),
+                Some(handle.plan.binary_hash),
+                Some(handle.plan.definition_hash),
+                Some(handle.plan.infra_hash),
             )
         }
     };

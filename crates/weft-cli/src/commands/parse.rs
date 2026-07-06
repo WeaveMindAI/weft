@@ -92,7 +92,13 @@ fn do_parse(
     // so the file's root carries the same id at parse, edit, and render. The
     // compiler derives it; a normal project (named main group) ignores it.
     let source_id = weft_compiler::source_name::derive_id(file);
-    let (project, diagnostics) = weft_compiler::parse_only(source, id, base, catalog, Some(&source_id));
+    // The CLI always reads `@file`/`@include` content from disk; a `base` is the
+    // project root to resolve against, its absence means "outside a project."
+    let fs = match base {
+        Some(b) => weft_compiler::CompileFs::disk(b),
+        None => weft_compiler::CompileFs::none(),
+    };
+    let (project, diagnostics) = weft_compiler::parse_only(source, id, fs, catalog, Some(&source_id));
     let catalog_map = collect_catalog(&project, catalog);
     ParseResponse { project, catalog: catalog_map, diagnostics }
 }
@@ -382,10 +388,14 @@ fn do_validate(
     // Same anonymous-group id derivation as parse, so a standalone file's
     // diagnostics reference the same filename-derived id the editor renders.
     let source_id = weft_compiler::source_name::derive_id(file);
+    let fs = match base {
+        Some(b) => weft_compiler::CompileFs::disk(b),
+        None => weft_compiler::CompileFs::none(),
+    };
     let (_, diagnostics) = weft_compiler::compile_strict(
         source,
         id,
-        base,
+        fs,
         catalog,
         ValidationMode::Runtime,
         Some(&source_id),

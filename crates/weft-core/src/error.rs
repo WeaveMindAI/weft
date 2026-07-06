@@ -33,6 +33,7 @@ pub enum WeftError {
 
 pub type WeftResult<T> = Result<T, WeftError>;
 
+#[cfg(feature = "runtime")]
 impl From<crate::caller::CallerError> for WeftError {
     /// A caller-connection failure surfaces as a node failure (fails
     /// loud, visible in the UI), EXCEPT a disconnect under the

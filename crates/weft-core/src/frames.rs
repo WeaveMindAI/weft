@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One iteration of one nested loop level the firing is inside.
-// SYNC: LoopIteration <-> extension-vscode/src/shared/protocol.ts LoopIteration
+// SYNC: LoopIteration <-> packages/weft-graph/src/protocol.ts LoopIteration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LoopIteration {
     pub index: u32,

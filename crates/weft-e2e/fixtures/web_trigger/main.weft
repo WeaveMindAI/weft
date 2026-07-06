@@ -1,4 +1,3 @@
-# Project: e2e_web_trigger
 # A live HTTP endpoint: an outside caller POSTs to /api; the responder reads the
 # request body, streams progress chunks, then responds with a final JSON body
 # that echoes what was sent. The rig POSTs and asserts the echoed response.

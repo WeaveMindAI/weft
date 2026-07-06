@@ -1,16 +1,30 @@
-# Heavy dirs not needed in Docker builds
-target/
-dashboard/node_modules/
-dashboard/.svelte-kit/
-extension/
-.git/
-restate-data/
-restate-data-cloud/
+# Allowlist model: ignore EVERYTHING, then un-ignore only what the weft
+# Dockerfiles (deploy/docker/*.Dockerfile) actually COPY. This keeps the build
+# context to a few MB of source instead of the whole tree (target/ alone is many
+# GB), and it stays correct when new heavy dirs appear (they are ignored by
+# default, never dragged in).
+#
+# The Dockerfiles COPY: rust-toolchain.toml, Cargo.toml, Cargo.lock, crates/,
+# catalog/, .weft-warmup/. deploy/ is kept so the Dockerfiles referenced with
+# `-f` are inside the context too.
+*
 
-# Dev-only files
-.env
-.env.*
-*.db
-*.db-journal
-*.db-shm
-*.db-wal
+!rust-toolchain.toml
+!Cargo.toml
+!Cargo.lock
+!crates/
+!catalog/
+!.weft-warmup/
+!deploy/
+
+# Even inside the allowlisted dirs, never ship build artifacts or VCS/dev junk.
+**/target/
+**/node_modules/
+**/.svelte-kit/
+**/pkg/
+.git/
+**/.env
+**/*.db
+**/*.db-journal
+**/*.db-shm
+**/*.db-wal

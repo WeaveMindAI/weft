@@ -1035,48 +1035,58 @@ impl ListenerPool {
         .fetch_all(pg_pool)
         .await?;
         for (pod_name, namespace) in rows {
-            // Claim the pod (take ownership + a short lease) so a
-            // sibling does not also reap it. The UPDATE ... RETURNING
-            // re-checks BOTH the idle condition and the grace under the
-            // row lock, so a placement (or a re-spawn that re-armed the
-            // grace) between the scan and the claim aborts the reap.
-            let claimed: Option<(String,)> = sqlx::query_as(
-                "UPDATE listener_pod SET owner_pod_id = $1, leased_until_unix = $2 \
-                 WHERE pod_name = $3 \
-                   AND grace_until_unix < $4 \
-                   AND NOT EXISTS (SELECT 1 FROM signal WHERE listener_pod = $3) \
-                 RETURNING pod_name",
-            )
-            .bind(pod_id)
-            .bind(now + crate::lease::LEASE_DURATION_SECS)
-            .bind(&pod_name)
-            .bind(now)
-            .fetch_optional(pg_pool)
-            .await?;
-            if claimed.is_none() {
-                // A signal got placed on it (or it re-armed its grace)
-                // between the scan and the claim, or a sibling claimed
-                // it. Leave it.
-                continue;
-            }
-            // Tear down the pod, then delete its registry row. A
-            // backend.stop failure is logged but does not block the row
-            // delete: a dangling pod with no registry row is caught by
-            // a later k8s sweep, whereas a registry row pointing at a
-            // half-dead pod would mis-route placement.
-            if let Err(e) = backend.stop(&pod_name, &namespace).await {
-                tracing::warn!(
-                    target: "weft_dispatcher::listener",
-                    pod = %pod_name,
-                    namespace = %namespace,
-                    error = %e,
-                    "backend.stop failed during listener reap; deleting registry row anyway"
-                );
-            }
-            sqlx::query("DELETE FROM listener_pod WHERE pod_name = $1")
+            // Delete the registry row FIRST, atomically re-checking the
+            // idle + grace conditions, under the per-pod advisory lock
+            // that every placement STAMP also takes (`signal_insert` /
+            // `set_placement`). The lock is what makes this race-free:
+            // a placement that picked this pod either stamps its signal
+            // row before we get the lock (the NOT EXISTS re-check then
+            // aborts the reap) or is forced to wait, finds the pod row
+            // gone, and re-places onto a live pod. Without the lock the
+            // two single statements can write-skew (both read the
+            // other's table before either write commits) and a signal
+            // ends up stamped onto a deleted pod. Row-first ordering:
+            // once the row is gone the pod is invisible to pick_live and
+            // to the stamps; a backend.stop failure then leaves only an
+            // orphan k8s object for the later k8s sweep, never a
+            // registry row pointing at a half-dead pod (which would
+            // mis-route placement).
+            let key = pod_lock_key(&pod_name);
+            let deleted = crate::lease::with_advisory_lock(pg_pool, key, || async {
+                let gone: Option<(String,)> = sqlx::query_as(
+                    "DELETE FROM listener_pod \
+                     WHERE pod_name = $1 \
+                       AND grace_until_unix < $2 \
+                       AND (owner_pod_id = $3 OR leased_until_unix < $2) \
+                       AND NOT EXISTS (SELECT 1 FROM signal WHERE listener_pod = $1) \
+                     RETURNING namespace",
+                )
                 .bind(&pod_name)
-                .execute(pg_pool)
+                .bind(now)
+                .bind(pod_id)
+                .fetch_optional(pg_pool)
                 .await?;
+                Ok(gone)
+            })
+            .await?;
+            match deleted {
+                // Lock contended (a placement is stamping onto it right
+                // now) or the re-check failed (a signal landed / grace
+                // re-armed / a sibling reaped first). Leave it.
+                None | Some(None) => continue,
+                Some(Some(_)) => {
+                    if let Err(e) = backend.stop(&pod_name, &namespace).await {
+                        tracing::warn!(
+                            target: "weft_dispatcher::listener",
+                            pod = %pod_name,
+                            namespace = %namespace,
+                            error = %e,
+                            "backend.stop failed during listener reap; registry row already \
+                             deleted, the k8s object is left for the later k8s sweep"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1275,15 +1285,44 @@ pub async fn set_placement(
     pod_name: &str,
     generation: i64,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE signal SET listener_pod = $1, placement_generation = $2 WHERE token = $3",
+    // Stamp under the per-pod advisory lock, guarded on the pod's
+    // registry row still existing: the idle reaper deletes that row (and
+    // then the pod) under the SAME lock with a none-placed re-check, so
+    // exactly one of {this stamp, that reap} wins. Without the lock the
+    // two writes can skew past each other and a signal ends up placed on
+    // a pod that no longer exists, which nothing would ever fire.
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(pod_lock_key(pod_name))
+        .execute(&mut *tx)
+        .await?;
+    let res = sqlx::query(
+        "UPDATE signal SET listener_pod = $1, placement_generation = $2 \
+         WHERE token = $3 \
+           AND EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $1)",
     )
     .bind(pod_name)
     .bind(generation)
     .bind(token)
-    .execute(pg_pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!(
+            "placement stamp for token '{token}' onto pod '{pod_name}' did not apply: the pod \
+             was reaped mid-placement (or the signal row is gone); retry places onto a live pod"
+        );
+    }
     Ok(())
+}
+
+/// The per-listener-pod advisory-lock key. Taken (blocking) by every
+/// placement STAMP (`signal_insert`, `set_placement`) and (try) by the
+/// idle reaper's claim-and-delete, so "a signal points at this pod" and
+/// "this pod's registry row is deleted" are strictly serialized; the
+/// reap-vs-place race cannot strand a signal on a reaped pod.
+pub fn pod_lock_key(pod_name: &str) -> i64 {
+    crate::lease::advisory_key(crate::lease::LISTENER_POOL_DOMAIN, pod_name)
 }
 
 #[cfg(test)]

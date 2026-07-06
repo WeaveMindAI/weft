@@ -11,14 +11,16 @@
 //! fresh UUID (so concurrent / repeated runs never collide on the dispatcher),
 //! refreshes the catalog, and is then ready to build/run/activate.
 //!
-//! Teardown is EXPLICIT: a passing test ends with `project.finish().await?`,
-//! which deactivates + removes the project from the dispatcher and deletes the
-//! temp copy, all awaited so a teardown failure surfaces loudly. A test that
-//! panics / returns early never reaches `finish`, so [`Drop`] is only a safety
-//! net: it leaves the remote project up (for post-mortem) and just warns,
-//! pointing at the temp dir and id to inspect. We do NOT do remote teardown in
-//! Drop (it cannot await, and a detached spawn would race the process exit and
-//! orphan projects anyway).
+//! Teardown is EXPLICIT and lives in the shared [`crate::teardown::Teardown`]
+//! guard (so the local CLI suite and an API-driven HTTP suite cannot drift on the
+//! policy): a passing test ends with `project.finish().await?`, which
+//! deactivates + removes the project from the dispatcher, deletes the temp copy,
+//! and marks the guard done, all awaited so a teardown failure surfaces loudly.
+//! A test that panics / returns early never reaches `finish`, so the guard's
+//! [`Drop`] is only a safety net: it leaves the remote project up (for
+//! post-mortem) and just warns, pointing at the temp dir and id to inspect. We
+//! do NOT do remote teardown in Drop (it cannot await, and a detached spawn
+//! would race the process exit and orphan projects anyway).
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +28,7 @@ use anyhow::{bail, Context, Result};
 use uuid::Uuid;
 
 use crate::client::{cli_ok, Dispatcher};
+use crate::teardown::Teardown;
 
 /// Root of the committed fixtures directory, resolved from this crate's
 /// manifest dir so it is correct regardless of the test binary's cwd.
@@ -38,18 +41,14 @@ fn fixtures_root() -> PathBuf {
 pub struct Project {
     /// Fresh project id (the rewritten `weft.toml` package.id).
     id: Uuid,
-    /// The fixture's name (for messages).
-    fixture: String,
     /// Temp working directory holding the isolated copy.
     dir: PathBuf,
     /// Dispatcher client, shared from the suite's ensured-up system.
     disp: Dispatcher,
-    /// Set once [`Project::finish`] has run, so Drop neither warns nor double-
-    /// removes. A still-`false` value at drop means the test ended early.
-    finished: bool,
-    /// Whether the project was registered/activated on the dispatcher (so
-    /// teardown knows whether a remote remove is even needed).
-    registered: bool,
+    /// The shared clean-on-pass / keep-and-warn-on-fail guard. Owns the id's
+    /// registered/finished bookkeeping + the Drop warning, so this CLI fixture
+    /// and an API-driven HTTP fixture share ONE teardown policy.
+    teardown: Teardown,
 }
 
 impl Project {
@@ -81,13 +80,15 @@ impl Project {
             .await
             .with_context(|| format!("catalog update for {fixture}"))?;
 
+        // The recovery hint the guard's Drop prints if a test ends early: the
+        // exact by-hand cleanup for a kept local project (remove it from the
+        // dispatcher, then delete the temp copy).
+        let recovery_hint = format!("`weft rm {id}` then `rm -rf {}`", dir.display());
         Ok(Self {
             id,
-            fixture: fixture.to_string(),
             dir,
             disp,
-            finished: false,
-            registered: false,
+            teardown: Teardown::new(id, fixture, recovery_hint),
         })
     }
 
@@ -134,13 +135,47 @@ impl Project {
         Ok(())
     }
 
+    /// Replace the project's `main.weft` wholesale. Transition tests evolve
+    /// ONE project through several graph shapes (no-infra -> infra -> trigger
+    /// -> ...) exactly as a user editing source would; the next verb picks the
+    /// new shape up. The old content is discarded on purpose (a user's editor
+    /// save), so no placeholder checking here; the caller writes complete,
+    /// final source.
+    pub fn set_main(&self, contents: &str) -> Result<()> {
+        let path = self.dir.join("main.weft");
+        std::fs::write(&path, contents).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Copy a custom node from ANOTHER committed fixture into this project's
+    /// `nodes/` directory (e.g. pull `infra_min`'s `mini_service` into a
+    /// transition fixture before rewriting `main.weft` to use it). One
+    /// committed source per node, shared across fixtures, instead of a copy
+    /// per fixture that would drift.
+    pub fn add_node_from_fixture(&self, fixture: &str, node: &str) -> Result<()> {
+        let src = fixtures_root().join(fixture).join("nodes").join(node);
+        if !src.is_dir() {
+            bail!(
+                "node '{node}' not found in fixture '{fixture}' at {}",
+                src.display()
+            );
+        }
+        let dst = self.dir.join("nodes").join(node);
+        std::fs::create_dir_all(&dst)
+            .with_context(|| format!("create node dir {}", dst.display()))?;
+        copy_tree(&src, &dst)
+            .with_context(|| format!("copy node {fixture}/{node} into {}", dst.display()))
+    }
+
     /// Substitute the live-trigger mount-path placeholder `__E2E_PATH__` with a
-    /// per-project-unique path and return that path. Mount paths are a GLOBAL
-    /// namespace on the dispatcher (two active projects cannot both claim
-    /// `/chat`), so a live fixture must NOT hardcode one: a leftover project or
-    /// a future parallel run would collide. The unique path is derived from the
-    /// project's fresh id, so it is stable within a run and distinct across runs.
-    /// Call BEFORE activate; the returned path is what the test connects to.
+    /// per-project-unique path, and return the CALLABLE path the test connects
+    /// to. Mount paths are namespaced per tenant on the dispatcher, so the
+    /// stored path (and the callable URL) is `/<tenant>/<path>`: the node config
+    /// gets the bare `<path>`, but a caller reaches it at `/connect/<tenant>/<path>`
+    /// (live) or `POST /<tenant>/<path>` (public fire). e2e runs as tenant
+    /// `local`, so the callable path is `local/<path>`. The unique suffix is
+    /// derived from the project's fresh id (stable within a run, distinct across
+    /// runs). Call BEFORE activate.
     pub fn unique_live_path(&self) -> Result<String> {
         // First 12 hex of the id (sans hyphens): short, unique, path-safe.
         let suffix: String = self
@@ -151,8 +186,11 @@ impl Project {
             .take(12)
             .collect();
         let path = format!("e2e-{suffix}");
+        // The node config carries the BARE path; the dispatcher prefixes the
+        // owning tenant when it stores + serves the mount path.
         self.substitute_in_main("__E2E_PATH__", &path)?;
-        Ok(path)
+        // The test connects at the tenant-namespaced path (e2e tenant = local).
+        Ok(format!("local/{path}"))
     }
 
     /// Build the project's worker image (the real compile path). `weft build`
@@ -169,7 +207,7 @@ impl Project {
     /// the project registered so [`Project::finish`] removes it.
     pub async fn activate(&mut self) -> Result<()> {
         self.weft(&["activate"]).await?;
-        self.registered = true;
+        self.teardown.mark_registered();
         Ok(())
     }
 
@@ -177,15 +215,18 @@ impl Project {
     /// run path, where the first `weft run` builds + registers the project as a
     /// side effect, so teardown must still remove it.
     pub fn mark_registered(&mut self) {
-        self.registered = true;
+        self.teardown.mark_registered();
     }
 
     /// End-of-test teardown for a PASSING test: remove the project from the
     /// dispatcher (deactivate + unregister, the real `weft rm` path) and delete
     /// the temp copy, all awaited so a teardown failure surfaces loudly rather
-    /// than orphaning state. Call this as the last line of a passing test.
+    /// than orphaning state. Then mark the shared guard done so its Drop stays
+    /// silent. Call this as the last line of a passing test. (A removal failure
+    /// returns early WITHOUT marking the guard done, so the guard keeps + warns,
+    /// exactly as an early-exiting test does.)
     pub async fn finish(mut self) -> Result<()> {
-        if self.registered {
+        if self.teardown.registered() {
             // `weft rm <id>` deactivates then unregisters, exactly as a user
             // would clean up. Run by id so it is unambiguous.
             let id = self.id.to_string();
@@ -195,30 +236,8 @@ impl Project {
         }
         std::fs::remove_dir_all(&self.dir)
             .with_context(|| format!("teardown: remove temp dir {}", self.dir.display()))?;
-        self.finished = true;
+        self.teardown.complete();
         Ok(())
-    }
-}
-
-impl Drop for Project {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        // The test ended without calling finish() (panic / early return / a
-        // test that simply forgot). Keep BOTH the remote project and the temp
-        // dir so the failure can be inspected, and say exactly where to look.
-        // No remote teardown here: Drop cannot await, and a detached spawn would
-        // race the process exit and orphan projects unpredictably.
-        tracing::warn!(
-            "weft-e2e: fixture '{}' NOT finished (test ended early); keeping project {} and temp \
-             dir {} for inspection. Clean up with `weft rm {}` then `rm -rf {}`.",
-            self.fixture,
-            self.id,
-            self.dir.display(),
-            self.id,
-            self.dir.display(),
-        );
     }
 }
 

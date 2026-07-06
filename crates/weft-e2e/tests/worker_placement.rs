@@ -2,10 +2,10 @@
 //! project declares infrastructure, the core of the shared-namespace change:
 //!
 //!   - a NO-INFRA project's worker runs in the single shared worker
-//!     namespace (`wm-shared-workers`), and NO per-project namespace is ever
+//!     namespace (`wft-shared-workers`), and NO per-project namespace is ever
 //!     created for it (the whole point: stop burning the namespace ceiling);
 //!   - an INFRA project's worker runs in the project's OWN namespace
-//!     (`wm-project-<tenant>--<project>`), next to its infra pods, and that
+//!     (`wft-project-<tenant>--<project>`), next to its infra pods, and that
 //!     namespace exists only after infra is applied.
 //!
 //! Only a real cluster can prove the pod actually lands in the right
@@ -28,7 +28,7 @@ use weft_e2e::{ensure, infra, platform::Platform, project::Project, run};
 
 /// The shared worker namespace name.
 // SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-dispatcher/src/project_namespace.rs SHARED_WORKER_NAMESPACE, crates/weft-broker/src/auth.rs SHARED_WORKER_NAMESPACE
-const SHARED_WORKER_NAMESPACE: &str = "wm-shared-workers";
+const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
 const INFRA_NODE: &str = "svc";
 
 /// A no-infra project's worker runs in the shared namespace, and the project
@@ -68,8 +68,12 @@ async fn no_infra_worker_runs_in_shared_namespace() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// An infra project's worker runs in the project's OWN namespace, created when
-/// infra is applied.
+/// An infra project's worker runs in the project's OWN namespace, and that
+/// includes the InfraSetup provisioning execution: infra Pods are reachable
+/// only from inside the project namespace (the namespace's ingress policy),
+/// so `infra start` creates the namespace FIRST and every worker spawned
+/// from then on (provisioning included) lands there. No worker of this
+/// project ever touches the shared pool once infra is declared and synced.
 #[tokio::test]
 async fn infra_worker_runs_in_project_namespace() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -77,8 +81,8 @@ async fn infra_worker_runs_in_project_namespace() -> anyhow::Result<()> {
     let mut project = Project::prepare("infra_min", disp.clone()).await?;
     let pid = project.id();
 
-    // Provisioning infra creates the per-project namespace and runs the
-    // worker there (next to the infra pods).
+    // `infra start` creates the per-project namespace, applies infra, and
+    // runs the provisioning execution on an in-namespace worker.
     infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
 
     let pods = platform.worker_pods_for_project(&pid).await?;
@@ -86,14 +90,15 @@ async fn infra_worker_runs_in_project_namespace() -> anyhow::Result<()> {
     for pod in &pods {
         anyhow::ensure!(
             pod.namespace != SHARED_WORKER_NAMESPACE
-                && pod.namespace.starts_with("wm-project-"),
-            "infra worker must run in the project's own namespace; pod {} is in {}",
+                && pod.namespace.starts_with("wft-project-"),
+            "an infra project's worker must run in the project's own namespace; \
+             pod {} is in {}",
             pod.pod_name,
             pod.namespace
         );
     }
     anyhow::ensure!(
-        platform.project_namespace(&pid).await?.starts_with("wm-project-"),
+        platform.project_namespace(&pid).await?.starts_with("wft-project-"),
         "an infra project must have its own k8s namespace recorded after apply"
     );
 

@@ -517,6 +517,7 @@ impl WeftType {
     /// `Journaled`, since silently misclassifying ephemeral as
     /// journaled would route a frame-rate stream into permanent
     /// journal storage.
+    #[cfg(feature = "runtime")]
     pub fn bus_marker_mode(value: &serde_json::Value) -> Option<crate::bus::BusMode> {
         let s = Self::detect_bus_type(value.as_object()?)?.get("mode")?.as_str()?;
         crate::bus::BusMode::from_wire_str(s)
@@ -525,6 +526,7 @@ impl WeftType {
     /// Build a Bus marker JSON value from a channel id and a mode.
     /// Takes `BusMode` (not `&str`) so the wire-vocabulary invariant
     /// is enforced at the type system; a typo can't slip through.
+    #[cfg(feature = "runtime")]
     pub fn bus_marker(id: &str, mode: crate::bus::BusMode) -> serde_json::Value {
         serde_json::json!({ "__weft_bus__": { "id": id, "mode": mode.as_wire_str() } })
     }

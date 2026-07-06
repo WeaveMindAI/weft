@@ -123,6 +123,15 @@ pub const POOL_SCALEDOWN_DOMAIN: &str = "weft_pool_scaledown";
 /// sequence makes "the highest reserved generation is the final holder"
 /// an invariant instead of a race outcome. The scope is the token.
 pub const SIGNAL_PLACEMENT_DOMAIN: &str = "weft_signal_placement";
+/// Serializes the read-state-then-flip entry into a PROJECT lifecycle
+/// transition (activate, deactivate, the build marker, the has-infra
+/// worker relocation), keyed by project id. Held only for the
+/// microseconds of the read-and-CAS (or the short kubectl-bounded
+/// worker relocation): the TRANSITIONAL STATE written into the project
+/// row is the durable mutual exclusion that makes competing verbs
+/// REJECT instantly; this lock only stops two verbs from both winning
+/// the flip. Never held across a build, a drain, or user code.
+pub const PROJECT_TRANSITION_DOMAIN: &str = "weft_project_transition";
 
 /// Run `body` while holding the TRANSACTION-SCOPED advisory lock for
 /// `key`, TRY-locking. Returns `Ok(None)` immediately if another holder
@@ -214,6 +223,28 @@ where
     with_advisory_lock(pg_pool, advisory_key(POOL_SCALEDOWN_DOMAIN, pool_scope), body).await
 }
 
+/// Convenience wrapper: hold the per-project transition lock for
+/// `project_id`, BLOCKING behind the current holder (transitions are
+/// microsecond-short, so a brief queue beats a spurious rejection at
+/// the lock layer; the state-level rejection happens inside `body`,
+/// which re-reads the row under the lock).
+pub async fn with_project_transition_lock<T, F, Fut>(
+    pg_pool: &sqlx::postgres::PgPool,
+    project_id: &str,
+    body: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    with_advisory_lock_blocking(
+        pg_pool,
+        advisory_key(PROJECT_TRANSITION_DOMAIN, project_id),
+        body,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +261,13 @@ mod tests {
         assert_eq!(
             advisory_key(SUPERVISOR_COORD_DOMAIN, "tenant-a"),
             5099131965359238650,
+        );
+        assert_eq!(
+            advisory_key(
+                PROJECT_TRANSITION_DOMAIN,
+                "00000000-0000-0000-0000-000000000042",
+            ),
+            8667617249734746809,
         );
     }
 

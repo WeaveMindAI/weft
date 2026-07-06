@@ -128,10 +128,8 @@ spec:
                   fieldPath: metadata.name
             - name: WEFT_HTTP_PORT
               value: "9999"
-            - name: WEFT_SYSTEM_NAMESPACE
+            - name: WEFT_CONTROL_PLANE_NAMESPACE
               value: weft-system
-            - name: WEFT_TENANT_NS_PREFIX
-              value: wm-
             - name: WEFT_LISTENER_IMAGE
               value: weft-listener:local
             - name: WEFT_DATABASE_URL
@@ -151,17 +149,26 @@ spec:
               value: "${WEFT_CLUSTER_SERVICE_CIDR}"
             - name: WEFT_BROKER_URL
               value: "http://weft-broker.weft-db.svc.cluster.local:9090"
-            # Public base URL surfaced to users in webhook /
-            # activation URLs AND storage file downloads
-            # (<base>/storage/<tenant>/...). The `weft daemon` apply
-            # path substitutes this from the local ingress port
-            # (http://127.0.0.1:<ingress_port>), which the daemon
-            # forwards the cluster ingress to; a real-cloud operator
-            # substitutes the external ingress host instead. Loopback
-            # is allowed in-cluster only when WEFT_LOCAL_DEV is set
-            # (see below); production must set a real host.
+            # Public base URL surfaced to users in webhook / trigger /
+            # activation URLs (<base>/<mount>, <base>/connect/...). This is a
+            # CONTROL-PLANE origin: it routes those requests to the dispatcher.
+            # File DOWNLOADS do NOT use it: a download is a short-lived presigned
+            # URL straight to the object store (see WEFT_OBJECT_STORE_PUBLIC_ENDPOINT
+            # below), so the bytes never traverse the dispatcher. The daemon
+            # substitutes the local port-forward host here; an operator deploying
+            # against a real cluster substitutes the external ingress host. Loopback is allowed in-cluster only
+            # when WEFT_LOCAL_DEV is set (see below); production must set a real host.
             - name: WEFT_DISPATCHER_PUBLIC_BASE_URL
               value: "${WEFT_DISPATCHER_PUBLIC_BASE_URL}"
+            # The BROWSER-facing object-store origin. The dispatcher serves it at
+            # GET /storage/public-base; the webview adds it to its CSP img-src /
+            # media-src so an <img>/<video> can load a presigned bucket URL DIRECTLY
+            # (bytes come from the store, not through any service). It MUST match the
+            # public origin the broker mints presigned download URLs against, or the
+            # URL loads but CSP blocks it. Empty when unset -> previews silently
+            # blocked, so a deployment that serves media must set it.
+            - name: WEFT_OBJECT_STORE_PUBLIC_ENDPOINT
+              value: "${WEFT_OBJECT_STORE_PUBLIC_ENDPOINT}"
             # Declares "this is a local kind cluster reached via
             # port-forward", which makes a loopback public base URL
             # legal in-cluster. The daemon sets it to "1" locally;
@@ -169,16 +176,11 @@ spec:
             # misconfiguration.
             - name: WEFT_LOCAL_DEV
               value: "${WEFT_LOCAL_DEV}"
-            # New env vars are APPENDED here (some code paths read env
-            # by index; inserting mid-list would shift them). Storage:
-            - name: WEFT_STORAGE_IMAGE
-              value: weft-storage:local
-            # Projected SA token (audience weft-broker) so the
-            # dispatcher's storage-box admin client can authenticate:
-            # the box relays this bearer to the broker's
-            # /storage/authorize, which resolves it to weft-dispatcher
-            # in weft-system (the control plane). Same path tenant
-            # pods use to reach the broker.
+            # Projected SA token (audience weft-broker) the dispatcher signs
+            # onto its broker storage-admin requests (the `weft files` CLI
+            # proxy): the broker resolves this bearer to weft-dispatcher in
+            # weft-system, i.e. the control plane. Same token path tenant pods
+            # use to reach the broker.
             - name: WEFT_BROKER_TOKEN_PATH
               value: "/var/run/weft/sa/token"
             # Live caller connection handshake: the HMAC the dispatcher

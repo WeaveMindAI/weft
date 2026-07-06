@@ -21,6 +21,15 @@ pub fn prompt_line(prompt: &str, flag_hint: &str) -> anyhow::Result<String> {
              to choose non-interactively"
         );
     }
+    // A prompt whose text goes into a pipe while the read comes from the
+    // terminal is an invisible hang (the user never sees the question).
+    // Prompting requires BOTH ends to be the terminal.
+    if !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "cannot prompt (stdout is not a terminal, the prompt would be invisible); \
+             pass {flag_hint} to choose non-interactively"
+        );
+    }
     print!("{prompt}");
     std::io::stdout().flush()?;
     let mut line = String::new();

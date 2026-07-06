@@ -5,11 +5,31 @@ import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import tailwindcss from '@tailwindcss/vite';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 
-const webviewRoot = path.dirname(fileURLToPath(import.meta.url));
-const libRoot = path.join(webviewRoot, 'src/webview/lib');
-const shimRoot = path.join(webviewRoot, 'src/webview/shims');
+const extRoot = path.dirname(fileURLToPath(import.meta.url));
+// The graph webview was extracted into the shared `weft-graph` package so the
+// website can share one graph renderer. The extension still builds it into its
+// own bundle, just from the package source now.
+const webviewRoot = path.join(extRoot, '../packages/weft-graph/src/webview');
+const shimRoot = path.join(webviewRoot, 'shims');
+
+// The package's source lives in a sibling dir (`../packages/weft-graph`) whose
+// node-resolution walk never reaches THIS app's node_modules, so its bare
+// imports (`svelte-sonner`, `@lucide/svelte`, codemirror, svelte, ...) wouldn't
+// resolve. `resolve.dedupe` is the documented fix: it forces each listed dep to
+// resolve to the single copy in THIS app's node_modules while still honoring the
+// dep's own `exports` map (so deep imports like `svelte/internal/...` work).
+// Read the list from the package manifest so it stays in lockstep with the
+// package's real deps.
+const graphPkg = createRequire(import.meta.url)(
+  path.join(extRoot, '../packages/weft-graph/package.json'),
+);
+const graphDeps = Object.keys({
+  ...graphPkg.dependencies,
+  ...graphPkg.peerDependencies,
+});
 
 export default defineConfig({
   plugins: [tailwindcss(), svelte()],
@@ -17,17 +37,14 @@ export default defineConfig({
     // Default Vite list minus the `.mjs` quirks plus `.svelte.ts`
     // so imports of `./lib/nodes` pick up `lib/nodes/index.svelte.ts`.
     extensions: ['.mjs', '.js', '.mts', '.ts', '.svelte.ts', '.jsx', '.tsx', '.json'],
-    // Mirror v1's SvelteKit path aliases so copied files resolve
-    // without editing a single import statement. $app/... and $env/...
-    // route to tiny shims; $lib and $lib/utils route to the copied
-    // v1 tree under src/webview/lib.
+    dedupe: graphDeps,
     alias: [
+      // The package's webview code uses SvelteKit's `$app/environment`; in a
+      // plain vite build that routes to a tiny shim (browser=true).
       { find: /^\$app\/environment$/, replacement: path.join(shimRoot, 'app-environment.ts') },
-      { find: /^\$lib\/utils$/, replacement: path.join(libRoot, 'utils.ts') },
-      { find: /^\$lib\/utils\.js$/, replacement: path.join(libRoot, 'utils.ts') },
-      { find: /^\$lib\/utils\//, replacement: path.join(libRoot, 'utils') + '/' },
-      { find: /^\$lib\//, replacement: libRoot + '/' },
-      { find: /^\$lib$/, replacement: libRoot },
+      // `@tailwindcss/vite` resolves `tailwindcss` relative to the package's CSS
+      // file, which also can't reach this app's node_modules; point it here too.
+      { find: /^tailwindcss$/, replacement: path.join(extRoot, 'node_modules/tailwindcss') },
     ],
   },
   build: {
@@ -35,7 +52,7 @@ export default defineConfig({
     emptyOutDir: true,
     target: 'es2020',
     rollupOptions: {
-      input: 'src/webview/main.ts',
+      input: path.join(webviewRoot, 'main.ts'),
       output: {
         entryFileNames: 'bundle.js',
         chunkFileNames: 'bundle-[name].js',

@@ -115,7 +115,14 @@ async fn alive_color_owner(
     Ok(row.map(|(p,)| p))
 }
 
-async fn enqueue_execution(
+/// Build the `NewTask` for an execution-family task (`execute` / `resume`),
+/// UNQUEUED: the caller decides how it is inserted (a plain dedup'd enqueue,
+/// or committed atomically with the execution's journal birth via
+/// `Journal::start_execution` / `start_live_execution`).
+///
+/// `live_connection`: `Some(spec)` for a live-caller execution (the worker
+/// expects a caller to attach), `None` otherwise.
+pub async fn execution_task_spec(
     pool: &sqlx::PgPool,
     kind: TaskKind,
     project_id: &str,
@@ -128,72 +135,64 @@ async fn enqueue_execution(
     // atomic claim guarantees exactly one). Resume passes the alive
     // owner so a sibling worker can't steal a live color.
     target_pod_name: Option<String>,
-) -> Result<()> {
+    live_connection: Option<serde_json::Value>,
+) -> Result<NewTask> {
     let color_str = color.to_string();
     let payload = ExecutionPayload {
         project_id: project_id.to_string(),
         color: color_str.clone(),
         definition_hash: definition_hash.to_string(),
-        live_connection: None,
+        live_connection,
     };
+    // Stamp the CURRENT image so an UNPINNED task is only claimable by a
+    // pod baked from it (a stale-image worker's binary lacks the current
+    // graph's node impls; the claim filter + cold-start sweep then route
+    // the task to a fresh, correct pod instead). Read from the project
+    // row here, the one producer, so every execute/resume enqueue path
+    // carries it without each call site re-fetching. Pinned tasks bypass
+    // the claim filter, so the stamp is inert on them.
+    let binary_hash: Option<String> =
+        sqlx::query_scalar("SELECT running_binary_hash FROM project WHERE id = $1::uuid")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
     let dedup = format!("{color_str}:{}", kind.as_str());
-    enqueue_dedup(
-        pool,
-        NewTask {
-            kind,
-            target: TaskTarget::Worker,
-            project_id: Some(project_id.to_string()),
-            dedup_key: Some(dedup),
-            color: Some(color_str),
-            tenant_id: tenant_id.map(str::to_string),
-            target_pod_name,
-            payload: serde_json::to_value(&payload)?,
-        },
-    )
-    .await?;
-    Ok(())
+    Ok(NewTask {
+        kind: kind.into(),
+        target: TaskTarget::Worker,
+        project_id: Some(project_id.to_string()),
+        dedup_key: Some(dedup),
+        color: Some(color_str),
+        tenant_id: tenant_id.map(str::to_string),
+        target_pod_name,
+        binary_hash,
+        payload: serde_json::to_value(&payload)?,
+    })
 }
 
-/// Enqueue a fresh execution STARTED by a live-caller handshake, pinned to
-/// a specific worker pod (per-pod addressing) and carrying the trigger's
-/// full signal spec (tag + config) so the worker recovers the protocol and
-/// the connection knobs and expects a caller to attach for this color. The
-/// `target_pod_name` claim filter guarantees ONLY the chosen pod runs it, so
-/// the caller (routed to that same pod by the gateway) and the execution
-/// land on the same process.
-/// ATOMICALLY admit a live execution: pick the least-PRESSURED admittable
-/// worker for the project (alive, not draining, memory below `saturation`) and
-/// insert the pinned execute task on it, in one transaction (admission IS the
-/// task insert; the task row is the durable pin). Returns the chosen pod, or
-/// `None` if every worker is saturated / draining (caller spawns another and
-/// retries). Capacity is memory-bounded, not a connection count.
-pub async fn admit_live_execution(
+async fn enqueue_execution(
     pool: &sqlx::PgPool,
+    kind: TaskKind,
     project_id: &str,
     color: weft_core::Color,
     definition_hash: &str,
     tenant_id: Option<&str>,
-    live_spec: serde_json::Value,
-    saturation: f64,
-) -> Result<Option<weft_task_store::tasks::AdmittedPod>> {
-    let color_str = color.to_string();
-    let payload = ExecutionPayload {
-        project_id: project_id.to_string(),
-        color: color_str.clone(),
-        definition_hash: definition_hash.to_string(),
-        live_connection: Some(live_spec),
-    };
-    let payload_json = serde_json::to_value(&payload)?;
-    let admitted = weft_task_store::tasks::admit_live_execution(
+    target_pod_name: Option<String>,
+) -> Result<()> {
+    let task = execution_task_spec(
         pool,
+        kind,
         project_id,
-        &color_str,
+        color,
+        definition_hash,
         tenant_id,
-        &payload_json,
-        saturation,
+        target_pod_name,
+        None,
     )
     .await?;
-    Ok(admitted)
+    enqueue_dedup(pool, task).await?;
+    Ok(())
 }
 
 /// Enqueue a `cancel_execution` task addressed to the Pod that OWNS
@@ -226,13 +225,16 @@ pub async fn enqueue_cancel(
     enqueue_dedup(
         pool,
         NewTask {
-            kind: TaskKind::CancelExecution,
+            kind: TaskKind::CancelExecution.into(),
             target: TaskTarget::Worker,
             project_id: Some(project_id.to_string()),
             dedup_key: Some(dedup),
             color: Some(color_str),
             tenant_id: tenant_id.map(str::to_string),
             target_pod_name: Some(pod_name),
+            // Pinned to the color's owner: must reach THAT pod whatever
+            // image it runs (the claim filter bypasses on pinned tasks).
+            binary_hash: None,
             payload: serde_json::to_value(&payload)?,
         },
     )

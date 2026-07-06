@@ -62,11 +62,11 @@ pub fn emit(
     let src_dir = crate_root.join("src");
     std::fs::create_dir_all(&src_dir).map_err(CompileError::Io)?;
 
-    let weft_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent() // crates/
-        .and_then(|p| p.parent()) // weft/
-        .ok_or_else(|| CompileError::Build("cannot resolve weft workspace root".into()))?
-        .to_path_buf();
+    // Runtime-resolvable workspace root (honors `WEFT_REPO_ROOT`), NOT the raw
+    // compile-time `CARGO_MANIFEST_DIR`: when the compile happens inside a built
+    // image there is no compile-time path, so codegen must read the pinned
+    // toolchain from the baked workspace. One resolver for every weft-root read.
+    let weft_root = crate::build::resolve_weft_root()?;
 
     // Every CATALOG-resolved node type referenced by the project.
     // Runtime-internal built-ins (Passthrough, LoopIn, LoopOut, ...)
@@ -185,45 +185,11 @@ fn write_worker_cargo_toml(
 ) -> CompileResult<()> {
     let package_name = crate::build::sanitize_crate_name(crate_name);
 
-    let mut deps = base_runtime_deps();
-    insert_dep(
-        &mut deps,
-        "weft-engine",
-        toml::Value::Table(path_table("../weft/crates/weft-engine")),
-    );
-    insert_dep(
-        &mut deps,
-        "weft-core",
-        toml::Value::Table(path_table("../weft/crates/weft-core")),
-    );
-    insert_dep(
-        &mut deps,
-        "weft-broker-client",
-        toml::Value::Table(path_table("../weft/crates/weft-broker-client")),
-    );
-    insert_dep(
-        &mut deps,
-        "weft-platform-traits",
-        toml::Value::Table(path_table("../weft/crates/weft-platform-traits")),
-    );
-    insert_dep(
-        &mut deps,
-        "clap",
-        toml::Value::Table(version_with_features("4", &["derive", "env"])),
-    );
-    insert_dep(
-        &mut deps,
-        "tracing-subscriber",
-        toml::Value::Table(version_with_features("0.3", &["env-filter"])),
-    );
-    insert_dep(
-        &mut deps,
-        "uuid",
-        toml::Value::Table(version_with_features("1", &["v4", "serde"])),
-    );
-    // Decodes the hex-encoded live-connection routing-token secret from env.
-    insert_dep(&mut deps, "hex", toml::Value::String("0.4".into()));
-    // One path dep per referenced package crate.
+    let mut deps = fixed_worker_deps();
+    // One path dep per referenced package crate. These are the ONLY
+    // per-project deps; everything else (`fixed_worker_deps`) is identical for
+    // every worker, which is what lets the builder base precompile them once
+    // (via the warm-up crate) and every worker reuse the rlibs.
     for pkg in packages {
         insert_dep(
             &mut deps,
@@ -506,6 +472,112 @@ fn base_runtime_deps() -> BTreeMap<String, toml::Value> {
     insert_dep(&mut deps, "anyhow", toml::Value::String("1".into()));
     insert_dep(&mut deps, "tracing", toml::Value::String("0.1".into()));
     deps
+}
+
+/// The COMPLETE project-INDEPENDENT dependency set every generated worker carries:
+/// the runtime baseline (`base_runtime_deps`) plus the engine path deps and the
+/// fixed crates.io deps. The ONLY thing a real worker adds on top is one path dep
+/// per referenced node package (`pkg_<node>`), and any crates THOSE nodes pull in
+/// live inside the `pkg_<node>` crate, not here. This is THE shared definition:
+/// `write_worker_cargo_toml` builds the real worker from it, and
+/// `emit_warmup_crate` builds the builder-base warm-up crate from the SAME set, so
+/// the base precompiles exactly the rlibs (with the exact feature unification) a
+/// real worker reuses. A test asserts the two stay in lockstep; if they drift, the
+/// warm-up stops matching and workers silently recompile the engine again.
+pub fn fixed_worker_deps() -> BTreeMap<String, toml::Value> {
+    let mut deps = base_runtime_deps();
+    insert_dep(
+        &mut deps,
+        "weft-engine",
+        toml::Value::Table(path_table("../weft/crates/weft-engine")),
+    );
+    insert_dep(
+        &mut deps,
+        "weft-core",
+        toml::Value::Table(path_table("../weft/crates/weft-core")),
+    );
+    insert_dep(
+        &mut deps,
+        "weft-broker-client",
+        toml::Value::Table(path_table("../weft/crates/weft-broker-client")),
+    );
+    insert_dep(
+        &mut deps,
+        "weft-platform-traits",
+        toml::Value::Table(path_table("../weft/crates/weft-platform-traits")),
+    );
+    insert_dep(
+        &mut deps,
+        "clap",
+        toml::Value::Table(version_with_features("4", &["derive", "env"])),
+    );
+    insert_dep(
+        &mut deps,
+        "tracing-subscriber",
+        toml::Value::Table(version_with_features("0.3", &["env-filter"])),
+    );
+    insert_dep(
+        &mut deps,
+        "uuid",
+        toml::Value::Table(version_with_features("1", &["v4", "serde"])),
+    );
+    // Decodes the hex-encoded live-connection routing-token secret from env.
+    insert_dep(&mut deps, "hex", toml::Value::String("0.4".into()));
+    deps
+}
+
+/// Emit the builder-base WARM-UP crate at `crate_root`: a minimal binary crate
+/// whose dependencies are EXACTLY `fixed_worker_deps()` (no per-project
+/// `pkg_<node>`), plus a `main.rs` that references the engine so cargo actually
+/// links it. The builder base compiles this once into the shared `/weft/target`,
+/// pre-cooking every engine + dependency rlib with the SAME crate identity and
+/// feature unification a real worker triggers. A real worker (same fixed deps,
+/// same seeded lock, same target dir) then finds those rlibs fingerprint-fresh and
+/// compiles only its `pkg_<node>` crates + the thin top crate.
+///
+/// The warm-up's `main.rs` only needs to force the engine + its deps to LINK
+/// (so they are compiled), not to do anything: a bare `use` of the engine root
+/// plus an empty `main` is enough for cargo to build the full dependency tree.
+pub fn emit_warmup_crate(crate_root: &Path, weft_root: &Path) -> CompileResult<()> {
+    let src = crate_root.join("src");
+    std::fs::create_dir_all(&src).map_err(CompileError::Io)?;
+
+    // Pin the SAME toolchain a real worker crate uses (codegen writes this into
+    // every worker via `write_rust_toolchain`). Without it, `cargo` in the
+    // warm-up's own directory has no `rust-toolchain.toml` and rustup refuses to
+    // pick a version, and a mismatched toolchain would re-fingerprint every rlib.
+    write_rust_toolchain(crate_root, weft_root)?;
+
+    let mut deps_fragment = String::new();
+    for (name, value) in fixed_worker_deps() {
+        deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
+    }
+    let cargo_toml = format!(
+        r#"# Emitted by weft codegen for the builder base. Do NOT edit by hand.
+# Its dependencies are exactly the project-independent set every worker shares
+# (`codegen::fixed_worker_deps`), so building it precompiles the rlibs a real
+# worker reuses. Per-project node packages are NOT here.
+
+[package]
+name = "weft-worker-warmup"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "weft-worker-warmup"
+path = "src/main.rs"
+
+[dependencies]
+{deps}"#,
+        deps = deps_fragment,
+    );
+    std::fs::write(crate_root.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
+
+    // Reference the engine crate so cargo links it (and thus its whole
+    // dependency tree). An empty `main` is all the warm-up needs to run.
+    let main_rs = "#[allow(unused_imports)]\nuse weft_engine as _;\n\nfn main() {}\n";
+    std::fs::write(src.join("main.rs"), main_rs).map_err(CompileError::Io)?;
+    Ok(())
 }
 
 /// Insert a package- or node-declared cargo dep, MERGING with any
@@ -803,8 +875,7 @@ async fn main() -> anyhow::Result<()> {{
     // would make `Arc<Arc<_>>`, which doesn't implement the trait).
     // `SystemClock` is bare, so it still needs the `Arc::new`.
     let storage = weft_engine::WorkerStorage::new(
-        tasks.clone(),
-        args.tenant_id.clone(),
+        args.broker_url.clone(),
         std::path::PathBuf::from(&args.broker_token_path),
     );
     let clients = EngineClients {{
@@ -873,6 +944,70 @@ impl NodeCatalog for CatalogRef {{
 #[cfg(test)]
 mod tests {
     use super::collect_node_types;
+    use super::{emit_warmup_crate, fixed_worker_deps};
+
+    /// The warm-up crate's dependencies MUST be exactly the project-independent
+    /// `fixed_worker_deps`: if they drift, the builder base precompiles a
+    /// different rlib set than real workers need and every worker silently
+    /// recompiles the engine again (the regression this whole mechanism fixes).
+    /// Also asserts the warm-up carries NO per-project `pkg_<node>` dep, so a
+    /// node's crates can never get baked into the shared base.
+    #[test]
+    fn warmup_crate_deps_match_fixed_worker_deps_exactly() {
+        let dir = std::env::temp_dir().join(format!("weft-warmup-test-{}", uuid::Uuid::new_v4()));
+        let weft_root = crate::build::resolve_weft_root().expect("resolve weft root");
+        emit_warmup_crate(&dir, &weft_root).expect("emit warm-up crate");
+        let cargo_toml =
+            std::fs::read_to_string(dir.join("Cargo.toml")).expect("read warm-up Cargo.toml");
+        let parsed: toml::Value = toml::from_str(&cargo_toml).expect("parse warm-up Cargo.toml");
+        let dep_table = parsed
+            .get("dependencies")
+            .and_then(|d| d.as_table())
+            .expect("warm-up has [dependencies]");
+
+        let expected = fixed_worker_deps();
+        // Same dependency NAMES, exactly (no missing, no extra like a pkg_*).
+        let got_names: std::collections::BTreeSet<&str> =
+            dep_table.keys().map(String::as_str).collect();
+        let want_names: std::collections::BTreeSet<&str> =
+            expected.keys().map(String::as_str).collect();
+        assert_eq!(
+            got_names, want_names,
+            "warm-up crate deps drifted from fixed_worker_deps"
+        );
+        assert!(
+            !got_names.iter().any(|n| n.starts_with("pkg_")),
+            "warm-up must carry NO per-project node package dep"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A real worker's dependency set is `fixed_worker_deps` PLUS one path dep per
+    /// referenced node package, and nothing else: nodes ADD on top of the shared
+    /// base, they never alter it. (Drives `write_worker_cargo_toml` indirectly via
+    /// the shared `fixed_worker_deps`; here we assert the base set is what a
+    /// node-LESS worker carries.)
+    #[test]
+    fn fixed_worker_deps_is_the_node_independent_baseline() {
+        let deps = fixed_worker_deps();
+        // The engine + the always-present runtime crates are present...
+        for required in [
+            "weft-engine",
+            "weft-core",
+            "weft-broker-client",
+            "weft-platform-traits",
+            "tokio",
+            "clap",
+        ] {
+            assert!(deps.contains_key(required), "fixed deps missing {required}");
+        }
+        // ...and nothing project-specific is.
+        assert!(
+            !deps.keys().any(|k| k.starts_with("pkg_")),
+            "fixed_worker_deps must be project-independent (no pkg_<node>)"
+        );
+    }
+
     use weft_core::project::{NodeDefinition, ProjectDefinition, Position};
     use weft_core::NodeFeatures;
 

@@ -1,4 +1,3 @@
-# Project: e2e_skip
 # Null-propagation: a Gate whose `pass` is false closes its `value` output, so
 # the downstream Debug never runs (it is SKIPPED, not failed). ExecPython emits
 # both the literal value and the boolean gate signal inline.

@@ -11,12 +11,20 @@ path = "src/main.rs"
 
 [dependencies]
 weft-core = { workspace = true }
+# When the `build` feature is enabled and a registry is configured, the
+# dispatcher acts as the COMPILE SITE for image builds: the `/projects/create`
+# door compiles the uploaded source itself (computes the definition + the three
+# hashes + stages the docker build context), then submits the image build. It
+# then needs the full `build` feature (codegen + worker_image + the hash path),
+# and the dispatcher image bakes the weft workspace at `WEFT_REPO_ROOT` so the
+# binary-hash + context-staging reads resolve. DIRECT path dep, NOT
+# `workspace = true`, to keep feature control explicit.
+weft-compiler = { path = "../weft-compiler", features = ["build"] }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
-weft-storage = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -42,13 +50,22 @@ cron = "0.12"
 sha2 = { workspace = true }
 hex = "0.4"
 url = { workspace = true }
+# Materialize uploaded source rows to a temp dir for the compile + stage
+# (the dispatcher is a compile site for image builds).
+tempfile = { workspace = true }
 
 [features]
 test-helpers = []
+# Layer-3 tests that hit a REAL Postgres via `#[sqlx::test]` + $DATABASE_URL
+# (the StoragePool placement/reservation/reap logic lives in SQL). OFF by
+# default so a plain `cargo test --workspace` needs no Postgres; CI runs
+# `cargo test -p weft-dispatcher --features db-tests` with a Postgres up.
+db-tests = []
 
 [dev-dependencies]
-tempfile = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-dispatcher = { path = ".", features = ["test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
-weft-storage = { workspace = true, features = ["test-helpers"] }
+# `#[sqlx::test]` (macros + migrate) provisions a fresh isolated DB per test.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono", "macros", "migrate"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -14,9 +14,6 @@ valid. If it compiles, the wiring is sound.
 ## A complete tiny program
 
 ```weft
-# Project: hello
-# Description: emit a literal and show it
-
 greeting = Text { value: "hello world" }
 out = Debug
 
@@ -29,10 +26,9 @@ string on its `value` output; `Debug` receives it on its `data` input.
 ## Comments and headers
 
 - `# ...` is a line comment.
-- `# Project: <name>` and `# Description: <text>` at the top set project
-  metadata. (The project id lives in `weft.toml`, not the source.)
-- A comment on the first line(s) inside a group body becomes that group's
-  description.
+- A `# Description: <text>` comment on the first line(s) inside a group body
+  becomes that group's description. (The project name and id live in
+  `weft.toml`, not the source.)
 
 ## Nodes
 
@@ -163,8 +159,9 @@ the top level.
 
 ## Loops
 
-`Loop` is a built-in like `Group`, but its body runs multiple times. Full detail
-is in [`loops.md`](./loops.md); the shape:
+`Loop` is a built-in like `Group`, but its body runs multiple times: once per
+element of a list, or until the body says "stop", with parallelism control and
+accumulator support.
 
 ```weft
 doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
@@ -180,10 +177,88 @@ doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
 doubler.values = nums.values
 ```
 
-The four port roles (iter input `over`, carry `carry`, gather output, broadcast
-input), the drive modes, and the "a loop is a launcher, not a lifecycle owner"
-semantic are all in `loops.md`. A gather output must be typed `List[T | Null]`
-explicitly (a slot is null when that iteration produced nothing).
+### The four port roles
+
+Every port on a loop is in exactly one of four roles, derived from the config:
+
+1. **Iter input** (named in `over`). Outside type is `List[T]`, inside type is
+   `T`; the body sees one element per iteration via `self.<port>`. Multiple
+   ports in `over` zip together in lockstep.
+2. **Carry port** (named in `carry`). Declared on the OUTPUT side of the
+   signature; the compiler auto-creates a matching input port (same name, same
+   type) for the initial value. Inside the body, reading `self.<port>` gives
+   the previous iteration's value (or the initial value); writing it sets the
+   next iteration's value. At termination the final value is emitted outward.
+3. **Gather output** (in the output signature, not in `carry`). Outside type
+   MUST be `List[T | Null]` explicitly (`gather-output-must-be-nullable`);
+   inside, the write port is `T?`. One value per iteration; an iteration that
+   fails to write leaves `null` at its slot. Parallel ordering is preserved by
+   iteration index.
+4. **Broadcast input** (in the input signature, not in `over`). Same type
+   inside and out; the value is available unchanged to every iteration.
+
+Two implicit body ports exist on every loop, never declared: `self.index:
+Number` (read-only, the 0-indexed iteration) and `self.done: Boolean`
+(write-only; the body writes `true` to stop launching new iterations,
+sequential mode only). `index` and `done` are reserved port names
+(`reserved-port-name`).
+
+### Drive modes and the config knobs
+
+`parallel` defaults to `false` (sequential: carry and `self.done` work, no
+ordering surprises). `over` / `carry` default to empty lists; no `max_iters`
+means no cap. A non-boolean `parallel` is a compile error
+(`loop-parallel-not-boolean`); unknown config keys are rejected
+(`loop-unknown-config-field`). A loop terminates on whichever comes first: the
+`over` lists are exhausted, the body wrote `self.done = true` (sequential
+only), or `max_iters` is reached.
+
+Invalid combinations, all compile errors: `parallel: true` with a non-empty
+`carry` (carry implies sequential), `parallel: true` with an empty `over` (the
+iteration count must be known upfront), and `parallel: true` with any
+`self.done` write (`parallel-with-done`). Empty `over` AND empty `carry` is
+allowed: the loop runs purely until `self.done` / `max_iters` (the pure
+side-effect shape).
+
+The five base shapes:
+
+| Shape | `parallel` | `over` | `carry` | Terminated by |
+|--|--|--|--|--|
+| Parallel map | `true` | `[...]` | `[]` | Over exhausted |
+| Sequential map | `false` | `[...]` | `[]` | Over exhausted |
+| Fold (sequential reduce) | `false` | `[...]` | `[acc]` | Over exhausted |
+| While | `false` | `[]` | `[acc?]` | `self.done = true` |
+| Side-effect | `false` | `[]` | `[]` | `self.done = true` |
+
+For a count-based loop ("run N times"), feed a `Range` catalog node into a map
+loop's `over` input.
+
+### A loop is a wrapper, not a lifecycle owner
+
+In mainstream languages a `for` loop OWNS its body's lifetime. In Weft it does
+not. The loop is only (1) a launcher that decides how/when/how-many iterations
+start, and (2) a single outward emitter that, at termination, assembles gathers
+and carries and emits them at the parent frame stack. The body is a SCOPE
+addressed by frame stacks: body work launched at an iteration keeps running
+until it naturally drains, even PAST the loop's outward emit. Only the branch
+wired to the loop's outputs gates the outward emit; other body branches keep
+going (a body node can launch a sub-agent or open a bus that stays alive for
+hours after the loop emitted). Body work is bounded in SPACE (edges cannot
+cross the loop boundary) but unbounded in TIME; the execution as a whole
+terminates only when all body work has drained. The canonical pattern: a
+parallel loop launches N agents, gathers their bus markers as
+`List[Bus | Null]`, and an outside coordinator wires to that list to talk to
+the still-running agents.
+
+### Failure and nesting
+
+Loops are not a kill-switch. A failing body branch cascades only through that
+branch: a gather port that received a closure yields `null` at that index (the
+`List[T | Null]` type forces downstream handling), a closed carry write keeps
+the previous carry value, a closed `self.done` reads as `false`. The outward
+emit is gated by "every launched iteration fired the loop boundary", not by
+"every body has fully drained." Nested loops add one frame per level to the
+iteration frame stack; outer-loop termination does not cascade to inner loops.
 
 ## Triggers
 

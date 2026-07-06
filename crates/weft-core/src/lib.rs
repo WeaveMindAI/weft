@@ -1,7 +1,17 @@
+// Runtime modules: the execution context, buses, storage streaming, caller
+// connections, cancellation, timer signals, and signed routing tokens. Pull
+// tokio/futures/bytes (no wasm32 support), so they are gated behind the
+// `runtime` feature (default on). The browser WASM parse build turns `runtime`
+// off and compiles only the pure type layer below.
+#[cfg(feature = "runtime")]
 pub mod bus;
+#[cfg(feature = "runtime")]
 pub mod caller;
+#[cfg(feature = "runtime")]
 pub mod caller_token;
+#[cfg(feature = "runtime")]
 pub mod cancellation;
+#[cfg(feature = "runtime")]
 pub mod context;
 pub mod error;
 pub mod exec;
@@ -12,8 +22,11 @@ pub mod primitive;
 pub mod project;
 pub mod pulse;
 pub mod running_policy;
+#[cfg(feature = "runtime")]
 pub mod signal;
+#[cfg(feature = "runtime")]
 pub mod signed_token;
+#[cfg(feature = "runtime")]
 pub mod storage;
 pub mod tag;
 pub mod wait;
@@ -89,12 +102,15 @@ pub mod hex_array8 {
 // reach the same crate version without adding a direct dep.
 pub use inventory;
 
+#[cfg(feature = "runtime")]
 pub use bus::{
     BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusMode, BusOptions,
     BusLiveness, BusParticipant, BusRegistry, CursorError, RegisterError, SendError, WaitError,
     WaitId,
 };
+#[cfg(feature = "runtime")]
 pub use cancellation::CancellationFlag;
+#[cfg(feature = "runtime")]
 pub use context::{
     ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, InputBag, Phase,
     StorageHandle,
@@ -110,10 +126,14 @@ pub use infra::{
 };
 pub use frames::{LoopFrames, LoopIteration};
 pub use node::{
-    Condition, FieldDef, FormFieldPort, FormFieldSpec, MetadataCatalog, Node, NodeCatalog,
+    Condition, FieldDef, FormFieldPort, FormFieldSpec, MetadataCatalog,
     NodeFeatures, NodeMetadata, NodeOutput, PortDef, RuleDiagnostic, RuleSeverity,
     ValidationLevel, ValidationRule,
 };
+// The runtime node interface (`Node` + the runtime `NodeCatalog`) is gated:
+// the parse/validate path uses only `MetadataCatalog` above.
+#[cfg(feature = "runtime")]
+pub use node::{Node, NodeCatalog};
 pub use primitive::{
     AwaitedEntry, AwaitedEntryKind, CostReport, ExecutionSnapshot, KickedNode, SignalAuth,
     SignalRouting, SignalSpec, SignalSurface, SuspensionInfo,
@@ -124,6 +144,7 @@ pub use project::{
 };
 pub use pulse::Pulse;
 pub use running_policy::RunningPolicy;
+#[cfg(feature = "runtime")]
 pub use storage::{ByteRange, ByteStream, KeepTtl, StorageScope, StoredFileMeta, StoredFile};
 pub use weft_type::{WeftPrimitive, WeftType};
 

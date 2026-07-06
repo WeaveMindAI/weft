@@ -28,13 +28,12 @@ pub struct AuthConfig {
 }
 
 // Service-account names + the dispatcher namespace, defined ONCE.
-// `from_sa_name` and `storage_authorize` both branch on these; without
+// `from_sa_name` and `resolve_storage_caller` both branch on these; without
 // shared consts a rename would update one site and silently break the
 // other (e.g. workers losing their storage identity).
 pub(crate) const WORKER_SA: &str = "weft-worker-sa";
 pub(crate) const LISTENER_SA: &str = "weft-listener-sa";
 pub(crate) const INFRA_SUPERVISOR_SA: &str = "weft-infra-supervisor-sa";
-pub(crate) const STORAGE_SA: &str = "weft-storage-sa";
 pub(crate) const DISPATCHER_SA: &str = "weft-dispatcher";
 pub(crate) const DISPATCHER_NS: &str = "weft-system";
 
@@ -44,7 +43,7 @@ pub(crate) const DISPATCHER_NS: &str = "weft-system";
 /// its own pod identity (`worker_pod` row -> project -> tenant), not
 /// from the namespace. See `extract_identity`.
 // SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-dispatcher/src/project_namespace.rs SHARED_WORKER_NAMESPACE, crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
-pub(crate) const SHARED_WORKER_NAMESPACE: &str = "wm-shared-workers";
+pub(crate) const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -78,6 +77,8 @@ impl Role {
     fn is_control_plane(self) -> bool {
         match self {
             Self::Listener | Self::InfraSupervisor => true,
+            // The worker runs untrusted user code, so it is tenant-scoped: the
+            // broker never lets it act cross-tenant.
             Self::Worker => false,
         }
     }
@@ -125,18 +126,17 @@ impl CallerScope {
     }
 }
 
-// NOTE: the per-tenant storage box (`weft-storage-sa`) and the
-// dispatcher (`weft-dispatcher` in `weft-system`) are deliberately
-// NOT in the role table: they never call the broker's tenant data
-// endpoints. They only appear on `/storage/authorize` (see
-// `handlers::storage_authorize`), which resolves them from the raw
+// NOTE: the dispatcher (`weft-dispatcher` in `weft-system`) is deliberately
+// NOT in the role table: it never calls the broker's tenant data endpoints. It
+// appears only on the runtime-file plane's caller resolution (see
+// `resolve_storage_caller`), which maps it to the control plane from the raw
 // reviewed token.
 
 /// The cached output of a TokenReview: who the token cryptographically
 /// is, with no role/tenant interpretation attached. Interpretation
 /// (role table, tenant lookup) happens per endpoint ON TOP of this,
-/// so endpoints with different caller universes (the storage
-/// authorize path admits the dispatcher and storage boxes) share one
+/// so endpoints with different caller universes (the runtime-storage
+/// caller resolution admits the dispatcher as the control plane) share one
 /// review + one cache.
 #[derive(Debug, Clone)]
 pub struct ReviewedToken {
@@ -271,6 +271,125 @@ pub async fn reviewed_token(
     };
     state.identity_cache.put(token, reviewed.clone());
     Ok(reviewed)
+}
+
+/// Resolve a runtime-storage caller from its presented token, into the
+/// pure key-wall identity (`CallerAuth`). This is the identity authority
+/// behind the runtime-file plane's prefix wall, run IN-PROCESS by the
+/// broker's own runtime-storage handlers (the broker is both the authority
+/// and the data path, so there is no relay):
+///   - the dispatcher (`weft-dispatcher` in `weft-system`) -> ControlPlane
+///     (the CLI admin verbs: list/usage/delete/presign/wipe for a tenant).
+///   - a worker (`weft-worker-sa`) -> Worker { tenant, project, color },
+///     resolving tenant + project from the token's namespace (or, in the
+///     shared worker namespace, from the worker's pod identity), and
+///     verifying any claimed `color` the same way journal writes do (the
+///     color's owning pod must be the caller, and the color must belong to
+///     the caller's project).
+/// A `color` claim that is absent yields `color: None` (execution-scoped
+/// keys then unreachable, which the wall enforces). Any other SA has no
+/// runtime-storage identity (403).
+pub async fn resolve_storage_caller(
+    state: &Arc<BrokerState>,
+    headers: &HeaderMap,
+    color: Option<&str>,
+) -> Result<weft_core::storage::key::CallerAuth, (StatusCode, String)> {
+    use weft_core::storage::key::CallerAuth;
+    let reviewed = reviewed_token(state, headers).await?;
+    match reviewed.sa_name.as_str() {
+        DISPATCHER_SA if reviewed.namespace == DISPATCHER_NS => Ok(CallerAuth::ControlPlane),
+        WORKER_SA => {
+            // Resolve the worker's project AND tenant. Two worker-hosting
+            // shapes, told apart by namespace (mirrors `storage_authorize`'s
+            // old logic, which this replaces):
+            //  - PER-PROJECT namespace: the namespace IS the project, so the
+            //    one `project` row whose `project_namespace` matches gives
+            //    both ids from a single source of truth. The registration
+            //    gate is preserved by write ordering (the dispatcher writes
+            //    the namespace->tenant registry row before stamping
+            //    `project_namespace`).
+            //  - SHARED namespace: maps to no project, so resolve from the
+            //    worker's OWN unforgeable pod identity (kubelet-stamped
+            //    pod_name -> the dispatcher-written `worker_pod` row ->
+            //    project -> tenant).
+            let row: Option<(String, String)> =
+                if reviewed.namespace == SHARED_WORKER_NAMESPACE {
+                    let pod_name = reviewed.pod_name.as_deref().ok_or((
+                        StatusCode::FORBIDDEN,
+                        "shared-namespace worker token carries no pod_name".to_string(),
+                    ))?;
+                    sqlx::query_as(
+                        "SELECT p.id::text, p.tenant_id \
+                         FROM worker_pod wp JOIN project p ON p.id::text = wp.project_id \
+                         WHERE wp.pod_name = $1",
+                    )
+                    .bind(pod_name)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+                } else {
+                    sqlx::query_as(
+                        "SELECT id::text, tenant_id FROM project WHERE project_namespace = $1",
+                    )
+                    .bind(&reviewed.namespace)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
+                };
+            let (project_id, tenant_id) = row.ok_or((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "could not resolve a project for worker in namespace '{}' (pod {:?}); \
+                     not a registered project namespace and no matching worker_pod row",
+                    reviewed.namespace, reviewed.pod_name
+                ),
+            ))?;
+            let color = match color {
+                None => None,
+                Some(color) => {
+                    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                        "SELECT tenant_id, project_id, owner_pod_name \
+                         FROM execution_color WHERE color = $1",
+                    )
+                    .bind(color)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+                    let Some((color_tenant, color_project, owner_pod)) = row else {
+                        return Err((StatusCode::FORBIDDEN, "unknown execution color".into()));
+                    };
+                    if color_tenant != tenant_id || color_project != project_id {
+                        tracing::warn!(
+                            target: "weft_broker::scope",
+                            caller_ns = %reviewed.namespace,
+                            color = %color,
+                            "runtime storage rejected cross-project color claim"
+                        );
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            "color belongs to a different project".into(),
+                        ));
+                    }
+                    // Same gate as journal writes: only the pod that claimed
+                    // the execution drives its color.
+                    if reviewed.pod_name.is_none()
+                        || owner_pod.as_deref() != reviewed.pod_name.as_deref()
+                    {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            "color is not owned by the calling pod".into(),
+                        ));
+                    }
+                    Some(color.to_string())
+                }
+            };
+            Ok(CallerAuth::Worker { tenant: tenant_id, project_id, color })
+        }
+        other => Err((
+            StatusCode::FORBIDDEN,
+            format!("service account '{other}' has no runtime-storage identity"),
+        )),
+    }
 }
 
 /// Resolve the namespace's owning tenant. Authoritative lookup: the

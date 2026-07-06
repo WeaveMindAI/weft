@@ -1,4 +1,3 @@
-# Project: e2e_reach_out_feed
 # Reach-out trigger: the system DIALS OUT to an SSE feed and fires per event.
 # A project-local custom trigger (TestSseTrigger) subscribes to the fake SSE
 # server the rig stands up; each pushed event fires a fresh execution carrying

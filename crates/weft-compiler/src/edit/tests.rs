@@ -154,19 +154,19 @@ fn apply_text_edit_rejects_bad_offsets_loudly() {
 #[test]
 fn inverse_edit_restores_original_for_each_op() {
     assert_reversible(
-        "# Project: T\n\nt = Text {\n  value: \"old\"\n}\n",
+        "t = Text {\n  value: \"old\"\n}\n",
         vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"new\"".into() }],
     );
     assert_reversible(
-        "# Project: T\n\nt = Text {\n  value: \"x\"\n}\n",
+        "t = Text {\n  value: \"x\"\n}\n",
         vec![EditOp::AddNode { id: "d".into(), node_type: "Debug".into(), parent_group: None }],
     );
     assert_reversible(
-        "# Project: T\n\na = Text {\n  value: \"x\"\n}\nb = Debug\nb.data = a.value\n",
+        "a = Text {\n  value: \"x\"\n}\nb = Debug\nb.data = a.value\n",
         vec![EditOp::RemoveNode { node: "a".into() }],
     );
     assert_reversible(
-        "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n",
+        "grp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n",
         vec![EditOp::RemoveGroup { group: "grp".into() }],
     );
     // Every remaining op also has a byte-exact inverse (the undo contract is for
@@ -224,7 +224,7 @@ fn inverse_edit_preserves_file_marker() {
     // resolved content (a semantic inverse from the resolved project couldn't).
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("sys.txt"), "you are helpful").unwrap();
-    let src = "# Project: T\n\nt = Text {\n  value: @file(\"sys.txt\")\n}\n";
+    let src = "t = Text {\n  value: @file(\"sys.txt\")\n}\n";
     let (new_source, inverse) = apply_edits(src, Some(dir.path()), "Untitled", &[
         EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"replaced\"".into() },
     ]).expect("edits apply");
@@ -236,7 +236,7 @@ fn inverse_edit_preserves_file_marker() {
 
 #[test]
 fn set_config_inline_field_replaces_in_place() {
-    let src = "# Project: T\n\nt = Text {\n  value: \"old\"\n}\n";
+    let src = "t = Text {\n  value: \"old\"\n}\n";
     let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"new\"".into() }]);
     assert!(out.contains("value: \"new\""), "{out}");
     assert!(!out.contains("\"old\""), "{out}");
@@ -246,14 +246,14 @@ fn set_config_inline_field_replaces_in_place() {
 fn set_config_connection_field_keeps_prefix() {
     // `t.style = "a"` is a connection-line field; replacing it must keep the
     // `t.style = ` prefix, not turn into `style: `.
-    let src = "# Project: T\n\nt = Text {\n  value: \"x\"\n}\nt.style = \"a\"\n";
+    let src = "t = Text {\n  value: \"x\"\n}\nt.style = \"a\"\n";
     let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into() }]);
     assert!(out.contains("t.style = \"b\""), "{out}");
 }
 
 #[test]
 fn set_config_inserts_when_absent() {
-    let src = "# Project: T\n\nt = Text {\n  value: \"x\"\n}\n";
+    let src = "t = Text {\n  value: \"x\"\n}\n";
     let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"bold\"".into() }]);
     assert!(out.contains("style: \"bold\""), "{out}");
     parse_ok(&out);
@@ -261,7 +261,7 @@ fn set_config_inserts_when_absent() {
 
 #[test]
 fn set_config_expands_one_liner() {
-    let src = "# Project: T\n\nt = Text { value: \"x\" }\n";
+    let src = "t = Text { value: \"x\" }\n";
     let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"bold\"".into() }]);
     assert!(out.contains("value: \"x\""), "{out}");
     assert!(out.contains("style: \"bold\""), "{out}");
@@ -270,7 +270,7 @@ fn set_config_expands_one_liner() {
 
 #[test]
 fn remove_config_drops_the_line() {
-    let src = "# Project: T\n\nt = Text {\n  value: \"x\"\n  style: \"bold\"\n}\n";
+    let src = "t = Text {\n  value: \"x\"\n  style: \"bold\"\n}\n";
     let out = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into() }]);
     assert!(!out.contains("style"), "{out}");
     assert!(out.contains("value: \"x\""), "{out}");
@@ -278,7 +278,7 @@ fn remove_config_drops_the_line() {
 
 #[test]
 fn set_label_and_clear() {
-    let src = "# Project: T\n\nt = Text {\n  value: \"x\"\n}\n";
+    let src = "t = Text {\n  value: \"x\"\n}\n";
     let withlabel = apply(src, vec![EditOp::SetLabel { node: "t".into(), label: Some("Hi".into()) }]);
     assert!(withlabel.contains("_label: \"Hi\""), "{withlabel}");
     let cleared = apply(&withlabel, vec![EditOp::SetLabel { node: "t".into(), label: None }]);
@@ -287,7 +287,7 @@ fn set_label_and_clear() {
 
 #[test]
 fn add_node_top_level() {
-    let src = "# Project: T\n\nt = Text {\n  value: \"x\"\n}\n";
+    let src = "t = Text {\n  value: \"x\"\n}\n";
     let out = apply(src, vec![EditOp::AddNode { id: "d".into(), node_type: "Debug".into(), parent_group: None }]);
     assert!(out.contains("d = Debug {}"), "{out}");
     parse_ok(&out);
@@ -295,7 +295,7 @@ fn add_node_top_level() {
 
 #[test]
 fn remove_node_and_its_edges() {
-    let src = "# Project: T\n\na = Text {\n  value: \"x\"\n}\nb = Debug\nb.data = a.value\n";
+    let src = "a = Text {\n  value: \"x\"\n}\nb = Debug\nb.data = a.value\n";
     let out = apply(src, vec![EditOp::RemoveNode { node: "a".into() }]);
     assert!(!out.contains("a = Text"), "{out}");
     assert!(!out.contains("b.data = a.value"), "connection to removed node dropped: {out}");
@@ -306,7 +306,7 @@ fn remove_node_and_its_edges() {
 fn remove_scoped_node_keeps_same_local_name_edge_in_another_scope() {
     // A top-level `a` and a `grp.a` share the local name `a`. Removing grp.a
     // must NOT delete the top-level edge `b.data = a.value`.
-    let src = "# Project: T\n\na = Text { value: \"x\" }\nb = Debug\nb.data = a.value\ngrp = Group() -> () {\n  a = Text { value: \"y\" }\n}\n";
+    let src = "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value\ngrp = Group() -> () {\n  a = Text { value: \"y\" }\n}\n";
     let out = apply(src, vec![EditOp::RemoveNode { node: "grp.a".into() }]);
     assert!(out.contains("b.data = a.value"), "top-level edge survives: {out}");
     assert!(out.contains("a = Text { value: \"x\" }"), "top-level a survives: {out}");
@@ -317,7 +317,7 @@ fn remove_scoped_node_keeps_same_local_name_edge_in_another_scope() {
 
 #[test]
 fn add_and_remove_edge() {
-    let src = "# Project: T\n\na = Text {\n  value: \"x\"\n}\nb = Debug\n";
+    let src = "a = Text {\n  value: \"x\"\n}\nb = Debug\n";
     let added = apply(src, vec![EditOp::AddEdge {
         source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
     }]);
@@ -332,7 +332,7 @@ fn add_and_remove_edge() {
 fn remove_edge_is_scope_disambiguated() {
     // Two groups each have `t = Text` wired into a `d = Debug` with the same
     // local quad. Removing the edge in `g1` must leave `g2`'s identical edge.
-    let src = "# Project: T\n\ng1 = Group() -> () {\n  t = Text { value: \"x\" }\n  d = Debug\n  d.data = t.value\n}\ng2 = Group() -> () {\n  t = Text { value: \"y\" }\n  d = Debug\n  d.data = t.value\n}\n";
+    let src = "g1 = Group() -> () {\n  t = Text { value: \"x\" }\n  d = Debug\n  d.data = t.value\n}\ng2 = Group() -> () {\n  t = Text { value: \"y\" }\n  d = Debug\n  d.data = t.value\n}\n";
     let out = apply(src, vec![EditOp::RemoveEdge {
         source: "t".into(), source_port: "value".into(), target: "d".into(), target_port: "data".into(), scope_group: Some("g1".into()),
     }]);
@@ -346,7 +346,7 @@ fn remove_edge_is_scope_disambiguated() {
 fn remove_edge_into_group_port() {
     // An edge into a group's port is written `grp.inp = a.value`; removeEdge
     // matches that connection by its as-written endpoints and drops it.
-    let src = "# Project: T\n\na = Text { value: \"x\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
+    let src = "a = Text { value: \"x\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
     let out = apply(src, vec![EditOp::RemoveEdge {
         source: "a".into(), source_port: "value".into(), target: "grp".into(), target_port: "inp".into(), scope_group: None,
     }]);
@@ -359,7 +359,7 @@ fn add_edge_into_group_input_replaces_driver_no_double() {
     // Reconnecting a group input must replace the existing driver (single-
     // driver), not append a second line. The existing `grp.inp = a.value` line
     // is matched by its as-written endpoints and rewritten in place.
-    let src = "# Project: T\n\na = Text { value: \"x\" }\nc = Text { value: \"y\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
+    let src = "a = Text { value: \"x\" }\nc = Text { value: \"y\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
     let out = apply(src, vec![EditOp::AddEdge {
         source: "c".into(), source_port: "value".into(), target: "grp".into(), target_port: "inp".into(), scope_group: None,
     }]);
@@ -371,7 +371,7 @@ fn add_edge_into_group_input_replaces_driver_no_double() {
 
 #[test]
 fn add_edge_replaces_existing_driver() {
-    let src = "# Project: T\n\na = Text {\n  value: \"x\"\n}\nc = Text {\n  value: \"y\"\n}\nb = Debug\nb.data = a.value\n";
+    let src = "a = Text {\n  value: \"x\"\n}\nc = Text {\n  value: \"y\"\n}\nb = Debug\nb.data = a.value\n";
     let out = apply(src, vec![EditOp::AddEdge {
         source: "c".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
     }]);
@@ -381,7 +381,7 @@ fn add_edge_replaces_existing_driver() {
 
 #[test]
 fn rename_group_updates_header_and_refs() {
-    let src = "# Project: T\n\ngrp = Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\nd = Debug\nd.data = grp.outp\n";
+    let src = "grp = Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\nd = Debug\nd.data = grp.outp\n";
     let out = apply(src, vec![EditOp::RenameGroup { group: "grp".into(), new_label: "proc".into() }]);
     assert!(out.contains("proc = Group"), "header renamed: {out}");
     assert!(out.contains("d.data = proc.outp"), "ref renamed: {out}");
@@ -452,7 +452,7 @@ fn set_group_description_on_inline_body_does_not_swallow_close_brace() {
 #[test]
 fn batch_is_atomic_and_sequential() {
     // remove-then-add edge in one batch (the classic chain) lands correctly.
-    let src = "# Project: T\n\na = Text {\n  value: \"x\"\n}\nc = Text {\n  value: \"y\"\n}\nb = Debug\nb.data = a.value\n";
+    let src = "a = Text {\n  value: \"x\"\n}\nc = Text {\n  value: \"y\"\n}\nb = Debug\nb.data = a.value\n";
     let out = apply(src, vec![
         EditOp::RemoveEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
         EditOp::AddEdge { source: "c".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
@@ -462,7 +462,7 @@ fn batch_is_atomic_and_sequential() {
 
 #[test]
 fn add_node_into_group() {
-    let src = "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
+    let src = "grp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
     let out = apply(src, vec![EditOp::AddNode { id: "d".into(), node_type: "Debug".into(), parent_group: Some("grp".into()) }]);
     parse_ok(&out);
     assert!(out.contains("d = Debug {}"), "{out}");
@@ -472,7 +472,7 @@ fn add_node_into_group() {
 
 #[test]
 fn add_and_remove_group() {
-    let src = "# Project: T\n\nt = Text { value: \"x\" }\n";
+    let src = "t = Text { value: \"x\" }\n";
     let added = apply(src, vec![EditOp::AddGroup { label: "grp".into(), parent_group: None }]);
     assert!(added.contains("grp = Group() -> () {}"), "{added}");
     parse_ok(&added);
@@ -482,7 +482,7 @@ fn add_and_remove_group() {
 
 #[test]
 fn move_node_into_group_then_out() {
-    let src = "# Project: T\n\ngrp = Group() -> () {\n  x = Text { value: \"a\" }\n}\nt = Text { value: \"b\" }\n";
+    let src = "grp = Group() -> () {\n  x = Text { value: \"a\" }\n}\nt = Text { value: \"b\" }\n";
     let moved_in = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved_in);
     // t now lives inside grp (the grp.t scoped id exists after re-parse).
@@ -556,7 +556,7 @@ fn move_node_into_single_line_empty_group() {
     // Moving a node into it must split the body open and nest the node INSIDE,
     // not splice it above the header. Regression: the inline `{}` case put the
     // node before the group line, leaving an orphan and an empty group.
-    let src = "# Project: T\n\ngrp = Group() -> () {}\nt = Text { value: \"b\" }\n";
+    let src = "grp = Group() -> () {}\nt = Text { value: \"b\" }\n";
     let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved);
     let p = structure(&moved);
@@ -571,7 +571,7 @@ fn move_node_into_group_with_multiline_signature() {
     // A group with a multi-line port signature ending in an inline `{}` spans
     // several lines, but its body is still inline. The insertion must split the
     // `{}` open and nest the node inside, NOT splice it into the signature.
-    let src = "# Project: T\n\ngrp = Group(\n  a: String\n) -> () {}\nt = Text { value: \"b\" }\n";
+    let src = "grp = Group(\n  a: String\n) -> () {}\nt = Text { value: \"b\" }\n";
     let moved = apply(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
     parse_ok(&moved);
     let p = structure(&moved);
@@ -581,7 +581,7 @@ fn move_node_into_group_with_multiline_signature() {
 
 #[test]
 fn update_node_ports_rewrites_signature() {
-    let src = "# Project: T\n\ng = Group() -> () {\n  x = Text { value: \"a\" }\n}\n";
+    let src = "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "g".into(),
         inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }],
@@ -922,7 +922,7 @@ fn move_node_preserves_heredoc_content() {
 fn unparseable_edit_fails_loud_not_silent() {
     // Targeting a node that doesn't exist is a hard error, never a silent no-op
     // that loses the user's intent.
-    let src = "# Project: T\n\nt = Text { value: \"x\" }\n";
+    let src = "t = Text { value: \"x\" }\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::RemoveNode { node: "nope".into() }]).unwrap_err();
     assert!(matches!(err, EditError::NodeNotFound(_)), "{err:?}");
 }
@@ -1018,7 +1018,7 @@ fn edit_inside_anonymous_root_resolves_by_source_id() {
 #[test]
 fn remove_group_ungroups_children_up_one_scope() {
     // Deleting a group keeps its nodes: they move up to the parent scope.
-    let src = "# Project: T\n\ngrp = Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\n";
+    let src = "grp = Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\n";
     let out = apply(src, vec![EditOp::RemoveGroup { group: "grp".into() }]);
     assert!(!out.contains("grp = Group"), "group header gone: {out}");
     assert!(out.contains("t = Text"), "child survives (ungroup): {out}");
@@ -1098,8 +1098,9 @@ fn remove_top_level_group_with_preceding_sibling_keeps_separators() {
     // ungrouped children glued onto the PRECEDING decl (`d = Debugx = Text...`).
     // The fix re-emits the group's leading line break and indents every child, so
     // the children land on their own lines. `parse_ok` can't catch the glue (it's
-    // whitespace), so assert exact bytes. The earlier tests all used a `# Project:`
-    // prefix, which made the group the first child and masked the bug.
+    // whitespace), so assert exact bytes. The bug only shows when a decl PRECEDES
+    // the group (so the group is not the file's first element); this test puts a
+    // `d = Debug` in front to hit it.
     let after_decl = apply(
         "d = Debug\ng = Group() -> (out: String) {\n  x = Text { value: \"x\" }\n  self.out = x.value\n}\n",
         vec![EditOp::RemoveGroup { group: "g".into() }],
@@ -1121,21 +1122,21 @@ fn remove_top_level_group_with_preceding_sibling_keeps_separators() {
 fn ambiguous_bare_id_fails_loud() {
     // Two `t` in different groups: a bare `t` op must error, never guess + splice
     // the wrong node.
-    let src = "# Project: T\n\ng1 = Group() -> () {\n  t = Text { value: \"a\" }\n}\ng2 = Group() -> () {\n  t = Text { value: \"b\" }\n}\n";
+    let src = "g1 = Group() -> () {\n  t = Text { value: \"a\" }\n}\ng2 = Group() -> () {\n  t = Text { value: \"b\" }\n}\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"z\"".into() }]).unwrap_err();
     assert!(matches!(err, EditError::AmbiguousId(_)), "{err:?}");
 }
 
 #[test]
 fn add_duplicate_id_fails_loud() {
-    let src = "# Project: T\n\nt = Text { value: \"x\" }\n";
+    let src = "t = Text { value: \"x\" }\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::AddNode { id: "t".into(), node_type: "Debug".into(), parent_group: None }]).unwrap_err();
     assert!(matches!(err, EditError::DuplicateId(_)), "{err:?}");
 }
 
 #[test]
 fn add_edge_to_missing_endpoint_fails_loud() {
-    let src = "# Project: T\n\nb = Debug\n";
+    let src = "b = Debug\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
         source: "ghost".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
     }]).unwrap_err();
@@ -1144,7 +1145,7 @@ fn add_edge_to_missing_endpoint_fails_loud() {
 
 #[test]
 fn rename_group_to_empty_fails_loud() {
-    let src = "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
+    let src = "grp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::RenameGroup { group: "grp".into(), new_label: "".into() }]).unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
 }
@@ -1154,7 +1155,7 @@ fn set_label_on_group_fails_loud() {
     // A setLabel targeting a container would write a `_label` field into
     // the group body, which the lowering rejects as a compile error.
     // The edit must fail at edit time with a kind mismatch instead.
-    let src = "# Project: T\n\ngrp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
+    let src = "grp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::SetLabel { node: "grp".into(), label: Some("Hi".into()) }]).unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
 }

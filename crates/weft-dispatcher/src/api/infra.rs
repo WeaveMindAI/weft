@@ -28,6 +28,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::authenticator::{authorize_project, CallerTenant};
 use crate::infra_lifecycle_command::{self, InfraLifecycleVerb, RunningPolicy};
 use crate::infra_node::{self, InfraNodeRow};
 use crate::project_namespace;
@@ -37,6 +38,10 @@ use crate::state::DispatcherState;
 // Sync request (Start / Restart / Upgrade)
 // =================================================================
 
+// SYNC: SyncRequest body keys <-> crates/weft-cli/src/commands/infra.rs (the
+// hand-built sync body map). Every field here is `#[serde(default)]`, so a
+// renamed key would silently deserialize to its default instead of failing:
+// change both sides together.
 #[derive(Debug, Default, Deserialize)]
 pub struct SyncRequest {
     #[serde(default, rename = "binaryHash")]
@@ -47,17 +52,39 @@ pub struct SyncRequest {
     pub infra_hash: Option<String>,
     /// Per-(node, image_name) hash map. Shape:
     /// `{ "<node_id>": { "<image_name>": "<hash_tag>" } }`.
-    /// Used by `ApplyInfraExecutor` to resolve `Image::Local { name }`
-    /// references to concrete docker tags at compile time.
+    /// The supervisor reads it (executing a claimed infra lifecycle command)
+    /// to resolve `Image::Local { name }` references to concrete docker tags.
     #[serde(default, rename = "imageHashes")]
     pub image_hashes: BTreeMap<String, BTreeMap<String, String>>,
-    /// How to deactivate triggers when the project is currently
-    /// Active. Required (412 otherwise) when project is Active;
-    /// ignored when Inactive. Carries the same `DeactivateSpec`
-    /// shape as the standalone `/deactivate` endpoint, so clients
-    /// reuse one picker UI.
+    /// UPGRADE mode: cycle the running infra onto the current specs
+    /// (deactivate per `triggerDeactivation` when Active, run the
+    /// STOP leg, then the normal apply). One backend-side definition
+    /// of "upgrade = stop then start" that every client gets from a
+    /// single POST. `false` (a plain START) only brings down units
+    /// up and never deactivates.
+    #[serde(default)]
+    pub upgrade: bool,
+    /// How to deactivate triggers before an UPGRADE of an Active
+    /// project (required then, 412 otherwise; rejected on a plain
+    /// start, which never deactivates). Same `DeactivateSpec` shape
+    /// as the standalone `/deactivate` endpoint, so clients reuse
+    /// one picker UI.
     #[serde(default, rename = "triggerDeactivation")]
     pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
+    /// How the worker reconciliation inside sync treats RUNNING
+    /// executions when a worker must be replaced (stale image, or its
+    /// namespace no longer matches placement after infra appeared /
+    /// went away). `wait` (the default) drains the doomed workers (no
+    /// new admissions; in-flight work finishes) up to
+    /// `drainTimeoutSecs`, then replaces; `cancel` cancels the running
+    /// executions first. Never a silent kill.
+    #[serde(default, rename = "runningPolicy")]
+    pub running_policy: Option<RunningPolicy>,
+    /// Cap on the `wait` drain, in seconds; defaults to
+    /// `DEFAULT_DRAIN_TIMEOUT_SECS`. The user's "wait this long as a
+    /// courtesy, then proceed" choice, picked alongside the policy.
+    #[serde(default, rename = "drainTimeoutSecs")]
+    pub drain_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +119,11 @@ pub struct InfraStatusEntry {
 pub struct StopRequest {
     #[serde(default, rename = "triggerDeactivation")]
     pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
+    /// Cap on the supervisor's `wait` drain (Stop waits for running
+    /// executions before scaling down), in seconds; defaults to
+    /// `DEFAULT_DRAIN_TIMEOUT_SECS`.
+    #[serde(default, rename = "drainTimeoutSecs")]
+    pub drain_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,6 +136,10 @@ pub struct PerNodeRequest {
     /// terminate (terminate already removes everything).
     #[serde(default)]
     pub force: bool,
+    /// Cap on the `wait` drain, in seconds; defaults to
+    /// `DEFAULT_DRAIN_TIMEOUT_SECS`.
+    #[serde(default, rename = "drainTimeoutSecs")]
+    pub drain_timeout_secs: Option<u64>,
 }
 
 // =================================================================
@@ -113,10 +149,12 @@ pub struct PerNodeRequest {
 
 pub async fn sync(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path(id_str): Path<String>,
     body: Option<Json<SyncRequest>>,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
     let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
     // No sync-in-flight sentinel: the supervisor pool reaps a supervisor
@@ -135,38 +173,13 @@ async fn sync_inner(
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
     let project_id = id.to_string();
 
-    // Binary / definition / infra-hash writes are load-bearing:
-    // the supervisor's apply-hash compute reads them on the next
-    // tick to decide skip/fresh/replace, and
-    // `replace_stale_worker_if_needed` (below) uses the binary_hash
-    // to decide whether to kill the running pod. One ATOMIC write for
-    // the trio: separate statements opened a window where a crash (or
-    // a sibling Pod's /run between them) saw a new binary hash paired
-    // with an old definition hash.
-    state
-        .projects
-        .set_running_hashes(
-            id,
-            body.binary_hash.as_deref(),
-            body.definition_hash.as_deref(),
-            body.infra_hash.as_deref(),
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_hashes: {e}")))?;
-    for (node_id, tags) in &body.image_hashes {
-        let tags_map: std::collections::HashMap<String, String> =
-            tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        state
-            .projects
-            .set_infra_image_tags(id, node_id, tags_map)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("set_infra_image_tags(node={node_id}): {e}"),
-                )
-            })?;
-    }
+    // The running-hash trio + infra image-tag map is written LATER, only after
+    // every reject gate below has passed AND the upgrade stop leg (if any) has
+    // succeeded, i.e. once this sync has actually committed to applying. Writing
+    // them up here (before the gates) stamped a project as "running the new build"
+    // even when a gate rejected the sync or the stop leg failed, so drift detection
+    // then read desired==running and reported "up to date" while the old worker
+    // still ran. See the write just before `ensure_project_namespace_if_infra`.
 
     let lifecycle = state
         .projects
@@ -187,20 +200,77 @@ async fn sync_inner(
             ),
         ));
     }
+    let transition = state
+        .projects
+        .transition(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("transition: {e}")))?
+        .unwrap_or(crate::project_store::ProjectTransition::None);
+    if transition.is_building() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "project is {}; wait for the build to finish or cancel it before syncing infra",
+                transition.as_str()
+            ),
+        ));
+    }
+    // Fast reject before any side effect; re-checked under the lock
+    // below (the locked re-check is the race-safe one).
+    if crate::api::project::infra_setup_in_flight(&state, &project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup_in_flight: {e}")))?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "an infra sync is already in flight for this project; wait for it to \
+             finish or cancel it (`/infra/cancel`)"
+                .into(),
+        ));
+    }
 
-    // When the project is currently Active, the user has to tell us
-    // how to deactivate triggers (wipe / hibernate / park + running
-    // policy). That choice lives in `triggerDeactivation`. A missing
-    // choice on an Active project is a client bug: respond with 412
-    // so the CLI / extension knows to prompt and retry.
+    // Verb auto-build, BEFORE the transition lock: a build
+    // takes minutes and must never run while the per-project advisory
+    // lock pins a pool connection. The `coherent_definition` call
+    // inside the locked `start_infra_setup` below then cache-hits
+    // (nothing left to build) and stays lock-cheap.
+    crate::transition::ensure_built_gated(&state, id).await?;
+
+    // Enforce against the same reconciliation the action bar renders:
+    // the two faces of sync are distinct table verbs. A plain START is
+    // `infra_start` (offered when infra is down/stopped/partial, never
+    // when everything already runs); an UPGRADE is `infra_upgrade`
+    // (re-cycle running infra onto current specs).
+    crate::api::project::require_action(
+        &state,
+        id,
+        if body.upgrade { &["infra_upgrade"] } else { &["infra_start"] },
+    )
+    .await?;
+
+    // A plain START never deactivates: an active project's triggers
+    // stay live while infra comes up (fires whose subgraph touches the
+    // not-yet-running infra fail loudly at the node; fires that don't
+    // touch it keep working, which is the continuity an active project
+    // is owed). An UPGRADE disturbs live infra the triggers may depend
+    // on, so on an Active project it REQUIRES the user's deactivation
+    // choice and applies it before the stop leg.
     let was_active = matches!(lifecycle.status, crate::project_store::ProjectStatus::Active);
-    if was_active {
+    if body.trigger_deactivation.is_some() && !body.upgrade {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "triggerDeactivation only applies to an upgrade (a plain infra start never \
+             deactivates); pass upgrade=true or drop the field"
+                .into(),
+        ));
+    }
+    if body.upgrade && was_active {
         let Some(deactivation) = body.trigger_deactivation.as_ref() else {
             return Err((
                 StatusCode::PRECONDITION_REQUIRED,
-                "project is active; triggerDeactivation { mode, runningPolicy, graceMinutes? } \
-                 required so the user can choose how to deactivate triggers (same picker as \
-                 the standalone Deactivate verb)"
+                "project is active; an upgrade requires triggerDeactivation \
+                 { mode, runningPolicy, graceMinutes? } (same picker as the standalone \
+                 Deactivate verb)"
                     .into(),
             ));
         };
@@ -212,7 +282,7 @@ async fn sync_inner(
     // reap and Apply commands both depend on a live supervisor).
     // Idempotent: applies the same Deployment manifest every time;
     // k8s no-ops if already present. MUST land before any code path
-    // that enqueues a lifecycle command (orphan reap, run_infra_setup).
+    // that enqueues a lifecycle command (orphan reap, start_infra_setup).
     ensure_supervisor(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -226,49 +296,178 @@ async fn sync_inner(
     // worse than asking the user to retry.
     reap_orphans(&state, id).await?;
 
-    // Per-project-namespace reconciliation is split around the worker
-    // (re)placement so the worker is never destroyed by a namespace it is
-    // still running in, and is never spawned into a namespace that does
-    // not exist yet. The ordering encodes both the add-infra and
-    // remove-infra transitions correctly:
+    // UPGRADE stop leg: the apply path leaves up units frozen, so to
+    // cycle a running unit onto a new spec the sync stops first
+    // (respecting each unit's on_stop) and BLOCKS until the stop
+    // settles, exactly like it blocks on the InfraSetup below; the
+    // start half then recreates the down units. Stop drains in-flight
+    // infra executions (RunningPolicy::Wait) up to the caller's cap;
+    // the wait here adds a generous margin over that cap so a
+    // legitimately slow drain is never misread as a wedged supervisor.
+    if body.upgrade {
+        let drain_timeout_secs = body
+            .drain_timeout_secs
+            .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+        let command_id = issue_lifecycle_ensuring_supervisor(
+            &state,
+            &project_id,
+            None,
+            InfraLifecycleVerb::Stop,
+            RunningPolicy::Wait,
+            false,
+            drain_timeout_secs,
+        )
+        .await?;
+        let wait = std::time::Duration::from_secs(drain_timeout_secs + 300);
+        match crate::infra_lifecycle_command::wait_for_command(&state.pg_pool, command_id, wait)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("wait for stop leg: {e}")))?
+        {
+            crate::infra_lifecycle_command::WaitOutcome::Succeeded => {}
+            crate::infra_lifecycle_command::WaitOutcome::Failed { error } => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("upgrade stop leg failed: {error}; infra left as-is, retry or act \
+                             per node (`weft infra status`)"),
+                ));
+            }
+            crate::infra_lifecycle_command::WaitOutcome::Cancelled { reason } => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("upgrade stop leg cancelled ({reason}); infra left as-is"),
+                ));
+            }
+            crate::infra_lifecycle_command::WaitOutcome::Timeout => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "upgrade stop leg did not complete within {}s (drain cap {}s + margin); \
+                         the stop command is still in flight: wait and retry the upgrade, or \
+                         cancel it (`/infra/cancel`)",
+                        wait.as_secs(),
+                        drain_timeout_secs
+                    ),
+                ));
+            }
+        }
+    }
+
+    // There is NO worker "move": a worker's namespace is fixed at
+    // spawn; a placement change is drain-or-cancel-gated
+    // kill-then-respawn (`reconcile_worker`). Infra Pods are
+    // reachable ONLY from inside the project namespace (the
+    // namespace's ingress policy), so EVERY worker that may talk to
+    // infra, including the InfraSetup provisioning execution, must
+    // run there; placement anchors on the namespace existing, which
+    // is why the namespace is created FIRST. Sequencing:
     //
-    //   1. ensure_project_namespace_if_infra: if the project NOW has
-    //      infra, create its namespace + RBAC (no-op otherwise). On
-    //      ADD-infra this makes the per-project namespace exist BEFORE
-    //      the worker is moved into it.
-    //   2. replace_stale_worker_if_needed: replace the worker if its
-    //      image is stale OR it is in the wrong namespace for the current
-    //      has_infra. It spawns the replacement in the target namespace
-    //      and waits for it alive BEFORE killing the old pod, so in-flight
-    //      executions requeue onto the new worker rather than dying. On
-    //      REMOVE-infra the target is the shared namespace, so the worker
-    //      LEAVES the per-project namespace here, before step 3 deletes it.
-    //   3. teardown_project_namespace_if_no_infra: if the project NO
-    //      longer has infra, delete the (now worker-less) per-project
-    //      namespace + clear the row (no-op otherwise).
-    //
-    // All three run after reap_orphans (node set final) and before
-    // run_infra_setup (so a doomed pod can't claim the InfraSetup
-    // `execute` task it enqueues, and the namespace+RBAC is in place
-    // before any infra Pod is applied).
+    //   1. ensure_project_namespace_if_infra: create the project
+    //      namespace + RBAC before any infra Pod is applied AND
+    //      before the reconcile, so the placement resolver already
+    //      answers "project namespace" for everything that follows.
+    //      Idempotent, so safe outside the lock.
+    //   2. reconcile_worker (pre-apply, OUTSIDE the lock: a Wait-
+    //      policy drain can sit for minutes and must never pin the
+    //      lock's connection): replace a stale-image or misplaced
+    //      worker so the InfraSetup exec never runs on an old binary
+    //      or on a shared-pool pod the infra network wall would
+    //      block. Both halves of the replacement converge under
+    //      concurrency (mark_dead is idempotent, the spawn task is
+    //      dedup-keyed).
+    //   3. UNDER the per-project transition lock (short; two
+    //      concurrent syncs serialize here and the second is rejected
+    //      by the in-flight re-check):
+    //      a. re-check no InfraSetup execution is in flight;
+    //      b. start_infra_setup: journal the InfraSetup color (the
+    //         durable "sync in flight" state) + enqueue.
+    //   4. OUTSIDE the lock: await the InfraSetup execution (user
+    //      code upstream of infra nodes may legitimately be slow;
+    //      never hold a lock across it).
+    //   5. reconcile_worker (post-apply, outside the lock again):
+    //      placement may have changed (a no-longer-infra source's
+    //      namespace is about to go); kill-then-respawn the worker
+    //      into the right namespace, drained/cancelled per
+    //      `runningPolicy`.
+    //   6. UNDER the lock: teardown_project_namespace_if_no_infra,
+    //      deleting the (now worker-less) namespace + its registry row
+    //      when the project no longer has ANY infra state.
+    let running_policy = body.running_policy.unwrap_or(RunningPolicy::Wait);
+    let drain_timeout_secs = body
+        .drain_timeout_secs
+        .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+
+    // Advance the running-hash trio + infra image-tag map NOW: every reject gate
+    // has passed and the upgrade stop leg (if any) succeeded, so from here the sync
+    // is committed to applying the new spec. The running pointers must reflect
+    // committed reality, never intent, or drift detection lies. ONE ATOMIC write
+    // for the trio AND the complete tag map: separate statements opened a window
+    // where a crash (or a sibling Pod's /run between them) saw a new binary hash
+    // paired with an old definition hash, OR a project stamped runnable with its
+    // infra tags absent/half-written (a supervisor apply then resolves
+    // `Image::Local { name }` to nothing and dangles). The whole tag map is
+    // REPLACED (this sync recomputed every node's tags). The supervisor's
+    // apply-hash compute reads the trio on its next tick to decide
+    // skip/fresh/replace, and `reconcile_worker` below reads the binary hash to
+    // decide whether to kill the running pod.
+    let infra_image_tags: crate::project_store::InfraImageTags = body
+        .image_hashes
+        .iter()
+        .map(|(node_id, tags)| {
+            (
+                node_id.clone(),
+                tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            )
+        })
+        .collect();
+    state
+        .projects
+        .set_running_hashes(
+            id,
+            body.binary_hash.as_deref(),
+            body.definition_hash.as_deref(),
+            body.infra_hash.as_deref(),
+            Some(&infra_image_tags),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("set_running_hashes: {e}")))?;
+
     ensure_project_namespace_if_infra(&state, id).await?;
-    crate::api::project::replace_stale_worker_if_needed(&state, &project_id)
+    crate::api::project::reconcile_worker(&state, &project_id, running_policy, drain_timeout_secs)
+        .await?;
+    let started: Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)> =
+        crate::lease::with_project_transition_lock(&state.pg_pool, &project_id, || async {
+            if crate::api::project::infra_setup_in_flight(&state, &project_id).await? {
+                return Ok(Err((
+                    StatusCode::CONFLICT,
+                    "an infra sync is already in flight for this project; wait for it \
+                     to finish or cancel it (`/infra/cancel`)"
+                        .into(),
+                )));
+            }
+            Ok(crate::api::project::start_infra_setup(&state, id).await)
+        })
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("replace_stale_worker_if_needed: {e}"),
-            )
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("project transition lock: {e}"))
         })?;
-    teardown_project_namespace_if_no_infra(&state, id).await?;
-
-    // run_infra_setup short-circuits internally when the project has
-    // no requires_infra nodes. It also computes the upstream-closure
-    // root seeds itself so callers don't have to know the seeding
-    // contract.
-    if let Err(err) = crate::api::project::run_infra_setup(&state, id).await {
-        return Err(err);
+    if let Some(run) = started? {
+        crate::api::project::await_infra_setup(&state, run).await?;
     }
+
+    // The landing flip: relocate the worker to match post-apply
+    // placement (drain outside the lock), then tear down an
+    // infra-less namespace under it.
+    crate::api::project::reconcile_worker(&state, &project_id, running_policy, drain_timeout_secs)
+        .await?;
+    let landing: Result<(), (StatusCode, String)> =
+        crate::lease::with_project_transition_lock(&state.pg_pool, &project_id, || async {
+            Ok(teardown_project_namespace_if_no_infra(&state, id).await)
+        })
+        .await
+        .map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("project transition lock: {e}"))
+        })?;
+    landing?;
 
     // No auto-reactivate. Upgrade is CLI-orchestrated stop-then-start:
     // the stop already deactivated the project, and a user-invoked
@@ -285,18 +484,73 @@ async fn sync_inner(
 
 pub async fn stop(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path(id_str): Path<String>,
     body: Option<Json<StopRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    // Reject-don't-crash against the same reconciliation the action
+    // bar renders (a stale tab firing stop into a transitional /
+    // already-stopped project).
+    crate::api::project::require_action(&state, id, &["infra_stop"]).await?;
     issue_destroy(state, id_str, InfraLifecycleVerb::Stop, body).await
 }
 
 pub async fn terminate(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path(id_str): Path<String>,
     body: Option<Json<StopRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    crate::api::project::require_action(&state, id, &["infra_terminate"]).await?;
     issue_destroy(state, id_str, InfraLifecycleVerb::Terminate, body).await
+}
+
+/// `POST /projects/{id}/infra/cancel`. Cancel the project's in-flight
+/// infra work: flag claimed lifecycle commands (the executing
+/// supervisor halts between kubectl steps), cancel still-unclaimed
+/// commands outright, and cancel any non-terminal InfraSetup
+/// provisioning execution. Cancel = HALT, never rollback: kubectl is
+/// not transactional, so per-node partial state stays visible and the
+/// user terminates/retries per-node from where it stopped.
+///
+/// 412 when nothing infra-transitional is in flight (stale tab; the
+/// client refetches `/status` and reconciles).
+pub async fn cancel(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id_str): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    let project_id = id.to_string();
+
+    let touched = infra_lifecycle_command::request_cancel_project(&state.pg_pool, &project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("request cancel: {e}")))?;
+
+    // Cancel the provisioning sub-execution too (the InfraSetup worker
+    // run that computes specs and enqueues applies).
+    let colors = crate::api::project::non_terminal_infra_setup_colors(&state, &project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup colors: {e}")))?;
+    let had_setup = !colors.is_empty();
+    for color in colors {
+        crate::api::execution::cancel_color(&state, color)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
+    }
+
+    if touched == 0 && !had_setup {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "no infra operation in flight to cancel".into(),
+        ));
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Stop / Terminate share this body. The trigger deactivation choice
@@ -337,11 +591,10 @@ async fn issue_destroy(
     let running_policy = match verb {
         InfraLifecycleVerb::Stop => RunningPolicy::Wait,
         InfraLifecycleVerb::Terminate => RunningPolicy::Cancel,
-        // Apply is never routed through issue_destroy (the engine
-        // enqueues ApplyInfra tasks directly). Deactivate /
-        // Reactivate are dispatcher-owned and don't take this path
-        // either. If we get here, a caller wired a new verb without
-        // updating this match.
+        // Apply is never routed through issue_destroy (it is issued as its
+        // own infra lifecycle command). Deactivate / Reactivate are
+        // dispatcher-owned and don't take this path either. If we get here,
+        // a caller wired a new verb without updating this match.
         InfraLifecycleVerb::Apply
         | InfraLifecycleVerb::Deactivate
         | InfraLifecycleVerb::Reactivate => {
@@ -368,9 +621,19 @@ async fn issue_destroy(
         };
         crate::api::project::execute_trigger_deactivation(&state, id, deactivation).await?;
     }
-    let command_id =
-        issue_lifecycle_ensuring_supervisor(&state, &project_id, None, verb, running_policy, false)
-            .await?;
+    let drain_timeout_secs = body
+        .drain_timeout_secs
+        .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+    let command_id = issue_lifecycle_ensuring_supervisor(
+        &state,
+        &project_id,
+        None,
+        verb,
+        running_policy,
+        false,
+        drain_timeout_secs,
+    )
+    .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(LifecycleCommandIssued { command_id }),
@@ -379,9 +642,11 @@ async fn issue_destroy(
 
 pub async fn stop_node(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path((id_str, node_id)): Path<(String, String)>,
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
+    authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
     issue_per_node(
         state,
         id_str,
@@ -395,9 +660,11 @@ pub async fn stop_node(
 
 pub async fn terminate_node(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path((id_str, node_id)): Path<(String, String)>,
     body: Option<Json<PerNodeRequest>>,
 ) -> Result<(StatusCode, Json<LifecycleCommandIssued>), (StatusCode, String)> {
+    authorize_project(&state, &caller.0, parse_id(&id_str)?).await?;
     issue_per_node(
         state,
         id_str,
@@ -474,6 +741,8 @@ async fn issue_per_node(
         verb,
         running_policy,
         force,
+        body.drain_timeout_secs
+            .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS),
     )
     .await?;
     Ok((
@@ -484,9 +753,12 @@ async fn issue_per_node(
 
 pub async fn status(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path(id_str): Path<String>,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
-    let project_id = parse_id(&id_str)?.to_string();
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    let project_id = id.to_string();
     Ok(Json(SyncResponse {
         nodes: read_infra_entries(&state, &project_id).await?,
     }))
@@ -510,12 +782,15 @@ pub struct CommandStatusResponse {
 /// CLI can't infer completion from the rollup.
 pub async fn command_status(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path((id_str, cmd_id)): Path<(String, i64)>,
 ) -> Result<Json<CommandStatusResponse>, (StatusCode, String)> {
     // Scope the command read to this project: the command is looked up
     // by `(id, project_id)`, so a caller can't read another project's
     // command outcome by enumerating the sequential id.
-    let project_id = parse_id(&id_str)?.to_string();
+    let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
+    let project_id = id.to_string();
     use infra_lifecycle_command::WaitOutcome;
     let outcome =
         infra_lifecycle_command::read_command_outcome(&state.pg_pool, &project_id, cmd_id)
@@ -543,9 +818,11 @@ pub async fn command_status(
 
 pub async fn live(
     State(state): State<DispatcherState>,
+    caller: CallerTenant,
     Path((id_str, node_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let id = parse_id(&id_str)?;
+    authorize_project(&state, &caller.0, id).await?;
     let project_id = id.to_string();
 
     // Gate on the catalog metadata's `features.live_endpoint`.
@@ -581,17 +858,23 @@ pub async fn live(
         format!("infra node has no endpoint named '{live_endpoint}' (live_endpoint)"),
     ))?;
     let live_url = format!("{}/live", endpoint_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&live_url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("live fetch: {e}")))?;
-    let value: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("live parse: {e}")))?;
+    // Reuse the dispatcher's shared HTTP client (one connection pool for the
+    // process, not a fresh pool per request). Bound the WHOLE exchange, connect +
+    // headers + body, with a single 3s deadline so a downstream node that accepts
+    // the connection then trickles the body can't pin the request open.
+    let value = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let resp = state
+            .http
+            .get(&live_url)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("live fetch: {e}")))?;
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("live parse: {e}")))
+    })
+    .await
+    .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "live endpoint timed out".to_string()))??;
     Ok(Json(value))
 }
 
@@ -640,6 +923,18 @@ mod tests {
         assert!(r.infra_hash.is_none());
         assert!(r.image_hashes.is_empty());
         assert!(r.trigger_deactivation.is_none());
+        assert!(r.running_policy.is_none());
+    }
+
+    #[test]
+    fn sync_request_running_policy_round_trips() {
+        let r: SyncRequest =
+            serde_json::from_value(json!({ "runningPolicy": "cancel" })).unwrap();
+        assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
+        // ONE wire spelling: snake_case is an unknown field.
+        let r: SyncRequest =
+            serde_json::from_value(json!({ "running_policy": "cancel" })).unwrap();
+        assert_eq!(r.running_policy, None);
     }
 
     #[test]
@@ -770,11 +1065,11 @@ async fn ensure_supervisor(state: &DispatcherState) -> anyhow::Result<()> {
 /// CREATE half of per-project-namespace reconciliation: if the project
 /// declares infra, ensure its own namespace + RBAC bundle exists and
 /// stamp the row. No-op for a no-infra project. Split from the teardown
-/// half so the worker can be (re)placed BETWEEN them: create the
-/// namespace here, then move the worker into it (add-infra), or move the
-/// worker OUT to the shared namespace, then tear the namespace down
-/// (remove-infra). Both halves run after orphan reap, so the node set is
-/// final.
+/// half because they sit at opposite ends of the sync sequence: create
+/// runs BEFORE any infra Pod is applied; teardown runs at the landing
+/// flip, after the worker reconciliation has already respawned the
+/// worker in the shared pool (there is no worker "move"; a placement
+/// change is a kill-then-respawn, see `reconcile_worker`).
 ///
 /// The namespace + RBAC bundle (worker/infra SAs, NetworkPolicies,
 /// RoleBindings to the pooled supervisor/listener ClusterRoles) is what
@@ -796,8 +1091,11 @@ async fn ensure_project_namespace_if_infra(
         return Ok(());
     }
     let project_id_str = id.to_string();
-    let tenant = state.tenant_router.tenant_for_project(&project_id_str);
-    let tenant_namespace = state.namespace_mapper.namespace_for(&tenant);
+    let tenant = state
+        .tenant_router
+        .tenant_for_project(&project_id_str)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let project_namespace = crate::project_namespace::name_for(tenant.as_str(), &project_id_str);
     let args = crate::project_namespace::ProjectNamespaceArgs {
         project_id: &project_id_str,
@@ -806,7 +1104,6 @@ async fn ensure_project_namespace_if_infra(
         pod_cidr: &state.cluster_pod_cidr,
         service_cidr: &state.cluster_service_cidr,
         ingress_namespace: &state.cluster_ingress_namespace,
-        tenant_namespace: &tenant_namespace,
         control_plane_namespace: &state.control_plane_namespace,
     };
     crate::project_namespace::ensure(&state.pg_pool, &*state.kube, &args)
@@ -834,13 +1131,19 @@ async fn ensure_project_namespace_if_infra(
     Ok(())
 }
 
-/// TEARDOWN half: if the project no longer declares infra but still has
-/// a per-project namespace, delete it + clear the row. MUST run AFTER
-/// the worker has been relocated to the shared namespace
-/// (`replace_stale_worker_if_needed`), so we never delete a namespace
-/// that still has the project's worker running in it (that would kill
-/// in-flight executions abruptly instead of letting them requeue onto
-/// the already-up shared-namespace worker).
+/// TEARDOWN half: if the project no longer declares infra AND no live
+/// infra state remains, delete the per-project namespace + clear the
+/// row + delete its `weft_namespace_tenant` registry row. Runs at the
+/// sync landing flip, AFTER `reconcile_worker` has kill-then-respawned
+/// the worker into the shared pool, so we never delete a namespace
+/// that still hosts the project's worker.
+///
+/// The live-rows guard is Model 1's never-silently-kill guarantee: an
+/// orphaned infra node whose terminate timed out still has an
+/// `infra_node` row, and deleting the namespace under it would kill
+/// live (billed) infra the user can still see and act on. Skip with a
+/// breadcrumb; the user terminates the orphan via the always-visible
+/// infra controls and the next sync (or `weft rm`) tears down.
 ///
 /// Clears the row BEFORE deleting the namespace: a cleared row pointing
 /// at a not-yet-deleted namespace is benign (the supervisor simply stops
@@ -848,7 +1151,10 @@ async fn ensure_project_namespace_if_infra(
 /// make the supervisor flap kubectl against a gone namespace. So clear
 /// first, delete second; a crash between leaves only an empty orphan
 /// namespace (reclaimed on project rm or by a manual delete), never a
-/// live-advertised dead namespace.
+/// live-advertised dead namespace. The registry row is deleted LAST
+/// (after the namespace object): while the namespace exists in k8s, its
+/// row must exist too (the broker's TokenReview resolves pod tenancy
+/// from it).
 async fn teardown_project_namespace_if_no_infra(
     state: &DispatcherState,
     id: uuid::Uuid,
@@ -872,6 +1178,20 @@ async fn teardown_project_namespace_if_no_infra(
     if existing.is_empty() {
         return Ok(());
     }
+    if crate::infra_node::any_for_project(&state.pg_pool, &project_id_str)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?
+    {
+        tracing::warn!(
+            target: "weft_dispatcher::api::infra",
+            project_id = %project_id_str,
+            namespace = %existing,
+            "namespace teardown skipped: live infra rows remain (orphaned infra whose \
+             terminate has not completed); terminate it via the infra controls, then \
+             re-sync"
+        );
+        return Ok(());
+    }
     // Clear the row first (stop advertising the namespace to supervisors)
     // ...
     state
@@ -892,6 +1212,21 @@ async fn teardown_project_namespace_if_no_infra(
             project_id = %project_id_str,
             "delete now-infra-less project namespace failed (continuing); \
              row already cleared so no supervisor manages it"
+        );
+        // Keep the registry row while the k8s namespace object may
+        // still exist (broker TokenReview needs it); the next sync
+        // retries the delete and then drops the row.
+        return Ok(());
+    }
+    // ... and finally drop the namespace's tenant-registry row, so a
+    // torn-down namespace leaves no dangling auth mapping behind.
+    if let Err(e) = crate::namespace_registry::delete(&state.pg_pool, &existing).await {
+        tracing::warn!(
+            target: "weft_dispatcher::api::infra",
+            error = %e,
+            namespace = %existing,
+            "delete weft_namespace_tenant row failed (continuing); harmless until \
+             the next sync retries (an unmapped namespace only over-restricts)"
         );
     }
     Ok(())
@@ -914,11 +1249,16 @@ async fn issue_lifecycle_ensuring_supervisor(
     verb: InfraLifecycleVerb,
     running_policy: RunningPolicy,
     force: bool,
+    drain_timeout_secs: u64,
 ) -> Result<i64, (StatusCode, String)> {
     ensure_supervisor(state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("ensure_supervisor: {e}")))?;
-    let tenant = state.tenant_router.tenant_for_project(project_id);
+    let tenant = state
+        .tenant_router
+        .tenant_for_project(project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     infra_lifecycle_command::issue_lifecycle(
         &state.pg_pool,
         tenant.as_str(),
@@ -927,6 +1267,7 @@ async fn issue_lifecycle_ensuring_supervisor(
         verb,
         running_policy,
         force,
+        drain_timeout_secs,
         state.pod_id.as_str(),
     )
     .await
@@ -977,7 +1318,11 @@ async fn reap_orphans(
     if orphans.is_empty() {
         return Ok(());
     }
-    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let tenant = state
+        .tenant_router
+        .tenant_for_project(&project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Step 1: issue every terminate in parallel. issue_lifecycle is
     // a single INSERT; bundling them keeps DB roundtrip cost flat
@@ -997,6 +1342,9 @@ async fn reap_orphans(
                 InfraLifecycleVerb::Terminate,
                 RunningPolicy::Cancel,
                 false,
+                // Cancel never drains; the cap is inert. Default keeps
+                // the row honest.
+                weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
                 &pod,
             )
             .await;
@@ -1088,27 +1436,42 @@ pub async fn delete_project(
     force: bool,
 ) -> Result<(), (StatusCode, String)> {
     let project_id = id.to_string();
-    // Step 1: enqueue a project-wide terminate so the supervisor
-    // tears down the workloads. `issue_lifecycle_ensuring_supervisor`
-    // guarantees the supervisor is alive first; if the reaper scaled
-    // it to 0 during an idle period, `weft rm` would otherwise leave
-    // k8s resources behind. A silent failure here is not acceptable;
-    // refuse the rm and let the user retry.
-    let cmd_id = issue_lifecycle_ensuring_supervisor(
-        state,
-        &project_id,
-        None,
-        InfraLifecycleVerb::Terminate,
-        RunningPolicy::Cancel,
-        false,
-    )
-    .await?;
-    // Step 2: wait for the supervisor unless --force. A wedged
-    // supervisor blocks rm indefinitely otherwise; force lets the
-    // user proceed knowing orphans may persist. Wait failures are
-    // logged but don't block rm: the terminate row is in the queue
-    // and the next sweep tick will catch it.
-    if !force {
+    // Step 0: does this project have infra at all? A no-infra project has NOTHING
+    // for the supervisor to terminate, so enqueuing a Terminate + waiting on it is
+    // pure waste: no supervisor owns the project, the command is never marked
+    // complete, and the wait below burns the full 120s timeout on EVERY no-infra
+    // `weft rm` (the common case, and most e2e teardowns). Skip the supervisor
+    // round-trip entirely; go straight to the broker-row cleanup. `None` (project
+    // already unregistered) is also "nothing to terminate".
+    let has_infra = state
+        .projects
+        .project_has_infra(&project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project_has_infra: {e}")))?
+        .unwrap_or(false);
+    if has_infra {
+        // Step 1: enqueue a project-wide terminate so the supervisor
+        // tears down the workloads. `issue_lifecycle_ensuring_supervisor`
+        // guarantees the supervisor is alive first; if the reaper scaled
+        // it to 0 during an idle period, `weft rm` would otherwise leave
+        // k8s resources behind. A silent failure here is not acceptable;
+        // refuse the rm and let the user retry.
+        let cmd_id = issue_lifecycle_ensuring_supervisor(
+            state,
+            &project_id,
+            None,
+            InfraLifecycleVerb::Terminate,
+            RunningPolicy::Cancel,
+            false,
+            weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+        )
+        .await?;
+        // Step 2: wait for the supervisor unless --force. A wedged
+        // supervisor blocks rm indefinitely otherwise; force lets the
+        // user proceed knowing orphans may persist. Wait failures are
+        // logged but don't block rm: the terminate row is in the queue
+        // and the next sweep tick will catch it.
+        if !force {
         match infra_lifecycle_command::wait_for_command(
             &state.pg_pool,
             cmd_id,
@@ -1150,6 +1513,7 @@ pub async fn delete_project(
                     "wait_for_command errored; continuing with rm cleanup"
                 );
             }
+        }
         }
     }
     // Step 3: drop the broker-side rows. All three MUST succeed
@@ -1208,13 +1572,29 @@ pub async fn delete_project(
                 "clear project_namespace row failed (continuing)"
             );
         }
-        if let Err(e) = project_namespace::delete(&*state.kube, &ns).await {
-            tracing::warn!(
-                target: "weft_dispatcher::api::infra",
-                error = %e,
-                project_id = %project_id,
-                "delete project namespace failed (continuing); row already cleared"
-            );
+        match project_namespace::delete(&*state.kube, &ns).await {
+            Ok(()) => {
+                // Namespace gone from k8s: drop its tenant-registry
+                // row too (same ordering rule as the sync-time
+                // teardown: row outlives the namespace object, never
+                // the reverse).
+                if let Err(e) = crate::namespace_registry::delete(&state.pg_pool, &ns).await {
+                    tracing::warn!(
+                        target: "weft_dispatcher::api::infra",
+                        error = %e,
+                        namespace = %ns,
+                        "delete weft_namespace_tenant row failed (continuing)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "weft_dispatcher::api::infra",
+                    error = %e,
+                    project_id = %project_id,
+                    "delete project namespace failed (continuing); row already cleared"
+                );
+            }
         }
     }
     Ok(())

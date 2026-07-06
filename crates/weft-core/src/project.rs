@@ -40,7 +40,7 @@ pub struct ProjectDefinition {
 /// unrepresentable). The enum is internally tagged on `kind` and
 /// flattened into `GroupDefinition`, so the wire shape stays
 /// `{"kind": "group"}` / `{"kind": "loop", "loopConfig": {...}}`.
-// SYNC: GroupKind <-> extension-vscode/src/shared/protocol.ts GroupDefinition (kind + loopConfig)
+// SYNC: GroupKind <-> packages/weft-graph/src/protocol.ts GroupDefinition (kind + loopConfig)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GroupKind {
@@ -266,7 +266,7 @@ impl NodeDefinition {
     /// each tag matches `[A-Za-z0-9_-]{1,64}`.
     pub fn tags(&self) -> Vec<String> {
         self.config
-            .get("_tags")
+            .get(crate::tag::TAGS_CONFIG_KEY)
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()

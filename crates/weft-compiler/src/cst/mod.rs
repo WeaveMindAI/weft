@@ -1,7 +1,6 @@
 //! Lossless concrete syntax tree for `.weft` source.
 //!
-//! The design is documented in `docs/cst-node-model.md` (read it before changing
-//! anything here). The short version:
+//! The design in short:
 //!
 //! - `kind` defines the untyped `SyntaxKind` tag set + the `rowan::Language`
 //!   binding. Every node and token is one of these tags.

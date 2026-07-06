@@ -48,12 +48,11 @@ pub enum TaskKind {
     /// Dispatcher: journal a `LogLine` event on behalf of a worker.
     /// Same durability rationale as `RecordCost`.
     RecordLog,
-    /// Dispatcher: lazily provision the caller's tenant storage box
-    /// (idempotent) and return its in-cluster URL. Producer = engine
-    /// `ctx.storage(...)` before its first call / after a
-    /// box-unreachable error.
-    EnsureStorageBox,
 }
+
+// This enum holds only the kinds the dispatcher itself ships. A deployment that
+// adds its own task kinds (e.g. an in-cluster image build) registers + enqueues
+// them by string via the string-keyed task dispatch, without widening this enum.
 
 impl TaskKind {
     pub fn as_str(self) -> &'static str {
@@ -67,7 +66,6 @@ impl TaskKind {
             Self::CancelExecution => "cancel_execution",
             Self::RecordCost => "record_cost",
             Self::RecordLog => "record_log",
-            Self::EnsureStorageBox => "ensure_storage_box",
         }
     }
 }

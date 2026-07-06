@@ -37,6 +37,10 @@ pub enum ActionVerb {
     /// partial trigger registrations and flips the project back to
     /// Inactive.
     CancelActivate,
+    /// Cancel an in-flight build (transition=building).
+    /// Flips the transition to cancelling_build; the pod driving the
+    /// build interrupts the builder job.
+    CancelBuild,
     Deactivate,
     /// Force-cancel running executions while a deactivate-with-wait
     /// is draining. The lifecycle target the original deactivate
@@ -45,12 +49,15 @@ pub enum ActionVerb {
     Resync,
     Build,
     InfraStart,
-    InfraRestart,
     InfraStop,
     InfraTerminate,
     InfraUpgrade,
     InfraNodeStop,
     InfraNodeTerminate,
+    /// Cancel in-flight infra work: halt claimed lifecycle commands,
+    /// cancel unclaimed ones, interrupt the InfraSetup provisioning
+    /// execution. HALT, not rollback: per-node partial state stays.
+    InfraCancel,
     /// Multi-level project cleanup (deactivate + unregister + optional
     /// infra/journal/image/local wipes).
     Rm,
@@ -67,8 +74,7 @@ pub enum Phase {
     BuildSkip,
     /// Build finished (image is local).
     BuildDone,
-    /// Loading image into kind cluster (or pushing to registry in
-    /// cloud).
+    /// Loading image into kind cluster (or pushing it to a registry).
     ImagePushStart,
     ImagePushDone,
     /// HTTP request to the dispatcher started.
@@ -84,21 +90,9 @@ pub enum Phase {
     /// Trigger registration started (signals about to be wired up).
     TriggerRegisterStart,
     TriggerRegisterDone,
-    /// Periodic heartbeat while waiting for running executions to
-    /// drain (`--running-policy wait`). The wait is unbounded by
-    /// design (user workflows can run for days); this event keeps it
-    /// legible in both JSON and TTY mode. Detail:
-    /// `{ "runningCount": N, "elapsedSeconds": S }`.
-    DrainWait,
-    /// The build gate parked the project's triggers to drain running
-    /// executions and the verb does NOT reactivate afterwards: the
-    /// project ends INACTIVE with queued fires. Detail:
-    /// `{ "recovery": "activate" }` (the verb that re-enables triggers
-    /// and replays the queue on the new image).
-    ParkedInactive,
     /// Waiting on a long-running infra supervisor command (stop /
     /// terminate / start), which can depend on draining in-flight
-    /// executions and so is unbounded like `DrainWait`. Detail:
+    /// executions and so is unbounded. Detail:
     /// `{ "verb": "...", "elapsedSeconds": S }`.
     InfraWait,
     /// CLI verb finished cleanly.
@@ -236,23 +230,6 @@ impl Progress {
         self.emit(Phase::TriggerRegisterStart, None);
     }
 
-    pub fn drain_wait(&self, running_count: u64, elapsed_seconds: u64) {
-        self.emit(
-            Phase::DrainWait,
-            Some(serde_json::json!({
-                "runningCount": running_count,
-                "elapsedSeconds": elapsed_seconds,
-            })),
-        );
-    }
-
-    pub fn parked_inactive(&self) {
-        self.emit(
-            Phase::ParkedInactive,
-            Some(serde_json::json!({ "recovery": "activate" })),
-        );
-    }
-
     pub fn infra_wait(&self, verb: &str, elapsed_seconds: u64) {
         self.emit(
             Phase::InfraWait,
@@ -324,25 +301,6 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
         Phase::ImagePushStart => "loading image".to_string(),
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
-        Phase::DrainWait => {
-            let count = ev
-                .detail
-                .and_then(|d| d.get("runningCount"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let elapsed = ev
-                .detail
-                .and_then(|d| d.get("elapsedSeconds"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            format!(
-                "still waiting on {count} execution(s) (elapsed {elapsed}s; Ctrl+C to back out)"
-            )
-        }
-        Phase::ParkedInactive => "note: triggers were parked to drain running executions; \
-             the project is now inactive with queued fires. Run `weft activate` to \
-             re-enable triggers and replay them on the new image."
-            .to_string(),
         Phase::InfraWait => {
             let verb = ev
                 .detail

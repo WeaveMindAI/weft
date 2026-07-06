@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use weft_catalog::{DiscoverPolicy, FsCatalog};
+use weft_catalog::{stdlib_root, DiscoverPolicy, FsCatalog};
 
 use super::node_catalog::NodeCatalogEntry;
 use super::Ctx;
@@ -22,13 +22,18 @@ struct NodesResponse {
     warnings: Vec<String>,
 }
 
-pub async fn run(ctx: Ctx) -> Result<()> {
-    let project = ctx.project()?;
-    // Lenient discovery: the editor's palette must survive a node
-    // mid-edit. Same traversal as the build, only the error reaction
-    // differs (warn vs abort), so the palette and the build never
-    // disagree about what a node is.
-    let cat = FsCatalog::discover_with_policy(&project.root.join("nodes"), DiscoverPolicy::Lenient)
+pub async fn run(ctx: Ctx, stdlib: bool) -> Result<()> {
+    // `--stdlib`: describe the bundled stdlib catalog directly (no project on
+    // disk). Otherwise describe the project's own `nodes/`. Lenient discovery
+    // either way: the editor's palette must survive a node mid-edit. Same
+    // traversal as the build, only the error reaction differs (warn vs abort),
+    // so the palette and the build never disagree about what a node is.
+    let nodes_dir = if stdlib {
+        stdlib_root()
+    } else {
+        ctx.project()?.root.join("nodes")
+    };
+    let cat = FsCatalog::discover_with_policy(&nodes_dir, DiscoverPolicy::Lenient)
         .map_err(|e| anyhow::anyhow!("describe: {e}"))?;
 
     let mut catalog = BTreeMap::new();

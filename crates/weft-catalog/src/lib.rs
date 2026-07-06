@@ -413,20 +413,35 @@ pub enum BuildStage {
 /// Filesystem path to this repo's bundled stdlib catalog. Resolved
 /// at compile time from the crate's own `CARGO_MANIFEST_DIR`.
 ///
-/// This is consumed ONLY by `weft new`, which clones the catalog into
-/// the new project's `nodes/` folder so the project is self-contained.
-/// Nothing in the build / parse / run path reads it: a project owns
-/// all its nodes under `nodes/`. (A future registry replaces this
-/// local copy; the project shape is already correct.)
-///
-/// Layout: `<weft-repo>/crates/weft-catalog` → parent → parent →
-/// `catalog`. If the repo layout changes, update this function.
+/// Consumed by `weft new` (clones the catalog into the new project's `nodes/`
+/// so the project is self-contained) and by any environment that compiles at
+/// RUNTIME rather than from a dev checkout. So this MUST be runtime-resolvable,
+/// not just a compile-time path: honor `WEFT_REPO_ROOT` first (for environments
+/// where the compile-time `CARGO_MANIFEST_DIR` does not exist), exactly like
+/// `weft_compiler::build::resolve_weft_root`. Fall back to the repo layout
+/// (`<weft-repo>/crates/weft-catalog` → parent → parent → `catalog`) for local
+/// dev where the env is unset.
 pub fn stdlib_root() -> PathBuf {
+    weft_repo_root()
+        .expect("stdlib_root: cannot resolve weft repo layout")
+        .join("catalog")
+}
+
+/// Resolve the on-disk weft workspace root: honor `WEFT_REPO_ROOT` first (set in a
+/// built image, where the compile-time `CARGO_MANIFEST_DIR` does not
+/// exist), else fall back to the repo layout (`<repo>/crates/weft-catalog` ->
+/// parent -> parent). THE single resolver; `weft_compiler::build::resolve_weft_root`
+/// delegates here so the two can't drift (they must return the same path or the
+/// stdlib seed and the build context disagree). Fallible (None when neither the env
+/// nor the layout resolves) so each caller chooses panic vs error.
+pub fn weft_repo_root() -> Option<PathBuf> {
+    if let Ok(root) = std::env::var("WEFT_REPO_ROOT") {
+        return Some(PathBuf::from(root));
+    }
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join("catalog"))
-        .expect("stdlib_root: cannot resolve weft repo layout")
+        .map(|p| p.to_path_buf())
 }
 
 // ----- Package discovery ---------------------------------------------
@@ -720,18 +735,21 @@ fn load_node_entry(
         error: e.to_string(),
     })?;
 
-    // form_field_specs_ref resolves relative to the package root
-    // (NOT the node dir) so package members can share one file.
-    // Default filename `form_field_specs.json`, looked up in the
-    // node dir first (bare-node case) then the package root
-    // (package-member case).
+    // Resolve the form-field specs file. Default filename
+    // `form_field_specs.json` (overridable per node via
+    // `form_field_specs_ref` in metadata.json). Looked up MOST-SPECIFIC
+    // first: the node's own dir, then the package root. So a bare node
+    // keeps its specs beside its `metadata.json`; a package member
+    // inherits the package-root file its siblings share, UNLESS it drops
+    // its own file in its member dir to override. For a bare node the two
+    // candidates are the same dir, so the order is a no-op there.
     let specs_ref = metadata
         .form_field_specs_ref
         .clone()
         .unwrap_or_else(|| "form_field_specs.json".to_string());
     let specs_candidates = [
-        package_key.join(&specs_ref),
         node_dir.join(&specs_ref),
+        package_key.join(&specs_ref),
     ];
     let mut form_field_specs: Vec<FormFieldSpec> = Vec::new();
     for candidate in &specs_candidates {

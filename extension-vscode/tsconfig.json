@@ -5,11 +5,28 @@
     "outDir": "out",
     "lib": ["ES2022", "DOM"],
     "sourceMap": true,
-    "rootDir": "src",
+    // The host consumes the shared graph package AS SOURCE (imports like
+    // `../../packages/weft-graph/src/*`), which puts those files in the tsc
+    // program. `rootDir` is pinned to the repo root so the emit layout is
+    // EXPLICIT and stable (`out/extension-vscode/src/*.js` +
+    // `out/packages/weft-graph/src/*.js`, with the relative requires between
+    // them preserved) instead of tsc inferring a root that shifts whenever the
+    // set of imported package files changes. `main` in package.json points at
+    // the emitted entry under this layout. A `rootDir: "src"` would reject the
+    // package files as outside-root, which is why we don't use it.
+    "rootDir": "..",
     "strict": true,
     "moduleResolution": "node",
     "verbatimModuleSyntax": false
   },
-  "include": ["src/**/*.ts"],
+  // The extension host sources PLUS the shared package files they import (the
+  // graph protocol + status remap + live-data transforms). The webview (svelte)
+  // is built by vite, not tsc (excluded below).
+  "include": [
+    "src/**/*.ts",
+    "../packages/weft-graph/src/protocol.ts",
+    "../packages/weft-graph/src/status.ts",
+    "../packages/weft-graph/src/live-data.ts"
+  ],
   "exclude": ["node_modules", ".vscode-test", "src/webview/**"]
 }

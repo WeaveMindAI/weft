@@ -30,6 +30,7 @@ import { ExecutionsProvider, ExecutionNode, type ExecutionSummary } from './side
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import type { ActionVerb, ActionErrorDetails, CliEvent } from './shared/protocol';
+import { emptyActionAvailability, parseStatusPayload } from './shared/protocol';
 
 export function activate(context: vscode.ExtensionContext) {
   const dispatcher = new DispatcherClient(getDispatcherUrl());
@@ -270,10 +271,10 @@ export function activate(context: vscode.ExtensionContext) {
       const sub = args[0] ?? '';
       switch (sub) {
         case 'start': return 'infra_start';
-        case 'restart': return 'infra_restart';
         case 'stop': return 'infra_stop';
         case 'terminate': return 'infra_terminate';
         case 'upgrade': return 'infra_upgrade';
+        case 'cancel': return 'infra_cancel';
         case 'node-stop': return 'infra_node_stop';
         case 'node-terminate': return 'infra_node_terminate';
         default:
@@ -284,6 +285,7 @@ export function activate(context: vscode.ExtensionContext) {
       case 'run': return 'run';
       case 'activate': return 'activate';
       case 'cancel-activate': return 'cancel_activate';
+      case 'cancel-build': return 'cancel_build';
       case 'deactivate': return 'deactivate';
       case 'cancel-running': return 'cancel_running';
       case 'resync': return 'resync';
@@ -449,104 +451,33 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       out = await runWeftCliCapture(['--json', 'status'], projectRoot);
     } catch (err) {
-      // Project not registered with the dispatcher yet (typical on
-      // first graph open, after a wipe, or after a rename). Every
-      // verb whose CLI path registers the project as a side effect
-      // must stay clickable so the user isn't gated on something
-      // they're literally about to fix by clicking. The bar's
-      // own source-derived gating (`hasTriggers`, `hasInfra` from
-      // the parsed graph) hides verbs that don't apply to this
-      // project's shape; we just need to make sure the registering
-      // verbs are in the list.
-      //
-      // State-mutating verbs that require an existing dispatcher
-      // record (deactivate, resync, infra_stop/terminate/upgrade)
-      // stay out: clicking them on an unregistered project would
-      // 404 with no useful side effect.
-      console.warn('[weft] status fetch failed; assuming unregistered project', err);
+      // Project not registered with the dispatcher yet (typical on first graph open,
+      // after a wipe, or after a rename), so `weft status` has nothing to report.
+      // This is NOT special-cased into a faked action list anymore: the shared
+      // ActionBar makes the STARTER verbs (run / activate / infra_start) clickable
+      // from the parsed graph shape regardless of backend state, and each verb's CLI
+      // path builds + registers on demand. So we return an honest snapshot with an
+      // EMPTY available list: the starter verbs light up from shape, and the
+      // state-dependent verbs (deactivate, cancel_*, infra_stop/terminate/upgrade,
+      // resync) correctly stay hidden until a real status reports the live lifecycle.
+      console.warn('[weft] status fetch failed; project not registered yet', err);
       return {
-        snapshot: {
-          availableActions: ['run', 'activate', 'infra_start'],
-          binaryDrift: false,
-          definitionDrift: false,
-          infraDrift: false,
-          projectStatus: 'unknown',
-          mode: 'unknown',
-          runningCount: 0,
-          infraRollup: 'none',
-          infraNodes: [],
-          preservation: { parked: 0, suspended: 0 },
-        },
+        snapshot: emptyActionAvailability(),
         color: undefined,
         isRunning: false,
       };
     }
     try {
-      const json = JSON.parse(out);
-      const drift = json?.drift ?? {};
-      const projectStatus: 'registered' | 'active' | 'deactivating' | 'inactive' | 'unknown' =
-        (json?.status as 'registered' | 'active' | 'deactivating' | 'inactive' | undefined) ?? 'unknown';
-      const mode = String(json?.mode ?? 'unknown');
-      const firesDeadlineUnix =
-        typeof json?.fires_deadline_unix === 'number' ? json.fires_deadline_unix : undefined;
-      const runningCount = Number(json?.running_count ?? 0);
-      const preservation = {
-        parked: Number(json?.preservation?.parked ?? 0),
-        suspended: Number(json?.preservation?.suspended ?? 0),
-      };
-      const infraArr: Array<{
-        node_id?: string;
-        node_type?: string;
-        status?: string;
-        failureStage?: string;
-        failureMessage?: string;
-      }> = Array.isArray(json?.infra) ? json.infra : [];
-      // Trust the dispatcher's authoritative rollup over re-deriving
-      // from individual node statuses. The dispatcher knows about
-      // `failed` / `flaky` rollups that a naive `allRunning` /
-      // `allStopped` re-derivation would collapse into `partial`.
-      const validRollups = [
-        'none',
-        'stopped',
-        'partial',
-        'running',
-        'failed',
-        'flaky',
-        'stopping',
-        'terminating',
-        'provisioning',
-      ] as const;
-      type RollupLiteral = typeof validRollups[number];
-      const rawRollup = String(json?.infra_rollup ?? 'none');
-      const rollup: RollupLiteral = (validRollups as readonly string[]).includes(rawRollup)
-        ? (rawRollup as RollupLiteral)
-        : 'none';
-      const infraNodes = infraArr.map((n) => ({
-        nodeId: n.node_id ?? '',
-        nodeType: n.node_type ?? '',
-        status: n.status ?? 'unknown',
-        ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
-        ...(n.failureMessage !== undefined ? { failureMessage: n.failureMessage } : {}),
-      }));
+      // The remap lives in the shared package (`parseStatusPayload`)
+      // so every host builds the exact same snapshot.
+      const json = JSON.parse(out) as import('./shared/protocol').RawStatusPayload;
       const execs = json?.executions ?? {};
       const lastStatus: string | undefined = execs.last_status;
       const lastColor: string | undefined = execs.last_color;
       const isRunning =
         lastStatus === 'running' || lastStatus === 'started' || lastStatus === 'queued';
       return {
-        snapshot: {
-          availableActions: Array.isArray(json?.available_actions) ? json.available_actions : [],
-          binaryDrift: !!drift.binary_drift,
-          definitionDrift: !!drift.definition_drift,
-          infraDrift: !!drift.infra_drift,
-          projectStatus,
-          mode,
-          ...(firesDeadlineUnix !== undefined ? { firesDeadlineUnix } : {}),
-          runningCount,
-          infraRollup: rollup,
-          infraNodes,
-          preservation,
-        },
+        snapshot: parseStatusPayload(json),
         color: typeof lastColor === 'string' ? lastColor : undefined,
         isRunning,
       };
@@ -931,6 +862,9 @@ export function activate(context: vscode.ExtensionContext) {
       deleteExecution('summary' in n ? n.summary : n),
     ),
     vscode.commands.registerCommand('weft.clearExecutions', () => clearAllExecutions()),
+    vscode.commands.registerCommand('weft.loadMoreExecutions', () =>
+      executionsProvider.loadMore(),
+    ),
 
     // Legacy commands kept so keybindings/URIs that reference them
     // still work.

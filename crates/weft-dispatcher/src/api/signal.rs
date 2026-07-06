@@ -19,6 +19,7 @@ use sqlx::Row;
 
 use weft_listener::protocol::ProcessTarget;
 
+use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
 
 /// One element of `signal.parked_fires`. Single source of truth for
@@ -37,14 +38,25 @@ pub(crate) struct ParkedFire {
     pub received_at_unix: i64,
 }
 
+/// Ceiling on an ENTRY signal's `parked_fires` queue. Entry fires accumulate while
+/// a project is parked (inactive); an unbounded queue lets an external caller who
+/// knows a public mount path grow one row without limit. Cap it so a flood is
+/// refused loudly (the append returns 0 rows) rather than growing the row until a
+/// write fails. Resume signals are already capped at one element. Sized generously
+/// so a legitimately busy parked project isn't cut off.
+const MAX_PARKED_ENTRY_FIRES: i64 = 1000;
+
 /// THE one append onto `signal.parked_fires`. Every park site (the
 /// lifecycle gate on external fires, the route_entry executor's
 /// authoritative re-check) goes through here so the queue-element
-/// shape and the append guards live in one place. Guards, both in
+/// shape and the append guards live in one place. Guards, all in
 /// one atomic UPDATE (no read-then-write race):
 ///   - resume cap: resume signals append iff the queue is empty
 ///     (one submission answers one suspension; later ones are
-///     duplicates). Entry signals append on every fire.
+///     duplicates). Entry signals append while under the entry cap.
+///   - entry cap: an entry signal appends only while its queue is
+///     below `MAX_PARKED_ENTRY_FIRES`, so a flood can't grow the row
+///     without bound.
 ///   - id dedup: an element with the same `ParkedFire.id` already
 ///     queued matches zero rows, so a retry of the same park (task
 ///     re-run after a crash) collapses instead of double-queueing.
@@ -62,17 +74,20 @@ pub(crate) async fn append_parked_fire(
     // `is_resume` is read from the TARGETED ROW (not a caller arg) so a
     // caller that could not first fetch the signal row (a transient read
     // error before re-parking) can still park correctly: a resume signal
-    // caps `parked_fires` at one element, an entry signal does not.
+    // caps `parked_fires` at one element, an entry signal caps at
+    // `MAX_PARKED_ENTRY_FIRES`.
     let updated = sqlx::query(
         "UPDATE signal \
          SET parked_fires = parked_fires || $1::jsonb \
          WHERE token = $2 \
            AND (is_resume = FALSE OR jsonb_array_length(parked_fires) = 0) \
+           AND (is_resume = TRUE OR jsonb_array_length(parked_fires) < $4) \
            AND NOT (parked_fires @> $3::jsonb)",
     )
     .bind(&entry_json)
     .bind(token)
     .bind(&dedup_probe)
+    .bind(MAX_PARKED_ENTRY_FIRES)
     .execute(pool)
     .await?;
     Ok(updated.rows_affected())
@@ -118,6 +133,7 @@ pub(crate) async fn remove_parked_fire(
 /// `listener_pod`, not per tenant (a pod holds many tenants' signals).
 pub async fn listener_inspect(
     State(state): State<DispatcherState>,
+    _ops: crate::authenticator::ControlPlaneCaller,
 ) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT pod_name, admin_url FROM listener_pod")
@@ -245,7 +261,15 @@ async fn apply_lifecycle_gate(
 
     // Active project: live fire. Ship straight to the listener.
     if routing.status == ProjectStatus::Active {
-        return dispatch_listener_outcome(state, token, &routing.project_id, payload, None).await;
+        return dispatch_listener_outcome(
+            state,
+            token,
+            &routing.project_id,
+            &routing.tenant_id,
+            payload,
+            None,
+        )
+        .await;
     }
 
     // Past the deadline (hibernate-style grace expired): refuse,
@@ -283,17 +307,43 @@ async fn apply_lifecycle_gate(
             payload,
             received_at_unix: crate::lease::now_unix(),
         };
-        // A resume signal with a non-empty queue matches zero rows
-        // in the shared append; we surface that as 409 Conflict so
-        // the consumer knows the suspension was already answered,
-        // not silently dropped under a 200.
+        // The shared append returns 0 rows when a guard refused OR the signal row
+        // is gone. Never silently swallow that under a 200: distinguish the causes
+        // and fail loud. A fresh-UUID id can't hit the dedup guard on a live fire,
+        // so for a live fire 0 rows means one of: resume queue already answered,
+        // entry queue at its cap, or the row vanished between routing lookup and
+        // park.
         let updated = append_parked_fire(&state.pg_pool, token, &entry)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?;
-        if updated == 0 && routing.is_resume {
+        if updated == 0 {
+            if routing.is_resume {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "suspension already answered; duplicate submission ignored".into(),
+                ));
+            }
+            // Entry signal: tell "queue full" (still registered) apart from "row
+            // gone" (no longer registered) so the caller gets an actionable status
+            // instead of a false 200.
+            let still_registered: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM signal WHERE token = $1)",
+            )
+            .bind(token)
+            .fetch_one(&state.pg_pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park recheck: {e}")))?;
+            if still_registered {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "this entry has too many pending fires queued; wait for the project \
+                     to process them (it is currently parked) or retry later"
+                        .into(),
+                ));
+            }
             return Err((
-                StatusCode::CONFLICT,
-                "suspension already answered; duplicate submission ignored".into(),
+                StatusCode::GONE,
+                "this signal is no longer registered; the fire was not accepted".into(),
             ));
         }
         return Ok(StatusCode::OK);
@@ -315,6 +365,11 @@ async fn apply_lifecycle_gate(
 /// `visible_signals`, never decides whether to park / refuse / pass.
 pub(crate) struct FireGateInfo {
     pub project_id: String,
+    /// The signal's own owning tenant, frozen on the row at register time. The
+    /// fire path stamps tasks/spawns with THIS, not a re-derivation through the
+    /// tenant router, so the answer comes from the same source that authorized
+    /// the register.
+    pub tenant_id: String,
     pub status: crate::project_store::ProjectStatus,
     pub accepting_fires: bool,
     pub fires_deadline_unix: Option<i64>,
@@ -332,7 +387,7 @@ pub(crate) async fn lookup_signal_routing(
     token: &str,
 ) -> Result<FireGateInfo, (StatusCode, String)> {
     let row = sqlx::query(
-        "SELECT s.project_id, s.surface_kind, s.is_resume, \
+        "SELECT s.project_id, s.tenant_id, s.surface_kind, s.is_resume, \
                 COALESCE(p.status, 'inactive') AS status, \
                 COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
                 p.fires_deadline_unix \
@@ -347,6 +402,9 @@ pub(crate) async fn lookup_signal_routing(
     .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
     let project_id: String = row
         .try_get("project_id")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
+    let tenant_id: String = row
+        .try_get("tenant_id")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     let surface_kind: String = row
         .try_get("surface_kind")
@@ -365,6 +423,7 @@ pub(crate) async fn lookup_signal_routing(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     Ok(FireGateInfo {
         project_id,
+        tenant_id,
         status: crate::project_store::project_status_from_str(&status_str)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode status: {e}")))?,
         accepting_fires: accepting,
@@ -437,13 +496,13 @@ pub(crate) async fn dispatch_listener_outcome(
     state: &DispatcherState,
     token: &str,
     project_id: &str,
+    tenant: &str,
     payload: Value,
     dedup_nonce: Option<&str>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let tenant = state.tenant_router.tenant_for_project(project_id);
     let token_owned = token.to_string();
     let project_owned = project_id.to_string();
-    let tenant_str = tenant.as_str().to_string();
+    let tenant_str = tenant.to_string();
     let dedup_nonce_owned = dedup_nonce.map(|s| s.to_string());
     // Resolve the listener holding this signal, re-placing it from its
     // durable row if the prior holder was reaped (a parked webhook may
@@ -588,7 +647,7 @@ pub(crate) async fn dispatch_listener_outcome(
                         weft_task_store::tasks::enqueue_dedup(
                             &state.pg_pool,
                             weft_task_store::tasks::NewTask {
-                                kind: weft_task_store::TaskKind::RouteEntry,
+                                kind: weft_task_store::TaskKind::RouteEntry.into(),
                                 target: weft_task_store::tasks::TaskTarget::Dispatcher,
                                 // Stamped so `running_count` can see
                                 // routed-but-unjournaled fires: the
@@ -600,6 +659,7 @@ pub(crate) async fn dispatch_listener_outcome(
                                 color: None,
                                 tenant_id: Some(tenant_str.clone()),
                                 target_pod_name: None,
+                                binary_hash: None,
                                 payload: task_payload,
                             },
                         )
@@ -712,7 +772,7 @@ pub(crate) async fn delete_signals_for_project(
 /// there's no execution to cancel: the signal row gets dropped
 /// and the listener registration unregistered.
 ///
-/// Auth: requires `Authorization: Bearer <api_token>` AND the
+/// Auth: requires `Authorization: Bearer <signal_token>` AND the
 /// token's scope must be ≥ project (kinds + tags both empty,
 /// project covered). Tag-scoped tokens cannot cancel because
 /// cancellation reaches into sibling signals the token can't see.
@@ -722,8 +782,8 @@ pub async fn cancel_signal(
     headers: HeaderMap,
     Path(signal_token): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let api_token = bearer_token(&headers)?;
-    let scope = require_scoped_api_token(&state, &api_token).await?;
+    let scoping_token = bearer_token(&headers)?;
+    let scope = require_scoped_signal_token(&state, &scoping_token).await?;
 
     let row = state
         .journal
@@ -732,7 +792,16 @@ pub async fn cancel_signal(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_get: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
 
-    if !scope.can_cancel(&row) {
+    // Tenant wall FIRST, as a 404: a signal token owned by ANOTHER tenant must be
+    // indistinguishable from a nonexistent one (both "unknown signal token" / 404),
+    // so a caller holding one valid token of their own cannot probe which tokens
+    // exist on other accounts (a cross-tenant existence oracle). Only AFTER the
+    // signal is confirmed same-tenant do we distinguish the intra-tenant
+    // scope-too-narrow case as a 403 (which reveals nothing across the wall).
+    if !scope.same_tenant(&row) {
+        return Err((StatusCode::NOT_FOUND, "unknown signal token".into()));
+    }
+    if !scope.can_cancel_within_tenant(&row) {
         return Err((
             StatusCode::FORBIDDEN,
             "cancel requires a token whose scope is at least the whole project (no kind/tag restrictions)".into(),
@@ -757,47 +826,60 @@ pub async fn cancel_signal(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /api-token/{token}/signals`. Scoped enumeration. Filters by
-/// the api_token's allowed_kinds, allowed_projects, allowed_tags AND
+/// `GET /signal-token/signals` (signal token in `Authorization: Bearer`).
+/// Scoped enumeration. Filters by
+/// the signal token's allowed_projects, allowed_tags AND
 /// by project visibility (`fires_visible_to_consumers = TRUE`):
 /// active and parked projects show up; hibernate-mode projects do
 /// not. Wiped projects have no rows. The dispatcher never asks the
-/// listener for the api_token: the SQL pre-filter is the only
+/// listener for the signal token: the SQL pre-filter is the only
 /// scope check.
 ///
 /// Returns the cached `consumer_payload` from each row. Computed
 /// once at register time on the listener `/render` endpoint and
 /// stored on the row, so this endpoint is a pure SQL read with
 /// no listener round-trip; park-mode projects can serve
-/// `/api-token/.../signals` even with the listener pod reaped.
+/// `/signal-token/.../signals` even with the listener pod reaped.
 pub async fn list_signals_for_token(
     State(state): State<DispatcherState>,
-    Path(api_token): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let scope = require_scoped_api_token(&state, &api_token).await?;
+    let signal_token = bearer_token(&headers)?;
+    let scope = require_scoped_signal_token(&state, &signal_token).await?;
     let visible = scope
         .visible_signals(&state)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
     let mut out: Vec<Value> = Vec::with_capacity(visible.len());
     for sig in visible {
-        if let Some(payload) = sig.consumer_payload {
+        if let Some(mut payload) = sig.consumer_payload {
+            // Stamp `isResume` onto the enumerated payload so the consumer can
+            // split the list into TRIGGERS (entry signals, always shown while
+            // registered, fireable repeatedly to start a run) and RESUME tasks
+            // (one-shot replies to a paused execution). It's a signal-row
+            // property, not part of the listener's render, so it is added here
+            // where the row and its rendered payload meet.
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("isResume".into(), Value::Bool(sig.is_resume));
+            }
             out.push(payload);
         }
     }
     Ok(Json(Value::Array(out)))
 }
 
-/// `GET /api-token/{token}/health`. Liveness + auth probe.
-pub async fn api_token_health(
+/// `GET /signal-token/health` (Bearer-authenticated). Liveness + auth probe.
+pub async fn signal_token_health(
     State(state): State<DispatcherState>,
-    Path(api_token): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_scoped_api_token(&state, &api_token).await?;
+    let signal_token = bearer_token(&headers)?;
+    require_scoped_signal_token(&state, &signal_token).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// `DELETE /api-token/{api_token}/signals`. Bulk clear-all: cancel
+/// `DELETE /signal-token/signals` (signal token in `Authorization: Bearer`).
+/// Bulk clear-all: cancel
 /// every execution this token has visibility over. Distinct colors
 /// cancel once each (cancel_color drops every sibling signal of
 /// the same color), so a 5-parallel HumanQuery set under one
@@ -810,13 +892,14 @@ pub async fn api_token_health(
 /// Returns counts: { colors_cancelled, entry_signals_dropped }.
 pub async fn clear_all_signals(
     State(state): State<DispatcherState>,
-    Path(api_token): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let scope = require_scoped_api_token(&state, &api_token).await?;
-    if !scope.row.allowed_kinds.is_empty() || !scope.row.allowed_tags.is_empty() {
+    let signal_token = bearer_token(&headers)?;
+    let scope = require_scoped_signal_token(&state, &signal_token).await?;
+    if !scope.row.allowed_tags.is_empty() {
         return Err((
             StatusCode::FORBIDDEN,
-            "clear-all requires a token whose scope is at least the whole project (no kind/tag restrictions)".into(),
+            "clear-all requires a token whose scope is at least the whole project (no tag restriction)".into(),
         ));
     }
 
@@ -879,39 +962,47 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
     Ok(raw.to_string())
 }
 
-/// Resolve and load an api_token by string, returning a typed scope
-/// helper. 401 if the token doesn't exist.
-async fn require_scoped_api_token(
+/// Resolve and load a signal token from its PRESENTED value, returning a
+/// typed scope helper. The DB stores only the sha256 of the value
+/// (show-once), so the lookup hashes first: a fixed-width digest match,
+/// never a raw-secret equality. 401 if the token doesn't exist.
+async fn require_scoped_signal_token(
     state: &DispatcherState,
     token: &str,
 ) -> Result<TokenScope, (StatusCode, String)> {
+    let hash = crate::api::signal_token_names::token_hash(token);
     let row = state
         .journal
-        .get_api_token(token)
+        .get_signal_token(&hash)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("api_token: {e}")))?
-        .ok_or((StatusCode::UNAUTHORIZED, "unknown api token".into()))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_token: {e}")))?
+        .ok_or((StatusCode::UNAUTHORIZED, "unknown signal token".into()))?;
     Ok(TokenScope { row })
 }
 
 struct TokenScope {
-    row: crate::journal::ApiToken,
+    row: crate::journal::SignalToken,
 }
 
 impl TokenScope {
-    /// True if the token may CANCEL this signal. Cancel reaches
-    /// into sibling signals of the same color (different tags,
-    /// different consumer kinds), so the token must have full
+    /// The tenant wall: is this signal owned by the same tenant as the scoping
+    /// token? Kept SEPARATE from the scope check so a cross-tenant signal is
+    /// answered as "not found" (indistinguishable from a nonexistent token),
+    /// never as a distinct "forbidden" that would leak the token's existence on
+    /// another account.
+    fn same_tenant(&self, sig: &crate::journal::SignalRegistration) -> bool {
+        sig.tenant_id == self.row.tenant_id
+    }
+
+    /// True if the token may CANCEL this signal, GIVEN it is already known to be
+    /// same-tenant (call `same_tenant` first). Cancel reaches into sibling
+    /// signals of the same color (different tags), so the token must have full
     /// project-level view, not a sub-project slice.
     ///
-    /// Rule: project covered AND no kind/tag restrictions. Empty
-    /// allowed_kinds + empty allowed_tags = "I see everything in
-    /// the projects I'm allowed in." Anything narrower can only
-    /// skip its own visible signals.
-    fn can_cancel(&self, sig: &crate::journal::SignalRegistration) -> bool {
-        if !self.row.allowed_kinds.is_empty() {
-            return false;
-        }
+    /// Rule (within the tenant): covered project AND no tag restriction. Empty
+    /// allowed_tags = "I see everything in the projects I'm allowed in." A
+    /// tag-scoped token can only skip its own visible signals, never cancel.
+    fn can_cancel_within_tenant(&self, sig: &crate::journal::SignalRegistration) -> bool {
         if !self.row.allowed_tags.is_empty() {
             return false;
         }
@@ -927,7 +1018,7 @@ impl TokenScope {
     }
 
     /// Run the SQL filter to enumerate every signal this token sees.
-    /// Filters by token scope (kinds / projects / tags) AND by
+    /// Filters by token scope (tenant / projects / tags) AND by
     /// project visibility: only projects with
     /// `fires_visible_to_consumers = TRUE` show up. That covers
     /// both active projects and parked projects (consumers can
@@ -948,14 +1039,17 @@ impl TokenScope {
                     s.kind_state \
              FROM signal s \
              LEFT JOIN project p ON p.id::text = s.project_id \
-             WHERE s.is_resume = TRUE AND jsonb_array_length(s.parked_fires) = 0 \
-               AND COALESCE(p.fires_visible_to_consumers, FALSE) = TRUE \
-               AND ($1::text[] = '{}'::text[] OR s.consumer_kind = ANY($1)) \
+             WHERE COALESCE(p.fires_visible_to_consumers, FALSE) = TRUE \
+               AND s.tenant_id = $1 \
                AND ($2::uuid[] = '{}'::uuid[] OR s.project_id::uuid = ANY($2)) \
                AND ($3::text[] = '{}'::text[] OR s.tags && $3) \
-             ORDER BY s.created_at ASC",
+               AND ( \
+                 s.is_resume = FALSE \
+                 OR jsonb_array_length(s.parked_fires) = 0 \
+               ) \
+             ORDER BY s.is_resume ASC, s.created_at ASC",
         )
-        .bind(&self.row.allowed_kinds)
+        .bind(&self.row.tenant_id)
         .bind(&self.row.allowed_projects)
         .bind(&self.row.allowed_tags)
         .fetch_all(&state.pg_pool)
@@ -1023,7 +1117,7 @@ pub async fn fire_public_entry(
         format!("/{}", mount_path)
     };
     let row = sqlx::query(
-        "SELECT s.token, s.project_id, s.auth_kind, s.auth_config, \
+        "SELECT s.token, s.project_id, s.tenant_id, s.auth_kind, s.auth_config, \
                 COALESCE(p.status, 'inactive') AS status, \
                 COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
                 p.fires_deadline_unix \
@@ -1045,6 +1139,9 @@ pub async fn fire_public_entry(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     let project_id: String = row
         .try_get("project_id")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
+    let tenant_id: String = row
+        .try_get("tenant_id")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     let status_str: String = row
         .try_get("status")
@@ -1068,6 +1165,7 @@ pub async fn fire_public_entry(
 
     let routing = FireGateInfo {
         project_id,
+        tenant_id,
         status: crate::project_store::project_status_from_str(&status_str)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("decode status: {e}")))?,
         accepting_fires: accepting,
@@ -1300,18 +1398,23 @@ pub async fn connect_live(
     // Ensure at least one worker pod is up for the project (spawn + wait if
     // none); this does NOT admit a slot, it only guarantees a routable pod
     // exists. Admission happens atomically below as the execute-task insert.
-    let tenant = state.tenant_router.tenant_for_project(&project_id);
+    let tenant = state
+        .tenant_router
+        .tenant_for_project(&project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     ensure_live_worker(&state, &project_id, tenant.as_str()).await?;
 
     // Prepare + ATOMICALLY admit the execution. `prepare_live_execution`
-    // journals ExecutionStarted/kicks and then calls `admit_live_execution`,
-    // which (in one transaction, under a per-project lock) picks the least-
-    // loaded under-cap pod and INSERTS the pinned execute task on it: admission
-    // IS the task insert, so there is no separate slot counter to drift and no
-    // admit/insert window. It returns the chosen pod, or signals "all full" so
-    // we spawn another and retry.
+    // builds the birth (ExecutionStarted + kicks + the pinned execute task)
+    // and hands it to `Journal::start_live_execution`, which in ONE
+    // transaction under a per-project lock picks the least-loaded under-cap
+    // pod, inserts the pinned task, and journals the birth: admission IS the
+    // task insert AND the journal write, so there is no admit/journal window
+    // and a failure anywhere leaves NOTHING (no cleanup needed on Err here).
+    // "All full" spawns another pod and retries inside.
     let color = uuid::Uuid::new_v4();
-    let pod = match prepare_live_execution(
+    let pod = prepare_live_execution(
         &state,
         &project_id,
         project_uuid,
@@ -1320,23 +1423,16 @@ pub async fn connect_live(
         tenant.as_str(),
         color,
     )
-    .await
-    {
-        Ok(pod) => pod,
-        Err(e) => {
-            cleanup_failed_live_setup(&state, color).await;
-            return Err(e);
-        }
-    };
+    .await?;
 
     // Do not hand the caller a URL the gateway cannot route yet: the pod is
     // admitted and DB-alive, but its per-pod DNS record may not have
     // propagated. Wait until the record resolves (through the same cluster
-    // resolver the gateway uses); on failure clean up exactly like a prepare
-    // failure, since ExecutionStarted is already journaled and the task is
-    // already admitted.
+    // resolver the gateway uses). This is the ONE failure point past the
+    // admission, so it is the one place that tears the admitted execution
+    // down (atomically: task delete + cancel terminals in one transaction).
     if let Err(e) = wait_for_pod_dns(&pod.pod_name, &pod.namespace).await {
-        cleanup_failed_live_setup(&state, color).await;
+        teardown_unclaimed_live_execution(&state, color).await;
         return Err(e);
     }
 
@@ -1376,13 +1472,13 @@ pub async fn connect_live(
     })
 }
 
-/// Resolve the project definition, journal `ExecutionStarted` + the trigger
-/// kicks, then ATOMICALLY admit the execution by inserting the pinned execute
-/// task on the least-loaded under-cap pod (`admit_live_execution`). Returns
-/// the chosen pod. If every pod is at the cap, spawns another and retries the
-/// admit (bounded). The caller cleans up on `Err` (delete the pending task +
-/// record a terminal); since admission IS the task insert, there is no slot
-/// counter to release.
+/// Resolve the project definition and ATOMICALLY start the live execution:
+/// `Journal::start_live_execution` picks the least-loaded under-cap pod,
+/// inserts the pinned execute task, and journals `ExecutionStarted` + the
+/// trigger kicks, all in ONE transaction. Returns the chosen pod. If every
+/// pod is at the cap, spawns another and retries (bounded). A failure
+/// anywhere leaves NOTHING journaled or queued, so the caller has nothing to
+/// clean up on `Err`.
 async fn prepare_live_execution(
     state: &DispatcherState,
     project_id: &str,
@@ -1416,51 +1512,62 @@ async fn prepare_live_execution(
     }
 
     let now = crate::lease::now_unix() as u64;
-    state
-        .journal
-        .record_event(&weft_journal::ExecEvent::ExecutionStarted {
+    let start = weft_journal::ExecEvent::ExecutionStarted {
+        color,
+        project_id: project_id.to_string(),
+        entry_node: node_id.to_string(),
+        phase: weft_core::context::Phase::Fire,
+        definition_hash: definition_hash.clone(),
+        at_unix: now,
+    };
+    let kick_events: Vec<weft_journal::ExecEvent> = kicks
+        .iter()
+        .map(|kick| weft_journal::ExecEvent::NodeKicked {
             color,
-            project_id: project_id.to_string(),
-            entry_node: node_id.to_string(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: definition_hash.clone(),
+            node_id: kick.node_id.clone(),
+            payload: kick.payload.clone(),
             at_unix: now,
         })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal start: {e}")))?;
-    for kick in &kicks {
-        state
-            .journal
-            .record_event(&weft_journal::ExecEvent::NodeKicked {
-                color,
-                node_id: kick.node_id.clone(),
-                payload: kick.payload.clone(),
-                at_unix: now,
-            })
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal kick: {e}")))?;
-    }
+        .collect();
     let spec_json = serde_json::to_value(spec)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec serialize: {e}")))?;
+    // The pinned execute task, unpinned here: the admission picks the pod and
+    // pins it. `live_connection` carries the trigger's full signal spec so the
+    // worker recovers the protocol + connection knobs and expects a caller.
+    let task = crate::task_kinds::execute::execution_task_spec(
+        &state.pg_pool,
+        weft_task_store::TaskKind::Execute,
+        project_id,
+        color,
+        &definition_hash,
+        Some(tenant),
+        None,
+        Some(spec_json),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live task spec: {e}")))?;
 
-    // Atomic admit-by-insert; if every worker is memory-saturated, spawn
-    // another and retry (bounded). The first attempt usually wins
-    // (ensure_live_worker already guaranteed a pod exists).
+    // Atomic admit-and-birth; if every worker is memory-saturated, nothing was
+    // written: spawn another pod and retry (bounded). The first attempt
+    // usually wins (ensure_live_worker already guaranteed a pod exists).
     let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
     loop {
-        if let Some(pod) = crate::task_kinds::execute::admit_live_execution(
-            &state.pg_pool,
-            project_id,
-            color,
-            &definition_hash,
-            Some(tenant),
-            spec_json.clone(),
-            weft_platform_traits::SATURATION_MEM_FRACTION,
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("admit live exec: {e}")))?
+        use weft_task_store::tasks::LiveAdmitOutcome;
+        match state
+            .journal
+            .start_live_execution(
+                &start,
+                &kick_events,
+                task.clone(),
+                weft_platform_traits::SATURATION_MEM_FRACTION,
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("admit live exec: {e}")))?
         {
-            return Ok(pod);
+            LiveAdmitOutcome::Admitted(pod) | LiveAdmitOutcome::AlreadyAdmitted(pod) => {
+                return Ok(pod);
+            }
+            LiveAdmitOutcome::Saturated => {}
         }
         // Every worker is memory-saturated: spawn another and retry.
         spawn_worker_pod(state, project_id, tenant).await?;
@@ -1516,9 +1623,26 @@ async fn ensure_live_worker(
     project_id: &str,
     tenant: &str,
 ) -> Result<(), (StatusCode, String)> {
-    if weft_task_store::worker_pod::has_live_for_project(&state.pg_pool, project_id)
+    // "Alive" means alive ON THE CURRENT IMAGE: a stale-image survivor
+    // cannot be admitted a new live execution (the atomic admit filters
+    // on the hash), so it must not satisfy this check either, or the
+    // handshake would skip the spawn and then find no admittable pod.
+    let want_hash = state
+        .projects
+        .running_binary_hash(
+            project_id
+                .parse::<uuid::Uuid>()
+                .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?,
+        )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_binary_hash: {e}")))?;
+    if weft_task_store::worker_pod::has_live_for_project(
+        &state.pg_pool,
+        project_id,
+        want_hash.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
     {
         return Ok(());
     }
@@ -1527,9 +1651,13 @@ async fn ensure_live_worker(
     let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
     loop {
         tokio::time::sleep(LIVE_SPAWN_POLL).await;
-        if weft_task_store::worker_pod::has_live_for_project(&state.pg_pool, project_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
+        if weft_task_store::worker_pod::has_live_for_project(
+            &state.pg_pool,
+            project_id,
+            want_hash.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
         {
             return Ok(());
         }
@@ -1553,28 +1681,27 @@ async fn spawn_worker_pod(
     project_id: &str,
     tenant: &str,
 ) -> Result<(), (StatusCode, String)> {
-    // Worker placement: shared namespace for no-infra projects, the
-    // project's own namespace for infra projects.
-    let has_infra = state
-        .projects
-        .project_has_infra(project_id)
+    // Worker placement via the single resolver (source-declares-infra
+    // AND its own namespace exists -> project namespace, else shared).
+    let placement = crate::placement::resolve_worker_placement(state, project_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("has_infra lookup: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("placement lookup: {e}")))?
         .ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
             "project not found; may be unregistered".into(),
         ))?;
-    let namespace = crate::project_namespace::worker_namespace(has_infra, tenant, project_id);
+    let namespace = placement.namespace;
     weft_task_store::tasks::enqueue_dedup(
         &state.pg_pool,
         weft_task_store::tasks::NewTask {
-            kind: weft_task_store::TaskKind::SpawnPod,
+            kind: weft_task_store::TaskKind::SpawnPod.into(),
             target: weft_task_store::tasks::TaskTarget::Dispatcher,
             project_id: Some(project_id.to_string()),
             dedup_key: Some(format!("{project_id}:spawn")),
             color: None,
             tenant_id: Some(tenant.to_string()),
             target_pod_name: None,
+            binary_hash: None,
             payload: serde_json::to_value(weft_task_store::SpawnPodPayload {
                 project_id: project_id.to_string(),
                 tenant: tenant.to_string(),
@@ -1589,45 +1716,30 @@ async fn spawn_worker_pod(
     Ok(())
 }
 
-/// Clean up after a live-connection setup that failed AFTER
-/// `prepare_live_execution` journaled `ExecutionStarted` and admitted the
-/// pinned execute task. Delete the still-pending execute task (the task row IS
-/// the slot, so deleting it frees the slot) and learn who, if anyone, will run
-/// this color. Then journal the cancel terminal ONLY if no worker will run it,
-/// routed through the canonical guarded writer (`journal_cancel_terminals`
-/// skips if a terminal already exists). If a worker CLAIMED the task in the
-/// commit-but-Err race, it owns the run AND its own terminal, so we record
-/// nothing (recording a cancel would stack a second, contradictory terminal on
-/// a color the worker is finishing). Shared by every post-admission failure
-/// path in `connect_live` (prepare error, DNS wait timeout).
-async fn cleanup_failed_live_setup(state: &DispatcherState, color: uuid::Uuid) {
-    use weft_task_store::tasks::SetupFailureOutcome;
-    match weft_task_store::tasks::delete_pending_live_execution(&state.pg_pool, &color.to_string())
+/// Tear down a live execution whose setup failed AFTER admission (the DNS
+/// wait): `Journal::cancel_never_claimed_execution` deletes the still-pending
+/// execute task (the task row IS the slot, so deleting it frees the slot) and
+/// journals the cancel terminals, in ONE transaction, so "task deleted" and
+/// "cancel journaled" can never disagree. If a worker CLAIMED the task in the
+/// commit-but-Err race, it owns the run AND its own terminal, so nothing is
+/// cancelled. On error, nothing was torn down: the color still HAS its task
+/// row, which is exactly the state the orphan-task sweep reconciles, so the
+/// failure is loud but leaves only reclaimable state.
+async fn teardown_unclaimed_live_execution(state: &DispatcherState, color: uuid::Uuid) {
+    if let Err(e) = state
+        .journal
+        .cancel_never_claimed_execution(
+            color,
+            "live-connection setup failed; no worker run was created",
+        )
         .await
     {
-        Ok(SetupFailureOutcome::NoWorkerWillRun) => {
-            if let Err(ce) = crate::api::execution::journal_cancel_terminals(
-                state,
-                color,
-                "live-connection setup failed; no worker run was created",
-            )
-            .await
-            {
-                tracing::warn!(
-                    target: "weft_dispatcher::signal",
-                    color = %color, error = %ce,
-                    "failed to journal cancel terminal for a failed live setup"
-                );
-            }
-        }
-        // A worker owns the run and its own terminal: nothing to do.
-        Ok(SetupFailureOutcome::WorkerOwnsIt) => {}
-        Err(de) => tracing::warn!(
+        tracing::warn!(
             target: "weft_dispatcher::signal",
-            color = %color, error = %de,
-            "failed to clean up a failed live setup; the orphan sweep reconciles if a \
-             task was left on a dead pod"
-        ),
+            color = %color, error = %e,
+            "failed to tear down a failed live setup; the execution keeps its task row, \
+             which the orphan sweep reconciles"
+        );
     }
 }
 
@@ -1689,9 +1801,13 @@ async fn wait_for_pod_dns(pod_name: &str, namespace: &str) -> Result<(), (Status
 /// listener up just to render its display).
 pub async fn display_signal(
     State(state): State<DispatcherState>,
-    _headers: HeaderMap,
+    caller: CallerTenant,
     Path((project_id, node_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let id = project_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?;
+    authorize_project(&state, &caller.0, id).await?;
     let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
     // Resolve the pod holding this signal; if none is live (reaped while
     // idle), 503 rather than spinning a listener up just to render the
@@ -1722,10 +1838,14 @@ pub struct ActionBody {
 /// in-memory state).
 pub async fn action_signal(
     State(state): State<DispatcherState>,
-    _headers: HeaderMap,
+    caller: CallerTenant,
     Path((project_id, node_id)): Path<(String, String)>,
     Json(body): Json<ActionBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let id = project_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?;
+    authorize_project(&state, &caller.0, id).await?;
     let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
     // Resolve the pod holding this signal; 503 if reaped (actions are
     // only meaningful against the live in-memory state of the holder).
@@ -1777,7 +1897,7 @@ async fn lookup_signal_token_for_node(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))
 }
 
-/// Project-management auth: caller must present an api_token whose
+/// Project-management auth: caller must present a signal token whose
 /// scope includes this project. Distinct from per-signal fire auth
 /// (the api_key gate); inspector actions are project-administrative.
 #[cfg(test)]
@@ -1902,6 +2022,19 @@ mod public_url_tests {
     }
 
     #[test]
+    fn live_connection_url_carries_connect_prefix() {
+        // A live-connection kind (api_endpoint) is reachable ONLY via
+        // /connect/...; the displayed URL must carry that prefix, unlike a
+        // plain public fire.
+        let mut s = fresh("public_entry", Some("/alice/chat"));
+        s.spec_json = r#"{"kind":"api_endpoint","config":{},"consumer_kind":null}"#.into();
+        assert_eq!(
+            s.public_url("http://localhost:9999"),
+            Some("http://localhost:9999/connect/alice/chat".into())
+        );
+    }
+
+    #[test]
     fn public_entry_strips_trailing_slash_on_base() {
         let s = fresh("public_entry", Some("/foo"));
         assert_eq!(
@@ -1961,13 +2094,13 @@ mod connect_url_tests {
         let url = build_pod_gateway_url(
             "http://127-0-0-1.nip.io:9097",
             "wp-abc",
-            "wm-project-t--p",
+            "wft-project-t--p",
             "chat",
             "v1.aaa.bbb",
         );
         assert_eq!(
             url,
-            "http://wp-abc.127-0-0-1.nip.io:9097/wm-project-t--p/chat?wct=v1.aaa.bbb"
+            "http://wp-abc.127-0-0-1.nip.io:9097/wft-project-t--p/chat?wct=v1.aaa.bbb"
         );
     }
 
@@ -1987,5 +2120,116 @@ mod connect_url_tests {
     fn defaults_scheme_when_missing() {
         let url = build_pod_gateway_url("live.example.com", "p", "n", "x", "t");
         assert_eq!(url, "https://p.live.example.com/n/x?wct=t");
+    }
+}
+
+/// Layer-1 tests for the `can_cancel` authorization gate (the C1 cross-tenant
+/// fix). The cancel path reaches sibling signals of the same color, so the gate
+/// must enforce: SAME TENANT (the outer wall, always) + covered project + no tag
+/// restriction. A pure function over `(SignalToken, SignalRegistration)`, so no
+/// DB is needed. Without these, the tenant predicate could be reverted and the
+/// suite would still pass (the enumeration test only exercises token CRUD).
+#[cfg(test)]
+mod can_cancel_tests {
+    use super::TokenScope;
+    use crate::journal::{SignalRegistration, SignalToken};
+
+    fn token(tenant: &str, projects: Vec<uuid::Uuid>, tags: Vec<String>) -> TokenScope {
+        TokenScope {
+            row: SignalToken {
+                id: uuid::Uuid::nil(),
+                token_hash: "hash".into(),
+                recognizer: "wft-test-…".into(),
+                tenant_id: tenant.into(),
+                name: None,
+                allowed_projects: projects,
+                allowed_tags: tags,
+                created_at: 0,
+            },
+        }
+    }
+
+    fn signal(tenant: &str, project: &str) -> SignalRegistration {
+        SignalRegistration {
+            token: "s".into(),
+            tenant_id: tenant.into(),
+            project_id: project.into(),
+            color: None,
+            node_id: "n".into(),
+            is_resume: false,
+            spec_json: "{}".into(),
+            consumer_kind: None,
+            tags: vec![],
+            consumer_payload: None,
+            surface_kind: "public_entry".into(),
+            mount_path: None,
+            auth_kind: "none".into(),
+            auth_config: None,
+            kind_state: serde_json::Value::Object(Default::default()),
+        }
+    }
+
+    #[test]
+    fn cross_tenant_is_not_same_tenant_even_with_wildcard_scope() {
+        // A tenant-A token is NOT same-tenant with a tenant-B signal, regardless of
+        // how wide its project/tag scope is. The handler maps `!same_tenant` to a
+        // 404 (identical to a nonexistent token), so a cross-tenant token is not a
+        // distinguishable "forbidden" that would leak its existence on another
+        // account.
+        let a = token("tenant-a", vec![], vec![]);
+        assert!(
+            !a.same_tenant(&signal("tenant-b", "proj-1")),
+            "cross-tenant signal must not be same-tenant (handler returns 404)"
+        );
+    }
+
+    #[test]
+    fn same_tenant_wildcard_token_can_cancel() {
+        let a = token("tenant-a", vec![], vec![]);
+        let sig = signal("tenant-a", "proj-1");
+        assert!(a.same_tenant(&sig));
+        assert!(a.can_cancel_within_tenant(&sig), "same-tenant wildcard token may cancel");
+    }
+
+    #[test]
+    fn project_scoped_token_is_not_same_tenant_across_tenants() {
+        // A tenant-A token scoped to a project id STILL is not same-tenant with that
+        // same id under tenant B: the tenant wall is a 404 checked before project
+        // scope, so a matching project id can never let a token reach across.
+        let pid = uuid::Uuid::from_u128(1);
+        let a = token("tenant-a", vec![pid], vec![]);
+        assert!(
+            !a.same_tenant(&signal("tenant-b", &pid.to_string())),
+            "tenant wall (404) wins over a matching project id"
+        );
+        let own = signal("tenant-a", &pid.to_string());
+        assert!(a.same_tenant(&own));
+        assert!(a.can_cancel_within_tenant(&own), "same tenant + covered project may cancel");
+    }
+
+    #[test]
+    fn project_scoped_token_cannot_cancel_uncovered_project() {
+        let covered = uuid::Uuid::from_u128(1);
+        let other = uuid::Uuid::from_u128(2);
+        let a = token("tenant-a", vec![covered], vec![]);
+        let sig = signal("tenant-a", &other.to_string());
+        assert!(a.same_tenant(&sig), "same tenant, so it is a 403 (scope), not a 404");
+        assert!(
+            !a.can_cancel_within_tenant(&sig),
+            "a project-scoped token can't cancel outside its projects (403)"
+        );
+    }
+
+    #[test]
+    fn tag_scoped_token_can_never_cancel() {
+        // A tag restriction means the token sees a sub-project SLICE, so it must not
+        // cancel (cancel reaches sibling signals of other tags in the same color).
+        let a = token("tenant-a", vec![], vec!["support".into()]);
+        let sig = signal("tenant-a", "proj-1");
+        assert!(a.same_tenant(&sig));
+        assert!(
+            !a.can_cancel_within_tenant(&sig),
+            "a tag-scoped token can never cancel (403)"
+        );
     }
 }

@@ -174,7 +174,6 @@ The compiler discovers nodes by walking the catalog. Adding one is a folder with
 
 - **Build something.** [docs/getting-started.md](./docs/getting-started.md).
 - **Author a node.** [docs/authoring-nodes.md](./docs/authoring-nodes.md).
-- **Understand the principles.** [DESIGN.md](./DESIGN.md) is the opinions behind every decision in the language.
 - **See what it's for.** [docs/target-use-cases.md](./docs/target-use-cases.md).
 - **Contribute.** [CONTRIBUTING.md](./CONTRIBUTING.md).
 - **Join in, share a project, argue with me.** [Discord](https://discord.com/invite/FGwNu6mDkU).

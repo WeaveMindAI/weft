@@ -10,6 +10,12 @@
 //!   - Predictable: matches the AWS / GCP / Kubernetes label-value
 //!     convention so users get the same constraints they expect.
 
+/// The reserved config key that carries a node's tags. The ONE definition; the
+/// compiler (validation + reserved-key allow-list) and the runtime tag reader
+/// reference this instead of re-spelling the literal.
+/// SYNC: TAGS_CONFIG_KEY <-> packages/weft-graph/src/webview/lib/node-tags.ts (TAGS_CONFIG_KEY)
+pub const TAGS_CONFIG_KEY: &str = "_tags";
+
 const MAX_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

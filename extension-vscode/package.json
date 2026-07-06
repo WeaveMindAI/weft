@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, AI streaming edits.",
-  "version": "0.2.106",
+  "version": "0.2.125",
   "publisher": "weavemind",
   "engines": {
     "vscode": "^1.90.0"
@@ -14,7 +14,7 @@
   "activationEvents": [
     "onStartupFinished"
   ],
-  "main": "./out/extension.js",
+  "main": "./out/extension-vscode/src/extension.js",
   "icon": "media/weft-icon.png",
   "contributes": {
     "languages": [
@@ -73,6 +73,12 @@
         "icon": "$(clear-all)"
       },
       {
+        "command": "weft.loadMoreExecutions",
+        "title": "Load more",
+        "category": "Weft",
+        "icon": "$(ellipsis)"
+      },
+      {
         "command": "weft.refreshProjects",
         "title": "Refresh",
         "category": "Weft",
@@ -107,6 +113,12 @@
       ]
     },
     "menus": {
+      "commandPalette": [
+        {
+          "command": "weft.loadMoreExecutions",
+          "when": "false"
+        }
+      ],
       "view/title": [
         {
           "command": "weft.refreshProjects",
@@ -137,12 +149,12 @@
         },
         {
           "command": "weft.viewExecution",
-          "when": "view == weft.executions && viewItem =~ /^weftExecution/",
+          "when": "view == weft.executions && viewItem =~ /^weftExecution-/",
           "group": "inline@1"
         },
         {
           "command": "weft.deleteExecution",
-          "when": "view == weft.executions && viewItem =~ /^weftExecution/",
+          "when": "view == weft.executions && viewItem =~ /^weftExecution-/",
           "group": "inline@2"
         }
       ]

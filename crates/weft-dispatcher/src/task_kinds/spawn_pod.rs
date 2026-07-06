@@ -58,19 +58,27 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
                 )
             })?;
 
-        // Idempotency: if a live pod already exists, nothing to do.
-        // Stale-image handling is the sync handler's job
-        // (`replace_stale_worker_if_needed` kills + waits for fresh
-        // spawn BEFORE enqueueing any task), so by the time
-        // spawn_pod runs the alive pod (if any) is already on the
-        // right hash.
-        if weft_task_store::worker_pod::has_live_for_project(
+        // Idempotency: if an ADMITTABLE pod already exists, nothing to
+        // do. "Admittable" is the ONE predicate every spawn-enqueuer
+        // uses (the cold-start sweep, the live-connect all-saturated
+        // loop): alive/spawning, not draining, below memory saturation,
+        // on the CURRENT image. Anything weaker here starves a real
+        // request: an any-alive check would let a memory-saturated pod
+        // (the horizontal scale-up trigger) or a stale-image survivor
+        // (which can no longer claim hash-stamped work) suppress the
+        // very spawn that was enqueued because of it. A `spawning` pod
+        // counts (pressure 0 until its first heartbeat), so a booting
+        // worker absorbs the burst instead of a spawn stampede.
+        if weft_task_store::worker_pod::pick_admittable_for_project(
             &state.pg_pool,
             &payload.project_id,
+            weft_platform_traits::SATURATION_MEM_FRACTION,
+            Some(&want_hash),
         )
         .await?
+        .is_some()
         {
-            return Ok(serde_json::json!({"skipped": "pod_already_alive"}));
+            return Ok(serde_json::json!({"skipped": "admittable_pod_exists"}));
         }
 
         // Deterministic pod name from task id. Two attempts of the

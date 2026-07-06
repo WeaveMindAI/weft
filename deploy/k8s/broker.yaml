@@ -68,13 +68,31 @@ spec:
               value: "9090"
             - name: WEFT_BROKER_AUDIENCE
               value: "weft-broker"
-            - name: WEFT_TENANT_NS_PREFIX
-              value: "wm-"
             - name: WEFT_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: weft-postgres-credentials
                   key: WEFT_DATABASE_URL
+            # Object-store slot: the broker's runtime-file plane (ctx.storage)
+            # writes bytes to this bucket. Points at the bundled SeaweedFS in
+            # weft-db; substituted from the daemon's template vars (an operator
+            # overrides them via env to point at their own S3 endpoint).
+            - name: WEFT_OBJECT_STORE_ENDPOINT
+              value: "${WEFT_OBJECT_STORE_ENDPOINT}"
+            - name: WEFT_OBJECT_STORE_BUCKET
+              value: "${WEFT_OBJECT_STORE_BUCKET}"
+            - name: WEFT_OBJECT_STORE_REGION
+              value: "${WEFT_OBJECT_STORE_REGION}"
+            - name: WEFT_OBJECT_STORE_ACCESS_KEY
+              value: "${WEFT_OBJECT_STORE_ACCESS_KEY}"
+            - name: WEFT_OBJECT_STORE_SECRET_KEY
+              value: "${WEFT_OBJECT_STORE_SECRET_KEY}"
+            # The browser/host-reachable endpoint presigned DOWNLOAD urls are
+            # signed for (the in-cluster I/O endpoint above is unreachable from a
+            # browser / the host). Empty = presign against the I/O endpoint (the
+            # GCS case, where it is already public).
+            - name: WEFT_OBJECT_STORE_PUBLIC_ENDPOINT
+              value: "${WEFT_OBJECT_STORE_PUBLIC_ENDPOINT}"
           readinessProbe:
             httpGet:
               path: /health
@@ -119,37 +137,40 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # Worker / storage pods reach the broker from three namespace flavors:
-    #   - `weft.dev/role=tenant` (storage box lives there)
+    # Worker pods reach the broker from two namespace flavors:
     #   - `weft.dev/role=project` (an INFRA project's worker runs in its
     #     own per-project namespace, next to its infra pods)
     #   - `weft.dev/role=shared-workers` (a NO-INFRA project's worker runs
     #     in the single shared worker namespace; that namespace maps to no
     #     tenant, so its workers resolve their tenant per-pod, but they
     #     still call the broker like any worker and must be admitted here)
-    # The pod label filter narrows to the roles allowed to call the
-    # broker. The storage box relays caller tokens to
-    # /storage/authorize, so it must be admitted here like the others.
+    # Storage is no longer here: it moved to a pooled pod in the
+    # control-plane namespace (admitted by the system rule below).
     - from:
         - namespaceSelector:
             matchExpressions:
               - key: weft.dev/role
                 operator: In
-                values: [tenant, project, shared-workers]
+                values: [project, shared-workers]
           podSelector:
             matchExpressions:
               - key: weft.dev/role
                 operator: In
-                values: [worker, storage]
+                values: [worker]
       ports:
         - protocol: TCP
           port: 9090
-    # The POOLED listener + infra-supervisor are trusted control-plane
-    # services: they run in the control-plane namespace
-    # (`weft.dev/role=system`), not per tenant, and serve all tenants.
-    # Admit them from there. The pod-role filter still constrains WHICH
-    # control-plane pods may call (not, e.g., the dispatcher, which goes
-    # direct to Postgres and never uses the broker).
+    # The POOLED listener + infra-supervisor pods are trusted control-plane
+    # services: they run in the control-plane namespace (`weft.dev/role=system`),
+    # not per tenant, and serve all tenants. Admit them from there. The pod-role
+    # filter still constrains WHICH control-plane pods may call:
+    #   - listener / infra-supervisor: relay caller tokens for their ops.
+    #   - dispatcher: goes direct to Postgres for its OWN data, and fronts the
+    #     `weft files` CLI storage surface (it resolves the acting tenant and
+    #     proxies each verb to the broker, which owns the bucket + metadata).
+    # (There is NO separate `storage` pod role anymore: file downloads are
+    # short-lived presigned URLs straight to the object store, so no pod relays
+    # bytes or calls a `/storage/authorize` endpoint.)
     - from:
         - namespaceSelector:
             matchLabels:
@@ -158,7 +179,7 @@ spec:
             matchExpressions:
               - key: weft.dev/role
                 operator: In
-                values: [listener, infra-supervisor]
+                values: [listener, infra-supervisor, dispatcher]
       ports:
         - protocol: TCP
           port: 9090
@@ -213,3 +234,17 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # Object store (the runtime-file bucket) + any external endpoint the broker
+    # legitimately calls. The store is EXTERNAL to the cluster (reached over S3 by
+    # its configured endpoint), so the broker reaches OUT to it.
+    # The broker is a trusted control-plane component (it holds the bucket creds); a
+    # compromised broker is already game-over, so it gets plain internet egress here
+    # rather than a hand-maintained per-host allowlist. The cluster-internal CIDRs
+    # stay excluded so this doesn't become a lateral-movement path to other pods.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - ${WEFT_CLUSTER_POD_CIDR}
+              - ${WEFT_CLUSTER_SERVICE_CIDR}
+              - 169.254.0.0/16

@@ -908,7 +908,10 @@ mod tests {
         assert_round_trip("");
         assert_round_trip("\n");
         assert_round_trip("# just a comment\n");
-        assert_round_trip("# Project: fossil\n# Description: also fossil\n");
+        // Top-level `#` lines are plain comments with no special meaning (there is
+        // no project header; a group's `# Description:` is semantic only as a
+        // group's first BODY line, not at file top). They round-trip verbatim.
+        assert_round_trip("# any comment\n# another comment\n");
     }
 
     /// Soak: a dependency-free LCG drives a generator that assembles random

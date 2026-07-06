@@ -573,6 +573,144 @@ seeds `LiveConnectionConfig`):
 A disconnect's meaning is derived purely from this one axis, there is no
 separate disconnect setting to contradict it.
 
+## Storage: `ctx.storage`
+
+A running node can read and write files through `ctx.storage`. Every
+write takes a **scope** that decides WHERE the file lives and, crucially,
+**how long it lives**. Pick the scope by how long you need the data, not
+as an afterthought: the scope is the file's lifetime contract.
+
+| Scope                      | Lives under              | Lifetime |
+|----------------------------|--------------------------|----------|
+| `StorageScope::Execution`  | `exec/<run>/`            | One run. Swept when the run terminates, UNLESS you flag it kept (a kept file survives until its keep-TTL or an explicit clean). The default scope. |
+| `StorageScope::Project`    | `project/<project_id>/`  | Tied to the PROJECT. Outlives individual runs and is shared across the project's executions, but is **deleted when the project is deleted** (or by an explicit clean). |
+| `StorageScope::Shared { name }` | `shared/<name>/`    | Tied to the OWNER (tenant), not any project. Survives runs AND project deletion. Projects that name the same `name` meet in the same space; first use auto-grants it. |
+
+The lifetime distinction is the thing to get right:
+
+- Use **`Execution`** for scratch a run needs and nothing else cares about
+  after (intermediate files, temp downloads). It cleans itself up.
+- Use **`Project`** for a project's own persistent state (a cache, an
+  index, accumulated outputs) that should exist for as long as the project
+  does and **go away with it**. Deleting the project reclaims these files;
+  that is intended, not a bug.
+- Use **`Shared { name }`** for data that must **outlive the project** (a
+  dataset the owner reuses across projects, a model the user paid to build,
+  anything they would be upset to lose when they delete a project). A
+  `Shared` file is the owner's, addressed by a name they choose, and a
+  project's deletion never touches it.
+
+So "do I want this file to survive deleting the project?" is answered
+entirely by the scope on the write call: `Project` = no, `Shared` = yes.
+There is no separate setting; changing the scope argument is the whole
+knob. The files are reachable independently of the editor (e.g. the `weft`
+CLI lists/downloads/removes them by scope), so `Shared` data a project
+wrote remains accessible after the project is gone.
+
+## Form-field nodes: `form_field_specs.json`
+
+A form-field node (a human trigger/query: the user fills a form, its
+fields become ports) does NOT hardcode its ports in `metadata.json`.
+Instead it declares a VOCABULARY of field types in a
+`form_field_specs.json` file, and the node's real ports are DERIVED from
+whatever fields the graph author configured, at parse/enrich time. So a
+`HumanTrigger` with an `approve_reject` field named `review` gets two
+Boolean outputs `review_approved` / `review_rejected` automatically; the
+author never writes those ports.
+
+### Turning it on
+
+Set `hasFormSchema: true` in the node's `metadata.json` `features`, and
+ship a `form_field_specs.json` (see resolution below). That flag is the
+gate: the enrich pass only materializes form ports for nodes that
+declare it.
+
+```json
+// metadata.json
+{ "type": "HumanTrigger", "features": { "hasFormSchema": true }, ... }
+```
+
+### The spec file
+
+Each entry defines one field type: its `field_type` token (what a
+graph author's field `fieldType` must equal), a `render` hint for the
+task UI, the config keys the editor collects, and the ports the field
+adds. `{key}` in a `name_template` is substituted with the field's
+user-supplied key; `T_Auto` requests a per-field type variable.
+
+```json
+[
+  {
+    "field_type": "approve_reject",
+    "label": "Approve / Reject",
+    "render": { "component": "buttons", "source": "static" },
+    "required_config": [],
+    "optional_config": ["label", "approveLabel", "rejectLabel"],
+    "adds_inputs": [],
+    "adds_outputs": [
+      { "name_template": "{key}_approved", "port_type": "Boolean" },
+      { "name_template": "{key}_rejected", "port_type": "Boolean" }
+    ]
+  },
+  {
+    "field_type": "text_input",
+    "label": "Text input",
+    "render": { "component": "text" },
+    "adds_outputs": [ { "name_template": "{key}", "port_type": "String" } ]
+  }
+]
+```
+
+The on-disk file may use snake_case (`field_type`, `adds_outputs`,
+`name_template`, `port_type`); the loader accepts that AND the camelCase
+wire form, so you can write either.
+
+### Where the file lives (the resolution rule)
+
+The filename defaults to `form_field_specs.json` (override per node with
+`"formFieldSpecsRef": "..."` in `metadata.json`). It is looked up
+**most-specific first**:
+
+1. **The node's own directory** (beside its `metadata.json`).
+2. **The package root** (the dir with `package.toml`).
+
+So:
+
+- **A bare node** (a dir with `metadata.json` and no `package.toml`, the
+  dir IS the node) keeps its `form_field_specs.json` in that same dir.
+- **A package member** (a subdir under a `package.toml` root) inherits
+  ONE shared `form_field_specs.json` at the package root, which all
+  members see. This is why the stdlib `human` package puts the file at
+  `catalog/human/form_field_specs.json` and its `query/` and `trigger/`
+  members share it.
+- **A member can override** the shared file by dropping its own
+  `form_field_specs.json` in its member dir; the local file wins.
+
+```
+catalog/human/                     # package (has package.toml)
+  package.toml
+  form_field_specs.json            # shared by BOTH members
+  form_helpers.rs                  # shared: fields -> FormSchema/output mapping
+  trigger/  metadata.json          # HumanTrigger  (hasFormSchema: true)
+  query/    metadata.json          # HumanQuery    (hasFormSchema: true)
+
+catalog/my_form_node/              # bare node (no package.toml)
+  metadata.json                    # hasFormSchema: true
+  mod.rs
+  form_field_specs.json            # beside metadata.json
+```
+
+### What derivation reads (and what it ignores)
+
+Port derivation reads ONLY each configured field's `fieldType` and
+`key`, matches the spec by `field_type`, and emits its `adds_inputs` /
+`adds_outputs` with `{key}` resolved. It does NOT read a field's
+`render` or `config` from the graph source: those are inherited from the
+spec (a field may override `render`, but it need not, and the editor
+emits the minimal `{ fieldType, key }` so the source stays lean). A
+field's `key` becomes a port name, so it must be a legal identifier
+(`[A-Za-z_][A-Za-z0-9_]*`).
+
 ## Infra nodes: long-running backing services
 
 Some nodes need a long-running process the user can't easily run

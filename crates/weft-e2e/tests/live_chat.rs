@@ -11,8 +11,9 @@ async fn websocket_echoes_with_turn_counter() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("live_chat", disp.clone()).await?;
 
-    // Mount paths are a global namespace; use a per-run-unique one so leftover
-    // projects / parallel runs never collide on it.
+    // Mount paths are namespaced per tenant; still use a per-run-unique one so
+    // leftover projects / parallel runs of the SAME tenant never collide.
+    // `unique_live_path` returns the tenant-namespaced callable path.
     let path = project.unique_live_path()?;
 
     // Live triggers must be activated (build + register + enable the endpoint).

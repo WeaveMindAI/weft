@@ -46,6 +46,7 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
             state,
             &payload.token,
             &signal.project_id,
+            &signal.tenant_id,
             payload.payload,
             Some(&nonce),
         )

@@ -1,4 +1,3 @@
-# Project: e2e_bus_chat
 # Two nodes converse over a bus: the host opens a bus and emits its marker, the
 # guest joins it; they exchange a scripted back-and-forth, then the host closes
 # the bus. The rig asserts a bus conversation happened (>=2 participants, >=1

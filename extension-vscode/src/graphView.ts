@@ -16,7 +16,8 @@ import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { textTabsForPath } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from './shared/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from './shared/protocol';
+import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
 import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
 
@@ -28,7 +29,7 @@ export class GraphViewController {
   /// from, fetched once from the dispatcher at panel boot. The
   /// webview CSP allows this origin in img-src/media-src so an
   /// <img>/<video> streams directly from the box (range requests,
-  /// seeking), exactly as the cloud web app will. Empty if the fetch
+  /// seeking), the same way any web host would. Empty if the fetch
   /// failed (older dispatcher / offline): previews then can't load,
   /// which surfaces as the node's fallback rather than a silent break.
   private storageOrigin = '';
@@ -769,148 +770,20 @@ export class GraphViewController {
     }
   }
 
-  /// Shared trigger-deactivation picker. Used by the standalone
-  /// Deactivate button AND by every infra verb that takes triggers
-  /// down as a side effect (Stop / Terminate / Upgrade). One UX
-  /// surface, one set of choices.
-  ///
-  /// Returns CLI flags (`--mode <m> --running-policy <p> [--grace <g>]`)
-  /// ready to splice into a dispatchVerb call, or `null` when the
-  /// user cancelled any step.
-  private async promptTriggerDeactivation(
-    verbHint: string,
-  ): Promise<string[] | null> {
-    const modes: Array<{
-      label: string;
-      detail: string;
-      mode: 'wipe' | 'hibernate' | 'park';
-    }> = [
-      {
-        label: 'Wipe',
-        detail:
-          'Drop every signal + cancel suspended runs. Reactivate is a fresh boot.',
-        mode: 'wipe',
-      },
-      {
-        label: 'Hibernate',
-        detail:
-          'Park submissions for a grace window, then refuse them. Project hidden from consumer enumeration the entire time.',
-        mode: 'hibernate',
-      },
-      {
-        label: 'Park',
-        detail:
-          'Park submissions indefinitely. Project visible to consumers; submissions drained on reactivate.',
-        mode: 'park',
-      },
-    ];
-    const modeChoice = await vscode.window.showQuickPick(modes, {
-      placeHolder: `${verbHint}: choose trigger-preservation mode`,
-      ignoreFocusOut: true,
-    });
-    if (!modeChoice) return null;
-
-    let runningPolicy: 'wait' | 'cancel';
-    if (modeChoice.mode === 'wipe') {
-      // Wipe forces cancel because waiting before wiping is
-      // contradictory (you've asked to drop everything anyway).
-      runningPolicy = 'cancel';
-    } else {
-      const runningPolicies: Array<{
-        label: string;
-        detail: string;
-        value: 'wait' | 'cancel';
-      }> = [
-        {
-          label: 'Wait for running executions to finish',
-          detail:
-            'Status flips to "deactivating": new fires already park; in-flight runs drain naturally; project becomes inactive once the last finishes. You can cancel running anytime.',
-          value: 'wait',
-        },
-        {
-          label: 'Cancel running executions immediately',
-          detail:
-            'Kills every running, non-suspended execution right away. Project flips to inactive at once.',
-          value: 'cancel',
-        },
-      ];
-      const runningChoice = await vscode.window.showQuickPick(
-        runningPolicies,
-        {
-          placeHolder: `${verbHint}: how should running executions be handled?`,
-          ignoreFocusOut: true,
-        },
-      );
-      if (!runningChoice) return null;
-      runningPolicy = runningChoice.value;
+  /// CLI flags for a trigger-deactivation spec chosen in the SHARED
+  /// webview picker (`DeactivationPicker`). The picker owns the UX +
+  /// business rules (wipe forces cancel, grace only for hibernate,
+  /// drain cap only with wait); this host just translates the spec
+  /// into `weft` flags.
+  private deactivationFlags(spec: DeactivationSpec): string[] {
+    const args = ['--mode', spec.mode, '--running-policy', spec.runningPolicy];
+    if (spec.mode === 'hibernate' && spec.graceMinutes !== undefined) {
+      args.push('--grace', String(spec.graceMinutes));
     }
-
-    const args = ['--mode', modeChoice.mode, '--running-policy', runningPolicy];
-    if (modeChoice.mode === 'hibernate') {
-      const grace = await vscode.window.showInputBox({
-        prompt:
-          'Hibernate grace window (minutes). Submissions arriving after this point are refused.',
-        value: '15',
-        ignoreFocusOut: true,
-        validateInput: (v) => {
-          const n = Number(v.trim());
-          if (!Number.isInteger(n) || n < 0) {
-            return 'Enter a non-negative integer (minutes).';
-          }
-          return null;
-        },
-      });
-      if (grace === undefined) return null;
-      args.push('--grace', String(Number(grace.trim())));
+    if (spec.drainTimeoutSecs !== undefined) {
+      args.push('--drain-timeout', String(spec.drainTimeoutSecs));
     }
     return args;
-  }
-
-  /// Read the project's current lifecycle.status. Failed reads
-  /// default to "not active" so the worst case is we skip the
-  /// deactivation prompt and let the dispatcher 412 if it disagrees.
-  private async projectIsActive(): Promise<boolean> {
-    const projectId = this.watchedProjectId;
-    if (!projectId) return false;
-    try {
-      const status = await this.client.get<{ status?: string }>(
-        `/projects/${projectId}/status`,
-      );
-      return status.status === 'active';
-    } catch {
-      return false;
-    }
-  }
-
-  /// Project-level infra Stop / Terminate. Surfaces the shared
-  /// deactivation picker when the project is Active; otherwise just
-  /// dispatches the bare verb.
-  private async confirmAndDispatchInfraVerb(
-    verb: 'stop' | 'terminate',
-  ): Promise<void> {
-    const active = await this.projectIsActive();
-    let deactivationArgs: string[] = [];
-    if (active) {
-      const picked = await this.promptTriggerDeactivation(`infra ${verb}`);
-      if (!picked) return;
-      deactivationArgs = picked;
-    }
-    void this.dispatchVerb('infra', [verb, ...deactivationArgs]);
-  }
-
-  /// Project-level infra Upgrade. Same trigger-deactivation flow as
-  /// Stop / Terminate when the project is Active. The project is left
-  /// deactivated after the upgrade; the user clicks Activate when ready
-  /// (no auto-reactivate: the user is here, it's their call).
-  private async confirmAndDispatchInfraUpgrade(): Promise<void> {
-    const active = await this.projectIsActive();
-    if (!active) {
-      void this.dispatchVerb('infra', ['upgrade']);
-      return;
-    }
-    const deactivationArgs = await this.promptTriggerDeactivation('infra upgrade');
-    if (!deactivationArgs) return;
-    void this.dispatchVerb('infra', ['upgrade', ...deactivationArgs]);
   }
 
   /// Per-node infra verb (stop / terminate) for partial-state
@@ -941,12 +814,6 @@ export class GraphViewController {
     // right-click stop on a NoOp-only node would silently do nothing).
     const args = verb === 'stop' ? ['node-stop', nodeId, '--force'] : ['node-terminate', nodeId];
     void this.dispatchVerb('infra', args);
-  }
-
-  private async runDeactivate(): Promise<void> {
-    const args = await this.promptTriggerDeactivation('deactivate');
-    if (!args) return;
-    void this.dispatchVerb('deactivate', args);
   }
 
   /// Cancel running while in `deactivating`. Shells out to
@@ -1051,14 +918,23 @@ export class GraphViewController {
       case 'infraStart':
         void this.dispatchVerb('infra', ['start']);
         break;
-      case 'infraRestart':
-        void this.dispatchVerb('infra', ['restart']);
-        break;
       case 'infraStop':
-        void this.confirmAndDispatchInfraVerb('stop');
+        void this.dispatchVerb('infra', [
+          'stop',
+          ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
+        ]);
         break;
       case 'infraTerminate':
-        void this.confirmAndDispatchInfraVerb('terminate');
+        void this.dispatchVerb('infra', [
+          'terminate',
+          ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
+        ]);
+        break;
+      case 'infraCancel':
+        void this.dispatchVerb('infra', ['cancel']);
+        break;
+      case 'cancelBuild':
+        void this.dispatchVerb('cancel-build', []);
         break;
       case 'infraNodeStop':
         // Route through the CLI like every other verb so the action
@@ -1074,7 +950,7 @@ export class GraphViewController {
         void this.dispatchVerb('activate', []);
         break;
       case 'deactivateProject':
-        void this.runDeactivate();
+        void this.dispatchVerb('deactivate', this.deactivationFlags(msg.spec));
         break;
       case 'reactivateProject':
         // Same CLI verb as activate; the CLI's own reactivate-
@@ -1098,10 +974,19 @@ export class GraphViewController {
         this.dismissErrorHandler?.();
         break;
       case 'resyncProject':
-        void this.dispatchVerb('resync', []);
+        // The picker's spec rides along when the project was Active
+        // (the CLI passes it as trigger-deactivation flags; the
+        // dispatcher 412s without them on an Active project).
+        void this.dispatchVerb(
+          'resync',
+          msg.spec ? this.deactivationFlags(msg.spec) : [],
+        );
         break;
       case 'infraUpgrade':
-        void this.confirmAndDispatchInfraUpgrade();
+        void this.dispatchVerb('infra', [
+          'upgrade',
+          ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
+        ]);
         break;
       case 'refreshStatus':
         void this.refreshActionAvailability();
@@ -1124,7 +1009,53 @@ export class GraphViewController {
       case 'resolveStoredFileUrl':
         void this.runResolveStoredFileUrl(msg.key, msg.requestId);
         break;
+      case 'editActiveSource':
+        void this.adoptActiveSource(msg.source);
+        break;
+      case 'replayExecution':
+        // Intentionally ignored by the VS Code host: replaying a past execution
+        // onto the canvas is a web-host affordance (its RightPanel history picker
+        // emits this). VS Code surfaces past executions through its own history
+        // UI, so it never wires the canvas replay. Listed explicitly (not dropped
+        // to default) so the exhaustive `never` check below stays a real guarantee
+        // that no NEW kind is silently ignored.
+        break;
+      default: {
+        // Every webview->host message kind must be handled explicitly. A silently
+        // dropped message is a contract break that only shows up as "the editor
+        // did nothing" with no trace. `never` here makes an unhandled kind a
+        // compile error; the runtime log covers a wire desync (webview newer than
+        // host) that TS can't catch.
+        const unhandled: never = msg;
+        console.error('[weft] unhandled webview message kind', (unhandled as { kind?: string }).kind);
+      }
     }
+  }
+
+  /// The webview's code panel edited the active file's `.weft` source directly.
+  /// Adopt `source` as the watched document's new text and re-parse: the parse
+  /// path posts a NON-fresh `parseResult`, so the editor adopts it as external
+  /// truth (canvas updates, pending ops re-apply) instead of rebuilding. The
+  /// mirror of a graph gesture: a graph edit writes the source, this is the
+  /// source writing the graph. Serialized on the doc's path so it can't race a
+  /// concurrent edit transaction to the same file.
+  private async adoptActiveSource(source: string): Promise<void> {
+    const doc = this.watchedDoc;
+    if (!doc) {
+      console.error('[weft] editActiveSource with no watched document');
+      return;
+    }
+    const key = doc.uri.fsPath;
+    try {
+      await this.serializeOnPath(key, () => this.writeTextRaw(doc.uri, source));
+    } catch (err) {
+      // The write lost the full-document range (buffer changed mid-write) or the
+      // save failed. Surface it and re-parse the live doc so the webview re-syncs
+      // to whatever the document actually holds now, rather than silently keeping
+      // the source it thinks it wrote.
+      console.error('[weft] editActiveSource write failed', err);
+    }
+    await this.triggerParse();
   }
 
   /// Fetch the storage origin the webview CSP must allow so media
@@ -1152,8 +1083,8 @@ export class GraphViewController {
   /// Inline preview (image display). Run the brokered handshake and
   /// hand the webview the box's public URL; the <img> streams the
   /// bytes DIRECTLY from the box (the CSP admits the storage origin;
-  /// the box does range requests, so this scales to video). Identical
-  /// to the cloud web app: the only thing that differs per deployment
+  /// the box does range requests, so this scales to video). The same
+  /// across hosts: the only thing that differs per deployment
   /// is the origin. Correlated by requestId. A 404 (expired/swept)
   /// becomes an `error` reply so the preview shows a fallback.
   private async runResolveStoredFileUrl(key: string, requestId: number): Promise<void> {
@@ -1649,85 +1580,5 @@ function randomNonce(): string {
   return out;
 }
 
-/// Set of allowed live-data kinds. New kinds: add the string here
-/// AND a render branch in ProjectNode.svelte. The type guard rejects
-/// anything else so a malformed payload never reaches the renderer.
-const LIVE_DATA_TYPES = ['text', 'image', 'progress', 'secret'] as const;
-type LiveDataType = (typeof LIVE_DATA_TYPES)[number];
-function isLiveDataType(v: unknown): v is LiveDataType {
-  return typeof v === 'string' && (LIVE_DATA_TYPES as readonly string[]).includes(v);
-}
-
-function isLiveDataItem(v: unknown): v is LiveDataItem {
-  if (!v || typeof v !== 'object') return false;
-  const o = v as Record<string, unknown>;
-  if (typeof o.label !== 'string') return false;
-  if (typeof o.data !== 'string' && typeof o.data !== 'number') return false;
-  if (!isLiveDataType(o.type)) return false;
-  if (o.action !== undefined) {
-    if (!o.action || typeof o.action !== 'object') return false;
-    const a = o.action as Record<string, unknown>;
-    if (typeof a.label !== 'string') return false;
-    if (typeof a.actionKind !== 'string') return false;
-  }
-  return true;
-}
-
-/** Convert the listener's signal /display JSON into the
- *  `LiveDataItem[]` shape the trigger node body panel renders.
- *
- *  The listener returns a free-form blob; the inspector knows
- *  about a few standard fields:
- *    - surface.kind  → "PublicEntry" / "TaskCallback"
- *    - surface.path  → for PublicEntry, the mount path
- *    - auth.kind     → "None" / "ApiKey"
- *    - auth.header_name → for ApiKey
- *    - secret        → plaintext, only present when listener still
- *                      holds a freshly-minted key
- */
-function signalDisplayToLiveItems(body: Record<string, unknown>): LiveDataItem[] {
-  const items: LiveDataItem[] = [];
-  const surface = body.surface as Record<string, unknown> | undefined;
-  if (surface && surface.kind === 'public_entry') {
-    const path = typeof surface.path === 'string' ? surface.path : '';
-    items.push({
-      type: 'text',
-      label: 'Path',
-      data: path === '' ? '/' : `/${path.replace(/^\//, '')}`,
-    });
-  }
-  const auth = body.auth as Record<string, unknown> | undefined;
-  if (auth && auth.kind === 'api_key') {
-    const header = typeof auth.header_name === 'string' ? auth.header_name : 'X-Api-Key';
-    items.push({ type: 'text', label: 'Auth header', data: header });
-  } else if (auth && auth.kind === 'none') {
-    items.push({ type: 'text', label: 'Auth', data: 'public (no key)' });
-  }
-  if (typeof body.secret === 'string' && body.secret.length > 0) {
-    items.push({
-      type: 'secret',
-      label: 'API key',
-      data: body.secret,
-      action: {
-        label: 'Regenerate',
-        actionKind: 'regenerate_api_key',
-        confirm: 'Regenerate the API key? The current key will stop working.',
-      },
-    });
-  } else if (auth && auth.kind === 'api_key') {
-    // Auth is api_key but the listener doesn't hold plaintext (pod
-    // restarted, original mint dropped). Show a placeholder text
-    // item with the regenerate button so the user can recover.
-    items.push({
-      type: 'text',
-      label: 'API key',
-      data: '(hidden by listener restart; click Regenerate to mint a new one)',
-      action: {
-        label: 'Regenerate',
-        actionKind: 'regenerate_api_key',
-        confirm: 'Mint a new API key? Replaces any current key.',
-      },
-    });
-  }
-  return items;
-}
+// isLiveDataItem + signalDisplayToLiveItems live in the shared weft-graph
+// package (imported above), so both hosts use one copy.

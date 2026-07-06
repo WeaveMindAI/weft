@@ -256,3 +256,47 @@ fn symlinked_marker_does_not_define_a_unit() {
          (staging/hash would drop the symlinked marker)",
     );
 }
+
+/// Write a `form_field_specs.json` with a single spec whose `field_type`
+/// is `tag` (so a test can tell WHICH file was resolved).
+fn write_specs(dir: &Path, tag: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("form_field_specs.json"),
+        format!(r#"[{{ "field_type": "{tag}", "label": "{tag}", "render": {{}} }}]"#),
+    )
+    .unwrap();
+}
+
+/// `form_field_specs.json` resolution: MOST-SPECIFIC wins. A package member
+/// inherits the package-ROOT file its siblings share, unless it drops its own
+/// file in its member dir (which overrides). A bare node reads the file beside
+/// its own metadata.json.
+#[test]
+fn form_field_specs_resolve_most_specific_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = tmp.path().join("nodes");
+
+    // Package with a root spec file and two members: one plain (inherits root),
+    // one that ships its own local spec (overrides).
+    let pkg = nodes.join("pack");
+    write_package_toml(&pkg, "pack");
+    write_specs(&pkg, "root_spec");
+    write_node(&pkg.join("inherits"), "Inherits");
+    write_node(&pkg.join("overrides"), "Overrides");
+    write_specs(&pkg.join("overrides"), "member_spec");
+
+    // A bare node with its own spec beside its metadata.json.
+    let bare = nodes.join("bare");
+    write_node(&bare, "Bare");
+    write_specs(&bare, "bare_spec");
+
+    let cat = FsCatalog::discover(&nodes).unwrap();
+
+    let field_type = |t: &str| {
+        cat.entry(t).unwrap().form_field_specs.first().map(|s| s.field_type.clone())
+    };
+    assert_eq!(field_type("Inherits"), Some("root_spec".into()), "member inherits package-root specs");
+    assert_eq!(field_type("Overrides"), Some("member_spec".into()), "member-local specs override the root");
+    assert_eq!(field_type("Bare"), Some("bare_spec".into()), "bare node reads its own specs");
+}
