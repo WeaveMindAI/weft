@@ -1,4 +1,5 @@
-FROM node:20-alpine
+# node >= 22 required: pnpm 11 uses node:sqlite internally
+FROM node:22-alpine
 
 RUN apk add --no-cache git
 # Pinned: pnpm@latest broke builds when v11 made unapproved

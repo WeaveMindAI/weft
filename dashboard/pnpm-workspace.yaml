@@ -1,2 +1,7 @@
 allowBuilds:
   esbuild: true
+
+# Hoist transitive deps: vite.config preserveSymlinks=true breaks pnpm's
+# strict symlink-based resolution for packages like esm-env. Lived in
+# .npmrc until pnpm 11 stopped reading pnpm settings from there.
+shamefullyHoist: true
