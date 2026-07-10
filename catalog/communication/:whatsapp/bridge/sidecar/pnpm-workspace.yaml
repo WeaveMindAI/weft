@@ -1,0 +1,10 @@
+# baileys resolves libsignal from a git repository; pnpm 11 blocks
+# git-hosted transitive dependencies by default.
+blockExoticSubdeps: false
+
+# These build scripts were always skipped (pnpm 10 default) and the
+# bridge works without them; keep them disabled explicitly so pnpm 11
+# doesn't hard-fail the install.
+allowBuilds:
+  baileys: false
+  protobufjs: false
