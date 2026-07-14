@@ -50,9 +50,9 @@ fn invalid_port_type_keeps_the_port_as_must_override_with_a_diagnostic() {
 #[test]
 fn test_basic_project() {
     let source = r#"
-# Description: A test project
+# A test project
 
-config = LlmConfig {
+config = OpenRouterConfig {
     model: "gpt-4"
 }
 
@@ -63,9 +63,9 @@ llm = Llm {
 llm.config = config.value
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
-    // `# Project:` / file-level `# Description:` are ordinary comments: the
-    // parsed definition carries no name/description (identity is the manifest
-    // filename; descriptions are per-group).
+    // File-top comments are ordinary comments: the parsed definition carries
+    // no name/description (identity is the manifest filename; descriptions
+    // are per-group, the first plain comment line of a group body).
     assert_eq!(result.nodes.len(), 2);
     assert_eq!(result.edges.len(), 1);
     // Connection direction: left = target input, right = source output
@@ -564,7 +564,7 @@ group_b = Group(data: String) -> (result: String) {
 #[test]
 fn test_nested_node_with_multiline_signature_in_group() {
     let source = "
-# Description: Test
+# Test
 
 outer = Group(
   data: Dict[String, Number]
@@ -697,7 +697,7 @@ c.data = b.response
 #[test]
 fn test_pack_with_require_one_of_in_group() {
     let source = "
-# Description: Test
+# Test
 
 grp = Group(
   notes: String?,
@@ -733,7 +733,7 @@ grp = Group(
 #[test]
 fn test_multiline_json_array_in_config() {
     let source = r#"
-# Description: Test
+# Test
 
 review = HumanQuery {
   _label: "Test"
@@ -1234,7 +1234,7 @@ fn test_empty_source() {
 #[test]
 fn test_comments_only() {
     let source = r#"
-# Description: Nothing here
+# Nothing here
 
 # Just comments
 # More comments
@@ -1566,7 +1566,7 @@ node = ExecPython(
 #[test]
 fn test_full_workflow_small() {
     let source = r#"
-# Description: Small end-to-end test
+# Small end-to-end test
 
 input = Text { value: "Hello world" }
 
@@ -1776,7 +1776,7 @@ fn file_ref_resolves_through_compile() {
     std::fs::write(dir.path().join("system.txt"), "you are a helpful poet").unwrap();
 
     let source = r#"
-poet = LlmConfig {
+poet = OpenRouterConfig {
     systemPrompt: @file("system.txt")
 }
 "#;
@@ -1797,7 +1797,7 @@ fn file_ref_on_connection_line_inside_group_resolves() {
 
     let source = r#"
 g = Group() -> () {
-    poet = LlmConfig
+    poet = OpenRouterConfig
     poet.systemPrompt = @file("sys.txt")
 }
 "#;
@@ -1830,7 +1830,7 @@ fn file_ref_surfaces_to_node_for_editor() {
     std::fs::write(dir.path().join("system.txt"), "be helpful").unwrap();
 
     let source = r#"
-poet = LlmConfig {
+poet = OpenRouterConfig {
     systemPrompt: @file("system.txt")
 }
 "#;
@@ -2254,7 +2254,7 @@ fn file_and_include_compose_in_one_project() {
     ).unwrap();
 
     let source = r#"
-cfg = LlmConfig { systemPrompt: @file("system.txt") }
+cfg = OpenRouterConfig { systemPrompt: @file("system.txt") }
 clean = @include("cleaner.weft")
 "#;
     let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");

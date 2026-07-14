@@ -503,11 +503,6 @@ pub fn fixed_worker_deps() -> BTreeMap<String, toml::Value> {
     );
     insert_dep(
         &mut deps,
-        "weft-platform-traits",
-        toml::Value::Table(path_table("../weft/crates/weft-platform-traits")),
-    );
-    insert_dep(
-        &mut deps,
         "clap",
         toml::Value::Table(version_with_features("4", &["derive", "env"])),
     );
@@ -713,7 +708,7 @@ fn write_registry_rs(
     body.push_str("//! the node structs in each `pkg_<name>` crate. Each package\n");
     body.push_str("//! is its own cargo crate, so editing one node's source\n");
     body.push_str("//! recompiles only that crate; the registry below relinks.\n\n");
-    body.push_str("use weft_core::node::{FormFieldSpec, Node, NodeCatalog};\n\n");
+    body.push_str("use weft_core::node::{Node, NodeCatalog};\n\n");
     body.push_str("pub struct ProjectCatalog;\n\n");
     body.push_str("impl NodeCatalog for ProjectCatalog {\n");
     body.push_str("    fn lookup(&self, node_type: &str) -> Option<&'static dyn Node> {\n");
@@ -739,12 +734,7 @@ fn write_registry_rs(
             body.push_str(&format!("\"{node_type}\", "));
         }
     }
-    body.push_str("]\n    }\n");
-    body.push_str("    fn form_field_specs(&self, _node_type: &str) -> &[FormFieldSpec] {\n");
-    body.push_str("        // Form field specs are a compile-time concern (used by\n");
-    body.push_str("        // enrich to materialize ports); the runtime catalog\n");
-    body.push_str("        // doesn't need them.\n");
-    body.push_str("        &[]\n    }\n}\n\n");
+    body.push_str("]\n    }\n}\n\n");
     body.push_str("pub static PROJECT_CATALOG: ProjectCatalog = ProjectCatalog;\n");
 
     std::fs::write(src_dir.join("registry.rs"), body).map_err(CompileError::Io)?;
@@ -752,8 +742,8 @@ fn write_registry_rs(
 }
 
 /// Convert a PascalCase node type (e.g. `ApiEndpoint`, `HumanQuery`,
-/// `LlmInference`) into a snake_case Rust module identifier
-/// (`api_endpoint`, `human_query`, `llm_inference`). Rules: lowercase
+/// `OpenRouterInference`) into a snake_case Rust module identifier
+/// (`api_endpoint`, `human_query`, `open_router_inference`). Rules: lowercase
 /// the first char; insert `_` before every subsequent uppercase.
 fn ident_for_node_type(node_type: &str) -> String {
     let mut out = String::with_capacity(node_type.len() + 4);
@@ -784,10 +774,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use weft_broker_client::{{
-    BrokerInfraClient, BrokerInfraStateClient, BrokerJournalClient, BrokerProjectClient,
-    BrokerTaskStoreClient, BrokerWorkerPodClient, TokenSource,
-}};
+use weft_broker_client::{{BrokerWorkerPodClient, TokenSource}};
 use weft_core::NodeCatalog;
 use weft_engine::EngineClients;
 
@@ -863,30 +850,14 @@ async fn main() -> anyhow::Result<()> {{
     let args = Args::parse();
 
     let token = TokenSource::new(std::path::PathBuf::from(&args.broker_token_path));
-    let journal = BrokerJournalClient::new(args.broker_url.clone(), token.clone());
-    let tasks = BrokerTaskStoreClient::new(args.broker_url.clone(), token.clone());
     let worker_pods = BrokerWorkerPodClient::new(args.broker_url.clone(), token.clone());
-    let infra = BrokerInfraClient::new(args.broker_url.clone(), token.clone());
-    let infra_state = BrokerInfraStateClient::new(args.broker_url.clone(), token.clone());
-    let project = BrokerProjectClient::new(args.broker_url.clone(), token.clone());
 
-    // The Broker*Client constructors already return `Arc<Self>`, so
-    // pass them straight into the `Arc<dyn _>` fields (re-wrapping
-    // would make `Arc<Arc<_>>`, which doesn't implement the trait).
-    // `SystemClock` is bare, so it still needs the `Arc::new`.
-    let storage = weft_engine::WorkerStorage::new(
-        args.broker_url.clone(),
-        std::path::PathBuf::from(&args.broker_token_path),
+    // The engine composes its own client bundle from the broker address + the
+    // pod's token, so this generated binary never names the bundle's fields.
+    let clients = EngineClients::from_broker(
+        &args.broker_url,
+        std::path::Path::new(&args.broker_token_path),
     );
-    let clients = EngineClients {{
-        journal,
-        tasks,
-        infra,
-        infra_state,
-        project,
-        clock: std::sync::Arc::new(weft_platform_traits::clock::SystemClock),
-        storage,
-    }};
 
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;
 
@@ -929,9 +900,6 @@ impl NodeCatalog for CatalogRef {{
     }}
     fn all(&self) -> Vec<&'static str> {{
         registry::PROJECT_CATALOG.all()
-    }}
-    fn form_field_specs(&self, node_type: &str) -> &[weft_core::node::FormFieldSpec] {{
-        registry::PROJECT_CATALOG.form_field_specs(node_type)
     }}
 }}
 "#,
@@ -991,14 +959,7 @@ mod tests {
     fn fixed_worker_deps_is_the_node_independent_baseline() {
         let deps = fixed_worker_deps();
         // The engine + the always-present runtime crates are present...
-        for required in [
-            "weft-engine",
-            "weft-core",
-            "weft-broker-client",
-            "weft-platform-traits",
-            "tokio",
-            "clap",
-        ] {
+        for required in ["weft-engine", "weft-core", "weft-broker-client", "tokio", "clap"] {
             assert!(deps.contains_key(required), "fixed deps missing {required}");
         }
         // ...and nothing project-specific is.

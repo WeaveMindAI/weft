@@ -555,6 +555,15 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Provider keys (`<PROVIDER>_API_KEY`) and local overrides come from
+    // the nearest `.env` up from the invoking directory. Real env vars
+    // win over the file; no file is normal; a malformed file fails loud.
+    match dotenvy::dotenv() {
+        Ok(_) => {}
+        Err(e) if e.not_found() => {}
+        Err(e) => anyhow::bail!("failed to load .env: {e}"),
+    }
+
     // Logs go to stderr so stdout stays a clean channel for
     // machine-readable output (notably `--json`). The extension
     // reads stdout-only and parses JSON; without this, tracing

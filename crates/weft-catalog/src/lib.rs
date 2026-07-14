@@ -7,15 +7,17 @@
 //!
 //! - **Bare node**: a directory with `metadata.json` at its root. The
 //!   directory IS the node. No `package.toml`. Files: `metadata.json`,
-//!   `mod.rs`, `deps.toml` (optional), `form_field_specs.json`
-//!   (optional, for nodes declaring `has_form_schema`).
+//!   `mod.rs`, `deps.toml` (optional).
 //!
 //! - **Package**: a directory with `package.toml` at its root. Member
 //!   nodes are auto-detected (every immediate subdir with a
 //!   `metadata.json`); the author never maintains a node list.
 //!   `package.toml` only names the package and carries shared cargo
 //!   deps. The package root can also hold shared Rust files (`.rs`)
-//!   accessible to every member via `use super::<name>;`.
+//!   accessible to every member via `use super::<name>;`, plus an
+//!   optional PARTIAL `metadata.json` of defaults (shared keys like
+//!   `provider` or `formFieldSpecs`) every member inherits key-by-key;
+//!   a member's own key, when present, wins.
 //!
 //! Units can sit at any depth under `nodes/`: directly under it or ten
 //! levels deep. The walk recurses until it hits a unit, then stops
@@ -35,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use weft_core::node::{FormFieldSpec, MetadataCatalog, NodeMetadata};
+use weft_core::node::{MetadataCatalog, NodeMetadata, ProviderDecl};
 
 /// Directory names that are never part of a node's source tree:
 /// build outputs and VCS/dependency caches. The single policy shared
@@ -64,11 +66,6 @@ pub struct CatalogEntry {
     pub metadata: NodeMetadata,
     /// Directory containing the node's `mod.rs` and `metadata.json`.
     pub source_dir: PathBuf,
-    /// Form field specs for nodes with `features.has_form_schema`.
-    /// Loaded from a JSON file resolved relative to the package
-    /// root (via metadata's `form_field_specs_ref`, defaulting to
-    /// `form_field_specs.json`). Empty vec if no such file exists.
-    pub form_field_specs: Vec<FormFieldSpec>,
     /// Key identifying which package this entry belongs to. Maps
     /// back into `FsCatalog::packages` for shared-file lookup.
     /// Bare nodes have package_key == source_dir.
@@ -242,12 +239,6 @@ impl MetadataCatalog for FsCatalog {
     fn all(&self) -> Vec<&NodeMetadata> {
         self.entries.values().map(|e| &e.metadata).collect()
     }
-    fn form_field_specs(&self, node_type: &str) -> &[FormFieldSpec] {
-        self.entries
-            .get(node_type)
-            .map(|e| e.form_field_specs.as_slice())
-            .unwrap_or(&[])
-    }
 }
 
 impl FsCatalog {
@@ -256,6 +247,13 @@ impl FsCatalog {
     /// the node's `deps.toml`.
     pub fn source_dir(&self, node_type: &str) -> Option<&Path> {
         self.entries.get(node_type).map(|e| e.source_dir.as_path())
+    }
+
+    /// The paid service a node's source declares (its metadata's `provider`
+    /// key, own or inherited from the package defaults), when it declares
+    /// one. `None` = the node type is unknown or declares nothing.
+    pub fn provider_of(&self, node_type: &str) -> Option<&ProviderDecl> {
+        self.entries.get(node_type).and_then(|e| e.metadata.provider.as_ref())
     }
 }
 
@@ -590,9 +588,11 @@ fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), CatalogError> 
 }
 
 /// A bare node: the directory IS the node. It is its own degenerate
-/// package (one member, no shared code, deps from its `deps.toml`).
+/// package (one member, no shared code, deps from its `deps.toml`, no
+/// package-level metadata defaults: its own `metadata.json` is already
+/// the whole story).
 fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), CatalogError> {
-    let entry = match load_node_entry(dir, dir) {
+    let entry = match load_node_entry(dir, dir, None) {
         Ok(e) => e,
         Err(e) => return ctx.soft_fail(e),
     };
@@ -652,6 +652,27 @@ fn register_package(
         }
     };
 
+    // Package-level metadata defaults: an OPTIONAL, PARTIAL `metadata.json`
+    // at the package root. Every member inherits its top-level keys unless
+    // the member's own `metadata.json` carries the key (key-by-key, member
+    // wins; see `load_node_entry`). One place for whatever a package's nodes
+    // share (`provider`, `formFieldSpecs`, future keys), instead of one
+    // sidecar file per feature. `type` is a node's identity and can never be
+    // shared, so its presence here is an error, not a default.
+    // Presence is decided by the SAME no-follow view the walk, staging, and
+    // hash use (`has_node_file`), never a re-`stat` that follows symlinks: a
+    // symlinked package-root metadata.json is dropped from the build context,
+    // so seeing it here would split the catalog's view from the compiled
+    // node's (whose derive reads the staged, no-follow tree).
+    let package_defaults = if has_node_file(&entries, "metadata.json") {
+        match load_package_defaults(dir) {
+            Ok(d) => d,
+            Err(e) => return ctx.soft_fail(e),
+        }
+    } else {
+        None
+    };
+
     // Auto-detect members: every immediate subdir whose own no-follow
     // view contains a `metadata.json`. Shared `.rs` files live at the
     // package root. All of this is the `read_node_dir` view (the
@@ -666,7 +687,7 @@ fn register_package(
                 if !has_node_file(&member_entries, "metadata.json") {
                     continue;
                 }
-                match load_node_entry(&path, dir) {
+                match load_node_entry(&path, dir, package_defaults.as_ref()) {
                     Ok(entry) => {
                         let node_type = entry.node_type.clone();
                         // Only list the type if it was actually inserted.
@@ -715,63 +736,97 @@ fn register_package(
     Ok(())
 }
 
+/// Load a package root's partial `metadata.json` (the defaults its members
+/// inherit key-by-key). The CALLER decides the file exists, from the no-follow
+/// view it already holds (`has_node_file`), so this never re-`stat`s the path
+/// (a follow-symlink check here would see a file the staging copy and the hash
+/// walk both drop). A file that is not a JSON object, or that carries an
+/// identity key, is an error: silently ignoring it would make every member
+/// quietly miss its inherited keys.
+fn load_package_defaults(
+    package_root: &Path,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, CatalogError> {
+    let path = package_root.join("metadata.json");
+    let raw = fs::read_to_string(&path).map_err(|e| CatalogError::Io {
+        path: path.clone(),
+        error: e,
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
+            path: path.clone(),
+            error: e.to_string(),
+        })?;
+    let serde_json::Value::Object(obj) = value else {
+        return Err(CatalogError::Parse {
+            path,
+            error: "package-level metadata.json must be a JSON object".into(),
+        });
+    };
+    // Refuse an identity key ONCE here, where the offending file is known, so
+    // the author is pointed at the package root rather than at whichever member
+    // happened to be merged first. The merge itself re-checks (it is the shared
+    // definition of the rule, also used by the derive).
+    for key in weft_core::node::NON_INHERITABLE_METADATA_KEYS {
+        if obj.contains_key(key) {
+            return Err(CatalogError::Parse {
+                path,
+                error: format!(
+                    "package-level metadata.json must not set `{key}`: it is one node's \
+                     identity, not a package default"
+                ),
+            });
+        }
+    }
+    Ok(Some(obj))
+}
+
 /// Load a single node's metadata + form field specs.
 ///
 /// `node_dir` = directory containing the node's `metadata.json`,
 /// `mod.rs`, and `deps.toml`. `package_key` = directory identifying
 /// the node's package (same as `node_dir` for a bare node, the
-/// package root otherwise).
+/// package root otherwise). `package_defaults` = the package root's
+/// partial `metadata.json`, merged in key-by-key (top level only) for
+/// every key the node's own file does not set.
 fn load_node_entry(
     node_dir: &Path,
     package_key: &Path,
+    package_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<CatalogEntry, CatalogError> {
     let meta_path = node_dir.join("metadata.json");
     let raw = fs::read_to_string(&meta_path).map_err(|e| CatalogError::Io {
         path: meta_path.clone(),
         error: e,
     })?;
-    let metadata: NodeMetadata = serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
-        path: meta_path.clone(),
-        error: e.to_string(),
-    })?;
-
-    // Resolve the form-field specs file. Default filename
-    // `form_field_specs.json` (overridable per node via
-    // `form_field_specs_ref` in metadata.json). Looked up MOST-SPECIFIC
-    // first: the node's own dir, then the package root. So a bare node
-    // keeps its specs beside its `metadata.json`; a package member
-    // inherits the package-root file its siblings share, UNLESS it drops
-    // its own file in its member dir to override. For a bare node the two
-    // candidates are the same dir, so the order is a no-op there.
-    let specs_ref = metadata
-        .form_field_specs_ref
-        .clone()
-        .unwrap_or_else(|| "form_field_specs.json".to_string());
-    let specs_candidates = [
-        node_dir.join(&specs_ref),
-        package_key.join(&specs_ref),
-    ];
-    let mut form_field_specs: Vec<FormFieldSpec> = Vec::new();
-    for candidate in &specs_candidates {
-        if candidate.is_file() {
-            let raw = fs::read_to_string(candidate).map_err(|e| CatalogError::Io {
-                path: candidate.clone(),
-                error: e,
-            })?;
-            form_field_specs =
-                serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
-                    path: candidate.clone(),
-                    error: e.to_string(),
-                })?;
-            break;
-        }
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
+            path: meta_path.clone(),
+            error: e.to_string(),
+        })?;
+    if let Some(defaults) = package_defaults {
+        // The node's own key wins wholesale (no deep merge). Same merge the
+        // derive runs at compile time, so catalog metadata and the runtime
+        // `manifest()` are one document.
+        //
+        // An error here is about the PACKAGE ROOT's file (an identity key it
+        // may not share), never the member's, so it names the package root:
+        // blaming an arbitrary member would send the author to the wrong file.
+        // `load_package_defaults` already refused that case once per package;
+        // this is the shared backstop.
+        weft_core::node::merge_package_defaults(&mut value, defaults).map_err(|error| {
+            CatalogError::Parse { path: package_key.join("metadata.json"), error }
+        })?;
     }
+    let metadata: NodeMetadata =
+        serde_json::from_value(value).map_err(|e| CatalogError::Parse {
+            path: meta_path.clone(),
+            error: e.to_string(),
+        })?;
 
     Ok(CatalogEntry {
         node_type: metadata.node_type.clone(),
         metadata,
         source_dir: node_dir.to_path_buf(),
-        form_field_specs,
         package_key: package_key.to_path_buf(),
     })
 }
@@ -804,8 +859,8 @@ mod package_tests {
         let cat = FsCatalog::discover(&stdlib_root()).unwrap();
         let q = cat.entry("HumanQuery").expect("HumanQuery missing");
         let t = cat.entry("HumanTrigger").expect("HumanTrigger missing");
-        assert!(!q.form_field_specs.is_empty(), "HumanQuery specs empty");
-        assert!(!t.form_field_specs.is_empty(), "HumanTrigger specs empty");
+        assert!(!q.metadata.form_field_specs.is_empty(), "HumanQuery specs empty");
+        assert!(!t.metadata.form_field_specs.is_empty(), "HumanTrigger specs empty");
         assert_eq!(q.package_key, t.package_key, "both nodes should share package_key");
         let pkg = cat.package_of("HumanQuery").expect("pkg_of missing");
         assert_eq!(pkg.name, "human");

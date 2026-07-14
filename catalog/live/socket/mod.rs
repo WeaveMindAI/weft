@@ -17,22 +17,13 @@ use serde_json::Value;
 use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
 use weft_core::signal::{LiveConnectionConfig, LiveSocket};
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct LiveSocketNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for LiveSocketNode {
-    fn node_type(&self) -> &'static str {
-        "LiveSocket"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("LiveSocket metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         match ctx.phase {
             Phase::TriggerSetup => {

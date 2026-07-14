@@ -1,6 +1,7 @@
 //! `record_cost` task: durable handoff for a worker's
-//! `ctx.report_cost`. The worker enqueues into the broker's task
-//! table (one atomic SQL INSERT), then can die freely. A dispatcher
+//! `ctx.settle_cost`. The broker's cost-settle handler
+//! enqueues into the task table (one atomic SQL INSERT), then the
+//! worker can die freely. A dispatcher
 //! pod claims this task on its own timeline and writes the
 //! `CostReported` journal event. Survives worker pod deletion or
 //! crash mid-flight.

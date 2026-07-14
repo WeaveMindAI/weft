@@ -7,6 +7,7 @@
 pub mod bus;
 #[cfg(feature = "runtime")]
 pub mod caller;
+pub mod access;
 #[cfg(feature = "runtime")]
 pub mod caller_token;
 #[cfg(feature = "runtime")]
@@ -115,6 +116,9 @@ pub use context::{
     ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, InputBag, Phase,
     StorageHandle,
 };
+pub use access::{
+    AccessOrigin, CostHold, CostProvision, ProviderAccess, PLATFORM_KEY_SENTINEL,
+};
 pub use error::{WeftError, WeftResult};
 pub use infra::{
     Access, AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
@@ -127,9 +131,13 @@ pub use infra::{
 pub use frames::{LoopFrames, LoopIteration};
 pub use node::{
     Condition, FieldDef, FormFieldPort, FormFieldSpec, MetadataCatalog,
-    NodeFeatures, NodeMetadata, NodeOutput, PortDef, RuleDiagnostic, RuleSeverity,
+    NodeFeatures, NodeManifest, NodeMetadata, NodeOutput, PortDef, RuleDiagnostic, RuleSeverity,
     ValidationLevel, ValidationRule,
 };
+// The `NodeManifest` DERIVE (same name as the trait, macro namespace):
+// `#[derive(NodeManifest)]` on a node struct embeds the metadata.json
+// sitting next to the node's source file.
+pub use weft_node_derive::NodeManifest;
 // The runtime node interface (`Node` + the runtime `NodeCatalog`) is gated:
 // the parse/validate path uses only `MetadataCatalog` above.
 #[cfg(feature = "runtime")]
@@ -192,6 +200,7 @@ mod helper_tests {
     #[test]
     fn hex_array8_rejects_malformed_without_panicking() {
         #[derive(serde::Deserialize)]
+        #[allow(dead_code)] // only deserialization failure is under test
         struct H(#[serde(with = "crate::hex_array8")] [u8; 8]);
         // 16 BYTES but containing a multi-byte char straddling an odd
         // offset: byte-indexed slicing would panic; must Err instead.

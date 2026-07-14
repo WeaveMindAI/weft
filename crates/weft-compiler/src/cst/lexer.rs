@@ -196,12 +196,7 @@ impl<'a> Lexer<'a> {
     /// closing fence exists, consume to end of input (the parser flags the
     /// unterminated heredoc; no byte is lost).
     fn heredoc_len(&self, rest: &'a str) -> usize {
-        // skip opening ```
-        let after_open = &rest[3..];
-        match after_open.find("```") {
-            Some(rel) => 3 + rel + 3, // open + body + close
-            None => rest.len(),
-        }
+        heredoc_span(rest).0
     }
 
     /// Length of a `"..."` string token (including both quotes), `\`-escape aware.
@@ -213,30 +208,89 @@ impl<'a> Lexer<'a> {
     /// respecting nested pairs and skipping `"..."` strings (so a bracket inside
     /// a JSON string doesn't unbalance it). Runs to end of input if unbalanced.
     fn balanced_len(&self, rest: &'a str, open: u8, close: u8) -> usize {
-        let bytes = rest.as_bytes();
-        let mut depth: i32 = 0;
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                // Skip a JSON string atomically so brackets/quotes inside it
-                // don't affect depth (one string-skip implementation, shared).
-                b'"' => {
-                    i = string_end(bytes, i);
-                    continue;
-                }
-                b if b == open => depth += 1,
-                b if b == close => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return i + 1;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        rest.len()
+        balanced_span(rest, open, close).unwrap_or(rest.len())
     }
+}
+
+/// The length of a balanced `open`/`close` span starting at `rest[0] == open`,
+/// or `None` if it runs to end of input WITHOUT closing (unbalanced). The one
+/// scan that decides where an opaque bracket/paren token ends: `balanced_len`
+/// uses it for lexing (padding an unbalanced token to EOF), and the
+/// `*_is_closed` predicates use it to answer "did this token actually close, or
+/// was it exhausted to EOF". Same scan, so a caller can never disagree with the
+/// lexer about closed-ness.
+fn balanced_span(rest: &str, open: u8, close: u8) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Skip a JSON string atomically so brackets/quotes inside it don't
+            // affect depth (one string-skip implementation, shared).
+            b'"' => {
+                i = string_end(bytes, i);
+                continue;
+            }
+            b if b == open => depth += 1,
+            b if b == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True iff a `JSON_VALUE` token (a `[`-led array) is actually CLOSED, i.e. its
+/// brackets balance and it ends exactly where it closes, rather than the lexer
+/// having padded an unbalanced one out to end-of-input. Uses the lexer's own
+/// scan, so it can never disagree with how the token would re-lex.
+pub(crate) fn json_value_is_closed(text: &str) -> bool {
+    matches!(balanced_span(text, b'[', b']'), Some(len) if len == text.len())
+}
+
+/// True iff a `MARKER` token (`@name(...)`) is CLOSED: a bare `@name` with no
+/// parens is self-contained; a `@name(...)` is closed iff its parens balance and
+/// end the token, by the same scan the lexer uses to bound the marker (so a `)`
+/// inside the marker's string argument does not fool it).
+pub(crate) fn marker_is_closed(text: &str) -> bool {
+    let Some(paren) = text.find('(') else {
+        return true; // bare `@name`, no parens to close
+    };
+    matches!(balanced_span(&text[paren..], b'(', b')'), Some(len) if paren + len == text.len())
+}
+
+/// True iff a `STRING` token is CLOSED, by the lexer's own escape-aware scan:
+/// the scan must end on its OWN closing quote (`string_span`'s `closed` flag)
+/// exactly at the end of the token. Using the scan's termination reason, not a
+/// last-byte check, so a trailing ESCAPED quote (`"\"`, which never closes) is
+/// correctly reported unterminated instead of wrongly matching on its `"`.
+pub(crate) fn string_is_closed(text: &str) -> bool {
+    text.as_bytes().first() == Some(&b'"')
+        && matches!(string_span(text.as_bytes(), 0), (end, true) if end == text.len())
+}
+
+/// The scan behind `heredoc_len`: end index AND whether a closing ```` ``` ````
+/// fence was found (`true`) vs the token ran to end-of-input unterminated. The
+/// one heredoc scan, so `heredoc_len` (lexing) and `heredoc_is_closed`
+/// (containment) cannot disagree about where a heredoc ends.
+fn heredoc_span(rest: &str) -> (usize, bool) {
+    // Callers pass a `` ``` ``-led run (the lexer only emits HEREDOC then), so
+    // `rest` is at least the 3-byte open fence.
+    match rest.get(3..).and_then(|body| body.find("```")) {
+        Some(rel) => (3 + rel + 3, true), // open + body + close
+        None => (rest.len(), false),
+    }
+}
+
+/// True iff a `HEREDOC` token is CLOSED (its closing fence was found), by the
+/// same scan the lexer uses to bound it, rather than a restated fence rule.
+pub(crate) fn heredoc_is_closed(text: &str) -> bool {
+    text.starts_with("```") && matches!(heredoc_span(text), (end, true) if end == text.len())
 }
 
 /// The length of `s` up to (not including) the first line break, `\n` OR a lone
@@ -254,6 +308,17 @@ fn line_end(s: &str) -> usize {
 /// the escape step is clamped). The single home for string scanning, so
 /// `string_len` and `balanced_len` cannot diverge on the EOF/escape edge.
 fn string_end(bytes: &[u8], open: usize) -> usize {
+    string_span(bytes, open).0
+}
+
+/// The scan behind `string_end`: returns the end index AND whether the string
+/// actually CLOSED on its own quote (`true`), vs stopped at an unescaped newline
+/// or end-of-input (`false`). Closed-ness comes from which branch ended the
+/// scan, so a caller asking "is this string terminated" (`string_is_closed`)
+/// can never disagree with where the lexer ends the token: a trailing ESCAPED
+/// quote runs the scan to EOF and reports NOT closed, where a last-byte `"`
+/// check would wrongly say closed.
+fn string_span(bytes: &[u8], open: usize) -> (usize, bool) {
     let mut i = open + 1; // past the opening quote
     while i < bytes.len() {
         match bytes[i] {
@@ -265,12 +330,12 @@ fn string_end(bytes: &[u8], open: usize) -> usize {
                 i += 1;
                 i += utf8_width(bytes.get(i).copied());
             }
-            b'"' => return i + 1,
-            b'\n' => return i, // unterminated: stop at line end
+            b'"' => return (i + 1, true),
+            b'\n' => return (i, false), // unterminated: stop at line end
             _ => i += 1,
         }
     }
-    i.min(bytes.len())
+    (i.min(bytes.len()), false) // ran off the end: unterminated
 }
 
 /// The UTF-8 byte width of the char whose leading byte is `b` (1 for ASCII /
@@ -358,7 +423,7 @@ mod tests {
     fn lossless_over_shapes() {
         assert_lossless("n = Debug\n");
         assert_lossless("n = Text { value: \"x\" }\n");
-        assert_lossless("# Description: hi\ng = Group() -> () {\n  x = Text {}\n}\n");
+        assert_lossless("# hi\ng = Group() -> () {\n  x = Text {}\n}\n");
         assert_lossless("n = Code {\n  src: ```\n  print(1)\n  ```\n}\n");
         assert_lossless("items: [\n  {\"a\": 1},\n  {\"b\": 2}\n]\n");
         assert_lossless("t = Text { value: @file(\"sys.txt\") }\n");

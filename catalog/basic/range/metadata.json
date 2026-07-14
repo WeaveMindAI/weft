@@ -19,6 +19,5 @@
     { "key": "to", "label": "To (exclusive)", "field_type": { "kind": "number" }, "required": true },
     { "key": "step", "label": "Step", "field_type": { "kind": "number" }, "required": false, "default_value": 1 }
   ],
-  "entry": [],
   "requires_infra": false
 }

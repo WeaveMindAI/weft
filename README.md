@@ -15,11 +15,11 @@ Here's a real one. A support ticket comes in over a webhook, an LLM triages it, 
 ````weft
 ticket = ApiPost -> (subject: String, body: String) {}
 
-triage = LlmConfig {
+triage = OpenRouterConfig {
   systemPrompt: "Classify this support ticket. Reply with JSON: {severity, summary}."
 }
 
-classify = LlmInference -> (response: String) {}
+classify = OpenRouterInference -> (response: String) {}
 classify.prompt = ticket.body
 classify.config = triage.config
 

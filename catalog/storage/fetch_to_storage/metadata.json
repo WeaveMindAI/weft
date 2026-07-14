@@ -25,6 +25,5 @@
       "description": "Store the file already flagged to survive the execution-end sweep (30-day access-extended TTL)."
     }
   ],
-  "entry": [],
   "requires_infra": false
 }

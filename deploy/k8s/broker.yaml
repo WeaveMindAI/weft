@@ -63,6 +63,13 @@ spec:
           ports:
             - containerPort: 9090
               name: http
+          # Operator-supplied provider keys (`<PROVIDER>_API_KEY`), packed
+          # from the CLI's environment into this Secret on daemon
+          # start/restart. Optional: absent until the operator sets one.
+          envFrom:
+            - secretRef:
+                name: weft-provider-keys
+                optional: true
           env:
             - name: WEFT_BROKER_PORT
               value: "9090"

@@ -109,8 +109,10 @@ impl Entitlement {
 /// planes (the cloud's version-chunk pool) sums them all in its impl.
 #[async_trait::async_trait]
 pub trait EntitlementSource: Send + Sync {
-    /// The tenant's plan caps.
-    fn caps(&self, tenant: &str) -> Entitlement;
+    /// The tenant's plan caps. Async so a plan-driven source can resolve the
+    /// tenant's live plan (a lookup, possibly remote); the default local
+    /// source answers from memory.
+    async fn caps(&self, tenant: &str) -> Result<Entitlement>;
 
     /// The tenant's TOTAL currently-stored bytes across every storage plane the
     /// deployment has, read on `tx` so it composes into the caller's locked
@@ -150,8 +152,8 @@ impl LocalEntitlementSource {
 
 #[async_trait::async_trait]
 impl EntitlementSource for LocalEntitlementSource {
-    fn caps(&self, _tenant: &str) -> Entitlement {
-        self.default
+    async fn caps(&self, _tenant: &str) -> Result<Entitlement> {
+        Ok(self.default)
     }
 
     async fn account_used_bytes(

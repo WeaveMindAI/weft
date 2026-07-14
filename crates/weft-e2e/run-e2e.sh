@@ -83,6 +83,22 @@ if [ "${1:-}" = "--from" ]; then
   TESTS=("${ALL_TESTS[@]:$START}")
   echo "Resuming from '${ALL_TESTS[$START]}' (${#TESTS[@]} test(s) remaining)."
 else
+  # Bare test names (no flags): `run-e2e.sh openrouter storage`. An unknown
+  # flag would otherwise be taken for a test name and produce a baffling
+  # cargo error, so reject it here with the usage.
+  for arg in "$@"; do
+    if [[ "$arg" == -* ]]; then
+      echo "unknown option '$arg'." >&2
+      echo "usage: run-e2e.sh [--from <name>] [<test> ...]" >&2
+      echo "  no args      run every test, in order" >&2
+      echo "  <test> ...   run only these (bare names, no --test)" >&2
+      echo "  --from <n>   run the ordered suite starting at the first name containing <n>" >&2
+      echo "" >&2
+      echo "known tests, in run order:" >&2
+      printf '  %s\n' "${ALL_TESTS[@]}" >&2
+      exit 1
+    fi
+  done
   TESTS=("$@")
   if [ ${#TESTS[@]} -eq 0 ]; then
     TESTS=("${ALL_TESTS[@]}")

@@ -1,0 +1,16 @@
+[package]
+name = "openrouter"
+
+# The OpenRouter nodes: one inference call, and a shared parameter block.
+# Both speak to OpenRouter specifically (its model slugs, its unified
+# pricing catalog, its API key), which is why they are named for it rather
+# than for "LLM" in general: another provider needs another key, another
+# catalog, and another node.
+#
+# minillmlib carries the price catalog, the token estimator and the cost
+# tracking, so the nodes need no HTTP client of their own. The `estimate`
+# feature is what bounds a call's cost before it is allowed to spend anything.
+[dependencies]
+async-trait = "0.1"
+minillmlib = { version = "0.5.5", features = ["estimate"] }
+serde_json = "1"

@@ -95,3 +95,8 @@ once (loops, parallelism, low-latency loop execution) and surfaces one
 primitive not yet in `TODO.md` (streaming emitting nodes). When loops
 and callbacks are designed, this is the use case to validate them
 against.
+
+
+## notes Q
+
+Iterating over a project bits by bits where like hte user go to a point, exdit the graph contineu from the point, go back a bit and modify a thing and start over from the side branch so it does the new thing but keep the other side branch that didn't edit. Basically a thng where you can use one input and manually do like an iteration where you manipulate the data until it does the thing properly, then you can cement this as a test case. Then user could iterate on new ones and run the precious one to verify it holds properly until all use case works wiht the designed shape.

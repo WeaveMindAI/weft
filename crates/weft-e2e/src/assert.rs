@@ -223,6 +223,39 @@ impl SettledRun {
         Ok(self)
     }
 
+    /// Every cost the execution reported, as `(service, amount_usd)` in
+    /// order. A paid node settles its cost on every path, so this is the
+    /// execution's money trail.
+    pub fn costs(&self) -> Vec<(String, f64)> {
+        self.replay
+            .by_kind("cost_reported")
+            .filter_map(|e| {
+                Some((
+                    e.str_field("service")?.to_string(),
+                    e.0.get("amount_usd").and_then(Value::as_f64)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Assert the execution reported exactly one cost for `service`, and that
+    /// it was actually priced (a positive amount): the call was made, and its
+    /// cost resolved.
+    pub fn assert_paid(&self, service: &str) -> Result<&Self> {
+        let costs = self.costs();
+        let for_service: Vec<f64> =
+            costs.iter().filter(|(s, _)| s == service).map(|(_, amount)| *amount).collect();
+        match for_service.as_slice() {
+            [amount] if *amount > 0.0 => Ok(self),
+            [amount] => bail!(
+                "the '{service}' call reported a cost of ${amount}: the call happened but its \
+                 cost never resolved"
+            ),
+            [] => bail!("no cost reported for '{service}'; costs seen: {costs:?}"),
+            many => bail!("expected one '{service}' cost, got {}: {many:?}", many.len()),
+        }
+    }
+
     /// Borrow the raw replay for assertions the typed helpers don't cover yet.
     /// Escape hatch, not the default path: prefer adding a named helper above
     /// when a check recurs, so tests read as intent.

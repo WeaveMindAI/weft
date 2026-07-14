@@ -138,6 +138,13 @@ impl LoopDecl {
     pub fn body(&self) -> Option<Body> {
         child(&self.0, SyntaxKind::BODY).and_then(Body::cast)
     }
+    /// The loop's description: the plain `# ...` comment that is the first
+    /// body line, if present (same rule as groups).
+    pub fn description(&self) -> Option<GroupDesc> {
+        self.body()
+            .and_then(|b| child(b.syntax(), SyntaxKind::GROUP_DESC))
+            .and_then(GroupDesc::cast)
+    }
 }
 
 impl NodeDecl {
@@ -162,11 +169,30 @@ impl GroupDecl {
     pub fn body(&self) -> Option<Body> {
         child(&self.0, SyntaxKind::BODY).and_then(Body::cast)
     }
-    /// The group's `# Description:` first-body-line, if present.
+    /// The group's description: the plain `# ...` comment that is the first
+    /// body line, if present.
     pub fn description(&self) -> Option<GroupDesc> {
         self.body()
             .and_then(|b| child(b.syntax(), SyntaxKind::GROUP_DESC))
             .and_then(GroupDesc::cast)
+    }
+}
+
+impl GroupDesc {
+    /// The description text: the comment body without the leading `# `.
+    pub fn text(&self) -> String {
+        self.0
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == SyntaxKind::COMMENT)
+            .map(|t| {
+                t.text()
+                    .trim_start()
+                    .strip_prefix('#')
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -547,12 +573,43 @@ mod tests {
 
     #[test]
     fn group_description_accessor() {
-        let f = file("g = Group() {\n  # Description: does things\n  x = Text {}\n}\n");
+        let f = file("g = Group() {\n  # does things\n  x = Text {}\n}\n");
         let g = match view(&f).resolve_decl("g") {
             Resolution::Found(Decl::Group(g)) => g,
             _ => panic!("g should resolve to a group"),
         };
-        assert!(g.description().is_some(), "first-body-line # Description: is the group desc");
+        let desc = g.description().expect("first-body-line comment is the group desc");
+        assert_eq!(desc.text(), "does things");
+    }
+
+    #[test]
+    fn group_description_is_first_body_line_only() {
+        // A comment after the first body item is a plain comment, not a desc.
+        let f = file("g = Group() {\n  x = Text {}\n  # not a description\n}\n");
+        let g = match view(&f).resolve_decl("g") {
+            Resolution::Found(Decl::Group(g)) => g,
+            _ => panic!("g should resolve to a group"),
+        };
+        assert!(g.description().is_none());
+    }
+
+    #[test]
+    fn group_description_is_single_line() {
+        // Only the FIRST comment line is the description; the second stays plain.
+        let f = file("g = Group() {\n  # short desc\n  # more prose\n  x = Text {}\n}\n");
+        let g = match view(&f).resolve_decl("g") {
+            Resolution::Found(Decl::Group(g)) => g,
+            _ => panic!("g should resolve to a group"),
+        };
+        assert_eq!(g.description().unwrap().text(), "short desc");
+        // exactly one GROUP_DESC child in the body
+        let body = g.body().unwrap();
+        let count = body
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::GROUP_DESC)
+            .count();
+        assert_eq!(count, 1);
     }
 
     #[test]

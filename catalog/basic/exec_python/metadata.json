@@ -16,7 +16,6 @@
       "required": true
     }
   ],
-  "entry": [],
   "requires_infra": false,
   "features": {
     "canAddInputPorts": true,

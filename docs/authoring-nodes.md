@@ -5,6 +5,130 @@ for Weft. Start with the existing nodes in `catalog/` for working
 examples; this document explains the cross-cutting concerns that aren't
 obvious from any single node.
 
+## Writing a basic node
+
+A node is a directory under the project's `nodes/` root:
+
+```
+nodes/my_node/
+  mod.rs              # the Rust impl (a `Node` trait impl)
+  metadata.json       # the node's declared surface (ports, fields, features)
+  deps.toml           # optional: extra cargo deps beyond the codegen base
+```
+
+The trait (in `weft_core`):
+
+```rust
+#[async_trait]
+pub trait Node: NodeManifest + Send + Sync {
+    /// Infra nodes only (`requires_infra: true`): the desired infra shape.
+    async fn provision(&self, ctx: InfraProvisionContext, input: InputBag)
+        -> WeftResult<InfraSpec> { /* default: error */ }
+    /// The node's logic. The ONLY way to fire downstream is
+    /// `ctx.pulse_downstream(output)`.
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
+}
+```
+
+The `NodeManifest` supertrait carries the node's identity and surface,
+and `#[derive(NodeManifest)]` on the node struct implements it by
+embedding the `metadata.json` sitting next to the node's source file:
+the node type comes from the json's `type` field, and a missing or
+malformed json is a compile error. You never write `node_type` or
+`metadata` by hand.
+
+A complete minimal node (the stdlib `Text`):
+
+```rust
+//! Text: emit a literal string configured at design time.
+
+use async_trait::async_trait;
+use serde_json::Value;
+
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft_core::node::NodeOutput;
+
+#[derive(NodeManifest)]
+pub struct TextNode;
+
+#[async_trait]
+impl Node for TextNode {
+    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let value: String = ctx.config.get("value")?;
+        ctx.pulse_downstream(NodeOutput::with("value", Value::String(value))).await
+    }
+}
+```
+
+What `execute` works with:
+
+- `ctx.config: ConfigBag`: the node's `.weft` config values;
+  `ctx.config.get::<T>("key")?` deserializes one (loud error when missing
+  or mistyped).
+- `ctx.input: InputBag`: the values that arrived on the input ports this
+  fire; `ctx.input.get::<T>("port")?`.
+- `ctx.pulse_downstream(NodeOutput)`: emit values on output ports and fire
+  downstream. `NodeOutput::with("port", value)` for one port; chain
+  `.set("other", value)` for more (`NodeOutput::empty()` fires nothing;
+  `.extend_from_object(json)` fans a JSON object's keys onto same-named
+  ports). A port not present in the output emits
+  no pulse (downstream of it skips, the null-propagation rule).
+- `ctx.phase: Phase`: which lifecycle phase this invocation is
+  (`InfraSetup` / `TriggerSetup` / `Fire`); non-trigger, non-infra nodes
+  only ever see `Fire`.
+- Identity fields: `ctx.execution_id`, `ctx.project_id`, `ctx.node_id`,
+  `ctx.node_type`, `ctx.node_label`, `ctx.color`, `ctx.frames`.
+
+`metadata.json` declares the surface (see `weft_core::NodeMetadata` for
+every field): `type`, `label`, `description`, `category`, `tags`, `icon`,
+`color`, `inputs`/`outputs` (`{ name, type, required, description }`),
+`fields` (config the editor collects: `{ key, label, field_type, required,
+description }`), `requires_infra`, `images`, `features`, `validate`.
+
+`deps.toml` lists extra cargo dependencies beyond the always-available
+base (weft-core, tokio, serde, serde_json, async-trait, anyhow, tracing,
+uuid):
+
+```toml
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+```
+
+A package (one `package.toml` root with member node subdirs) shares deps
+and helper files across members; a bare node dir stands alone.
+
+## Sharing state across executions: process-global statics
+
+A worker process multiplexes many executions of the same project, so a
+plain Rust `static` in a node's module is shared by ALL of them: every
+execution (and every firing of every node in the file) sees the same
+instance for as long as the worker lives. This is safe tenant-wise by
+construction (a worker only ever hosts one project), so executions
+reading and writing each other's state through it is a feature, not a
+hazard: caches, pools, warmed clients, a shared task buffer one
+execution fills and others drain. If a piece of state is meant to be
+private to one execution instead, key it by `ctx.execution_id`.
+
+```rust
+/// The process-shared `GeneratorInfo` for a model. Shared because the
+/// model's published rates are cached on the generator (clones share the
+/// cache), so the price sheet is fetched once per TTL rather than once
+/// per execution.
+fn shared_generator(model: &str) -> GeneratorInfo {
+    static POOL: OnceLock<Mutex<HashMap<String, GeneratorInfo>>> = OnceLock::new();
+    let fresh = GeneratorInfo::openrouter(model);
+    let mut pool = POOL.get_or_init(Mutex::default).lock().expect("generator pool lock");
+    pool.entry(fresh.pricing_key()).or_insert(fresh).clone()
+}
+```
+
+One rule keeps it sound: **it's a per-process layer, not durable
+state**. It dies with the worker (workers idle-shutdown) and other Pods
+never see it, so anything that must survive a restart or be visible
+across Pods belongs in the language's durable primitives (`ctx.run`,
+buses, storage), with the static as at most a warm cache in front. And
+hold locks only for map lookups, never across `.await`.
+
 ## Cancellation
 
 Every execution has a `CancellationFlag` attached to it. When the user
@@ -80,6 +204,26 @@ The flag is **persistent**: once `.cancel()` has been called, every
 subsequent `is_cancelled()` returns true and every new `cancelled()`
 future resolves immediately. There's no race window where you can
 "miss" a cancellation.
+
+### Guaranteed cleanup: `interruptGrace`
+
+By default the engine aborts in-flight node futures as soon as it
+observes the cancel, so a `cancelled()` branch in your body only runs
+if it happens to win that race. If your node has cleanup that MUST run
+on cancel (settle a provisioned cost, close a paid stream, tell a peer
+goodbye), declare it in metadata.json:
+
+```json
+"features": { "interruptGrace": true }
+```
+
+The engine then lets in-flight firings observe the tripped flag and
+wrap up before the hard abort. The wait is dynamic: it ends the moment
+every in-flight task finishes, capped at 30 seconds; a node that wraps
+up in 2 seconds stops in 2 seconds. Declare it only when `execute`
+actually watches the flag: without a watcher the grace is pure added
+Stop latency (the full cap). The graceful-subprocess and cleanup
+patterns below assume it.
 
 ### Pattern: subprocess
 
@@ -206,13 +350,175 @@ anything special for cancel; the engine handles it.
 | Streaming receive (WS / SSE)            | Yes, instant        | Nothing                    |
 | Suspended via `await_signal`            | Yes (engine path)   | Nothing                    |
 | Subprocess                              | Process leaks       | `.kill_on_drop(true)`      |
-| Subprocess needing graceful shutdown    | Yes, with delay     | `tokio::select!` + signal  |
+| Subprocess needing graceful shutdown    | Yes, with delay     | `tokio::select!` + signal + `interruptGrace` |
 | CPU-bound `spawn_blocking`              | Future returns, thread leaks | Pass flag, poll `is_cancelled()` |
-| External resource needing cleanup       | Yes, with cleanup   | `tokio::select!` branch    |
+| External resource needing cleanup       | Yes, with cleanup   | `tokio::select!` branch + `interruptGrace` |
 
 **Bottom line**: write normal async Rust. Reach for `ctx.cancellation()`
-only when you spawn a subprocess, run blocking CPU work, or hold a
-resource that needs explicit cleanup before drop.
+(plus `interruptGrace` when the cleanup must be guaranteed) only when
+you spawn a subprocess, run blocking CPU work, or hold a resource that
+needs explicit cleanup before drop.
+
+## Paid calls: keys, provisioning, settling
+
+A node that spends money on a third-party API (an LLM call, a search
+credit, an enrichment lookup) never handles raw key plumbing or
+ad-hoc cost logging. The context gives it one fixed ordering:
+
+```rust
+// 1. Get your access to the provider: what to authenticate with, and the
+//    address to send it to (the user's own key, or the deployment's). The
+//    window is how long your provider work may take; it is the credential's
+//    crash backstop AND the provision's deadline, declared once.
+let access = ctx
+    .provider_access_within("openrouter", cfg.get_optional("apiKey")?, Duration::from_secs(30 * 60))
+    .await?;
+// 2. Build the EXACT request you are about to make.
+// 3. Declare its cost.
+let hold = ctx.provision_cost(&access, CostProvision::estimate(worst_case_usd)).await?;
+// 4. Make the call. NOTHING else goes between 3, 4, and 5.
+let outcome = do_the_paid_call().await;
+// 5. Settle to what it actually cost, on EVERY path (a failed call may
+//    still have cost money; a provider error that means "not charged"
+//    settles 0).
+ctx.settle_cost(hold, actual_usd, metadata).await?;
+// (3-4-5 repeat for as many calls as you make on this access.)
+// 6. Done with the provider: retire the access, so a deployment's key stops
+//    being spendable at once instead of at the end of its window.
+ctx.close_access(access).await?;
+```
+
+Keep 3-4-5 TIGHT: no branching, no extra awaits between the provision,
+the call, and the settle. Then an unsettled provision can only mean one
+thing (the runtime was interrupted or died at the paid action itself),
+which is what makes unsettled provisions interpretable.
+
+Settling IS the recording: the settle books the amount to the
+execution's durable cost trail, and (on a deployment key, when the
+deployment meters usage) releases the provisioned hold. With the user's
+own key the provision holds nothing and the settle purely records.
+
+### Declaring the cost: estimate vs exact
+
+How well you know the price up front decides the provision:
+
+- **Fixed price per call** (one search = one credit): use
+  `CostProvision::exact(price)`. The amount IS the price. If the
+  runtime dies between the call and the settle, the deployment can
+  resolve the provision at the amount itself: the call almost certainly
+  happened.
+- **Metered output** (LLM tokens): use `CostProvision::estimate(ceiling)`
+  with a deliberately-high worst case derived from the provider's
+  published pricing. The settle brings it down to the actual.
+
+How long the action may run is the `window` you passed to
+`ctx.provider_access`: declared once, it bounds both the credential's life
+and how long an unsettled provision waits before it is treated as abandoned.
+A node wrapping a genuinely long action (a multi-hour generation) passes a
+window to match, so it is never mistaken for a lost one.
+
+### Interruption: settle before you die
+
+When the user stops the execution mid-call, the settle in step 5 never
+runs unless you make it. Declare `interruptGrace` (see Cancellation
+above) and branch on the flag around the paid call:
+
+- If the service can tell you what an interrupted call cost (a
+  streaming LLM call reports usage per chunk, or exposes a
+  by-request-id ledger you can query right then), stop the call,
+  settle at that number, and return.
+- If the price was exact, settle at the exact price (the request went
+  out; it cost what it costs).
+- If you can know nothing, settle 0 with metadata saying so; the
+  deployment treats the provision accordingly.
+
+### If the runtime dies outright
+
+No node code runs. The principle is: **the provision is dropped**. The
+cost was still charged by the provider, but its record is lost (an
+`exact` provision is the exception: the amount itself is trustworthy).
+This is the accepted trade for a rare event; it is also why steps 3-4-5
+stay tight, so "dropped provision" can never mean anything else.
+
+### Provider keys: use the access, never a key
+
+`ctx.provider_access(provider, key_input)` gives you the two things a
+paid call needs: what to authenticate with (`.credential()`) and the
+address to send it to (`.base_url(provider_default)`). Always use both,
+even when you think you know the provider's address: an access may hand
+you a different one, and the call only works if you honor it.
+
+```rust
+let access = ctx.provider_access("openrouter", cfg.get_optional("apiKey")?).await?;
+
+// An HTTP library: give it the access's address and credential.
+let generator = GeneratorInfo::openrouter(model);
+let base_url = access.base_url(&generator.base_url);
+let generator = generator.with_base_url(base_url).with_api_key(access.credential().to_string());
+
+// A hand-built request: same two values.
+let response = client
+    .post(format!("{}/search", access.base_url("https://api.tavily.com")))
+    .bearer_auth(access.credential())
+    .json(&body)
+    .send()
+    .await?;
+
+// When your provider work is finished (after the last call on this
+// access, including anything the library does afterwards, like resolving
+// a cost), retire it:
+ctx.close_access(access).await?;
+```
+
+Where the credential comes from is not your node's business: a key on the
+node's input is the user's own, and an empty input (or the platform
+sentinel) asks the deployment for its configured key for that provider
+(the `<PROVIDER>_API_KEY` env var of the deployment's broker, packed from
+your shell or `.env` by the CLI on daemon start). Either way your code is
+the same lines; nothing branches.
+
+For the deployment-key path to work, your node must declare the provider
+it calls, with the `provider` metadata key:
+
+```jsonc
+// metadata.json
+{
+  "type": "TavilySearch",
+  ...
+  "provider": {
+    "name": "tavily",
+    "base_url": "https://api.tavily.com"
+  }
+}
+```
+
+Two fields, nothing else: the provider's name (which is also where the
+deployment's key comes from: `<NAME>_API_KEY`, uppercased, `-` becomes
+`_`) and the provider's real API base URL. The name you declare is the
+name you pass to `ctx.provider_access`.
+
+Like any metadata key, a package whose nodes all call one service
+declares it once in the package-level `metadata.json` (see
+"Package-level metadata defaults") instead of per node. A node with no
+declaration can still make calls on the user's own key; the
+deployment-key path refuses with an error telling you to declare it.
+
+`provider_access` assumes your provider work fits the default window (15
+minutes). A node wrapping a genuinely long action declares its own:
+`ctx.provider_access_within(provider, key_input, Duration::from_secs(...))`.
+
+Rules that matter:
+
+- Get the access, use it, close it. Do not stash `.credential()` anywhere
+  (an output port, a log, an error, a struct that outlives the call).
+- Close as soon as the provider work is done, not at the end of `execute`.
+- A missing deployment key is a loud error naming the fix ("set your own
+  key"); do not paper over it.
+- On a deployment's key, requests do not follow redirects: a provider that
+  answers "go ask this other address instead" is an error, not a second
+  request. Every API we support answers directly. If yours genuinely cannot,
+  get in touch: we are working out how to support it. (A user's own key is
+  unaffected: those requests are yours, and go straight to the provider.)
 
 ## Durable execution: `await_signal`, `register_signal`, `ctx.run`
 
@@ -607,30 +913,55 @@ knob. The files are reachable independently of the editor (e.g. the `weft`
 CLI lists/downloads/removes them by scope), so `Shared` data a project
 wrote remains accessible after the project is gone.
 
-## Form-field nodes: `form_field_specs.json`
+## Package-level metadata defaults
+
+A package (a dir with `package.toml`) may hold a PARTIAL `metadata.json`
+at its root: defaults every member node inherits. The merge is top-level
+and key-by-key: for each key in the package file, a member gets it
+unless its own `metadata.json` carries that key, in which case the
+member's value wins wholesale (no deep merge). `type` can never be a
+default (it is one node's identity); setting it at the package level is
+an error.
+
+Use it for whatever a package's nodes share: the `provider` a whole
+provider package calls, the `formFieldSpecs` vocabulary the `human`
+package's trigger and query both speak, and any future shared key. A
+bare node has no package level; its own `metadata.json` is already the
+whole story.
+
+```
+catalog/human/                     # package (has package.toml)
+  package.toml
+  metadata.json                    # PARTIAL: { "formFieldSpecs": [...] }, shared by BOTH members
+  form_helpers.rs                  # shared: fields -> FormSchema/output mapping
+  trigger/  metadata.json          # HumanTrigger  (hasFormSchema: true)
+  query/    metadata.json          # HumanQuery    (hasFormSchema: true)
+```
+
+## Form-field nodes: `formFieldSpecs`
 
 A form-field node (a human trigger/query: the user fills a form, its
-fields become ports) does NOT hardcode its ports in `metadata.json`.
-Instead it declares a VOCABULARY of field types in a
-`form_field_specs.json` file, and the node's real ports are DERIVED from
-whatever fields the graph author configured, at parse/enrich time. So a
-`HumanTrigger` with an `approve_reject` field named `review` gets two
-Boolean outputs `review_approved` / `review_rejected` automatically; the
-author never writes those ports.
+fields become ports) does NOT hardcode its ports. Instead it declares a
+VOCABULARY of field types under the `formFieldSpecs` metadata key, and
+the node's real ports are DERIVED from whatever fields the graph author
+configured, at parse/enrich time. So a `HumanTrigger` with an
+`approve_reject` field named `review` gets two Boolean outputs
+`review_approved` / `review_rejected` automatically; the author never
+writes those ports.
 
 ### Turning it on
 
 Set `hasFormSchema: true` in the node's `metadata.json` `features`, and
-ship a `form_field_specs.json` (see resolution below). That flag is the
-gate: the enrich pass only materializes form ports for nodes that
-declare it.
+declare `formFieldSpecs` (usually once at the package level; see
+"Package-level metadata defaults"). That flag is the gate: the enrich
+pass only materializes form ports for nodes that declare it.
 
 ```json
 // metadata.json
 { "type": "HumanTrigger", "features": { "hasFormSchema": true }, ... }
 ```
 
-### The spec file
+### The spec entries
 
 Each entry defines one field type: its `field_type` token (what a
 graph author's field `fieldType` must equal), a `render` hint for the
@@ -639,66 +970,34 @@ adds. `{key}` in a `name_template` is substituted with the field's
 user-supplied key; `T_Auto` requests a per-field type variable.
 
 ```json
-[
-  {
-    "field_type": "approve_reject",
-    "label": "Approve / Reject",
-    "render": { "component": "buttons", "source": "static" },
-    "required_config": [],
-    "optional_config": ["label", "approveLabel", "rejectLabel"],
-    "adds_inputs": [],
-    "adds_outputs": [
-      { "name_template": "{key}_approved", "port_type": "Boolean" },
-      { "name_template": "{key}_rejected", "port_type": "Boolean" }
-    ]
-  },
-  {
-    "field_type": "text_input",
-    "label": "Text input",
-    "render": { "component": "text" },
-    "adds_outputs": [ { "name_template": "{key}", "port_type": "String" } ]
-  }
-]
+// metadata.json (package-level, shared by every member)
+{
+  "formFieldSpecs": [
+    {
+      "field_type": "approve_reject",
+      "label": "Approve / Reject",
+      "render": { "component": "buttons", "source": "static" },
+      "required_config": [],
+      "optional_config": ["label", "approveLabel", "rejectLabel"],
+      "adds_inputs": [],
+      "adds_outputs": [
+        { "name_template": "{key}_approved", "port_type": "Boolean" },
+        { "name_template": "{key}_rejected", "port_type": "Boolean" }
+      ]
+    },
+    {
+      "field_type": "text_input",
+      "label": "Text input",
+      "render": { "component": "text" },
+      "adds_outputs": [ { "name_template": "{key}", "port_type": "String" } ]
+    }
+  ]
+}
 ```
 
-The on-disk file may use snake_case (`field_type`, `adds_outputs`,
+The on-disk entries may use snake_case (`field_type`, `adds_outputs`,
 `name_template`, `port_type`); the loader accepts that AND the camelCase
 wire form, so you can write either.
-
-### Where the file lives (the resolution rule)
-
-The filename defaults to `form_field_specs.json` (override per node with
-`"formFieldSpecsRef": "..."` in `metadata.json`). It is looked up
-**most-specific first**:
-
-1. **The node's own directory** (beside its `metadata.json`).
-2. **The package root** (the dir with `package.toml`).
-
-So:
-
-- **A bare node** (a dir with `metadata.json` and no `package.toml`, the
-  dir IS the node) keeps its `form_field_specs.json` in that same dir.
-- **A package member** (a subdir under a `package.toml` root) inherits
-  ONE shared `form_field_specs.json` at the package root, which all
-  members see. This is why the stdlib `human` package puts the file at
-  `catalog/human/form_field_specs.json` and its `query/` and `trigger/`
-  members share it.
-- **A member can override** the shared file by dropping its own
-  `form_field_specs.json` in its member dir; the local file wins.
-
-```
-catalog/human/                     # package (has package.toml)
-  package.toml
-  form_field_specs.json            # shared by BOTH members
-  form_helpers.rs                  # shared: fields -> FormSchema/output mapping
-  trigger/  metadata.json          # HumanTrigger  (hasFormSchema: true)
-  query/    metadata.json          # HumanQuery    (hasFormSchema: true)
-
-catalog/my_form_node/              # bare node (no package.toml)
-  metadata.json                    # hasFormSchema: true
-  mod.rs
-  form_field_specs.json            # beside metadata.json
-```
 
 ### What derivation reads (and what it ignores)
 

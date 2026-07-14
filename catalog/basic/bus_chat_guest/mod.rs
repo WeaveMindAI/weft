@@ -32,11 +32,10 @@ use serde_json::{json, Value};
 
 use weft_core::bus::BusEntryKind;
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct BusChatGuestNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 /// The guest's replies, one per host turn.
 // SYNC: GUEST_LINES <-> catalog::basic::bus_chat_host::HOST_LINES.
@@ -47,15 +46,6 @@ const GUEST_LINES: &[&str] = &["hey there", "not much, you?", "later"];
 
 #[async_trait]
 impl Node for BusChatGuestNode {
-    fn node_type(&self) -> &'static str {
-        "BusChatGuest"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON)
-            .expect("BusChatGuest metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let mut bus = ctx.bus_from_input("channel")?;
 

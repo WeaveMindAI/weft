@@ -480,6 +480,102 @@ pub struct InfraEndpointUrlResponse {
     pub endpoint_url: Option<String>,
 }
 
+// ---------- Provider access + cost provisioning ----------
+
+/// Worker asks the deployment for access to `provider` on ITS configured key
+/// (the node's key input was empty or the managed sentinel; a user-supplied
+/// key never makes this call). The node's identity travels with the request
+/// so the deployment's key policy can decide per node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccessRequest {
+    /// The requesting execution; the broker resolves + enforces the owning
+    /// tenant from it.
+    pub color: String,
+    pub project_id: String,
+    pub node_id: String,
+    pub node_type: String,
+    pub provider: String,
+    /// How long the paid call this access is for may reasonably take. The
+    /// stand-in is live for exactly that long, so a node that never closes
+    /// the access (a crash) still cannot leave a spendable credential behind.
+    pub expected_duration_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccessResponse {
+    /// A stand-in for the deployment's key: the key itself never leaves the
+    /// broker. Requests carrying it go to the broker's proxy for the
+    /// provider, which swaps it for the real key (see the broker's
+    /// `provider_proxy` module). The caller already knows the broker's
+    /// address, so the proxy URL is built worker-side.
+    pub standin: String,
+}
+
+/// Worker is done with a provider: give the access back NOW, rather than
+/// leaving it live to its window (which is only the crash backstop).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccessCloseRequest {
+    pub color: String,
+    pub standin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccessCloseResponse {}
+
+/// Worker declares the cost of an imminent call on a deployment key. The
+/// deployment may meter it (hold against a usage budget) or refuse (loud
+/// 4xx with a user-facing message).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostProvisionRequest {
+    pub color: String,
+    pub project_id: String,
+    pub node_id: String,
+    pub node_type: String,
+    pub provider: String,
+    /// Service/model audit detail from the node's cost report.
+    pub service: String,
+    pub model: Option<String>,
+    /// The declared cost of the exact call about to be made: a ceiling
+    /// when `exact` is false, the true price when `exact` is true.
+    pub amount_usd: f64,
+    /// The amount IS the price (fixed-per-call pricing). An unsettled
+    /// exact provision can be resolved at the provisioned amount itself
+    /// (the call almost certainly happened; only the settle was lost).
+    pub exact: bool,
+    /// How long the paid action should reasonably take. An unsettled
+    /// provision counts as abandoned only well after this window, so
+    /// declared long-running actions are never swept mid-flight.
+    pub expected_duration_secs: u64,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostProvisionResponse {
+    /// The deployment's tracked hold when it meters usage; `None` when
+    /// nothing is tracked (nothing to settle later).
+    pub hold_id: Option<String>,
+}
+
+/// Worker reports what a provisioned call ACTUALLY cost. Settling IS the
+/// recording: the broker durably records the amount against the execution
+/// (the journal's cost trail), and additionally releases the metered hold
+/// when the provision took one (`hold_id`). `dedup_key` makes the record
+/// idempotent under worker retries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostSettleRequest {
+    pub color: String,
+    pub hold_id: Option<String>,
+    /// The billed service (the key's provider) and model, from the hold.
+    pub service: String,
+    pub model: Option<String>,
+    pub amount_usd: f64,
+    pub metadata: Value,
+    pub dedup_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostSettleResponse {}
+
 // ---------- Project (worker fetches its own definition) ----------
 
 /// Worker call to fetch the project's runtime `ProjectDefinition`

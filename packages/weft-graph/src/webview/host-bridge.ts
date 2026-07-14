@@ -125,6 +125,8 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     config: {
       ...(isLoop && g.loopConfig ? (g.loopConfig as Record<string, unknown>) : {}),
       ...(parentId ? { parentId } : {}),
+      // GroupNode renders the description from `config.description`.
+      ...(g.description ? { description: g.description } : {}),
     },
     position: { x: 0, y: 0 },
     parentId,

@@ -21,7 +21,6 @@ pub mod infra;
 pub mod add;
 pub mod catalog;
 pub mod describe_nodes;
-pub mod node_catalog;
 pub mod parse;
 pub mod executions;
 pub mod status;

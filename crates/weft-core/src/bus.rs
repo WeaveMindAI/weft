@@ -2263,9 +2263,7 @@ mod tests {
         a.send("G", json!(6)).unwrap();        // @7 msg
         a.send("H", json!(7)).unwrap();        // @8 msg (live; window=1 keeps only this)
         // Cursor positioned AT an evicted mid-log message offset (E == @5).
-        let mut cur = bus.cursor_from_start().strict_gaps();
-        // jump cursor to offset 5 by re-seeding there.
-        cur = bus.cursor_at(5).strict_gaps();
+        let mut cur = bus.cursor_at(5).strict_gaps();
         // First read: gap (5 evicted) -> FellBehind, resume FORWARD at the
         // next retained entry, which is the Join @6 (NOT backward to @0/@3).
         match cur.next().await {

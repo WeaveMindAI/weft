@@ -327,7 +327,7 @@ impl RuntimeStore {
         incoming: u64,
     ) -> Result<bool> {
         let total = entitlements.account_used_bytes(tx, tenant).await?;
-        Ok(entitlements.caps(tenant).disk_bytes_would_exceed(total, incoming))
+        Ok(entitlements.caps(tenant).await?.disk_bytes_would_exceed(total, incoming))
     }
 
     /// Re-wall a caller-supplied key: parse it through the grammar and confirm
@@ -420,7 +420,11 @@ impl RuntimeStore {
                     .await
                     .context("runtime begin_upload: count tenant files")
                     .map_err(RuntimeStoreError::Other)?;
-            let caps = entitlements.caps(&tenant);
+            let caps = entitlements
+                .caps(&tenant)
+                .await
+                .context("runtime begin_upload: resolve tenant caps")
+                .map_err(RuntimeStoreError::Other)?;
             if caps.file_count_would_exceed(count as u64) {
                 return Err(RuntimeStoreError::QuotaExceeded(format!(
                     "tenant '{tenant}' is at its file cap ({} files); delete files or raise the cap",
@@ -629,11 +633,17 @@ impl RuntimeStore {
                          the bucket lifecycle rule will reap it"
                     );
                 }
+                // Best-effort cap readout for the message; the quota verdict
+                // above already stands regardless.
+                let cap_display = entitlements
+                    .caps(&pending.tenant_id)
+                    .await
+                    .map(|c| c.disk_bytes_cap.to_string())
+                    .unwrap_or_else(|_| "?".to_string());
                 return Err(RuntimeStoreError::QuotaExceeded(format!(
-                    "tenant '{}' would exceed its storage quota ({} bytes) by streaming \
-                     {incoming} more; the upload was aborted",
-                    pending.tenant_id,
-                    entitlements.caps(&pending.tenant_id).disk_bytes_cap
+                    "tenant '{}' would exceed its storage quota ({cap_display} bytes) by \
+                     streaming {incoming} more; the upload was aborted",
+                    pending.tenant_id
                 )));
             }
             sqlx::query(

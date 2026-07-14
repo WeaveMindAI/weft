@@ -23,17 +23,18 @@ use weft_compiler::build::build_project_catalog;
 use weft_compiler::project::Project;
 use weft_compiler::validate::ValidationMode;
 use weft_compiler::Diagnostic;
+use weft_core::node::NodeMetadata;
 use weft_core::{MetadataCatalog, ProjectDefinition};
 
-use super::node_catalog::NodeCatalogEntry;
 use super::Ctx;
 
 #[derive(Debug, Serialize)]
 struct ParseResponse {
     project: ProjectDefinition,
-    /// Per-node-type catalog entries, keyed by `NodeDefinition.nodeType`,
-    /// scoped to the node types the project references.
-    catalog: BTreeMap<String, NodeCatalogEntry>,
+    /// Per-node-type catalog entries (the metadata IS the entry; form-field
+    /// specs included), keyed by `NodeDefinition.nodeType`, scoped to the
+    /// node types the project references.
+    catalog: BTreeMap<String, NodeMetadata>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -409,7 +410,7 @@ fn do_validate(
 fn collect_catalog(
     project: &ProjectDefinition,
     catalog: &FsCatalog,
-) -> BTreeMap<String, NodeCatalogEntry> {
+) -> BTreeMap<String, NodeMetadata> {
     let mut out = BTreeMap::new();
     for node in &project.nodes {
         if out.contains_key(&node.node_type) {
@@ -419,11 +420,7 @@ fn collect_catalog(
             if meta.features.hidden {
                 continue;
             }
-            let specs = catalog.form_field_specs(&node.node_type).to_vec();
-            out.insert(
-                node.node_type.clone(),
-                NodeCatalogEntry { metadata: meta.clone(), form_field_specs: specs },
-            );
+            out.insert(node.node_type.clone(), meta.clone());
         }
     }
     out

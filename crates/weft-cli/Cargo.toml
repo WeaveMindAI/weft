@@ -10,6 +10,8 @@ name = "weft"
 path = "src/main.rs"
 
 [dependencies]
+# `.env` loading at CLI startup (provider keys, local overrides).
+dotenvy = "0.15"
 weft-core = { workspace = true }
 weft-compiler = { workspace = true }
 weft-catalog = { workspace = true }

@@ -83,6 +83,9 @@ async fn run_core_migrations_locked(pool: &sqlx::PgPool) -> anyhow::Result<crate
     crate::storage::migrate(pool)
         .await
         .context("apply storage_sweep migrations")?;
+    crate::provider_decl::migrate(pool)
+        .await
+        .context("apply provider_declaration migrations")?;
     let projects: crate::ProjectStore = std::sync::Arc::new(
         crate::PostgresProjectStore::new(pool.clone())
             .await

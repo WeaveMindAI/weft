@@ -26,9 +26,13 @@ string on its `value` output; `Debug` receives it on its `data` input.
 ## Comments and headers
 
 - `# ...` is a line comment.
-- A `# Description: <text>` comment on the first line(s) inside a group body
-  becomes that group's description. (The project name and id live in
-  `weft.toml`, not the source.)
+- If the FIRST line inside a group or loop body is a plain comment, that
+  single line is the group's description (keep it short; a second comment
+  line is an ordinary comment). Tooling shows it when the group is rendered
+  or collapsed. For an included `.weft` file, the description lives inside
+  the file's top-level group body, same rule; comments at the top of a file
+  outside any group have no special meaning. (The project name and id live
+  in `weft.toml`, not the source.)
 
 ## Nodes
 
@@ -104,19 +108,63 @@ Read it right-to-left: the value flows FROM `source.output_port` INTO
 error. Every required input must be wired (an unwired required input is a compile
 error); an unwired optional input (`port?`) is fine.
 
+### Config sugar on connection lines
+
+When the target is a NODE's own port and the right-hand side is a literal, the
+line fills that node's config instead of creating an edge:
+
+```weft
+prompt = Text
+prompt.value = "summarize the input"    # same as Text { value: "..." }
+```
+
+Only a node's own config port takes a literal this way. A group boundary port
+(`self.x`), an include alias port, or an undeclared target cannot be assigned a
+literal; those are driven by wiring or by an inline expression.
+
+### Inline expressions (anonymous nodes)
+
+A node literal can appear directly as a value, with a MANDATORY trailing
+`.port` naming which of its outputs feeds the target:
+
+```weft
+out.data = Text { value: "hi" }.value
+```
+
+This synthesizes an anonymous child node (id `{host}__{field}`, here
+`out__data`) plus the edge into `out.data`. The same form works as a config
+field's value inside a node body. Inline expressions carry full node syntax
+(inline port signatures, config, nesting); omitting the trailing `.port` is a
+compile error.
+
 ## Types
 
 Port types the compiler understands:
 
-- **Primitives**: `String`, `Number`, `Boolean`, `Image`, `File` (plus media
-  aliases like `Video`, `Audio`), `Bus`, `Null`.
+- **Primitives**: `String`, `Number`, `Boolean`, `Null`, `Image`, `Video`,
+  `Audio`, `Blob` (the catch-all stored-file primitive: any bytes whose mime
+  is not image/video/audio, e.g. a pdf or a zip), `Empty` (the bottom type: a
+  port that never carries a value; `Number | Empty` simplifies to `Number`).
+- **Union aliases**: `Media` = `Image | Video | Audio`; `File` = `Image |
+  Video | Audio | Blob`. These are shorthand names for those unions, not
+  primitives of their own.
 - **Containers**: `List[T]` (e.g. `List[Number]`, `List[List[String]]`),
   `Dict[K, V]` (e.g. `Dict[String, String]`).
+- **`JsonDict`**: an opaque `Dict[String, *]` whose value types are unchecked;
+  compatible with any `Dict[String, V]` in both directions. Use it for raw API
+  responses where the shape is unknown or too complex to declare.
 - **Unions**: `A | B` (e.g. `String | Number`, `Number | Null`).
+- **`Bus`**: a message-bus handle, an in-process channel between co-alive
+  nodes. A `Bus` output connects only to a `Bus` input; message payloads are
+  not type-checked by the language. Wired-only: the value is a live runtime
+  handle, never a config literal.
 - **Type variables**: a bare capitalized name like `T` is a generic that unifies
   across the node's ports. A node with input `T` and output `T` carries whatever
   concrete type flows in. A type variable must be pinned to something concrete
   somewhere in the graph, or the compiler rejects it as unresolved.
+- **`MustOverride`**: a node whose metadata cannot determine a port's type
+  declares it `MustOverride`; the `.weft` author must pin it (via the inline
+  port signature). Any `MustOverride` remaining at compile time is an error.
 - **Optional**: a trailing `?` on an input port lets it accept `null` (it opts
   into receiving "no value"). Without `?`, a required input refuses to run on
   null and the node is skipped.
@@ -218,7 +266,11 @@ Invalid combinations, all compile errors: `parallel: true` with a non-empty
 iteration count must be known upfront), and `parallel: true` with any
 `self.done` write (`parallel-with-done`). Empty `over` AND empty `carry` is
 allowed: the loop runs purely until `self.done` / `max_iters` (the pure
-side-effect shape).
+side-effect shape). But a sequential loop with no `over`, no `max_iters`, AND
+no `self.done` write anywhere in its body is provably infinite and rejected at
+compile time (`loop-unbounded-no-termination`): give it something to exhaust,
+a cap, or a stop vote. A port listed in both `over` and `carry` is an error
+(`over-and-carry-overlap`).
 
 The five base shapes:
 

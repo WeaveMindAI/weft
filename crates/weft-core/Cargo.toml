@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Re-exported as the `weft_core::NodeManifest` derive: every node picks up
+# its co-located metadata.json through it. Proc-macro crates build for the
+# host, so the WASM parse build is unaffected.
+weft-node-derive = { path = "../weft-node-derive" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,6 +39,9 @@ cron = { version = "0.12", optional = true }
 # base64url payload.
 hmac = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+# The context HTTP capability (`ctx.http()`): marker-aware egress routing
+# for deployment-key requests. Runtime-only (no wasm32 support needed).
+reqwest = { workspace = true, optional = true }
 
 [features]
 default = ["runtime"]
@@ -42,7 +49,15 @@ default = ["runtime"]
 # connections, cancellation, timer signals, and signed routing tokens. Pulls
 # tokio/futures/bytes (no wasm32 support). Default on; the WASM parse build is
 # the only consumer that turns it off (it needs only the pure type layer).
-runtime = ["dep:tokio", "dep:futures", "dep:bytes", "dep:cron", "dep:hmac", "dep:base64"]
+runtime = [
+    "dep:tokio",
+    "dep:futures",
+    "dep:bytes",
+    "dep:cron",
+    "dep:hmac",
+    "dep:base64",
+    "dep:reqwest",
+]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into
 # layer-3 tests. Off by default; consumers enable it in `[dev-dependencies]`.

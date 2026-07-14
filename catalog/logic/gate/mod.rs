@@ -7,23 +7,14 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 use weft_core::node::NodeOutput;
 
+#[derive(NodeManifest)]
 pub struct GateNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for GateNode {
-    fn node_type(&self) -> &'static str {
-        "Gate"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("Gate metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // `pass` and `value` are BOTH required inputs: the engine only
         // fires this node once they're present, so a missing one is an

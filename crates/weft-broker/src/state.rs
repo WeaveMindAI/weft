@@ -16,6 +16,8 @@ use weft_task_store::{
 use weft_platform_traits::ObjectStore;
 
 use crate::auth::{AuthConfig, IdentityCache};
+use crate::cost_gate::CostGate;
+use crate::credential::CredentialSource;
 use crate::entitlement::EntitlementSource;
 use crate::runtime_store::RuntimeStore;
 use crate::scope::ScopeCache;
@@ -40,6 +42,11 @@ pub struct BrokerState {
     pub runtime_store: Option<Arc<RuntimeStore>>,
     /// Resolves a tenant's runtime-storage caps.
     pub entitlements: Arc<dyn EntitlementSource>,
+    /// Resolves the deployment's provider keys for nodes that asked the
+    /// deployment to supply one (default: the host env).
+    pub credentials: Arc<dyn CredentialSource>,
+    /// Meters spend on the deployment's keys (default: unmetered).
+    pub cost_gate: Arc<dyn CostGate>,
 }
 
 impl BrokerState {
@@ -52,6 +59,8 @@ impl BrokerState {
         auth: AuthConfig,
         object_store: Option<Arc<dyn ObjectStore>>,
         entitlements: Arc<dyn EntitlementSource>,
+        credentials: Arc<dyn CredentialSource>,
+        cost_gate: Arc<dyn CostGate>,
     ) -> anyhow::Result<Arc<Self>> {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let pool = loop {
@@ -80,6 +89,10 @@ impl BrokerState {
         let worker_pods: Arc<dyn WorkerPodClient> =
             Arc::new(PostgresWorkerPodClient::new(pool.clone()));
         let infra: Arc<dyn InfraReader> = Arc::new(PostgresInfraReader::new(pool.clone()));
+
+        // The stand-in table: the broker owns it (mint when an access opens,
+        // spend at the provider proxy, sweep on expiry).
+        crate::provider_proxy::migrate(&pool).await.context("provider stand-in migrate")?;
 
         // Wire the runtime-file plane over the slot when one is configured. The
         // broker OWNS the `runtime_file` table (it is the only reader/writer),
@@ -112,6 +125,8 @@ impl BrokerState {
             object_store,
             runtime_store,
             entitlements,
+            credentials,
+            cost_gate,
         }))
     }
 }

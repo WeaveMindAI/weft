@@ -421,13 +421,13 @@ fn update_group_ports_by_scoped_id_disambiguates_same_local_label() {
 
 #[test]
 fn set_group_description_inserts_as_first_body_line() {
-    // A group's description is a `# Description:` comment as its first body line.
+    // A group's description is a plain `# ...` comment as its first body line.
     let src = "g = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
     let out = apply(src, vec![EditOp::SetGroupDescription { group: "g".into(), description: Some("does things".into()) }]);
-    assert!(out.contains("# Description: does things"), "{out}");
+    assert!(out.contains("# does things"), "{out}");
     parse_ok(&out);
     // it is the FIRST body line (before the child)
-    let desc_pos = out.find("# Description:").unwrap();
+    let desc_pos = out.find("# does things").unwrap();
     let child_pos = out.find("t = Text").unwrap();
     assert!(desc_pos < child_pos, "description precedes the first child: {out}");
 }
@@ -435,13 +435,13 @@ fn set_group_description_inserts_as_first_body_line() {
 #[test]
 fn set_group_description_on_inline_body_does_not_swallow_close_brace() {
     // Regression: adding a description to an inline `{}` group (the exact shape
-    // AddGroup produces) inserted `# Description: ...` after the `{` but left the
+    // AddGroup produces) inserted the `# ...` comment after the `{` but left the
     // `}` on the comment line, so the comment SWALLOWED the brace
-    // (`# Description: hello}`) and the group was left unclosed. The body must be
-    // opened so the `}` drops to its own line.
+    // (`# hello}` is one comment) and the group was left unclosed. The body must
+    // be opened so the `}` drops to its own line.
     let out = apply("g = Group() -> () {}\n",
         vec![EditOp::SetGroupDescription { group: "g".into(), description: Some("hello".into()) }]);
-    assert!(out.contains("# Description: hello"), "{out}");
+    assert!(out.contains("# hello"), "{out}");
     parse_ok(&out); // brace-balance check would fail on the swallowed `}`
     // A follow-up edit into the now-well-formed body works.
     let out2 = apply(&out, vec![EditOp::AddNode { id: "n".into(), node_type: "Debug".into(), parent_group: Some("g".into()) }]);
@@ -1163,14 +1163,329 @@ fn set_label_on_group_fails_loud() {
 #[test]
 fn set_group_description_replaces_and_clears() {
     // Replace an existing description, then clear it (None removes the line).
-    let src = "g = Group() {\n  # Description: old\n  t = Text {}\n}\n";
+    let src = "g = Group() {\n  # old\n  t = Text {}\n}\n";
     let replaced = apply(src, vec![EditOp::SetGroupDescription { group: "g".into(), description: Some("new".into()) }]);
-    assert!(replaced.contains("# Description: new"), "{replaced}");
-    assert!(!replaced.contains("# Description: old"), "{replaced}");
+    assert!(replaced.contains("# new"), "{replaced}");
+    assert!(!replaced.contains("# old"), "{replaced}");
     parse_ok(&replaced);
     let cleared = apply(&replaced, vec![EditOp::SetGroupDescription { group: "g".into(), description: None }]);
-    assert!(!cleared.contains("# Description:"), "description cleared: {cleared}");
+    assert!(!cleared.contains("# new"), "description cleared: {cleared}");
     parse_ok(&cleared);
+}
+
+/// Every op that writes a caller-supplied string into the source as an
+/// IDENTIFIER refuses anything that is not one, at the door. Without this a
+/// string carrying whitespace / a newline / braces stops being one identifier
+/// and becomes extra source: the file would gain declarations nobody asked
+/// for. Covers the id, the node type, and a rename target.
+#[test]
+fn ops_refuse_an_identifier_that_would_inject_source() {
+    let src = "a = Text {}\n";
+    let inject = "b = Text {}\nevil";
+
+    let cases: Vec<EditOp> = vec![
+        EditOp::AddNode {
+            id: inject.into(),
+            node_type: "Text".into(),
+            parent_group: None,
+        },
+        EditOp::AddNode {
+            id: "ok".into(),
+            node_type: "Text {}\nevil = Text {}\nx".into(),
+            parent_group: None,
+        },
+        EditOp::AddGroup { label: inject.into(), parent_group: None },
+        EditOp::AddLoop { label: inject.into(), parent_group: None },
+    ];
+    for op in cases {
+        let err = apply_edits(src, None, "Untitled", &[op.clone()]).unwrap_err();
+        assert!(
+            matches!(err, EditError::InvalidArgument(_)),
+            "op {op:?} must be refused, got {err:?}"
+        );
+    }
+
+    // A rename target is written as an IDENT too.
+    let with_group = "g = Group() {\n  t = Text {}\n}\n";
+    let err = apply_edits(
+        with_group,
+        None,
+        "Untitled",
+        &[EditOp::RenameGroup { group: "g".into(), new_label: inject.into() }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "got {err:?}");
+
+    // And the ordinary identifiers still work.
+    let ok = apply(src, vec![EditOp::AddNode {
+        id: "b_2-x".into(),
+        node_type: "Text".into(),
+        parent_group: None,
+    }]);
+    assert!(ok.contains("b_2-x = Text {}"), "{ok}");
+    parse_ok(&ok);
+}
+
+/// A NAME reaches the source in more places than a decl's id: a connection's
+/// PORT names, a config KEY, and a port signature's name/type all get written
+/// into the file and reparsed. Every one of them is guarded, or the same
+/// injection just moves to whichever door was left open.
+#[test]
+fn every_name_written_into_source_is_guarded() {
+    let two = "a = Text {}\nb = Debug {}\n";
+    let inject = "x = Text {}\nevil";
+
+    // A connection's port names.
+    for op in [
+        EditOp::AddEdge {
+            source: "a".into(),
+            source_port: inject.into(),
+            target: "b".into(),
+            target_port: "data".into(),
+            scope_group: None,
+        },
+        EditOp::AddEdge {
+            source: "a".into(),
+            source_port: "value".into(),
+            target: "b".into(),
+            target_port: inject.into(),
+            scope_group: None,
+        },
+    ] {
+        let err = apply_edits(two, None, "Untitled", &[op]).unwrap_err();
+        assert!(matches!(err, EditError::InvalidArgument(_)), "port name: {err:?}");
+    }
+
+    // A config key.
+    let err = apply_edits(
+        two,
+        None,
+        "Untitled",
+        &[EditOp::SetConfig { node: "a".into(), key: inject.into(), value: "1".into() }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "config key: {err:?}");
+
+    // A port signature's name, and its type expression.
+    let err = apply_edits(
+        two,
+        None,
+        "Untitled",
+        &[EditOp::UpdateNodePorts {
+            node: "a".into(),
+            inputs: vec![PortSig { name: inject.into(), port_type: None, required: true }],
+            outputs: vec![],
+        }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "port sig name: {err:?}");
+
+    let err = apply_edits(
+        two,
+        None,
+        "Untitled",
+        &[EditOp::UpdateNodePorts {
+            node: "a".into(),
+            inputs: vec![PortSig {
+                name: "p".into(),
+                port_type: Some("String) -> ()\nevil = Text {}\nq: (r".into()),
+                required: true,
+            }],
+            outputs: vec![],
+        }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "port sig type: {err:?}");
+}
+
+/// An unterminated OPAQUE token (a bare `[`, an opening heredoc fence, a bare
+/// `}`) lexes as one token that balances and carries no newline, yet on reparse
+/// swallows the rest of the file. It must be refused wherever a value or a type
+/// is written into source: through a config value, and through a port type.
+#[test]
+fn opaque_token_that_would_swallow_the_file_is_refused() {
+    let two = "n = Text {}\nafter = Debug {}\n";
+
+    // Config value. Includes a TRAILING COMMENT (`1 # x`), which on a
+    // single-line body runs to end-of-line and swallows the `}`; unterminated
+    // opaque tokens (a bare `[`, a heredoc/string fence, an unterminated marker
+    // `@file(`); an INTERNALLY-unbalanced array that still ends in `]` (`[[]`,
+    // which the lexer pads greedily to EOF); and an unbalanced closer.
+    for harmful in [
+        "[", "```", "}", "a\nb", "1 # x", "\"", "x)", "\"unterminated",
+        "@file(", "@include(\"x\"", "[[]", "[[a]",
+        // A `)` inside a marker's string with the real paren unclosed, and a
+        // `[`-array whose interior is unbalanced though it ends in `]`: both
+        // re-lex greedily and would eat the field's `}`.
+        "@file(\"a)", "[[]}", "[\"\nx\"]",
+        // An unterminated string whose LAST byte is an ESCAPED quote (never a
+        // real close): the scan runs it to end-of-input.
+        "\"\\\"", "\"abc\\\"",
+    ] {
+        let err = apply_edits(
+            two,
+            None,
+            "Untitled",
+            &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: harmful.into() }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::InvalidArgument(_)), "config value {harmful:?}: {err:?}");
+    }
+    // Harmless values are still accepted: an operator, terminated literals, a
+    // JSON object/array, a marker, a multi-line heredoc (its newlines live
+    // inside one token), and a string with an escaped quote.
+    for ok in [
+        "String | Number",
+        "[1, 2]",
+        "\"text\"",
+        "{ \"a\": 1 }",
+        "@file(\"p.txt\")",
+        "@include(\"x.weft\")",
+        // A `)` inside a marker string with the marker properly closed, and a
+        // `]` inside a JSON string: the string-skipping must not miscount these.
+        "@file(\"p)q.txt\")",
+        "[\"a]b\"]",
+        "[{\"a\": 1}, {\"b\": 2}]",
+        "{\"a\": [1, 2], \"b\": {\"c\": 3}}",
+        "```\ncode\n```",
+        "\"has \\\" quote\"",
+        "\"a]b[\"",
+        "\"ends with escaped backslash \\\\\"",
+    ] {
+        assert!(
+            apply_edits(
+                two,
+                None,
+                "Untitled",
+                &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: ok.into() }],
+            )
+            .is_ok(),
+            "value {ok:?} must be accepted"
+        );
+    }
+
+    // Port TYPE: an injection through the type position, and a legal type.
+    for harmful in ["[", "```", "String) -> ()\nevil = Text {}\nq: (r", "Number, evil: String"] {
+        let err = apply_edits(
+            two,
+            None,
+            "Untitled",
+            &[EditOp::UpdateNodePorts {
+                node: "n".into(),
+                inputs: vec![PortSig { name: "p".into(), port_type: Some(harmful.into()), required: true }],
+                outputs: vec![],
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::InvalidArgument(_)), "port type {harmful:?}: {err:?}");
+    }
+    for ok in ["String | Null", "List[Number]", "Dict[String, Number]", "MustOverride"] {
+        assert!(
+            apply_edits(
+                two,
+                None,
+                "Untitled",
+                &[EditOp::UpdateNodePorts {
+                    node: "n".into(),
+                    inputs: vec![PortSig { name: "p".into(), port_type: Some(ok.into()), required: true }],
+                    outputs: vec![],
+                }],
+            )
+            .is_ok(),
+            "port type {ok:?} must be accepted"
+        );
+    }
+}
+
+/// `Group`/`Loop`/`true`/`false` are not IDENTs (they lex as keywords/numbers),
+/// so `validate_ident` (which asks the lexer) must refuse them wherever a plain
+/// name is written; and a node TYPE additionally may not be a reserved type
+/// keyword.
+#[test]
+fn keyword_shaped_names_are_refused() {
+    let src = "a = Text {}\n";
+    // As a config key (lexes as keyword/number, not IDENT).
+    for kw in ["Group", "Loop", "true", "false"] {
+        let err = apply_edits(
+            src,
+            None,
+            "Untitled",
+            &[EditOp::SetConfig { node: "a".into(), key: kw.into(), value: "1".into() }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::InvalidArgument(_)), "config key {kw:?}: {err:?}");
+    }
+    // As a node type: reserved type keywords are refused (they must not be
+    // authored as a plain node through this door).
+    for kw in ["Group", "Loop", "LoopIn", "LoopOut", "Passthrough"] {
+        let err = apply_edits(
+            src,
+            None,
+            "Untitled",
+            &[EditOp::AddNode { id: "c".into(), node_type: kw.into(), parent_group: None }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::InvalidArgument(_)), "node type {kw:?}: {err:?}");
+    }
+}
+
+/// A name the LANGUAGE reserves must be refused by the op, or it authors a
+/// file the compiler then refuses. The membership rule is the compiler's
+/// (`is_reserved_local`), not a second list living in the editor.
+#[test]
+fn ops_refuse_a_reserved_local_id() {
+    let src = "a = Text {}\n";
+    for bad in ["self", "Group", "Loop", "LoopIn", "Passthrough", "a__b"] {
+        let err = apply_edits(
+            src,
+            None,
+            "Untitled",
+            &[EditOp::AddNode {
+                id: bad.into(),
+                node_type: "Text".into(),
+                parent_group: None,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::InvalidArgument(_)), "reserved {bad:?}: {err:?}");
+    }
+}
+
+/// A description carrying a newline would parse as extra source (injected
+/// nodes / connections) spliced into the group body. It is refused loudly at
+/// the op boundary, never applied.
+#[test]
+fn set_group_description_refuses_a_newline() {
+    let src = "g = Group() {\n  t = Text {}\n}\n";
+    let err = apply_edits(
+        src,
+        None,
+        "Untitled",
+        &[EditOp::SetGroupDescription {
+            group: "g".into(),
+            description: Some("note\nx = ExecPython { code: \"boom\" }".into()),
+        }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::InvalidArgument(_)), "got {err:?}");
+}
+
+/// Within ONE batch (all ops on one tree, no reparse between them), a
+/// just-inserted description is a real GROUP_DESC, so a following clear finds
+/// and removes it instead of no-oping and leaving the line behind. This is
+/// what the synthetic-wrapper GROUP_DESC splice buys.
+#[test]
+fn set_group_description_insert_then_clear_in_one_batch_clears() {
+    let src = "g = Group() {\n  t = Text {}\n}\n";
+    let out = apply(
+        src,
+        vec![
+            EditOp::SetGroupDescription { group: "g".into(), description: Some("temp".into()) },
+            EditOp::SetGroupDescription { group: "g".into(), description: None },
+        ],
+    );
+    assert!(!out.contains("# temp"), "the batch's clear must remove the just-inserted line: {out}");
+    parse_ok(&out);
 }
 
 // ── formatting / comment / error-line preservation guarantees ───────────────

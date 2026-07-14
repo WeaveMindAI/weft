@@ -439,9 +439,9 @@ impl<'a> Parser<'a> {
     /// A node/group BODY: `{ ... }`. Children are config fields, connections,
     /// inline directives, nested decls, and trivia. The R_BRACE closes it.
     ///
-    /// `is_group`: when true, a `# Description:` comment that is the FIRST body
-    /// content (model doc §5: prefix AND first-body-line, both required) is
-    /// promoted to a GROUP_DESC node instead of staying plain COMMENT trivia.
+    /// `is_group`: when true, a plain `# ...` comment that is the FIRST body
+    /// content is the group's description (single line; a second comment line
+    /// stays plain COMMENT trivia) and is promoted to a GROUP_DESC node.
     fn maybe_parse_body(&mut self, is_group: bool) {
         // Skip inline trivia to find a `{`.
         let (off, kind) = match self.peek_significant() {
@@ -477,12 +477,12 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
-    /// Right after a group body's `{`, if the first non-whitespace content is a
-    /// `# Description:` COMMENT, wrap it (with its leading whitespace) in a
-    /// GROUP_DESC node. Only the FIRST body line qualifies; a `# Description:`
-    /// anywhere else stays a plain comment. Leading whitespace before the
-    /// comment is bumped first so it stays as body trivia, then the comment is
-    /// wrapped alone.
+    /// Right after a group body's `{`, if the first non-whitespace content is
+    /// a COMMENT, wrap it (with its leading whitespace) in a GROUP_DESC node:
+    /// the first comment line of a group body IS the group's description.
+    /// Only the FIRST body line qualifies; any later comment stays plain.
+    /// Leading whitespace before the comment is bumped first so it stays as
+    /// body trivia, then the comment is wrapped alone.
     fn maybe_promote_group_description(&mut self) {
         // peek past whitespace (not comments) to the first content token
         let mut i = self.pos;
@@ -496,7 +496,7 @@ impl<'a> Parser<'a> {
         let is_desc = self
             .tokens
             .get(i)
-            .map(|t| t.kind == SyntaxKind::COMMENT && is_description_comment(t.text))
+            .map(|t| t.kind == SyntaxKind::COMMENT)
             .unwrap_or(false);
         if !is_desc {
             return;
@@ -821,15 +821,6 @@ enum LineShape {
     Unknown,
 }
 
-/// True if a COMMENT's text is a `# Description:` line (the group-description
-/// convention). Tolerates leading whitespace inside the comment slice and an
-/// optional space after `#`.
-fn is_description_comment(text: &str) -> bool {
-    let t = text.trim_start();
-    let body = t.strip_prefix('#').map(|s| s.trim_start()).unwrap_or("");
-    body.starts_with("Description:")
-}
-
 /// The token kinds that can stand as a scalar config value (`key: <value>`).
 /// A structural token (`}`, `,`, whitespace) is NOT a value: an editor relies on
 /// the field node containing only its value, so a `key:` with nothing must parse
@@ -889,7 +880,7 @@ mod tests {
         // §4.10 include
         assert_round_trip("myThing = @include(\"sub.weft\")\n");
         // description + comments + blank lines
-        assert_round_trip("# top comment\n\ng = Group() {\n  # Description: does things\n  x = Text {}  # trailing\n}\n\n");
+        assert_round_trip("# top comment\n\ng = Group() {\n  # does things\n  x = Text {}  # trailing\n}\n\n");
         // optional port
         assert_round_trip("g = Group(a: String, b: Int?) -> (out: T) {}\n");
         // require_one_of directive
@@ -909,7 +900,7 @@ mod tests {
         assert_round_trip("\n");
         assert_round_trip("# just a comment\n");
         // Top-level `#` lines are plain comments with no special meaning (there is
-        // no project header; a group's `# Description:` is semantic only as a
+        // no project header; a group's description comment is semantic only as a
         // group's first BODY line, not at file top). They round-trip verbatim.
         assert_round_trip("# any comment\n# another comment\n");
     }
@@ -935,7 +926,7 @@ mod tests {
             "  k: \"v\"\n",
             "\n",
             "# a comment\n",
-            "  # Description: d\n",
+            "  # a description line\n",
             "a.b = c.d\n",
             "t.style = \"a\"\n",
             "g = Group() {\n",

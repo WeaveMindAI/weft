@@ -1,0 +1,15 @@
+[package]
+name = "weft-node-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = "2"
+serde_json = { workspace = true }

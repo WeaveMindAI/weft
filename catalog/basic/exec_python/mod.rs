@@ -46,22 +46,13 @@ use pyo3::ToPyObject;
 use serde_json::{Map, Number, Value};
 
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftError, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct ExecPythonNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for ExecPythonNode {
-    fn node_type(&self) -> &'static str {
-        "ExecPython"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("ExecPython metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let code: String = ctx.config.get("code")?;
 

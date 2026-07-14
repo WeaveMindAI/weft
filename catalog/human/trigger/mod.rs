@@ -13,28 +13,17 @@ use serde_json::Value;
 
 use weft_core::context::Phase;
 use weft_core::signal::{Form, FormSchema};
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::form_helpers::{
-    build_form_fields, human_form_field_specs, map_response_to_ports, parse_form_fields,
-};
+use super::form_helpers::{build_form_fields, map_response_to_ports, parse_form_fields};
 
+#[derive(NodeManifest)]
 pub struct HumanTriggerNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for HumanTriggerNode {
-    fn node_type(&self) -> &'static str {
-        "HumanTrigger"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("HumanTrigger metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let specs = human_form_field_specs();
+        let specs = &self.manifest().form_field_specs;
         match ctx.phase {
             Phase::TriggerSetup => {
                 let raw_fields = parse_form_fields(&ctx.config.values);

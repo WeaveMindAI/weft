@@ -18,23 +18,14 @@ use weft_core::infra::{
     Mount, Probe, Protocol, Resources, TerminateBehavior, Unit, UnitKind, UpgradeBehavior, Volume,
     VolumeKind,
 };
-use weft_core::node::{NodeMetadata, NodeOutput};
-use weft_core::{ExecutionContext, InfraProvisionContext, InputBag, Node, WeftResult};
+use weft_core::node::NodeOutput;
+use weft_core::{ExecutionContext, InfraProvisionContext, InputBag, Node, NodeManifest, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct WhatsAppBridgeNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for WhatsAppBridgeNode {
-    fn node_type(&self) -> &'static str {
-        "WhatsAppBridge"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("WhatsAppBridge metadata.json must be valid")
-    }
-
     async fn provision(
         &self,
         _ctx: InfraProvisionContext,
@@ -138,9 +129,9 @@ async fn query_outputs(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
         .call(weft_core::EndpointMethod::Get, "/outputs", None)
         .await?;
     // `endpointUrl` is our locally-known truth (the resolved
-    // EndpointHandle URL). Exclude it from the bridge response merge
-    // so a misbehaving container can't shadow it with its own value.
+    // EndpointHandle URL). Set AFTER the fan (set-after-fan wins) so a
+    // misbehaving container can't shadow it with its own value.
     Ok(NodeOutput::empty()
-        .extend_from_object(&bridge_outputs, &["endpointUrl"])
+        .extend_from_object(&bridge_outputs)
         .set("endpointUrl", Value::String(api.url().to_string())))
 }

@@ -25,6 +25,5 @@
       "default_value": "GET"
     }
   ],
-  "entry": [],
   "requires_infra": false
 }

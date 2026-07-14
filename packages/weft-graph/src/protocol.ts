@@ -60,6 +60,10 @@ export interface NodeFeaturesWire {
   hasFormSchema?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
+  // SYNC: interruptGrace <-> crates/weft-core/src/node.rs NodeFeatures.interrupt_grace
+  // On cancellation, give the node a short grace window to observe the
+  // cancellation flag and wrap up before its future is aborted.
+  interruptGrace?: boolean;
   // SYNC: showImagePreview <-> crates/weft-core/src/node.rs NodeFeatures.show_image_preview
   showImagePreview?: boolean;
   // SYNC: showDownloadLink <-> crates/weft-core/src/node.rs NodeFeatures.show_download_link
@@ -84,7 +88,6 @@ export interface NodeDefinition {
   outputs: PortDefinition[];
   features: NodeFeaturesWire;
   requiresInfra?: boolean;
-  entry: unknown[];
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
@@ -125,13 +128,17 @@ export interface GroupDefinition {
   nodeIds: string[];
   span?: Span;
   headerSpan?: Span;
+  /// The group's description: the plain `# ...` comment on the first body
+  /// line of the group (text without the `# `).
+  // SYNC: GroupDefinition <-> crates/weft-core/src/project.rs GroupDefinition
+  description?: string | null;
 }
 
 export interface ProjectDefinition {
   id: string;
   // The parsed graph carries no name/description: a project's name comes from
   // the manifest (`weft.toml` `[package] name`), and descriptions are per-group
-  // (`# Description:` first body line). The Rust `ProjectDefinition` mirrors this.
+  // (first plain `# ...` body line). The Rust `ProjectDefinition` mirrors this.
   nodes: NodeDefinition[];
   edges: Edge[];
   groups: GroupDefinition[];
@@ -224,15 +231,20 @@ export interface CatalogEntry {
   inputs: PortDef[];
   outputs: PortDef[];
   fields: FieldDef[];
-  entry: unknown[];
   requires_infra?: boolean;
   features?: NodeFeaturesWire;
   /** Form-field vocabulary for nodes whose `features.hasFormSchema`
-   *  is true. Empty/undefined for everything else. `weft describe-nodes`
-   *  inlines this from each node's `form_field_specs.json` so the
-   *  form_builder editor can drive the field-type dropdown without a
-   *  separate fetch. */
+   *  is true. Empty/undefined for everything else. A metadata key,
+   *  declared once in the package root's partial `metadata.json` and
+   *  inherited by every member, so the form_builder editor can drive
+   *  the field-type dropdown without a separate fetch. */
   formFieldSpecs?: FormFieldSpecWire[];
+  /** The paid service this node calls on a deployment-granted access.
+   *  Present only on nodes that declare one (a metadata key, inherited
+   *  from the package root). `deny_unknown_fields` Rust-side, so the
+   *  wire shape is exactly `{ name, base_url }`. */
+  // SYNC: provider <-> crates/weft-core/src/node.rs NodeMetadata.provider (ProviderDecl)
+  provider?: { name: string; base_url: string };
 }
 
 /** Render hint for one form field. Opaque to the host; the
@@ -1155,7 +1167,7 @@ export type EditOp =
   | { op: 'moveGroupScope'; group: string; targetGroup: string | null }
   | { op: 'updateNodePorts'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
   | { op: 'updateGroupPorts'; group: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
-  // A group's description is the `# Description:` comment on its first body line
+  // A group's description is the plain `# ...` comment on its first body line
   // (the single description concept; the old single-file `# Project:` header is
   // dropped, a file's identity is its filename). `description: null` clears it.
   | { op: 'setGroupDescription'; group: string; description: string | null }

@@ -20,7 +20,7 @@ pub enum SyntaxKind {
     // ── tokens (leaves; carry text) ────────────────────────────────────────
     // trivia: whitespace + comments, kept in the tree so round-trip is exact.
     WHITESPACE = 0, // runs of spaces / tabs / newlines
-    COMMENT,        // `# ...` to end of line (incl. the `# Description:` convention)
+    COMMENT,        // `# ...` to end of line
 
     // punctuation / structure
     L_PAREN,   // (
@@ -66,7 +66,7 @@ pub enum SyntaxKind {
     INLINE_EXPR,  // key: Type { ... }.port (a node literal used as a value)
     DIRECTIVE,    // standalone @require_one_of(...) line inside a body
     LABEL_FIELD,  // _label: "..." / label: "..." (promoted to node.label)
-    GROUP_DESC,   // `# Description:` comment as the FIRST body line of a group
+    GROUP_DESC,   // plain `# ...` comment as the FIRST body line of a group
 
     #[doc(hidden)]
     __LAST,

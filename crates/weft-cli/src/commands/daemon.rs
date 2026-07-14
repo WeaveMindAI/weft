@@ -406,8 +406,17 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // idempotent: unchanged manifests are no-ops at the
     // kube-apiserver layer (resourceVersion match).
     let manifests_changed = apply_static_manifests(cfg).await?;
+    // Re-pack the operator's provider keys on every restart; a changed
+    // key set rolls the broker below (env is read at pod start).
+    let provider_keys_changed = apply_provider_keys_secret(cfg).await?;
 
-    if dispatcher_built || listener_built || broker_built || supervisor_built || manifests_changed {
+    if dispatcher_built
+        || listener_built
+        || broker_built
+        || supervisor_built
+        || manifests_changed
+        || provider_keys_changed
+    {
         if cfg.backend == ClusterBackend::Kind {
             // System tags are reused (`:local`), so tag presence on the
             // kind node DOESN'T imply matching content. Use the _force
@@ -454,7 +463,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         //     dispatcher created dynamically (same rationale as listeners).
         let db_namespace = cfg.db_namespace.to_string();
         let broker_rollout = async move {
-            if broker_built {
+            if broker_built || provider_keys_changed {
                 let _ = kubectl(&[
                     "-n", &db_namespace, "rollout", "restart", "deployment/weft-broker",
                 ])
@@ -789,6 +798,9 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // substitute them so a non-kind operator sets them once via env
     // instead of hand-editing manifests.
     let template_vars = manifest_template_vars(cfg).await?;
+    // Provider keys before the broker: its pods import the secret via
+    // `envFrom` at start, so it must exist when they come up.
+    apply_provider_keys_secret(cfg).await?;
     kubectl_apply_templated(&manifests.join("broker.yaml"), &template_vars).await?;
     wait_for_deployment_ready_in_ns("weft-broker", &cfg.db_namespace).await?;
     kubectl_apply_templated(&manifests.join("dispatcher.yaml"), &template_vars).await?;
@@ -1515,6 +1527,21 @@ async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<b
             path.display()
         );
     }
+    kubectl_apply_stdin(&manifest, &path.display().to_string()).await?;
+    // "changed" is decided by the CONTENT we applied, not kubectl's verb. Some
+    // server-defaulted resources (the Envoy-Gateway HTTPRoute) report
+    // "configured" on EVERY apply even when our manifest is byte-identical,
+    // which would force a needless image-reload + dispatcher restart on every
+    // `daemon restart`. We stamp the substituted manifest's hash per file and
+    // call it changed only when that hash differs from the last apply (or no
+    // stamp exists yet). We still apply unconditionally above (cheap, keeps the
+    // cluster in sync); only the change SIGNAL is stamp-gated.
+    Ok(manifest_apply_changed_by_stamp(path, &manifest))
+}
+
+/// Pipe a manifest to `kubectl apply -f -`. `what` names the manifest in
+/// errors (a file path, or a description for generated manifests).
+async fn kubectl_apply_stdin(manifest: &str, what: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut child = kubectl(&["apply", "-f", "-"])
         .stdin(std::process::Stdio::piped())
@@ -1532,19 +1559,35 @@ async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<b
     let out = child.wait_with_output().await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("kubectl apply ({}) failed: {stderr}", path.display());
+        anyhow::bail!("kubectl apply ({what}) failed: {stderr}");
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     print!("{stdout}");
-    // "changed" is decided by the CONTENT we applied, not kubectl's verb. Some
-    // server-defaulted resources (the Envoy-Gateway HTTPRoute) report
-    // "configured" on EVERY apply even when our manifest is byte-identical,
-    // which would force a needless image-reload + dispatcher restart on every
-    // `daemon restart`. We stamp the substituted manifest's hash per file and
-    // call it changed only when that hash differs from the last apply (or no
-    // stamp exists yet). We still apply unconditionally above (cheap, keeps the
-    // cluster in sync); only the change SIGNAL is stamp-gated.
-    Ok(manifest_apply_changed_by_stamp(path, &manifest))
+    Ok(())
+}
+
+/// Pack every `<PROVIDER>_API_KEY` in the CLI's environment (the shell,
+/// or the `.env` the CLI loaded at startup) into the
+/// `weft-provider-keys` Secret the broker imports via `envFrom`: a key
+/// set on the operator's machine IS the deployment's key for that
+/// provider. Applied on every daemon start/restart so added and removed
+/// keys both propagate. Returns whether the key set changed since the
+/// last apply (the broker reads env at pod start, so a change needs a
+/// broker rollout).
+async fn apply_provider_keys_secret(cfg: &ClusterConfig) -> Result<bool> {
+    let keys: std::collections::BTreeMap<String, String> = std::env::vars()
+        .filter(|(name, value)| name.ends_with("_API_KEY") && !value.is_empty())
+        .collect();
+    let secret = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": { "name": "weft-provider-keys", "namespace": cfg.db_namespace },
+        "type": "Opaque",
+        "stringData": keys,
+    })
+    .to_string();
+    kubectl_apply_stdin(&secret, "weft-provider-keys secret").await?;
+    Ok(manifest_apply_changed_by_stamp(Path::new("provider-keys-secret"), &secret))
 }
 
 /// Per-manifest content stamp: returns true iff `manifest` differs from the

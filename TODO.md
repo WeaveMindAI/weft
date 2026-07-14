@@ -300,8 +300,25 @@ weft-journal (the encrypted field), and the extension inspector
 from the feat-bus review (FORK-2): LLM `apiKey` and similar node-typed
 secrets currently land in the journal and inspector in plaintext.
 
+**Also covers the config-node BYOK path (surfaced in the provider
+review).** The OpenRouterConfig node emits its whole config map, incl.
+`apiKey`, on its `config` OUTPUT port; a downstream inference node reads
+the key from its overlaid effective config. So a user's own key does not
+just sit in one node's config, it RIDES AN EDGE: it is journaled in the
+config node's `NodeCompleted.output` AND in the inference node's
+`NodeStarted.input`, both in plaintext, on every run. The narrow
+alternative (drop `apiKey` from what the config node emits, so each
+inference node reads it only from its own directly-typed field) was
+rejected in favor of this general sensitive-value mechanism, because
+"config node carries shared provider settings" is a pattern users want
+and amputating the key from it degrades the feature. When this lands, the
+mechanism must redact a sensitive value that travels an EDGE (a port
+value), not only one sitting in a node's own config: the `config` port
+carries it as ordinary `Dict` data today.
+
 [Update Notice Warning] If we touch how node config is journaled
-(`NodeStarted`), the metadata field-definition shape, or the inspector's
+(`NodeStarted`), how PORT VALUES are journaled (`NodeCompleted.output` /
+`PulseEmitted`), the metadata field-definition shape, or the inspector's
 config rendering, revisit this entry.
 
 ## Held suspensions (warm-worker model)
@@ -371,3 +388,21 @@ situation would corrupt their install on a routine upgrade.
 When this flips ON, revisit alongside setup.sh's flag set and the
 image/tag + manifest + project-layout conventions; the migration logic
 lives wherever setup.sh sequences install/upgrade.
+
+## Note Q
+Remember to double check for ephemeral journaling we should buffer so that if there is 60 exchanger per second it should only store a log for every X second and what happened on this window. I don't remmber if I did it already, need to check. Maybe also should be done for non ephemeral with aggregated logs.
+## Provider proxy: WebSocket support
+
+The broker's provider proxy (`crates/weft-broker/src/provider_proxy.rs`)
+forwards any HTTP method (request bodies buffered so the stand-in can be
+swapped for the real key; responses streamed, SSE included). It does NOT
+handle protocol upgrades, so a node cannot use a provider's WebSocket API on
+a DEPLOYMENT access (its own key works: those requests never touch the proxy).
+
+Known case: ElevenLabs' WebSocket TTS. Its HTTP streaming endpoint is
+equivalent for our purposes, so the constraint is narrow today.
+
+Fix when a real node needs it: accept the upgrade at the proxy, open the
+upstream WS with the real key substituted into the handshake, and pipe frames
+both ways (no substitution inside frames: the credential only rides the
+handshake). Also revisit the broker's replica count then (see below).

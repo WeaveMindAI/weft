@@ -11,23 +11,14 @@
 use async_trait::async_trait;
 use serde_json::{Number, Value};
 
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult, WeftError};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult, WeftError};
 use weft_core::node::NodeOutput;
 
+#[derive(NodeManifest)]
 pub struct RangeNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for RangeNode {
-    fn node_type(&self) -> &'static str {
-        "Range"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("Range metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let from: f64 = ctx.input.get_optional("from")?.unwrap_or(0.0);
         let to: f64 = ctx.input.get("to")?;

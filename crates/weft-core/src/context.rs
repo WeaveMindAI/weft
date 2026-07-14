@@ -46,10 +46,29 @@ impl Phase {
 }
 
 
+/// How long a node's provider work may take, unless it says otherwise
+/// ([`ExecutionContext::provider_access_within`]). Generous for a normal API
+/// call (including a stream and its cost resolution), short enough that an
+/// access left behind by a crashed worker goes stale the same quarter hour.
+pub const DEFAULT_PROVIDER_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// A cost amount must be a finite, non-negative number of dollars. A NaN or
+/// negative is a node bug in the cost accounting, so it fails loud at the ctx
+/// door, on BOTH the user's-own-key and the deployment paths (`what` names the
+/// caller: `provision_cost` / `settle_cost`).
+fn validate_amount_usd(what: &str, amount_usd: f64) -> WeftResult<()> {
+    if amount_usd.is_finite() && amount_usd >= 0.0 {
+        return Ok(());
+    }
+    Err(WeftError::Config(format!(
+        "{what} amount_usd must be finite and non-negative; got {amount_usd}"
+    )))
+}
+
 /// The per-execution context handed to `Node::execute`. Exposes the
 /// language's primitive surface (`await_signal` for mid-execution
-/// suspensions, `report_cost`, `log`) plus read helpers for config
-/// and input.
+/// suspensions, `provision_cost`/`settle_cost`, `log`) plus read
+/// helpers for config and input.
 ///
 /// ExecutionContext is constructed by the engine (inside the user's
 /// compiled binary) and passed to each node invocation. It holds an
@@ -205,14 +224,16 @@ impl ExecutionContext {
         self.handle.pulse_downstream(output).await
     }
 
-    /// The output ports this node declared in its metadata. A node
-    /// fanning a dynamic object onto ports (an LLM JSON response, a
-    /// forwarded HTTP body) intersects its keys with this set so it
-    /// emits only declared ports, instead of tripping the
-    /// undeclared-port error AFTER a paid / irreversible call. See
-    /// [`crate::node::NodeOutput::extend_from_declared`].
-    pub fn declared_output_ports(&self) -> &HashMap<String, WeftType> {
-        self.handle.declared_output_ports()
+    /// Build a `NodeOutput` by fanning a dynamic object's top-level keys
+    /// (an LLM JSON response, a forwarded HTTP body) onto same-named
+    /// output ports, intersected with the ports this node declared in
+    /// its metadata: payload extras are skipped instead of tripping the
+    /// undeclared-port error AFTER a paid / irreversible call. Chain
+    /// `.set(..)` after it for ports the node computes itself; the later
+    /// set wins, so a payload key can't shadow the node's own truth.
+    pub fn fan_declared(&self, source: &serde_json::Value) -> crate::node::NodeOutput {
+        crate::node::NodeOutput::empty()
+            .extend_from_declared(source, self.handle.declared_output_ports())
     }
 
     /// Close an output port mid-firing. The downstream subgraph attached
@@ -361,21 +382,155 @@ impl ExecutionContext {
         }
     }
 
-    // ----- Side-effect primitives ------------------------------------
+    // ----- Provider access + cost provisioning ------------------------
 
-    /// Report a cost attributable to this execution. Durable: the
-    /// underlying broker INSERT is the commit point, so the worker
-    /// pod can die immediately after `.await` returns and the
-    /// dispatcher will still journal the cost on its own timeline.
-    /// Returns Err if the broker can't accept the record (e.g.
-    /// negative amount rejected, broker unreachable); callers
-    /// decide how to handle a cost they couldn't book.
-    pub async fn report_cost(&self, report: CostReport) -> WeftResult<()> {
-        self.handle.report_cost(report).await
+    /// Your access to a provider: what to authenticate with, and where to
+    /// send it. `user_key` is the raw value of the node's key input: a real
+    /// key string is the USER'S OWN key (their provider account, used as-is,
+    /// sent to the provider); empty/absent or the `__PLATFORM__` sentinel
+    /// asks the DEPLOYMENT to supply its configured key for `provider`,
+    /// which it may refuse (none configured, or this node is not permitted
+    /// to use it). Errors are loud and name the fix ("set your own key for
+    /// `provider`").
+    ///
+    /// A deployment's key never enters this process: the access carries a
+    /// short-lived stand-in and the broker proxy that swaps it for the real
+    /// key.
+    ///
+    /// Fixed ordering for paid calls: `provider_access` -> build the exact
+    /// request -> [`Self::provision_cost`] -> call -> [`Self::settle_cost`]
+    /// (repeat per call) -> [`Self::close_access`].
+    ///
+    /// Uses the default work window ([`DEFAULT_PROVIDER_WINDOW`]); a node
+    /// whose provider work legitimately runs longer declares its own with
+    /// [`Self::provider_access_within`].
+    pub async fn provider_access(
+        &self,
+        provider: &str,
+        user_key: Option<String>,
+    ) -> WeftResult<crate::access::ProviderAccess> {
+        self.provider_access_within(provider, user_key, DEFAULT_PROVIDER_WINDOW).await
     }
 
-    /// Emit a log line from this node. Same durability shape as
-    /// `report_cost`: the broker INSERT is the commit point.
+    /// [`Self::provider_access`] with an explicit `window`: how long this
+    /// node's provider work may take. It bounds the access's life (the crash
+    /// backstop, since [`Self::close_access`] normally ends it first) AND the
+    /// cost provision's deadline, so it is declared once, here. Nodes wrapping
+    /// genuinely long actions (a multi-hour generation) raise it.
+    pub async fn provider_access_within(
+        &self,
+        provider: &str,
+        user_key: Option<String>,
+        window: std::time::Duration,
+    ) -> WeftResult<crate::access::ProviderAccess> {
+        if let Some(own) = crate::access::user_key_of(user_key.as_deref()) {
+            return Ok(crate::access::ProviderAccess::own(provider, own, window));
+        }
+        let (standin, base_url) = self.handle.open_provider_access(provider, window).await?;
+        Ok(crate::access::ProviderAccess::deployment(provider, standin, base_url, window))
+    }
+
+    /// Done with the provider: give the access back. A deployment access's
+    /// stand-in stops working immediately, so it dies with the work that
+    /// needed it instead of lingering to its window. Call it once the node
+    /// has made ALL its calls on this access (a retry loop, several turns, a
+    /// paginated crawl: one access, many calls, one close).
+    ///
+    /// Mandatory for a node spending on the deployment's key: the window is
+    /// only the crash backstop, not the intended lifetime. Access on the
+    /// user's own key has nothing to give back (this is a no-op).
+    pub async fn close_access(&self, access: crate::access::ProviderAccess) -> WeftResult<()> {
+        match access.origin() {
+            crate::access::AccessOrigin::UserProvided => Ok(()),
+            crate::access::AccessOrigin::Deployment => {
+                self.handle.close_provider_access(access.credential()).await
+            }
+        }
+    }
+
+    /// Declare the cost of the exact call about to be made on `access`
+    /// (see [`crate::access::CostProvision`]: a ceiling estimate or an exact
+    /// price). On the deployment's key the deployment may meter this (and
+    /// refuse loudly when a usage limit is reached); on the user's own key it
+    /// is a no-op (their account, their money).
+    ///
+    /// The returned hold remembers who it was for (the access's provider is
+    /// the billed service, plus `model`), so settling it needs only the actual
+    /// amount: see [`Self::settle_cost`].
+    pub async fn provision_cost(
+        &self,
+        access: &crate::access::ProviderAccess,
+        provision: crate::access::CostProvision,
+    ) -> WeftResult<crate::access::CostHold> {
+        // Validate the money at THIS door, so the user's-own-key path (which
+        // never reaches the handle) is checked too: a NaN or negative amount
+        // is a node bug and must fail loud, not silently pass on one origin.
+        validate_amount_usd("provision_cost", provision.amount_usd)?;
+        let estimate = CostReport {
+            service: access.provider().to_string(),
+            model: provision.model.clone(),
+            amount_usd: provision.amount_usd,
+            metadata: serde_json::json!({
+                "basis": if provision.exact { "exact price" } else { "estimated upper bound" },
+            }),
+        };
+        // The provision's deadline is the access's window: one declaration.
+        let hold_id = match access.origin() {
+            crate::access::AccessOrigin::UserProvided => None,
+            crate::access::AccessOrigin::Deployment => {
+                self.handle
+                    .provision_cost(access.provider(), &provision, access.window(), &estimate)
+                    .await?
+            }
+        };
+        Ok(crate::access::CostHold::new(hold_id, estimate.service, estimate.model))
+    }
+
+    /// Report what the provisioned call ACTUALLY cost, consuming the hold.
+    /// Mandatory on every path (success, failure, partial): a failed call
+    /// may still have cost money, and an unreported provision stays held
+    /// against the deployment's metering until it times out.
+    ///
+    /// Settling IS the recording: one durable settle books the amount to
+    /// the execution's cost trail (the broker INSERT is the commit point,
+    /// so the worker pod can die right after and the cost still lands),
+    /// and additionally releases the deployment's hold when the provision
+    /// took one. The service and model are the ones the hold was
+    /// provisioned for.
+    ///
+    /// This settles ONE call's cost; the access it was made on stays usable
+    /// (a node may make several calls on one access). Giving the access back
+    /// is [`Self::close_access`].
+    pub async fn settle_cost(
+        &self,
+        hold: crate::access::CostHold,
+        amount_usd: f64,
+        metadata: serde_json::Value,
+    ) -> WeftResult<()> {
+        validate_amount_usd("settle_cost", amount_usd)?;
+        let actual = CostReport {
+            service: hold.service.clone(),
+            model: hold.model.clone(),
+            amount_usd,
+            metadata,
+        };
+        self.handle.settle_cost(hold.hold_id(), &actual).await
+    }
+
+    /// This node's configuration with the `config` input port overlaid.
+    ///
+    /// The config-node pattern: a node may take a whole configuration object on
+    /// an input port named `config` (fed by a dedicated config node), and each
+    /// key it carries wins over the same key set on the node itself. A node
+    /// without that port gets its own config unchanged.
+    pub fn effective_config(&self) -> crate::context::ConfigBag {
+        self.config.overlaid(self.input.raw("config"))
+    }
+
+    // ----- Side-effect primitives ------------------------------------
+
+    /// Emit a log line from this node. Durable: the broker INSERT is
+    /// the commit point.
     pub async fn log(&self, level: LogLevel, message: impl Into<String>) -> WeftResult<()> {
         self.handle.log(level, message.into()).await
     }
@@ -492,6 +647,54 @@ impl ConfigBag {
 
     pub fn raw(&self, key: &str) -> Option<&Value> {
         self.values.get(key)
+    }
+
+    /// This config with `overlay`'s keys winning on collision. A non-object
+    /// (or absent) overlay changes nothing. Pure: the mechanism behind
+    /// [`ExecutionContext::effective_config`].
+    pub fn overlaid(&self, overlay: Option<&Value>) -> ConfigBag {
+        let mut values = self.values.clone();
+        if let Some(object) = overlay.and_then(|v| v.as_object()) {
+            for (k, v) in object {
+                values.insert(k.clone(), v.clone());
+            }
+        }
+        ConfigBag { values }
+    }
+}
+
+#[cfg(test)]
+mod config_overlay_tests {
+    use super::*;
+
+    fn bag(json: serde_json::Value) -> ConfigBag {
+        ConfigBag { values: serde_json::from_value(json).expect("object fixture") }
+    }
+
+    /// The config-node pattern: a key from the config input wins over the same
+    /// key on the node; keys only one side has all survive.
+    #[test]
+    fn an_overlay_key_wins_and_disjoint_keys_survive() {
+        let own = bag(serde_json::json!({"model": "a", "temperature": 0.2}));
+        let overlay = serde_json::json!({"model": "b", "maxTokens": 100});
+
+        let merged = own.overlaid(Some(&overlay));
+        assert_eq!(merged.get::<String>("model").unwrap(), "b");
+        assert_eq!(merged.get::<f64>("temperature").unwrap(), 0.2);
+        assert_eq!(merged.get::<u64>("maxTokens").unwrap(), 100);
+    }
+
+    /// No overlay, or one that is not an object, leaves the config unchanged.
+    #[test]
+    fn a_missing_or_non_object_overlay_changes_nothing() {
+        let own = bag(serde_json::json!({"model": "a"}));
+        assert_eq!(own.overlaid(None).get::<String>("model").unwrap(), "a");
+        assert_eq!(
+            own.overlaid(Some(&serde_json::json!("not an object")))
+                .get::<String>("model")
+                .unwrap(),
+            "a"
+        );
     }
 }
 
@@ -794,7 +997,48 @@ pub trait ContextHandle: Send + Sync {
     /// is the value `run_step` returned; passing it explicitly
     /// removes the read-counter-and-subtract-one coupling.
     async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()>;
-    async fn report_cost(&self, report: CostReport) -> WeftResult<()>;
+    /// Open access to `provider` on the DEPLOYMENT's configured key for the
+    /// calling node: returns the key's stand-in and the proxy address that
+    /// swaps it for the real key (the key itself never enters this process).
+    /// Used internally by [`ExecutionContext::provider_access`] (a
+    /// user-supplied key never reaches this). The deployment decides whether
+    /// this node may use its key; a refusal or a missing key is a loud error
+    /// telling the user to set their own key.
+    async fn open_provider_access(
+        &self,
+        provider: &str,
+        window: std::time::Duration,
+    ) -> WeftResult<(String, String)>;
+    /// Give a deployment access back: its stand-in stops working at once.
+    /// Used internally by [`ExecutionContext::close_access`].
+    async fn close_provider_access(&self, standin: &str) -> WeftResult<()>;
+    /// Declare the cost of an imminent call on the DEPLOYMENT's key.
+    /// Returns the deployment's hold id when it meters usage (`None` when it
+    /// does not); errors loudly when a usage limit refuses the spend. Used
+    /// internally by [`ExecutionContext::provision_cost`]. `provision`
+    /// carries the exactness + expected-duration declarations; `estimate`
+    /// is the same amount as a cost report (service resolved from the key).
+    ///
+    /// CONTRACT: `estimate.amount_usd` is already validated finite and
+    /// non-negative by [`ExecutionContext::provision_cost`], the only caller.
+    /// An impl does not re-check it.
+    async fn provision_cost(
+        &self,
+        provider: &str,
+        provision: &crate::access::CostProvision,
+        window: std::time::Duration,
+        estimate: &CostReport,
+    ) -> WeftResult<Option<String>>;
+    /// Report the actual cost of a provisioned call. Settling IS the
+    /// recording: books `actual` to the execution's durable cost trail,
+    /// and additionally releases the metered hold when the provision
+    /// took one (`hold_id`). Used internally by
+    /// [`ExecutionContext::settle_cost`].
+    ///
+    /// CONTRACT: `actual.amount_usd` is already validated finite and
+    /// non-negative by [`ExecutionContext::settle_cost`], the only caller.
+    /// An impl does not re-check it.
+    async fn settle_cost(&self, hold_id: Option<&str>, actual: &CostReport) -> WeftResult<()>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 

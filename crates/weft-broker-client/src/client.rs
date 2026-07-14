@@ -439,6 +439,52 @@ impl InfraReader for BrokerInfraClient {
     }
 }
 
+// ---------- Provider access + cost provisioning ----------
+
+/// Worker-side client for the paid-call endpoints: open access to the
+/// deployment's provider key, provision an upper-bound cost before a call on
+/// it, settle to the actual after, give the access back.
+pub struct BrokerPaidCallClient {
+    http: HttpCore,
+}
+
+impl BrokerPaidCallClient {
+    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
+        Arc::new(Self {
+            http: HttpCore::new(base_url, token),
+        })
+    }
+
+    pub async fn open_provider_access(
+        &self,
+        req: &ProviderAccessRequest,
+    ) -> Result<ProviderAccessResponse> {
+        self.http.post("/v1/access/open", req).await
+    }
+
+    pub async fn provision(&self, req: &CostProvisionRequest) -> Result<CostProvisionResponse> {
+        self.http.post("/v1/cost/provision", req).await
+    }
+
+    pub async fn settle(&self, req: &CostSettleRequest) -> Result<CostSettleResponse> {
+        self.http.post("/v1/cost/settle", req).await
+    }
+
+    pub async fn close_provider_access(
+        &self,
+        req: &ProviderAccessCloseRequest,
+    ) -> Result<ProviderAccessCloseResponse> {
+        self.http.post("/v1/access/close", req).await
+    }
+
+    /// The broker's proxy for a provider: where a deployment access's
+    /// requests are addressed (the broker swaps the stand-in for the real
+    /// key there).
+    pub fn provider_proxy_url(&self, provider: &str) -> String {
+        weft_core::access::provider_proxy_url(&self.http.base_url, provider)
+    }
+}
+
 // ---------- Project (worker fetches own definition) ----------
 
 /// Worker-side client for `/v1/project/fetch_definition`. Used at

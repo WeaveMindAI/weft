@@ -51,6 +51,7 @@ pub enum GroupKind {
     },
 }
 
+// SYNC: GroupDefinition <-> packages/weft-graph/src/protocol.ts GroupDefinition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupDefinition {
     pub id: String,
@@ -92,6 +93,10 @@ pub struct GroupDefinition {
     pub span: Option<Span>,
     #[serde(default, rename = "headerSpan")]
     pub header_span: Option<Span>,
+    /// The group's description: the plain `# ...` comment that is the first
+    /// body line of the group body (text without the `# `).
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Graph-level instance of a node.
@@ -511,6 +516,7 @@ mod project_wire_tests {
             anonymous: false,
             span: None,
             header_span: None,
+            description: None,
         };
         let edge = Edge {
             id: "e1".into(),

@@ -366,6 +366,52 @@ mod fs_hashes {
         Ok(())
     }
 
+    /// Content hash of ONE node package root: the unit that compiles
+    /// together (mod.rs, metadata.json, deps.toml, shared package files).
+    /// Same folding + same relative-path labeling as the binary hash's
+    /// package section, so the digest is machine-independent and stable
+    /// for an unmodified catalog node across projects. This is the
+    /// content address OF a node's code; consumers use it wherever "this
+    /// exact node source" must be named (caching, review, provenance).
+    pub fn compute_node_package_hash(root: &Path, bases: &[&Path]) -> Result<SourceHash> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"weft-node-package-v1\n");
+        hash_package_roots(&mut hasher, std::slice::from_ref(&root.to_path_buf()), bases)?;
+        Ok(hex(&hasher.finalize()))
+    }
+
+    /// Per-node-type content hashes for every node type a project
+    /// references: `node_type -> compute_node_package_hash(its package
+    /// root)`. Types sharing a package share the hash (the package is the
+    /// compile unit). The build's manifest of "exactly which node code
+    /// went into this binary".
+    pub fn compute_node_source_hashes(
+        definition: &ProjectDefinition,
+        project_root: &Path,
+        weft_root: &Path,
+        catalog: &FsCatalog,
+    ) -> Result<BTreeMap<String, SourceHash>> {
+        let referenced = crate::codegen::collect_node_types(definition);
+        let bases = [project_root, weft_root];
+        let mut by_root: BTreeMap<PathBuf, SourceHash> = BTreeMap::new();
+        let mut out = BTreeMap::new();
+        for nt in &referenced {
+            let Some(pkg) = catalog.package_of(nt) else {
+                anyhow::bail!("node type {nt:?} referenced by the project is not in the catalog");
+            };
+            let hash = match by_root.get(&pkg.root) {
+                Some(h) => h.clone(),
+                None => {
+                    let h = compute_node_package_hash(&pkg.root, &bases)?;
+                    by_root.insert(pkg.root.clone(), h.clone());
+                    h
+                }
+            };
+            out.insert(nt.clone(), hash);
+        }
+        Ok(out)
+    }
+
     /// Hash everything that affects the running infrastructure.
     /// Scoped to the infra closure: every node where `requires_infra` is
     /// true plus every node upstream of one (the chain that produces the

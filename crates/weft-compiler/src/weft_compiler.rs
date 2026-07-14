@@ -138,6 +138,9 @@ struct ParsedGroup {
     loop_config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
     span: Option<Span>,
     header_span: Option<Span>,
+    /// The group's description: the plain `# ...` comment that is the first
+    /// body line, text without the `# `. None when absent or empty.
+    description: Option<String>,
 }
 
 impl ParsedGroup {
@@ -1696,6 +1699,7 @@ fn lower_group(
         loop_config_spans: Default::default(),
         span: Some(li.span_of(g.syntax())),
         header_span: Some(header_span),
+        description: g.description().map(|d| d.text()).filter(|s| !s.is_empty()),
     };
     lower_grouplike_body(&mut group, g.body(), parent, source_id, in_ports, one_of_required, header_span, li, errors);
     Some(group)
@@ -1739,6 +1743,7 @@ fn lower_loop(
         loop_config_spans: Default::default(),
         span: Some(li.span_of(l.syntax())),
         header_span: Some(header_span),
+        description: l.description().map(|d| d.text()).filter(|s| !s.is_empty()),
     };
     lower_grouplike_body(&mut group, l.body(), parent, source_id, in_ports, one_of_required, header_span, li, errors);
     Some(group)
@@ -2537,6 +2542,7 @@ fn collect_group_definitions(
         anonymous: group.anonymous,
         span: group.span.clone(),
         header_span: group.header_span.clone(),
+        description: group.description.clone(),
     });
 
     for child in &group.child_groups {
@@ -2853,7 +2859,7 @@ fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
 //
 //     target.port = Template { template: "hi" }.text
 //
-//     my_llm = LlmInference {
+//     my_llm = OpenRouterInference {
 //       systemPrompt: Template { template: "{{x}}" x: other.value }.text
 //     }
 //

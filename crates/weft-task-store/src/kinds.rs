@@ -38,7 +38,8 @@ pub enum TaskKind {
     /// one pod via `target_pod_name`.
     CancelExecution,
     /// Dispatcher: journal a `CostReported` event on behalf of a
-    /// worker. Producers = engine `ctx.report_cost`. Routed
+    /// worker. Producer = the broker's cost-settle handler (a
+    /// worker's `ctx.settle_cost`). Routed
     /// through the task table (not direct journal write) so a
     /// worker pod dying mid-call still has the cost record
     /// committed: the broker's atomic INSERT into `task` is the

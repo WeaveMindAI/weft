@@ -1,18 +1,19 @@
 //! Generic form-field helpers for nodes with `has_form_schema`.
 //!
-//! The pipeline is data-driven by `form_field_specs.json` next to
-//! the node's metadata. The catalog loads the specs at boot, the
-//! compiler's enrich pass materializes ports from them, and these
-//! helpers shape the runtime form schema (sent to the human) and
-//! map the user's response back to output ports.
+//! The pipeline is data-driven by the `formFieldSpecs` metadata key,
+//! declared once in the package root's `metadata.json` and inherited by
+//! every member (HumanQuery, HumanTrigger). The catalog loads it, the
+//! compiler's enrich pass materializes ports from it, and these helpers
+//! shape the runtime form schema (sent to the human) and map the user's
+//! response back to output ports. The node reads its specs from its own
+//! `manifest().form_field_specs`, the same document the catalog sees.
 //!
-//! Adding a new field type means: add an entry to that JSON.
-//! Nothing in the engine, dispatcher, or UI needs to change as
-//! long as the entry's `render.component` is something the
-//! consumer already knows how to draw.
+//! Adding a new field type means: add an entry to that metadata. Nothing
+//! in the engine, dispatcher, or UI needs to change as long as the
+//! entry's `render.component` is something the consumer already knows how
+//! to draw.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use serde_json::{Map, Value};
 use weft_core::node::FormFieldSpec;
@@ -20,48 +21,19 @@ use weft_core::node::FormFieldPort;
 use weft_core::node::NodeOutput;
 use weft_core::signal::FormField;
 
-/// Embedded copy of `form_field_specs.json` shared by HumanQuery
-/// and HumanTrigger. Parsed once on first access. The catalog
-/// loader also reads the same file from disk, so the on-disk and
-/// in-binary versions stay in sync as long as authors edit the
-/// JSON (the only source of truth) and rebuild.
-const SPECS_JSON: &str = include_str!("form_field_specs.json");
-
-pub fn human_form_field_specs() -> &'static [FormFieldSpec] {
-    static CELL: OnceLock<Vec<FormFieldSpec>> = OnceLock::new();
-    CELL.get_or_init(|| {
-        serde_json::from_str(SPECS_JSON)
-            .expect("human/form_field_specs.json must be valid FormFieldSpec[]")
-    })
-}
-
-/// Pull the `fields` array off a node's config. Accepts either a
-/// raw JSON array (the canonical shape after parse) or a JSON
-/// string (legacy shape from older serializers).
+/// Pull the `fields` array off a node's config. The canonical shape is a
+/// JSON array (what the compiler produces); anything else means no fields.
 pub fn parse_form_fields(config: &HashMap<String, Value>) -> Vec<Value> {
     match config.get("fields") {
         Some(Value::Array(arr)) => arr.clone(),
-        Some(Value::String(s)) => serde_json::from_str::<Vec<Value>>(s).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
 
-/// Read the `fieldType` off one entry of `config.fields`. Source
-/// .weft files use `fieldType: "display"` (camelCase, flat); some
-/// older code paths produced `field_type: { kind: "display" }`. We
-/// accept both so a HumanQuery authored in either era keeps
-/// working.
+/// Read the `fieldType` off one entry of `config.fields`. Source .weft
+/// files use `fieldType: "display"` (camelCase, flat).
 pub fn field_type_of(field: &Value) -> Option<&str> {
-    field
-        .get("fieldType")
-        .and_then(|v| v.as_str())
-        .or_else(|| field.get("field_type").and_then(|v| v.as_str()))
-        .or_else(|| {
-            field
-                .get("field_type")
-                .and_then(|v| v.get("kind"))
-                .and_then(|v| v.as_str())
-        })
+    field.get("fieldType").and_then(|v| v.as_str())
 }
 
 /// Build the runtime form schema sent to the human.

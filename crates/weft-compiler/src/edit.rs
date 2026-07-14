@@ -61,7 +61,7 @@ pub enum EditOp {
     UpdateNodePorts { node: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
     /// Rewrite a group's port signature.
     UpdateGroupPorts { group: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
-    /// Set (or clear) a group's description: the `# Description:` comment that is
+    /// Set (or clear) a group's description: the plain `# ...` comment that is
     /// the first body line of the group. `description: None`/empty removes it.
     SetGroupDescription { group: String, description: Option<String> },
     /// Add an empty loop `name = Loop() -> () {}` at the end of the

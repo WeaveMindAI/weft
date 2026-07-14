@@ -7,17 +7,31 @@ use crate::weft_type::WeftType;
 // context + infra provision context), so it is gated behind `runtime`. The
 // browser WASM parse build needs only the node METADATA layer
 // (`NodeMetadata` / `MetadataCatalog`), which is pure and stays below.
+/// The node's declared surface (`metadata.json`), parsed once and shared
+/// for the process lifetime. `#[derive(NodeManifest)]` implements it by
+/// embedding the `metadata.json` sitting next to the deriving type's
+/// source file; hand-built nodes (test doubles) implement it directly.
+/// `Node::node_type` and `Node::metadata` are views of it, so the type
+/// identifier has a single source of truth: the json's `type` field.
+pub trait NodeManifest {
+    fn manifest(&self) -> &'static NodeMetadata;
+}
+
 #[cfg(feature = "runtime")]
 mod node_trait {
     use async_trait::async_trait;
 
-    use super::NodeMetadata;
+    use super::NodeManifest;
     use crate::context::{ExecutionContext, InputBag};
     use crate::error::{WeftError, WeftResult};
     use crate::infra::{InfraProvisionContext, InfraSpec};
 
     /// The core trait every node implements. Stdlib nodes in `catalog/`
     /// and user-defined nodes under `myproject/nodes/` both implement this.
+    /// The identity/surface layer comes from the [`NodeManifest`]
+    /// supertrait (usually `#[derive(NodeManifest)]` on the node struct,
+    /// which picks up the co-located `metadata.json`); a node only writes
+    /// `execute`.
     ///
     /// Infra nodes (those with `metadata.requires_infra == true`)
     /// additionally implement `provision`, which returns an [`InfraSpec`]
@@ -25,14 +39,12 @@ mod node_trait {
     /// Non-infra nodes leave `provision` as the default Err impl; the
     /// dispatcher never calls it for them.
     #[async_trait]
-    pub trait Node: Send + Sync {
+    pub trait Node: NodeManifest + Send + Sync {
         /// Stable identifier for this node type. Must be unique across the
         /// project's full catalog (stdlib + user + vendored).
-        fn node_type(&self) -> &'static str;
-
-        /// Metadata describing ports, fields, entry primitives. Usually
-        /// loaded from a co-located `metadata.json` via `include_str!`.
-        fn metadata(&self) -> NodeMetadata;
+        fn node_type(&self) -> &'static str {
+            &self.manifest().node_type
+        }
 
         /// Build the desired infrastructure for this node. Called by the
         /// engine in `Phase::InfraSetup` BEFORE `execute`. Returns the desired
@@ -51,7 +63,7 @@ mod node_trait {
 
         /// Run this node. `ctx` provides language primitives
         /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
-        /// `report_cost`, `log`, `endpoint`). The ONLY way to fire downstream is
+        /// `settle_cost`, `log`, `endpoint`). The ONLY way to fire downstream is
         /// `ctx.pulse_downstream(output)`.
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
     }
@@ -104,11 +116,19 @@ pub enum Severity {
     Hint,
 }
 
-/// Metadata returned from `Node::metadata`. Describes the node's
-/// surface to the compiler, the dispatcher, and tooling.
+/// A node's declared surface (ports, fields, features) to the compiler, the
+/// dispatcher, and tooling. Two producers, one document: the catalog builds it
+/// by reading `metadata.json` from disk (merging the package root's shared
+/// defaults), and the runtime copy is [`NodeManifest::manifest`], which the
+/// `#[derive(NodeManifest)]` expansion builds by embedding the same two files.
 // SYNC: NodeMetadata (describe-nodes serialization) <-> packages/weft-graph/src/protocol.ts
 //       CatalogEntry/FieldDef/FieldType/PortDef
+// `deny_unknown_fields`: an unknown key in a `metadata.json` (a typo like
+// `providr`, or a stale key) is a loud parse error, not silently dropped. This
+// matters most for the package-root defaults file, where one typo would
+// otherwise make every member quietly miss the shared key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeMetadata {
     /// Stable type identifier (matches `Node::node_type`).
     #[serde(rename = "type")]
@@ -168,14 +188,150 @@ pub struct NodeMetadata {
     /// so a missing credential is fine in the editor).
     #[serde(default)]
     pub validate: Vec<ValidationRule>,
-    /// Optional path to this node's form field specs JSON. Resolved
-    /// relative to the owning package root. Lets multi-node
-    /// packages share one specs file across their nodes (e.g.
-    /// HumanQuery and HumanTrigger both point at the package's
-    /// `form_field_specs.json`). Defaults to `form_field_specs.json`
-    /// at load time when absent.
-    #[serde(default, rename = "formFieldSpecsRef", alias = "form_field_specs_ref")]
-    pub form_field_specs_ref: Option<String>,
+    /// Form-field vocabulary for nodes whose `features.has_form_schema`
+    /// is true (which field types a form config may use, and what ports
+    /// each materializes). Empty for everything else. Multi-node
+    /// packages declare it once in the package root's partial
+    /// `metadata.json` (HumanQuery and HumanTrigger share one
+    /// vocabulary); every member inherits it via the catalog's
+    /// package-defaults merge unless its own file carries the key.
+    #[serde(
+        default,
+        rename = "formFieldSpecs",
+        alias = "form_field_specs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub form_field_specs: Vec<FormFieldSpec>,
+    /// The paid service this node calls on a deployment-granted access
+    /// (`ctx.provider_access`), when it calls one. Absent for the
+    /// overwhelming majority of nodes. Like every metadata key, package
+    /// members inherit it from the package root's partial
+    /// `metadata.json` unless their own file carries the key (see the
+    /// catalog's package-defaults merge), so one declaration serves a
+    /// whole provider package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderDecl>,
+}
+
+/// A node's declaration of the paid service it calls on a
+/// deployment-granted access (`ctx.provider_access`): the provider's
+/// name (which is also the key's identity: the deployment's key for it
+/// lives in `<NAME>_API_KEY`; the declaration deliberately cannot name
+/// an env var of its own, so a node can never point a fresh service
+/// name at another service's key) and the provider's real API base
+/// URL, which the deployment forwards deployment-key requests to.
+/// The runtime carries no provider list of its own.
+// `deny_unknown_fields`: a declaration that tries to say MORE than name +
+// URL (say, a key name) must be a loud parse error, never silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDecl {
+    #[serde(deserialize_with = "deserialize_provider_name")]
+    pub name: String,
+    pub base_url: String,
+}
+
+/// The one charset a provider name may use: lowercase ASCII letters,
+/// digits, and `_`. This is what makes the name the key's identity with no
+/// aliasing: the deployment key lives in `<NAME>_API_KEY`, derived by
+/// uppercasing the name (`credential::provider_env_var`). Restricting to
+/// this set makes that derivation injective (two distinct names can never
+/// share one env var) and rules out a name that would form a malformed or
+/// surprising env var (spaces, dots, `-` vs `_`, unicode, empty). A raw
+/// string comparison of names is therefore exactly a comparison of key
+/// identities. Enforced at deserialize, so every entry point (catalog
+/// discovery, the register payload, any wire read) rejects a bad name
+/// loudly at the door.
+pub fn is_valid_provider_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn deserialize_provider_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    if !is_valid_provider_name(&name) {
+        return Err(serde::de::Error::custom(format!(
+            "provider name '{name}' is invalid: use only lowercase letters, digits, and '_' \
+             (the name is the key's identity, derived to <NAME>_API_KEY)"
+        )));
+    }
+    Ok(name)
+}
+
+/// Keys a package root's partial `metadata.json` may never supply as a
+/// default, because they are one node's identity, not something a package
+/// shares. `type` is the node's catalog id; `label` and `description` name
+/// this one node to a human. A package root carrying any of them is an
+/// authoring mistake, so it is a loud error, not a silent default.
+// SYNC: NON_INHERITABLE_METADATA_KEYS <-> crates/weft-node-derive/src/lib.rs NON_INHERITABLE_KEYS
+pub const NON_INHERITABLE_METADATA_KEYS: [&str; 3] = ["type", "label", "description"];
+
+/// Merge a package root's partial defaults into a member's `metadata.json`
+/// value, key-by-key at the top level, the member's own key winning
+/// wholesale (no deep merge). Both must be JSON objects. This is THE one
+/// definition of the package-defaults semantics: the catalog (build side)
+/// and `#[derive(NodeManifest)]` (runtime side) both merge through here so
+/// a node's metadata is one document, never two that disagree.
+///
+/// `Err` names the offending key/shape. A `defaults` carrying a
+/// [`NON_INHERITABLE_METADATA_KEYS`] key is refused (an identity key is
+/// never a package default). Callers map the error into their own type.
+pub fn merge_package_defaults(
+    member: &mut serde_json::Value,
+    defaults: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let member = member.as_object_mut().ok_or("metadata.json must be a JSON object")?;
+    for key in NON_INHERITABLE_METADATA_KEYS {
+        if defaults.contains_key(key) {
+            return Err(format!(
+                "package-level metadata.json must not set `{key}`: it is one node's identity, \
+                 not a package default"
+            ));
+        }
+    }
+    for (key, default) in defaults {
+        if !member.contains_key(key) {
+            member.insert(key.clone(), default.clone());
+        }
+    }
+    Ok(())
+}
+
+impl NodeMetadata {
+    /// Parse a compile-time-embedded `metadata.json`, merging the package
+    /// root's partial defaults (`defaults_json`, the sibling package
+    /// `metadata.json` when the node is a package member; `None` for a bare
+    /// node) key-by-key through [`merge_package_defaults`]. Called by the
+    /// `#[derive(NodeManifest)]` expansion, which embeds BOTH files, so the
+    /// runtime `manifest()` is the SAME merged document the catalog builds.
+    ///
+    /// `site` names the deriving node and its file so a mismatch panics with
+    /// a pointer to the culprit. This is the runtime backstop: the catalog's
+    /// typed parse runs the identical merge at `weft build` and fails there
+    /// first, so a schema-invalid file never reaches a shipped image.
+    pub fn parse_embedded(member_json: &str, defaults_json: Option<&str>, site: &str) -> Self {
+        let mut value: serde_json::Value = serde_json::from_str(member_json)
+            .unwrap_or_else(|e| panic!("{site}: metadata.json is not valid JSON: {e}"));
+        if let Some(defaults_json) = defaults_json {
+            // The offender here is the PACKAGE ROOT's metadata.json, so say so:
+            // the member file named in `site` is not the one at fault.
+            let defaults: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(defaults_json).unwrap_or_else(|e| {
+                    panic!(
+                        "{site}: the package root's metadata.json is not a JSON object of \
+                         defaults: {e}"
+                    )
+                });
+            merge_package_defaults(&mut value, &defaults).unwrap_or_else(|e| {
+                panic!("{site}: the package root's metadata.json is invalid: {e}")
+            });
+        }
+        serde_json::from_value(value)
+            .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"))
+    }
 }
 
 /// One validation rule. The `when` condition is evaluated against the
@@ -321,6 +477,13 @@ pub struct NodeFeatures {
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview")]
     pub show_debug_preview: bool,
+    /// On cancellation, give this node a short grace window to observe
+    /// `ctx.cancellation()` and wrap up (settle a provisioned cost,
+    /// close a paid stream) before its future is aborted. Declare it
+    /// only when `execute` actually watches the flag; without a watcher
+    /// the grace is pure added Stop latency.
+    #[serde(default, rename = "interruptGrace")]
+    pub interrupt_grace: bool,
     /// Webview hint: when the node's input is a stored image
     /// reference, render the picture inline on the node body, fetched
     /// through the authenticated download handshake. Used by
@@ -442,12 +605,6 @@ pub trait MetadataCatalog: Send + Sync {
     fn lookup(&self, node_type: &str) -> Option<&NodeMetadata>;
     /// Every known node's metadata.
     fn all(&self) -> Vec<&NodeMetadata>;
-    /// Form field specs for nodes with `features.has_form_schema`.
-    /// Defaults to empty; `FsCatalog` returns statically-known specs
-    /// for nodes that declare them alongside their metadata.
-    fn form_field_specs(&self, _node_type: &str) -> &[FormFieldSpec] {
-        &[]
-    }
 }
 
 /// Runtime node catalog. Produced by codegen inside the emitted
@@ -464,9 +621,6 @@ pub trait NodeCatalog: Send + Sync {
     /// reference.
     fn lookup(&self, node_type: &str) -> Option<&'static dyn Node>;
     fn all(&self) -> Vec<&'static str>;
-    fn form_field_specs(&self, _node_type: &str) -> &[FormFieldSpec] {
-        &[]
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,21 +698,19 @@ impl NodeOutput {
     /// Fan every top-level key of a JSON object onto a same-named
     /// output port, preserving the field value. Useful for nodes that
     /// forward an upstream payload verbatim (trigger seeds, bridge
-    /// `/outputs` responses, LLM `parseJson` object responses). Keys
-    /// in `exclude` are skipped. Returns `self` unchanged if the
-    /// value isn't an object.
+    /// `/outputs` responses). Returns `self` unchanged if the value
+    /// isn't an object.
     ///
     /// **Precedence rule: last-write-wins, chain order = precedence.**
     /// `.set(k, x).extend_from_object({k: y})` ends up with `k = y` (the
     /// helper overwrites the prior set). `.extend_from_object({k: y}).set(k, x)`
     /// ends up with `k = x` (the explicit set overrides the merge). Both
-    /// orderings are pinned by tests in `node_output_tests`.
-    pub fn extend_from_object(mut self, source: &Value, exclude: &[&str]) -> Self {
+    /// orderings are pinned by tests in `node_output_tests`. A node that
+    /// wants a port it computes itself to win therefore sets it AFTER
+    /// the fan.
+    pub fn extend_from_object(mut self, source: &Value) -> Self {
         if let Value::Object(map) = source {
             for (k, v) in map {
-                if exclude.contains(&k.as_str()) {
-                    continue;
-                }
                 self.outputs.insert(k.clone(), v.clone());
             }
         }
@@ -574,21 +726,19 @@ impl NodeOutput {
     /// LLM completion, an HTTP POST already sent). Intersecting here
     /// is the honest contract: "emit the declared fields I have."
     ///
-    /// `exclude` is still honored (e.g. the primary full-object port
-    /// shouldn't be re-fanned). Same last-write-wins precedence as
-    /// `extend_from_object`.
-    pub fn extend_from_declared(
+    /// Nodes use it through [`crate::ExecutionContext::fan_declared`],
+    /// which supplies the declared set. Same last-write-wins precedence
+    /// as `extend_from_object`.
+    pub(crate) fn extend_from_declared(
         mut self,
         source: &Value,
         declared: &std::collections::HashMap<String, WeftType>,
-        exclude: &[&str],
     ) -> Self {
         if let Value::Object(map) = source {
             for (k, v) in map {
-                if exclude.contains(&k.as_str()) || !declared.contains_key(k) {
-                    continue;
+                if declared.contains_key(k) {
+                    self.outputs.insert(k.clone(), v.clone());
                 }
-                self.outputs.insert(k.clone(), v.clone());
             }
         }
         self
@@ -616,27 +766,17 @@ mod node_output_tests {
     #[test]
     fn extend_from_object_fans_keys_onto_ports() {
         let src = json!({"a": 1, "b": "two", "c": null});
-        let out = NodeOutput::empty().extend_from_object(&src, &[]);
+        let out = NodeOutput::empty().extend_from_object(&src);
         assert_eq!(out.outputs.len(), 3);
         assert_eq!(out.outputs.get("a"), Some(&json!(1)));
         assert_eq!(out.outputs.get("c"), Some(&Value::Null), "user-emitted null is data; engine doesn't strip it");
     }
 
     #[test]
-    fn extend_from_object_honors_exclude() {
-        let src = json!({"keep": 1, "skip_me": 2, "also_keep": 3});
-        let out = NodeOutput::empty().extend_from_object(&src, &["skip_me"]);
-        assert_eq!(out.outputs.len(), 2);
-        assert!(out.outputs.contains_key("keep"));
-        assert!(out.outputs.contains_key("also_keep"));
-        assert!(!out.outputs.contains_key("skip_me"));
-    }
-
-    #[test]
     fn extend_from_declared_only_fans_declared_keys() {
         let src = json!({"sentiment": "positive", "score": 0.9, "extra": "ignored"});
         let declared = declared_ports(&["sentiment", "score", "response"]);
-        let out = NodeOutput::empty().extend_from_declared(&src, &declared, &[]);
+        let out = NodeOutput::empty().extend_from_declared(&src, &declared);
         assert_eq!(out.outputs.len(), 2, "only declared keys present in the object are fanned");
         assert!(out.outputs.contains_key("sentiment"));
         assert!(out.outputs.contains_key("score"));
@@ -647,52 +787,48 @@ mod node_output_tests {
     }
 
     #[test]
-    fn extend_from_declared_honors_exclude() {
-        let src = json!({"response": "full", "field": "x"});
-        let declared = declared_ports(&["response", "field"]);
-        let out = NodeOutput::empty()
-            .set("response", json!("full-object"))
-            .extend_from_declared(&src, &declared, &["response"]);
-        // `response` excluded from the fan, so the earlier `set` stands.
-        assert_eq!(out.outputs.get("response"), Some(&json!("full-object")));
-        assert_eq!(out.outputs.get("field"), Some(&json!("x")));
-    }
-
-    #[test]
     fn extend_from_object_no_op_on_non_object() {
         for src in [json!(null), json!(42), json!("string"), json!([1, 2, 3])] {
-            let out = NodeOutput::empty().extend_from_object(&src, &[]);
+            let out = NodeOutput::empty().extend_from_object(&src);
             assert!(out.outputs.is_empty(), "non-object: helper leaves outputs untouched");
         }
     }
 
     #[test]
-    fn extend_from_object_does_not_overwrite_prior_set_unless_key_matches() {
+    fn extend_from_object_overwrites_a_prior_set() {
         let src = json!({"a": "new"});
         let out = NodeOutput::empty()
             .set("a", json!("prior"))
-            .extend_from_object(&src, &[]);
-        // Same key: the helper DOES overwrite. Document this for users
-        // who want to chain `extend_from_object` then `set` to keep
-        // their override (or vice versa).
+            .extend_from_object(&src);
+        // Same key: the fan DOES overwrite. Chain order is precedence.
         assert_eq!(out.outputs.get("a"), Some(&json!("new")));
     }
 
-    /// Mirror of the prior test in the opposite order: `extend_from_object`
-    /// FIRST, `set` SECOND. The later `set` wins. Both orderings are
-    /// pinned because catalog callers rely on each:
-    ///   - `whatsapp/bridge` and `triggers/api/post` chain `.extend_from_object(...).set(...)`
-    ///     so a sender-supplied key can't override the locally-known truth.
-    ///   - `llm/inference` chains `.set(PRIMARY, ...).extend_from_object(..., &[PRIMARY])`
-    ///     so a returned object key colliding with the primary port doesn't double-fire.
-    /// Last-write-wins is the contract; the chain order is the precedence.
+    /// Mirror of the prior test in the opposite order: fan FIRST, `set`
+    /// SECOND, the later `set` wins. This ordering is the contract
+    /// catalog callers rely on: a node fans the dynamic payload, then
+    /// sets the ports it computes itself (its primary port, a locally
+    /// resolved URL), so a payload key can never shadow the node's own
+    /// truth. Last-write-wins is the rule; the chain order is the
+    /// precedence.
     #[test]
     fn extend_from_object_then_set_lets_set_win() {
         let src = json!({"a": "from_object"});
         let out = NodeOutput::empty()
-            .extend_from_object(&src, &[])
+            .extend_from_object(&src)
             .set("a", json!("from_set"));
         assert_eq!(out.outputs.get("a"), Some(&json!("from_set")));
+    }
+
+    #[test]
+    fn extend_from_declared_then_set_lets_set_win() {
+        let src = json!({"response": "payload-shadow", "field": "x"});
+        let declared = declared_ports(&["response", "field"]);
+        let out = NodeOutput::empty()
+            .extend_from_declared(&src, &declared)
+            .set("response", json!("full-object"));
+        assert_eq!(out.outputs.get("response"), Some(&json!("full-object")));
+        assert_eq!(out.outputs.get("field"), Some(&json!("x")));
     }
 }
 
@@ -724,6 +860,115 @@ mod diagnostic_wire_tests {
             "line": 1, "column": 0, "severity": "warning", "message": "m"
         })).expect("diagnostic without end bounds still deserializes");
         assert_eq!(pointy.end_line, 0, "absent endLine defaults to 0");
+    }
+
+    /// Layer-2 wire-shape: the provider declaration crosses two boundaries
+    /// (`metadata.json` on disk, the register payload carrying the
+    /// collected declarations). Absent = the node makes no deployment-key
+    /// provider calls, and absence serializes as NO key (not `null`), so
+    /// old metadata files and old readers keep working. Present = exactly
+    /// `{ name, base_url }`; an extra field (say, a key name) must be
+    /// REFUSED, because the whole point of the shape is that a declaration
+    /// cannot name a key.
+    #[test]
+    fn node_metadata_provider_wire() {
+        let bare: NodeMetadata = serde_json::from_str(
+            r#"{ "type": "T", "label": "t", "description": "", "category": "AI" }"#,
+        )
+        .expect("metadata without provider");
+        assert!(bare.provider.is_none());
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.get("provider").is_none(), "absent provider stays absent: {v}");
+
+        let declared: NodeMetadata = serde_json::from_str(
+            r#"{ "type": "T", "label": "t", "description": "", "category": "AI",
+                 "provider": { "name": "openrouter", "base_url": "https://openrouter.ai/api/v1" } }"#,
+        )
+        .expect("metadata with provider");
+        let decl = declared.provider.clone().expect("declared");
+        assert_eq!(decl.name, "openrouter");
+        assert_eq!(decl.base_url, "https://openrouter.ai/api/v1");
+        let back: NodeMetadata =
+            serde_json::from_value(serde_json::to_value(&declared).unwrap()).expect("round-trip");
+        assert_eq!(back.provider, declared.provider);
+
+        let smuggled = serde_json::from_str::<ProviderDecl>(
+            r#"{ "name": "shape", "base_url": "https://shape.ai", "key_env": "OPENROUTER_API_KEY" }"#,
+        );
+        assert!(smuggled.is_err(), "a declaration naming a key must be refused at parse");
+
+        // The name is the key's identity, so it is validated to [a-z0-9_]+ at
+        // the door: a name that would form a surprising or colliding env var
+        // (case games, a hyphen aliasing an underscore, a space, empty) is a
+        // loud parse error, not a silent alias.
+        for bad in ["OpenRouter", "open-router", "open router", "open.router", ""] {
+            let decl = serde_json::from_str::<ProviderDecl>(&format!(
+                r#"{{ "name": "{bad}", "base_url": "https://x" }}"#
+            ));
+            assert!(decl.is_err(), "invalid provider name '{bad}' must be refused");
+        }
+        assert!(serde_json::from_str::<ProviderDecl>(
+            r#"{ "name": "open_router2", "base_url": "https://x" }"#
+        )
+        .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod package_defaults_tests {
+    use super::*;
+
+    const MEMBER: &str = r#"{ "type": "OpenRouterInference", "label": "OpenRouter",
+        "description": "", "category": "AI" }"#;
+    const DEFAULTS: &str = r#"{ "provider":
+        { "name": "openrouter", "base_url": "https://openrouter.ai/api/v1" } }"#;
+
+    /// The one guarantee finding-3 turns on: a package member's metadata is
+    /// ONE document. The derive's runtime `parse_embedded(member, defaults)`
+    /// must produce exactly what the catalog builds by merging the same two
+    /// files, so `manifest()` never disagrees with the compile-side catalog.
+    #[test]
+    fn derive_and_catalog_merge_produce_the_same_metadata() {
+        // Runtime side (the derive expansion calls this):
+        let from_derive = NodeMetadata::parse_embedded(MEMBER, Some(DEFAULTS), "test");
+        // Catalog side (what `load_node_entry` does): merge then typed parse.
+        let mut value: serde_json::Value = serde_json::from_str(MEMBER).unwrap();
+        let defaults: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(DEFAULTS).unwrap();
+        merge_package_defaults(&mut value, &defaults).unwrap();
+        let from_catalog: NodeMetadata = serde_json::from_value(value).unwrap();
+
+        assert_eq!(from_derive.provider, from_catalog.provider);
+        assert_eq!(
+            from_derive.provider.as_ref().map(|d| d.name.as_str()),
+            Some("openrouter"),
+            "the package-root provider reaches the merged metadata"
+        );
+        // A bare node (no defaults) parses its own file unchanged.
+        let bare = NodeMetadata::parse_embedded(MEMBER, None, "test");
+        assert!(bare.provider.is_none());
+    }
+
+    /// The member's own key wins wholesale, disjoint keys survive, and an
+    /// identity key at the package level is refused (the same rule the
+    /// catalog and the derive share).
+    #[test]
+    fn merge_semantics() {
+        let mut member = serde_json::json!({ "a": "mine", "keep": 1 });
+        let defaults: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({ "a": "theirs", "add": 2 })).unwrap();
+        merge_package_defaults(&mut member, &defaults).unwrap();
+        assert_eq!(member["a"], "mine", "member wins");
+        assert_eq!(member["keep"], 1);
+        assert_eq!(member["add"], 2, "disjoint default survives");
+
+        for key in NON_INHERITABLE_METADATA_KEYS {
+            let mut member = serde_json::json!({ "type": "T" });
+            let defaults: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_value(serde_json::json!({ key: "x" })).unwrap();
+            let err = merge_package_defaults(&mut member, &defaults).unwrap_err();
+            assert!(err.contains(key), "refusal names `{key}`: {err}");
+        }
     }
 }
 

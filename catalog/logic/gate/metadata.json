@@ -14,6 +14,5 @@
     { "name": "value", "type": "T", "required": false, "description": "The forwarded value; the port is closed when pass was null or false" }
   ],
   "fields": [],
-  "entry": [],
   "requires_infra": false
 }

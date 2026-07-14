@@ -22,6 +22,5 @@
       "description": "How long the kept file lives. Any access (download, read, presign) resets the clock. 0 means never expire."
     }
   ],
-  "entry": [],
   "requires_infra": false
 }

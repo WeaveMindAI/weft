@@ -561,7 +561,7 @@ export type NodeValidateFunction = (context: ValidationContext) => ValidationErr
 
 /**
  * NodeTemplate defines what a node TYPE looks like.
- * This is the schema/blueprint for nodes like "LlmInference", "ExecPython", "Http".
+ * This is the schema/blueprint for nodes like "OpenRouterInference", "ExecPython", "Http".
  * Each node type has one template.
  */
 export interface NodeTemplate {
@@ -656,7 +656,8 @@ export interface Edge {
 export interface ProjectDefinition {
 	id: string;
 	// A project carries no name/description: identity is the manifest file name,
-	// descriptions are per-group (`# Description:`). (Matches the Rust wire type.)
+	// descriptions are per-group (the first plain `# ...` comment line of the
+	// group body). (Matches the Rust wire type.)
 	// Stored (source of truth)
 	weftCode?: string | null;
 	layoutCode?: string | null;

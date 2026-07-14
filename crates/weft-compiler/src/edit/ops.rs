@@ -41,6 +41,17 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         RemoveConfig { node, key } => set_config(view, node, key, None),
         SetLabel { node, label } => set_label(view, node, label.as_deref()),
         AddNode { id, node_type, parent_group } => {
+            // The type is written into the source too, so it is validated at the
+            // door: a single identifier, and not one of the type names the
+            // language reserves (asking `is_reserved_type_keyword`, the one
+            // owner of that list, so `Group`/`Loop`/... cannot be authored as a
+            // plain node through this door).
+            validate_ident("node type", node_type)?;
+            if crate::weft_compiler::is_reserved_type_keyword(node_type) {
+                return Err(EditError::InvalidArgument(format!(
+                    "node type {node_type:?} is a type name the language reserves"
+                )));
+            }
             add_decl(view, parent_group.as_deref(), id, &format!("{id} = {node_type} {{}}"))
         }
         RemoveNode { node } => remove_node(view, node),
@@ -97,6 +108,74 @@ fn kind_name(decl: &Decl) -> &'static str {
         Decl::Node(_) => "Node",
         Decl::Include(_) => "Include",
     }
+}
+
+/// THE injection guard. Every op that writes a caller-supplied string into the
+/// source as a NAME (a node/group/loop id, a node type, a port name, a config
+/// key, a rename target) validates it HERE, at the door, before it is
+/// interpolated into source text that is then parsed. Without this, a string
+/// carrying whitespace, a newline, a brace, or a dot stops being ONE name and
+/// becomes extra source: `AddNode { id: "b = Text {}\nevil" }` would splice a
+/// second declaration into the file, and so would a port name or a config key.
+///
+/// The rule is not restated here, it is ASKED of the lexer: the string must lex
+/// to exactly ONE token, and that token must be an IDENT. Anything else (a
+/// keyword like `Group`/`Loop`, a NUMBER like `true`/`false`, a dotted path, a
+/// space, a brace, a newline, a non-ASCII byte) lexes as something other than a
+/// single IDENT and is refused. Asking the lexer rather than reimplementing its
+/// charset means a future keyword or token rule cannot silently un-guard this
+/// door, which a hand-copied `[A-Za-z_][A-Za-z0-9_-]*` would (it wrongly
+/// accepts `Group`, `Loop`, `true`, `false`).
+///
+/// This is the LEXICAL guard only. Whether a name is one the language RESERVES
+/// is a separate question with a separate owner: [`validate_local_id`] asks the
+/// compiler's `is_reserved_local`, the single source of that rule.
+///
+/// The sibling guards for the other things written into source are
+/// [`validate_port_type`] (a type expression) and `reject_uncontained_value` (a
+/// config value).
+fn validate_ident(what: &str, s: &str) -> Result<(), EditError> {
+    let toks = crate::cst::lexer::lex(s);
+    if toks.len() == 1 && toks[0].kind == SyntaxKind::IDENT {
+        return Ok(());
+    }
+    Err(EditError::InvalidArgument(format!(
+        "{what} {s:?} is not a valid name: it must be a single identifier (letters, digits, \
+         '_' and '-', not starting with a digit, and not a word the language already uses)"
+    )))
+}
+
+/// A caller-supplied PORT TYPE is written into a decl's signature, which is then
+/// reparsed, so it is validated against the language's own definition of a legal
+/// type: [`weft_core::WeftType::parse`], the SAME function the compiler's
+/// lowering uses. One owner for "what is a legal type".
+///
+/// This is what a generic containment check cannot do: a bare `[` or an opening
+/// heredoc fence is a single UNTERMINATED opaque token, so it balances and
+/// carries no newline, yet on reparse it swallows the rest of the file (and a
+/// heredoc that closes on a later fence in the user's own source would reparse
+/// that source as a value). Only "does this parse as a type" rejects those.
+fn validate_port_type(what: &str, ty: &str) -> Result<(), EditError> {
+    if weft_core::WeftType::parse(ty).is_some() {
+        return Ok(());
+    }
+    Err(EditError::InvalidArgument(format!("{what} {ty:?} is not a valid type")))
+}
+
+/// A caller-supplied LOCAL ID (a node/group/loop id, a rename target): it must
+/// lex as one name AND must not be a name the language reserves, or the op
+/// would author a file the compiler then refuses. The reserved-name membership
+/// rule is NOT restated here: it is `weft_compiler::is_reserved_local`, the
+/// single source (the `self` boundary keyword, the reserved type keywords, and
+/// any `__`-containing id).
+fn validate_local_id(what: &str, s: &str) -> Result<(), EditError> {
+    validate_ident(what, s)?;
+    if crate::weft_compiler::is_reserved_local(s) {
+        return Err(EditError::InvalidArgument(format!(
+            "{what} {s:?} is a name the language reserves"
+        )));
+    }
+    Ok(())
 }
 
 /// The honest kind-mismatch error: the id EXISTS but is the wrong
@@ -400,6 +479,7 @@ fn leading_indent(node: &SyntaxNode) -> String {
 
 /// Add a node or group decl into a scope. Rejects a duplicate local id loudly.
 fn add_decl(view: &FileView, parent_group: Option<&str>, local_id: &str, decl_src: &str) -> Result<(), EditError> {
+    validate_local_id("id", local_id)?;
     reject_if_taken(view, parent_group, local_id)?;
     match target_body(view, parent_group)? {
         InsertTarget::FileRoot(f) => {
@@ -730,7 +810,12 @@ fn field_key(field: &SyntaxNode) -> Option<String> {
 }
 
 /// Set (replace) or insert a config field `key: value`.
+///
+/// The KEY is written into the source as an IDENT (the value is separately
+/// guarded by `reject_uncontained_value`), so it is validated at the door: an
+/// unguarded key would carry structure into the body and inject source.
 fn set_or_insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
+    validate_ident("config key", key)?;
     let existing = find_fields(decl, key);
     if let Some(first) = existing.first() {
         // Replace only the value tokens (after `:`) on the first match.
@@ -817,17 +902,50 @@ fn remove_loop_config(view: &FileView, loop_id: &str, key: &str) -> Result<(), E
     Ok(())
 }
 
-/// Set/replace/remove a group's first-body-line `# Description:`.
+/// The real `GROUP_DESC` node for a description line `# {d}`, parsed in group
+/// context so it is a promoted GROUP_DESC (not a bare COMMENT token). Splicing
+/// this, rather than raw comment elements, keeps `group.description()` truthful
+/// across ops applied to ONE tree in a batch (a later clear/re-set in the same
+/// batch finds it). The wrapper trick mirrors `snippet_elements_as_body_content`.
+///
+/// The caller has already rejected any newline in `d`, so `# {d}` is exactly
+/// one comment line and the group body has exactly one first-line comment to
+/// promote.
+fn group_desc_element(d: &str) -> Result<SyntaxElement, EditError> {
+    let wrapper_src = format!("__edit_desc_wrap = Group() {{\n# {d}\n}}\n");
+    let root = parse(&wrapper_src).clone_for_update();
+    let node = WeftFile::cast(root)
+        .and_then(|f| {
+            f.syntax()
+                .descendants()
+                .find(|n| n.kind() == SyntaxKind::GROUP_DESC)
+        })
+        .ok_or_else(|| EditError::Unparseable("could not synthesize a group description".into()))?;
+    node.detach();
+    Ok(NodeOrToken::Node(node))
+}
+
+/// Set/replace/remove a group's description: the plain `# ...` comment on
+/// its first body line. A description is a single line by construction, so a
+/// value carrying a newline (which would parse as extra source: injected
+/// nodes, connections) is refused loudly. Whitespace-only clears it.
 fn set_group_description(view: &FileView, group_id: &str, desc: Option<&str>) -> Result<(), EditError> {
+    let desc = desc.map(str::trim).filter(|d| !d.is_empty());
+    if let Some(d) = desc {
+        if d.contains('\n') || d.contains('\r') {
+            return Err(EditError::InvalidArgument(
+                "group description must be a single line (no newline)".into(),
+            ));
+        }
+    }
     let group = resolve_group(view, group_id)?;
     let body = group.body().ok_or_else(|| EditError::ContainerNotFound(group_id.to_string()))?;
     let indent = format!("{}  ", leading_indent(group.syntax()));
     let existing = group.description().map(|d| d.syntax().clone());
-    match (existing, desc.filter(|d| !d.is_empty())) {
+    match (existing, desc) {
         (Some(node), Some(d)) => {
-            let elements = snippet_elements(&format!("# Description: {d}"));
             let idx = node.index();
-            node.parent().unwrap().splice_children(idx..idx + 1, elements);
+            node.parent().unwrap().splice_children(idx..idx + 1, vec![group_desc_element(d)?]);
         }
         (Some(node), None) => detach_with_leading_ws(&node),
         (None, Some(d)) => {
@@ -839,19 +957,24 @@ fn set_group_description(view: &FileView, group_id: &str, desc: Option<&str>) ->
                 .ok_or_else(|| EditError::Unparseable("group body missing {".into()))?;
             let at = brace_idx + 1;
             // A single-line body (`{}`) has its `}` on the open-brace line, so a
-            // comment first-line would SWALLOW it (`# Description: d}` is one
+            // comment first-line would SWALLOW it (`# d}` is one
             // comment). Append a newline + the group's own indent after the
             // description so the `}` drops to its own line. A multi-line body
             // already has structure. `body_owner_indent` is the ONE definition of
             // "the column a body's close brace sits at" (also used by
             // `insert_before_close`), so the two never drift.
             let group_indent = body_owner_indent(&body);
-            let snippet = if body_is_single_line(&body) {
-                format!("\n{indent}# Description: {d}\n{group_indent}")
-            } else {
-                format!("\n{indent}# Description: {d}")
-            };
-            body.syntax().splice_children(at..at, snippet_elements(&snippet));
+            // Splice the REAL GROUP_DESC node (not a bare comment) with its
+            // layout trivia, so `group.description()` recognizes it later in
+            // the same batch. Single-line bodies get a trailing newline+indent
+            // so the `}` drops to its own line (a comment would otherwise
+            // swallow it: `# d}` is one comment).
+            let mut elements =
+                vec![make_token(SyntaxKind::WHITESPACE, &format!("\n{indent}")), group_desc_element(d)?];
+            if body_is_single_line(&body) {
+                elements.push(make_token(SyntaxKind::WHITESPACE, &format!("\n{group_indent}")));
+            }
+            body.syntax().splice_children(at..at, elements);
         }
         (None, None) => {}
     }
@@ -875,6 +998,11 @@ fn add_edge(
     // inside scope `G` means `G.x`, not a file-wide `x`.
     require_endpoint(view, scope_group, source)?;
     require_endpoint(view, scope_group, target)?;
+    // The port names are written into the source as IDENTs, exactly like the
+    // node ids, so they are validated at the door too: an unguarded port name
+    // would carry structure into the connection line and inject source.
+    validate_ident("source port", source_port)?;
+    validate_ident("target port", target_port)?;
     // Remove the existing driver of this target port in the same scope.
     remove_driver(view, scope_group, target, target_port);
     let conn = format!("{target}.{target_port} = {source}.{source_port}");
@@ -1048,9 +1176,9 @@ fn rename_container(
     new_label: &str,
     expected: ContainerKind,
 ) -> Result<(), EditError> {
-    if new_label.is_empty() {
-        return Err(EditError::InvalidArgument("rename to empty label".into()));
-    }
+    // The new label is written into the source as an IDENT token, so it is
+    // validated at the door (this also covers the previous empty-label check).
+    validate_local_id("new label", new_label)?;
     let decl = resolve(view, id)?;
     if !expected.matches(&decl) {
         return Err(kind_mismatch(
@@ -1139,47 +1267,89 @@ fn raw_token_elements(tokens: &[(SyntaxKind, &str)]) -> Vec<SyntaxElement> {
     SyntaxNode::new_root(b.finish()).clone_for_update().children_with_tokens().collect()
 }
 
-/// Reject a config-value string that would BREAK CONTAINMENT, escaping the field
-/// and corrupting the surrounding tree: a raw newline in a WHITESPACE token
-/// (would split the line; a heredoc's own newlines live inside its single opaque
-/// token, so they don't count), or an unbalanced `}`/`)` that would close the
-/// enclosing body/sig early. An ERROR token (an operator like `|`, or an invalid
-/// byte) is harmless: it is one lossless token that stays in value position, so
-/// it is NOT rejected (rejecting it false-flagged legit type exprs).
+/// Reject a config-value string that would BREAK CONTAINMENT: once its lexed
+/// tokens are spliced into value position, a token that reaches FORWARD past
+/// itself (a line comment to the next newline, an unterminated opaque token to
+/// end-of-input, an unbalanced closer) consumes the `}` that ends the field and
+/// swallows the rest of the file. The check refuses exactly those forward-
+/// reaching tokens.
+///
+/// Whether an opaque token (a `[`-array, a heredoc, a string, a `@marker`) is
+/// terminated is ASKED OF THE LEXER (`*_is_closed`), using its own scan, never
+/// re-derived here: the two must agree about closed-ness or a token this gate
+/// calls contained would re-lex greedily and reach forward anyway.
 ///
 /// The ONE containment gate, shared by both value-writing paths (in-place
 /// replace via `value_elements`, and insert/synthesize-body via `insert_field`),
-/// so a value the replace path rejects can't slip through the insert path and
-/// corrupt the tree (an unbalanced `}` would close the node body early).
+/// so a value the replace path rejects can't slip through the insert path.
 fn reject_uncontained_value(value: &str) -> Result<(), EditError> {
+    let bad = || {
+        Err(EditError::InvalidArgument(format!(
+            "value would break out of its field (it does not parse as a single contained \
+             value): {value:?}"
+        )))
+    };
+    // The value is spliced (as its lexed tokens) into value position, right
+    // before whatever terminates the field: a `}` on the same line for a
+    // single-line body, a newline then `}` for a multi-line one. It is safe iff
+    // none of its tokens REACH FORWARD past itself to consume that terminator.
+    // Exactly the tokens that reach forward are refused, on the lexed value:
     let toks = crate::cst::lexer::lex(value);
-    // A raw newline outside a heredoc would break the value onto a new line.
-    let has_bare_newline = toks
-        .iter()
-        .any(|t| t.kind == SyntaxKind::WHITESPACE && t.text.contains('\n'));
-    // Bracket balance: a closer with no opener (depth < 0) escapes the field.
     let mut depth: i32 = 0;
-    let mut unbalanced = false;
-    // `[...]` arrays + `{...}`/heredoc/marker bodies are single opaque tokens
-    // (the lexer doesn't emit bracket tokens for them), so only the paren/brace
-    // PAIR tokens can appear unbalanced in a value.
     for t in &toks {
         match t.kind {
+            // A line comment runs to the next newline, so on a single-line body
+            // it eats the `}`. Unsafe wherever it appears in a value.
+            SyntaxKind::COMMENT => return bad(),
+            // A raw newline splits the value onto a new line. (A heredoc's own
+            // newlines live inside its single HEREDOC token, so they never
+            // surface as a WHITESPACE token here.)
+            SyntaxKind::WHITESPACE if t.text.contains('\n') => return bad(),
+            // An UNTERMINATED opaque token runs to end-of-input, swallowing the
+            // rest of the file: a `[`-array missing its `]`, a heredoc/string
+            // missing its closing fence/quote, a marker missing its `)`. A
+            // terminated one is contained.
+            //
+            // For a JSON_VALUE / MARKER, endpoint-matching is NOT enough: the
+            // lexer's scan is greedy and pads an unbalanced token (`[[]`,
+            // `@file("a)`) out to EOF, so it can still end in `]` / `)`. Ask the
+            // LEXER whether the token actually closed, using its own scan, so
+            // this can never disagree with how the token re-lexes.
+            SyntaxKind::JSON_VALUE => {
+                if !crate::cst::lexer::json_value_is_closed(t.text) {
+                    return bad();
+                }
+            }
+            SyntaxKind::MARKER => {
+                if !crate::cst::lexer::marker_is_closed(t.text) {
+                    return bad();
+                }
+            }
+            SyntaxKind::HEREDOC => {
+                if !crate::cst::lexer::heredoc_is_closed(t.text) {
+                    return bad();
+                }
+            }
+            SyntaxKind::STRING => {
+                if !crate::cst::lexer::string_is_closed(t.text) {
+                    return bad();
+                }
+            }
+            // A closer with no opener inside the value would close the enclosing
+            // body/sig early. (`[...]`/`{...}` arrays are single opaque tokens
+            // above, so only the paren/brace PAIR tokens can appear here.)
             SyntaxKind::L_BRACE | SyntaxKind::L_PAREN => depth += 1,
             SyntaxKind::R_BRACE | SyntaxKind::R_PAREN => {
                 depth -= 1;
                 if depth < 0 {
-                    unbalanced = true;
-                    break;
+                    return bad();
                 }
             }
             _ => {}
         }
     }
-    if has_bare_newline || unbalanced || depth != 0 {
-        return Err(EditError::InvalidArgument(format!(
-            "value would break out of its field (unbalanced brackets or a newline): {value:?}"
-        )));
+    if depth != 0 {
+        return bad();
     }
     Ok(())
 }
@@ -1357,6 +1527,15 @@ fn update_ports(
     outputs: &[PortSig],
     expected: ContainerKind,
 ) -> Result<(), EditError> {
+    // Both halves of every port sig are written into the decl's HEADER, which is
+    // then reparsed, so both are validated at the door: the NAME must be a
+    // single identifier, and the TYPE must actually parse as a type.
+    for p in inputs.iter().chain(outputs.iter()) {
+        validate_ident("port name", &p.name)?;
+        if let Some(ty) = p.port_type.as_deref() {
+            validate_port_type("port type", ty)?;
+        }
+    }
     let decl = resolve(view, id)?;
     if !expected.matches(&decl) {
         return Err(kind_mismatch(

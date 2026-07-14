@@ -262,8 +262,8 @@ pub fn enrich_collecting(
         // always OPTIONAL: omitting the header is the normal case.
         let mut catalog_inputs = catalog_inputs;
         if meta.features.has_form_schema {
-            let specs = catalog.form_field_specs(&node.node_type);
-            let (form_inputs, form_outputs) = derive_form_ports(&node.config, specs);
+            let (form_inputs, form_outputs) =
+                derive_form_ports(&node.config, &meta.form_field_specs);
             catalog_inputs.extend(form_inputs);
             catalog_outputs.extend(form_outputs);
         }

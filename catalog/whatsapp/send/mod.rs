@@ -6,22 +6,13 @@ use async_trait::async_trait;
 
 use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct WhatsAppSendNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for WhatsAppSendNode {
-    fn node_type(&self) -> &'static str {
-        "WhatsAppSend"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("WhatsAppSend metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let endpoint_url = ctx
             .input

@@ -7,24 +7,15 @@ use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::Value;
 
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 
+#[derive(NodeManifest)]
 pub struct HttpRequestNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for HttpRequestNode {
-    fn node_type(&self) -> &'static str {
-        "HttpRequest"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("HttpRequest metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let url: String = ctx.input.get("url")?;
         let method_str: String = ctx.config.get("method")?;

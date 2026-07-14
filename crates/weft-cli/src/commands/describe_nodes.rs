@@ -8,13 +8,15 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use weft_catalog::{stdlib_root, DiscoverPolicy, FsCatalog};
+use weft_core::node::NodeMetadata;
 
-use super::node_catalog::NodeCatalogEntry;
 use super::Ctx;
 
 #[derive(Serialize)]
 struct NodesResponse {
-    catalog: BTreeMap<String, NodeCatalogEntry>,
+    // The metadata itself is the wire entry: everything the palette needs
+    // (form-field specs included) is a metadata key.
+    catalog: BTreeMap<String, NodeMetadata>,
     /// Soft errors from scanning `nodes/` (malformed metadata.json,
     /// duplicate types). Surfaced, not silent: a node mid-rename has a
     /// transient parse error the editor should see but not crash on.
@@ -41,13 +43,7 @@ pub async fn run(ctx: Ctx, stdlib: bool) -> Result<()> {
         if entry.metadata.features.hidden {
             continue;
         }
-        catalog.insert(
-            entry.node_type.clone(),
-            NodeCatalogEntry {
-                metadata: entry.metadata.clone(),
-                form_field_specs: entry.form_field_specs.clone(),
-            },
-        );
+        catalog.insert(entry.node_type.clone(), entry.metadata.clone());
     }
     let resp = NodesResponse {
         catalog,

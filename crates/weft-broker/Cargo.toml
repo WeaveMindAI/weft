@@ -51,3 +51,10 @@ weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 futures = { workspace = true }
 # `#[sqlx::test]` provisions a fresh isolated DB per test for the Layer-3 suite.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+# Dev-only, for the provider-declaration resolution suite: the table is
+# written by the dispatcher (`provider_decl::record`, which owns its schema)
+# and read by this crate's `provider_proxy::declared_base_url` as plain SQL
+# over the shared Postgres (like `worker_pod` / `project_definition`), so the
+# broker itself never links the dispatcher crate. The test needs the real
+# writer to populate the table before exercising the reader, hence this dep.
+weft-dispatcher = { path = "../weft-dispatcher" }

@@ -4081,6 +4081,7 @@ dependencies = [
  "uuid",
  "weft-broker-client",
  "weft-core",
+ "weft-dispatcher",
  "weft-infra",
  "weft-journal",
  "weft-platform-traits",
@@ -4126,6 +4127,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dotenvy",
  "eventsource-client",
  "futures",
  "ipnet",
@@ -4177,6 +4179,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "inventory",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4184,6 +4187,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "weft-node-derive",
 ]
 
 [[package]]
@@ -4347,6 +4351,16 @@ dependencies = [
  "weft-core",
  "weft-platform-traits",
  "weft-task-store",
+]
+
+[[package]]
+name = "weft-node-derive"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn",
 ]
 
 [[package]]

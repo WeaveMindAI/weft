@@ -87,26 +87,29 @@ execution completes. Use `--detach` if you don't want to watch.
 Look at the ops dashboard in a browser: `http://localhost:9999/`.
 You should see the `hello` project listed.
 
-## Webhook entry
+## Live HTTP entry
 
-Make a webhook-style project:
+Make a project an outside caller can hit over HTTP. `ApiEndpoint` is the
+trigger (each request fires a fresh execution); a downstream node reads the
+request and replies through the caller handle. `LiveHttpResponder` is the
+shipped demo responder (streams two progress chunks, then echoes the request
+body back as JSON):
 
 ```bash
 cat > main.weft <<'EOF'
-receive = ApiPost
-print = Debug { label: "webhook" }
-print.value = receive.body
+api = ApiEndpoint { path: "hello" }
+reply = LiveHttpResponder { _label: "responder" }
+
+reply.started = api.started
 EOF
 
-weft run --detach   # registers the project
-weft activate $(weft ps | awk 'NR==2 {print $1}')
-# response contains the minted /w/{token} URL
+weft activate      # compiles, registers, activates; prints the live URL
 ```
 
-Fire the webhook from anywhere:
+Fire it from anywhere:
 
 ```bash
-curl -X POST "http://localhost:9999/w/<TOKEN>" \
+curl -X POST "<live URL from activate>" \
      -H "content-type: application/json" \
      -d '{"message":"hi"}'
 ```

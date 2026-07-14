@@ -6,22 +6,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct MultiplyNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for MultiplyNode {
-    fn node_type(&self) -> &'static str {
-        "Multiply"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("Multiply metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // Both inputs are required, so the engine only fires once they are
         // present; read them loudly (`get` errors on absent/wrong type).

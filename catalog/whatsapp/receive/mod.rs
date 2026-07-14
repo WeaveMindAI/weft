@@ -15,22 +15,13 @@ use async_trait::async_trait;
 use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
 use weft_core::signal::SseSubscribe;
-use weft_core::{ExecutionContext, Node, NodeMetadata, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct WhatsAppReceiveNode;
-
-const METADATA_JSON: &str = include_str!("metadata.json");
 
 #[async_trait]
 impl Node for WhatsAppReceiveNode {
-    fn node_type(&self) -> &'static str {
-        "WhatsAppReceive"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("WhatsAppReceive metadata.json must be valid")
-    }
-
     async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         match ctx.phase {
             // Setup registers the SSE signal; emits nothing downstream.
@@ -70,13 +61,21 @@ async fn fire(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
     // payload. Fan the DECLARED fields onto their matching output
     // ports; payload extras that are routing handles, not data
     // (`messageKey`, used by the bridge's own media resolve), are
-    // skipped by intersecting with the declared set. Missing fields
+    // skipped by the declared-set intersection. Missing fields
     // stay un-mentioned and the engine closes those ports at
     // termination (substituting empty strings / `false` would
     // publish data nulls indistinguishable from real user values).
-    let data = ctx.wake_payload_object()?.clone();
-    let mut out =
-        NodeOutput::empty().extend_from_declared(&data, ctx.declared_output_ports(), &["file"]);
+    //
+    // `file` is a port THIS node computes (a stored-file reference, only
+    // on the media path below); it is never a payload field. Strip it
+    // before fanning so an event carrying a `file` key can't put a value
+    // on the `file` port. The set-after-fan on the media path only guards
+    // that one path; stripping here guards both.
+    let mut data = ctx.wake_payload_object()?.clone();
+    data.as_object_mut()
+        .expect("wake_payload_object returns an object or errors")
+        .remove("file");
+    let mut out = ctx.fan_declared(&data);
 
     // Media messages: stream the bytes from the bridge's media
     // endpoint STRAIGHT into execution-scoped storage and emit the

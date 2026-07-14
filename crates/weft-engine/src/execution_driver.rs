@@ -868,6 +868,7 @@ async fn drive(
                 edge_idx,
                 pulses,
                 journal,
+                clients.clock.as_ref(),
                 pod_name,
                 phase_scope.as_ref(),
                 loop_runtime,
@@ -1307,6 +1308,7 @@ async fn drive(
                 project.id.to_string(),
                 group.color,
                 node_id.clone(),
+                node_def.node_type.clone(),
                 group.frames.clone(),
                 clients.clone(),
                 pod_name.to_string(),
@@ -1775,6 +1777,7 @@ async fn drive(
                     edge_idx,
                     pulses,
                     journal,
+                    clients.clock.as_ref(),
                     pod_name,
                     phase_scope.as_ref(),
                     loop_runtime,
@@ -2928,6 +2931,17 @@ async fn handle_node_skip(
     ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, closures).await;
 }
 
+/// CAP on the grace window for nodes that declared `interruptGrace`: time
+/// for an in-flight `execute` to observe the tripped cancellation flag
+/// and wrap up (settle a provisioned cost, close a paid stream) before
+/// the abort. The wait ends the instant every in-flight task finishes,
+/// so a node that settles in 2s stops in 2s; the cap only bounds a
+/// wrap-up that hangs. Sized for the slow real case: resolving a
+/// cancelled generation's cost from a provider ledger takes >7s
+/// (measured against OpenRouter: the record finalizes well after the
+/// client abort), plus retries.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Single cancellation cleanup path. Called from BOTH cancellation
 /// entry points (loop-top check and idle-wait branch) so they have
 /// identical drain semantics. The order is load-bearing:
@@ -2974,10 +2988,44 @@ async fn cancel_cleanup(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
+    clock: &dyn weft_platform_traits::Clock,
     pod_name: &str,
     phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
 ) {
+    // 0. Nodes that declared `interruptGrace` get a short window to
+    //    observe the tripped cancellation flag and wrap up (settle a
+    //    provisioned cost, close a paid stream) before the hard abort.
+    //    Only in-flight firings of opted-in nodes buy the window, so a
+    //    cancel with none of those aborts instantly, exactly as before.
+    let grace_wanted = executions.iter().any(|(node_id, execs)| {
+        execs.iter().any(|e| e.color == color && !e.status.is_terminal())
+            && project
+                .nodes
+                .iter()
+                .any(|n| n.id == *node_id && n.features.interrupt_grace)
+    });
+    if grace_wanted && !in_flight.is_empty() {
+        tracing::info!(
+            target: "weft_engine::execution_driver",
+            color = %color,
+            in_flight = in_flight.len(),
+            grace_secs = INTERRUPT_GRACE.as_secs(),
+            "interruptGrace node in flight; letting tasks observe the cancel before aborting"
+        );
+        let deadline = clock.sleep(INTERRUPT_GRACE);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                joined = in_flight.join_next() => {
+                    if joined.is_none() {
+                        break;
+                    }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+    }
     // 1. Drive every spawned task to its abort point.
     in_flight.shutdown().await;
     // 2. Drain the task channel in one FIFO pass. Emissions: apply with
@@ -4247,6 +4295,20 @@ mod bus_comm_tests {
         .expect("trivial metadata")
     }
 
+    /// Inline test nodes have no metadata.json, so they can't use
+    /// `#[derive(NodeManifest)]`; this hands them the same static
+    /// manifest shape, built from `trivial_metadata`.
+    macro_rules! test_manifest {
+        ($node:ty, $ty:literal) => {
+            impl weft_core::NodeManifest for $node {
+                fn manifest(&self) -> &'static NodeMetadata {
+                    static M: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+                    M.get_or_init(|| trivial_metadata($ty))
+                }
+            }
+        };
+    }
+
     /// A minimal wait-for-input signal for the bus + await_signal tests.
     fn human_form() -> weft_core::signal::Form {
         weft_core::signal::Form {
@@ -4266,10 +4328,9 @@ mod bus_comm_tests {
     /// send three messages and close. Stays alive (its execute does not
     /// return) until it has sent + closed.
     struct Producer;
+    test_manifest!(Producer, "Producer");
     #[async_trait]
     impl Node for Producer {
-        fn node_type(&self) -> &'static str { "Producer" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("Producer") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let (mut bus, marker) = ctx.create_bus(Default::default())?;
             bus.register("producer").expect("register producer");
@@ -4298,10 +4359,9 @@ mod bus_comm_tests {
     struct Consumer {
         seen: Arc<StdMutex<Vec<(String, i64)>>>,
     }
+    test_manifest!(Consumer, "Consumer");
     #[async_trait]
     impl Node for Consumer {
-        fn node_type(&self) -> &'static str { "Consumer" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("Consumer") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let mut bus = ctx.bus_from_input("channel")?;
             // Claim our identity: this is what releases the producer's
@@ -4497,6 +4557,7 @@ mod bus_comm_tests {
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
+            paid_calls: crate::context::FakePaidCallClient::new(),
         };
 
         let outcome = run_one_execution(
@@ -4584,10 +4645,9 @@ mod bus_comm_tests {
     /// handle drops). This is what makes a user "Stop" tear down a
     /// live-bus execution.
     struct Waiter;
+    test_manifest!(Waiter, "Waiter");
     #[async_trait]
     impl Node for Waiter {
-        fn node_type(&self) -> &'static str { "Waiter" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("Waiter") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let (mut bus, _marker) = ctx.create_bus(Default::default())?;
             bus.register("waiter").expect("register");
@@ -4639,6 +4699,7 @@ mod bus_comm_tests {
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
+            paid_calls: crate::context::FakePaidCallClient::new(),
         };
         let cancel = CancellationFlag::new_arc();
 
@@ -4707,10 +4768,9 @@ mod bus_comm_tests {
     }
 
     struct Configurable;
+    test_manifest!(Configurable, "Configurable");
     #[async_trait]
     impl Node for Configurable {
-        fn node_type(&self) -> &'static str { "Configurable" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("Configurable") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let key = (ctx.project_id.clone(), ctx.node_id.clone());
             let body = bodies().lock().unwrap().get(&key).cloned();
@@ -4901,6 +4961,7 @@ mod bus_comm_tests {
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
+            paid_calls: crate::context::FakePaidCallClient::new(),
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -5337,6 +5398,97 @@ mod bus_comm_tests {
     );
 
     weft_core::stress_test!(
+        // interruptGrace: a node that watches `ctx.cancellation()` gets a
+        // grace window on cancel to run its interruption branch (settle a
+        // provisioned cost) before its future is aborted. The body
+        // provisions on the deployment key, signals readiness, parks on
+        // the cancellation flag, and settles once it trips; the test
+        // cancels only after the provision is in, then asserts the settle
+        // landed with the hold. Stress-looped: the settle races
+        // `cancel_cleanup`'s abort by construction, and the grace window
+        // is exactly what must make the node win every time.
+        name: interrupt_grace_lets_the_node_settle_before_the_abort,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let project: ProjectDefinition = serde_json::from_value(json!({
+                "id": uuid::Uuid::new_v4(), "name": "grace", "description": null,
+                "nodes": [{
+                    "id": "payer", "nodeType": "Configurable", "label": null, "config": null,
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [], "outputs": [],
+                    "features": { "interruptGrace": true }, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                }],
+                "edges": [], "groups": []
+            }))
+            .expect("grace project");
+            let pid = project.id.to_string();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let ready_tx = std::sync::Arc::new(StdMutex::new(Some(ready_tx)));
+            install_body(&pid, "payer", std::sync::Arc::new(move |ctx| {
+                let ready_tx = ready_tx.clone();
+                Box::pin(async move {
+                    let access = ctx.provider_access("openrouter", None).await?;
+                    let hold = ctx
+                        .provision_cost(&access, weft_core::CostProvision::estimate(1.0))
+                        .await?;
+                    if let Some(tx) = ready_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    ctx.cancellation().cancelled().await;
+                    ctx.settle_cost(hold, 0.25, serde_json::json!({"interrupted": true})).await?;
+                    Ok(())
+                })
+            }));
+
+            let color = uuid::Uuid::new_v4();
+            let journal = Arc::new(MemJournal::default());
+            journal.record_event(&ExecEvent::ExecutionStarted {
+                color, project_id: pid.clone(), entry_node: "payer".into(),
+                phase: weft_core::context::Phase::Fire, definition_hash: "test-hash".into(), at_unix: 0,
+            }, None).await.unwrap();
+            journal.record_event(&ExecEvent::NodeKicked {
+                color, node_id: "payer".into(), payload: None, at_unix: 0,
+            }, None).await.unwrap();
+            let fake_paid_calls = crate::context::FakePaidCallClient::metered();
+            fake_paid_calls.set_key("openrouter", "sk-platform");
+            let clients = EngineClients {
+                journal: journal.clone(),
+                tasks: Arc::new(NoopTasks),
+                infra: Arc::new(NoopInfra),
+                infra_state: Arc::new(NoopInfraState),
+                project: Arc::new(NoopProject),
+                clock: Arc::new(weft_platform_traits::clock::SystemClock),
+                storage: crate::storage::FakeWorkerStorage::new(),
+                paid_calls: fake_paid_calls.clone(),
+            };
+            let cancel = CancellationFlag::new_arc();
+            let run = tokio::spawn(run_one_execution(
+                Arc::new(project), configurable_catalog(), color, clients,
+                "pod".into(), "tenant".into(), "ns".into(),
+                cancel.clone(),
+                None,
+            ));
+            ready_rx.await.expect("payer must reach its provisioned state");
+            cancel.cancel();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), run)
+                .await
+                .expect("cancel with grace must still terminate promptly")
+                .expect("join ok")
+                .expect("run ok");
+            assert!(
+                matches!(outcome, ExecutionOutcome::Cancelled),
+                "cancelled execution reports Cancelled; got {outcome:?}"
+            );
+            let settles = fake_paid_calls.settles.lock().unwrap();
+            assert_eq!(settles.len(), 1, "the interruption branch must settle exactly once");
+            assert_eq!(settles[0].amount_usd, 0.25);
+            assert_eq!(settles[0].hold_id.as_deref(), Some("hold-0"), "the provisioned hold is the one settled");
+        }
+    );
+
+    weft_core::stress_test!(
         // END-TO-END concurrent waits in ONE node task, through the real
         // WaitGuard/cursor wiring (not the coordinator hooks directly).
         // Node A holds TWO concurrent bus waits at once: a `tokio::select!`
@@ -5561,6 +5713,7 @@ mod bus_comm_tests {
                 project: Arc::new(NoopProject),
                 clock: Arc::new(weft_platform_traits::clock::SystemClock),
                 storage: crate::storage::FakeWorkerStorage::new(),
+                paid_calls: crate::context::FakePaidCallClient::new(),
             };
             run_one_execution(
                 Arc::new(project),
@@ -6345,6 +6498,7 @@ mod bus_comm_tests {
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
+            paid_calls: crate::context::FakePaidCallClient::new(),
         };
         run_one_execution(
             Arc::new(project),
@@ -6388,10 +6542,9 @@ mod bus_comm_tests {
     /// onto a bus it creates, then closes the bus. Proves caller + bus
     /// coexist in one firing. Exposes the bus on `channel` for a consumer.
     struct CallerToBus;
+    test_manifest!(CallerToBus, "CallerToBus");
     #[async_trait]
     impl Node for CallerToBus {
-        fn node_type(&self) -> &'static str { "CallerToBus" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("CallerToBus") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
                 return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
@@ -6430,10 +6583,9 @@ mod bus_comm_tests {
         label: &'static str,
         seen: Arc<StdMutex<Vec<(&'static str, Value)>>>,
     }
+    test_manifest!(WsReader, "WsReader");
     #[async_trait]
     impl Node for WsReader {
-        fn node_type(&self) -> &'static str { "WsReader" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("WsReader") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
                 return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
@@ -6458,10 +6610,9 @@ mod bus_comm_tests {
     /// HTTP responder: streams one chunk, sends the final body, AND pulses
     /// `done` downstream, proving talk-to-caller and graph emission compose.
     struct HttpResponder;
+    test_manifest!(HttpResponder, "HttpResponder");
     #[async_trait]
     impl Node for HttpResponder {
-        fn node_type(&self) -> &'static str { "HttpResponder" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("HttpResponder") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let Some(CallerHandle::Http(http)) = ctx.caller() else {
                 return Err(weft_core::error::WeftError::NodeExecution("no http caller".into()));
@@ -6476,10 +6627,9 @@ mod bus_comm_tests {
     /// makes the send error (cancel); on a survives run it is a no-op and
     /// the node still completes. Distinguishes the two lifetime regimes.
     struct CallerSender;
+    test_manifest!(CallerSender, "CallerSender");
     #[async_trait]
     impl Node for CallerSender {
-        fn node_type(&self) -> &'static str { "CallerSender" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("CallerSender") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
                 return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
@@ -6494,10 +6644,9 @@ mod bus_comm_tests {
     /// Requires a caller and fails loud when there is none. Models a node
     /// wired under a live trigger but run on a caller-less execution.
     struct NeedsCaller;
+    test_manifest!(NeedsCaller, "NeedsCaller");
     #[async_trait]
     impl Node for NeedsCaller {
-        fn node_type(&self) -> &'static str { "NeedsCaller" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("NeedsCaller") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             if ctx.caller().is_none() {
                 return Err(weft_core::error::WeftError::NodeExecution(
@@ -6549,10 +6698,9 @@ mod bus_comm_tests {
         // Drainer registers "drain" (releasing CallerToBus's wait_for) and
         // drains every message so the run reaches quiescence.
         struct Drainer;
+        test_manifest!(Drainer, "Drainer");
         #[async_trait]
         impl Node for Drainer {
-            fn node_type(&self) -> &'static str { "Drainer" }
-            fn metadata(&self) -> NodeMetadata { trivial_metadata("Drainer") }
             async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
                 let mut bus = ctx.bus_from_input("channel")?;
                 bus.register("drain").expect("register drain");
@@ -6603,16 +6751,14 @@ mod bus_comm_tests {
         // delegates to a shared `WsReader` body with its own label.
         struct ReaderA(WsReader);
         struct ReaderB(WsReader);
+        test_manifest!(ReaderA, "ReaderA");
         #[async_trait]
         impl Node for ReaderA {
-            fn node_type(&self) -> &'static str { "ReaderA" }
-            fn metadata(&self) -> NodeMetadata { trivial_metadata("ReaderA") }
             async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> { self.0.execute(ctx).await }
         }
+        test_manifest!(ReaderB, "ReaderB");
         #[async_trait]
         impl Node for ReaderB {
-            fn node_type(&self) -> &'static str { "ReaderB" }
-            fn metadata(&self) -> NodeMetadata { trivial_metadata("ReaderB") }
             async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> { self.0.execute(ctx).await }
         }
         struct AB { a: &'static ReaderA, b: &'static ReaderB }
@@ -6773,10 +6919,9 @@ mod bus_comm_tests {
     /// primitive. Its interaction with a live caller is the whole point: a
     /// caller-tied run must NOT durably suspend here.
     struct AwaiterNode;
+    test_manifest!(AwaiterNode, "Awaiter");
     #[async_trait]
     impl Node for AwaiterNode {
-        fn node_type(&self) -> &'static str { "Awaiter" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("Awaiter") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let _ = ctx.await_signal(human_form()).await?;
             ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true))).await
@@ -6848,10 +6993,9 @@ mod bus_comm_tests {
     /// the two paths coexist without interfering. The caller send is
     /// recorded regardless of the infra outcome.
     struct CallerPlusEndpoint;
+    test_manifest!(CallerPlusEndpoint, "CallerPlusEndpoint");
     #[async_trait]
     impl Node for CallerPlusEndpoint {
-        fn node_type(&self) -> &'static str { "CallerPlusEndpoint" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("CallerPlusEndpoint") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
                 return Err(weft_core::error::WeftError::NodeExecution("no ws caller".into()));
@@ -6894,10 +7038,9 @@ mod bus_comm_tests {
     /// `ctx.caller()` resolves for a firing INSIDE a loop frame (non-empty
     /// frame stack), and the caller is the SAME one across iterations.
     struct LoopBodyCaller;
+    test_manifest!(LoopBodyCaller, "LoopBodyCaller");
     #[async_trait]
     impl Node for LoopBodyCaller {
-        fn node_type(&self) -> &'static str { "LoopBodyCaller" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("LoopBodyCaller") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
                 return Err(weft_core::error::WeftError::NodeExecution("no ws caller in loop body".into()));
@@ -6919,10 +7062,9 @@ mod bus_comm_tests {
     /// Entry node that emits the two-item list onto `items`, feeding LoopIn
     /// (a loop is never the entry; an upstream node supplies the `over` list).
     struct ListSource;
+    test_manifest!(ListSource, "ListSource");
     #[async_trait]
     impl Node for ListSource {
-        fn node_type(&self) -> &'static str { "ListSource" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("ListSource") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             ctx.pulse_downstream(NodeOutput::with("items", json!(["a", "b"]))).await
         }
@@ -6930,10 +7072,9 @@ mod bus_comm_tests {
 
     /// Sink collecting the loop's gathered `List[String|Null]` output.
     struct GatherSink { got: Arc<StdMutex<Option<Value>>> }
+    test_manifest!(GatherSink, "GatherSink");
     #[async_trait]
     impl Node for GatherSink {
-        fn node_type(&self) -> &'static str { "GatherSink" }
-        fn metadata(&self) -> NodeMetadata { trivial_metadata("GatherSink") }
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
             let data = ctx.input.get::<Value>("data").unwrap_or(Value::Null);
             *self.got.lock().unwrap() = Some(data);

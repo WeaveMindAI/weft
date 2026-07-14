@@ -13,24 +13,16 @@ use weft_core::infra::{
     Container, ContainerPort, Endpoint, Expose, Image, InfraSpec, Probe, Protocol, Resources, Unit,
     UnitKind,
 };
-use weft_core::node::{NodeMetadata, NodeOutput};
-use weft_core::{ExecutionContext, InfraProvisionContext, InputBag, Node, WeftResult};
+use weft_core::node::NodeOutput;
+use weft_core::{ExecutionContext, InfraProvisionContext, InputBag, Node, NodeManifest, WeftResult};
 
+#[derive(NodeManifest)]
 pub struct MiniServiceNode;
 
-const METADATA_JSON: &str = include_str!("metadata.json");
 const PORT: u16 = 8080;
 
 #[async_trait]
 impl Node for MiniServiceNode {
-    fn node_type(&self) -> &'static str {
-        "MiniService"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        serde_json::from_str(METADATA_JSON).expect("MiniService metadata.json must be valid")
-    }
-
     async fn provision(
         &self,
         _ctx: InfraProvisionContext,
@@ -83,7 +75,7 @@ impl Node for MiniServiceNode {
         // so a timeout here is a real failure, not flakiness.
         let outputs = call_with_warmup_retry(&api).await?;
         let out = NodeOutput::empty()
-            .extend_from_object(&outputs, &["endpointUrl"])
+            .extend_from_object(&outputs)
             .set("endpointUrl", Value::String(api.url().to_string()));
         ctx.pulse_downstream(out).await
     }

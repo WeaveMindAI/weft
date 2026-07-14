@@ -608,6 +608,241 @@ pub async fn project_fetch_definition(
     }))
 }
 
+// ---------- Provider access + cost provisioning ----------
+
+/// Worker opens access to a provider on the deployment's configured key. The
+/// caller's execution scope anchors the tenant; the deployment's
+/// `CredentialSource` decides whether THIS node may use its key.
+///
+/// The KEY never leaves the broker: a granted access carries a STAND-IN (see
+/// [`crate::provider_proxy`]) the worker splices in the key's place and spends
+/// through the provider proxy, which substitutes the real key on the way out.
+/// Worker memory never holds key material.
+///
+/// The node declares how long its provider work may take
+/// (`expected_duration_secs`) and the runtime does not second-guess it: a
+/// legitimately long action (a multi-day agent, a slow batch job) says so and
+/// gets a window that long. There is no ceiling here.
+pub async fn open_provider_access(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<ProviderAccessRequest>,
+) -> Resp<ProviderAccessResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "worker only".into()));
+    }
+    // The provider name arrives on the wire from the worker. It is the string
+    // the deployment's key is derived from (`<NAME>_API_KEY`), so it is held to
+    // the same charset it is validated against where it is DECLARED
+    // (`weft_core::node::is_valid_provider_name`). Without this, the derivation
+    // would run on an arbitrary caller-supplied string.
+    if !weft_core::node::is_valid_provider_name(&req.provider) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "provider name '{}' is invalid: use only lowercase letters, digits, and '_'",
+                req.provider
+            ),
+        ));
+    }
+    let tenant =
+        scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color)
+            .await?;
+    let key_req = crate::credential::KeyRequest {
+        tenant: tenant.clone(),
+        project_id: req.project_id,
+        node_id: req.node_id,
+        node_type: req.node_type,
+        provider: req.provider.clone(),
+        pod_name: caller.pod_name.clone(),
+    };
+    match state.credentials.resolve(&state.pool, &key_req).await.map_err(internal)? {
+        crate::credential::KeyResolution::Key(_key) => {
+            // The node's own registered source must declare the provider
+            // (the `provider` metadata key, on the node or inherited from
+            // its package root's partial `metadata.json`):
+            // the declaration is where the proxy gets the forwarding URL,
+            // so an access to an undeclared provider could never be spent.
+            // Refuse it here, where the node gets a clear error, instead of
+            // mid-call at the proxy. The proxy re-checks on every forwarded
+            // request; this is the same rail, consulted early.
+            let declared = crate::provider_proxy::declared_base_url(
+                &state.pool,
+                key_req.pod_name.as_deref(),
+                &key_req.node_type,
+                &key_req.provider,
+            )
+            .await
+            .map_err(internal)?;
+            if declared.is_none() {
+                return Err((
+                    StatusCode::PRECONDITION_FAILED,
+                    format!(
+                        "this node's source declares no provider '{}' (no `provider` key in \
+                         its metadata.json, own or package-level), so the deployment cannot \
+                         forward calls for it; declare the provider in the metadata or set \
+                         your own key on the node",
+                        key_req.provider
+                    ),
+                ));
+            }
+            // The stand-in lives exactly as long as the call the node declared,
+            // and is retired when the access is closed: a crash that skips the
+            // close still leaves nothing behind past the window. The node picks
+            // the window, so both steps saturate rather than wrap: an
+            // absurdly-large declaration means "effectively never expires", it
+            // must never wrap into a PAST timestamp (which would mint a
+            // born-dead stand-in and fail the node's call for no visible
+            // reason).
+            let window_secs = i64::try_from(req.expected_duration_secs).unwrap_or(i64::MAX);
+            let expires_at = chrono::Utc::now().timestamp().saturating_add(window_secs);
+            let standin =
+                crate::provider_proxy::mint_standin(&state.pool, &tenant, &key_req, expires_at)
+                    .await
+                    .map_err(internal)?;
+            Ok(Json(ProviderAccessResponse { standin }))
+        }
+        crate::credential::KeyResolution::NotConfigured => Err((
+            StatusCode::PRECONDITION_FAILED,
+            format!(
+                "this deployment has no key configured for '{}'; set your own key on the \
+                 node's key input",
+                req.provider
+            ),
+        )),
+        crate::credential::KeyResolution::Denied { reason } => {
+            Err((StatusCode::FORBIDDEN, reason))
+        }
+    }
+}
+
+/// Worker is done with a provider: retire the access's stand-in now. The
+/// stand-in's own window is only the crash backstop, so a node that finishes
+/// its provider work closes here and the access dies with it.
+///
+/// The color scope check keeps a worker from retiring another tenant's
+/// accesses; the delete is scoped to the caller's tenant, so a stand-in it
+/// does not own is simply not found (and closing is idempotent).
+pub async fn close_provider_access(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<ProviderAccessCloseRequest>,
+) -> Resp<ProviderAccessCloseResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "worker only".into()));
+    }
+    let tenant =
+        scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color)
+            .await?;
+    crate::provider_proxy::close_standin(&state.pool, &req.standin, &tenant)
+        .await
+        .map_err(internal)?;
+    Ok(Json(ProviderAccessCloseResponse {}))
+}
+
+/// Worker provisions the upper-bound cost of an imminent call on a
+/// deployment key. Money amounts are validated at the door: a NaN or a
+/// negative is rejected, so the gate only ever sees a finite, non-negative
+/// amount.
+pub async fn provision_cost(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<CostProvisionRequest>,
+) -> Resp<CostProvisionResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "worker only".into()));
+    }
+    if !req.amount_usd.is_finite() || req.amount_usd < 0.0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("provision amount_usd must be finite and >= 0, got {}", req.amount_usd),
+        ));
+    }
+    let tenant =
+        scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color)
+            .await?;
+    let spend = crate::cost_gate::SpendRequest {
+        tenant,
+        project_id: req.project_id,
+        node_id: req.node_id,
+        node_type: req.node_type,
+        provider: req.provider,
+        service: req.service,
+        model: req.model,
+        amount_usd: req.amount_usd,
+        exact: req.exact,
+        expected_duration_secs: req.expected_duration_secs,
+        metadata: req.metadata,
+    };
+    match state.cost_gate.provision(&spend).await.map_err(internal)? {
+        crate::cost_gate::SpendDecision::Approved { hold_id } => {
+            Ok(Json(CostProvisionResponse { hold_id }))
+        }
+        crate::cost_gate::SpendDecision::Denied { reason } => {
+            Err((StatusCode::PAYMENT_REQUIRED, reason))
+        }
+    }
+}
+
+/// Worker reports what a provisioned call actually cost. Settling IS the
+/// recording: a durable `RecordCost` task journals the amount against the
+/// execution on the dispatcher's timeline (idempotent via the request's
+/// dedup key), and a metered hold, when the gate took one at provision,
+/// is additionally settled down to the actual. The color scope check
+/// keeps a worker from settling another tenant's costs; the gate itself
+/// validates the hold id belongs to this tenant's hold.
+pub async fn settle_cost(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<CostSettleRequest>,
+) -> Resp<CostSettleResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "worker only".into()));
+    }
+    if !req.amount_usd.is_finite() || req.amount_usd < 0.0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("settle amount_usd must be finite and >= 0, got {}", req.amount_usd),
+        ));
+    }
+    let tenant =
+        scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color)
+            .await?;
+    let payload = serde_json::to_value(weft_task_store::RecordCostPayload {
+        color: req.color.clone(),
+        service: req.service.clone(),
+        model: req.model.clone(),
+        amount_usd: req.amount_usd,
+        metadata: req.metadata.clone(),
+    })
+    .map_err(|e| internal(anyhow::anyhow!("record_cost payload: {e}")))?;
+    // Record first: the cost trail must be complete even when the gate's
+    // settle fails (the failed settle then errors loud on top).
+    state
+        .tasks
+        .enqueue_dedup(weft_task_store::NewTask {
+            kind: TaskKind::RecordCost.into(),
+            target: TaskTarget::Dispatcher,
+            project_id: None,
+            dedup_key: Some(req.dedup_key.clone()),
+            color: Some(req.color.clone()),
+            tenant_id: Some(tenant),
+            target_pod_name: None,
+            binary_hash: None,
+            payload,
+        })
+        .await
+        .map_err(internal)?;
+    if let Some(hold_id) = &req.hold_id {
+        state
+            .cost_gate
+            .settle(hold_id, req.amount_usd, &req.metadata)
+            .await
+            .map_err(internal)?;
+    }
+    Ok(Json(CostSettleResponse {}))
+}
+
 // ---------- Supervisor surface ----------
 
 pub async fn supervisor_sync_ownership(

@@ -48,8 +48,8 @@ struct TestEntitlements {
 
 #[async_trait::async_trait]
 impl EntitlementSource for TestEntitlements {
-    fn caps(&self, _tenant: &str) -> Entitlement {
-        self.caps
+    async fn caps(&self, _tenant: &str) -> anyhow::Result<Entitlement> {
+        Ok(self.caps)
     }
     async fn account_used_bytes(
         &self,

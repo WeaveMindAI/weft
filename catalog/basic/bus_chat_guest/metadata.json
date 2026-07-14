@@ -13,6 +13,5 @@
     { "name": "done", "type": "Boolean", "required": false }
   ],
   "fields": [],
-  "entry": [],
   "requires_infra": false
 }

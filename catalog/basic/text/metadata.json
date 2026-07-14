@@ -18,6 +18,5 @@
       "required": true
     }
   ],
-  "entry": [],
   "requires_infra": false
 }

@@ -87,6 +87,54 @@ pub struct EngineClients {
     /// Production: `crate::storage::WorkerStorage`; tests inject a
     /// fake.
     pub storage: Arc<dyn crate::storage::WorkerStorageOps>,
+    /// The paid-call surface (`ctx.provider_access`, `ctx.provision_cost`,
+    /// `ctx.settle_cost`, `ctx.close_access`). Production: the broker-backed
+    /// client; tests inject a fake.
+    pub paid_calls: Arc<dyn PaidCallClient>,
+}
+
+impl EngineClients {
+    /// The production bundle: every client speaks to the same broker with the
+    /// same pod token, and the clock is the real one. The worker binary is
+    /// GENERATED, so it cannot be typechecked with the engine; keeping the
+    /// composition here means a field added or renamed on `EngineClients` is a
+    /// compile error in this crate rather than a silent break in generated
+    /// code.
+    pub fn from_broker(broker_url: &str, broker_token_path: &std::path::Path) -> Self {
+        let token =
+            weft_broker_client::TokenSource::new(broker_token_path.to_path_buf());
+        Self {
+            journal: weft_broker_client::BrokerJournalClient::new(
+                broker_url.to_string(),
+                token.clone(),
+            ),
+            tasks: weft_broker_client::BrokerTaskStoreClient::new(
+                broker_url.to_string(),
+                token.clone(),
+            ),
+            infra: weft_broker_client::BrokerInfraClient::new(
+                broker_url.to_string(),
+                token.clone(),
+            ),
+            infra_state: weft_broker_client::BrokerInfraStateClient::new(
+                broker_url.to_string(),
+                token.clone(),
+            ),
+            project: weft_broker_client::BrokerProjectClient::new(
+                broker_url.to_string(),
+                token.clone(),
+            ),
+            clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::WorkerStorage::new(
+                broker_url.to_string(),
+                broker_token_path.to_path_buf(),
+            ),
+            paid_calls: weft_broker_client::BrokerPaidCallClient::new(
+                broker_url.to_string(),
+                token,
+            ),
+        }
+    }
 }
 
 /// Trait surface over `BrokerProjectClient` so tests can inject a
@@ -175,6 +223,179 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
         command_id: i64,
     ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
         self.wait_apply(project_id, command_id).await
+    }
+}
+
+/// Trait surface over `BrokerPaidCallClient` so tests can inject a fake.
+/// The paid-call path: open access to the deployment's provider key,
+/// provision an upper-bound cost before a call on it, settle to the actual
+/// after, give the access back. Production has one impl: the broker-backed
+/// HTTP client.
+#[async_trait]
+pub trait PaidCallClient: Send + Sync {
+    async fn open_provider_access(
+        &self,
+        req: &weft_broker_client::protocol::ProviderAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessResponse>;
+
+    async fn provision(
+        &self,
+        req: &weft_broker_client::protocol::CostProvisionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::CostProvisionResponse>;
+
+    async fn settle(
+        &self,
+        req: &weft_broker_client::protocol::CostSettleRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::CostSettleResponse>;
+
+    async fn close_provider_access(
+        &self,
+        req: &weft_broker_client::protocol::ProviderAccessCloseRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessCloseResponse>;
+
+    /// The broker's proxy for a provider: where a deployment access's
+    /// requests are addressed.
+    fn provider_proxy_url(&self, provider: &str) -> String;
+}
+
+#[async_trait]
+impl PaidCallClient for weft_broker_client::client::BrokerPaidCallClient {
+    async fn open_provider_access(
+        &self,
+        req: &weft_broker_client::protocol::ProviderAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessResponse> {
+        self.open_provider_access(req).await
+    }
+
+    async fn provision(
+        &self,
+        req: &weft_broker_client::protocol::CostProvisionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::CostProvisionResponse> {
+        self.provision(req).await
+    }
+
+    async fn settle(
+        &self,
+        req: &weft_broker_client::protocol::CostSettleRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::CostSettleResponse> {
+        self.settle(req).await
+    }
+
+    async fn close_provider_access(
+        &self,
+        req: &weft_broker_client::protocol::ProviderAccessCloseRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessCloseResponse> {
+        self.close_provider_access(req).await
+    }
+
+    fn provider_proxy_url(&self, provider: &str) -> String {
+        self.provider_proxy_url(provider)
+    }
+}
+
+/// Hand-rolled fake `PaidCallClient`: configured keys in a map, sequential
+/// hold ids when metered, every provision/settle recorded in an append-only
+/// log.
+// Gated to `test` only (not `test-helpers`): the sole consumers are this
+// crate's own tests. Widen to `test-helpers` if a downstream crate ever needs
+// it, matching the other engine fakes.
+#[cfg(test)]
+pub struct FakePaidCallClient {
+    keys: std::sync::Mutex<HashMap<String, String>>,
+    metered: bool,
+    next_hold: AtomicU32,
+    /// Separate from `next_hold`: an access's stand-in and a metering hold
+    /// are different things, and sharing a counter would make the fake's ids
+    /// depend on each other.
+    next_standin: AtomicU32,
+    pub provisions: std::sync::Mutex<Vec<weft_broker_client::protocol::CostProvisionRequest>>,
+    pub settles: std::sync::Mutex<Vec<weft_broker_client::protocol::CostSettleRequest>>,
+    /// The stand-ins of the accesses the caller gave back (`ctx.close_access`).
+    pub closed_accesses: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl FakePaidCallClient {
+    fn build(metered: bool) -> Arc<Self> {
+        Arc::new(Self {
+            keys: std::sync::Mutex::new(HashMap::new()),
+            metered,
+            next_hold: AtomicU32::new(0),
+            next_standin: AtomicU32::new(0),
+            provisions: std::sync::Mutex::new(Vec::new()),
+            settles: std::sync::Mutex::new(Vec::new()),
+            closed_accesses: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Unmetered fake with no configured keys (opening an access fails loudly).
+    pub fn new() -> Arc<Self> {
+        Self::build(false)
+    }
+
+    /// Metered fake: provisions mint sequential hold ids ("hold-0", ...).
+    pub fn metered() -> Arc<Self> {
+        Self::build(true)
+    }
+
+    pub fn set_key(&self, provider: &str, key: &str) {
+        self.keys.lock().unwrap().insert(provider.to_string(), key.to_string());
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl PaidCallClient for FakePaidCallClient {
+    async fn open_provider_access(
+        &self,
+        req: &weft_broker_client::protocol::ProviderAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessResponse> {
+        // Like the broker: the KEY never leaves; a stand-in comes back.
+        match self.keys.lock().unwrap().get(&req.provider) {
+            Some(_key) => Ok(weft_broker_client::protocol::ProviderAccessResponse {
+                standin: format!(
+                    "{}{:032x}",
+                    weft_core::access::STANDIN_PREFIX,
+                    self.next_standin.fetch_add(1, Ordering::SeqCst)
+                ),
+            }),
+            None => anyhow::bail!(
+                "this deployment has no key configured for '{}'; set your own key on the \
+                 node's key input",
+                req.provider
+            ),
+        }
+    }
+
+    async fn provision(
+        &self,
+        req: &weft_broker_client::protocol::CostProvisionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::CostProvisionResponse> {
+        self.provisions.lock().unwrap().push(req.clone());
+        let hold_id = self.metered.then(|| {
+            format!("hold-{}", self.next_hold.fetch_add(1, Ordering::SeqCst))
+        });
+        Ok(weft_broker_client::protocol::CostProvisionResponse { hold_id })
+    }
+
+    async fn close_provider_access(
+        &self,
+        req: &weft_broker_client::protocol::ProviderAccessCloseRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessCloseResponse> {
+        self.closed_accesses.lock().unwrap().push(req.standin.clone());
+        Ok(weft_broker_client::protocol::ProviderAccessCloseResponse {})
+    }
+
+    async fn settle(
+        &self,
+        req: &weft_broker_client::protocol::CostSettleRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::CostSettleResponse> {
+        self.settles.lock().unwrap().push(req.clone());
+        Ok(weft_broker_client::protocol::CostSettleResponse {})
+    }
+
+    fn provider_proxy_url(&self, provider: &str) -> String {
+        weft_core::access::provider_proxy_url("https://fake-broker.test", provider)
     }
 }
 
@@ -1094,6 +1315,10 @@ pub struct RunnerHandle {
     project_id: String,
     color: Color,
     node_id: String,
+    /// The node's catalog type, sent with deployment-key / cost-provision
+    /// requests so the deployment's policy + audit trail name the exact
+    /// node kind asking.
+    node_type: String,
     node_frames: weft_core::frames::LoopFrames,
     /// Broker-backed clients: journal writes, task enqueue, and
     /// infra reads (infra endpoint lookup) all flow through here.
@@ -1127,7 +1352,7 @@ pub struct RunnerHandle {
     /// with the per-(node, frames) sequence above, it determines
     /// whether the call replays or registers fresh.
     next_call_index: AtomicU32,
-    /// 0-based ordinal of the NEXT side-effect call (`report_cost`,
+    /// 0-based ordinal of the NEXT side-effect call (`settle_cost`,
     /// `log`) within this (node, frames). Separate counter from
     /// `next_call_index` so side effects don't shift the replay
     /// alignment of `await_signal` / `run_step`. Used to form
@@ -1196,6 +1421,7 @@ impl RunnerHandle {
         project_id: String,
         color: Color,
         node_id: String,
+        node_type: String,
         node_frames: weft_core::frames::LoopFrames,
         clients: EngineClients,
         pod_name: String,
@@ -1209,6 +1435,7 @@ impl RunnerHandle {
             project_id,
             color,
             node_id,
+            node_type,
             node_frames,
             clients,
             pod_name,
@@ -1266,7 +1493,7 @@ impl RunnerHandle {
     /// event regardless of whether this worker pod survives.
     ///
     /// `dedup_prefix` is the human-readable label used in the dedup
-    /// key (`"report_cost"`, `"log"`, ...); the rest of the key
+    /// key (`"settle_cost"`, `"log"`, ...); the rest of the key
     /// keys to (color, node, frames, side-effect-index) so distinct
     /// calls in one node body produce distinct tasks while a retry
     /// of the same call (e.g. supervisor reconnect, body replay)
@@ -1281,14 +1508,7 @@ impl RunnerHandle {
         let payload_json = serde_json::to_value(&payload).map_err(|e| {
             WeftError::Config(format!("{dedup_prefix} payload: {e}"))
         })?;
-        let frames_key = frames_dedup_key(&self.node_frames)
-            .map_err(|e| WeftError::Config(format!("{dedup_prefix} frames key: {e}")))?;
-        let dedup_key = format!(
-            "{dedup_prefix}:{color}:{node}:{frames_key}:{idx}",
-            color = self.color,
-            node = self.node_id,
-            idx = self.next_side_effect_index(),
-        );
+        let dedup_key = self.side_effect_dedup_key(dedup_prefix)?;
         self.clients
             .tasks
             .enqueue_dedup(weft_task_store::NewTask {
@@ -1305,6 +1525,32 @@ impl RunnerHandle {
             .await
             .map_err(|e| WeftError::Config(format!("{dedup_prefix} enqueue: {e}")))?;
         Ok(())
+    }
+
+    /// One idempotency key per side effect: retries of the SAME effect
+    /// reuse the key (broker dedups), distinct effects of one firing get
+    /// distinct indices.
+    ///
+    /// The index counts up from 0 and RESETS to 0 when a fresh worker
+    /// re-runs this node body after a crash. So a FULL replay from the top
+    /// re-emits each side effect at the same index and lands on the same
+    /// key (dedup collapses it). This holds only while the body runs the
+    /// same sequence of side effects on a replay as on the first run. A
+    /// node that PAUSES mid-body (`await_signal` / `ctx.run`) and emits a
+    /// DIFFERENT number of side effects before vs after the pause across
+    /// runs would shift these indices and mis-key a settle (double-book or
+    /// wrongly suppress). Today's paid nodes do not interleave a pause with
+    /// `settle_cost` / `log`, so this cannot happen; keep it that way, or
+    /// key a settle on a durable per-call identity if it ever must.
+    fn side_effect_dedup_key(&self, prefix: &str) -> WeftResult<String> {
+        let frames_key = frames_dedup_key(&self.node_frames)
+            .map_err(|e| WeftError::Config(format!("{prefix} frames key: {e}")))?;
+        Ok(format!(
+            "{prefix}:{color}:{node}:{frames_key}:{idx}",
+            color = self.color,
+            node = self.node_id,
+            idx = self.next_side_effect_index(),
+        ))
     }
 
     /// Seed the per-(node, frames) await-call sequence the loop
@@ -1983,25 +2229,91 @@ impl ContextHandle for RunnerHandle {
         Ok(())
     }
 
-    async fn report_cost(&self, report: CostReport) -> WeftResult<()> {
-        let amount = report.amount_usd;
-        if !(amount.is_finite() && amount >= 0.0) {
-            return Err(WeftError::Config(format!(
-                "report_cost amount_usd must be finite and non-negative; got {amount}"
-            )));
-        }
-        self.enqueue_side_effect_task(
-            "report_cost",
-            weft_task_store::TaskKind::RecordCost,
-            weft_task_store::RecordCostPayload {
-                color: self.color.to_string(),
-                service: report.service,
-                model: report.model,
-                amount_usd: amount,
-                metadata: report.metadata,
-            },
-        )
-        .await
+    async fn open_provider_access(
+        &self,
+        provider: &str,
+        window: std::time::Duration,
+    ) -> WeftResult<(String, String)> {
+        let req = weft_broker_client::protocol::ProviderAccessRequest {
+            expected_duration_secs: window.as_secs(),
+            color: self.color.to_string(),
+            project_id: self.project_id.clone(),
+            node_id: self.node_id.clone(),
+            node_type: self.node_type.clone(),
+            provider: provider.to_string(),
+        };
+        let resp =
+            self.clients.paid_calls.open_provider_access(&req).await.map_err(|e| {
+                WeftError::NodeExecution(format!("open access to '{provider}': {e:#}"))
+            })?;
+        Ok((resp.standin, self.clients.paid_calls.provider_proxy_url(provider)))
+    }
+
+    async fn close_provider_access(&self, standin: &str) -> WeftResult<()> {
+        let req = weft_broker_client::protocol::ProviderAccessCloseRequest {
+            color: self.color.to_string(),
+            standin: standin.to_string(),
+        };
+        self.clients
+            .paid_calls
+            .close_provider_access(&req)
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("close provider access: {e:#}")))?;
+        Ok(())
+    }
+
+    async fn provision_cost(
+        &self,
+        provider: &str,
+        provision: &weft_core::access::CostProvision,
+        window: std::time::Duration,
+        estimate: &CostReport,
+    ) -> WeftResult<Option<String>> {
+        // The amount is validated at the one door, `ExecutionContext::
+        // provision_cost` (weft-core), which is the only caller of this method
+        // and also covers the user's-own-key path that never gets here. The
+        // broker re-validates at its HTTP door, which is a real trust boundary.
+        let amount = estimate.amount_usd;
+        let req = weft_broker_client::protocol::CostProvisionRequest {
+            color: self.color.to_string(),
+            project_id: self.project_id.clone(),
+            node_id: self.node_id.clone(),
+            node_type: self.node_type.clone(),
+            provider: provider.to_string(),
+            service: estimate.service.clone(),
+            model: estimate.model.clone(),
+            amount_usd: amount,
+            exact: provision.exact,
+            expected_duration_secs: window.as_secs(),
+            metadata: estimate.metadata.clone(),
+        };
+        let resp = self
+            .clients
+            .paid_calls
+            .provision(&req)
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("provision cost: {e:#}")))?;
+        Ok(resp.hold_id)
+    }
+
+    async fn settle_cost(&self, hold_id: Option<&str>, actual: &CostReport) -> WeftResult<()> {
+        // Validated at the one door (see `provision_cost` above).
+        let amount = actual.amount_usd;
+        let req = weft_broker_client::protocol::CostSettleRequest {
+            color: self.color.to_string(),
+            hold_id: hold_id.map(str::to_string),
+            service: actual.service.clone(),
+            model: actual.model.clone(),
+            amount_usd: amount,
+            metadata: actual.metadata.clone(),
+            dedup_key: self.side_effect_dedup_key("settle_cost")?,
+        };
+        self.clients
+            .paid_calls
+            .settle(&req)
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("settle cost: {e:#}")))?;
+        Ok(())
     }
 
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()> {
@@ -2290,12 +2602,14 @@ mod replay_tests {
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
+            paid_calls: FakePaidCallClient::new(),
         };
         RunnerHandle::new(
             "exec-1".into(),
             "00000000-0000-0000-0000-000000000000".into(),
             uuid::Uuid::nil(),
             "node-x".into(),
+            "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
             "pod-1".into(),
@@ -2305,6 +2619,192 @@ mod replay_tests {
             HashMap::new(),
         )
         .with_awaited_sequence(seq)
+    }
+
+    /// Same rig as `handle_with_sequence` but with a caller-supplied
+    /// `PaidCallClient` fake, for the access/provision/settle tests.
+    fn handle_with_paid_calls(paid_calls: Arc<FakePaidCallClient>) -> RunnerHandle {
+        let clients = EngineClients {
+            journal: Arc::new(NoopJournal),
+            tasks: Arc::new(NoopTaskStore),
+            infra: Arc::new(NoopInfra),
+            infra_state: Arc::new(NoopInfraState),
+            project: Arc::new(NoopProject),
+            clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
+            paid_calls,
+        };
+        RunnerHandle::new(
+            "exec-1".into(),
+            "00000000-0000-0000-0000-000000000000".into(),
+            uuid::Uuid::nil(),
+            "node-x".into(),
+            "TestNode".into(),
+            weft_core::frames::LoopFrames::default(),
+            clients,
+            "pod-1".into(),
+            "tenant-1".into(),
+            std::sync::Arc::new(CancellationFlag::new()),
+            BusCoordinator::new(),
+            HashMap::new(),
+        )
+    }
+
+    fn ctx_over(handle: RunnerHandle) -> weft_core::ExecutionContext {
+        weft_core::ExecutionContext::new(
+            "exec-1".into(),
+            "00000000-0000-0000-0000-000000000000".into(),
+            "node-x".into(),
+            "TestNode".into(),
+            None,
+            uuid::Uuid::nil(),
+            weft_core::frames::LoopFrames::default(),
+            weft_core::context::ConfigBag::default(),
+            weft_core::context::InputBag::default(),
+            weft_core::context::Phase::Fire,
+            Arc::new(handle),
+        )
+    }
+
+    /// How long the paid call may run: the access's window (and so the key
+    /// stand-in's life, and the provision's deadline).
+    const CALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    // Layer 3: the provider_access / provision / report ordering over the fake
+    // paid-call client: origin classification, no-op on the user's own key,
+    // hold + settle on the deployment's.
+    #[tokio::test]
+    async fn a_users_own_key_short_circuits_provision_and_settle() {
+        let fake = FakePaidCallClient::metered();
+        let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
+
+        let access = ctx.provider_access("openrouter", Some("sk-own".into())).await.unwrap();
+        assert_eq!(access.origin(), weft_core::AccessOrigin::UserProvided);
+        assert_eq!(access.credential(), "sk-own");
+
+        let hold = ctx
+            .provision_cost(&access, weft_core::CostProvision::estimate(1.0).with_model("m"))
+            .await
+            .unwrap();
+        assert!(hold.hold_id().is_none(), "a user's own key takes no hold");
+        ctx.settle_cost(hold, 0.4, serde_json::json!({})).await.unwrap();
+
+        assert!(fake.provisions.lock().unwrap().is_empty(), "no provision round-trip");
+        // Settling IS the recording, so it happens on the user's own key too:
+        // the actual cost lands on the execution's trail, with no hold to
+        // release.
+        let settles = fake.settles.lock().unwrap();
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0].hold_id, None, "a user's own key has no hold to release");
+        assert_eq!(settles[0].amount_usd, 0.4);
+    }
+
+    #[tokio::test]
+    async fn deployment_access_provisions_and_settles_the_hold() {
+        let fake = FakePaidCallClient::metered();
+        fake.set_key("openrouter", "sk-deployment");
+        let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
+
+        // Empty and sentinel both open access on the deployment's key.
+        let access = ctx
+            .provider_access_within(
+                "openrouter",
+                Some(weft_core::PLATFORM_KEY_SENTINEL.into()),
+                CALL_WINDOW,
+            )
+            .await
+            .unwrap();
+        assert_eq!(access.origin(), weft_core::AccessOrigin::Deployment);
+        // The deployment's KEY never enters the worker: what the access
+        // carries is a stand-in, spendable only at the broker's proxy.
+        assert!(
+            access.credential().starts_with(weft_core::access::STANDIN_PREFIX),
+            "got {:?}",
+            access.credential()
+        );
+        assert_ne!(access.credential(), "sk-deployment");
+        assert_eq!(
+            access.base_url("https://openrouter.ai/api/v1"),
+            "https://fake-broker.test/v1/provider/openrouter",
+            "a deployment access's requests go to the proxy, never the provider"
+        );
+
+        let standin = access.credential().to_string();
+        let hold = ctx
+            .provision_cost(&access, weft_core::CostProvision::estimate(1.0).with_model("m"))
+            .await
+            .unwrap();
+        assert_eq!(hold.hold_id(), Some("hold-0"));
+        ctx.settle_cost(hold, 0.25, serde_json::json!({})).await.unwrap();
+
+        let provisions = fake.provisions.lock().unwrap();
+        assert_eq!(provisions.len(), 1);
+        assert_eq!(provisions[0].amount_usd, 1.0);
+        assert_eq!(provisions[0].node_type, "TestNode");
+        assert_eq!(
+            provisions[0].expected_duration_secs,
+            CALL_WINDOW.as_secs(),
+            "the provision's deadline is the access's window: one declaration"
+        );
+        let settles = fake.settles.lock().unwrap();
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0].hold_id.as_deref(), Some("hold-0"));
+        assert_eq!(settles[0].service, "openrouter");
+        assert_eq!(settles[0].amount_usd, 0.25);
+        // Settling is per CALL and leaves the access usable (a node may make
+        // several calls on one access). Closing the ACCESS is what retires
+        // the stand-in, so it dies with the work that needed it.
+        assert!(
+            fake.closed_accesses.lock().unwrap().is_empty(),
+            "settling one call must not give the access back"
+        );
+        drop(settles);
+        drop(provisions);
+        ctx.close_access(access).await.unwrap();
+        assert_eq!(
+            *fake.closed_accesses.lock().unwrap(),
+            vec![standin],
+            "closing the access retires exactly its stand-in"
+        );
+    }
+
+    /// The window is optional: a node that says nothing gets the default,
+    /// and that default is what bounds the access AND the provision.
+    #[tokio::test]
+    async fn the_default_window_is_used_when_a_node_declares_none() {
+        let fake = FakePaidCallClient::metered();
+        fake.set_key("openrouter", "sk-deployment");
+        let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
+
+        let access = ctx.provider_access("openrouter", None).await.unwrap();
+        let hold =
+            ctx.provision_cost(&access, weft_core::CostProvision::estimate(1.0)).await.unwrap();
+        ctx.settle_cost(hold, 0.5, serde_json::json!({})).await.unwrap();
+
+        assert_eq!(
+            fake.provisions.lock().unwrap()[0].expected_duration_secs,
+            weft_core::context::DEFAULT_PROVIDER_WINDOW.as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_access_on_a_users_own_key_is_a_no_op() {
+        let fake = FakePaidCallClient::metered();
+        let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
+        let access = ctx.provider_access("openrouter", Some("sk-own".into())).await.unwrap();
+        ctx.close_access(access).await.unwrap();
+        assert!(
+            fake.closed_accesses.lock().unwrap().is_empty(),
+            "access on the user's own key has nothing of the deployment's to give back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_the_deployment_has_no_key_for_errors_loud() {
+        let fake = FakePaidCallClient::new();
+        let ctx = ctx_over(handle_with_paid_calls(fake));
+        let err = ctx.provider_access("elevenlabs", None).await.unwrap_err();
+        assert!(err.to_string().contains("set your own key"), "{err}");
     }
 
     // Layer 3: the ContextHandle storage methods over the fake

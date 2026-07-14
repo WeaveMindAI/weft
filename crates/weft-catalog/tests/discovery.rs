@@ -257,46 +257,99 @@ fn symlinked_marker_does_not_define_a_unit() {
     );
 }
 
-/// Write a `form_field_specs.json` with a single spec whose `field_type`
-/// is `tag` (so a test can tell WHICH file was resolved).
-fn write_specs(dir: &Path, tag: &str) {
-    fs::create_dir_all(dir).unwrap();
-    fs::write(
-        dir.join("form_field_specs.json"),
-        format!(r#"[{{ "field_type": "{tag}", "label": "{tag}", "render": {{}} }}]"#),
-    )
-    .unwrap();
+/// A `formFieldSpecs` metadata value with a single spec whose `field_type`
+/// is `tag` (so a test can tell WHICH definition site won the merge).
+fn specs_json(tag: &str) -> String {
+    format!(r#"[{{ "field_type": "{tag}", "label": "{tag}", "render": {{}} }}]"#)
 }
 
-/// `form_field_specs.json` resolution: MOST-SPECIFIC wins. A package member
-/// inherits the package-ROOT file its siblings share, unless it drops its own
-/// file in its member dir (which overrides). A bare node reads the file beside
-/// its own metadata.json.
+/// Package-level metadata defaults: a PARTIAL `metadata.json` at the package
+/// root is merged into every member key-by-key, the member's own key winning
+/// wholesale. Exercised on the two shared keys that exist today
+/// (`formFieldSpecs`, `provider`); the mechanism is key-agnostic.
 #[test]
-fn form_field_specs_resolve_most_specific_first() {
+fn package_metadata_defaults_merge_key_by_key_member_wins() {
     let tmp = tempfile::tempdir().unwrap();
     let nodes = tmp.path().join("nodes");
 
-    // Package with a root spec file and two members: one plain (inherits root),
-    // one that ships its own local spec (overrides).
+    // Package with root defaults and two members: one plain (inherits both
+    // keys), one that carries its own `formFieldSpecs` (overrides that key,
+    // still inherits `provider`).
     let pkg = nodes.join("pack");
     write_package_toml(&pkg, "pack");
-    write_specs(&pkg, "root_spec");
+    fs::write(
+        pkg.join("metadata.json"),
+        format!(
+            r#"{{ "formFieldSpecs": {},
+                  "provider": {{ "name": "svc", "base_url": "https://svc.example" }} }}"#,
+            specs_json("root_spec")
+        ),
+    )
+    .unwrap();
     write_node(&pkg.join("inherits"), "Inherits");
-    write_node(&pkg.join("overrides"), "Overrides");
-    write_specs(&pkg.join("overrides"), "member_spec");
+    let overrides = pkg.join("overrides");
+    fs::create_dir_all(&overrides).unwrap();
+    fs::write(overrides.join("mod.rs"), "// impl\n").unwrap();
+    fs::write(
+        overrides.join("metadata.json"),
+        format!(
+            r#"{{ "type": "Overrides", "label": "o", "description": "", "category": "Test",
+                  "formFieldSpecs": {} }}"#,
+            specs_json("member_spec")
+        ),
+    )
+    .unwrap();
 
-    // A bare node with its own spec beside its metadata.json.
+    // A bare node with its own key beside nothing: no defaults in play.
     let bare = nodes.join("bare");
-    write_node(&bare, "Bare");
-    write_specs(&bare, "bare_spec");
+    fs::create_dir_all(&bare).unwrap();
+    fs::write(bare.join("mod.rs"), "// impl\n").unwrap();
+    fs::write(
+        bare.join("metadata.json"),
+        format!(
+            r#"{{ "type": "Bare", "label": "b", "description": "", "category": "Test",
+                  "formFieldSpecs": {} }}"#,
+            specs_json("bare_spec")
+        ),
+    )
+    .unwrap();
 
     let cat = FsCatalog::discover(&nodes).unwrap();
 
     let field_type = |t: &str| {
-        cat.entry(t).unwrap().form_field_specs.first().map(|s| s.field_type.clone())
+        cat.entry(t).unwrap().metadata.form_field_specs.first().map(|s| s.field_type.clone())
     };
-    assert_eq!(field_type("Inherits"), Some("root_spec".into()), "member inherits package-root specs");
-    assert_eq!(field_type("Overrides"), Some("member_spec".into()), "member-local specs override the root");
-    assert_eq!(field_type("Bare"), Some("bare_spec".into()), "bare node reads its own specs");
+    assert_eq!(field_type("Inherits"), Some("root_spec".into()), "member inherits package defaults");
+    assert_eq!(field_type("Overrides"), Some("member_spec".into()), "member's own key wins wholesale");
+    assert_eq!(field_type("Bare"), Some("bare_spec".into()), "bare node reads its own metadata");
+
+    let provider = |t: &str| cat.provider_of(t).map(|d| d.name.clone());
+    assert_eq!(provider("Inherits"), Some("svc".into()), "provider inherits from package defaults");
+    assert_eq!(
+        provider("Overrides"),
+        Some("svc".into()),
+        "overriding one key must not drop the others"
+    );
+    assert_eq!(provider("Bare"), None, "a bare node with no declaration declares nothing");
+}
+
+/// A package-level `metadata.json` that sets an IDENTITY key (`type`,
+/// `label`, or `description`, the things that name one node) is a
+/// contradiction, never a shared default, and must fail discovery loudly
+/// under Strict, never be merged. The refusal lives in
+/// `weft_core::node::merge_package_defaults`, so the catalog and the
+/// `#[derive(NodeManifest)]` runtime path enforce the identical rule.
+#[test]
+fn package_metadata_defaults_refuse_identity_keys() {
+    for key in ["type", "label", "description"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let nodes = tmp.path().join("nodes");
+        let pkg = nodes.join("pack");
+        write_package_toml(&pkg, "pack");
+        fs::write(pkg.join("metadata.json"), format!(r#"{{ "{key}": "shared" }}"#)).unwrap();
+        write_node(&pkg.join("member"), "Member");
+
+        let err = FsCatalog::discover(&nodes).unwrap_err().to_string();
+        assert!(err.contains(key), "the error names the offending key `{key}`: {err}");
+    }
 }
