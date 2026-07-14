@@ -5,6 +5,40 @@ for Weft. Start with the existing nodes in `catalog/` for working
 examples; this document explains the cross-cutting concerns that aren't
 obvious from any single node.
 
+## A node does ONE thing; Weft does the coordination
+
+A node is a single, sharply-scoped capability: call this API, transcribe
+this audio, write this row, render this PDF. It takes its inputs, does
+that one thing, and pulses its result downstream. It does not orchestrate.
+
+**Control flow is the graph's job, not the node's.** Looping, retrying,
+branching, fanning out, gathering results, waiting for a human between two
+steps: Weft expresses all of it declaratively with `Loop(...)`, edges, and
+the wait primitives, and the engine gives you per-iteration journaling,
+resumability, and cancellation for free. A node that reimplements that
+control flow inside its own Rust body throws all of it away and takes on
+correctness burdens (replay, idempotency, cancellation) that the engine
+would otherwise have carried for it.
+
+Concretely, when you feel the urge to write:
+
+- a `for` / `loop` / `while` that drives a multi-step process, reach for a
+  weft `Loop(...)` in the graph and let each iteration fire your node once;
+- a retry-with-backoff around a call, express the retry in the graph;
+- "call A, then depending on the result call B or C", wire A's outputs to
+  B and C and let the null-propagation rule pick the branch;
+- "do some work, then wait for a human, then do more work", split it into
+  a work node, a human node, and a second work node.
+
+The reward is not stylistic. A node that does one thing and returns is
+trivially cancellable, trivially replayable, needs no `ctx.run`, cannot
+double-charge anyone, and composes into graphs its author never imagined.
+A node that owns a loop with a wait inside it is a small workflow engine
+hiding inside a node, and it has to solve, by hand, every problem Weft
+already solved. The closing section of this guide documents how to survive
+that shape when a genuine constraint forces it. Treat needing it as a
+signal that the work belongs in the graph.
+
 ## Writing a basic node
 
 A node is a directory under the project's `nodes/` root:
@@ -628,8 +662,11 @@ URLs that need to be stable across replays, expensive computation,
 external side effects: all live behind `ctx.run`.
 
 The author-supplied `name` is for traceability in the journal. The
-runtime keys on call-site ORDER, not on the name; you can change a
-name freely as long as the call sequence stays the same.
+runtime keys on call-site ORDER, not on the name: two `ctx.run` calls
+may share the same name (a `ctx.run("charge", ..)` inside a loop reuses
+that name every iteration and is fine), and you may rename any call
+freely, as long as the sequence of `ctx.run` / `ctx.await_signal` calls
+stays the same across replays.
 
 ### Deterministic-replay rule
 
@@ -1218,3 +1255,17 @@ it; within your own namespace you can do what you want.
   or background work, model it as another node and exchange with it over
   the bus, rather than spawning a task yourself. This is a convention, not
   enforced.
+
+## Last warning: a loop with a wait inside a node
+
+Don't. A `loop` in your `execute` that contains an `await_signal` means
+the node is orchestrating, which is the graph's job. Use weft's `Loop(...)`
+and let each iteration fire a single-responsibility node.
+
+If you do it anyway: a resume re-runs the WHOLE body from the top, so the
+loop restarts at iteration zero. Past `await_signal` and `ctx.run` calls
+replay instantly from the journal, but every other call runs for real
+again, once per replay. An un-wrapped paid API call or payment inside that
+loop is charged again on every human response. Wrap every side-effecting
+or non-deterministic call in `ctx.run` (the same name each iteration is
+fine, the runtime keys on call order, not name).
