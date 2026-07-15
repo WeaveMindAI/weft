@@ -230,7 +230,6 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
         "binaryHash": plan.binary_hash,
         "definitionHash": plan.definition_hash,
         "infraHash": plan.infra_hash,
-        "providerDecls": plan.provider_decls,
     });
     let register_resp: serde_json::Value = client
         .post_json("/projects/register", &register_body)

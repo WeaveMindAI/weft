@@ -455,6 +455,18 @@ export interface NodeExecution {
 	closedPorts?: string[];
 	output?: unknown;
 	costUsd: number;
+	/// At least one of this firing's cost records could not be resolved
+	/// to a figure (amount null). Rendered as an explicit "unknown" so an
+	/// unresolved cost is never mistaken for a free call.
+	costUnknown?: boolean;
+	/// Whose key this firing's cost records spent; 'mixed' when records
+	/// disagree (e.g. a group row aggregating both kinds of member).
+	costOrigin?: 'user-provided' | 'deployment' | 'mixed';
+	/// Identities of the cost records already folded into `costUsd` /
+	/// `costUnknown`. The dispatcher re-streams journal events on every
+	/// follow/reconnect (replay + live overlap), so the reducer dedups on
+	/// these.
+	costIds?: string[];
 	logs: unknown[];
 	color: string;
 	frames: LoopIteration[];

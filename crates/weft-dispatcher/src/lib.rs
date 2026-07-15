@@ -35,7 +35,6 @@ pub mod pg_wake;
 pub mod placement;
 pub mod project_namespace;
 pub mod project_store;
-pub mod provider_decl;
 pub mod reaper;
 pub mod registry;
 pub mod shared_worker_namespace;

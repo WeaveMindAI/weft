@@ -1,12 +1,16 @@
-//! The deployment-key seam: how the broker resolves ITS configured provider
-//! keys for nodes that asked the deployment to supply one (the node's key
-//! input was empty or the managed sentinel; a user-supplied key never
-//! reaches here).
+//! The deployment-key seam: how the broker answers a node that asked the
+//! deployment to supply its configured provider key (the node's key input
+//! was empty or the managed sentinel; a user-supplied key never reaches
+//! here).
 //!
-//! The default source reads the broker host's environment
-//! (`<PROVIDER>_API_KEY`), which is exactly what a self-hosted deployment
-//! means by "my configured key". A deployment with per-node policy (which
-//! node may use which key) supplies its own source.
+//! A source answers with an ACCESS: what to authenticate with, and where
+//! calls on it go (`None` = the provider's own API). The default source
+//! reads the broker host's environment (`<PROVIDER>_API_KEY`) and hands the
+//! key itself: self-hosting means the deployment's key is the operator's
+//! own, and the worker is the operator's own process, so there is nothing
+//! to hide it from. A source that hands out time-bounded credentials
+//! instead retires them in [`CredentialSource::close`] when the runtime
+//! gives the access back.
 
 use anyhow::Result;
 
@@ -16,37 +20,58 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct KeyRequest {
     pub tenant: String,
+    /// The opening execution, verified against the tenant by the handler.
+    pub color: String,
     pub project_id: String,
     pub node_id: String,
+    /// The opening firing's loop-frame coordinate: a source that books
+    /// anything against the granted access later (a measured cost) uses it
+    /// to attribute the figure to the exact firing.
+    pub frames: weft_core::LoopFrames,
     pub node_type: String,
     pub provider: String,
     /// The calling pod, taken from the caller's verified token (not from the
     /// request body). A policy that resolves the running binary uses this;
     /// `None` means the token was not pod-bound.
     pub pod_name: Option<String>,
+    /// How long the caller declared its provider work may take. A source
+    /// that hands out time-bounded credentials bounds them by this (the
+    /// crash backstop; the runtime normally closes the access first).
+    pub window: std::time::Duration,
 }
 
 /// The source's answer.
 #[derive(Debug)]
 pub enum KeyResolution {
-    /// The deployment's key for this provider, cleared for this node.
-    Key(String),
+    /// Access granted: authenticate with `credential`; send calls to
+    /// `relay_url` when set (`None` = the provider's own API).
+    Access {
+        credential: String,
+        relay_url: Option<String>,
+    },
     /// The deployment has no key configured for this provider. The caller
     /// turns this into "set your own key for `provider`".
     NotConfigured,
-    /// The deployment has a key but refuses THIS node's use of it, with a
-    /// user-facing reason (policy; e.g. the node is not cleared to handle
-    /// the deployment's key).
+    /// The deployment has a key but refuses THIS request, with a
+    /// user-facing reason (policy).
     Denied { reason: String },
 }
 
-/// Resolves the deployment's provider keys. One method; policy lives in the
-/// impl. `pool` is the broker's Postgres, passed in (same shape as
-/// `EntitlementSource`) so a policy can consult runtime state (e.g. which
-/// binary the calling pod runs) without holding a second pool.
+/// Resolves the deployment's provider keys. Policy lives in the impl.
+/// `pool` is the broker's Postgres, passed in (same shape as
+/// `EntitlementSource`) so a policy can consult runtime state without
+/// holding a second pool.
 #[async_trait::async_trait]
 pub trait CredentialSource: Send + Sync {
     async fn resolve(&self, pool: &sqlx::PgPool, req: &KeyRequest) -> Result<KeyResolution>;
+
+    /// The runtime gives a granted access back (the node that opened it
+    /// finished): a source that hands out time-bounded credentials retires
+    /// this one now instead of letting it live to its window. The default
+    /// hands out the key itself, which is not retirable: nothing to do.
+    async fn close(&self, _pool: &sqlx::PgPool, _credential: &str, _tenant: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The env name a provider's key is read from: `<PROVIDER>_API_KEY`,
@@ -65,14 +90,16 @@ pub fn provider_env_var(provider: &str) -> String {
 /// Default source: the broker host's environment. Self-hosting means the
 /// deployment's keys are the host's env; every node of every tenant on this
 /// deployment may use them (single-operator deployments have no policy to
-/// enforce).
+/// enforce), and calls go straight to the provider.
 pub struct EnvCredentialSource;
 
 #[async_trait::async_trait]
 impl CredentialSource for EnvCredentialSource {
     async fn resolve(&self, _pool: &sqlx::PgPool, req: &KeyRequest) -> Result<KeyResolution> {
         match std::env::var(provider_env_var(&req.provider)) {
-            Ok(key) if !key.is_empty() => Ok(KeyResolution::Key(key)),
+            Ok(key) if !key.is_empty() => {
+                Ok(KeyResolution::Access { credential: key, relay_url: None })
+            }
             _ => Ok(KeyResolution::NotConfigured),
         }
     }

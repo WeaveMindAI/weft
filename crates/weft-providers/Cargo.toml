@@ -1,0 +1,26 @@
+[package]
+name = "weft-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Self-registration of provider meters: each provider file submits its meter
+# into a link-time-collected registry, so adding a provider needs no edit to
+# any central list (same pattern weft-core uses for signal kinds).
+inventory = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+# The OpenRouter meter's billing ceiling: the request body is the JSON
+# minillmlib serialized, so its conversation deserializes straight back and
+# the lib's own deliberately-high estimator prices it (`estimate` feature).
+minillmlib = { version = "0.5.7", features = ["estimate"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

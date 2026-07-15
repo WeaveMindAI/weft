@@ -30,7 +30,7 @@ pub fn derive_node_manifest(input: TokenStream) -> TokenStream {
 
     // Embed the package root's partial defaults too, when this node is a
     // package member, so `manifest()` is the SAME merged document the catalog
-    // builds (provider, formFieldSpecs, ... declared once at the package root
+    // builds (formFieldSpecs, ... declared once at the package root
     // reach the runtime metadata). A bare node has no package root, so the
     // derive embeds `None` and there is nothing to merge.
     let defaults_expr = match package_defaults_path {

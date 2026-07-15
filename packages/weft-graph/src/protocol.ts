@@ -60,10 +60,6 @@ export interface NodeFeaturesWire {
   hasFormSchema?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
-  // SYNC: interruptGrace <-> crates/weft-core/src/node.rs NodeFeatures.interrupt_grace
-  // On cancellation, give the node a short grace window to observe the
-  // cancellation flag and wrap up before its future is aborted.
-  interruptGrace?: boolean;
   // SYNC: showImagePreview <-> crates/weft-core/src/node.rs NodeFeatures.show_image_preview
   showImagePreview?: boolean;
   // SYNC: showDownloadLink <-> crates/weft-core/src/node.rs NodeFeatures.show_download_link
@@ -239,12 +235,6 @@ export interface CatalogEntry {
    *  inherited by every member, so the form_builder editor can drive
    *  the field-type dropdown without a separate fetch. */
   formFieldSpecs?: FormFieldSpecWire[];
-  /** The paid service this node calls on a deployment-granted access.
-   *  Present only on nodes that declare one (a metadata key, inherited
-   *  from the package root). `deny_unknown_fields` Rust-side, so the
-   *  wire shape is exactly `{ name, base_url }`. */
-  // SYNC: provider <-> crates/weft-core/src/node.rs NodeMetadata.provider (ProviderDecl)
-  provider?: { name: string; base_url: string };
 }
 
 /** Render hint for one form field. Opaque to the host; the
@@ -314,6 +304,11 @@ export type NodeExecutionStatus =
 export interface LoopIteration {
   index: number;
 }
+
+/// Whose key a metered call spent (the wire values of the runtime's
+/// access-origin tag).
+// SYNC: CostOrigin <-> crates/weft-core/src/access.rs AccessOrigin
+export type CostOrigin = 'user-provided' | 'deployment';
 
 export interface NodeExecEvent {
   nodeId: string;
@@ -877,6 +872,13 @@ export type HostMessage =
   /// changing its state (the node did not fail). Kept separate from
   /// `execEvent`, which is purely a state transition.
   | { kind: 'execPortWarning'; nodeId: string; frames: LoopIteration[]; port: string; expected: string; actual: string }
+  /// One metered call's cost record for a firing (a provider meter's
+  /// figure). `costId` is the record's stable identity: the same record can
+  /// arrive via both the replay and the live stream, so the reducer dedups
+  /// on it. `amountUsd` null = the meter could not resolve the figure (an
+  /// honest unknown; nothing is added to the row's total). `origin` says
+  /// whose key the call spent.
+  | { kind: 'execCost'; nodeId: string; frames: LoopIteration[]; costId: string; amountUsd: number | null; origin: CostOrigin }
   /// One bus event (live or replay). Carries only what the bus layer
   /// recorded: join / left / message / closed keyed by `busId`.
   /// Routing to node inspector panels is a SEPARATE signal,

@@ -4,19 +4,16 @@
 //! node) overlaid on this node's own config. With `parseJson`, the response is
 //! JSON-repaired and its top-level keys fan onto matching declared output ports.
 //!
-//! The call streams internally and watches the cancellation flag
-//! (`interruptGrace`): on a Stop mid-generation the stream is cancelled and the
-//! call's ACTUAL cost still gets settled (resolved from OpenRouter's ledger;
-//! the upstream generation bills in full whether we hang up or not).
+//! The paid-call surface is two steps: open the access, make the call on the
+//! metered client. The runtime routes the call and measures what it really
+//! cost (the call streams internally, and a Stop mid-generation still gets
+//! its actual cost resolved); this node holds no cost bookkeeping at all.
 
 use async_trait::async_trait;
 use minillmlib::{
-    estimate_cost_usd, AsyncCostCallback, ChatNode, CollectOutcome, CompletionContext,
-    CompletionMeta, CompletionParameters, CostInfo, GeneratorInfo, NodeCompletionParameters,
-    ProviderSettings, ReasoningConfig,
+    ChatNode, CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings,
+    ReasoningConfig,
 };
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -27,18 +24,6 @@ use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct OpenRouterInferenceNode;
-
-/// The process-shared `GeneratorInfo` for a model. Shared because minillmlib
-/// caches the model's published rates on the generator (clones share the
-/// cache), so the price sheet is fetched once per TTL rather than once per
-/// execution. Keyless: the calling generator, which carries the user's key,
-/// is built per call instead.
-fn shared_generator(model: &str) -> GeneratorInfo {
-    static POOL: OnceLock<Mutex<HashMap<String, GeneratorInfo>>> = OnceLock::new();
-    let fresh = GeneratorInfo::openrouter(model);
-    let mut pool = POOL.get_or_init(Mutex::default).lock().expect("generator pool lock");
-    pool.entry(fresh.pricing_key()).or_insert(fresh).clone()
-}
 
 /// The completion parameters, deserialized straight from the config (the lib
 /// takes the flat camelCase fields directly). Only `reasoning` is this node's
@@ -81,10 +66,6 @@ impl Node for OpenRouterInferenceNode {
         let parse_json = cfg.get_optional::<bool>("parseJson")?.unwrap_or(false);
 
         let mut cp = completion_params(&cfg)?;
-
-        // Routing decides who serves the call, therefore what it costs. The
-        // SAME settings drive the request and the estimate, so they can't
-        // disagree; only one ordered provider with fallbacks off pins a price.
         let mut routing = ProviderSettings::new();
         if let Some(provider) = cfg.get_optional::<String>("provider")? {
             routing = routing.with_order(vec![provider]);
@@ -92,132 +73,37 @@ impl Node for OpenRouterInferenceNode {
         if let Some(fallbacks) = cfg.get_optional::<bool>("providerFallbacks")? {
             routing = routing.with_fallbacks(fallbacks);
         }
-        let billing_provider = routing.billing_provider();
         if routing.order.is_some() || routing.allow_fallbacks.is_some() {
             cp = cp.with_openrouter_routing(routing);
         }
 
+        // The whole paid-call surface: open the access, build the generator
+        // over the metered client. The runtime routes the call and measures
+        // its real cost behind the client.
+        let access = ctx.provider_access("openrouter", cfg.get_optional("apiKey")?).await?;
+        let generator = GeneratorInfo::openrouter(model)
+            .with_api_key(access.credential())
+            .with_app_attribution("https://weavemind.ai", "Weft")
+            .with_http_client(ctx.metered_client(&access)?);
+
         let root = ChatNode::root(system_prompt);
         let user = root.add_user(prompt);
-
-        // Price the call BEFORE opening access: the price sheet is keyed on the
-        // model, not the access (`shared_generator` is keyless), so if pricing
-        // fails there is no open access to clean up (there is none yet).
-        let rates = shared_generator(&model)
-            .model_rates_served_by(billing_provider.as_deref())
-            .await
-            .map_err(|e| {
-                WeftError::NodeExecution(format!("openrouter: cannot price model {model}: {e}"))
-            })?;
-        let estimate = estimate_cost_usd(&user.thread(), &cp, &rates);
-
-        // A generation (with its cost resolution) fits the default window, so
-        // it needs no declaration of its own.
-        let access = ctx.provider_access("openrouter", cfg.get_optional("apiKey")?).await?;
-        let generator = GeneratorInfo::openrouter(model.clone());
-        let base_url = access.base_url(&generator.base_url);
-        let generator =
-            generator.with_base_url(base_url).with_api_key(access.credential().to_string());
-
-        // Provision the estimated upper bound before spending anything:
-        // refusable on the deployment's key, a no-op on the user's own. A
-        // refusal comes back with the access still open and nothing spent, so
-        // give it back before returning.
-        let hold = match ctx
-            .provision_cost(
-                &access,
-                weft_core::CostProvision::estimate(estimate).with_model(model.clone()),
-            )
-            .await
-        {
-            Ok(hold) => hold,
-            Err(e) => {
-                // Nothing was spent, so give the access back. The provisioning
-                // error is what the user must see, so it stays the primary; a
-                // close that ALSO fails is folded into the message rather than
-                // discarded, so a broken close is never invisible.
-                return Err(match ctx.close_access(access).await {
-                    Ok(()) => e,
-                    Err(close) => WeftError::NodeExecution(format!(
-                        "{e} (additionally, giving the provider access back failed: {close})"
-                    )),
-                });
-            }
-        };
-
-        // The cost arrives through the tracking callback on every end of the
-        // stream: a finished one books from its usage, a cancelled one from
-        // OpenRouter's ledger (`TrackedStream::cancel` resolves it before
-        // returning), a transport-errored one books nothing.
-        let (cost_tx, mut cost_rx) = tokio::sync::mpsc::unbounded_channel();
-        let on_cost: AsyncCostCallback = Arc::new(move |info: CostInfo, _meta: CompletionMeta| {
-            let cost_tx = cost_tx.clone();
-            Box::pin(async move {
-                let _ = cost_tx.send(info);
-            })
-        });
-        let tracking = CompletionContext::new(
-            generator,
-            serde_json::json!({}),
-            on_cost,
-            "https://weavemind.ai",
-            "Weft",
-        );
-
         let params = NodeCompletionParameters::new().with_params(cp);
-        let outcome = match user.complete_streaming_tracked(&tracking, Some(&params)).await {
-            Ok(stream) => {
-                let cancelled = ctx.cancellation();
-                stream.collect_or_cancel(async move { cancelled.cancelled().await }).await
-            }
-            // The request never started: nothing was spent. Same shape as a
-            // stream that died on the wire, so one settle + close covers both.
-            Err(e) => CollectOutcome::Failed(e),
-        };
-        // Settle FIRST, then close. Settling records the actual cost (the call
-        // may already have spent real money) and needs nothing from the access;
-        // closing only retires the stand-in. Doing settle first means a close
-        // hiccup can never drop a real charge on the floor. The callback has
-        // already fired by now (or booked nothing, for a transport error or a
-        // request that never started).
-        let interrupted = matches!(outcome, CollectOutcome::Interrupted);
-        let (actual_usd, meta) = match cost_rx.try_recv() {
-            Ok(info) => (
-                info.cost,
-                serde_json::json!({
-                    "promptTokens": info.prompt_tokens,
-                    "completionTokens": info.completion_tokens,
-                    "estimatedUsd": estimate,
-                    "resolution": format!("{:?}", info.resolution),
-                    "interrupted": interrupted,
-                }),
-            ),
-            Err(_) => (
-                0.0,
-                serde_json::json!({
-                    "resolution": "no cost info from provider",
-                    "estimatedUsd": estimate,
-                    "interrupted": interrupted,
-                }),
-            ),
-        };
-        // Settle, then ALWAYS give the access back, then surface whichever
-        // failed (settle first: it is the one that records real money). Running
-        // both before the `?` is what keeps the two symmetric: a failing settle
-        // must not skip the close and leave the access alive to its window when
-        // the worker is right here, able to retire it.
-        let settled = ctx.settle_cost(hold, actual_usd, meta).await;
-        let closed = ctx.close_access(access).await;
-        settled?;
-        closed?;
 
-        let response = match outcome {
-            CollectOutcome::Finished(response) => response,
-            CollectOutcome::Interrupted => return Err(WeftError::Cancelled),
-            CollectOutcome::Failed(e) => {
-                return Err(WeftError::NodeExecution(format!("openrouter: {e}")))
-            }
+        // Stream so a Stop lands mid-generation instead of after it; on
+        // cancel, dropping the stream is all the wrap-up there is (the
+        // metered client resolves the interrupted call's cost on its own).
+        let stream = user
+            .complete_streaming(&generator, Some(&params))
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("openrouter: {e}")))?;
+        let cancelled = ctx.cancellation();
+        let response = tokio::select! {
+            collected = stream.collect() => collected
+                .map_err(|e| WeftError::NodeExecution(format!("openrouter: {e}")))?,
+            _ = cancelled.cancelled() => return Err(WeftError::Cancelled),
         };
+
         if response.content.trim().is_empty() {
             return Err(WeftError::NodeExecution(
                 "openrouter: provider returned no text content (function-call only or empty \
@@ -248,4 +134,3 @@ impl Node for OpenRouterInferenceNode {
         ctx.pulse_downstream(output).await
     }
 }
-

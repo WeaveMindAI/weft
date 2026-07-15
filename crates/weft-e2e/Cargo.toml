@@ -32,7 +32,7 @@ path = "src/lib.rs"
 # reads the cluster's Postgres directly (a host-side, test-only reach-behind the
 # public API, never shipped), so its weight lands solely on the e2e build, not
 # on `cargo test --workspace`.
-e2e = ["dep:sqlx", "dep:weft-task-store"]
+e2e = ["dep:sqlx", "dep:weft-task-store", "dep:dotenvy"]
 
 [dependencies]
 # Light real types reused for the wire-shape safety net. weft-core is
@@ -42,6 +42,10 @@ e2e = ["dep:sqlx", "dep:weft-task-store"]
 # where it is cheap (the value types) without dragging the server's whole tree
 # into the test build.
 weft-core = { workspace = true }
+# The structured `.weft` editor (`EditOp::SetConfig`), so a test sets a node's
+# config field the same way the editor does (parse the CST, edit structurally,
+# reserialize), never by string-surgery on source.
+weft-compiler = { workspace = true }
 
 tokio = { workspace = true }
 reqwest = { workspace = true }
@@ -66,3 +70,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = t
 # read, so "old enough" tracks the real source instead of a hard-coded number.
 # Dependency-light (no k8s / no dispatcher tree); safe to pull into the rig.
 weft-task-store = { workspace = true, optional = true }
+
+# Optional: only under `e2e`. Loads the repo-root `.env` (the same file the
+# daemon's setup reads OPENROUTER_API_KEY from) so a test that spends on a
+# real key finds it without the operator re-exporting it into the test shell.
+dotenvy = { version = "0.15", optional = true }

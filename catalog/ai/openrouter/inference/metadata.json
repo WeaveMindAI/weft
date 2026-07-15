@@ -32,7 +32,6 @@
   ],
   "requires_infra": false,
   "features": {
-    "canAddOutputPorts": true,
-    "interruptGrace": true
+    "canAddOutputPorts": true
   }
 }

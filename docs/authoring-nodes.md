@@ -205,25 +205,14 @@ subsequent `is_cancelled()` returns true and every new `cancelled()`
 future resolves immediately. There's no race window where you can
 "miss" a cancellation.
 
-### Guaranteed cleanup: `interruptGrace`
-
-By default the engine aborts in-flight node futures as soon as it
-observes the cancel, so a `cancelled()` branch in your body only runs
-if it happens to win that race. If your node has cleanup that MUST run
-on cancel (settle a provisioned cost, close a paid stream, tell a peer
-goodbye), declare it in metadata.json:
-
-```json
-"features": { "interruptGrace": true }
-```
-
-The engine then lets in-flight firings observe the tripped flag and
-wrap up before the hard abort. The wait is dynamic: it ends the moment
-every in-flight task finishes, capped at 30 seconds; a node that wraps
-up in 2 seconds stops in 2 seconds. Declare it only when `execute`
-actually watches the flag: without a watcher the grace is pure added
-Stop latency (the full cap). The graceful-subprocess and cleanup
-patterns below assume it.
+The engine aborts in-flight node futures as soon as it observes the
+cancel, so a `cancelled()` branch in your body only runs if it happens
+to win that race. Paid calls need nothing from you here: the metering
+runs BELOW your future and resolves an interrupted call's real cost on
+its own, and the runtime gives your provider accesses back after the
+abort. The patterns below are for the things an abort genuinely cannot
+clean up by dropping (subprocesses, blocking threads, external
+resources).
 
 ### Pattern: subprocess
 
@@ -350,175 +339,104 @@ anything special for cancel; the engine handles it.
 | Streaming receive (WS / SSE)            | Yes, instant        | Nothing                    |
 | Suspended via `await_signal`            | Yes (engine path)   | Nothing                    |
 | Subprocess                              | Process leaks       | `.kill_on_drop(true)`      |
-| Subprocess needing graceful shutdown    | Yes, with delay     | `tokio::select!` + signal + `interruptGrace` |
+| Paid call (metered client)              | Yes, instant        | Nothing (the metering settles on its own) |
 | CPU-bound `spawn_blocking`              | Future returns, thread leaks | Pass flag, poll `is_cancelled()` |
-| External resource needing cleanup       | Yes, with cleanup   | `tokio::select!` branch + `interruptGrace` |
+| External resource needing cleanup       | Best effort         | `tokio::select!` branch on the flag |
 
 **Bottom line**: write normal async Rust. Reach for `ctx.cancellation()`
-(plus `interruptGrace` when the cleanup must be guaranteed) only when
-you spawn a subprocess, run blocking CPU work, or hold a resource that
-needs explicit cleanup before drop.
+only when you spawn a subprocess, run blocking CPU work, or hold a
+resource that needs explicit cleanup before drop, and treat that cleanup
+as best-effort (the abort races it).
 
-## Paid calls: keys, provisioning, settling
+## Paid calls: the access and the metered client
 
 A node that spends money on a third-party API (an LLM call, a search
-credit, an enrichment lookup) never handles raw key plumbing or
-ad-hoc cost logging. The context gives it one fixed ordering:
+credit, an enrichment lookup) does exactly two things:
 
 ```rust
-// 1. Get your access to the provider: what to authenticate with, and the
-//    address to send it to (the user's own key, or the deployment's). The
-//    window is how long your provider work may take; it is the credential's
-//    crash backstop AND the provision's deadline, declared once.
-let access = ctx
-    .provider_access_within("openrouter", cfg.get_optional("apiKey")?, Duration::from_secs(30 * 60))
-    .await?;
-// 2. Build the EXACT request you are about to make.
-// 3. Declare its cost.
-let hold = ctx.provision_cost(&access, CostProvision::estimate(worst_case_usd)).await?;
-// 4. Make the call. NOTHING else goes between 3, 4, and 5.
-let outcome = do_the_paid_call().await;
-// 5. Settle to what it actually cost, on EVERY path (a failed call may
-//    still have cost money; a provider error that means "not charged"
-//    settles 0).
-ctx.settle_cost(hold, actual_usd, metadata).await?;
-// (3-4-5 repeat for as many calls as you make on this access.)
-// 6. Done with the provider: retire the access, so a deployment's key stops
-//    being spendable at once instead of at the end of its window.
-ctx.close_access(access).await?;
-```
-
-Keep 3-4-5 TIGHT: no branching, no extra awaits between the provision,
-the call, and the settle. Then an unsettled provision can only mean one
-thing (the runtime was interrupted or died at the paid action itself),
-which is what makes unsettled provisions interpretable.
-
-Settling IS the recording: the settle books the amount to the
-execution's durable cost trail, and (on a deployment key, when the
-deployment meters usage) releases the provisioned hold. With the user's
-own key the provision holds nothing and the settle purely records.
-
-### Declaring the cost: estimate vs exact
-
-How well you know the price up front decides the provision:
-
-- **Fixed price per call** (one search = one credit): use
-  `CostProvision::exact(price)`. The amount IS the price. If the
-  runtime dies between the call and the settle, the deployment can
-  resolve the provision at the amount itself: the call almost certainly
-  happened.
-- **Metered output** (LLM tokens): use `CostProvision::estimate(ceiling)`
-  with a deliberately-high worst case derived from the provider's
-  published pricing. The settle brings it down to the actual.
-
-How long the action may run is the `window` you passed to
-`ctx.provider_access`: declared once, it bounds both the credential's life
-and how long an unsettled provision waits before it is treated as abandoned.
-A node wrapping a genuinely long action (a multi-hour generation) passes a
-window to match, so it is never mistaken for a lost one.
-
-### Interruption: settle before you die
-
-When the user stops the execution mid-call, the settle in step 5 never
-runs unless you make it. Declare `interruptGrace` (see Cancellation
-above) and branch on the flag around the paid call:
-
-- If the service can tell you what an interrupted call cost (a
-  streaming LLM call reports usage per chunk, or exposes a
-  by-request-id ledger you can query right then), stop the call,
-  settle at that number, and return.
-- If the price was exact, settle at the exact price (the request went
-  out; it cost what it costs).
-- If you can know nothing, settle 0 with metadata saying so; the
-  deployment treats the provision accordingly.
-
-### If the runtime dies outright
-
-No node code runs. The principle is: **the provision is dropped**. The
-cost was still charged by the provider, but its record is lost (an
-`exact` provision is the exception: the amount itself is trustworthy).
-This is the accepted trade for a rare event; it is also why steps 3-4-5
-stay tight, so "dropped provision" can never mean anything else.
-
-### Provider keys: use the access, never a key
-
-`ctx.provider_access(provider, key_input)` gives you the two things a
-paid call needs: what to authenticate with (`.credential()`) and the
-address to send it to (`.base_url(provider_default)`). Always use both,
-even when you think you know the provider's address: an access may hand
-you a different one, and the call only works if you honor it.
-
-```rust
+// 1. Your access to the provider: what to authenticate with. A key on
+//    the node's key input is the user's own; an empty input (or the
+//    platform sentinel) asks the deployment for its configured key
+//    (<PROVIDER>_API_KEY on the deployment's broker). Your code is the
+//    same lines either way; nothing branches.
 let access = ctx.provider_access("openrouter", cfg.get_optional("apiKey")?).await?;
 
-// An HTTP library: give it the access's address and credential.
-let generator = GeneratorInfo::openrouter(model);
-let base_url = access.base_url(&generator.base_url);
-let generator = generator.with_base_url(base_url).with_api_key(access.credential().to_string());
+// 2. An ordinary HTTP client to make the calls with. Use it directly,
+//    or hand it to any library that accepts an injected client.
+let http = ctx.metered_client(&access)?;
+
+// An HTTP library: give it the credential and the client.
+let generator = GeneratorInfo::openrouter(model)
+    .with_api_key(access.credential())
+    .with_http_client(http);
 
 // A hand-built request: same two values.
-let response = client
-    .post(format!("{}/search", access.base_url("https://api.tavily.com")))
+let response = ctx.metered_client(&access)?
+    .post("https://api.tavily.com/search")
     .bearer_auth(access.credential())
     .json(&body)
     .send()
     .await?;
-
-// When your provider work is finished (after the last call on this
-// access, including anything the library does afterwards, like resolving
-// a cost), retire it:
-ctx.close_access(access).await?;
 ```
 
-Where the credential comes from is not your node's business: a key on the
-node's input is the user's own, and an empty input (or the platform
-sentinel) asks the deployment for its configured key for that provider
-(the `<PROVIDER>_API_KEY` env var of the deployment's broker, packed from
-your shell or `.env` by the CLI on daemon start). Either way your code is
-the same lines; nothing branches.
+That is the whole surface: open the access, make the calls. **The runtime
+measures what each call really cost** (the provider's meter runs around the
+call, behind the client) and records it on the execution's cost trail. A
+node states no cost and has no way to; the number is always the runtime's
+measurement, so you cannot misbill no matter what your code does. A Stop
+mid-generation is equally not your problem: the metering outlives your
+future and still resolves the interrupted call's real cost.
 
-For the deployment-key path to work, your node must declare the provider
-it calls, with the `provider` metadata key:
-
-```jsonc
-// metadata.json
-{
-  "type": "TavilySearch",
-  ...
-  "provider": {
-    "name": "tavily",
-    "base_url": "https://api.tavily.com"
-  }
-}
-```
-
-Two fields, nothing else: the provider's name (which is also where the
-deployment's key comes from: `<NAME>_API_KEY`, uppercased, `-` becomes
-`_`) and the provider's real API base URL. The name you declare is the
-name you pass to `ctx.provider_access`.
-
-Like any metadata key, a package whose nodes all call one service
-declares it once in the package-level `metadata.json` (see
-"Package-level metadata defaults") instead of per node. A node with no
-declaration can still make calls on the user's own key; the
-deployment-key path refuses with an error telling you to declare it.
-
-`provider_access` assumes your provider work fits the default window (15
-minutes). A node wrapping a genuinely long action declares its own:
-`ctx.provider_access_within(provider, key_input, Duration::from_secs(...))`.
+When the node's body finishes (any outcome), the runtime gives a
+deployment-granted access back on its own; nothing node-facing closes it.
 
 Rules that matter:
 
-- Get the access, use it, close it. Do not stash `.credential()` anywhere
-  (an output port, a log, an error, a struct that outlives the call).
-- Close as soon as the provider work is done, not at the end of `execute`.
+- **Never construct your own HTTP client for a paid call**; always take it
+  from `ctx.metered_client(&access)`. A call on a hand-rolled client is
+  invisible to the cost trail, and a deployment-granted credential only
+  works through the metered client's routing. (A library that refuses an
+  injected client cannot be used for a paid call, and that is a smell in
+  that library.)
+- Address the provider's REAL API. The client does any routing a
+  deployment-granted access needs; your code never rewrites a URL for it.
+- Do not stash `.credential()` anywhere (an output port, a log, an error,
+  a struct that outlives the call).
 - A missing deployment key is a loud error naming the fix ("set your own
   key"); do not paper over it.
-- On a deployment's key, requests do not follow redirects: a provider that
-  answers "go ask this other address instead" is an error, not a second
-  request. Every API we support answers directly. If yours genuinely cannot,
-  get in touch: we are working out how to support it. (A user's own key is
-  unaffected: those requests are yours, and go straight to the provider.)
+- On a deployment-granted access, requests do not follow redirects: a
+  provider that answers "go ask this other address instead" is an error,
+  not a second request. Every API we support answers directly. (A user's
+  own key is unaffected: those requests are yours.)
+- Sending media? Declare what you know about it on the media objects
+  (`AudioData::with_duration`, `ImageData::with_dimensions`, ...): it
+  sharpens the pre-flight cost estimate for the call. It never changes
+  what is actually billed (that is always the measured cost).
+
+`provider_access` assumes your provider work fits the default window (15
+minutes): that is how long a deployment-granted credential is guaranteed
+usable if your node crashes without finishing. A node wrapping a genuinely
+long action declares its own:
+`ctx.provider_access_within(provider, key_input, Duration::from_secs(...))`.
+
+### Which providers
+
+The provider name you pass to `ctx.provider_access` is the key's identity:
+the deployment's key for it lives in `<NAME>_API_KEY` (uppercased). Any
+provider works with the user's own key. A deployment only supplies ITS
+configured key for providers whose spend it can measure: the ones with a
+meter in `weft-providers` (see `docs/authoring-provider-meters.md`, which
+is also the path to adding one).
+
+The key input itself is an ordinary config field with the `api_key` field
+type, naming the provider so the editor renders the "Credits / Own key"
+choice:
+
+```jsonc
+// metadata.json, in configFields
+{ "key": "apiKey", "label": "API key",
+  "field_type": { "kind": "api_key", "provider": "tavily" } }
+```
 
 ## Durable execution: `await_signal`, `register_signal`, `ctx.run`
 
@@ -923,9 +841,9 @@ member's value wins wholesale (no deep merge). `type` can never be a
 default (it is one node's identity); setting it at the package level is
 an error.
 
-Use it for whatever a package's nodes share: the `provider` a whole
-provider package calls, the `formFieldSpecs` vocabulary the `human`
-package's trigger and query both speak, and any future shared key. A
+Use it for whatever a package's nodes share: the `formFieldSpecs`
+vocabulary the `human` package's trigger and query both speak, a shared
+`category`, and any future shared key. A
 bare node has no package level; its own `metadata.json` is already the
 whole story.
 

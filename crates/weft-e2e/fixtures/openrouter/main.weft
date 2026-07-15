@@ -1,7 +1,8 @@
-# One real LLM call on the DEPLOYMENT's key (no apiKey set), through the
-# broker's provider proxy: the worker never holds the key. The model is asked
-# for one exact word so the answer is assertable, and parseJson is off so the
-# response is the raw string.
+# One real LLM call, metered end to end, on the DEPLOYMENT's key: `apiKey` is
+# unset, which the runtime reads as "use the deployment's configured key" (the
+# worker never holds it). The runtime measures the real cost off the real
+# response. The model is asked for one exact word so the answer is assertable,
+# and parseJson is off so the response is the raw string.
 #
 # Needs OPENROUTER_API_KEY in the environment the daemon was started from (the
 # CLI packs it into the broker's secret); the cheapest model keeps the run

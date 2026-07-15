@@ -106,15 +106,6 @@ pub struct RegisterRequest {
     /// `binary_hash` so all three signals stay in sync.
     #[serde(default, rename = "infraHash")]
     pub infra_hash: Option<String>,
-    /// Per-node-type provider declarations of the binary this register
-    /// describes (`BuildPlan::provider_decls`: which paid service each node's
-    /// own `metadata.json` declares). Recorded content-addressed under
-    /// `binary_hash`; the broker resolves a deployment-key call's forwarding
-    /// URL from them. Empty for the overwhelming majority of projects, and
-    /// only meaningful alongside `binary_hash` (a register that sets neither
-    /// is a metadata-only register, exactly like the hashes).
-    #[serde(default, rename = "providerDecls")]
-    pub provider_decls: std::collections::BTreeMap<String, weft_core::node::ProviderDecl>,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,34 +154,6 @@ pub async fn register(
     project.id = req.id;
     let name = req.name;
     let tenant = caller.0.clone();
-
-    // EVERYTHING that can reject the request runs BEFORE the project row is
-    // written, so a failed register never half-applies.
-    //
-    // Provider declarations are keyed by the binary they were compiled into, so
-    // decls with no binary to key on are a contradiction in the request.
-    if req.binary_hash.is_none() && !req.provider_decls.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(RegisterError {
-                error: "providerDecls without binaryHash: declarations are recorded per \
-                        binary, so a register carrying them must carry the binary hash too"
-                    .to_string(),
-            }),
-        ));
-    }
-
-    // Record the declarations FIRST. They key on `binary_hash` alone
-    // (content-addressed, project-independent, idempotent), so recording them
-    // before the project exists is sound, and it means a declaration that
-    // disagrees with what this binary already recorded fails LOUD with nothing
-    // written: the project row is not created, and `record`'s own transaction
-    // leaves no partial decl set behind.
-    if let Some(binary_hash) = &req.binary_hash {
-        crate::provider_decl::record(&state.pg_pool, binary_hash, &req.provider_decls)
-            .await
-            .map_err(|e| register_internal_error(format!("record provider decls: {e}")))?;
-    }
 
     let summary = state
         .projects

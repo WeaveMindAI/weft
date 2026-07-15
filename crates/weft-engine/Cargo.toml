@@ -21,6 +21,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+# The metered paid-call client (`ctx.metered_client`): the middleware seam
+# plus the provider meters it runs around each call.
+reqwest-middleware = { workspace = true }
+weft-providers = { workspace = true }
+http = "1"
 # Stream adapters for put_from_url (TryStreamExt on the reqwest body),
 # and FutureExt::catch_unwind for the stress_test! macro in tests.
 futures = { workspace = true }

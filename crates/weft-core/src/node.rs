@@ -63,8 +63,8 @@ mod node_trait {
 
         /// Run this node. `ctx` provides language primitives
         /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
-        /// `settle_cost`, `log`, `endpoint`). The ONLY way to fire downstream is
-        /// `ctx.pulse_downstream(output)`.
+        /// `provider_access`, `log`, `endpoint`). The ONLY way to fire
+        /// downstream is `ctx.pulse_downstream(output)`.
         async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
     }
 }
@@ -202,33 +202,6 @@ pub struct NodeMetadata {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub form_field_specs: Vec<FormFieldSpec>,
-    /// The paid service this node calls on a deployment-granted access
-    /// (`ctx.provider_access`), when it calls one. Absent for the
-    /// overwhelming majority of nodes. Like every metadata key, package
-    /// members inherit it from the package root's partial
-    /// `metadata.json` unless their own file carries the key (see the
-    /// catalog's package-defaults merge), so one declaration serves a
-    /// whole provider package.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<ProviderDecl>,
-}
-
-/// A node's declaration of the paid service it calls on a
-/// deployment-granted access (`ctx.provider_access`): the provider's
-/// name (which is also the key's identity: the deployment's key for it
-/// lives in `<NAME>_API_KEY`; the declaration deliberately cannot name
-/// an env var of its own, so a node can never point a fresh service
-/// name at another service's key) and the provider's real API base
-/// URL, which the deployment forwards deployment-key requests to.
-/// The runtime carries no provider list of its own.
-// `deny_unknown_fields`: a declaration that tries to say MORE than name +
-// URL (say, a key name) must be a loud parse error, never silently dropped.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderDecl {
-    #[serde(deserialize_with = "deserialize_provider_name")]
-    pub name: String,
-    pub base_url: String,
 }
 
 /// The one charset a provider name may use: lowercase ASCII letters,
@@ -239,26 +212,11 @@ pub struct ProviderDecl {
 /// share one env var) and rules out a name that would form a malformed or
 /// surprising env var (spaces, dots, `-` vs `_`, unicode, empty). A raw
 /// string comparison of names is therefore exactly a comparison of key
-/// identities. Enforced at deserialize, so every entry point (catalog
-/// discovery, the register payload, any wire read) rejects a bad name
-/// loudly at the door.
+/// identities. Enforced where a provider name enters the system (the
+/// access request handler), so a bad name is refused loudly at the door.
 pub fn is_valid_provider_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
-
-fn deserialize_provider_name<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let name = String::deserialize(deserializer)?;
-    if !is_valid_provider_name(&name) {
-        return Err(serde::de::Error::custom(format!(
-            "provider name '{name}' is invalid: use only lowercase letters, digits, and '_' \
-             (the name is the key's identity, derived to <NAME>_API_KEY)"
-        )));
-    }
-    Ok(name)
 }
 
 /// Keys a package root's partial `metadata.json` may never supply as a
@@ -477,13 +435,6 @@ pub struct NodeFeatures {
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview")]
     pub show_debug_preview: bool,
-    /// On cancellation, give this node a short grace window to observe
-    /// `ctx.cancellation()` and wrap up (settle a provisioned cost,
-    /// close a paid stream) before its future is aborted. Declare it
-    /// only when `execute` actually watches the flag; without a watcher
-    /// the grace is pure added Stop latency.
-    #[serde(default, rename = "interruptGrace")]
-    pub interrupt_grace: bool,
     /// Webview hint: when the node's input is a stored image
     /// reference, render the picture inline on the node body, fetched
     /// through the authenticated download handshake. Used by
@@ -862,55 +813,16 @@ mod diagnostic_wire_tests {
         assert_eq!(pointy.end_line, 0, "absent endLine defaults to 0");
     }
 
-    /// Layer-2 wire-shape: the provider declaration crosses two boundaries
-    /// (`metadata.json` on disk, the register payload carrying the
-    /// collected declarations). Absent = the node makes no deployment-key
-    /// provider calls, and absence serializes as NO key (not `null`), so
-    /// old metadata files and old readers keep working. Present = exactly
-    /// `{ name, base_url }`; an extra field (say, a key name) must be
-    /// REFUSED, because the whole point of the shape is that a declaration
-    /// cannot name a key.
+    /// The name is the key's identity, so it is validated to [a-z0-9_]+: a
+    /// name that would form a surprising or colliding env var (case games,
+    /// a hyphen aliasing an underscore, a space, empty) is refused; only
+    /// the injective set passes.
     #[test]
-    fn node_metadata_provider_wire() {
-        let bare: NodeMetadata = serde_json::from_str(
-            r#"{ "type": "T", "label": "t", "description": "", "category": "AI" }"#,
-        )
-        .expect("metadata without provider");
-        assert!(bare.provider.is_none());
-        let v = serde_json::to_value(&bare).unwrap();
-        assert!(v.get("provider").is_none(), "absent provider stays absent: {v}");
-
-        let declared: NodeMetadata = serde_json::from_str(
-            r#"{ "type": "T", "label": "t", "description": "", "category": "AI",
-                 "provider": { "name": "openrouter", "base_url": "https://openrouter.ai/api/v1" } }"#,
-        )
-        .expect("metadata with provider");
-        let decl = declared.provider.clone().expect("declared");
-        assert_eq!(decl.name, "openrouter");
-        assert_eq!(decl.base_url, "https://openrouter.ai/api/v1");
-        let back: NodeMetadata =
-            serde_json::from_value(serde_json::to_value(&declared).unwrap()).expect("round-trip");
-        assert_eq!(back.provider, declared.provider);
-
-        let smuggled = serde_json::from_str::<ProviderDecl>(
-            r#"{ "name": "shape", "base_url": "https://shape.ai", "key_env": "OPENROUTER_API_KEY" }"#,
-        );
-        assert!(smuggled.is_err(), "a declaration naming a key must be refused at parse");
-
-        // The name is the key's identity, so it is validated to [a-z0-9_]+ at
-        // the door: a name that would form a surprising or colliding env var
-        // (case games, a hyphen aliasing an underscore, a space, empty) is a
-        // loud parse error, not a silent alias.
+    fn provider_names_are_key_identities() {
         for bad in ["OpenRouter", "open-router", "open router", "open.router", ""] {
-            let decl = serde_json::from_str::<ProviderDecl>(&format!(
-                r#"{{ "name": "{bad}", "base_url": "https://x" }}"#
-            ));
-            assert!(decl.is_err(), "invalid provider name '{bad}' must be refused");
+            assert!(!is_valid_provider_name(bad), "invalid provider name '{bad}' must be refused");
         }
-        assert!(serde_json::from_str::<ProviderDecl>(
-            r#"{ "name": "open_router2", "base_url": "https://x" }"#
-        )
-        .is_ok());
+        assert!(is_valid_provider_name("open_router2"));
     }
 }
 
@@ -920,8 +832,8 @@ mod package_defaults_tests {
 
     const MEMBER: &str = r#"{ "type": "OpenRouterInference", "label": "OpenRouter",
         "description": "", "category": "AI" }"#;
-    const DEFAULTS: &str = r#"{ "provider":
-        { "name": "openrouter", "base_url": "https://openrouter.ai/api/v1" } }"#;
+    const DEFAULTS: &str = r#"{ "formFieldSpecs":
+        [{ "fieldType": "root_spec", "label": "Root spec", "render": {} }] }"#;
 
     /// The one guarantee finding-3 turns on: a package member's metadata is
     /// ONE document. The derive's runtime `parse_embedded(member, defaults)`
@@ -938,15 +850,18 @@ mod package_defaults_tests {
         merge_package_defaults(&mut value, &defaults).unwrap();
         let from_catalog: NodeMetadata = serde_json::from_value(value).unwrap();
 
-        assert_eq!(from_derive.provider, from_catalog.provider);
+        let spec_types = |m: &NodeMetadata| {
+            m.form_field_specs.iter().map(|s| s.field_type.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(spec_types(&from_derive), spec_types(&from_catalog));
         assert_eq!(
-            from_derive.provider.as_ref().map(|d| d.name.as_str()),
-            Some("openrouter"),
-            "the package-root provider reaches the merged metadata"
+            spec_types(&from_derive),
+            vec!["root_spec".to_string()],
+            "the package-root defaults reach the merged metadata"
         );
         // A bare node (no defaults) parses its own file unchanged.
         let bare = NodeMetadata::parse_embedded(MEMBER, None, "test");
-        assert!(bare.provider.is_none());
+        assert!(bare.form_field_specs.is_empty());
     }
 
     /// The member's own key wins wholesale, disjoint keys survive, and an

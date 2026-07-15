@@ -11,11 +11,9 @@
 //!     namespace `weft-db` with k8s NetworkPolicy.
 
 pub mod auth;
-pub mod cost_gate;
 pub mod credential;
 pub mod entitlement;
 pub mod handlers;
-pub mod provider_proxy;
 pub mod runtime_storage;
 pub mod runtime_store;
 pub mod scope;
@@ -23,40 +21,16 @@ pub mod state;
 
 use std::sync::Arc;
 
-use axum::{
-    routing::{any, post},
-    Router,
-};
+use axum::{routing::post, Router};
 
 pub use auth::AuthConfig;
 pub use state::BrokerState;
 
-/// Spawn the periodic expiry sweeps: expired provider-access stand-ins
-/// always; kept runtime files when an object-store slot is configured. The
-/// broker owns both stores, so it runs the sweeps itself (not the
-/// dispatcher). Stateless + idempotent, so every broker replica may run them
-/// concurrently.
+/// Spawn the periodic expiry sweep for kept runtime files, when an
+/// object-store slot is configured. The broker owns the store, so it runs
+/// the sweep itself (not the dispatcher). Stateless + idempotent, so every
+/// broker replica may run it concurrently.
 pub fn spawn_expiry_sweep(state: Arc<BrokerState>) {
-    {
-        let pool = state.pool.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                match provider_proxy::sweep_expired_standins(&pool).await {
-                    Ok(n) if n > 0 => tracing::info!(
-                        target: "weft_broker::provider_proxy",
-                        swept = n,
-                        "expired provider stand-ins"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(
-                        target: "weft_broker::provider_proxy", "stand-in sweep failed: {e:#}"
-                    ),
-                }
-            }
-        });
-    }
     let Some(store) = state.runtime_store.clone() else {
         return;
     };
@@ -127,15 +101,10 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/project/fetch_definition",
             post(handlers::project_fetch_definition),
         )
-        // Provider access + cost provisioning (worker data path)
+        // Provider access (worker data path). Cost records ride the generic
+        // task rail (`/v1/task/enqueue_dedup`, kind `record_cost`).
         .route("/v1/access/open", post(handlers::open_provider_access))
         .route("/v1/access/close", post(handlers::close_provider_access))
-        // The provider proxy: a worker addresses it like the provider's own
-        // API, with a stand-in where the key goes; the broker swaps in the
-        // real key and forwards (see `provider_proxy`).
-        .route("/v1/provider/{provider}/{*path}", any(provider_proxy::serve))
-        .route("/v1/cost/provision", post(handlers::provision_cost))
-        .route("/v1/cost/settle", post(handlers::settle_cost))
         // Signals (listener-only rehydrate read, by placement = pod)
         .route(
             "/v1/signal/list_for_pod",

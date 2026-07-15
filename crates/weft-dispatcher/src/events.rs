@@ -37,7 +37,7 @@ const NOTIFY_CHANNEL: &str = "weft_dispatcher_events";
 /// An event the dispatcher publishes about some piece of runtime
 /// state changing. Tagged enum so SSE serialization matches the
 /// spec in the design doc.
-// SYNC: DispatcherEvent <-> extension-vscode/src/execFollower.ts DispatcherEvent
+// SYNC: DispatcherEvent <-> extension-vscode/src/execFollower.ts DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DispatcherEvent {
@@ -97,7 +97,23 @@ pub enum DispatcherEvent {
         parent_frames: LoopFrames,
         reason: weft_core::primitive::LoopTerminationReason,
     },
-    CostReported { color: Color, project_id: String, service: String, amount_usd: f64 },
+    /// One metered call's cost record landed on the journal, attributed to
+    /// the exact firing (`node_id` + `frames`). `amount_usd` `None` = the
+    /// meter could not resolve the figure (an honest unknown).
+    CostReported {
+        color: Color,
+        project_id: String,
+        node_id: String,
+        frames: LoopFrames,
+        /// Stable per-record identity; the webview dedups on it (the same
+        /// journal row can arrive via both the replay and the live stream).
+        cost_id: String,
+        service: String,
+        amount_usd: Option<f64>,
+        /// Whose key the call spent (`user-provided` or `deployment`), so a
+        /// client can say whose account a figure landed on.
+        origin: weft_core::AccessOrigin,
+    },
     TriggerUrlChanged { project_id: String, node_id: String, url: String },
     ProjectRegistered { project_id: String, name: String },
     ProjectActivated { project_id: String },

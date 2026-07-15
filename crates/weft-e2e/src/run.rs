@@ -162,8 +162,16 @@ pub struct SettledRun {
     /// The terminal status string from `/executions/{color}` (`completed` /
     /// `failed` / `cancelled`).
     pub status: String,
-    /// The full event log from `/executions/{color}/replay`.
+    /// The event log from `/executions/{color}/replay`, snapshotted at
+    /// terminal. The journal is APPEND-ONLY and a run's trailing bookkeeping
+    /// (a metered call's cost record, a late log line) lands AFTER the
+    /// terminal event by design; an assertion about those events refreshes
+    /// this snapshot via [`Self::refresh_replay_until`] instead of assuming
+    /// it is complete.
     pub replay: Replay,
+    /// The dispatcher the run was observed through, kept so the replay can
+    /// be re-read (see `replay`).
+    disp: Dispatcher,
 }
 
 impl SettledRun {
@@ -177,6 +185,7 @@ impl SettledRun {
             color,
             status,
             replay,
+            disp: disp.clone(),
         })
     }
 
@@ -193,7 +202,41 @@ impl SettledRun {
             color,
             status,
             replay,
+            disp: disp.clone(),
         })
+    }
+
+    /// Re-fetch the replay until `present` holds for it, updating
+    /// `self.replay`; errors loudly when `what` is still absent at
+    /// `deadline`.
+    ///
+    /// This is how an assertion reads the journal's TRAILING events. The
+    /// terminal event marks the user's work done, but bookkeeping that is
+    /// deliberately detached from the run (a metered call's cost resolve,
+    /// which may make its own provider follow-up query) journals after it.
+    /// Waiting on the condition here asserts the real contract ("the record
+    /// lands, bounded") instead of racing the at-terminal snapshot.
+    pub(crate) async fn refresh_replay_until(
+        &mut self,
+        what: &str,
+        deadline: Duration,
+        present: impl Fn(&Replay) -> bool,
+    ) -> Result<()> {
+        if present(&self.replay) {
+            return Ok(());
+        }
+        let disp = self.disp.clone();
+        let color = self.color;
+        let present = &present;
+        self.replay = poll_until(what, deadline, RUN_SETTLE_POLL, || {
+            let disp = disp.clone();
+            async move {
+                let replay = fetch_replay(&disp, color).await?;
+                Ok(present(&replay).then_some(replay))
+            }
+        })
+        .await?;
+        Ok(())
     }
 }
 

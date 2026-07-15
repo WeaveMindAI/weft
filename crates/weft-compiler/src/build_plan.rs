@@ -68,17 +68,6 @@ pub struct BuildPlan {
     pub definition_hash: String,
     /// Infra closure identity: infra-node sources + engine. Drives infra upgrade.
     pub infra_hash: String,
-    /// Per-node-type content hashes of the node code compiled into the worker
-    /// binary (`node_type -> package-root hash`). The build's provenance
-    /// manifest: exactly which node source went in.
-    pub node_source_hashes: std::collections::BTreeMap<String, String>,
-    /// Per-node-type provider declarations (`node_type -> the paid service
-    /// that node's `metadata.json` declares`), for exactly the node types in
-    /// the binary (same referenced set as `node_source_hashes`, so the two
-    /// can never disagree about what went in). Nodes with no declaration are
-    /// absent. Recorded at register so the deployment forwards a node's
-    /// deployment-key calls to the URL the node's OWN source declared.
-    pub provider_decls: std::collections::BTreeMap<String, weft_core::node::ProviderDecl>,
     /// The worker image plus every infra image, each with its ref + build context.
     pub images: Vec<PlannedImage>,
 }
@@ -138,11 +127,6 @@ pub fn plan_build_from(
     let infra_hash =
         crate::hash::compute_infra_hash(definition, &project.root, &weft_root, catalog)
             .map_err(|e| e.context("compute infra hash"))?;
-    let node_source_hashes =
-        crate::hash::compute_node_source_hashes(definition, &project.root, &weft_root, catalog)
-            .map_err(|e| e.context("compute node source hashes"))?;
-    let provider_decls = collect_provider_decls(definition, catalog)
-        .map_err(|e| e.context("collect provider declarations"))?;
     let definition_json = serde_json::to_string(definition)
         .map_err(|e| anyhow::anyhow!("serialize compiled definition: {e}"))?;
 
@@ -177,100 +161,6 @@ pub fn plan_build_from(
         binary_hash,
         definition_hash,
         infra_hash,
-        node_source_hashes,
-        provider_decls,
         images,
     })
-}
-
-/// The provider declarations of exactly the node types the project references
-/// (same set as `node_source_hashes`), from each node's resolved metadata
-/// (`provider` key, own or package-inherited). Fails LOUDLY when two referenced node
-/// types declare the same provider name with different base URLs: that is a
-/// contradiction about where the deployment's key for that provider gets
-/// sent, and no build may pick a side. Same name + same URL is fine (two
-/// nodes, one service; package siblings share one file, so agreement is the
-/// norm).
-fn collect_provider_decls(
-    definition: &weft_core::project::ProjectDefinition,
-    catalog: &weft_catalog::FsCatalog,
-) -> anyhow::Result<std::collections::BTreeMap<String, weft_core::node::ProviderDecl>> {
-    let mut decls = std::collections::BTreeMap::new();
-    for nt in crate::codegen::collect_node_types(definition) {
-        if let Some(decl) = catalog.provider_of(&nt) {
-            decls.insert(nt, decl.clone());
-        }
-    }
-    check_provider_decl_conflicts(&decls)?;
-    Ok(decls)
-}
-
-/// Pure conflict check over collected declarations: one provider name, one
-/// base URL, project-wide. Split out so the rule is testable without a
-/// filesystem catalog.
-fn check_provider_decl_conflicts(
-    decls: &std::collections::BTreeMap<String, weft_core::node::ProviderDecl>,
-) -> anyhow::Result<()> {
-    let mut by_name: std::collections::BTreeMap<&str, (&str, &str)> =
-        std::collections::BTreeMap::new();
-    for (node_type, decl) in decls {
-        match by_name.get(decl.name.as_str()) {
-            Some((first_node, first_url)) if *first_url != decl.base_url => {
-                anyhow::bail!(
-                    "conflicting provider declarations for '{}': node {} declares base_url {} \
-                     but node {} declares base_url {}; a provider name must map to one URL \
-                     project-wide",
-                    decl.name, first_node, first_url, node_type, decl.base_url,
-                );
-            }
-            Some(_) => {}
-            None => {
-                by_name.insert(&decl.name, (node_type, &decl.base_url));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use weft_core::node::ProviderDecl;
-
-    fn decl(name: &str, url: &str) -> ProviderDecl {
-        ProviderDecl { name: name.into(), base_url: url.into() }
-    }
-
-    #[test]
-    fn provider_decl_conflicts_fail_loudly_and_agreement_passes() {
-        // No declarations: fine (the overwhelming majority of projects).
-        check_provider_decl_conflicts(&Default::default()).unwrap();
-
-        // Two nodes, one service, same URL: fine.
-        let agree: std::collections::BTreeMap<String, ProviderDecl> = [
-            ("A".to_string(), decl("openrouter", "https://openrouter.ai/api/v1")),
-            ("B".to_string(), decl("openrouter", "https://openrouter.ai/api/v1")),
-        ]
-        .into();
-        check_provider_decl_conflicts(&agree).unwrap();
-
-        // Different services: fine.
-        let distinct: std::collections::BTreeMap<String, ProviderDecl> = [
-            ("A".to_string(), decl("openrouter", "https://openrouter.ai/api/v1")),
-            ("B".to_string(), decl("elevenlabs", "https://api.elevenlabs.io/v1")),
-        ]
-        .into();
-        check_provider_decl_conflicts(&distinct).unwrap();
-
-        // Same name, different URL: a contradiction; the error names both sides.
-        let conflict: std::collections::BTreeMap<String, ProviderDecl> = [
-            ("A".to_string(), decl("openrouter", "https://openrouter.ai/api/v1")),
-            ("B".to_string(), decl("openrouter", "https://evil.example")),
-        ]
-        .into();
-        let err = check_provider_decl_conflicts(&conflict).unwrap_err().to_string();
-        assert!(err.contains("openrouter"), "{err}");
-        assert!(err.contains("A") && err.contains("B"), "{err}");
-        assert!(err.contains("https://evil.example"), "{err}");
-    }
 }

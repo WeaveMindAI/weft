@@ -18,6 +18,7 @@
   //
   // Width persists per `storageKey` in localStorage so it survives reloads.
 
+  import { untrack } from 'svelte';
   import type { Snippet } from 'svelte';
 
   let {
@@ -78,12 +79,14 @@
       return defaultWidth;
     }
   }
-  let panelWidth = $state(loadWidthFor(widthKey));
+  // The two initial reads of `widthKey` below are intentionally one-shot
+  // (`untrack`): the $effect right after owns reacting to later key changes.
+  let panelWidth = $state(untrack(() => loadWidthFor(widthKey)));
   // Re-LOAD the width when the key changes (a consumer re-keyed the panel):
   // read the NEW key's stored value rather than carrying the old key's width
   // and clobbering the new key's stored value on the next persist. Tracked by
   // key only (untrack panelWidth) so a drag doesn't retrigger a reload.
-  let lastWidthKey: string | null = widthKey;
+  let lastWidthKey: string | null = untrack(() => widthKey);
   $effect(() => {
     if (widthKey !== lastWidthKey) {
       lastWidthKey = widthKey;

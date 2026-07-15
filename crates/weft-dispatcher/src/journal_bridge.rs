@@ -474,12 +474,18 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 project_id,
             }]
         }
-        ExecEvent::CostReported { color, service, amount_usd, .. } => {
+        ExecEvent::CostReported {
+            color, node_id, frames, cost_id, service, amount_usd, origin, ..
+        } => {
             vec![DispatcherEvent::CostReported {
                 color: *color,
                 project_id,
+                node_id: node_id.clone(),
+                frames: frames.clone(),
+                cost_id: cost_id.clone(),
                 service: service.clone(),
                 amount_usd: *amount_usd,
+                origin: *origin,
             }]
         }
         // Bus events: surfaced so the inspector renders a live IRC-style

@@ -48,15 +48,22 @@ type CancelRegistry = Arc<Mutex<HashMap<Color, Arc<CancellationFlag>>>>;
 /// `IdleExit` impl backed by the broker's guarded CAS. The picker
 /// calls `try_idle_exit` after the idle window; the broker flips
 /// `alive -> done` only if no pending/claimed work exists for the
-/// project, so a concurrent exec keeps the pod alive.
+/// project, so a concurrent exec keeps the pod alive. A cost record
+/// still being resolved (a metered call's figure being written down)
+/// also keeps the pod alive: money bookkeeping never dies with an
+/// idle exit.
 struct WorkerIdleExit {
     worker_pods: Arc<dyn WorkerPodClient>,
     pod_name: String,
+    pending_costs: Arc<crate::metering::PendingCostRecords>,
 }
 
 #[async_trait::async_trait]
 impl weft_task_store::executor::IdleExit for WorkerIdleExit {
     async fn try_idle_exit(&self) -> anyhow::Result<bool> {
+        if self.pending_costs.count() > 0 {
+            return Ok(false);
+        }
         self.worker_pods.mark_done_if_idle(&self.pod_name).await
     }
 }
@@ -233,9 +240,11 @@ pub async fn run_pod(
     // Idle self-exit: after `WORKER_IDLE_EXIT` of no claimable
     // work, the picker attempts the guarded `alive -> done` CAS via
     // the broker. The CAS (not the timer) is the correctness gate.
+    let pending_costs = ctx.clients.pending_costs.clone();
     let idle_exit: Arc<dyn weft_task_store::executor::IdleExit> = Arc::new(WorkerIdleExit {
         worker_pods: worker_pods.clone(),
         pod_name: pod_name.clone(),
+        pending_costs: pending_costs.clone(),
     });
     run_worker_picker(
         picker_tasks,
@@ -261,6 +270,11 @@ pub async fn run_pod(
         f.cancel();
     }
     shutdown.store(true, Ordering::Relaxed);
+    // Money bookkeeping outlives the executions: wait for every in-flight
+    // cost resolution to land its record before the row is marked done.
+    // Each resolve is internally bounded (request timeout + fixed ledger
+    // budget), so this wait always ends.
+    pending_costs.wait_zero().await;
     let _ = worker_pods.mark_done(&pod_name).await;
     Ok(())
 }

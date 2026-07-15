@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use weft_core::node::{MetadataCatalog, NodeMetadata, ProviderDecl};
+use weft_core::node::{MetadataCatalog, NodeMetadata};
 
 /// Directory names that are never part of a node's source tree:
 /// build outputs and VCS/dependency caches. The single policy shared
@@ -249,12 +249,6 @@ impl FsCatalog {
         self.entries.get(node_type).map(|e| e.source_dir.as_path())
     }
 
-    /// The paid service a node's source declares (its metadata's `provider`
-    /// key, own or inherited from the package defaults), when it declares
-    /// one. `None` = the node type is unknown or declares nothing.
-    pub fn provider_of(&self, node_type: &str) -> Option<&ProviderDecl> {
-        self.entries.get(node_type).and_then(|e| e.metadata.provider.as_ref())
-    }
 }
 
 // ----- Per-node deps.toml --------------------------------------------

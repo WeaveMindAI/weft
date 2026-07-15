@@ -143,16 +143,6 @@ pub struct SignalRouting {
     pub auth_config: Value,
 }
 
-// ----- Cost report (fire-and-forget primitive) ------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostReport {
-    pub service: String,
-    pub model: Option<String>,
-    pub amount_usd: f64,
-    pub metadata: Value,
-}
-
 // ----- Execution snapshot ---------------------------------------------
 //
 // Written by the worker when it stalls (all firings either terminal or

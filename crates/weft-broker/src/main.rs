@@ -46,10 +46,9 @@ async fn main() -> anyhow::Result<()> {
         weft_broker::AuthConfig { audience },
         object_store,
         entitlements,
-        // Deployment keys come from this host's env (`<PROVIDER>_API_KEY`);
-        // spend on them is unmetered (the operator's own keys).
+        // Deployment keys come from this host's env (`<PROVIDER>_API_KEY`):
+        // the operator's own keys, handed to the operator's own workers.
         std::sync::Arc::new(weft_broker::credential::EnvCredentialSource),
-        std::sync::Arc::new(weft_broker::cost_gate::UnmeteredCostGate),
     )
     .await?;
 

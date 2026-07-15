@@ -192,6 +192,34 @@
 		return `$${usd.toFixed(2)}`;
 	}
 
+	/// The firing's cost line, honest about unresolved records: a firing
+	/// with only an unknown cost says "unknown" (never looks free), one
+	/// mixing resolved and unknown records says both, and the line names
+	/// whose key spent. Empty = no cost.
+	function costLabel(firing: {
+		costUsd: number;
+		costUnknown?: boolean;
+		costOrigin?: 'user-provided' | 'deployment' | 'mixed';
+	}): string {
+		let amount: string;
+		if (firing.costUnknown) {
+			amount = firing.costUsd > 0 ? `${formatCost(firing.costUsd)} + unknown` : 'cost unknown';
+		} else if (firing.costUsd > 0) {
+			amount = formatCost(firing.costUsd);
+		} else {
+			return '';
+		}
+		const origin =
+			firing.costOrigin === 'user-provided'
+				? ' (own key)'
+				: firing.costOrigin === 'deployment'
+					? ' (deployment key)'
+					: firing.costOrigin === 'mixed'
+						? ' (mixed keys)'
+						: '';
+		return amount + origin;
+	}
+
 	/// A short label for one firing so the user can correlate it across
 	/// nodes when following a single pulse. The record's `framesKey` is
 	/// the frame stack serialized as JSON. Renders
@@ -243,7 +271,7 @@
 	`--- Details ---`, detailsText, ``,
 	`--- Output ---`, outputJson ?? '(none)', ``,
 	...(busSection ? [`--- Bus Communication ---`, busSection, ``] : []),
-	`Status: ${selected.status} | Duration: ${formatDuration(selected.startedAt, selected.completedAt)}${selected.costUsd > 0 ? ` | Cost: ${formatCost(selected.costUsd)}` : ''} | ${new Date(selected.startedAt).toLocaleString()} | ${selected.id}`,
+	`Status: ${selected.status} | Duration: ${formatDuration(selected.startedAt, selected.completedAt)}${costLabel(selected) ? ` | Cost: ${costLabel(selected)}` : ''} | ${new Date(selected.startedAt).toLocaleString()} | ${selected.id}`,
 ].join('\n')}
 <Dialog.Root bind:open>
 	<Dialog.Content class="sm:max-w-[92vw] max-h-[85vh] overflow-hidden p-0 gap-0 [&>button:last-child]:hidden nodrag nopan flex flex-col">
@@ -460,8 +488,8 @@
 		<div class="flex items-center gap-4 px-4 py-1.5 border-t border-zinc-200 bg-zinc-50 text-[10px] text-zinc-500 shrink-0">
 			<span class="font-medium {selected.status === 'failed' ? 'text-red-600' : selected.status === 'completed' ? 'text-green-600' : ''}">{selected.status}</span>
 			<span class="font-mono">{formatDuration(selected.startedAt, selected.completedAt)}</span>
-			{#if selected.costUsd > 0}
-				<span class="font-mono">{formatCost(selected.costUsd)}</span>
+			{#if costLabel(selected)}
+				<span class="font-mono">{costLabel(selected)}</span>
 			{/if}
 			<span>{new Date(selected.startedAt).toLocaleString()}</span>
 		</div>

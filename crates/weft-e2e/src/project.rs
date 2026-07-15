@@ -147,6 +147,34 @@ impl Project {
         Ok(())
     }
 
+    /// Set one config field on a node in the project's `main.weft`, exactly as
+    /// the editor does it: parse the source to a lossless tree, apply a
+    /// structural `SetConfig` op, reserialize. `value` is a `.weft` literal
+    /// expression (`"a string"`, `42`, `true`), so a caller passing a string
+    /// wraps it in quotes (e.g. via `format!("{v:?}")`). Call BEFORE a run so
+    /// the compiled graph carries it. No string-surgery on source: the edit is
+    /// the same operation a click in the editor performs.
+    pub fn set_node_config(&self, node: &str, key: &str, value: &str) -> Result<()> {
+        let path = self.dir.join("main.weft");
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let (edited, _inverse) = weft_compiler::edit::apply_edits(
+            &source,
+            None,
+            // `main.weft`'s anonymous root takes the "Main" id; SetConfig
+            // resolves the node against that, matching the lowering.
+            "Main",
+            &[weft_compiler::edit::EditOp::SetConfig {
+                node: node.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+            }],
+        )
+        .map_err(|e| anyhow::anyhow!("set config {node}.{key} in {}: {e:?}", path.display()))?;
+        std::fs::write(&path, edited).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
     /// Copy a custom node from ANOTHER committed fixture into this project's
     /// `nodes/` directory (e.g. pull `infra_min`'s `mini_service` into a
     /// transition fixture before rewriting `main.weft` to use it). One

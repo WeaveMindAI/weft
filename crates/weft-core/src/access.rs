@@ -1,30 +1,28 @@
-//! Provider access + cost provisioning: the node-facing surface for calling
-//! paid third-party services.
+//! Provider access: the node-facing surface for calling paid third-party
+//! services.
 //!
-//! A node that talks to a paid provider never handles raw key plumbing.
-//! It asks the context (`ctx.provider_access`) for access to the provider,
-//! provisions an upper-bound cost before the call, makes the call, and
-//! settles the actual cost after. The fixed ordering:
+//! A node that talks to a paid provider does two things, and only two:
 //!
-//! 1. `ctx.provider_access(provider, user_key)` opens the access.
-//! 2. Build the exact request about to be made.
-//! 3. `ctx.provision_cost(&access, upper_bound)` declares the worst-case cost
-//!    of THAT request; the deployment may refuse (usage limit reached).
-//! 4. Make the call on the access.
-//! 5. `ctx.settle_cost(hold, actual)` settles to what it really cost, on
-//!    EVERY path (success, failure, partial): a failed call may still
-//!    have cost money. Settling IS the recording: the amount lands on
-//!    the execution's durable cost trail, and a metered hold (when the
-//!    provision took one) is released down to the actual.
-//! 6. `ctx.close_access(access)` gives the access back.
+//! 1. `ctx.provider_access(provider, user_key)` opens the access: what to
+//!    authenticate with.
+//! 2. `ctx.metered_client(&access)` hands back an ordinary HTTP client to
+//!    make the calls with.
+//!
+//! Everything else (where the call is routed, what it cost, recording that
+//! cost) is the runtime's job, done behind the client. A node never states
+//! a cost and has no way to: every cost figure in the system is produced by
+//! a provider meter (`weft-providers`), run by the runtime around the call.
 //!
 //! Two origins for an access:
 //! - the user supplied their OWN key (a real key string on the node's key
-//!   input): it is their provider account; provision is a no-op and the
-//!   settle only records the cost for the user's own tracking.
+//!   input): it is their provider account, used as-is.
 //! - the DEPLOYMENT grants the access (the input is empty or the
-//!   `__PLATFORM__` sentinel): the runtime this project runs on grants access
-//!   on its configured key for the provider, and may meter/limit its usage.
+//!   `__PLATFORM__` sentinel): the runtime this project runs on answers
+//!   with a credential for its configured key, and may bound or refuse its
+//!   use. The deployment may also answer with a RELAY address: calls on its
+//!   credential are then sent there (the relay holds the actual provider
+//!   relationship) instead of to the provider directly; the metered client
+//!   does that routing, the node never sees it.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,46 +34,24 @@ use serde::{Deserialize, Serialize};
 // SYNC: PLATFORM_KEY_SENTINEL <-> weavemind/website editor key-input widget (the "Platform" option value)
 pub const PLATFORM_KEY_SENTINEL: &str = "__PLATFORM__";
 
-/// A deployment access carries a stand-in, and it starts with this. The real
-/// key never enters a worker: the broker hands out a stand-in, and swaps it
-/// for the key when the request comes back through the broker's provider
-/// proxy (see the broker's `provider_proxy` module, which scans for this
-/// prefix).
-pub const STANDIN_PREFIX: &str = "weftstandin-";
-
-/// The broker's proxy for a provider: a deployment access sends its requests
-/// here instead of to the provider's own API, and the broker swaps the
-/// stand-in for the real key on the way out. `broker_url` is the broker as
-/// the caller reaches it.
-///
-/// One definition, used by both sides: the worker builds the address, the
-/// broker serves it. The request that goes there is the provider call as the
-/// caller built it, with the stand-in where the key goes and no other
-/// credential.
-pub fn provider_proxy_url(broker_url: &str, provider: &str) -> String {
-    format!("{}/v1/provider/{provider}", broker_url.trim_end_matches('/'))
-}
-
-/// Where an access came from; decides whether provision/settle enforce.
+/// Where an access came from; decides whose money a call on it spends.
+// SYNC: AccessOrigin <-> packages/weft-graph/src/protocol.ts CostOrigin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccessOrigin {
-    /// The user's own key, their own provider account. Nothing to enforce.
+    /// The user's own key, their own provider account.
     UserProvided,
-    /// The deployment's configured key. Usage of it may be metered and
-    /// refused by the deployment.
+    /// A deployment-granted credential for the deployment's configured key.
     Deployment,
 }
 
-/// Access to a paid provider: what to authenticate with, and the address to
-/// send it to.
+/// Access to a paid provider: what to authenticate with, and (for a
+/// deployment-granted access) where the deployment routes calls on it.
 ///
-/// The two go together, which is what keeps a deployment's keys safe. Access
-/// on the user's OWN key carries the real key and the provider's own address.
-/// A DEPLOYMENT's key never enters this process: the credential is a stand-in
-/// for it, and the address is the broker's proxy for that provider, where
-/// the stand-in is swapped for the real key on the way out. So a caller just
-/// uses both, and nothing else has to know which kind it holds.
+/// The credential is used exactly like a key: spliced into the auth header
+/// by whatever library makes the call. Whether it IS the key or a
+/// deployment-managed credential for one is not the node's concern; the
+/// node uses `credential()` and the metered client does the rest.
 ///
 /// `Debug` redacts the credential so a key can never leak through an error
 /// string or a log line.
@@ -83,17 +59,21 @@ pub enum AccessOrigin {
 pub struct ProviderAccess {
     provider: String,
     credential: String,
-    base_url: Option<String>,
+    /// A deployment-granted access may carry a relay address: calls on its
+    /// credential are sent THERE (the relay holds the provider
+    /// relationship) instead of to the provider's own API. `None` = calls
+    /// go straight to the provider. Consumed by the metered client's
+    /// routing; nothing node-facing reads it.
+    relay_url: Option<String>,
     origin: AccessOrigin,
-    /// How long the paid call this access is for may run: a deployment
-    /// access's stand-in is alive exactly that long (and is retired earlier,
-    /// at close). Declared once, by the node, when it opens the access.
+    /// How long the provider work on this access may run: a deployment
+    /// credential is guaranteed usable exactly that long (the runtime may
+    /// retire it after). Declared once, when the access is opened.
     window: std::time::Duration,
 }
 
 impl ProviderAccess {
-    /// Access on the user's own key, sent straight to the provider (no
-    /// address of its own: the provider's default stands).
+    /// Access on the user's own key, sent straight to the provider.
     pub fn own(
         provider: impl Into<String>,
         key: impl Into<String>,
@@ -102,32 +82,32 @@ impl ProviderAccess {
         Self {
             provider: provider.into(),
             credential: key.into(),
-            base_url: None,
+            relay_url: None,
             origin: AccessOrigin::UserProvided,
             window,
         }
     }
 
-    /// Access on the deployment's key: `standin` stands in for the key, and
-    /// `base_url` is the broker proxy that swaps it for the real key.
+    /// Access granted by the deployment on its configured key.
+    /// `relay_url` is where calls on `credential` must be sent when the
+    /// deployment relays them; `None` = straight to the provider.
     pub fn deployment(
         provider: impl Into<String>,
-        standin: impl Into<String>,
-        base_url: impl Into<String>,
+        credential: impl Into<String>,
+        relay_url: Option<String>,
         window: std::time::Duration,
     ) -> Self {
         Self {
             provider: provider.into(),
-            credential: standin.into(),
-            base_url: Some(base_url.into()),
+            credential: credential.into(),
+            relay_url,
             origin: AccessOrigin::Deployment,
             window,
         }
     }
 
-    /// How long the paid call this access is for may run. The cost provision
-    /// takes its deadline from here, so the access's life and the provision's
-    /// window are the same declaration, made once.
+    /// How long the provider work on this access may run (the credential's
+    /// guaranteed-usable window).
     pub fn window(&self) -> std::time::Duration {
         self.window
     }
@@ -142,13 +122,10 @@ impl ProviderAccess {
         &self.credential
     }
 
-    /// Where requests on this access must go, given the provider's own API
-    /// address: the provider itself when the access is on the user's own key,
-    /// the broker proxy (which holds the real key) when it is on the
-    /// deployment's. Callers pass the address they would otherwise have used,
-    /// and get the one to actually use.
-    pub fn base_url(&self, provider_api: &str) -> String {
-        self.base_url.clone().unwrap_or_else(|| provider_api.to_string())
+    /// The deployment's relay for calls on this access, when it routes
+    /// them. Read by the metered client; nothing node-facing needs it.
+    pub fn relay_url(&self) -> Option<&str> {
+        self.relay_url.as_deref()
     }
 
     pub fn origin(&self) -> AccessOrigin {
@@ -163,76 +140,6 @@ impl std::fmt::Debug for ProviderAccess {
             .field("credential", &"<redacted>")
             .field("origin", &self.origin)
             .finish()
-    }
-}
-
-/// What a node declares before a paid call: the cost and how well it
-/// knows it.
-///
-/// `exact: false` (an [`estimate`](Self::estimate)) is the metered-output
-/// family (an LLM call): `amount_usd` is a deliberately-high ceiling and
-/// the settle brings it down to the actual. `exact: true` (an
-/// [`exact`](Self::exact) provision) is the fixed-price family (one
-/// search = one credit): the amount IS the price, so a provision that
-/// was never settled (the runtime died between the call and the settle)
-/// can be resolved at the provisioned amount itself.
-///
-/// How long the paid action may run comes from the [`ProviderAccess`] the
-/// call is made on ([`ProviderAccess::window`]): the node declares it once,
-/// when it opens the access, and it bounds both the access's life and how
-/// long an unsettled provision waits before it is treated as abandoned.
-#[derive(Debug, Clone)]
-pub struct CostProvision {
-    pub model: Option<String>,
-    pub amount_usd: f64,
-    pub exact: bool,
-}
-
-impl CostProvision {
-    /// A ceiling estimate (metered-output pricing): settle brings it down.
-    pub fn estimate(amount_usd: f64) -> Self {
-        Self { model: None, amount_usd, exact: false }
-    }
-
-    /// An exact price (fixed-per-call pricing): the amount IS the cost.
-    pub fn exact(amount_usd: f64) -> Self {
-        Self { exact: true, ..Self::estimate(amount_usd) }
-    }
-
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
-        self
-    }
-}
-
-/// A live cost provision, returned by `ctx.provision_cost` and consumed by
-/// `ctx.settle_cost`. Consuming (not `Clone`) so one provision gets
-/// exactly one settle. Remembers who it was provisioned for (service, model),
-/// so settling needs only the actual amount.
-///
-#[must_use = "a provisioned cost must be settled (ctx.settle_cost), on failure paths too"]
-#[derive(Debug)]
-pub struct CostHold {
-    /// The deployment's hold id when the access is on the deployment's key
-    /// and the deployment meters usage; `None` for user keys / unmetered
-    /// deployments.
-    pub(crate) hold_id: Option<String>,
-    /// The billed service (the provisioning access's provider).
-    pub(crate) service: String,
-    /// The model the provisioned call targets, when there is one.
-    pub(crate) model: Option<String>,
-}
-
-impl CostHold {
-    /// Only `ExecutionContext::provision_cost` mints a hold, so one provision
-    /// yields exactly one hold (and, with `settle_cost` consuming it, one
-    /// settle): node code cannot fabricate one. Hence `pub(crate)`.
-    pub(crate) fn new(hold_id: Option<String>, service: String, model: Option<String>) -> Self {
-        Self { hold_id, service, model }
-    }
-
-    pub fn hold_id(&self) -> Option<&str> {
-        self.hold_id.as_deref()
     }
 }
 
@@ -286,31 +193,41 @@ mod tests {
         let rendered = format!("{access:?}");
         assert!(!rendered.contains("sk-very-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+
+        let managed = ProviderAccess::deployment(
+            "openrouter",
+            "managed-credential",
+            Some("http://relay.internal/v1/provider/openrouter".into()),
+            CALL_WINDOW,
+        );
+        let rendered = format!("{managed:?}");
+        assert!(!rendered.contains("managed-credential"), "{rendered}");
     }
 
-    /// An access answers where its requests go, given the provider's own API:
-    /// access on the user's own key goes to the provider itself, access on
-    /// the deployment's key goes to the broker proxy that holds the real key.
-    /// One unconditional question, so no caller branches on the origin.
+    /// An access carries what to authenticate with and, for a
+    /// deployment-granted one, where its calls are routed. The node only
+    /// ever reads the credential; the routing is the metered client's.
     #[test]
-    fn an_access_answers_where_its_requests_go() {
-        let provider_api = "https://openrouter.ai/api/v1";
-
+    fn an_access_carries_credential_and_routing() {
         let own = ProviderAccess::own("openrouter", "sk-users-own", CALL_WINDOW);
-        assert_eq!(own.base_url(provider_api), provider_api, "a user's key goes to the provider");
         assert_eq!(own.credential(), "sk-users-own");
+        assert_eq!(own.relay_url(), None, "a user's key goes to the provider");
+        assert_eq!(own.origin(), AccessOrigin::UserProvided);
 
-        let proxy = provider_proxy_url("http://broker:9090", "openrouter");
-        let deployment =
-            ProviderAccess::deployment("openrouter", "weftstandin-abc", &proxy, CALL_WINDOW);
+        let relayed = ProviderAccess::deployment(
+            "openrouter",
+            "managed-credential",
+            Some("http://relay.internal/v1/provider/openrouter".into()),
+            CALL_WINDOW,
+        );
+        assert_eq!(relayed.credential(), "managed-credential");
         assert_eq!(
-            deployment.base_url(provider_api),
-            "http://broker:9090/v1/provider/openrouter",
-            "deployment access goes to the broker proxy, never the provider"
+            relayed.relay_url(),
+            Some("http://relay.internal/v1/provider/openrouter"),
         );
-        assert!(
-            deployment.credential().starts_with(STANDIN_PREFIX),
-            "deployment access carries a stand-in, never the key"
-        );
+        assert_eq!(relayed.origin(), AccessOrigin::Deployment);
+
+        let direct = ProviderAccess::deployment("openrouter", "the-key", None, CALL_WINDOW);
+        assert_eq!(direct.relay_url(), None, "an unrelayed grant goes straight to the provider");
     }
 }

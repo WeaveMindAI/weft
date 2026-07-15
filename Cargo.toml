@@ -16,6 +16,7 @@ members = [
     "crates/weft-infra",
     "crates/weft-infra-supervisor",
     "crates/weft-platform-traits",
+    "crates/weft-providers",
     "crates/weft-e2e",
 ]
 
@@ -36,6 +37,10 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# The injectable-client seam for metered paid calls: `ctx.metered_client`
+# returns a `ClientWithMiddleware`, the ecosystem-standard way to hand a
+# library an HTTP client with behavior layered behind it.
+reqwest-middleware = { version = "0.4", features = ["json"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # S3-compatible object storage (the ObjectStore slot: GCS / SeaweedFS / AWS /
@@ -88,3 +93,4 @@ weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
 weft-platform-traits = { path = "crates/weft-platform-traits" }
+weft-providers = { path = "crates/weft-providers" }

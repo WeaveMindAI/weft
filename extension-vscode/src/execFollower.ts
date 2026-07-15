@@ -27,7 +27,7 @@ import type {
   NodeExecEvent,
 } from './shared/protocol';
 
-// SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent
+// SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 export type DispatcherEvent =
   | { kind: 'execution_started'; color: string; entry_node: string; project_id: string }
   | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; project_id: string }
@@ -64,8 +64,11 @@ export type DispatcherEvent =
   // public URL emit this when the URL changes (re-activate, new
   // mount path, etc.). UI invalidates any cached chip.
   | { kind: 'trigger_url_changed'; project_id: string; node_id: string; url: string }
-  // Cost report. Workers emit one per `report_cost` call.
-  | { kind: 'cost_reported'; color: string; project_id: string; service: string; amount_usd: number }
+  // One metered call's cost record (a provider meter's figure), attributed
+  // to the exact firing. amount_usd null = the meter could not resolve the
+  // figure. cost_id is the record's stable identity (the webview dedups on
+  // it: the same journal row can arrive via both replay and live streams).
+  | { kind: 'cost_reported'; color: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'user-provided' | 'deployment' }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -478,6 +481,18 @@ export class ExecutionFollower implements vscode.Disposable {
           reason: e.reason,
         });
         break;
+      case 'cost_reported':
+        // One metered call's cost record: fold it onto the firing's row
+        // (the webview dedups by costId across replay/live overlap).
+        this.post({
+          kind: 'execCost',
+          nodeId: e.node_id,
+          frames: e.frames,
+          costId: e.cost_id,
+          amountUsd: e.amount_usd,
+          origin: e.origin,
+        });
+        break;
       // Events handled by `autoFollow` (action-bar refresh) or
       // user-facing banners; this execution-scoped follower
       // intentionally no-ops on them. Listing them keeps the
@@ -493,7 +508,6 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'project_deactivated':
       case 'project_transition_changed':
       case 'trigger_url_changed':
-      case 'cost_reported':
       case 'infra_config_error':
         break;
       default: {

@@ -37,12 +37,11 @@ pub enum TaskKind {
     /// Worker: cancel a running execution by color. Addressed to
     /// one pod via `target_pod_name`.
     CancelExecution,
-    /// Dispatcher: journal a `CostReported` event on behalf of a
-    /// worker. Producer = the broker's cost-settle handler (a
-    /// worker's `ctx.settle_cost`). Routed
+    /// Dispatcher: journal a `CostReported` event for one metered
+    /// call (a provider meter's figure). Routed
     /// through the task table (not direct journal write) so a
     /// worker pod dying mid-call still has the cost record
-    /// committed: the broker's atomic INSERT into `task` is the
+    /// committed: the atomic INSERT into `task` is the
     /// durable handoff, and the dispatcher's executor catches up
     /// later regardless of pod state.
     RecordCost,
@@ -127,16 +126,25 @@ pub struct SpawnPodPayload {
     pub owner_dispatcher: String,
 }
 
-/// Payload for `TaskKind::RecordCost`. The dispatcher's executor
-/// validates `amount_usd >= 0` and writes the journal event. The
-/// broker also rejects negative amounts on enqueue so a malicious
-/// worker can't submit and immediately die before validation runs.
+/// Payload for `TaskKind::RecordCost`: one metered call's cost, produced by
+/// a provider meter, journaled as a `CostReported` event attributed to the
+/// exact firing (`node_id` + `frames`). `amount_usd: None` = the meter could
+/// not resolve the figure (recorded as unknown, never $0). `billed` = the
+/// figure moved credits, vs a measurement on a key the user holds. The
+/// dispatcher's executor validates a present amount is `>= 0` and writes the
+/// journal event; the broker also rejects bad amounts on enqueue so a
+/// malicious worker can't submit and immediately die before validation runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordCostPayload {
     pub color: String,
+    pub node_id: String,
+    pub frames: weft_core::LoopFrames,
     pub service: String,
     pub model: Option<String>,
-    pub amount_usd: f64,
+    pub amount_usd: Option<f64>,
+    pub billed: bool,
+    /// Whose key the call spent (the access the metered call rode).
+    pub origin: weft_core::AccessOrigin,
     pub metadata: serde_json::Value,
 }
 
@@ -146,4 +154,48 @@ pub struct RecordLogPayload {
     pub color: String,
     pub level: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RecordCostPayload` is the whole worker->dispatcher cost contract, so
+    /// its wire shape is pinned here: both the resolved and the
+    /// honest-unknown (`amount_usd: null`) arms, the always-false worker
+    /// `billed`, and the key origin.
+    #[test]
+    fn record_cost_payload_round_trip_both_amount_arms() {
+        for amount_usd in [Some(0.000031), None] {
+            let payload = RecordCostPayload {
+                color: "c1".into(),
+                node_id: "ask".into(),
+                frames: vec![weft_core::LoopIteration { index: 2 }],
+                service: "openrouter".into(),
+                model: Some("m".into()),
+                amount_usd,
+                billed: false,
+                origin: weft_core::AccessOrigin::UserProvided,
+                metadata: serde_json::json!({ "tokensPrompt": 12 }),
+            };
+            let v = serde_json::to_value(&payload).unwrap();
+            // The full literal object pins the FIELD NAMES on the wire (a
+            // symmetric struct-field rename would round-trip green while
+            // breaking every peer that reads the raw JSON).
+            assert_eq!(
+                v,
+                serde_json::json!({
+                    "color": "c1", "node_id": "ask", "frames": [{"index": 2}],
+                    "service": "openrouter", "model": "m", "amount_usd": amount_usd,
+                    "billed": false, "origin": "user-provided",
+                    "metadata": {"tokensPrompt": 12}
+                })
+            );
+            let back: RecordCostPayload = serde_json::from_value(v).unwrap();
+            assert_eq!(back.amount_usd, amount_usd);
+            assert!(!back.billed);
+            assert_eq!(back.origin, weft_core::AccessOrigin::UserProvided);
+            assert_eq!(back.frames, vec![weft_core::LoopIteration { index: 2 }]);
+        }
+    }
 }

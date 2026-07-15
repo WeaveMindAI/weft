@@ -223,35 +223,76 @@ impl SettledRun {
         Ok(self)
     }
 
-    /// Every cost the execution reported, as `(service, amount_usd)` in
-    /// order. A paid node settles its cost on every path, so this is the
-    /// execution's money trail.
-    pub fn costs(&self) -> Vec<(String, f64)> {
+    /// Every cost the execution recorded, as `(service, amount_usd)` in order.
+    /// Each is a provider meter's measurement of a real call; the execution's
+    /// money trail. A record whose amount is `null` (the meter could not
+    /// resolve the figure, an honest unknown) is skipped here.
+    /// Every resolved cost record: `(service, origin, amount_usd)`. Origin is
+    /// the wire string of whose key the call spent (`"user-provided"` or
+    /// `"deployment"`). Records with a null amount (an honest unknown) are
+    /// not in this list.
+    pub fn costs(&self) -> Vec<(String, String, f64)> {
         self.replay
             .by_kind("cost_reported")
             .filter_map(|e| {
                 Some((
                     e.str_field("service")?.to_string(),
+                    e.str_field("origin")?.to_string(),
                     e.0.get("amount_usd").and_then(Value::as_f64)?,
                 ))
             })
             .collect()
     }
 
-    /// Assert the execution reported exactly one cost for `service`, and that
-    /// it was actually priced (a positive amount): the call was made, and its
-    /// cost resolved.
-    pub fn assert_paid(&self, service: &str) -> Result<&Self> {
+    /// Assert the execution recorded exactly one cost for `service`, resolved
+    /// to a real positive amount AND spent on the expected key (`origin` is
+    /// `"user-provided"` or `"deployment"`): the call was made, it rode the
+    /// key the test set up (no silent fall-through to the other one), and the
+    /// meter read a real figure off the real response. (This is measurement,
+    /// not billing: on this path the cost is recorded, not charged.)
+    ///
+    /// A cost record journals AFTER the terminal event by design (the meter
+    /// resolves detached from the node, possibly via a provider follow-up
+    /// query), so this waits for the record to land before judging it. The
+    /// deadline covers the resolve's own internal bounds (the follow-up
+    /// client's request timeout, the record's bounded enqueue retries, the
+    /// task fold); a record still absent past it is a real failure.
+    pub async fn assert_measured(&mut self, service: &str, origin: &str) -> Result<&Self> {
+        const COST_TRAIL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+        self.refresh_replay_until(
+            &format!("the '{service}' call's cost record to land on the journal"),
+            COST_TRAIL_DEADLINE,
+            |replay| {
+                replay
+                    .by_kind("cost_reported")
+                    .any(|e| e.str_field("service") == Some(service))
+            },
+        )
+        .await?;
         let costs = self.costs();
-        let for_service: Vec<f64> =
-            costs.iter().filter(|(s, _)| s == service).map(|(_, amount)| *amount).collect();
+        let for_service: Vec<(&str, f64)> = costs
+            .iter()
+            .filter(|(s, _, _)| s == service)
+            .map(|(_, o, amount)| (o.as_str(), *amount))
+            .collect();
         match for_service.as_slice() {
-            [amount] if *amount > 0.0 => Ok(self),
-            [amount] => bail!(
-                "the '{service}' call reported a cost of ${amount}: the call happened but its \
-                 cost never resolved"
+            [(o, amount)] if *amount > 0.0 && *o == origin => Ok(self),
+            [(o, _)] if *o != origin => bail!(
+                "the '{service}' call spent on the '{o}' key, expected '{origin}': the call \
+                 did not ride the key the test set up"
             ),
-            [] => bail!("no cost reported for '{service}'; costs seen: {costs:?}"),
+            [(_, amount)] => bail!(
+                "the '{service}' call recorded a cost of ${amount}: the call happened but its \
+                 cost never resolved to a real figure"
+            ),
+            // The refresh above guarantees a record for the service EXISTS,
+            // so reaching here means its amount is null: the meter honestly
+            // could not resolve the figure. That is a final answer, not
+            // something to wait longer for.
+            [] => bail!(
+                "the '{service}' call's cost record landed with an UNKNOWN amount (the meter \
+                 could not resolve the figure); resolved costs seen: {costs:?}"
+            ),
             many => bail!("expected one '{service}' cost, got {}: {many:?}", many.len()),
         }
     }

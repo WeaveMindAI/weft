@@ -290,11 +290,29 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
+    /// One metered call's cost, as a provider meter measured it. The only
+    /// producer is a meter (run by the runtime around the call); nodes have
+    /// no way to state a cost. `amount_usd: None` = the meter could not
+    /// resolve the figure (recorded AS unknown, never as $0). `billed` =
+    /// the figure moved credits (a deployment-billed call) as opposed to a
+    /// measurement on a key the user holds; a data-model distinction for
+    /// debugging and the ledger, not a UI one.
     CostReported {
         color: Color,
+        node_id: String,
+        frames: LoopFrames,
+        /// The record's stable identity (from the durable task that carried
+        /// it). Consumers that see the same journal row more than once (a
+        /// replay stream overlapping a live one) dedup on it.
+        cost_id: String,
         service: String,
         model: Option<String>,
-        amount_usd: f64,
+        amount_usd: Option<f64>,
+        billed: bool,
+        /// Whose key the call spent: the user's own, or one the deployment
+        /// holds. Part of the money trail (a figure without "whose key" is
+        /// half an answer).
+        origin: weft_core::AccessOrigin,
         metadata: Value,
         at_unix: u64,
     },
@@ -1144,14 +1162,33 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                     }
                 }
             }
+            // A metered call's cost record: the cost of a firing belongs on
+            // its execution record. A record may already be terminal when
+            // the cost lands (a durable RecordCost task journals on its own
+            // timeline); the fold still books it onto the matching
+            // (color, frames) record. An unknown amount (`None`) adds
+            // nothing here (the sum is a number); the honest unknown lives
+            // in the event's own row.
+            ExecEvent::CostReported { color: c, node_id, frames, amount_usd, .. } => {
+                if let Some(amount) = amount_usd {
+                    if let Some(execs) = executions.get_mut(node_id) {
+                        if let Some(e) = execs
+                            .iter_mut()
+                            .rev()
+                            .find(|e| e.color == *c && &e.frames == frames)
+                        {
+                            e.cost_usd += amount;
+                        }
+                    }
+                }
+            }
             // Observability-only events: they carry no state the resume
             // fold needs. Bus replay and caller-exchange replay are read
             // straight from the row stream by the inspector, not from the
             // snapshot. Caller events are additionally non-durable by
             // design (a live connection dies with its worker), so they
             // never contribute to a resumed run's state.
-            ExecEvent::CostReported { .. }
-            | ExecEvent::LogLine { .. }
+            ExecEvent::LogLine { .. }
             | ExecEvent::ExecutionCompleted { .. }
             | ExecEvent::ExecutionFailed { .. }
             | ExecEvent::ExecutionCancelled { .. }

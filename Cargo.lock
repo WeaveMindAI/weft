@@ -1095,6 +1095,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1146,6 +1155,17 @@ dependencies = [
  "pin-project",
  "rand 0.8.6",
  "tokio",
+]
+
+[[package]]
+name = "eventsource-stream"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
+dependencies = [
+ "futures-core",
+ "nom",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -2056,6 +2076,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minillmlib"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589412f218b441eaf600cb7393983adac090a0d0ac6a895995b4a08ed66e569c"
+dependencies = [
+ "base64 0.22.1",
+ "dotenvy",
+ "eventsource-stream",
+ "futures",
+ "regex",
+ "reqwest",
+ "reqwest-middleware",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2542,8 +2586,10 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "encoding_rs",
  "futures-core",
  "futures-util",
+ "h2 0.4.15",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
@@ -2552,6 +2598,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -2573,6 +2620,21 @@ dependencies = [
  "wasm-streams",
  "web-sys",
  "webpki-roots",
+]
+
+[[package]]
+name = "reqwest-middleware"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57f17d28a6e6acfe1733fe24bcd30774d13bffa4b8a22535b4c8c98423088d4e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http 1.4.0",
+ "reqwest",
+ "serde",
+ "thiserror 1.0.69",
+ "tower-service",
 ]
 
 [[package]]
@@ -2809,6 +2871,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2886,6 +2958,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -4179,7 +4252,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "inventory",
- "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4236,6 +4309,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "dotenvy",
  "futures",
  "reqwest",
  "serde",
@@ -4246,6 +4320,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "weft-compiler",
  "weft-core",
  "weft-task-store",
 ]
@@ -4259,8 +4334,10 @@ dependencies = [
  "axum",
  "bytes",
  "futures",
+ "http 1.4.0",
  "parking_lot",
  "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4273,6 +4350,7 @@ dependencies = [
  "weft-infra",
  "weft-journal",
  "weft-platform-traits",
+ "weft-providers",
  "weft-task-store",
 ]
 
@@ -4381,6 +4459,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-providers"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "inventory",
+ "minillmlib",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "weft-task-store"
 version = "0.2.0"
 dependencies = [
@@ -4394,6 +4487,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "weft-core",
  "weft-platform-traits",
 ]
 

@@ -1,14 +1,13 @@
-//! `record_cost` task: durable handoff for a worker's
-//! `ctx.settle_cost`. The broker's cost-settle handler
-//! enqueues into the task table (one atomic SQL INSERT), then the
-//! worker can die freely. A dispatcher
+//! `record_cost` task: durable handoff for a metered call's cost record
+//! (a provider meter's figure, enqueued into the task table in one atomic
+//! SQL INSERT), after which the producer can die freely. A dispatcher
 //! pod claims this task on its own timeline and writes the
 //! `CostReported` journal event. Survives worker pod deletion or
 //! crash mid-flight.
 //!
-//! Negative-amount rejection runs at the broker on enqueue, so a
-//! compromised worker can't sneak a negative cost into the task
-//! table.
+//! Payload validation (amount null-or-non-negative, worker records never
+//! billed) runs at the broker on enqueue, so a compromised worker can't
+//! sneak a bad row into the task table.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -42,9 +41,17 @@ impl TaskExecutor<DispatcherState> for RecordCostExecutor {
             .record_event_dedup(
                 &weft_journal::ExecEvent::CostReported {
                     color,
+                    node_id: payload.node_id,
+                    frames: payload.frames,
+                    // The task id is the record's stable identity: retries
+                    // of the same task keep it, distinct records never
+                    // share it.
+                    cost_id: task.id.to_string(),
                     service: payload.service,
                     model: payload.model,
                     amount_usd: payload.amount_usd,
+                    billed: payload.billed,
+                    origin: payload.origin,
                     metadata: payload.metadata,
                     at_unix,
                 },

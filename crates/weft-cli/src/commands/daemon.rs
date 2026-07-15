@@ -1041,8 +1041,33 @@ async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
     if running.status.success() && !running.stdout.is_empty() {
         return Ok(());
     }
+    // The s3 identities file the container bind-mounts. Ensure it exists AS A
+    // FILE before any `docker start/run`: a start whose bind-mount source is
+    // missing makes Docker auto-create the source as an empty DIRECTORY, and a
+    // directory cannot be mounted onto the container's file target, which
+    // wedges every later start (`not a directory: mounting ... onto a file`).
+    // So we self-heal a stray directory here and (re)write the file, on BOTH
+    // the restart and the fresh-run path, instead of only writing it for a
+    // brand-new container.
+    let cfg_dir = data_dir().join("object-store");
+    let cfg_path = cfg_dir.join("s3.config.json");
+    if cfg_path.is_dir() {
+        std::fs::remove_dir_all(&cfg_path).with_context(|| {
+            format!(
+                "the object-store config path {} is a directory (Docker auto-created it from a \
+                 missing bind-mount source); remove it to write the real config file",
+                cfg_path.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&cfg_dir)?;
+    std::fs::write(
+        &cfg_path,
+        object_store_s3_config("weft-local", "weft-local-dev-secret"),
+    )?;
+
     // A stopped container with our name (previous daemon run): start it, preserving
-    // its data volume.
+    // its data volume. Its config file is now guaranteed present as a file above.
     let exists = Command::new("docker")
         .args(["ps", "-aq", "-f", &format!("name=^{OBJECT_STORE_CONTAINER}$")])
         .output()
@@ -1056,14 +1081,6 @@ async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
         return Ok(());
     }
     println!("starting object store container '{OBJECT_STORE_CONTAINER}' on port {}", cfg.seaweed_port);
-    // Write the s3 identities file into the daemon's data dir and bind-mount it.
-    let cfg_dir = data_dir().join("object-store");
-    std::fs::create_dir_all(&cfg_dir)?;
-    let cfg_path = cfg_dir.join("s3.config.json");
-    std::fs::write(
-        &cfg_path,
-        object_store_s3_config("weft-local", "weft-local-dev-secret"),
-    )?;
     let port_map = format!("{}:8333", cfg.seaweed_port);
     let mount = format!("{}:/etc/seaweedfs/s3.config.json:ro", cfg_path.display());
     let status = Command::new("docker")

@@ -480,7 +480,7 @@ pub struct InfraEndpointUrlResponse {
     pub endpoint_url: Option<String>,
 }
 
-// ---------- Provider access + cost provisioning ----------
+// ---------- Provider access + cost recording ----------
 
 /// Worker asks the deployment for access to `provider` on ITS configured key
 /// (the node's key input was empty or the managed sentinel; a user-supplied
@@ -493,88 +493,46 @@ pub struct ProviderAccessRequest {
     pub color: String,
     pub project_id: String,
     pub node_id: String,
+    /// The opening firing's loop-frame coordinate, so anything the
+    /// deployment later books against this access (a measured cost) can be
+    /// attributed to the exact firing, not just the node.
+    pub frames: weft_core::LoopFrames,
     pub node_type: String,
     pub provider: String,
-    /// How long the paid call this access is for may reasonably take. The
-    /// stand-in is live for exactly that long, so a node that never closes
-    /// the access (a crash) still cannot leave a spendable credential behind.
+    /// How long the paid work this access is for may reasonably take: the
+    /// granted credential is guaranteed usable for that long, and the
+    /// deployment may retire it after (the crash backstop for a worker that
+    /// dies without giving the access back).
     pub expected_duration_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderAccessResponse {
-    /// A stand-in for the deployment's key: the key itself never leaves the
-    /// broker. Requests carrying it go to the broker's proxy for the
-    /// provider, which swaps it for the real key (see the broker's
-    /// `provider_proxy` module). The caller already knows the broker's
-    /// address, so the proxy URL is built worker-side.
-    pub standin: String,
+    /// What to authenticate with. Used exactly like a key by the caller.
+    pub credential: String,
+    /// Where calls on `credential` must be sent when the deployment relays
+    /// them; `None` = straight to the provider's own API. The metered
+    /// client does that routing.
+    pub relay_url: Option<String>,
 }
 
-/// Worker is done with a provider: give the access back NOW, rather than
-/// leaving it live to its window (which is only the crash backstop).
+/// Runtime is done with a deployment-granted access: give it back NOW,
+/// rather than leaving the credential usable to its window (which is only
+/// the crash backstop). Sent by the engine when the node that opened the
+/// access finishes; nothing node-facing makes this call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderAccessCloseRequest {
     pub color: String,
-    pub standin: String,
+    pub credential: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderAccessCloseResponse {}
 
-/// Worker declares the cost of an imminent call on a deployment key. The
-/// deployment may meter it (hold against a usage budget) or refuse (loud
-/// 4xx with a user-facing message).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostProvisionRequest {
-    pub color: String,
-    pub project_id: String,
-    pub node_id: String,
-    pub node_type: String,
-    pub provider: String,
-    /// Service/model audit detail from the node's cost report.
-    pub service: String,
-    pub model: Option<String>,
-    /// The declared cost of the exact call about to be made: a ceiling
-    /// when `exact` is false, the true price when `exact` is true.
-    pub amount_usd: f64,
-    /// The amount IS the price (fixed-per-call pricing). An unsettled
-    /// exact provision can be resolved at the provisioned amount itself
-    /// (the call almost certainly happened; only the settle was lost).
-    pub exact: bool,
-    /// How long the paid action should reasonably take. An unsettled
-    /// provision counts as abandoned only well after this window, so
-    /// declared long-running actions are never swept mid-flight.
-    pub expected_duration_secs: u64,
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostProvisionResponse {
-    /// The deployment's tracked hold when it meters usage; `None` when
-    /// nothing is tracked (nothing to settle later).
-    pub hold_id: Option<String>,
-}
-
-/// Worker reports what a provisioned call ACTUALLY cost. Settling IS the
-/// recording: the broker durably records the amount against the execution
-/// (the journal's cost trail), and additionally releases the metered hold
-/// when the provision took one (`hold_id`). `dedup_key` makes the record
-/// idempotent under worker retries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostSettleRequest {
-    pub color: String,
-    pub hold_id: Option<String>,
-    /// The billed service (the key's provider) and model, from the hold.
-    pub service: String,
-    pub model: Option<String>,
-    pub amount_usd: f64,
-    pub metadata: Value,
-    pub dedup_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CostSettleResponse {}
+// A metered call's cost record rides the generic task rail (a
+// `TaskKind::RecordCost` enqueued like any worker side effect), so there is
+// no dedicated cost endpoint or wire type: `weft_task_store::RecordCostPayload`
+// is the whole contract.
 
 // ---------- Project (worker fetches its own definition) ----------
 
@@ -1690,6 +1648,65 @@ mod supervisor_protocol_tests {
         assert_eq!(back.command_id, 7);
         assert_eq!(back.preserve_pvcs, vec!["data".to_string()]);
         assert_eq!(back.instance_id, "wn-abc-tgi-12");
+    }
+
+    #[test]
+    fn provider_access_request_round_trip() {
+        let req = ProviderAccessRequest {
+            color: "c1".into(),
+            project_id: "p1".into(),
+            node_id: "ask".into(),
+            frames: vec![weft_core::LoopIteration { index: 3 }],
+            node_type: "openrouter.inference".into(),
+            provider: "openrouter".into(),
+            expected_duration_secs: 120,
+        };
+        // The full literal object pins the FIELD NAMES on the wire: a
+        // symmetric struct-field rename round-trips fine but breaks the
+        // peer, so equality on the serialized form is the real contract.
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "color": "c1", "project_id": "p1", "node_id": "ask",
+                "frames": [{"index": 3}], "node_type": "openrouter.inference",
+                "provider": "openrouter", "expected_duration_secs": 120
+            })
+        );
+        let back: ProviderAccessRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.frames, vec![weft_core::LoopIteration { index: 3 }]);
+        assert_eq!(back.provider, "openrouter");
+        assert_eq!(back.expected_duration_secs, 120);
+    }
+
+    #[test]
+    fn provider_access_response_round_trip_both_relay_arms() {
+        for relay_url in [Some("http://relay/prov".to_string()), None] {
+            let resp = ProviderAccessResponse {
+                credential: "cred".into(),
+                relay_url: relay_url.clone(),
+            };
+            // Field names pinned literally (a symmetric rename would
+            // round-trip but break the peer).
+            let v = serde_json::to_value(&resp).unwrap();
+            assert_eq!(
+                v,
+                json!({ "credential": "cred", "relay_url": relay_url })
+            );
+            let back: ProviderAccessResponse = serde_json::from_value(v).unwrap();
+            assert_eq!(back.credential, "cred");
+            assert_eq!(back.relay_url, relay_url);
+        }
+    }
+
+    #[test]
+    fn provider_access_close_request_round_trip() {
+        let req = ProviderAccessCloseRequest { color: "c1".into(), credential: "cred".into() };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v, json!({ "color": "c1", "credential": "cred" }));
+        let back: ProviderAccessCloseRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.credential, "cred");
+        assert_eq!(back.color, "c1");
     }
 
     #[test]

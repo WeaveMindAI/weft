@@ -36,11 +36,25 @@ static READY: OnceCell<()> = OnceCell::const_new();
 /// its own start, so it never destroys the evidence of the failure that stopped the
 /// previous run.
 pub async fn up() -> Result<Dispatcher> {
+    load_repo_env();
     READY
         .get_or_try_init(|| async { bring_up().await })
         .await?;
     sweep_leftovers().await?;
     Dispatcher::from_env()
+}
+
+/// Load the repo-root `.env` into this test process's environment (the same
+/// uncommitted file the daemon's setup reads provider keys from), so a test
+/// that spends on a real key finds it without the operator re-exporting it
+/// into the test shell. Never overrides an already-set var, and a missing
+/// `.env` is fine (a test needing a key fails loudly on its own). Only under
+/// the `e2e` feature: `.env` loading is meaningless without the live system.
+fn load_repo_env() {
+    #[cfg(feature = "e2e")]
+    if let Ok(root) = repo_root() {
+        let _ = dotenvy::from_path(root.join(".env"));
+    }
 }
 
 /// Run `setup.sh` to bring the cluster to current code and wait for the dispatcher

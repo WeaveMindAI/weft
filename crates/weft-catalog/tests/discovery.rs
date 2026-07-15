@@ -279,11 +279,7 @@ fn package_metadata_defaults_merge_key_by_key_member_wins() {
     write_package_toml(&pkg, "pack");
     fs::write(
         pkg.join("metadata.json"),
-        format!(
-            r#"{{ "formFieldSpecs": {},
-                  "provider": {{ "name": "svc", "base_url": "https://svc.example" }} }}"#,
-            specs_json("root_spec")
-        ),
+        format!(r#"{{ "formFieldSpecs": {} }}"#, specs_json("root_spec")),
     )
     .unwrap();
     write_node(&pkg.join("inherits"), "Inherits");
@@ -323,14 +319,6 @@ fn package_metadata_defaults_merge_key_by_key_member_wins() {
     assert_eq!(field_type("Overrides"), Some("member_spec".into()), "member's own key wins wholesale");
     assert_eq!(field_type("Bare"), Some("bare_spec".into()), "bare node reads its own metadata");
 
-    let provider = |t: &str| cat.provider_of(t).map(|d| d.name.clone());
-    assert_eq!(provider("Inherits"), Some("svc".into()), "provider inherits from package defaults");
-    assert_eq!(
-        provider("Overrides"),
-        Some("svc".into()),
-        "overriding one key must not drop the others"
-    );
-    assert_eq!(provider("Bare"), None, "a bare node with no declaration declares nothing");
 }
 
 /// A package-level `metadata.json` that sets an IDENTITY key (`type`,

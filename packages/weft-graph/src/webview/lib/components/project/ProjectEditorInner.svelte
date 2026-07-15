@@ -519,6 +519,19 @@
 		return execPrefix + localId;
 	}
 
+	/** Whose key a group's members spent, folded for the group's synthetic
+	 *  execution row: one distinct origin passes through, disagreeing
+	 *  members read 'mixed', no cost records means no origin. */
+	function groupCostOrigin(
+		members: { costOrigin?: 'user-provided' | 'deployment' | 'mixed' }[],
+	): 'user-provided' | 'deployment' | 'mixed' | undefined {
+		const origins = new Set(
+			members.map((e) => e.costOrigin).filter((o) => o !== undefined),
+		);
+		if (origins.size === 0) return undefined;
+		return origins.size === 1 ? [...origins][0] : 'mixed';
+	}
+
 	function createNodeUpdateHandler(nodeId: string) {
 		return (updates: NodeDataUpdates) => {
 			// A collapse/expand TOGGLE is `expanded` actually CHANGING value, not
@@ -1467,6 +1480,10 @@
 								// shows `port: (closed)` rows.
 								closedPorts: inExec.closedPorts,
 								costUsd: allRelated.reduce((sum, e) => sum + (e.costUsd || 0), 0),
+								// An unknown member cost keeps the group honest too: the
+								// summed figure alone would read as the full price.
+								costUnknown: allRelated.some((e) => e.costUnknown),
+								costOrigin: groupCostOrigin(allRelated),
 								logs: [],
 								color: inExec.color,
 								frames: inExec.frames,

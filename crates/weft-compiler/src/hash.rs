@@ -380,38 +380,6 @@ mod fs_hashes {
         Ok(hex(&hasher.finalize()))
     }
 
-    /// Per-node-type content hashes for every node type a project
-    /// references: `node_type -> compute_node_package_hash(its package
-    /// root)`. Types sharing a package share the hash (the package is the
-    /// compile unit). The build's manifest of "exactly which node code
-    /// went into this binary".
-    pub fn compute_node_source_hashes(
-        definition: &ProjectDefinition,
-        project_root: &Path,
-        weft_root: &Path,
-        catalog: &FsCatalog,
-    ) -> Result<BTreeMap<String, SourceHash>> {
-        let referenced = crate::codegen::collect_node_types(definition);
-        let bases = [project_root, weft_root];
-        let mut by_root: BTreeMap<PathBuf, SourceHash> = BTreeMap::new();
-        let mut out = BTreeMap::new();
-        for nt in &referenced {
-            let Some(pkg) = catalog.package_of(nt) else {
-                anyhow::bail!("node type {nt:?} referenced by the project is not in the catalog");
-            };
-            let hash = match by_root.get(&pkg.root) {
-                Some(h) => h.clone(),
-                None => {
-                    let h = compute_node_package_hash(&pkg.root, &bases)?;
-                    by_root.insert(pkg.root.clone(), h.clone());
-                    h
-                }
-            };
-            out.insert(nt.clone(), hash);
-        }
-        Ok(out)
-    }
-
     /// Hash everything that affects the running infrastructure.
     /// Scoped to the infra closure: every node where `requires_infra` is
     /// true plus every node upstream of one (the chain that produces the

@@ -116,9 +116,7 @@ pub use context::{
     ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, InputBag, Phase,
     StorageHandle,
 };
-pub use access::{
-    AccessOrigin, CostHold, CostProvision, ProviderAccess, PLATFORM_KEY_SENTINEL,
-};
+pub use access::{AccessOrigin, ProviderAccess, PLATFORM_KEY_SENTINEL};
 pub use error::{WeftError, WeftResult};
 pub use infra::{
     Access, AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
@@ -143,7 +141,7 @@ pub use weft_node_derive::NodeManifest;
 #[cfg(feature = "runtime")]
 pub use node::{Node, NodeCatalog};
 pub use primitive::{
-    AwaitedEntry, AwaitedEntryKind, CostReport, ExecutionSnapshot, KickedNode, SignalAuth,
+    AwaitedEntry, AwaitedEntryKind, ExecutionSnapshot, KickedNode, SignalAuth,
     SignalRouting, SignalSpec, SignalSurface, SuspensionInfo,
 };
 pub use project::{

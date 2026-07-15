@@ -439,11 +439,11 @@ impl InfraReader for BrokerInfraClient {
     }
 }
 
-// ---------- Provider access + cost provisioning ----------
+// ---------- Provider access + cost recording ----------
 
-/// Worker-side client for the paid-call endpoints: open access to the
-/// deployment's provider key, provision an upper-bound cost before a call on
-/// it, settle to the actual after, give the access back.
+/// Worker-side client for the provider-access endpoints: open access to the
+/// deployment's provider key, give it back when the node finishes. (Cost
+/// records ride the generic task rail, not a dedicated endpoint.)
 pub struct BrokerPaidCallClient {
     http: HttpCore,
 }
@@ -462,26 +462,11 @@ impl BrokerPaidCallClient {
         self.http.post("/v1/access/open", req).await
     }
 
-    pub async fn provision(&self, req: &CostProvisionRequest) -> Result<CostProvisionResponse> {
-        self.http.post("/v1/cost/provision", req).await
-    }
-
-    pub async fn settle(&self, req: &CostSettleRequest) -> Result<CostSettleResponse> {
-        self.http.post("/v1/cost/settle", req).await
-    }
-
     pub async fn close_provider_access(
         &self,
         req: &ProviderAccessCloseRequest,
     ) -> Result<ProviderAccessCloseResponse> {
         self.http.post("/v1/access/close", req).await
-    }
-
-    /// The broker's proxy for a provider: where a deployment access's
-    /// requests are addressed (the broker swaps the stand-in for the real
-    /// key there).
-    pub fn provider_proxy_url(&self, provider: &str) -> String {
-        weft_core::access::provider_proxy_url(&self.http.base_url, provider)
     }
 }
 

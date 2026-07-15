@@ -23,6 +23,9 @@ tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# LoopFrames on RecordCostPayload: a cost record is attributed to the exact
+# firing (node + loop-frame coordinate), typed rather than smuggled as JSON.
+weft-core = { workspace = true }
 
 [dev-dependencies]
 # `test-util` enables tokio's paused virtual clock (start_paused +

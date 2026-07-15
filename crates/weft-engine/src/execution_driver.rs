@@ -868,7 +868,6 @@ async fn drive(
                 edge_idx,
                 pulses,
                 journal,
-                clients.clock.as_ref(),
                 pod_name,
                 phase_scope.as_ref(),
                 loop_runtime,
@@ -1323,7 +1322,11 @@ async fn drive(
             if let Some(payload) = wake_payload {
                 runner = runner.with_wake_payload(payload);
             }
-            let handle = Arc::new(runner) as Arc<dyn weft_core::context::ContextHandle>;
+            // A concrete clone survives next to the ctx so the spawn can
+            // give back the firing's provider accesses after the body ends.
+            let runner = Arc::new(runner);
+            let runner_for_close = runner.clone();
+            let handle = runner as Arc<dyn weft_core::context::ContextHandle>;
 
             let ctx = ExecutionContext::new(
                 exec_id.to_string(),
@@ -1457,7 +1460,15 @@ async fn drive(
                 // channel, applied by the loop while the task runs, and
                 // always BEFORE this terminal by FIFO ordering). The
                 // return just signals terminal outcome.
+                //
+                // The guard gives back every deployment-granted provider
+                // access the body opened, on EVERY exit: awaited inline on
+                // normal completion, spawned detached when the task is
+                // ABORTED mid-body (a cancel), where no code after
+                // `execute` ever runs. Runtime plumbing, not the node's job.
+                let access_guard = AccessCloseGuard(Some(runner_for_close));
                 let result = node_impl.execute(ctx).await;
+                access_guard.close_now().await;
                 let outcome = match result {
                     Ok(()) => NodeTaskOutcome::Completed,
                     Err(weft_core::error::WeftError::Suspended { token }) => {
@@ -1777,7 +1788,6 @@ async fn drive(
                     edge_idx,
                     pulses,
                     journal,
-                    clients.clock.as_ref(),
                     pod_name,
                     phase_scope.as_ref(),
                     loop_runtime,
@@ -2931,16 +2941,32 @@ async fn handle_node_skip(
     ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, closures).await;
 }
 
-/// CAP on the grace window for nodes that declared `interruptGrace`: time
-/// for an in-flight `execute` to observe the tripped cancellation flag
-/// and wrap up (settle a provisioned cost, close a paid stream) before
-/// the abort. The wait ends the instant every in-flight task finishes,
-/// so a node that settles in 2s stops in 2s; the cap only bounds a
-/// wrap-up that hangs. Sized for the slow real case: resolving a
-/// cancelled generation's cost from a provider ledger takes >7s
-/// (measured against OpenRouter: the record finalizes well after the
-/// client abort), plus retries.
-const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Gives a firing's deployment-granted provider accesses back on every exit
+/// of the node task. Normal completion calls [`Self::close_now`] (awaited
+/// inline, before the terminal ships); an ABORT (cancel) drops the guard
+/// mid-body, and the drop spawns the close detached, because nothing after
+/// the abort point ever runs. A close that cannot even be spawned (no
+/// runtime) is fine to skip silently here: the credential's own window is
+/// the documented backstop for exactly this case.
+struct AccessCloseGuard(Option<Arc<crate::context::RunnerHandle>>);
+
+impl AccessCloseGuard {
+    async fn close_now(mut self) {
+        if let Some(runner) = self.0.take() {
+            runner.close_opened_accesses().await;
+        }
+    }
+}
+
+impl Drop for AccessCloseGuard {
+    fn drop(&mut self) {
+        if let Some(runner) = self.0.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { runner.close_opened_accesses().await });
+            }
+        }
+    }
+}
 
 /// Single cancellation cleanup path. Called from BOTH cancellation
 /// entry points (loop-top check and idle-wait branch) so they have
@@ -2988,44 +3014,15 @@ async fn cancel_cleanup(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
-    clock: &dyn weft_platform_traits::Clock,
     pod_name: &str,
     phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
 ) {
-    // 0. Nodes that declared `interruptGrace` get a short window to
-    //    observe the tripped cancellation flag and wrap up (settle a
-    //    provisioned cost, close a paid stream) before the hard abort.
-    //    Only in-flight firings of opted-in nodes buy the window, so a
-    //    cancel with none of those aborts instantly, exactly as before.
-    let grace_wanted = executions.iter().any(|(node_id, execs)| {
-        execs.iter().any(|e| e.color == color && !e.status.is_terminal())
-            && project
-                .nodes
-                .iter()
-                .any(|n| n.id == *node_id && n.features.interrupt_grace)
-    });
-    if grace_wanted && !in_flight.is_empty() {
-        tracing::info!(
-            target: "weft_engine::execution_driver",
-            color = %color,
-            in_flight = in_flight.len(),
-            grace_secs = INTERRUPT_GRACE.as_secs(),
-            "interruptGrace node in flight; letting tasks observe the cancel before aborting"
-        );
-        let deadline = clock.sleep(INTERRUPT_GRACE);
-        tokio::pin!(deadline);
-        loop {
-            tokio::select! {
-                joined = in_flight.join_next() => {
-                    if joined.is_none() {
-                        break;
-                    }
-                }
-                _ = &mut deadline => break,
-            }
-        }
-    }
+    // An in-flight node's future is aborted immediately; it needs no window
+    // to wrap up first. A paid call's cost is measured by the metering tap
+    // BELOW the node's future, which finalizes on drop and resolves the
+    // figure detached (tracked by the pod's pending-cost records), so an
+    // aborted node body never loses money bookkeeping.
     // 1. Drive every spawned task to its abort point.
     in_flight.shutdown().await;
     // 2. Drain the task channel in one FIFO pass. Emissions: apply with
@@ -4558,6 +4555,7 @@ mod bus_comm_tests {
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
             paid_calls: crate::context::FakePaidCallClient::new(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
         };
 
         let outcome = run_one_execution(
@@ -4700,6 +4698,7 @@ mod bus_comm_tests {
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
             paid_calls: crate::context::FakePaidCallClient::new(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
         };
         let cancel = CancellationFlag::new_arc();
 
@@ -4962,6 +4961,7 @@ mod bus_comm_tests {
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
             paid_calls: crate::context::FakePaidCallClient::new(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -5398,46 +5398,44 @@ mod bus_comm_tests {
     );
 
     weft_core::stress_test!(
-        // interruptGrace: a node that watches `ctx.cancellation()` gets a
-        // grace window on cancel to run its interruption branch (settle a
-        // provisioned cost) before its future is aborted. The body
-        // provisions on the deployment key, signals readiness, parks on
-        // the cancellation flag, and settles once it trips; the test
-        // cancels only after the provision is in, then asserts the settle
-        // landed with the hold. Stress-looped: the settle races
-        // `cancel_cleanup`'s abort by construction, and the grace window
-        // is exactly what must make the node win every time.
-        name: interrupt_grace_lets_the_node_settle_before_the_abort,
+        // A cancelled node's deployment-granted provider access is given
+        // back by the RUNTIME even though the node's future is aborted
+        // mid-body (the node never runs any wrap-up code of its own; the
+        // AccessCloseGuard's drop path is what must fire). The body opens
+        // an access, signals readiness, and parks on the cancellation flag
+        // forever; the test cancels after the open is in, then asserts the
+        // close landed. Stress-looped: the drop-spawned close races the
+        // execution's teardown by construction.
+        name: a_cancelled_nodes_provider_access_is_given_back,
         runs: 32,
         worker_threads: 4,
         async fn body() {
             let project: ProjectDefinition = serde_json::from_value(json!({
-                "id": uuid::Uuid::new_v4(), "name": "grace", "description": null,
+                "id": uuid::Uuid::new_v4(), "name": "grant", "description": null,
                 "nodes": [{
                     "id": "payer", "nodeType": "Configurable", "label": null, "config": null,
                     "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [], "outputs": [],
-                    "features": { "interruptGrace": true }, "scope": [], "groupBoundary": null,
+                    "features": {}, "scope": [], "groupBoundary": null,
                     "requiresInfra": false, "images": []
                 }],
                 "edges": [], "groups": []
             }))
-            .expect("grace project");
+            .expect("grant project");
             let pid = project.id.to_string();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
             let ready_tx = std::sync::Arc::new(StdMutex::new(Some(ready_tx)));
             install_body(&pid, "payer", std::sync::Arc::new(move |ctx| {
                 let ready_tx = ready_tx.clone();
                 Box::pin(async move {
-                    let access = ctx.provider_access("openrouter", None).await?;
-                    let hold = ctx
-                        .provision_cost(&access, weft_core::CostProvision::estimate(1.0))
-                        .await?;
+                    let _access = ctx.provider_access("openrouter", None).await?;
                     if let Some(tx) = ready_tx.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
+                    // Park until the abort: the node itself never gives the
+                    // access back; the runtime must.
                     ctx.cancellation().cancelled().await;
-                    ctx.settle_cost(hold, 0.25, serde_json::json!({"interrupted": true})).await?;
+                    std::future::pending::<()>().await;
                     Ok(())
                 })
             }));
@@ -5451,7 +5449,7 @@ mod bus_comm_tests {
             journal.record_event(&ExecEvent::NodeKicked {
                 color, node_id: "payer".into(), payload: None, at_unix: 0,
             }, None).await.unwrap();
-            let fake_paid_calls = crate::context::FakePaidCallClient::metered();
+            let fake_paid_calls = crate::context::FakePaidCallClient::new();
             fake_paid_calls.set_key("openrouter", "sk-platform");
             let clients = EngineClients {
                 journal: journal.clone(),
@@ -5462,6 +5460,7 @@ mod bus_comm_tests {
                 clock: Arc::new(weft_platform_traits::clock::SystemClock),
                 storage: crate::storage::FakeWorkerStorage::new(),
                 paid_calls: fake_paid_calls.clone(),
+                pending_costs: crate::metering::PendingCostRecords::new(),
             };
             let cancel = CancellationFlag::new_arc();
             let run = tokio::spawn(run_one_execution(
@@ -5470,21 +5469,30 @@ mod bus_comm_tests {
                 cancel.clone(),
                 None,
             ));
-            ready_rx.await.expect("payer must reach its provisioned state");
+            ready_rx.await.expect("payer must reach its opened-access state");
             cancel.cancel();
             let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), run)
                 .await
-                .expect("cancel with grace must still terminate promptly")
+                .expect("cancel must terminate promptly")
                 .expect("join ok")
                 .expect("run ok");
             assert!(
                 matches!(outcome, ExecutionOutcome::Cancelled),
                 "cancelled execution reports Cancelled; got {outcome:?}"
             );
-            let settles = fake_paid_calls.settles.lock().unwrap();
-            assert_eq!(settles.len(), 1, "the interruption branch must settle exactly once");
-            assert_eq!(settles[0].amount_usd, 0.25);
-            assert_eq!(settles[0].hold_id.as_deref(), Some("hold-0"), "the provisioned hold is the one settled");
+            // The close is drop-spawned on abort, so it may land a beat
+            // after the run returns: poll briefly rather than sleep blind.
+            for _ in 0..100 {
+                if !fake_paid_calls.closed_accesses.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                *fake_paid_calls.closed_accesses.lock().unwrap(),
+                vec!["sk-platform".to_string()],
+                "the aborted body's access must be given back by the runtime"
+            );
         }
     );
 
@@ -5714,6 +5722,7 @@ mod bus_comm_tests {
                 clock: Arc::new(weft_platform_traits::clock::SystemClock),
                 storage: crate::storage::FakeWorkerStorage::new(),
                 paid_calls: crate::context::FakePaidCallClient::new(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
             };
             run_one_execution(
                 Arc::new(project),
@@ -6499,6 +6508,7 @@ mod bus_comm_tests {
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
             paid_calls: crate::context::FakePaidCallClient::new(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
         };
         run_one_execution(
             Arc::new(project),

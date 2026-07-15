@@ -451,6 +451,47 @@
         };
         return;
       }
+      if (msg.kind === 'execCost') {
+        // One metered call's cost, added onto the matching firing's total.
+        // Dedup by the record's stable identity: the dispatcher re-streams
+        // journal events on every follow/reconnect (replay + live overlap),
+        // so the same record can arrive twice. An unknown amount (null)
+        // sets the firing's costUnknown flag so it renders as "unknown",
+        // never disappearing into a $0-looking total.
+        const framesKey = JSON.stringify(msg.frames);
+        const rows = executionState.nodeExecutions[msg.nodeId];
+        const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
+        if (!rows || idx < 0) {
+          // The firing's row must already exist (node_started precedes any
+          // cost record on both the live and replay paths). A miss means an
+          // ordering/keying regression; surface it instead of losing money
+          // display silently.
+          console.warn('[weft] cost record for an unknown firing', msg);
+          return;
+        }
+        const seen = rows[idx].costIds ?? [];
+        if (seen.includes(msg.costId)) {
+          return;
+        }
+        executionState.nodeExecutions = {
+          ...executionState.nodeExecutions,
+          [msg.nodeId]: rows.map((r, i) =>
+            i === idx
+              ? {
+                  ...r,
+                  costIds: [...seen, msg.costId],
+                  costUsd: r.costUsd + (msg.amountUsd ?? 0),
+                  costUnknown: (r.costUnknown ?? false) || msg.amountUsd === null,
+                  costOrigin:
+                    r.costOrigin === undefined || r.costOrigin === msg.origin
+                      ? msg.origin
+                      : 'mixed',
+                }
+              : r,
+          ),
+        };
+        return;
+      }
       if (msg.kind === 'execEvent') {
         const e = msg.event;
         const state = e.state;

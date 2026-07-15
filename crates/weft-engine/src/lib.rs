@@ -8,6 +8,7 @@ pub(crate) mod caller_conn;
 pub(crate) mod context;
 pub(crate) mod execution_driver;
 pub(crate) mod loop_runtime;
+pub(crate) mod metering;
 pub mod run_pod;
 pub mod storage;
 

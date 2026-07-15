@@ -7,10 +7,12 @@ name = "openrouter"
 # than for "LLM" in general: another provider needs another key, another
 # catalog, and another node.
 #
-# minillmlib carries the price catalog, the token estimator and the cost
-# tracking, so the nodes need no HTTP client of their own. The `estimate`
-# feature is what bounds a call's cost before it is allowed to spend anything.
+# minillmlib carries the wire dialects and accepts an injected HTTP client
+# (`GeneratorInfo::with_http_client`), which is how every call rides
+# `ctx.metered_client`; the nodes need no HTTP client and no cost
+# bookkeeping of their own.
 [dependencies]
 async-trait = "0.1"
-minillmlib = { version = "0.5.5", features = ["estimate"] }
+minillmlib = "0.5.7"
 serde_json = "1"
+tokio = "1"
