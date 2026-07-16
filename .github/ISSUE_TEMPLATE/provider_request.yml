@@ -1,0 +1,52 @@
+name: Provider request
+description: Ask for a paid provider to be supported by the platform key.
+labels: ["provider-request", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Want the platform to pay for a provider's calls (so people using it do not have to bring their own key)? Tell us about it here.
+
+        You do not have to wait on us to use a provider. A provider defined inside your own project works today with your own key: write its meter as a shared `.rs` file in your package (see [authoring a provider meter](https://github.com/WeaveMindAI/weft/blob/main/docs/authoring-provider-meters.md)) and set your key on the node. This request is only for getting it onto the platform key, which needs a reviewed meter shipped in weft itself.
+
+  - type: input
+    id: name
+    attributes:
+      label: Provider name
+      description: The lowercase name the meter uses (its key lives in `<NAME>_API_KEY`).
+      placeholder: elevenlabs, tavily, deepgram, etc.
+    validations:
+      required: true
+
+  - type: input
+    id: base-url
+    attributes:
+      label: API base URL
+      placeholder: https://api.elevenlabs.io/v1
+    validations:
+      required: true
+
+  - type: textarea
+    id: pricing
+    attributes:
+      label: How does it charge?
+      description: How is a call priced (per token, per second of audio, per image, one flat credit per call)? Does the response report the cost, or is there a separate endpoint to look it up? A link to the provider's pricing page helps.
+    validations:
+      required: true
+
+  - type: textarea
+    id: existing-meter
+    attributes:
+      label: Meter you already wrote (if any)
+      description: If you have already written this provider's meter in your own project, paste it (or link a repo). A working meter is most of the review, and it is the fastest path to shipping.
+      render: rust
+    validations:
+      required: false
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What are you building that needs this provider? A concrete scenario helps us prioritize.
+    validations:
+      required: true

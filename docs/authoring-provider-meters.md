@@ -1,24 +1,55 @@
 # Authoring a provider meter
 
 A **meter** is the per-provider Rust impl that computes the REAL cost of a
-paid API call from the bytes of the request and the response. Each concrete
-meter is one file under `crates/weft-providers/src/providers/`. The shared
-toolkit meters build on (the trait, the route classification, the SSE tap
-helper) lives at the crate root, not in `providers/`.
+paid API call from the bytes of the request and the response.
 
-**Adding a provider is a file plus two lines, nothing central to update:**
+## Where a meter lives: weft, or your own project
 
-1. Write `providers/<name>.rs` with your `ProviderMeter` impl and a `'static`
-   meter value.
-2. Register it at the bottom of that file: `crate::register_meter!(MY_METER);`.
-3. Declare the module in `providers/mod.rs`: `pub mod <name>;`.
+A meter can live in either of two places, and it runs the same way in both
+(the worker runs it; there is no proxy or central service that has to know
+about it):
 
-The registry collects every `register_meter!` at link time, so there is no
-central array to edit and nothing to keep in sync. If you forget the
-`register_meter!` line the provider is simply unsupported (a loud refusal
-wherever a measured call is required, never a silent wrong number); the
-crate's `the_registry_is_well_formed` test guards the registry's shape
-(unique non-empty names, base URLs its routes sit under).
+- **In weft**, one file under `crates/weft-providers/src/providers/`. This is
+  a provider weft ships and reviews. It is the ONLY place a meter can be that
+  lets the platform key pay for the provider (see "Platform key" below).
+- **In your own project**, alongside the nodes that call the provider. In a
+  package, that is a shared `.rs` file at the package root; in a bare node (a
+  lone node with no package), it is the bottom of the node's own `mod.rs`.
+  Either way it ends in `weft_providers::register_meter!(...)` (see the package
+  layout in `authoring-nodes.md`). This lets a project support a provider weft
+  does not ship yet: it works with a key you set yourself, right away, no
+  waiting on anyone. The node and the meter connect only through the provider
+  name string, so the node never imports the meter.
+
+Either way, adding a provider is a file plus one line, nothing central to
+update:
+
+1. Write the file with your `ProviderMeter` impl and a `'static` meter value.
+2. Register it at the bottom of that file: `weft_providers::register_meter!(MY_METER);`
+   (inside weft's own crate, write `crate::register_meter!(MY_METER);`).
+3. If the file is under `weft-providers/src/providers/`, also declare the
+   module in `providers/mod.rs`: `pub mod <name>;`. A project's shared `.rs`
+   file needs no such line; the package picks it up on its own.
+
+The registry collects every `register_meter!` at link time (weft's meters and
+your project's alike, since your project compiles into the same worker), so
+there is no central array to edit and nothing to keep in sync. If you forget
+the `register_meter!` line the provider is simply unsupported (a loud refusal
+wherever a measured call is required, never a silent wrong number).
+
+## Platform key vs your own key
+
+The place a meter lives decides one thing: who can pay for the provider.
+
+- **Your own key** (you set it on the node) works with ANY meter, wherever it
+  lives. A project-defined provider is used exactly this way.
+- **The platform key** (the deployment pays, the user sets no key) is only
+  ever spent on a provider weft ships a meter for. A project-defined provider
+  is refused the platform key, with a message pointing at how to request it.
+  The reason is honesty: the platform can only bill for a spend it can
+  measure with a meter it has reviewed. Getting a provider onto the platform
+  key IS submitting its meter to weft to be reviewed and shipped, and a meter
+  you already wrote in your project is most of that work.
 
 Meters are the trusted artifact of the whole paid-call system. A node never
 states a cost and has no way to: the runtime runs the provider's meter

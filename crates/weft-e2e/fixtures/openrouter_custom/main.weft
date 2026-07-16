@@ -1,0 +1,19 @@
+# One real LLM call through a PROJECT-DEFINED provider (openrouter_custom).
+# The provider's meter ships in this project (nodes/ask/mod.rs), not in weft.
+# The call goes to the real OpenRouter API (the custom meter keeps OpenRouter's
+# real base URL and pricing, only the provider NAME differs), so a real cost is
+# measured by the project's own meter and lands on the journal.
+#
+# Driven BYOK: the test sets `apiKey` to a real OpenRouter key, exactly as a
+# user picks "Own key". A project-defined provider cannot use the deployment
+# key (that is refused, pointing the user at requesting platform support), so
+# BYOK is the path that exercises the whole thing.
+
+ask = AskCustom -> (response: String) {
+  model: "openai/gpt-4.1-nano",
+  systemPrompt: "You answer with exactly one word, lowercase, no punctuation.",
+  prompt: "What color is a clear midday sky? Answer with one word."
+}
+
+out = Debug
+out.data = ask.response

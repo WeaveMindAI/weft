@@ -266,6 +266,16 @@ fn write_package_cargo_toml(
         "weft-core",
         toml::Value::Table(path_table("../../weft/crates/weft-core")),
     );
+    // A package may define its OWN provider meter (a shared `.rs` file that
+    // calls `weft_providers::register_meter!`), so every package crate can
+    // reach the provider toolkit. Cargo compiles it only if a file uses it,
+    // and the workspace resolves the one shared copy the worker already
+    // links via weft-engine, so this adds no second build.
+    insert_dep(
+        &mut deps,
+        "weft-providers",
+        toml::Value::Table(path_table("../../weft/crates/weft-providers")),
+    );
 
     if let Some(pkg_deps) = &pkg.package.package_deps {
         for (name, value) in pkg_deps.iter() {

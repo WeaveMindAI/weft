@@ -1,0 +1,7 @@
+[dependencies]
+minillmlib = "0.5.7"
+# The project defines its OWN provider meter in this node's mod.rs; the
+# ProviderMeter trait's method signatures name these two crates (a follow-up
+# HTTP client, and anyhow errors), so a node that ships a meter pulls them in.
+# anyhow is already in the codegen base, but a bare node still declares reqwest.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

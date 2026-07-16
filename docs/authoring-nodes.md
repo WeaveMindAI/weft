@@ -458,9 +458,16 @@ long action declares its own:
 The provider name you pass to `ctx.provider_access` is the key's identity:
 the deployment's key for it lives in `<NAME>_API_KEY` (uppercased). Any
 provider works with the user's own key. A deployment only supplies ITS
-configured key for providers whose spend it can measure: the ones with a
-meter in `weft-providers` (see `docs/authoring-provider-meters.md`, which
-is also the path to adding one).
+configured key for providers whose spend it can measure: the ones weft
+ships a reviewed meter for.
+
+A meter is the small piece of code that measures what a call really cost.
+Weft ships meters for the providers it supports, and **your project can
+define its own meter** for a provider weft does not ship yet (it lives
+beside the nodes that call it, and works with your own key right away).
+Writing one, and getting a project's meter promoted to a weft-shipped one
+(so the deployment key can pay for it too), is all in
+`docs/authoring-provider-meters.md`.
 
 The key input itself is an ordinary config field with the `api_key` field
 type, naming the provider so the editor renders the "Credits / Own key"
@@ -892,6 +899,13 @@ catalog/human/                     # package (has package.toml)
   trigger/  metadata.json          # HumanTrigger  (hasFormSchema: true)
   query/    metadata.json          # HumanQuery    (hasFormSchema: true)
 ```
+
+Any `.rs` file at the package root is a shared file like `form_helpers.rs`
+above (`super::<filename>` from a member). This is also where a package
+defines its own **provider meter**, when its nodes call a paid service weft
+does not ship: a shared `.rs` file that ends in `weft_providers::register_meter!(...)`.
+A bare node (no package) has no package root, so its meter goes at the bottom
+of the node's own `mod.rs` instead. See `authoring-provider-meters.md`.
 
 ## Form-field nodes: `formFieldSpecs`
 
