@@ -104,7 +104,7 @@ impl FromRequestParts<DispatcherState> for CallerTenant {
         match state.authenticator.authenticate(&parts.headers) {
             Ok(tenant) => Ok(CallerTenant(tenant)),
             // Both arms are 401: the caller must present a valid credential.
-            // The reason string is logged server-side; the body stays generic
+            // The reason string is logged by the dispatcher; the body stays generic
             // so it does not reveal whether a token was absent vs rejected.
             Err(e) => {
                 tracing::debug!(target: "weft_dispatcher::auth", error = %e, "request rejected");

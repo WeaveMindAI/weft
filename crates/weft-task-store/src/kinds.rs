@@ -50,9 +50,9 @@ pub enum TaskKind {
     RecordLog,
 }
 
-// This enum holds only the kinds the dispatcher itself ships. A deployment that
-// adds its own task kinds (e.g. an in-cluster image build) registers + enqueues
-// them by string via the string-keyed task dispatch, without widening this enum.
+// This enum holds only the kinds the dispatcher itself ships. A runtime that
+// adds its own task kinds registers + enqueues them by string via the
+// string-keyed task dispatch, without widening this enum.
 
 impl TaskKind {
     pub fn as_str(self) -> &'static str {

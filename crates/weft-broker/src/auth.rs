@@ -279,7 +279,7 @@ pub async fn reviewed_token(
 /// broker's own runtime-storage handlers (the broker is both the authority
 /// Additional CONTROL-PLANE service accounts, from the deploy config:
 /// `WEFT_BROKER_EXTRA_CONTROL_PLANE_SAS` is a comma list of
-/// `namespace/serviceaccount` pairs a deployment trusts with the admin
+/// `namespace/serviceaccount` pairs the runtime trusts with the admin
 /// surface alongside the dispatcher. TokenReview still verifies every
 /// token; this only extends WHICH verified identities count as control
 /// plane, and each stays distinct in audit logs. Parsed once per process.

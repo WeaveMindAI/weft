@@ -83,7 +83,7 @@ fn parse_color(stdout: &str) -> Result<Uuid> {
 /// execution (the Fire), not a pre-existing one (e.g. the TriggerSetup run that
 /// activation created). Returns an empty set if the project has no executions.
 pub async fn execution_colors(disp: &Dispatcher, project_id: &Uuid) -> Result<HashSet<Uuid>> {
-    // `/executions` is paginated (`{ executions, total }`) with a server-side
+    // `/executions` is paginated (`{ executions, total }`) with a dispatcher-side
     // project filter; walk the pages so the snapshot is complete.
     let mut colors = HashSet::new();
     let mut offset = 0u32;

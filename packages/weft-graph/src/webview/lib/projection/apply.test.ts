@@ -458,7 +458,7 @@ describe('foldOps', () => {
 
   it('drops a dependent op when its producer is gone (no fixpoint loops)', () => {
     // Truth never had text_9: op 2 consumed op 1's product; with op 1 absent
-    // (rejected server-side and removed), op 2 fails against the new truth.
+    // (rejected by the host and removed), op 2 fails against the new truth.
     const result = foldOps(fixture(), [
       pending('2', { op: 'addEdge', source: 'text_9', sourcePort: 'value', target: 'debug_1', targetPort: 'data', scopeGroup: null }),
     ], catalog);

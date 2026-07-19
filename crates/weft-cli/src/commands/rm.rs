@@ -129,7 +129,7 @@ async fn drop_journal_rows(
 ) -> Result<()> {
     // Walk the execution list and delete colors individually (the
     // dispatcher has no bulk DELETE for a project's journal rows).
-    // `/executions` is paginated (`{ executions, total }`) with a server-side
+    // `/executions` is paginated (`{ executions, total }`) with a dispatcher-side
     // project filter; deleting shifts offsets, so re-fetch the FIRST page
     // after each batch until it comes back empty.
     let mut dropped = 0u32;

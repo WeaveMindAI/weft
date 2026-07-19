@@ -3,8 +3,8 @@
 //! pull-secret, the builder-base image the worker Dockerfile FROMs, and the
 //! CONTENT-addressed worker image ref (`<registry>/weft-worker:<binary_hash>`).
 //!
-//! Presence of a registry is the signal that this deployment pulls worker images
-//! from a registry it pushed to. A deployment with no registry configured mints
+//! Presence of a registry is the signal that worker images are pulled from a
+//! registry they were pushed to. With no registry configured the runtime mints
 //! bare tags (images built and loaded onto the node directly), so its
 //! registry-ref minting is never reached.
 //!
@@ -31,7 +31,7 @@ pub struct RegistryConfig {
     /// trailing slash (normalized on construction).
     pub url: String,
     /// The registry-qualified builder-base image the per-project worker
-    /// Dockerfile FROMs (the deployment built + pushed it), e.g.
+    /// Dockerfile FROMs (the builder built + pushed it), e.g.
     /// `<registry>/weft-builder-base:<hash>`. The dispatcher passes this to the
     /// compiler when staging the build context.
     pub builder_base_image: String,

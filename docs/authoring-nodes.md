@@ -390,8 +390,8 @@ credit, an enrichment lookup) does exactly two things:
 ```rust
 // 1. Your access to the provider: what to authenticate with. A key on
 //    the node's key input is the user's own; an empty input (or the
-//    platform sentinel) asks the deployment for its configured key
-//    (<PROVIDER>_API_KEY on the deployment's broker). Your code is the
+//    platform sentinel) asks the runtime for its configured key
+//    (<PROVIDER>_API_KEY on the runtime's broker). Your code is the
 //    same lines either way; nothing branches.
 let access = ctx.provider_access("openrouter", cfg.get_optional("apiKey")?).await?;
 
@@ -422,23 +422,23 @@ mid-generation is equally not your problem: the metering outlives your
 future and still resolves the interrupted call's real cost.
 
 When the node's body finishes (any outcome), the runtime gives a
-deployment-granted access back on its own; nothing node-facing closes it.
+runtime-granted access back on its own; nothing node-facing closes it.
 
 Rules that matter:
 
 - **Never construct your own HTTP client for a paid call**; always take it
   from `ctx.metered_client(&access)`. A call on a hand-rolled client is
-  invisible to the cost trail, and a deployment-granted credential only
+  invisible to the cost trail, and a runtime-granted credential only
   works through the metered client's routing. (A library that refuses an
   injected client cannot be used for a paid call, and that is a smell in
   that library.)
 - Address the provider's REAL API. The client does any routing a
-  deployment-granted access needs; your code never rewrites a URL for it.
+  runtime-granted access needs; your code never rewrites a URL for it.
 - Do not stash `.credential()` anywhere (an output port, a log, an error,
   a struct that outlives the call).
-- A missing deployment key is a loud error naming the fix ("set your own
+- A missing runtime key is a loud error naming the fix ("set your own
   key"); do not paper over it.
-- On a deployment-granted access, requests do not follow redirects: a
+- On a runtime-granted access, requests do not follow redirects: a
   provider that answers "go ask this other address instead" is an error,
   not a second request. Every API we support answers directly. (A user's
   own key is unaffected: those requests are yours.)
@@ -448,7 +448,7 @@ Rules that matter:
   what is actually billed (that is always the measured cost).
 
 `provider_access` assumes your provider work fits the default window (15
-minutes): that is how long a deployment-granted credential is guaranteed
+minutes): that is how long a runtime-granted credential is guaranteed
 usable if your node crashes without finishing. A node wrapping a genuinely
 long action declares its own:
 `ctx.provider_access_within(provider, key_input, Duration::from_secs(...))`.
@@ -456,8 +456,8 @@ long action declares its own:
 ### Which providers
 
 The provider name you pass to `ctx.provider_access` is the key's identity:
-the deployment's key for it lives in `<NAME>_API_KEY` (uppercased). Any
-provider works with the user's own key. A deployment only supplies ITS
+the runtime's key for it lives in `<NAME>_API_KEY` (uppercased). Any
+provider works with the user's own key. The runtime only supplies ITS
 configured key for providers whose spend it can measure: the ones weft
 ships a reviewed meter for.
 
@@ -466,7 +466,7 @@ Weft ships meters for the providers it supports, and **your project can
 define its own meter** for a provider weft does not ship yet (it lives
 beside the nodes that call it, and works with your own key right away).
 Writing one, and getting a project's meter promoted to a weft-shipped one
-(so the deployment key can pay for it too), is all in
+(so the platform keys in app.weavemind.ai can pay for it too), is all in
 `docs/authoring-provider-meters.md`.
 
 The key input itself is an ordinary config field with the `api_key` field

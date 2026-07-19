@@ -602,8 +602,8 @@ fn apply_snapshot(
     *awaited_sequences = snap.awaited_sequences;
     // `snap.corruptions` is intentionally not consumed here. The
     // engine cannot do anything with a list of unparseable rows it
-    // already skipped during fold. The same fold runs server-side
-    // when the inspector calls `/replay`, and THAT path forwards
+    // already skipped during fold. The same fold runs when the
+    // inspector calls `/replay`, and THAT path forwards
     // each corruption as a `DispatcherEvent::JournalCorruption`
     // (the user-facing surface). For ops, `report_corruption`
     // already wrote each row at `error!` level when the fold ran.
@@ -1461,7 +1461,7 @@ async fn drive(
                 // always BEFORE this terminal by FIFO ordering). The
                 // return just signals terminal outcome.
                 //
-                // The guard gives back every deployment-granted provider
+                // The guard gives back every runtime-granted provider
                 // access the body opened, on EVERY exit: awaited inline on
                 // normal completion, spawned detached when the task is
                 // ABORTED mid-body (a cancel), where no code after
@@ -2941,7 +2941,7 @@ async fn handle_node_skip(
     ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, closures).await;
 }
 
-/// Gives a firing's deployment-granted provider accesses back on every exit
+/// Gives a firing's runtime-granted provider accesses back on every exit
 /// of the node task. Normal completion calls [`Self::close_now`] (awaited
 /// inline, before the terminal ships); an ABORT (cancel) drops the guard
 /// mid-body, and the drop spawns the close detached, because nothing after
@@ -5398,7 +5398,7 @@ mod bus_comm_tests {
     );
 
     weft_core::stress_test!(
-        // A cancelled node's deployment-granted provider access is given
+        // A cancelled node's runtime-granted provider access is given
         // back by the RUNTIME even though the node's future is aborted
         // mid-body (the node never runs any wrap-up code of its own; the
         // AccessCloseGuard's drop path is what must fire). The body opens

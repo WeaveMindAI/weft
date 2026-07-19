@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use crate::protocol::{evaluate_condition, HealthProtocol, HealthProtocols};
 
 /// Default windows. Public so callers can override per-test or
-/// per-deployment without forking the engine.
+/// per-instance without forking the engine.
 pub const FLAKY_AFTER: Duration = Duration::from_secs(30);
 pub const RECOVERY_AFTER: Duration = Duration::from_secs(30);
 

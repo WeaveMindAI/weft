@@ -11,7 +11,7 @@ use anyhow::Context;
 use super::Ctx;
 
 fn project_query(ctx: &Ctx) -> String {
-    // Best-effort project context (tenant resolution server-side);
+    // Best-effort project context (tenant resolution on the dispatcher);
     // `weft files` outside a project dir still works on the caller's
     // tenant.
     match ctx.project() {

@@ -43,7 +43,7 @@ The place a meter lives decides one thing: who can pay for the provider.
 
 - **Your own key** (you set it on the node) works with ANY meter, wherever it
   lives. A project-defined provider is used exactly this way.
-- **The platform key** (the deployment pays, the user sets no key) is only
+- **The platform key** (app.weavemind.ai pays, the user sets no key) is only
   ever spent on a provider weft ships a meter for. A project-defined provider
   is refused the platform key, with a message pointing at how to request it.
   The reason is honesty: the platform can only bill for a spend it can
@@ -59,7 +59,7 @@ the node author can be careless**: a node cannot produce an incorrect bill,
 no matter what it does, because it is never asked.
 
 Adding a provider's meter here is also what makes it a **supported
-provider**: a deployment-held key is only ever spent on a provider with a
+provider**: a platform-held key is only ever spent on a provider with a
 meter (there would be no honest way to account for it otherwise). A
 provider without a meter still works on a key the user sets themselves; its
 calls simply carry no cost figure.
@@ -84,7 +84,7 @@ impl ProviderMeter for MyProviderMeter {
 - **`base_url`** is the single authority for where the provider lives. No
   caller ever accepts a host from a request instead; requests are rebuilt
   against this base. That is what makes it impossible to aim a
-  deployment-held key at another host.
+  platform-held key at another host.
 - **`classify`** maps `(method, relative path)` to a `RouteClass`. Matching
   is EXACT string matching on the raw path, and that is a security rule,
   not a style choice: an unknown route can be REFUSED by the caller's

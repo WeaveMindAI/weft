@@ -17,8 +17,8 @@
 //!
 //! There is no "local default that fails loud" here: object storage is a
 //! hard dependency of a running cluster (the source plane AND the runtime
-//! plane both need it), so a deployment without a configured store is a
-//! deploy error, surfaced where the slot is constructed, not a silent
+//! plane both need it), so a cluster without a configured store is a
+//! startup error, surfaced where the slot is constructed, not a silent
 //! no-op impl that defers the failure to first use.
 //!
 //! `FakeObjectStore` is an in-memory drop-in for tests (a map plus a

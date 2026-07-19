@@ -246,7 +246,7 @@ describe('gesture to confirmation', () => {
 	});
 
 	it('a dependent queued op drops when its producer is rejected', async () => {
-		// Op 1 (addNode) rejected server-side; op 2 (edge from that node)
+		// Op 1 (addNode) rejected by the host; op 2 (edge from that node)
 		// becomes unapplyable after the resync and drops with its own toast.
 		host.editScript.push({ kind: 'reject', reason: 'id already exists in scope: text_2' });
 		host.resyncScript.push({ project: baseProject(), weftCode: 'v0' });

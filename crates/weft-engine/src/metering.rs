@@ -2,7 +2,7 @@
 //! `ctx.metered_client`.
 //!
 //! For each request on a provider access, the middleware
-//!   1. routes it (straight to the provider, or to the deployment's relay
+//!   1. routes it (straight to the provider, or to the runtime's relay
 //!      when the access carries one),
 //!   2. on a direct billable route, runs the provider's meter around it:
 //!      prepare the request so its cost becomes reportable, TAP the response
@@ -11,7 +11,7 @@
 //!   3. when the response ends (cleanly or cut), resolves the meter's
 //!      figure and records it durably on the execution's cost trail.
 //!
-//! A relayed call is not measured here: the relay is where the deployment's
+//! A relayed call is not measured here: the relay is where the runtime's
 //! own measuring happens, and this side's only job is to route the call
 //! there. A worker-side figure is a MEASUREMENT, never a charge: the record
 //! it enqueues is pinned `billed: false` and the broker refuses anything
@@ -175,7 +175,7 @@ pub struct MeteringMiddleware {
     /// call passes through unmeasured (a provider without a meter has no
     /// cost figure at all).
     meter: Option<&'static dyn ProviderMeter>,
-    /// The deployment's relay for calls on this access; `None` = direct.
+    /// The runtime's relay for calls on this access; `None` = direct.
     relay_url: Option<String>,
     /// The access credential, for the meter's own follow-up query on the
     /// direct lane.
@@ -195,7 +195,7 @@ pub fn metered_client(
     let meter = weft_providers::meter_for(provider);
     if relay_url.is_some() && meter.is_none() {
         return Err(WeftError::NodeExecution(format!(
-            "the deployment relays calls for provider '{provider}', but this runtime has no \
+            "the runtime relays calls for provider '{provider}', but it has no \
              provider definition to route them by; set your own key on the node"
         )));
     }
@@ -264,8 +264,8 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
             // relay does the measuring; this side does none.
             let Some(route) = route else {
                 return Err(middleware_err(format!(
-                    "this call ({}) is not under provider '{}''s API ({}), so the deployment \
-                     cannot relay it; calls on a deployment-granted access must address the \
+                    "this call ({}) is not under provider '{}''s API ({}), so the runtime \
+                     cannot relay it; calls on a runtime-granted access must address the \
                      provider's own API",
                     req.url(),
                     self.sink.provider,
@@ -801,7 +801,7 @@ mod tests {
 
     /// L3, the relay lane: a call on a relayed access is REWRITTEN to the
     /// relay (path + query preserved) and NOT measured here (the relay is
-    /// where the deployment measures). A call outside the provider's API
+    /// where the runtime measures). A call outside the provider's API
     /// cannot be relayed and fails loud.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_relayed_call_is_rewritten_to_the_relay_and_not_measured_here() {

@@ -103,8 +103,8 @@ impl<Ctx: Send + Sync> TaskRegistryBuilder<Ctx> {
     }
 
     /// Register an executor by its raw kind STRING. For task kinds that live
-    /// OUTSIDE the built-in `TaskKind` enum (e.g. an in-cluster image build):
-    /// dispatch is string-keyed on `Task.kind`, so an added executor slots in
+    /// OUTSIDE the built-in `TaskKind` enum, dispatch is string-keyed on
+    /// `Task.kind`, so an added executor slots in
     /// without widening the built-in enum.
     pub fn register_str(mut self, kind: impl Into<String>, exec: Arc<dyn TaskExecutor<Ctx>>) -> Self {
         self.map.insert(kind.into(), exec);

@@ -191,7 +191,7 @@ pub async fn task_enqueue_dedup(
             //   - amount_usd is null (a meter's honest unknown) or a
             //     finite non-negative number; never negative or NaN.
             //   - billed must be false: a worker-side record is a
-            //     MEASUREMENT. Only the deployment's own billing path may
+            //     MEASUREMENT. Only the runtime's own billing path may
             //     mark a record billed, and it does not come through here.
             if kind == TaskKind::RecordCost.as_str() {
                 match req.spec.payload.get("amount_usd") {
@@ -248,7 +248,7 @@ pub async fn task_enqueue_dedup(
     }
     // `target_pod_name` is meaningful only for cancel-style tasks
     // claimed by a specific worker pod. Tenant pods never enqueue
-    // those (the dispatcher emits cancels server-side), so any
+    // those (the dispatcher emits cancels itself), so any
     // wire-set value is either confused or hostile. Refuse to
     // persist a value the caller has no legitimate use for.
     if req.spec.target_pod_name.is_some() {
@@ -625,8 +625,8 @@ pub async fn project_fetch_definition(
 
 // ---------- Provider access ----------
 
-/// Worker opens access to a provider on the deployment's configured key. The
-/// caller's execution scope anchors the tenant; the deployment's
+/// Worker opens access to a provider on the runtime's configured key. The
+/// caller's execution scope anchors the tenant; the runtime's
 /// `CredentialSource` decides whether THIS node may use its key and answers
 /// with the credential to authenticate with, plus (when it relays) where
 /// calls on it go.
@@ -644,7 +644,7 @@ pub async fn open_provider_access(
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
     // The provider name arrives on the wire from the worker. It is the string
-    // the deployment's key is derived from (`<NAME>_API_KEY`), so it is held to
+    // the runtime's key is derived from (`<NAME>_API_KEY`), so it is held to
     // the same charset it is validated against where it is DECLARED
     // (`weft_core::node::is_valid_provider_name`). Without this, the derivation
     // would run on an arbitrary caller-supplied string.
@@ -678,7 +678,7 @@ pub async fn open_provider_access(
         crate::credential::KeyResolution::NotConfigured => Err((
             StatusCode::PRECONDITION_FAILED,
             format!(
-                "this deployment has no key configured for '{}'; set your own key on the \
+                "no key is configured for '{}'; set your own key on the \
                  node's key input",
                 req.provider
             ),
@@ -689,7 +689,7 @@ pub async fn open_provider_access(
     }
 }
 
-/// Runtime gives a deployment-granted access back (the node that opened it
+/// Runtime gives a runtime-granted access back (the node that opened it
 /// finished): a source that hands out time-bounded credentials retires this
 /// one now, rather than leaving it usable to its window (the crash
 /// backstop).

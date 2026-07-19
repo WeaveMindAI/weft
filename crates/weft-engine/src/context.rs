@@ -232,7 +232,7 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
 }
 
 /// Trait surface over `BrokerPaidCallClient` so tests can inject a fake.
-/// The paid-call access path: open access to the deployment's provider key,
+/// The paid-call access path: open access to the runtime's provider key,
 /// give it back when the node finishes. (Cost records ride the generic task
 /// rail.) Production has one impl: the broker-backed HTTP client.
 #[async_trait]
@@ -274,7 +274,7 @@ impl PaidCallClient for weft_broker_client::client::BrokerPaidCallClient {
 pub struct FakePaidCallClient {
     keys: std::sync::Mutex<HashMap<String, String>>,
     /// The relay every granted access is routed through, when set (the
-    /// deployment-relays shape); `None` = the key goes out directly.
+    /// runtime-relays shape); `None` = the key goes out directly.
     relay_url: Option<String>,
     /// Credentials of the accesses the runtime gave back.
     pub closed_accesses: std::sync::Mutex<Vec<String>>,
@@ -315,7 +315,7 @@ impl PaidCallClient for FakePaidCallClient {
                 })
             }
             None => anyhow::bail!(
-                "this deployment has no key configured for '{}'; set your own key on the \
+                "the runtime has no key configured for '{}'; set your own key on the \
                  node's key input",
                 req.provider
             ),
@@ -1247,8 +1247,8 @@ pub struct RunnerHandle {
     project_id: String,
     color: Color,
     node_id: String,
-    /// The node's catalog type, sent with deployment-key / cost-provision
-    /// requests so the deployment's policy + audit trail name the exact
+    /// The node's catalog type, sent with runtime-key / cost-provision
+    /// requests so the runtime's policy + audit trail name the exact
     /// node kind asking.
     node_type: String,
     node_frames: weft_core::frames::LoopFrames,
@@ -1336,7 +1336,7 @@ pub struct RunnerHandle {
     /// did not receive a `live_connection` request. Per-execution, not
     /// per-firing: all firings of one color share the one caller.
     caller_connection: Option<Arc<dyn weft_core::caller::CallerConnection>>,
-    /// Deployment-granted credentials this firing opened
+    /// Runtime-granted credentials this firing opened
     /// (`ctx.provider_access`), given back by the loop driver when the
     /// node's body finishes (see [`Self::close_opened_accesses`]); nothing
     /// node-facing closes an access.
@@ -1392,7 +1392,7 @@ impl RunnerHandle {
         }
     }
 
-    /// Give back every deployment-granted access this firing opened. The
+    /// Give back every runtime-granted access this firing opened. The
     /// loop driver calls this once the node's body has finished (any
     /// outcome); a close that fails is logged loudly rather than failing
     /// the node, because the credential's own window is the backstop.
@@ -2676,7 +2676,7 @@ mod replay_tests {
 
     // Layer 3: the provider_access surface over the fake paid-call client:
     // origin classification, the user's own key never touching the broker,
-    // and the runtime (not the node) giving deployment grants back.
+    // and the runtime (not the node) giving runtime grants back.
     #[tokio::test]
     async fn a_users_own_key_never_touches_the_deployment() {
         let fake = FakePaidCallClient::new();
@@ -2696,7 +2696,7 @@ mod replay_tests {
         let handle = Arc::new(handle_with_paid_calls(fake.clone()));
         let ctx = ctx_over_arc(handle.clone());
 
-        // Empty and sentinel both open access on the deployment's key.
+        // Empty and sentinel both open access on the runtime's key.
         let access = ctx
             .provider_access_within(
                 "openrouter",
@@ -2752,7 +2752,7 @@ mod replay_tests {
         handle.close_opened_accesses().await;
         assert!(
             fake.closed_accesses.lock().unwrap().is_empty(),
-            "access on the user's own key has nothing of the deployment's to give back"
+            "access on the user's own key has nothing of the runtime's to give back"
         );
     }
 

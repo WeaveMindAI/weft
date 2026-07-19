@@ -55,7 +55,7 @@
 		// flip back to Inactive.
 		onCancelActivate?: () => void;
 		// Mid-build (backend transition=building): cancel the
-		// server-side build. Cancel reconciles, never asserts: the
+		// build. Cancel reconciles, never asserts: the
 		// displayed state is whatever the backend reports next.
 		onCancelBuild?: () => void;
 		// Mid-infra-flip (rollup provisioning/stopping/terminating):
@@ -327,7 +327,7 @@
 		if (cliVerb && cliPhase !== undefined && isMiddleVerb(cliVerb)) {
 			return { kind: 'cli_working', phase: cliPhase };
 		}
-		// Backend-reported server-side build. Owned by the trigger slot
+		// Backend-reported build. Owned by the trigger slot
 		// when that slot is visible (an activate launched it there);
 		// otherwise the run button owns it.
 		if (buildTransition !== 'none' && !triggerSlotVisible) {
@@ -383,7 +383,7 @@
 		if (pendingVerb !== undefined && isTriggerVerb(pendingVerb) && pendingMessage !== undefined) {
 			return { kind: 'pending', message: pendingMessage };
 		}
-		// Backend-reported server-side build launched from this slot
+		// Backend-reported build launched from this slot
 		// (an activate on a not-yet-built project).
 		if (buildTransition !== 'none') {
 			return { kind: 'building', cancelling: buildTransition === 'cancelling_build' };

@@ -69,7 +69,7 @@ impl DiscoveredSignal {
 
 /// Mint an api token scoped to a single project, so enumeration through it
 /// returns ONLY that project's signals. The dispatcher filters the enumeration
-/// server-side by the token's `allowedProjects` (a SQL pre-filter on the signal
+/// by the token's `allowedProjects` (a SQL pre-filter on the signal
 /// row's project_id), which is the system's own isolation mechanism: it is what
 /// keeps one project's consumer from seeing another's signals. The rig leans on
 /// the same gate instead of best-effort filtering the (often project_id-less)

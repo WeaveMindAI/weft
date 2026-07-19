@@ -94,7 +94,7 @@ pub struct Task {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewTask {
     /// The task kind as its raw STRING (the value stored on `task.kind` and
-    /// dispatched on). Built-in producers pass `TaskKind::X.into()`; a deployment
+    /// dispatched on). Built-in producers pass `TaskKind::X.into()`; a runtime
     /// with its own task kinds passes its own kind string (e.g. `"build_image"`)
     /// directly, so an added kind never has to widen the built-in `TaskKind` enum.
     pub kind: String,
@@ -985,7 +985,7 @@ mod wire_tests {
     // Layer-2 wire-shape tests: NewTask and Task are the JSON contract on
     // `/v1/task/enqueue_dedup` (producer sends NewTask, the row round-trips as
     // Task). Round-trip them through serde_json so a renamed/retyped field breaks
-    // the test, not a live enqueue. `kind` is a free String so a deployment can add
+    // the test, not a live enqueue. `kind` is a free String so the runtime can add
     // its own task kinds without widening the built-in TaskKind enum.
     use super::*;
 

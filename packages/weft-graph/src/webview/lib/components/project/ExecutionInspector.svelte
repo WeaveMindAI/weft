@@ -213,7 +213,7 @@
 			firing.costOrigin === 'user-provided'
 				? ' (own key)'
 				: firing.costOrigin === 'deployment'
-					? ' (deployment key)'
+					? ' (platform key)'
 					: firing.costOrigin === 'mixed'
 						? ' (mixed keys)'
 						: '';

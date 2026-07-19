@@ -14,8 +14,8 @@
 //! cluster credentials would: it reads the cluster's Postgres directly and
 //! drives pods with `kubectl`. This is host-side TEST code only. It is compiled
 //! solely under the `e2e` feature and lives in `crates/weft-e2e`, which is never
-//! compiled into any shipped image, so NONE of this exists in a real
-//! deployment.
+//! compiled into any shipped image, so NONE of this exists in the shipped
+//! system.
 //!
 //! ## Faking time = database backdating, never a clock hook
 //!

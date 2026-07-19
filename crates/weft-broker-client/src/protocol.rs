@@ -417,7 +417,7 @@ pub struct TaskFailResponse {}
 
 /// Worker flips its row to `alive` and starts heartbeating. The
 /// dispatcher's earlier `insert_spawning` already wrote `namespace`
-/// and `owner_dispatcher` from trusted server-side values, so this
+/// and `owner_dispatcher` from trusted dispatcher-side values, so this
 /// request only needs the worker's own identity. The broker re-
 /// derives the namespace from the SA token if it ever needs it
 /// (caller.namespace) rather than trusting wire data.
@@ -482,10 +482,10 @@ pub struct InfraEndpointUrlResponse {
 
 // ---------- Provider access + cost recording ----------
 
-/// Worker asks the deployment for access to `provider` on ITS configured key
+/// Worker asks the runtime for access to `provider` on ITS configured key
 /// (the node's key input was empty or the managed sentinel; a user-supplied
 /// key never makes this call). The node's identity travels with the request
-/// so the deployment's key policy can decide per node.
+/// so the runtime's key policy can decide per node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderAccessRequest {
     /// The requesting execution; the broker resolves + enforces the owning
@@ -494,14 +494,14 @@ pub struct ProviderAccessRequest {
     pub project_id: String,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate, so anything the
-    /// deployment later books against this access (a measured cost) can be
+    /// runtime later books against this access (a measured cost) can be
     /// attributed to the exact firing, not just the node.
     pub frames: weft_core::LoopFrames,
     pub node_type: String,
     pub provider: String,
     /// How long the paid work this access is for may reasonably take: the
     /// granted credential is guaranteed usable for that long, and the
-    /// deployment may retire it after (the crash backstop for a worker that
+    /// runtime may retire it after (the crash backstop for a worker that
     /// dies without giving the access back).
     pub expected_duration_secs: u64,
 }
@@ -510,13 +510,13 @@ pub struct ProviderAccessRequest {
 pub struct ProviderAccessResponse {
     /// What to authenticate with. Used exactly like a key by the caller.
     pub credential: String,
-    /// Where calls on `credential` must be sent when the deployment relays
+    /// Where calls on `credential` must be sent when the runtime relays
     /// them; `None` = straight to the provider's own API. The metered
     /// client does that routing.
     pub relay_url: Option<String>,
 }
 
-/// Runtime is done with a deployment-granted access: give it back NOW,
+/// Runtime is done with a runtime-granted access: give it back NOW,
 /// rather than leaving the credential usable to its window (which is only
 /// the crash backstop). Sent by the engine when the node that opened the
 /// access finishes; nothing node-facing makes this call.

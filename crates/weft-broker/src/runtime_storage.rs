@@ -106,7 +106,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
 // ---------- error mapping ----------
 
 // The generic body returned for an internal (500) storage error. The full detail is
-// logged server-side; it is NOT echoed to the caller because the runtime-storage
+// logged by the broker; it is NOT echoed to the caller because the runtime-storage
 // data path is reached by UNTRUSTED worker pods (user node code runs there), and the
 // `Other`/anyhow chain carries internal detail (SQL text, driver messages, table
 // names) that must not be disclosed to attacker-controlled code. The typed 4xx

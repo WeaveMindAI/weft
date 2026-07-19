@@ -401,7 +401,7 @@ export type LoopInspectorEvent =
 /// `* the bus closed here` marker. `busId` groups lines by channel
 /// so a node attached to multiple buses gets one scrollable section
 /// per bus. Replay orders lines by arrival from the SSE stream (the
-/// dispatcher already orders them by journal row id server-side).
+/// dispatcher already orders them by journal row id).
 // SYNC: JournaledPayload <-> crates/weft-core/src/primitive.rs JournaledPayload
 /// Tagged payload. Default `Option<Value>` would collapse `Some(Value::Null)` with
 /// `None` at the JSON boundary; the tag preserves the distinction
@@ -1044,7 +1044,7 @@ export type WebviewMessage =
   /// Cancel in-flight infra work (provisioning / stopping /
   /// terminating): HALT, per-node partial state stays visible.
   | { kind: 'infraCancel' }
-  /// Cancel the in-flight server-side build (transition=building).
+  /// Cancel the in-flight build (transition=building).
   | { kind: 'cancelBuild' }
   /// Per-node Stop (graph menu, partial-state recovery).
   | { kind: 'infraNodeStop'; nodeId: string }

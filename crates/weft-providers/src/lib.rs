@@ -144,17 +144,40 @@ pub trait ProviderMeter: Send + Sync {
     /// unmeasurable spend.
     fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
 
-    /// A worst-case price for the Billable call described by `body`,
-    /// computable BEFORE the call goes out and only from the request bytes
-    /// (never from anything a caller could hand over separately). Errors
-    /// when the call cannot be priced (unknown model, no output bound);
-    /// never guesses.
+    /// The worst-case price this provider could charge for the Billable call
+    /// described by `body`: computed BEFORE the call goes out, from the
+    /// request bytes ALONE (the model, the output bound, the provider's own
+    /// rate card) and nothing a caller could hand over separately. Errors
+    /// when the request cannot be priced (unknown model, no output bound);
+    /// never guesses. It is the pre-call twin of [`Self::resolve`] (which
+    /// prices the call after the fact from the response): the same provider
+    /// cost math asked forward instead of backward.
+    ///
+    /// OPTIONAL to implement; the default refuses. A provider is fully usable
+    /// on the user's OWN key without it (a caller paying from their own
+    /// provider account bounds nothing up front). Implementing it correctly
+    /// is the bar to have the provider promoted to run on the platform keys
+    /// in app.weavemind.ai: a prepaid balance can only admit a call whose
+    /// worst case it can bound first, so a provider that will not price ahead
+    /// of time cannot spend the platform's money. Until it is promoted, keep
+    /// the default; the refusal is what keeps an unbounded call off a
+    /// platform key. (A future weft feature may also consume it to PREDICT a
+    /// run's cost up front: a second consumer, not a second reason to
+    /// implement it.)
     async fn ceiling_usd(
         &self,
-        path: &str,
-        body: &[u8],
-        http: &reqwest::Client,
-    ) -> anyhow::Result<f64>;
+        _path: &str,
+        _body: &[u8],
+        _http: &reqwest::Client,
+    ) -> anyhow::Result<f64> {
+        anyhow::bail!(
+            "provider '{}' does not price calls ahead of time, so it cannot run on the \
+             app.weavemind.ai platform keys; implement `ceiling_usd` to have it promoted, or \
+             set your own '{}' key on the node to use it now",
+            self.provider(),
+            self.provider(),
+        )
+    }
 
     /// A fresh observer for one Billable call's response.
     fn observe(&self) -> Box<dyn CallObservation>;

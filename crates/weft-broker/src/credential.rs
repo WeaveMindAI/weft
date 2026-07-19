@@ -1,12 +1,12 @@
-//! The deployment-key seam: how the broker answers a node that asked the
-//! deployment to supply its configured provider key (the node's key input
+//! The runtime-key seam: how the broker answers a node that asked the
+//! runtime to supply its configured provider key (the node's key input
 //! was empty or the managed sentinel; a user-supplied key never reaches
 //! here).
 //!
 //! A source answers with an ACCESS: what to authenticate with, and where
 //! calls on it go (`None` = the provider's own API). The default source
 //! reads the broker host's environment (`<PROVIDER>_API_KEY`) and hands the
-//! key itself: self-hosting means the deployment's key is the operator's
+//! key itself: self-hosting means the configured key is the operator's
 //! own, and the worker is the operator's own process, so there is nothing
 //! to hide it from. A source that hands out time-bounded credentials
 //! instead retires them in [`CredentialSource::close`] when the runtime
@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 
-/// Who is asking for a deployment key, and for which provider. Everything a
+/// Who is asking for a runtime key, and for which provider. Everything a
 /// policy needs to decide: the tenant, the project, the exact node, and the
 /// VERIFIED pod identity of the caller.
 #[derive(Debug, Clone)]
@@ -49,15 +49,15 @@ pub enum KeyResolution {
         credential: String,
         relay_url: Option<String>,
     },
-    /// The deployment has no key configured for this provider. The caller
+    /// No key is configured for this provider. The caller
     /// turns this into "set your own key for `provider`".
     NotConfigured,
-    /// The deployment has a key but refuses THIS request, with a
+    /// A key is configured but this request is refused, with a
     /// user-facing reason (policy).
     Denied { reason: String },
 }
 
-/// Resolves the deployment's provider keys. Policy lives in the impl.
+/// Resolves the runtime's provider keys. Policy lives in the impl.
 /// `pool` is the broker's Postgres, passed in (same shape as
 /// `EntitlementSource`) so a policy can consult runtime state without
 /// holding a second pool.
@@ -88,8 +88,8 @@ pub fn provider_env_var(provider: &str) -> String {
 }
 
 /// Default source: the broker host's environment. Self-hosting means the
-/// deployment's keys are the host's env; every node of every tenant on this
-/// deployment may use them (single-operator deployments have no policy to
+/// operator's keys are the host's env; every node of every tenant on this
+/// instance may use them (a single operator has no policy to
 /// enforce), and calls go straight to the provider.
 pub struct EnvCredentialSource;
 

@@ -244,8 +244,8 @@ pub async fn remove(
     // log-and-continue for the cluster-unreachable case; only DB
     // writes are fail-loud.
     crate::api::infra::delete_project(&state, id, query.force).await?;
-    // Reclaim the project's deployment-specific stored data through the ONE hook.
-    // The default frees the project's `project/`-scoped runtime files; a deployment
+    // Reclaim the project's instance-specific stored data through the ONE hook.
+    // The default frees the project's `project/`-scoped runtime files; a reclaimer
     // that also stores project content elsewhere (a versioned project-editing
     // history) extends it. `shared/`-scoped runtime files are the owner's and are
     // deliberately NOT touched (they outlive the project). MUST run before the
@@ -1174,7 +1174,7 @@ pub struct StatusQuery {
     /// `ProjectDefinition`. Compared against
     /// `project.running_definition_hash` to surface "the project
     /// shape has changed" drift (a config / topology edit that
-    /// hasn't been resynced into the running deployment).
+    /// hasn't been resynced into the running project).
     #[serde(default, rename = "desiredDefinitionHash")]
     pub desired_definition_hash: Option<String>,
     /// Infra hash the CLI computed for the current infra closure.
@@ -1685,7 +1685,7 @@ pub(crate) struct DriftBits {
 /// feed the SAME pure function from the SAME facts. `drift` is the one
 /// input only a client can supply (the desired hashes live on the
 /// client); enforcement passes all-true so drift-gated verbs are never
-/// spuriously rejected server-side.
+/// spuriously rejected by the dispatcher.
 pub(crate) struct ActionInputs<'a> {
     pub lifecycle: &'a crate::project_store::ProjectLifecycle,
     pub transition: crate::project_store::ProjectTransition,

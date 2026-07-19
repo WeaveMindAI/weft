@@ -134,7 +134,7 @@ impl Defaults {
 /// the env-driven backends (kube, listener/supervisor/worker), resolve the
 /// cluster knobs, and assemble `DispatcherState` from `defaults` plus the shared
 /// env-derived infra. Everything env-driven here is identical across
-/// deployments; only the `defaults` values vary.
+/// runs; only the `defaults` values vary.
 pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<DispatcherState> {
     let Defaults {
         authenticator,
@@ -195,7 +195,7 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
             }
         };
 
-    // Worker-image registry: present iff this deployment pulls worker images from
+    // Worker-image registry: present iff worker images are pulled from
     // a registry it pushed to. Read from env. `None` when worker images are built
     // and loaded onto the node directly (the bare content-addressed tag is pulled
     // `IfNotPresent`), so the worker spawn resolves the local tag.
@@ -414,8 +414,8 @@ where
 
 /// Spawn the dispatcher's core background loops against `state`: lease renewal,
 /// the journal + infra-event bridges, the reapers, the lifecycle claimer, the
-/// task picker (over `registry`), and the cold-start trigger. A deployment that
-/// adds its own loops spawns them after this returns. Every loop runs under
+/// task picker (over `registry`), and the cold-start trigger. Callers that
+/// add their own loops spawn them after this returns. Every loop runs under
 /// [`spawn_supervised`], so a panic in any of them crashes the pod (Kubernetes
 /// restarts it) rather than silently killing that one function.
 pub fn spawn_core_loops(state: DispatcherState, registry: crate::task_executor::TaskRegistry) {

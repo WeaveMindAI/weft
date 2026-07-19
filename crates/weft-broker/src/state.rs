@@ -41,8 +41,8 @@ pub struct BrokerState {
     pub runtime_store: Option<Arc<RuntimeStore>>,
     /// Resolves a tenant's runtime-storage caps.
     pub entitlements: Arc<dyn EntitlementSource>,
-    /// Resolves the deployment's provider keys for nodes that asked the
-    /// deployment to supply one (default: the host env).
+    /// Resolves the runtime's provider keys for nodes that asked the
+    /// runtime to supply one (default: the host env).
     pub credentials: Arc<dyn CredentialSource>,
 }
 
@@ -245,7 +245,7 @@ pub mod kube_client {
             // serviceAccountToken volume projection, which is how every
             // weft tenant pod gets its token). Absence here means the
             // caller is using a raw legacy SA token (not bound to a
-            // specific pod), which under our deployment model should
+            // specific pod), which under this runtime model should
             // not exist; treat as None and let downstream handlers
             // refuse pod-bound operations.
             let pod_name = user

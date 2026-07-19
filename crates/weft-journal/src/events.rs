@@ -294,7 +294,7 @@ pub enum ExecEvent {
     /// producer is a meter (run by the runtime around the call); nodes have
     /// no way to state a cost. `amount_usd: None` = the meter could not
     /// resolve the figure (recorded AS unknown, never as $0). `billed` =
-    /// the figure moved credits (a deployment-billed call) as opposed to a
+    /// the figure moved credits (a platform-billed call) as opposed to a
     /// measurement on a key the user holds; a data-model distinction for
     /// debugging and the ledger, not a UI one.
     CostReported {
@@ -309,8 +309,8 @@ pub enum ExecEvent {
         model: Option<String>,
         amount_usd: Option<f64>,
         billed: bool,
-        /// Whose key the call spent: the user's own, or one the deployment
-        /// holds. Part of the money trail (a figure without "whose key" is
+        /// Whose key the call spent: the user's own, or the platform's
+        /// (app.weavemind.ai). Part of the money trail (a figure without "whose key" is
         /// half an answer).
         origin: weft_core::AccessOrigin,
         metadata: Value,

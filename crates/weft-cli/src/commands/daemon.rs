@@ -1586,7 +1586,7 @@ async fn kubectl_apply_stdin(manifest: &str, what: &str) -> Result<()> {
 /// Pack every `<PROVIDER>_API_KEY` in the CLI's environment (the shell,
 /// or the `.env` the CLI loaded at startup) into the
 /// `weft-provider-keys` Secret the broker imports via `envFrom`: a key
-/// set on the operator's machine IS the deployment's key for that
+/// set on the operator's machine IS the broker's key for that
 /// provider. Applied on every daemon start/restart so added and removed
 /// keys both propagate. Returns whether the key set changed since the
 /// last apply (the broker reads env at pod start, so a change needs a

@@ -114,7 +114,7 @@ pub trait EntitlementSource: Send + Sync {
     async fn caps(&self, tenant: &str) -> Result<Entitlement>;
 
     /// The tenant's TOTAL currently-stored bytes across every storage plane the
-    /// deployment has, read on `tx` so it composes into the caller's locked
+    /// runtime has, read on `tx` so it composes into the caller's locked
     /// transaction. THE single account-usage definition.
     async fn account_used_bytes(
         &self,

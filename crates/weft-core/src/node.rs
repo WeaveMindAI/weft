@@ -206,7 +206,7 @@ pub struct NodeMetadata {
 
 /// The one charset a provider name may use: lowercase ASCII letters,
 /// digits, and `_`. This is what makes the name the key's identity with no
-/// aliasing: the deployment key lives in `<NAME>_API_KEY`, derived by
+/// aliasing: the runtime key lives in `<NAME>_API_KEY`, derived by
 /// uppercasing the name (`credential::provider_env_var`). Restricting to
 /// this set makes that derivation injective (two distinct names can never
 /// share one env var) and rules out a name that would form a malformed or

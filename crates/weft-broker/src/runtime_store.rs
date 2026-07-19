@@ -15,10 +15,10 @@
 //! bucket scan, so the plane scales with the number of tenants, not with the
 //! number of stored files. The bucket holds ONLY opaque bytes.
 //!
-//! This is the runtime-file plane: the broker serves it directly. A deployment
-//! that adds a versioned-projects plane (pack a folder into a content tree, a
-//! version graph) builds it as a separate plane around its own broker; this
-//! module is only the runtime-file plane.
+//! This is the runtime-file plane: the broker serves it directly. A
+//! versioned-projects plane (pack a folder into a content tree, a version
+//! graph) is built as a separate plane around this broker; this module is
+//! only the runtime-file plane.
 
 use std::sync::Arc;
 

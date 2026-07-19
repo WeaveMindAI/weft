@@ -442,7 +442,7 @@ impl InfraReader for BrokerInfraClient {
 // ---------- Provider access + cost recording ----------
 
 /// Worker-side client for the provider-access endpoints: open access to the
-/// deployment's provider key, give it back when the node finishes. (Cost
+/// runtime's provider key, give it back when the node finishes. (Cost
 /// records ride the generic task rail, not a dedicated endpoint.)
 pub struct BrokerPaidCallClient {
     http: HttpCore,

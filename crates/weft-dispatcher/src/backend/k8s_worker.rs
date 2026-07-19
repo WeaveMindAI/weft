@@ -261,7 +261,7 @@ fn render_pod_manifest(
     // isolation comes from the surrounding NetworkPolicies (a per-
     // project namespace's default-deny + worker-policy, or the shared
     // namespace's blanket pod-to-pod deny), not from per-pod hardening.
-    // Per-pod sandboxing of the worker process, when a deployment wants it,
+    // Per-pod sandboxing of the worker process, when the `SandboxPolicy` asks for it,
     // arrives as the `runtimeClassName` line below; the shared namespace is the
     // natural population to sandbox first.
     let headless_svc = worker_headless_service_name();

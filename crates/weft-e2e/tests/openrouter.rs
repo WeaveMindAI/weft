@@ -21,7 +21,7 @@
 //! OpenRouter key: `OPENROUTER_API_KEY` in the environment the daemon was
 //! started from (the CLI packs it into the broker's secret for the deployment
 //! path, and this test reads it for the BYOK path). Without it the deployment
-//! scenario fails loudly with "this deployment has no key configured for
+//! scenario fails loudly with "the runtime has no key configured for
 //! 'openrouter'", which is exactly what this test then reports.
 #![cfg(feature = "e2e")]
 

@@ -374,7 +374,7 @@ impl ExecutionContext {
     /// Your access to a provider: what to authenticate with. `user_key` is
     /// the raw value of the node's key input: a real key string is the
     /// USER'S OWN key (their provider account, used as-is); empty/absent or
-    /// the `__PLATFORM__` sentinel asks the DEPLOYMENT to supply its
+    /// the `__PLATFORM__` sentinel asks the RUNTIME to supply its
     /// configured key for `provider`, which it may refuse (none configured,
     /// or this node is not permitted to use it). Errors are loud and name
     /// the fix ("set your own key for `provider`").
@@ -383,7 +383,7 @@ impl ExecutionContext {
     /// the calls with [`Self::metered_client`]. The runtime routes the call,
     /// measures what it cost (the provider's meter, run around the call),
     /// records the figure on the execution's cost trail, and gives a
-    /// deployment-granted access back when the node finishes. The node
+    /// runtime-granted access back when the node finishes. The node
     /// declares no estimate, holds nothing, settles nothing, and cannot
     /// misstate a cost.
     ///
@@ -399,7 +399,7 @@ impl ExecutionContext {
     }
 
     /// [`Self::provider_access`] with an explicit `window`: how long this
-    /// node's provider work may take. A deployment-granted credential is
+    /// node's provider work may take. A runtime-granted credential is
     /// guaranteed usable exactly that long (the crash backstop; the runtime
     /// normally retires it when the node finishes). Nodes wrapping genuinely
     /// long actions (a multi-hour generation) raise it.
@@ -420,7 +420,7 @@ impl ExecutionContext {
     /// An HTTP client for paid calls on `access`: use it directly, or hand
     /// it to any library that accepts an injected client. Behind it, the
     /// runtime routes the request (straight to the provider, or through the
-    /// deployment's relay when the access carries one) and runs the
+    /// runtime's relay when the access carries one) and runs the
     /// provider's meter around the call, so the call's real cost lands on
     /// the execution's cost trail without the node doing anything.
     ///
@@ -963,12 +963,12 @@ pub trait ContextHandle: Send + Sync {
     /// is the value `run_step` returned; passing it explicitly
     /// removes the read-counter-and-subtract-one coupling.
     async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()>;
-    /// Open access to `provider` on the DEPLOYMENT's configured key for the
+    /// Open access to `provider` on the RUNTIME's configured key for the
     /// calling node: returns the credential to authenticate with and,
     /// optionally, the relay address calls on it must go to (`None` = the
     /// provider's own API). Used internally by
     /// [`ExecutionContext::provider_access`] (a user-supplied key never
-    /// reaches this). The deployment decides whether this node may use its
+    /// reaches this). The runtime decides whether this node may use its
     /// key; a refusal or a missing key is a loud error telling the user to
     /// set their own key. The runtime gives the access back when the node
     /// finishes; nothing node-facing closes it.
