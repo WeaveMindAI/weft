@@ -30,13 +30,31 @@ export interface ConfigFieldSpan {
   origin: 'inline' | 'connection';
 }
 
-/// A `@file("path", Type)` reference on a config field. `config[field]`
-/// holds the resolved value; this says the value came from a file, so the
-/// editor renders the field as file-backed and writes edits to `path`
-/// instead of rewriting the `@file(...)` token in the source.
+/// A `@file("path", Type)` / `@asset("path", Type)` reference on a config
+/// field. The marker is the edit contract:
+///
+/// `marker: 'file'` (bidirectional): `config[field]` holds the resolved text
+/// content; the editor renders the field as file-backed and writes edits to
+/// `path` instead of rewriting the marker token in the source.
+///
+/// `marker: 'asset'` (pull-only): nothing writes back. A file-typed ref
+/// (`typeReferencesFile(type)`) defers to the build (the marker itself is
+/// the field's value; the file-drop field sets/clears it); a text-typed one
+/// resolved at parse and renders read-only.
+/// SYNC: FileRef <-> crates/weft-core/src/project.rs FileRef, FileMarker
 export interface FileRef {
   path: string;
   type: string;
+  marker: 'file' | 'asset';
+}
+
+/// Does a ref's declared type make it a stored-file ref (its value is a
+/// stored file, not text content)? The file primitives + their aliases are
+/// matched as whole tokens anywhere in the type expression, so composite
+/// types (`List[Image]`, `Image | Null`) count too.
+/// SYNC: typeReferencesFile <-> crates/weft-core/src/weft_type.rs references_file
+export function typeReferencesFile(type: string): boolean {
+  return /\b(Image|Video|Audio|Blob|Media|File)\b/.test(type);
 }
 
 /// The resolved state of a `@file` target: its content, a read error, or
@@ -177,6 +195,9 @@ export interface FieldType {
   language?: string;
   options?: string[];
   accept?: string;
+  /// file_drop: the declared weft file type (Image/Audio/Video/Blob/File).
+  // SYNC: FieldType.type <-> crates/weft-core/src/node.rs FieldType::FileDrop file_type
+  type?: string;
   provider?: ApiKeyProvider;
   min?: number;
   max?: number;
@@ -941,11 +962,25 @@ export type HostMessage =
   /// the bar can show "Resync available" while a different verb
   /// is in flight without flickering.
   | { kind: 'statusSnapshot'; snapshot: ActionAvailability }
-  /// Reply to `resolveStoredFileUrl`. `url` present = the box's
-  /// public URL (carrying a short-lived capability) the <img>/<video>
-  /// streams directly from; `error` present = the file is
-  /// expired/deleted or the handshake failed (preview shows fallback).
-  | { kind: 'storedFileUrl'; requestId: number; url?: string; error?: string };
+  /// Reply to `storageCall`, correlated by requestId. `result` is the
+  /// dispatcher route's JSON response on success; `error` is the failure
+  /// reason (HTTP error body or transport fault) on failure.
+  | { kind: 'storageResult'; requestId: number; result?: unknown; error?: string }
+  /// Reply to `pickAsset`: `path` is the token path the field writes into its
+  /// `@asset("<path>", <Type>)` ref (a path in place locally, `assets/<name>`
+  /// for stored bytes), absent on cancel; `error` on failure.
+  | { kind: 'assetPicked'; requestId: number; path?: string; error?: string }
+  /// Reply to `listRuntimeFiles`: the project's STORED runtime files (its
+  /// `project/` + `asset/` storage scopes), keys tenant-less (the short
+  /// address a picked ref writes into source). `error` is the failure
+  /// reason when the listing itself failed; an empty `files` with no
+  /// `error` genuinely means the project has no stored files.
+  | {
+      kind: 'runtimeFiles';
+      requestId: number;
+      files: { key: string; filename: string; mimeType: string; sizeBytes: number }[];
+      error?: string;
+    };
 
 export interface FollowStatus {
   mode: 'latest' | 'pinned';
@@ -1097,24 +1132,43 @@ export type WebviewMessage =
   /// surfaces as "expired or deleted" (the metadata in the value
   /// stays readable; the bytes are gone).
   | { kind: 'downloadStoredFile'; key: string }
-  /// Inline image preview: the webview asks the host to run the
-  /// brokered handshake and return the box's public URL (carrying a
-  /// short-lived capability). The host replies with a correlated
-  /// `storedFileUrl`; the <img> streams directly from the box (the
-  /// CSP admits the storage origin).
-  | { kind: 'resolveStoredFileUrl'; key: string; requestId: number };
+  /// Drive one storage-plane verb through the host: the host POSTs `body`
+  /// as JSON to the dispatcher's `/storage/<path>` route and replies with a
+  /// correlated `storageResult`. This is the ONE channel for storage control
+  /// calls (the inline preview's download handshake); bytes never ride it.
+  | { kind: 'storageCall'; requestId: number; path: string; body: unknown }
+  /// The file-drop field asks the host to produce an ASSET REF path. With
+  /// `dropped` (a drag-dropped file's bytes, base64), the host stores them
+  /// as a project file under `assets/<name>` through its normal save path
+  /// and replies with that path. Without, the host runs its own picker
+  /// (e.g. a native file dialog whose result is referenced IN PLACE, no
+  /// copy) and replies with the chosen path. The field then writes `@asset("<path>", <Type>)` into
+  /// config; the pre-build asset sync does the rest.
+  | {
+      kind: 'pickAsset';
+      requestId: number;
+      accept?: string;
+      dropped?: { name: string; bytesBase64: string };
+    }
+  /// The file-picker modal asks for the project's STORED runtime files
+  /// (reply: `runtimeFiles`): what the storage plane holds for this project,
+  /// listed through the same door `weft files` uses. Picking one writes
+  /// `@asset("<scope-key>", <Type>)` into config.
+  | { kind: 'listRuntimeFiles'; requestId: number };
 
-// SYNC: StoredFileWire <-> crates/weft-core/src/storage/mod.rs StoredFile
-/// The payload INSIDE a concrete stored-file marker: a logical key +
-/// self-describing metadata, NO url (bytes are fetched via the
-/// authenticated handshake above). url/data file values are the other
-/// two handle forms and don't carry `key`.
-export interface StoredFileWire {
-  key: string;
+// SYNC: FileValueWire <-> crates/weft-core/src/storage/mod.rs StoredFile
+/// The payload INSIDE a concrete file marker: self-describing metadata
+/// plus exactly ONE handle saying where the bytes live. A bucket-backed
+/// file carries a `key` (bytes fetched via the authenticated handshake
+/// above); a file pointing at an external resource carries a `url`
+/// (rendered/fetched directly). `data` (inline base64) is deliberately
+/// NOT a handle here: the read paths don't resolve it, so it falls
+/// through to the raw-JSON rendering instead of a broken preview.
+export type FileValueWire = {
   mimeType: string;
   sizeBytes: number;
   filename: string;
-}
+} & ({ key: string; url?: undefined } | { url: string; key?: undefined });
 
 // SYNC: STORED_FILE_MARKERS <-> crates/weft-core/src/weft_type.rs FileKind::marker_key
 /// The per-kind sentinel keys a stored-file value can carry. The marker
@@ -1126,13 +1180,16 @@ const STORED_FILE_MARKERS = [
   '__weft_blob__',
 ] as const;
 
-// SYNC: parseStoredFile <-> crates/weft-core/src/storage/mod.rs StoredFile::from_value
-/// The ONE place the webview parses a stored-file value, regardless of
-/// which concrete marker (image/video/audio/blob) it carries. Returns
-/// null for anything that is not a key-backed stored-file value. Every
-/// consumer (inspector card, node preview) routes through here so the
-/// shape is validated identically.
-export function parseStoredFile(value: unknown): StoredFileWire | null {
+// SYNC: parseFileValue <-> crates/weft-core/src/storage/mod.rs FileHandle::from_value
+/// The ONE place the webview parses a file value, regardless of which
+/// concrete marker (image/video/audio/blob) it carries. Returns the
+/// metadata plus its handle (`key` for bucket-backed, `url` for an
+/// external resource; `key` wins when both are somehow present, the
+/// bucket copy is authoritative), or null for anything that is not a
+/// resolvable file value (including data-backed markers, which no read
+/// path resolves). Every consumer (inspector card, node preview)
+/// routes through here so the shape is validated identically.
+export function parseFileValue(value: unknown): FileValueWire | null {
   if (typeof value !== 'object' || value === null) return null;
   const obj = value as Record<string, unknown>;
   const marker = STORED_FILE_MARKERS.find((m) => m in obj);
@@ -1140,13 +1197,15 @@ export function parseStoredFile(value: unknown): StoredFileWire | null {
   const payload = obj[marker];
   if (typeof payload !== 'object' || payload === null) return null;
   const p = payload as Record<string, unknown>;
-  if (typeof p.key !== 'string' || typeof p.mimeType !== 'string') return null;
-  return {
-    key: p.key,
+  if (typeof p.mimeType !== 'string') return null;
+  const meta = {
     mimeType: p.mimeType,
     sizeBytes: typeof p.sizeBytes === 'number' ? p.sizeBytes : 0,
     filename: typeof p.filename === 'string' ? p.filename : '',
   };
+  if (typeof p.key === 'string' && p.key !== '') return { key: p.key, ...meta };
+  if (typeof p.url === 'string' && p.url !== '') return { url: p.url, ...meta };
+  return null;
 }
 
 // SYNC: EditOp <-> crates/weft-compiler/src/edit.rs EditOp

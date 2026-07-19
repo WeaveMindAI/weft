@@ -2,6 +2,7 @@
 //! thin wrappers over an HTTP call to the dispatcher.
 
 pub mod new;
+pub mod assets;
 pub mod build;
 pub mod ensure;
 pub mod run;

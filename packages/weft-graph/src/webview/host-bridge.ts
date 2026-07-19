@@ -154,7 +154,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
   // resolved content is shown separately via the host's fileContents map.
   if (n.fileRefs) {
     for (const [key, ref] of Object.entries(n.fileRefs)) {
-      cleanConfig[key] = { __weftFileRef: { path: ref.path, type: ref.type } };
+      cleanConfig[key] = { __weftFileRef: { path: ref.path, type: ref.type, marker: ref.marker } };
     }
   }
   const parentId = resolveParentGroup(n, groupIds);

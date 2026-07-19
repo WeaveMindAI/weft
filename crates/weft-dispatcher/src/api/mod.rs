@@ -119,6 +119,17 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/storage/files/download", post(storage::download))
         .route("/storage/public-base", get(storage::public_base))
         .route("/storage/usage", get(storage::usage))
+        // Asset publication (the pre-build sync): the same multipart contract
+        // the worker uses, proxied to the broker's admin upload surface; part
+        // URLs are caller-facing so bytes go straight to the bucket.
+        .route("/storage/upload/begin", post(storage::upload_begin))
+        // The pre-build asset sync's diff input: the project's published assets.
+        .route("/storage/assets/list", post(storage::assets_list))
+        .route("/storage/upload/parts", post(storage::upload_parts))
+        .route("/storage/upload/part-done", post(storage::upload_part_done))
+        .route("/storage/upload/complete", post(storage::upload_complete))
+        .route("/storage/upload/resume", post(storage::upload_resume))
+        .route("/storage/upload/abort", post(storage::upload_abort))
         // Inspector proxy: project-scoped read of signal display
         // info (mount_path, plaintext key while listener still
         // holds it, etc). Project-token gated.

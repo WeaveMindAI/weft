@@ -27,11 +27,90 @@ pub mod key;
 /// Boxed byte stream used for streaming put/get. `'static` so it can
 /// cross the `ContextHandle` trait object; chunks are `Bytes` so
 /// hops are zero-copy.
+#[cfg(feature = "runtime")]
 pub type ByteStream = futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>;
 
 /// Wrap a fully-buffered payload as a one-chunk [`ByteStream`].
+#[cfg(feature = "runtime")]
 pub fn bytes_stream(bytes: bytes::Bytes) -> ByteStream {
     Box::pin(futures::stream::once(async move { Ok(bytes) }))
+}
+
+/// Extension -> mime guess for a name/URL with no served Content-Type (an
+/// asset ref at compile time, a pasted URL). Display + marker-kind selection
+/// only: whenever real bytes are fetched, the response's own Content-Type is
+/// authoritative. Small common set; unknown -> octet-stream.
+// SYNC: mime_from_filename <-> packages/weft-graph/src/webview/lib/utils/file-browser.ts EXT_MIME
+pub fn mime_from_filename(name: &str) -> &'static str {
+    match name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("avif") => "image/avif",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("m4a") => "audio/mp4",
+        Some("pdf") => "application/pdf",
+        Some("csv") => "text/csv",
+        Some("txt") => "text/plain",
+        Some("json") => "application/json",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The url-form file value for an external media ref (`@file("https://…",
+/// Image)` or the editor's paste-URL): a concrete marker whose payload's
+/// handle is the URL. The marker KIND comes from the declared type when it
+/// names a concrete file primitive (an `Image` ref is `__weft_image__`
+/// whatever the extension suggests); a union (`File`/`Media`) falls back to
+/// the extension's mime guess. Size is unknown until fetched (0, display
+/// only); the worker's fetch reports the real Content-Type at run time.
+pub fn url_file_value(url: &str, declared: &crate::weft_type::WeftType) -> Value {
+    let filename = filename_from_url(url);
+    let mime = mime_from_filename(&filename);
+    let kind = declared
+        .concrete_file_kind()
+        .unwrap_or_else(|| crate::weft_type::FileKind::from_mime(mime));
+    crate::weft_type::WeftType::file_marker(
+        kind,
+        serde_json::json!({
+            "url": url,
+            "mimeType": mime,
+            "sizeBytes": 0,
+            "filename": filename,
+        }),
+    )
+}
+
+/// The stored-file value for `file` with the marker KIND picked by a DECLARED
+/// type when it names a concrete file primitive (an asset `@file` ref typed
+/// `Image` is `__weft_image__` even if its extension guesses a different
+/// mime); a union (`File`/`Media`) or non-file declaration falls back to the
+/// file's own mime, exactly like [`StoredFile::to_value`].
+pub fn typed_file_value(file: &StoredFile, declared: &crate::weft_type::WeftType) -> Value {
+    let kind = declared.concrete_file_kind().unwrap_or_else(|| file.kind());
+    crate::weft_type::WeftType::file_marker(
+        kind,
+        serde_json::to_value(file).expect("StoredFile serializes"),
+    )
+}
+
+/// Is `s` a content hash: exactly 64 lowercase hex chars (sha256). The id
+/// grammar of the ASSET scope (`asset/<project>/<sha256>`): the hash IS the
+/// file's identity, so "this content is uploaded" is a key-existence check and
+/// the pre-build sync's diff is a set compare. Anything else in asset-id
+/// position is a rejected request, never a lookup.
+pub fn is_content_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Derive a filename from a URL's last path segment, sans query and
@@ -67,6 +146,7 @@ pub fn normalize_content_type(header: Option<&str>) -> String {
 /// Collect a [`ByteStream`] into one contiguous buffer. Convenience
 /// for callers that want the whole payload in memory; large files
 /// should consume the stream incrementally instead.
+#[cfg(feature = "runtime")]
 pub async fn collect_stream(mut stream: ByteStream) -> std::io::Result<bytes::Bytes> {
     use futures::StreamExt;
     let mut buf = Vec::new();
@@ -92,6 +172,12 @@ pub enum StorageScope {
     /// name the same `name` meet in the same prefix; first use by a
     /// project auto-grants it. Opt-in by naming.
     Shared { name: String },
+    /// `asset/<project_id>/`: the project's PUBLISHED ASSETS, the storage
+    /// copies of files the source references via media `@file` refs. Derived
+    /// state owned by the pre-build asset sync (content-hash ids; created and
+    /// deleted only through the control-plane surface). Workers READ this
+    /// scope like project scope; the worker data path refuses writes to it.
+    Asset,
 }
 
 impl Default for StorageScope {
@@ -158,8 +244,8 @@ pub struct StoredFileMeta {
 /// NO url: byte access always goes through an authenticated fetch (or
 /// an explicit, expiring presigned URL a node deliberately mints). The
 /// concrete kind (Image/Video/Audio/Blob) is derived from `mime_type`.
-// SYNC: StoredFile <-> packages/weft-graph/src/protocol.ts StoredFileWire
-//       (per-kind markers __weft_image__/video/audio/blob, parseStoredFile)
+// SYNC: StoredFile <-> packages/weft-graph/src/protocol.ts FileValueWire
+//       (per-kind markers __weft_image__/video/audio/blob, parseFileValue)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredFile {
     pub key: String,
@@ -215,18 +301,98 @@ impl StoredFile {
         })
     }
 
-    /// Extract a storage key from either a raw key string value, a
-    /// raw key `&str`-shaped JSON string, or a stored-file value.
-    /// The accepted forms are exactly what nodes hold: the stored-file
-    /// value an upstream node emitted, or a key they kept around.
-    pub fn key_from(value: &Value) -> WeftResult<String> {
+}
+
+/// How to reach the bytes behind a file value: the marker payload's HANDLE.
+/// A file value is a self-describing reference (see [`StoredFile`]); the
+/// handle is the one field that says WHERE the bytes live. A bucket-backed
+/// file carries a `key` (read via a presigned bucket URL); a file pointing at
+/// an external resource carries a `url` (fetched directly). The read path
+/// ([`crate::context::StorageHandle::get`]) branches on this so a node's
+/// `get_bytes(&file)` is identical whichever handle the value carries: the
+/// node holds an ADDRESS and decides what to do with it, and the address may
+/// be a bucket key or an external URL.
+///
+/// (`data`, an inline base64 handle, is a third form the type system accepts
+/// but the read path does not yet resolve; it is deliberately not a variant
+/// here so an unresolved `data` value fails loud rather than reading wrong.)
+// SYNC: FileHandle <-> packages/weft-graph/src/protocol.ts parseFileValue
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileHandle {
+    /// The bytes live in the storage bucket under this tenant-local key.
+    Key(String),
+    /// The bytes live at this external URL, fetched directly by the worker.
+    Url {
+        url: String,
+        /// The declared mime, so a read reports it without a fetch-ahead
+        /// (the actual Content-Type on fetch is authoritative for bytes).
+        mime_type: String,
+        filename: String,
+        size_bytes: u64,
+    },
+}
+
+impl FileHandle {
+    /// Parse a file value into its handle. Accepts a bare key string (a node
+    /// held onto a key), a `key`-backed marker, or a `url`-backed marker.
+    /// Errors loud on a value that is neither, or a marker whose only handle
+    /// is one the read path can't resolve (`data`), so a caller never silently
+    /// reads the wrong bytes.
+    pub fn from_value(value: &Value) -> WeftResult<Self> {
         if let Some(s) = value.as_str() {
             if s.is_empty() {
                 return Err(WeftError::Input("empty storage key".into()));
             }
-            return Ok(s.to_string());
+            return Ok(FileHandle::Key(s.to_string()));
         }
-        Ok(Self::from_value(value)?.key)
+        let obj = value.as_object().ok_or_else(|| {
+            WeftError::Input(format!(
+                "not a file value (not an object): {}",
+                crate::truncate_user_string(&value.to_string(), 256)
+            ))
+        })?;
+        let kind = crate::weft_type::FileKind::from_marker_obj(obj).ok_or_else(|| {
+            WeftError::Input(format!(
+                "not a file value (no __weft_image__/video/audio/blob marker): {}",
+                crate::truncate_user_string(&value.to_string(), 256)
+            ))
+        })?;
+        let payload = obj[kind.marker_key()].as_object().ok_or_else(|| {
+            WeftError::Input("file marker payload is not an object".into())
+        })?;
+        // A key-backed marker is the common case; a url-backed one points
+        // outside the bucket. Exactly one handle is expected; prefer `key`
+        // when both are somehow present (a bucket copy is authoritative).
+        if let Some(key) = payload.get("key").and_then(Value::as_str) {
+            if key.is_empty() {
+                return Err(WeftError::Input("file marker has an empty key".into()));
+            }
+            return Ok(FileHandle::Key(key.to_string()));
+        }
+        if let Some(url) = payload.get("url").and_then(Value::as_str) {
+            if url.is_empty() {
+                return Err(WeftError::Input("file marker has an empty url".into()));
+            }
+            return Ok(FileHandle::Url {
+                url: url.to_string(),
+                mime_type: payload
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                filename: payload
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| filename_from_url(url)),
+                size_bytes: payload.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0),
+            });
+        }
+        Err(WeftError::Input(
+            "file value has no readable handle (expected `key` or `url`; a `data` inline \
+             handle is not readable through storage)"
+                .into(),
+        ))
     }
 }
 
@@ -273,10 +439,16 @@ pub struct UploadBeginRequest {
 /// Begin response: the minted key + the fixed part size for this upload.
 /// Every part the caller reserves must be exactly `part_size` bytes except
 /// the final one (which may be smaller and marks the end of the upload).
+/// A content-addressed (asset) begin whose content is already stored ACTIVE
+/// answers `already_stored: true` with the existing key: there is nothing to
+/// transfer, the caller must not reserve parts, and `part_size` is a
+/// meaningless 0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadBeginResponse {
     pub key: String,
     pub part_size: u64,
+    #[serde(default)]
+    pub already_stored: bool,
 }
 
 /// `POST /v1/storage/upload/parts`: reserve + presign the next parts, in
@@ -408,6 +580,50 @@ pub struct WipePrefixResponse {
     pub wiped: u64,
 }
 
+// The admin upload surface: the dispatcher drives the same multipart upload
+// contract as a worker, on behalf of a tenant's editor session (a file-drop
+// config field). Editor uploads are always PROJECT-scoped (there is no
+// execution at edit time, and project files persist without a keep flag), so
+// `begin` names the project explicitly; every later verb is key-addressed and
+// carries only the acting tenant (the key itself names project + tenant, and
+// the broker re-checks they match).
+
+/// `POST /v1/storage/admin/upload/begin`: start an ASSET upload for
+/// `tenant`/`project` (the pre-build sync publishing a source-referenced
+/// media file). Same size semantics as `UploadBeginRequest`; `content_hash`
+/// is the sha256 that becomes the key id (content-addressed). The admin
+/// surface uploads ONLY the asset plane: every other scope is written by
+/// workers through the data path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUploadBeginRequest {
+    pub tenant: String,
+    pub project: String,
+    pub mime_type: String,
+    pub filename: String,
+    #[serde(default)]
+    pub declared_size: Option<u64>,
+    pub content_hash: String,
+}
+
+/// The key-addressed admin upload verbs (`parts`/`part-done`/`complete`/
+/// `resume`/`abort`): the acting tenant wrapping the same worker envelope the
+/// data path uses, so the two surfaces cannot drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tenanted<T> {
+    pub tenant: String,
+    #[serde(flatten)]
+    pub inner: T,
+}
+
+/// `POST /v1/storage/admin/list-prefix`: the files under one scope-boundary
+/// prefix (the pre-build sync's asset diff over `<tenant>/asset/<project>/`).
+/// The broker validates the prefix with the same scope-boundary grammar as a
+/// wipe, so it can only ever range one owner's space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListPrefixRequest {
+    pub prefix: String,
+}
+
 /// `POST /v1/storage/admin/sweep-exec`: terminate-sweep one color's un-kept
 /// exec files (crashed uploads reaped; completed files stamped to expire
 /// after the post-run linger).
@@ -450,6 +666,50 @@ mod tests {
     }
 
     // Layer 2: wire-shape round-trips for every cross-process type.
+
+    #[test]
+    fn admin_upload_envelopes_round_trip() {
+        // The `Tenanted<T>` wrapper flattens the inner worker envelope, so the
+        // wire shape is one flat object: `{tenant, key, sizes}` for parts, etc.
+        let parts = Tenanted {
+            tenant: "alice".to_string(),
+            inner: UploadPartsRequest { key: "alice/project/p1/f".into(), sizes: vec![5, 3] },
+        };
+        let v = serde_json::to_value(&parts).unwrap();
+        assert_eq!(
+            v,
+            json!({"tenant": "alice", "key": "alice/project/p1/f", "sizes": [5, 3]})
+        );
+        let back: Tenanted<UploadPartsRequest> = serde_json::from_value(v).unwrap();
+        assert_eq!(back.tenant, "alice");
+        assert_eq!(back.inner.sizes, vec![5, 3]);
+
+        let begin = AdminUploadBeginRequest {
+            tenant: "alice".into(),
+            project: "p1".into(),
+            mime_type: "image/png".into(),
+            filename: "x.png".into(),
+            declared_size: Some(8),
+            content_hash: "a".repeat(64),
+        };
+        let v = serde_json::to_value(&begin).unwrap();
+        assert_eq!(
+            v,
+            json!({"tenant": "alice", "project": "p1", "mime_type": "image/png",
+                   "filename": "x.png", "declared_size": 8,
+                   "content_hash": "a".repeat(64)})
+        );
+        let back: AdminUploadBeginRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.project, "p1");
+        // declared_size is optional on the wire; content_hash is not (the
+        // admin surface uploads only the content-addressed asset plane).
+        let min: AdminUploadBeginRequest = serde_json::from_value(json!({
+            "tenant": "t", "project": "p", "mime_type": "a/b", "filename": "f",
+            "content_hash": "b".repeat(64)
+        }))
+        .unwrap();
+        assert_eq!(min.declared_size, None);
+    }
 
     #[test]
     fn stored_file_value_round_trip() {
@@ -510,16 +770,63 @@ mod tests {
     }
 
     #[test]
-    fn key_from_accepts_string_and_stored_file() {
-        assert_eq!(StoredFile::key_from(&json!("project/p/1")).unwrap(), "project/p/1");
-        assert!(StoredFile::key_from(&json!("")).is_err());
-        let m = StoredFile {
+    fn file_handle_parses_key_and_url_forms() {
+        // A bare key string is a Key handle.
+        assert_eq!(
+            FileHandle::from_value(&json!("project/p/1")).unwrap(),
+            FileHandle::Key("project/p/1".into())
+        );
+        assert!(FileHandle::from_value(&json!("")).is_err());
+
+        // A key-backed marker is a Key handle (the common case).
+        let key_file = StoredFile {
             key: "shared/team/2".into(),
             mime_type: "application/pdf".into(),
             size_bytes: 9,
             filename: "d.pdf".into(),
         };
-        assert_eq!(StoredFile::key_from(&m.to_value()).unwrap(), "shared/team/2");
+        assert_eq!(
+            FileHandle::from_value(&key_file.to_value()).unwrap(),
+            FileHandle::Key("shared/team/2".into())
+        );
+
+        // A url-backed marker is a Url handle, carrying the declared metadata.
+        let url_file = json!({"__weft_image__": {
+            "url": "https://ex.com/a.png",
+            "mimeType": "image/png",
+            "filename": "a.png",
+            "sizeBytes": 1234
+        }});
+        assert_eq!(
+            FileHandle::from_value(&url_file).unwrap(),
+            FileHandle::Url {
+                url: "https://ex.com/a.png".into(),
+                mime_type: "image/png".into(),
+                filename: "a.png".into(),
+                size_bytes: 1234,
+            }
+        );
+
+        // A url marker with only the handle + mime derives a filename from the
+        // URL and defaults size to 0 (both display-only; the fetch is truth).
+        let bare = json!({"__weft_blob__": {"url": "https://ex.com/d/x.bin", "mimeType": "application/octet-stream"}});
+        assert_eq!(
+            FileHandle::from_value(&bare).unwrap(),
+            FileHandle::Url {
+                url: "https://ex.com/d/x.bin".into(),
+                mime_type: "application/octet-stream".into(),
+                filename: "x.bin".into(),
+                size_bytes: 0,
+            }
+        );
+
+        // A data-inline marker has no readable handle: fail loud, never read wrong.
+        let data_file = json!({"__weft_image__": {"data": "aGVsbG8=", "mimeType": "image/png"}});
+        assert!(FileHandle::from_value(&data_file).is_err());
+        // Not a file value at all.
+        assert!(FileHandle::from_value(&json!({"key": "x"})).is_err());
+        // An empty url is refused.
+        assert!(FileHandle::from_value(&json!({"__weft_blob__": {"url": ""}})).is_err());
     }
 
     #[test]
@@ -585,6 +892,10 @@ mod tests {
             serde_json::to_value(StorageScope::Shared { name: "team".into() }).unwrap(),
             json!({"kind": "shared", "name": "team"})
         );
+        assert_eq!(
+            serde_json::to_value(StorageScope::Asset).unwrap(),
+            json!({"kind": "asset"})
+        );
         let s: StorageScope = serde_json::from_value(json!({"kind": "project"})).unwrap();
         assert_eq!(s, StorageScope::Project);
     }
@@ -640,9 +951,21 @@ mod tests {
         .unwrap();
         assert_eq!(b2.declared_size, Some(42));
 
-        let r = UploadBeginResponse { key: "t/exec/c/1".into(), part_size: 8 << 20 };
+        let r = UploadBeginResponse {
+            key: "t/exec/c/1".into(),
+            part_size: 8 << 20,
+            already_stored: false,
+        };
         let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v, json!({"key": "t/exec/c/1", "part_size": 8_388_608u64}));
+        assert_eq!(
+            v,
+            json!({"key": "t/exec/c/1", "part_size": 8_388_608u64, "already_stored": false})
+        );
+        // `already_stored` defaults false on the wire, so a begin reply
+        // without the field parses as a fresh reservation.
+        let back: UploadBeginResponse =
+            serde_json::from_value(json!({"key": "t/exec/c/1", "part_size": 1})).unwrap();
+        assert!(!back.already_stored);
 
         let p = PresignedPart { part_number: 2, size_bytes: 5, url: "u".into() };
         let v = serde_json::to_value(UploadPartsResponse { parts: vec![p.clone()] }).unwrap();

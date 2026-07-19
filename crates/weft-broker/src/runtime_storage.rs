@@ -42,11 +42,13 @@ use serde::Deserialize;
 
 use weft_core::storage::key::{self, CallerAuth};
 use weft_core::storage::{
-    DownloadUrlResponse, ListFilesResponse, PartDoneRequest, PresignResponse, PresignResult,
-    StorageScope, StoredFileMeta, SweepExecRequest, SweepExecResponse, TenantScopeRequest,
-    TenantUsage, UploadAbortRequest, UploadBeginRequest, UploadBeginResponse,
-    UploadCompleteRequest, UploadPartsRequest, UploadPartsResponse, UploadResumeRequest,
-    UploadResumeResponse, WipePrefixRequest, WipePrefixResponse,
+    AdminUploadBeginRequest, DownloadUrlResponse, ListFilesResponse,
+    ListPrefixRequest, PartDoneRequest,
+    PresignResponse, PresignResult, StorageScope, StoredFileMeta, SweepExecRequest,
+    SweepExecResponse, Tenanted, TenantScopeRequest, TenantUsage, UploadAbortRequest,
+    UploadBeginRequest, UploadBeginResponse, UploadCompleteRequest, UploadPartsRequest,
+    UploadPartsResponse, UploadResumeRequest, UploadResumeResponse, WipePrefixRequest,
+    WipePrefixResponse,
 };
 use weft_platform_traits::PresignAudience;
 
@@ -82,7 +84,18 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/list", get(list_files))
         .route("/v1/storage/keep", post(keep_file))
         .route("/v1/storage/presign", post(presign))
+        // Admin upload: the dispatcher drives the SAME multipart contract on
+        // behalf of a tenant's editor session (a file-drop config field).
+        // Project-scoped only; part URLs are presigned for the browser-facing
+        // endpoint (the editor PUTs bytes to the bucket directly).
+        .route("/v1/storage/admin/upload/begin", post(admin_upload_begin))
+        .route("/v1/storage/admin/upload/parts", post(admin_upload_parts))
+        .route("/v1/storage/admin/upload/part-done", post(admin_upload_part_done))
+        .route("/v1/storage/admin/upload/complete", post(admin_upload_complete))
+        .route("/v1/storage/admin/upload/resume", post(admin_upload_resume))
+        .route("/v1/storage/admin/upload/abort", post(admin_upload_abort))
         .route("/v1/storage/admin/tenant-list", post(admin_tenant_list))
+        .route("/v1/storage/admin/list-prefix", post(admin_list_prefix))
         .route("/v1/storage/admin/tenant-usage", post(admin_tenant_usage))
         .route("/v1/storage/admin/files/{*key}", delete(admin_delete_file))
         .route("/v1/storage/admin/presign", post(admin_presign))
@@ -106,6 +119,7 @@ fn map_err(e: RuntimeStoreError) -> ApiError {
         RuntimeStoreError::Denied(m) => (StatusCode::FORBIDDEN, m),
         RuntimeStoreError::Invalid(m) => (StatusCode::BAD_REQUEST, m),
         RuntimeStoreError::QuotaExceeded(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
+        RuntimeStoreError::Conflict(m) => (StatusCode::CONFLICT, m),
         RuntimeStoreError::Other(e) => {
             tracing::error!(target: "weft_broker::runtime_storage", error = format!("{e:#}"), "runtime-store op failed");
             (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string())
@@ -189,20 +203,45 @@ async fn upload_begin(
 ) -> Result<Json<UploadBeginResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
+    // Assets are sync-managed derived state (content-hash ids minted by the
+    // pre-build sync through the control-plane surface); node code writing
+    // into the asset scope would fork that ownership, so refuse it loudly.
+    if matches!(req.scope, StorageScope::Asset) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the asset scope is managed by the pre-build asset sync; node code writes \
+             execution/project/shared scopes"
+                .into(),
+        ));
+    }
     validate_serveable(&req.mime_type, &req.filename)?;
-    let (key, part_size) = store
+    let begun = store
         .begin_upload(
             &caller,
-            &req.scope,
-            &req.mime_type,
-            &req.filename,
-            req.keep,
+            &crate::runtime_store::UploadSpec {
+                scope: &req.scope,
+                mime: &req.mime_type,
+                filename: &req.filename,
+                keep: req.keep,
+                declared_size: req.declared_size,
+                content_hash: None,
+            },
             state.entitlements.as_ref(),
-            req.declared_size,
         )
         .await
         .map_err(map_err)?;
-    Ok(Json(UploadBeginResponse { key, part_size }))
+    match begun {
+        crate::runtime_store::BeginUpload::Ready { key, part_size } => {
+            Ok(Json(UploadBeginResponse { key, part_size, already_stored: false }))
+        }
+        // Only content-addressed (asset) begins can answer already-stored,
+        // and this path never carries a content hash: reaching here is a
+        // store invariant break, not a caller error.
+        crate::runtime_store::BeginUpload::AlreadyStored { key } => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("begin without a content hash answered already-stored for '{key}'"),
+        )),
+    }
 }
 
 /// `POST /v1/storage/upload/parts`: reserve + presign the next part(s). Each
@@ -216,7 +255,13 @@ async fn upload_parts(
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
     let parts = store
-        .reserve_parts(&caller, &req.key, &req.sizes, state.entitlements.as_ref())
+        .reserve_parts(
+            &caller,
+            &req.key,
+            &req.sizes,
+            state.entitlements.as_ref(),
+            PresignAudience::Internal,
+        )
         .await
         .map_err(map_err)?;
     Ok(Json(UploadPartsResponse { parts }))
@@ -256,7 +301,10 @@ async fn upload_resume(
 ) -> Result<Json<UploadResumeResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
-    let (part_size, missing) = store.resume_upload(&caller, &req.key).await.map_err(map_err)?;
+    let (part_size, missing) = store
+        .resume_upload(&caller, &req.key, PresignAudience::Internal)
+        .await
+        .map_err(map_err)?;
     Ok(Json(UploadResumeResponse { part_size, missing }))
 }
 
@@ -374,6 +422,156 @@ fn wall(caller: &CallerAuth, key: &str) -> Result<key::ParsedKey, ApiError> {
     Ok(parsed)
 }
 
+// ---------- control-plane admin upload (the dispatcher's editor proxy) ----------
+//
+// The dispatcher verified the acting tenant; the broker re-runs the key wall
+// against that tenant on every key-addressed verb, so a dispatcher bug can
+// still never cross tenants. The store code is the exact worker path: the
+// admin surface only differs in WHO vouches for the caller and in the part
+// URLs' audience (External: the editor's browser PUTs to the bucket directly).
+
+/// The store-level identity for an editor upload: the dispatcher-vouched
+/// tenant + project, with no execution color (so exec-scoped keys are
+/// unreachable by construction).
+fn editor_caller(tenant: &str, project: &str) -> CallerAuth {
+    CallerAuth::Worker {
+        tenant: tenant.to_string(),
+        project_id: project.to_string(),
+        color: None,
+    }
+}
+
+/// Re-derive the acting caller for a key-addressed admin upload verb: the key
+/// must be ASSET-scoped (the one admin-uploadable plane) and belong to the
+/// vouched tenant. Returns the caller whose walls (`check_key_access`) then
+/// hold for the store call.
+fn editor_caller_for_key(tenant: &str, k: &str) -> Result<CallerAuth, ApiError> {
+    let parsed = key::parse_key(k).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if parsed.tenant != tenant {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "denied: key does not belong to the acting tenant".into(),
+        ));
+    }
+    let key::KeyScope::Asset { project_id } = &parsed.scope else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "admin uploads are asset-scoped; the key names a different scope".into(),
+        ));
+    };
+    Ok(editor_caller(tenant, project_id))
+}
+
+async fn admin_upload_begin(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<AdminUploadBeginRequest>,
+) -> Result<Json<UploadBeginResponse>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    validate_serveable(&req.mime_type, &req.filename)?;
+    let caller = editor_caller(&req.tenant, &req.project);
+    let begun = store
+        .begin_upload(
+            &caller,
+            &crate::runtime_store::UploadSpec {
+                scope: &StorageScope::Asset,
+                mime: &req.mime_type,
+                filename: &req.filename,
+                keep: None,
+                declared_size: req.declared_size,
+                content_hash: Some(&req.content_hash),
+            },
+            state.entitlements.as_ref(),
+        )
+        .await
+        .map_err(map_err)?;
+    Ok(Json(match begun {
+        crate::runtime_store::BeginUpload::Ready { key, part_size } => {
+            UploadBeginResponse { key, part_size, already_stored: false }
+        }
+        crate::runtime_store::BeginUpload::AlreadyStored { key } => {
+            UploadBeginResponse { key, part_size: 0, already_stored: true }
+        }
+    }))
+}
+
+async fn admin_upload_parts(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<UploadPartsRequest>>,
+) -> Result<Json<UploadPartsResponse>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
+    let parts = store
+        .reserve_parts(
+            &caller,
+            &req.inner.key,
+            &req.inner.sizes,
+            state.entitlements.as_ref(),
+            PresignAudience::External,
+        )
+        .await
+        .map_err(map_err)?;
+    Ok(Json(UploadPartsResponse { parts }))
+}
+
+async fn admin_upload_part_done(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<PartDoneRequest>>,
+) -> Result<Response, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
+    store
+        .record_part(&caller, &req.inner.key, req.inner.part_number, &req.inner.etag)
+        .await
+        .map_err(map_err)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn admin_upload_complete(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<UploadCompleteRequest>>,
+) -> Result<Response, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
+    let meta = store.complete_upload(&caller, &req.inner.key).await.map_err(map_err)?;
+    let file = crate::runtime_store::meta_to_stored_file(&meta);
+    Ok(Json(file.to_value()).into_response())
+}
+
+async fn admin_upload_resume(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<UploadResumeRequest>>,
+) -> Result<Json<UploadResumeResponse>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
+    let (part_size, missing) = store
+        .resume_upload(&caller, &req.inner.key, PresignAudience::External)
+        .await
+        .map_err(map_err)?;
+    Ok(Json(UploadResumeResponse { part_size, missing }))
+}
+
+async fn admin_upload_abort(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<UploadAbortRequest>>,
+) -> Result<Response, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
+    store.abort_upload(&caller, &req.inner.key).await.map_err(map_err)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 // ---------- control-plane admin (the dispatcher's CLI proxy) ----------
 //
 // The wire envelopes live in `weft_core::storage` (single definition, shared
@@ -389,6 +587,21 @@ async fn admin_tenant_list(
     let prefix = key::ParsedKey::tenant_prefix(&req.tenant)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let files = store.list(&prefix).await.map_err(map_anyhow)?;
+    Ok(Json(ListFilesResponse { files }))
+}
+
+/// The files under one scope-boundary prefix: the pre-build sync's asset diff.
+/// The prefix passes the SAME boundary grammar as a wipe (never a bare
+/// starts_with that could range across owners or tenants).
+async fn admin_list_prefix(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<ListPrefixRequest>,
+) -> Result<Json<ListFilesResponse>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    key::validate_wipe_prefix(&req.prefix).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let files = store.list(&req.prefix).await.map_err(map_anyhow)?;
     Ok(Json(ListFilesResponse { files }))
 }
 

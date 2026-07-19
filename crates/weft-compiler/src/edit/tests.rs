@@ -243,6 +243,118 @@ fn set_config_inline_field_replaces_in_place() {
 }
 
 #[test]
+fn set_config_writes_a_stored_file_marker_object() {
+    // The FileDrop field's write path: after an upload it hands SetConfig the
+    // stored-file MARKER object (`{"__weft_image__": {...}}`), not a string. The
+    // object literal must insert as a config value and re-parse cleanly, so the
+    // marker the runtime folds onto the media port survives the editor round-trip.
+    let src = "sized = FileSize\n";
+    let marker = r#"{"__weft_blob__": {"key": "local/project/p/abc", "mimeType": "application/octet-stream", "sizeBytes": 52, "filename": "picked.bin"}}"#;
+    let out = apply(
+        src,
+        vec![EditOp::SetConfig { node: "sized".into(), key: "file".into(), value: marker.into() }],
+    );
+    parse_ok(&out);
+    // The inserted config value is exactly the marker object (a later build parses
+    // it back to the stored-file value the node reads).
+    assert!(out.contains("__weft_blob__"), "marker key present: {out}");
+    assert!(out.contains("\"key\": \"local/project/p/abc\""), "payload present: {out}");
+    // And SetConfig round-trips: writing the marker then removing it restores the
+    // freshly-added-node source with no `file` config.
+    assert_reversible(src, vec![EditOp::SetConfig { node: "sized".into(), key: "file".into(), value: marker.into() }]);
+}
+
+#[test]
+fn set_config_compact_object_into_one_liner_bodies() {
+    // A COMPACT object value must be writable everywhere the editor can write:
+    // replacing an existing scalar inside a ONE-LINER canonical body, and a
+    // one-liner anon body. If the re-parse of `{ k: {"a": 1} }` on a single
+    // line mis-nested (the body's `}` vs the object's), parse_ok catches it.
+    let compact = r#"{"__weft_image__": {"key": "p/x/1", "mimeType": "image/png"}}"#;
+    let one_liner = "t = Text { value: \"x\" }\n";
+    let out = apply(
+        one_liner,
+        vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: compact.into() }],
+    );
+    parse_ok(&out);
+    assert!(out.contains("__weft_image__"), "{out}");
+
+    let anon = "op = ExecPython() -> (a: Number) { code: \"return 1\" }\n";
+    let out = apply(
+        anon,
+        vec![EditOp::SetConfig { node: "op".into(), key: "code".into(), value: compact.into() }],
+    );
+    parse_ok(&out);
+    assert!(out.contains("__weft_image__"), "{out}");
+}
+
+#[test]
+fn set_config_writes_a_multiline_object_value_everywhere() {
+    // A MULTI-LINE `{`-object value is contained (its newlines live inside the
+    // balanced brace-run) and the grammar parses it in EVERY value position
+    // (pinned by tests/parser_multiline_object.rs), so the editor accepts it:
+    // bodyless node, one-liner body, and connection-origin field alike. This is
+    // the form the webview emits for LARGE objects (a stored-file marker); the
+    // historical failure mode was the gate refusing it and the FileDrop field
+    // silently "unsetting itself".
+    let marker = "{\n  \"__weft_image__\": {\n    \"key\": \"local/project/p/abc\",\n    \"mimeType\": \"image/png\",\n    \"sizeBytes\": 52,\n    \"filename\": \"x.png\"\n  }\n}";
+
+    // Bodyless node (insert synthesizes the body).
+    let src = "pick = ImagePick\nshow = ImageDisplay\n\nshow.image = pick.image\n";
+    let out = apply(src, vec![EditOp::SetConfig { node: "pick".into(), key: "file".into(), value: marker.into() }]);
+    parse_ok(&out);
+    assert!(out.contains("__weft_image__"), "{out}");
+    assert_reversible(src, vec![EditOp::SetConfig { node: "pick".into(), key: "file".into(), value: marker.into() }]);
+
+    // One-liner body (in-place replace of an existing scalar).
+    let one_liner = "t = Text { value: \"x\" }\n";
+    let out = apply(one_liner, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: marker.into() }]);
+    parse_ok(&out);
+    assert!(out.contains("__weft_image__"), "{out}");
+
+    // Connection-origin field (`t.style = ...` line).
+    let conn = "t = Text {\n  value: \"x\"\n}\nt.style = \"a\"\n";
+    let out = apply(conn, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: marker.into() }]);
+    parse_ok(&out);
+    assert!(out.contains("t.style = {"), "keeps the connection form: {out}");
+}
+
+#[test]
+fn set_config_writes_a_multiline_array_value() {
+    // Arrays take a DIFFERENT containment path than `{`-objects: the lexer
+    // folds `[...]` into one opaque JSON_VALUE token (checked via
+    // `json_value_is_closed`), not a tracked brace-run, so a multi-line
+    // array is its own case to pin, not covered by the object test above.
+    let arr = "[\n  1,\n  2\n]";
+    let src = "t = Text { value: \"x\" }\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "t".into(),
+        key: "value".into(),
+        value: arr.into(),
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("[\n  1,\n  2\n]"), "{out}");
+}
+
+#[test]
+fn set_config_rejects_a_newline_outside_braces() {
+    // A newline at brace depth 0 splits the VALUE itself across lines (it is
+    // not multi-line JSON, it is two fragments), so the containment gate still
+    // refuses it: this is the genuine break-out the gate exists for.
+    let err = apply_edits(
+        "t = Text { value: \"x\" }\n",
+        None,
+        "Untitled",
+        &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "1\n2".into() }],
+    )
+    .expect_err("a bare newline-split value must be refused");
+    assert!(
+        format!("{err:?}").contains("break out of its field"),
+        "refusal names the containment rule: {err:?}"
+    );
+}
+
+#[test]
 fn set_config_connection_field_keeps_prefix() {
     // `t.style = "a"` is a connection-line field; replacing it must keep the
     // `t.style = ` prefix, not turn into `style: `.

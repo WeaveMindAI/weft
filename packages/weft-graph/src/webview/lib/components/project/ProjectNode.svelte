@@ -15,15 +15,16 @@
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
-	import { isFileRefValue } from '../../value-format';
+	import { isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { createPortContextMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
-	import StoredFilePreview from './StoredFilePreview.svelte';
-	import type { StoredFileWire } from "../../../../shared/protocol";
-	import { parseStoredFile } from "../../../../shared/protocol";
+	import FileDropField from './FileDropField.svelte';
+	import FilePreview from './FilePreview.svelte';
+	import type { FileValueWire } from "../../../../shared/protocol";
+	import { parseFileValue, typeReferencesFile } from "../../../../shared/protocol";
 
 	const edgesState = useEdges();
 
@@ -210,17 +211,17 @@
 		return JSON.stringify(cleaned, null, 2);
 	});
 
-	// Stored-file preview (ImageDisplay / DownloadLink): these sink
-	// nodes take a File value on an INPUT port and emit nothing, so
-	// the preview reads the latest execution's input, not its output.
-	// Returns the first stored-file value found (a concrete
-	// `__weft_<kind>__` marker carrying a logical `key`; url/data file
-	// values have no key and are skipped).
-	const storedInputFile = $derived.by<StoredFileWire | null>(() => {
+	// File preview (ImageDisplay / DownloadLink): these sink nodes
+	// take a File value on an INPUT port and emit nothing, so the
+	// preview reads the latest execution's input, not its output.
+	// Returns the first file value found (a concrete `__weft_<kind>__`
+	// marker carrying a `key` or `url` handle; data-backed values have
+	// no resolvable handle and are skipped).
+	const inputFileValue = $derived.by<FileValueWire | null>(() => {
 		const input = latestExecution?.input;
 		if (typeof input !== 'object' || input === null) return null;
 		for (const value of Object.values(input as Record<string, unknown>)) {
-			const file = parseStoredFile(value);
+			const file = parseFileValue(value);
 			if (file) return file;
 		}
 		return null;
@@ -247,7 +248,7 @@
 	// in `liveDisplay`, and `hasLiveDisplay` picks it up for free.
 	const showBodyFeed = $derived(!!data.bodyFeed && (data.bodyFeed.state === 'error' || data.bodyFeed.items.length > 0));
 	const showDebugDisplay = $derived(!!(typeConfig.features?.showDebugPreview && debugDataJson));
-	const showFileDisplay = $derived(!!((typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink) && storedInputFile));
+	const showFileDisplay = $derived(!!((typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink) && inputFileValue));
 	// Simplified view: a node with any live-display part (an infra/trigger feed, a
 	// debug preview, an image/file preview) is drawn as a card showing that display
 	// instead of a bare square.
@@ -432,34 +433,40 @@
 		}
 	}
 
-	/** If `config[key]` is a `@file` marker, its {path, type}. The single
-	 *  per-field test for "is this field file-backed". */
-	function fileRefOf(key: string): { path: string; type: string } | null {
+	/** If `config[key]` is a `@file`/`@asset` marker whose CONTENT is text the
+	 *  host ships (both markers with text types), its ref. The per-field test
+	 *  for "this field displays a referenced file's text". A file-typed
+	 *  `@asset` is NOT: the marker itself is the field's value (the file-drop
+	 *  field sets/clears it); nothing text-shaped exists to display, and
+	 *  routing its edits into a file write would clobber the media file. */
+	function fileRefOf(key: string): { path: string; type: string; marker: 'file' | 'asset' } | null {
 		const v = (data.config as Record<string, unknown>)?.[key];
-		return isFileRefValue(v) ? v.__weftFileRef : null;
+		if (!isFileRefValue(v)) return null;
+		return typeReferencesFile(v.__weftFileRef.type) ? null : v.__weftFileRef;
 	}
 
 	/** Resolved state of a file-backed field, from the host's fileContents
 	 *  map. `loading` = content not yet delivered (brief, transient).
 	 *  `error` = the file couldn't be read (fail loudly, no fallback). */
-	function fileFieldState(key: string): { path: string; content?: string; error?: string; loading: boolean } | null {
+	function fileFieldState(key: string): { path: string; marker: 'file' | 'asset'; content?: string; error?: string; loading: boolean } | null {
 		const ref = fileRefOf(key);
 		if (!ref) return null;
 		const entry = data.fileContents?.[ref.path];
 		// Undefined (not delivered) OR an explicit `{loading}` (bytes still being
 		// fetched lazily) both render the non-interactive loading state.
-		if (entry === undefined || 'loading' in entry) return { path: ref.path, loading: true };
-		if ('error' in entry) return { path: ref.path, error: entry.error, loading: false };
-		return { path: ref.path, content: entry.content, loading: false };
+		if (entry === undefined || 'loading' in entry) return { path: ref.path, marker: ref.marker, loading: true };
+		if ('error' in entry) return { path: ref.path, marker: ref.marker, error: entry.error, loading: false };
+		return { path: ref.path, marker: ref.marker, content: entry.content, loading: false };
 	}
 
-	/** A file-backed field whose content isn't loaded yet (loading or error)
-	 *  is read-only: its display is a status string, not editable content.
-	 *  False for a normal field or a loaded file-backed field. The single
+	/** A file-backed field is read-only when its content isn't loaded yet
+	 *  (its display is a status string, not editable content) or when the ref
+	 *  is an `@asset` (pull-only by contract: nothing ever writes back).
+	 *  False for a normal field or a loaded `@file` field. The single
 	 *  editability rule applied across every editable field branch. */
-	function fileFieldUnready(key: string): boolean {
+	function fileFieldReadonly(key: string): boolean {
 		const fs = fileFieldState(key);
-		return fs ? fs.content === undefined : false;
+		return fs ? fs.content === undefined || fs.marker === 'asset' : false;
 	}
 
 	/// Field keys this node renders itself rather than delegating to the
@@ -467,7 +474,7 @@
 	/// api_key, form_builder). File-backed primitives render through
 	/// FieldStrip via its displayValueOf / readonlyKeys / headerBadge
 	/// capabilities.
-	const EXOTIC_FIELD_TYPES = new Set(['code', 'api_key', 'form_builder']);
+	const EXOTIC_FIELD_TYPES = new Set(['code', 'api_key', 'form_builder', 'file_drop']);
 	const customFieldKeys = $derived.by(() => {
 		const keys = new Set<string>();
 		for (const field of displayedFields) {
@@ -489,21 +496,57 @@
 
 	/// File-backed fields whose content isn't loaded (loading / read
 	/// error) are read-only in FieldStrip so the status text can't be
-	/// saved as content.
+	/// saved as content; `@asset`-backed fields are read-only by contract.
 	const readonlyFieldKeys = $derived.by(() => {
 		const keys = new Set<string>();
 		for (const field of displayedFields) {
-			if (fileFieldUnready(field.key)) keys.add(field.key);
+			if (fileFieldReadonly(field.key)) keys.add(field.key);
 		}
 		return keys;
 	});
 
-	function updateConfig(key: string, value: string | string[] | number | boolean | FormFieldDef[] | null) {
+	/// Typing into a read-only file-backed field: explain WHY it's locked,
+	/// throttled per field so held-down keys don't stack toasts.
+	const readonlyToastAt = new Map<string, number>();
+	function explainReadonlyField(key: string) {
+		const fs = fileFieldState(key);
+		if (!fs) return;
+		const now = Date.now();
+		const last = readonlyToastAt.get(key) ?? 0;
+		if (now - last < 4000) return;
+		readonlyToastAt.set(key, now);
+		if (fs.marker === 'asset') {
+			toast.error(`This field pulls its value from @asset(${fs.path}); it can't be edited here. Switch it to @file (the badge next to the label) to edit.`);
+		} else {
+			toast.error(`Cannot edit ${fs.path}: ${fs.error ?? 'still loading'}`);
+		}
+	}
+
+	/// Flip a text-file-backed field between `@file` (editable, writes back)
+	/// and `@asset` (pull-only). A DIRECT config write, deliberately not
+	/// `updateConfig` (which routes a `@file` field's edit into the
+	/// referenced file's content); switching the marker edits the marker.
+	function switchFileMarker(key: string) {
+		const v = (data.config as Record<string, unknown>)?.[key];
+		if (!isFileRefValue(v)) return;
+		const r = v.__weftFileRef;
+		const flipped = { __weftFileRef: { ...r, marker: r.marker === 'file' ? 'asset' as const : 'file' as const } };
+		data.onUpdate?.({ config: { ...data.config, [key]: flipped } });
+	}
+
+	function updateConfig(key: string, value: string | string[] | number | boolean | FormFieldDef[] | Record<string, unknown> | WeftFileRefValue | null) {
 		// File-backed field: the edit goes to the referenced file, never to the
 		// weft source. The `@file(...)` marker in config (and source) is left
 		// untouched; only the file's content changes.
 		const fs = fileFieldState(key);
 		if (fs) {
+			// An `@asset` is pull-only: nothing ever writes back to the
+			// referenced file, and the field is read-only. Guard loudly (the
+			// readonly rendering should make this unreachable).
+			if (fs.marker === 'asset') {
+				toast.error(`${fs.path} is an @asset (read-only); use @file for an editable reference`);
+				return;
+			}
 			// Only a loaded field is editable. Editing while loading or on a
 			// read error must not write (it would clobber the file with a
 			// status string); the field is read-only in those states, but
@@ -847,8 +890,8 @@
 			<pre class="debug-data-container nodrag nopan nowheel select-text cursor-text">{debugDataJson}</pre>
 		</div>
 	{/if}
-	{#if showFileDisplay && storedInputFile}
-		<StoredFilePreview file={storedInputFile} mode={typeConfig.features?.showImagePreview ? 'image' : 'link'} />
+	{#if showFileDisplay && inputFileValue}
+		<FilePreview file={inputFileValue} mode={typeConfig.features?.showImagePreview ? 'image' : 'link'} />
 	{/if}
 {/snippet}
 
@@ -1236,15 +1279,28 @@
 					readonlyKeys={readonlyFieldKeys}
 					{headerBadge}
 					{renderCustom}
+					onReadonlyEdit={explainReadonlyField}
 				/>
 
 				{#snippet headerBadge(field: FieldDefinition)}
 					{#if fileRefOf(field.key)}
 						{@const ref = fileRefOf(field.key)}
-						<span
-							class="text-[9px] text-muted-foreground font-mono px-1 py-0.5 rounded bg-muted"
-							title={`Loaded from ${ref?.path} (edits save to this file)`}
-						>📄 {ref?.path}</span>
+						<!-- The chip doubles as the marker toggle: @file (editable,
+						     edits save to the file) <-> @asset (pull-only). Only
+						     text-backed refs reach here (fileRefOf is null for
+						     file-typed assets, which the file-drop field owns). -->
+						<button
+							type="button"
+							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag transition-colors
+								{ref?.marker === 'asset' ? 'bg-amber-100 text-amber-800 hover:bg-amber-200' : 'bg-muted text-muted-foreground hover:bg-accent'}"
+							title={ref?.marker === 'asset'
+								? `@asset(${ref?.path}): pull-only, not editable here. Click to switch to @file (editable).`
+								: `@file(${ref?.path}): edits save to this file. Click to switch to @asset (pull-only).`}
+							aria-label={ref?.marker === 'asset'
+								? `Switch ${ref?.path} to editable @file`
+								: `Switch ${ref?.path} to pull-only @asset`}
+							onclick={(e) => { e.stopPropagation(); switchFileMarker(field.key); }}
+						><span aria-hidden="true">{ref?.marker === 'asset' ? '🔒' : '📄'}</span> {ref?.path}</button>
 					{/if}
 				{/snippet}
 
@@ -1259,10 +1315,17 @@
 							<div class="nodrag nopan" onclick={(e) => e.stopPropagation()}
 							onfocusin={(e) => e.currentTarget.classList.add('nowheel')}
 							onfocusout={(e) => e.currentTarget.classList.remove('nowheel')}
+							onkeydown={(e) => {
+								if (fileFieldReadonly(field.key) && (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Enter')) {
+									explainReadonlyField(field.key);
+								}
+							}}
+							onpaste={() => { if (fileFieldReadonly(field.key)) explainReadonlyField(field.key); }}
+							ondrop={() => { if (fileFieldReadonly(field.key)) explainReadonlyField(field.key); }}
 						>
 								<CodeEditor
 									value={getConfigDisplayValue(field.key)}
-									readonly={fileFieldUnready(field.key)}
+									readonly={fileFieldReadonly(field.key)}
 									placeholder={field.placeholder}
 									minHeight="120px"
 									onchange={(newValue) => {
@@ -1306,6 +1369,18 @@
 									/>
 								{/if}
 							</div>
+						{:else if field.type === "file_drop"}
+							<!-- Writes an `@asset("<path-or-url>", <Type>)` ref into
+							     config; the pre-build asset sync publishes the file and the
+							     compile substitutes the stored-file value the runtime folds
+							     onto the same-named input port (or the node reads from
+							     config). Source never holds storage keys. -->
+							<FileDropField
+								value={(data.config as Record<string, unknown>)?.[field.key]}
+								accept={field.accept}
+								fileType={field.fileType}
+								onUpdate={(ref) => updateConfig(field.key, ref)}
+							/>
 						{:else if field.type === "form_builder"}
 							<div class="nodrag nopan space-y-1.5" onclick={(e) => e.stopPropagation()}>
 								{#each getFormFields() as f, i}
@@ -1424,14 +1499,15 @@
 				{/if}
 			{/if}
 
-			<!-- Stored-file preview: inline image (ImageDisplay) or a
+			<!-- File preview: inline image (ImageDisplay) or a
 			     download-link card (DownloadLink). Reads the latest
-			     execution's INPUT (these nodes emit nothing). Both fetch
-			     through the authenticated download handshake. -->
+			     execution's INPUT (these nodes emit nothing). Key-backed
+			     files fetch through the authenticated download handshake;
+			     url-backed ones render/link their URL directly. -->
 			{#if typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink}
-				{#if storedInputFile}
-					<StoredFilePreview
-						file={storedInputFile}
+				{#if inputFileValue}
+					<FilePreview
+						file={inputFileValue}
 						mode={typeConfig.features?.showImagePreview ? 'image' : 'link'}
 					/>
 				{:else if displayedStatus === 'completed'}

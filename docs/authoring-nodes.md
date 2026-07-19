@@ -875,6 +875,58 @@ knob. The files are reachable independently of the editor (e.g. the `weft`
 CLI lists/downloads/removes them by scope), so `Shared` data a project
 wrote remains accessible after the project is gone.
 
+## Media config: the `file_drop` field and project assets
+
+When your node needs a user-supplied file (an image to display, an audio
+clip to transcribe), declare a `file_drop` field with the weft file type it
+picks:
+
+```json
+"inputs": [
+  { "name": "image", "type": "Image", "required": true }
+],
+"fields": [
+  { "key": "image", "label": "Image", "field_type": { "kind": "file_drop", "type": "Image" } }
+]
+```
+
+The declared `type` (`Image`, `Audio`, `Video`, `Blob`, or the `File` union)
+drives the editor's file filter, validates drops, and is what gets written
+into source. An optional `accept` narrows the filter further (e.g.
+`"image/png"`). A field whose `key` matches an input port makes that port
+fillable from config; a field with no matching port is read via
+`ctx.config`.
+
+What lands in source is ONE clean line, never a storage key:
+
+```
+pick = ImagePick {
+  image: @asset("assets/photo.png", Image)
+}
+```
+
+The file lives WITH the project (the editor's drop/pick writes it under
+`assets/`; a dev can equally copy a file there and type the line). The
+`@asset` source can also be a path outside the project (local runs only),
+an `http(s)` URL (never uploaded: the worker fetches it at run time), or a
+stored runtime file's short address (`project/<project-id>/<file-id>`,
+picked from the editor's "Stored files" browser).
+
+`@asset` is the PULL-ONLY sibling of `@file`: `@file` injects a text
+file's content and lets the editor write field edits back to that file
+(so it requires a text-shaped type), while nothing ever writes back
+through an `@asset`. A text-typed `@asset` is legal too: same inline read
+as `@file`, just read-only in the editor.
+
+Right before every build, the **asset sync** makes storage mirror exactly
+what the code references: it hashes each referenced file, uploads new or
+changed content, deletes content no longer referenced, and the compile
+substitutes the resolved stored-file value. Your node code never sees any
+of this: at run time the value on the port (or in config) is a normal media
+value, identical to one an upstream node emitted, and `ctx.storage`
+`get`/`get_bytes` read its bytes whichever handle it carries (a bucket key
+or an external URL).
+
 ## Package-level metadata defaults
 
 A package (a dir with `package.toml`) may hold a PARTIAL `metadata.json`

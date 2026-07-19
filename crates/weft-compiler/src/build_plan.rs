@@ -20,8 +20,6 @@
 //! ref stops matching, so it rebuilds; change nothing and every ref is present, so
 //! nothing rebuilds. There is no separate stamp to keep in sync.
 
-use std::path::Path;
-
 use crate::error::CompileResult;
 use crate::image_set::{self, InfraImage};
 use crate::project::Project;
@@ -55,7 +53,7 @@ pub struct PlannedImage {
 }
 
 /// The full set of artifacts a compiled project version needs, plus the three
-/// authoritative hashes and the compiled definition. Produced by [`plan_build`].
+/// authoritative hashes and the compiled definition. Produced by [`plan_build_from`].
 #[derive(Debug, Clone)]
 pub struct BuildPlan {
     /// The compiled `ProjectDefinition`, serialized. Sent to the dispatcher at
@@ -82,35 +80,21 @@ pub trait TagPolicy {
     fn infra_ref(&self, image_name: &str, content_hash: &str) -> String;
 }
 
-/// Compile + enrich a project ALREADY ON DISK at `project_root`, compute the three
-/// hashes, enumerate + stage every image, and mint each ref via `tags`. One path,
-/// so a project builds identically whether the source came from the user's disk or
-/// an unpacked content tree.
+/// Compute the three hashes, enumerate + stage every image, and mint each ref
+/// via `tags`, from a project the caller ALREADY compiled + enriched + resolved
+/// (e.g. the CLI, which compiles with structured diagnostics for the editor's
+/// error modal, then resolves `@asset` refs into the definition). The single
+/// build path, so a project builds identically whichever driver invokes it.
 ///
-/// The project MUST already contain its own `nodes/` (including the seeded
-/// `base_catalog/`); nothing is injected from outside the folder. Callers that start
-/// from a bare upload seed the catalog into the folder FIRST (the create door), the
-/// same self-contained shape `weft new` produces on disk.
+/// Resolution MUST happen before this: `build_project` validates + codegens the
+/// definition as given and does not recompile source, so a raw (unresolved)
+/// `@asset` marker would fail validation against its file-typed port. The
+/// project MUST already contain its own `nodes/` (including the seeded
+/// `base_catalog/`); nothing is injected from outside the folder.
 ///
-/// Pure + blocking (filesystem + compile); run it on a blocking thread from async
-/// callers. The returned worker `context_dir` lives under a temp dir the caller must
-/// keep alive until it has built the worker image.
-pub fn plan_build(
-    project_root: &Path,
-    builder_base_image: &str,
-    tags: &dyn TagPolicy,
-) -> CompileResult<BuildPlan> {
-    let project = Project::load(project_root)?;
-    let (definition, catalog) = crate::hash::load_enriched_project(&project)
-        .map_err(|e| e.context("compile + enrich project"))?;
-    plan_build_from(&project, &definition, &catalog, builder_base_image, tags)
-}
-
-/// Like [`plan_build`] but for a caller that ALREADY compiled + enriched the project
-/// (e.g. the CLI, which compiles with structured diagnostics for the editor's error
-/// modal). Avoids a second compile: it computes the hashes + stages the images from
-/// the given `definition` + `catalog`. `plan_build` is the convenience that compiles
-/// first; both share this body so the plan is identical whichever entry is used.
+/// Pure + blocking (filesystem); run it on a blocking thread from async
+/// callers. The returned worker `context_dir` lives under a temp dir the caller
+/// must keep alive until it has built the worker image.
 pub fn plan_build_from(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
@@ -130,8 +114,11 @@ pub fn plan_build_from(
     let definition_json = serde_json::to_string(definition)
         .map_err(|e| anyhow::anyhow!("serialize compiled definition: {e}"))?;
 
-    // Stage the worker docker build context (`FROM {{builder_base_image}}`).
-    let staged = crate::build::build_project(&project.root, true, builder_base_image)?;
+    // Stage the worker docker build context (`FROM {{builder_base_image}}`)
+    // from the already-resolved definition. `build_project` does NOT recompile
+    // from source: it validates + codegens this definition, whose `@asset`
+    // refs the caller already resolved into concrete file values.
+    let staged = crate::build::build_project(project, definition, catalog, true, builder_base_image)?;
 
     let mut images = vec![PlannedImage {
         kind: ImageKind::Worker,

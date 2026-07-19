@@ -78,7 +78,8 @@ describe('applyOpsToProject: config and label', () => {
     expect(apply('true')).toBe(true);
     expect(apply('{\n  "a": 1\n}')).toEqual({ a: 1 });
     expect(apply('```\nline1\nline2\n```')).toBe('line1\nline2');
-    expect(apply('@file("prompt.md")')).toEqual({ __weftFileRef: { path: 'prompt.md', type: 'String' } });
+    expect(apply('@file("prompt.md")')).toEqual({ __weftFileRef: { path: 'prompt.md', type: 'String', marker: 'file' } });
+    expect(apply('@asset("assets/pic.png", Image)')).toEqual({ __weftFileRef: { path: 'assets/pic.png', type: 'Image', marker: 'asset' } });
   });
 
   it('removeConfig deletes the key', () => {

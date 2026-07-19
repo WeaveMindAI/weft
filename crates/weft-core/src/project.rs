@@ -226,15 +226,44 @@ pub struct NodeDefinition {
     pub include_path: Option<String>,
 }
 
-/// A `@file("path", Type)` reference attached to a config field: where the
-/// value was read from and the type it was cast to. Serializes as
-/// `{ "path": "...", "type": "String" }`. Lives in weft-core because it
-/// flows on the parse wire to the editor.
+/// Which directive wrote a file reference, and therefore its edit contract.
+/// SYNC: FileMarker <-> packages/weft-graph/src/protocol.ts FileRef.marker
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileMarker {
+    /// `@file`: BIDIRECTIONAL. The referenced file's content is the field's
+    /// value, and editing the field writes the new value back to the file.
+    File,
+    /// `@asset`: PULL-ONLY. The field's value comes from the referenced
+    /// file/URL/stored file; nothing ever writes back to it. A file-typed
+    /// value defers to the build's asset resolution; a text-typed value is
+    /// read at parse like `@file`, but renders read-only.
+    Asset,
+}
+
+impl FileMarker {
+    /// The source-level directive that writes this marker, for error
+    /// messages (`@file` / `@asset`).
+    pub fn directive(&self) -> &'static str {
+        match self {
+            FileMarker::File => "@file",
+            FileMarker::Asset => "@asset",
+        }
+    }
+}
+
+/// A `@file("path", Type)` / `@asset("path", Type)` reference attached to a
+/// config field: where the value comes from, the type it carries, and which
+/// directive (edit contract) declared it. Serializes as
+/// `{ "path": "...", "type": "String", "marker": "file" }`. Lives in
+/// weft-core because it flows on the parse wire to the editor.
+/// SYNC: FileRef <-> packages/weft-graph/src/protocol.ts FileRef
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileRef {
     pub path: String,
     #[serde(rename = "type")]
     pub ty: WeftType,
+    pub marker: FileMarker,
 }
 
 fn default_config() -> Value {

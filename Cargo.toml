@@ -16,6 +16,7 @@ members = [
     "crates/weft-infra",
     "crates/weft-infra-supervisor",
     "crates/weft-platform-traits",
+    "crates/weft-assets",
     "crates/weft-providers",
     "crates/weft-e2e",
 ]
@@ -93,4 +94,5 @@ weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
 weft-platform-traits = { path = "crates/weft-platform-traits" }
+weft-assets = { path = "crates/weft-assets" }
 weft-providers = { path = "crates/weft-providers" }

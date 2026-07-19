@@ -21,9 +21,8 @@ use crate::runtime_store::charged_bytes_for;
 /// ends. THE single definition of the account-wide storage budget's lock key:
 /// every path that reads a tenant's charged bytes and then writes must take
 /// this first, so the check-and-charge is atomic per tenant. The runtime-file
-/// plane AND any deployment plane that charges the same account-wide budget
-/// (the cloud version-save) call THIS, so they contend on one key and neither
-/// can pass a stale usage read.
+/// plane AND any other plane that charges the same account-wide budget call
+/// THIS, so they contend on one key and neither can pass a stale usage read.
 ///
 /// `hashtextextended(<tenant>, 0)` over the bare tenant id: a 64-bit key (the
 /// 32-bit `hashtext` collides between two DIFFERENT tenants at birthday-bound
@@ -105,8 +104,8 @@ impl Entitlement {
 /// so a check is just `account_used_bytes + incoming > cap`.
 ///
 /// The default `LocalEntitlementSource` has ONE plane (the runtime-file table),
-/// so its account total is that plane's charged bytes. A deployment with more
-/// planes (the cloud's version-chunk pool) sums them all in its impl.
+/// so its account total is that plane's charged bytes. A source with more
+/// planes sums them all in its impl.
 #[async_trait::async_trait]
 pub trait EntitlementSource: Send + Sync {
     /// The tenant's plan caps. Async so a plan-driven source can resolve the

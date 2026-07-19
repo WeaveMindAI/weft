@@ -2067,6 +2067,84 @@ impl ContextHandle for RunnerHandle {
         self.clients.storage.get(self.color, key, range).await
     }
 
+    async fn storage_get_url(
+        &self,
+        url: &str,
+        declared_mime: &str,
+        declared_filename: &str,
+        declared_size: u64,
+        range: Option<weft_core::storage::ByteRange>,
+    ) -> WeftResult<(weft_core::storage::StoredFileMeta, weft_core::storage::ByteStream)> {
+        // Fetch the external URL directly (worker-side, isolated). A byte range
+        // is passed through as a Range header so a piecewise read never buffers
+        // the whole resource; a server that ignores Range simply returns the
+        // full body (the caller's range logic still slices correctly).
+        let mut req = http_client().get(url);
+        if let Some(r) = range {
+            let header = match r.end {
+                Some(e) if e < r.start => {
+                    return Err(WeftError::NodeExecution(format!(
+                        "invalid byte range: end {e} precedes start {}",
+                        r.start
+                    )));
+                }
+                Some(e) if e == r.start => {
+                    let meta = weft_core::storage::StoredFileMeta {
+                        key: String::new(),
+                        mime_type: declared_mime.to_string(),
+                        size_bytes: declared_size,
+                        filename: declared_filename.to_string(),
+                        keep: false,
+                        expires_at_unix: None,
+                        keep_ttl_secs: None,
+                        created_at_unix: 0,
+                    };
+                    return Ok((meta, weft_core::storage::bytes_stream(bytes::Bytes::new())));
+                }
+                Some(e) => format!("bytes={}-{}", r.start, e - 1),
+                None => format!("bytes={}-", r.start),
+            };
+            req = req.header("range", header);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("fetch {url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WeftError::NodeExecution(format!(
+                "fetch {url} returned {status}: {}",
+                weft_core::truncate_user_string(&body, 512)
+            )));
+        }
+        // The response's own Content-Type is authoritative for the bytes; fall
+        // back to the marker's declared mime when the server omits one (rather
+        // than the generic octet-stream `normalize_content_type` would give).
+        // Same for the size (Content-Length when present, else the declared).
+        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok());
+        let mime = match ct {
+            Some(ct) => weft_core::storage::normalize_content_type(Some(ct)),
+            None => declared_mime.to_string(),
+        };
+        let size = resp.content_length().unwrap_or(declared_size);
+        let meta = weft_core::storage::StoredFileMeta {
+            key: String::new(),
+            mime_type: mime,
+            size_bytes: size,
+            filename: declared_filename.to_string(),
+            keep: false,
+            expires_at_unix: None,
+            keep_ttl_secs: None,
+            created_at_unix: 0,
+        };
+        let stream: weft_core::storage::ByteStream = Box::pin(
+            resp.bytes_stream()
+                .map_err(|e| std::io::Error::other(format!("fetch stream: {e}"))),
+        );
+        Ok((meta, stream))
+    }
+
     async fn storage_delete(&self, key: &str) -> WeftResult<()> {
         self.clients.storage.delete(self.color, key).await
     }
@@ -2732,6 +2810,26 @@ mod replay_tests {
         // Presign mints a (bucket) URL for an owned file.
         let url = handle.storage_presign(&stored.key, Some(60)).await.expect("presign");
         assert!(url.starts_with("http") && url.contains(&stored.key), "{url}");
+    }
+
+    /// A url-backed file value routes by its handle in every storage
+    /// verb: presign hands the URL back as-is (it already IS a URL an
+    /// external service can fetch); delete/keep are bucket-only and
+    /// error loud naming the URL.
+    #[tokio::test]
+    async fn url_backed_values_route_by_handle_in_storage_verbs() {
+        use weft_core::storage::{KeepTtl, StorageScope};
+        let ctx = ctx_over(handle_with_sequence(vec![]));
+        let ty = weft_core::WeftType::parse("Image").unwrap();
+        let url_file = weft_core::storage::url_file_value("https://x/pic.png", &ty);
+        let storage = ctx.storage(StorageScope::Execution);
+
+        assert_eq!(storage.presign(&url_file, None).await.unwrap(), "https://x/pic.png");
+
+        let err = storage.keep(&url_file, KeepTtl::Default).await.unwrap_err();
+        assert!(err.to_string().contains("external URL"), "{err}");
+        let err = storage.delete(&url_file).await.unwrap_err();
+        assert!(err.to_string().contains("external URL"), "{err}");
     }
 
     struct NoopJournal;

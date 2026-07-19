@@ -157,6 +157,19 @@ pub trait ObjectStore: Send + Sync {
         ttl_secs: u64,
     ) -> Result<String>;
 
+    /// Upload ONE part DIRECTLY from this process (no presigned URL): for
+    /// when the caller itself moves bytes it already holds (e.g.
+    /// concatenating stored objects) instead of handing a URL to an
+    /// external uploader. Returns the part's etag, verbatim, exactly like a
+    /// presigned PUT's response header.
+    async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        bytes: Bytes,
+    ) -> Result<String>;
+
     /// Complete the multipart upload from the caller's OWN `(part_number,
     /// etag)` list, ascending, etags verbatim as returned by the part PUTs
     /// (quotes included; normalizing them breaks completion on some
@@ -641,6 +654,29 @@ impl ObjectStore for S3ObjectStore {
         Ok(presigned.uri().to_string())
     }
 
+    async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        bytes: Bytes,
+    ) -> Result<String> {
+        let out = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+            .send()
+            .await
+            .with_context(|| format!("object-store upload-part {key} #{part_number}"))?;
+        out.e_tag()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("object-store upload-part {key} #{part_number}: response carried no etag"))
+    }
+
     async fn complete_multipart(
         &self,
         key: &str,
@@ -719,6 +755,7 @@ pub mod fake {
         PresignPut { key: String, content_length: u64, audience: PresignAudience, ttl_secs: u64 },
         CreateMultipart { key: String },
         PresignPart { key: String, upload_id: String, part_number: i32, part_size: u64 },
+        UploadPart { key: String, upload_id: String, part_number: i32, len: usize },
         CompleteMultipart { key: String, upload_id: String, parts: usize },
         AbortMultipart { key: String, upload_id: String },
     }
@@ -961,6 +998,34 @@ pub mod fake {
             // exactly like re-presigning after a URL expiry.
             upload.reserved.insert(part_number, part_size);
             Ok(format!("fake-multipart://{upload_id}#{part_number}"))
+        }
+
+        async fn upload_part(
+            &self,
+            key: &str,
+            upload_id: &str,
+            part_number: i32,
+            bytes: Bytes,
+        ) -> Result<String> {
+            self.calls.lock().push(FakeCall::UploadPart {
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+                part_number,
+                len: bytes.len(),
+            });
+            let mut uploads = self.uploads.lock();
+            let upload = uploads
+                .get_mut(upload_id)
+                .ok_or_else(|| anyhow!("no such upload {upload_id}"))?;
+            if upload.key != key {
+                anyhow::bail!("upload {upload_id} is for key {}, not {key}", upload.key);
+            }
+            // Direct (in-process) part upload: no presign, no signed length; the
+            // etag shape matches the presigned PUT helper's so completion code
+            // can't tell the two paths apart, exactly like the real bucket.
+            let etag = format!("\"fake-etag-{upload_id}-{part_number}-{}\"", bytes.len());
+            upload.parts.insert(part_number, (etag.clone(), bytes));
+            Ok(etag)
         }
 
         async fn complete_multipart(

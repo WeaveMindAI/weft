@@ -290,6 +290,22 @@ impl NodeMetadata {
         serde_json::from_value(value)
             .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"))
     }
+
+    /// Whether an input port may be filled from config (no incoming edge):
+    /// its own explicit flag, the type's default, or a `FileDrop` field
+    /// targeting it by name. A FileDrop declaration IS the author's statement
+    /// that the port is fillable from config: the editor uploads the file and
+    /// writes the stored-file marker under the field's key, which the runtime
+    /// folds onto the same-named port like any other config value. Without
+    /// this, file-typed ports (never default-configurable, since nobody can
+    /// hand-type a marker) would need a redundant `configurable: true`.
+    pub fn input_configurable(&self, port: &PortDef) -> bool {
+        port.configurable
+            || port.port_type.is_default_configurable()
+            || self.fields.iter().any(|f| {
+                f.key == port.name && matches!(f.field_type, FieldType::FileDrop { .. })
+            })
+    }
 }
 
 /// One validation rule. The `when` condition is evaluated against the
@@ -613,13 +629,34 @@ pub enum FieldType {
     Password,
     ApiKey { provider: String },
     FormBuilder,
-    /// Editor file picker: the user drops/selects a file, the editor
-    /// uploads it to project-scoped storage and the field's config
-    /// value becomes the stored-file reference (see
-    /// `crate::storage::StoredFile`).
-    /// `accept` is an HTML-accept-style filter (e.g. "audio/*").
-    // SYNC: FieldType::FileDrop <-> packages/weft-graph/src/protocol.ts FieldKind 'file_drop'
-    FileDrop { accept: Option<String> },
+    /// Editor file picker: the user picks a project file (drop/browse) or
+    /// pastes a URL, and the field's config value becomes a media
+    /// `@asset("<path-or-url>", <Type>)` ref. The pre-build asset sync
+    /// publishes referenced files to storage and the compile substitutes the
+    /// stored-file value, so source never carries storage keys.
+    ///
+    /// `file_type` is the weft file type this field picks (`Image`, `Audio`,
+    /// `Video`, `Blob`, or the `File`/`Media` unions): it drives the editor's
+    /// accept filter + drop validation AND the `, <Type>)` annotation written
+    /// into source. Deserializing through [`WeftType`] validates the string
+    /// at the metadata boundary (a typo'd type fails the node's metadata
+    /// load, not a later marker parse). `accept` optionally NARROWS the
+    /// derived filter (e.g. `image/png` under `Image`).
+    // SYNC: FieldType::FileDrop <-> packages/weft-graph/src/protocol.ts FieldKind 'file_drop' + FieldType.type,
+    //       packages/weft-graph/src/webview/lib/types/index.ts FieldType 'file_drop',
+    //       packages/weft-graph/src/webview/lib/utils/file-browser.ts acceptForFileType
+    FileDrop {
+        accept: Option<String>,
+        #[serde(default = "file_drop_default_type", rename = "type")]
+        file_type: crate::weft_type::WeftType,
+    },
+}
+
+/// A `file_drop` field with no declared type picks ANY file (the `File`
+/// union): every stored kind qualifies, and the written annotation is
+/// `, File)`.
+fn file_drop_default_type() -> crate::weft_type::WeftType {
+    crate::weft_type::WeftType::file()
 }
 
 /// What a node emits when it's done.
@@ -680,6 +717,9 @@ impl NodeOutput {
     /// Nodes use it through [`crate::ExecutionContext::fan_declared`],
     /// which supplies the declared set. Same last-write-wins precedence
     /// as `extend_from_object`.
+    // The only caller lives in the runtime-gated context module; without
+    // the gate this would false-positive as dead in the parse-only build.
+    #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
     pub(crate) fn extend_from_declared(
         mut self,
         source: &Value,
@@ -823,6 +863,82 @@ mod diagnostic_wire_tests {
             assert!(!is_valid_provider_name(bad), "invalid provider name '{bad}' must be refused");
         }
         assert!(is_valid_provider_name("open_router2"));
+    }
+}
+
+#[cfg(test)]
+mod input_configurable_tests {
+    use super::*;
+    use crate::weft_type::{WeftPrimitive, WeftType};
+
+    fn metadata_with(fields: Vec<FieldDef>, inputs: Vec<PortDef>) -> NodeMetadata {
+        serde_json::from_str::<NodeMetadata>(
+            r#"{ "type": "T", "label": "T", "description": "", "category": "Utility" }"#,
+        )
+        .map(|mut m| {
+            m.fields = fields;
+            m.inputs = inputs;
+            m
+        })
+        .unwrap()
+    }
+
+    fn file_drop_field(key: &str) -> FieldDef {
+        FieldDef {
+            key: key.into(),
+            label: key.into(),
+            field_type: FieldType::FileDrop {
+                accept: None,
+                file_type: crate::weft_type::WeftType::parse("Image").unwrap(),
+            },
+            default_value: None,
+            required: false,
+            description: None,
+        }
+    }
+
+    /// A FileDrop field targeting a file-typed port by name makes that port
+    /// configurable (the uploaded marker fills it from config); a file port
+    /// with no matching FileDrop stays wired-only, and non-file ports keep
+    /// their type default regardless.
+    #[test]
+    fn file_drop_field_makes_its_port_configurable() {
+        let image_port = PortDef {
+            name: "image".into(),
+            port_type: WeftType::primitive(WeftPrimitive::Image),
+            required: true,
+            configurable: false,
+        };
+        let other_file_port = PortDef {
+            name: "attachment".into(),
+            port_type: WeftType::primitive(WeftPrimitive::Blob),
+            required: false,
+            configurable: false,
+        };
+        let text_port = PortDef {
+            name: "prompt".into(),
+            port_type: WeftType::primitive(WeftPrimitive::String),
+            required: false,
+            configurable: false,
+        };
+        let meta = metadata_with(
+            vec![file_drop_field("image")],
+            vec![image_port.clone(), other_file_port.clone(), text_port.clone()],
+        );
+        assert!(meta.input_configurable(&image_port));
+        assert!(!meta.input_configurable(&other_file_port));
+        assert!(meta.input_configurable(&text_port)); // type default
+
+        // A non-FileDrop field with the same key does NOT open the port.
+        let mut text_field = file_drop_field("attachment");
+        text_field.field_type = FieldType::Text;
+        let meta = metadata_with(vec![text_field], vec![other_file_port.clone()]);
+        assert!(!meta.input_configurable(&other_file_port));
+
+        // An explicit `configurable: true` still wins on its own.
+        let mut explicit = other_file_port;
+        explicit.configurable = true;
+        assert!(meta.input_configurable(&explicit));
     }
 }
 

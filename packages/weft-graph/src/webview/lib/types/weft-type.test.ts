@@ -268,12 +268,17 @@ describe('complex type parsing', () => {
 		}
 	});
 
-	it('Media roundtrip: expands then re-parses', () => {
-		const t = parseWeftType('Media')!;
-		const s = weftTypeToString(t);
-		expect(s).toBe('Image | Video | Audio');
-		const reparsed = parseWeftType(s);
-		expect(reparsed).toEqual(t);
+	it('alias roundtrip: Media/File render under their NAME and re-parse', () => {
+		for (const name of ['Media', 'File']) {
+			const t = parseWeftType(name)!;
+			const s = weftTypeToString(t);
+			expect(s).toBe(name);
+			expect(parseWeftType(s)).toEqual(t);
+		}
+		// The structural spelling parses to the same type and renders under
+		// the canonical name; a non-alias union stays structural.
+		expect(weftTypeToString(parseWeftType('Audio | Image | Video')!)).toBe('Media');
+		expect(weftTypeToString(parseWeftType('Image | Null')!)).toBe('Image | Null');
 	});
 });
 

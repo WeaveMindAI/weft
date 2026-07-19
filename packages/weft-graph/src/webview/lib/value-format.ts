@@ -7,16 +7,19 @@
 // WHERE the token goes (spans). The `@file` marker is reconstructed to its
 // `@file("path", Type)` source form (config never carries resolved content).
 
-/** Structural `@file` reference held in a config field. The value the field
- *  resolves to lives elsewhere (host-supplied file content); config holds only
- *  this marker, so no path can serialize resolved content into source. */
+/** Structural `@file` / `@asset` reference held in a config field. The value
+ *  the field resolves to lives elsewhere (host-supplied file content, or the
+ *  build's asset resolution); config holds only this marker, so no path can
+ *  serialize resolved content into source. `marker` says which directive it
+ *  serializes back to (and therefore the edit contract; see protocol FileRef). */
 export interface WeftFileRefValue {
-  __weftFileRef: { path: string; type: string };
+  __weftFileRef: { path: string; type: string; marker: 'file' | 'asset' };
 }
 
 export function isFileRefValue(v: unknown): v is WeftFileRefValue {
   const r = (v as WeftFileRefValue | null)?.__weftFileRef;
-  return typeof r === 'object' && r !== null && typeof r.path === 'string' && typeof r.type === 'string';
+  return typeof r === 'object' && r !== null && typeof r.path === 'string'
+    && typeof r.type === 'string' && (r.marker === 'file' || r.marker === 'asset');
 }
 
 /** A weft double-quoted string literal: backslash and quote escaped. Used for
@@ -44,9 +47,10 @@ export function formatConfigValue(value: unknown): string {
     throw new Error('config value is unset; emit a removeConfig, not a token');
   }
   if (isFileRefValue(value)) {
-    const { path, type } = value.__weftFileRef;
+    const { path, type, marker } = value.__weftFileRef;
     const p = quoteString(path);
-    return type === 'String' ? `@file(${p})` : `@file(${p}, ${type})`;
+    const directive = marker === 'asset' ? '@asset' : '@file';
+    return type === 'String' ? `${directive}(${p})` : `${directive}(${p}, ${type})`;
   }
   if (typeof value === 'string') {
     if (value.includes('\n')) {
@@ -72,11 +76,20 @@ export function formatConfigValue(value: unknown): string {
   if (typeof value === 'boolean') {
     return String(value);
   }
-  // Objects / arrays: pretty-printed multi-line JSON. Multi-line form parses in
-  // every context (canonical nodes, anons after expansion); compact JSON does
-  // not parse inside one-liner anon bodies.
-  return JSON.stringify(value, null, 2);
+  // Objects / arrays: compact when small, pretty multi-line when large. Pure
+  // STYLE, not correctness: the grammar parses both forms in every value
+  // position (pinned by crates/weft-compiler/tests/parser_multiline_object.rs)
+  // and the structured editor accepts both (its containment gate admits
+  // newlines inside a balanced brace-run). The proxy keeps a small value (a
+  // two-key marker, a short list) on one readable line and lets a big one (a
+  // form schema, a stored-file marker with long fields) breathe across lines.
+  const compact = JSON.stringify(value);
+  return compact.length <= JSON_COMPACT_MAX_CHARS ? compact : JSON.stringify(value, null, 2);
 }
+
+/// Above this many characters, a JSON config value is written pretty
+/// (multi-line) instead of compact: roughly "does it still read as one line".
+const JSON_COMPACT_MAX_CHARS = 60;
 
 /** Parse a `.weft` source token back to its in-memory config value: the exact
  *  inverse of `formatConfigValue`, kept next to it so the two can't drift.
@@ -86,9 +99,15 @@ export function formatConfigValue(value: unknown): string {
  *  SYNC: parseConfigToken <-> crates/weft-compiler/src/edit/ops.rs format_string (it inverts what format_string emits) */
 export function parseConfigToken(token: string): unknown {
   // The path group accepts escaped chars so a `"` inside the path round-trips.
-  const fileRef = token.match(/^@file\("((?:[^"\\]|\\.)*)"(?:,\s*([A-Za-z][A-Za-z0-9_[\],| ]*))?\)$/);
+  const fileRef = token.match(/^@(file|asset)\("((?:[^"\\]|\\.)*)"(?:,\s*([A-Za-z][A-Za-z0-9_[\],| ]*))?\)$/);
   if (fileRef) {
-    return { __weftFileRef: { path: unquoteString(fileRef[1]), type: fileRef[2] ?? 'String' } } satisfies WeftFileRefValue;
+    return {
+      __weftFileRef: {
+        path: unquoteString(fileRef[2]),
+        type: fileRef[3] ?? 'String',
+        marker: fileRef[1] as 'file' | 'asset',
+      },
+    } satisfies WeftFileRefValue;
   }
   if (token.startsWith('```')) {
     // Require a real closing fence: an unterminated heredoc is not a token

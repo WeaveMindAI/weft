@@ -733,7 +733,8 @@ mod tests {
         let mut renamed = serde_json::to_value(&plain).unwrap();
         let node = &mut renamed["nodes"][0];
         // Same resolved config value ("hi"), only the source-reference paths differ.
-        node["fileRefs"] = serde_json::json!({ "value": { "path": "renamed.txt", "type": "String" } });
+        node["fileRefs"] =
+            serde_json::json!({ "value": { "path": "renamed.txt", "type": "String", "marker": "file" } });
         node["includePath"] = serde_json::json!("some/other/path.weft");
         let renamed: ProjectDefinition = serde_json::from_value(renamed).unwrap();
         let h1 = compute_definition_hash(&plain).unwrap();

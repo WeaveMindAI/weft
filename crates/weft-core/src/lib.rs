@@ -27,7 +27,9 @@ pub mod running_policy;
 pub mod signal;
 #[cfg(feature = "runtime")]
 pub mod signed_token;
-#[cfg(feature = "runtime")]
+// Mostly pure (key grammar, wire types, marker builders — the compiler needs
+// them, so the WASM parse build compiles them too); only its byte-stream
+// aliases are runtime-gated, inside the module.
 pub mod storage;
 pub mod tag;
 pub mod wait;

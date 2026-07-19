@@ -29,13 +29,32 @@ describe('formatConfigValue / parseConfigToken round-trip', () => {
     expect(roundTrip([1, 2, { k: 'v' }])).toEqual([1, 2, { k: 'v' }]);
   });
 
-  it('round-trips an @file marker, including a path with a quote', () => {
-    const ref: WeftFileRefValue = { __weftFileRef: { path: 'dir/file.txt', type: 'String' } };
+  it('JSON values are compact when small, pretty when large (a size proxy)', () => {
+    // Style only: the editor accepts both forms everywhere (the Rust edit test
+    // set_config_writes_a_multiline_object_value_everywhere pins acceptance,
+    // parser_multiline_object.rs pins the grammar). The proxy keeps small
+    // values on one line and lets big ones (markers, form schemas) breathe.
+    expect(formatConfigValue({ a: 1 })).not.toContain('\n');
+    expect(formatConfigValue([1, 2, 3])).not.toContain('\n');
+    const marker = {
+      __weft_image__: { key: 'local/project/p/abc', mimeType: 'image/png', sizeBytes: 52, filename: 'x.png' },
+    };
+    expect(formatConfigValue(marker)).toContain('\n');
+    // Both forms round-trip identically.
+    expect(roundTrip(marker)).toEqual(marker);
+    expect(roundTrip({ a: 1 })).toEqual({ a: 1 });
+  });
+
+  it('round-trips @file and @asset markers, including a path with a quote', () => {
+    const ref: WeftFileRefValue = { __weftFileRef: { path: 'dir/file.txt', type: 'String', marker: 'file' } };
     expect(roundTrip(ref)).toEqual(ref);
-    const typed: WeftFileRefValue = { __weftFileRef: { path: 'a/b.json', type: 'List[Number]' } };
+    const typed: WeftFileRefValue = { __weftFileRef: { path: 'a/b.json', type: 'List[Number]', marker: 'file' } };
     expect(roundTrip(typed)).toEqual(typed);
-    const quoted: WeftFileRefValue = { __weftFileRef: { path: 'weird "name".txt', type: 'String' } };
+    const quoted: WeftFileRefValue = { __weftFileRef: { path: 'weird "name".txt', type: 'String', marker: 'file' } };
     expect(roundTrip(quoted)).toEqual(quoted);
+    const asset: WeftFileRefValue = { __weftFileRef: { path: 'assets/pic.png', type: 'Image', marker: 'asset' } };
+    expect(formatConfigValue(asset)).toBe('@asset("assets/pic.png", Image)');
+    expect(roundTrip(asset)).toEqual(asset);
   });
 });
 

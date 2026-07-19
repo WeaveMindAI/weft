@@ -26,6 +26,7 @@
 		displayValueOf,
 		readonlyKeys,
 		headerBadge,
+		onReadonlyEdit,
 	}: {
 		fields: FieldDefinition[];
 		config: Record<string, unknown>;
@@ -64,7 +65,28 @@
 		/// Optional badge rendered next to a field's label (e.g. the
 		/// file path chip on file-backed fields).
 		headerBadge?: Snippet<[FieldDefinition]>;
+		/// Called when the user tries to TYPE into a readonly field (a
+		/// readonly input swallows keystrokes silently). The parent decides
+		/// how to surface it (e.g. a throttled toast explaining why).
+		onReadonlyEdit?: (key: string) => void;
 	} = $props();
+
+	/// Keydown handler for readonly text controls: an editing keystroke
+	/// (printable char, deletion, enter) on a readonly field means the user
+	/// is trying to type; report it so the parent can explain the lock.
+	function readonlyKeydown(e: KeyboardEvent, key: string, ro: boolean) {
+		if (!ro) return;
+		if (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Enter') {
+			onReadonlyEdit?.(key);
+		}
+	}
+
+	/// Paste/drop attempt on a readonly control: the DOM already rejects the
+	/// edit (`readonly`), this only reports it so the lock gets explained for
+	/// input methods that never produce an editing keydown.
+	function readonlyPasteDrop(key: string, ro: boolean) {
+		if (ro) onReadonlyEdit?.(key);
+	}
 
 	const fieldEditor = createFieldEditor();
 	const fieldEditorRegistry = useFieldEditorRegistry();
@@ -142,6 +164,9 @@
 					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, saveFn(field.key))}
 					onblur={() => fieldEditor.blur(field.key, saveFn(field.key))}
 					onclick={(e) => e.stopPropagation()}
+					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
+					onpaste={() => readonlyPasteDrop(field.key, ro)}
+					ondrop={() => readonlyPasteDrop(field.key, ro)}
 					use:observeTextareaResize={field.key}
 				></textarea>
 			{:else if field.type === 'select' && field.options}
@@ -211,6 +236,9 @@
 					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, (v) => saveNumber(field.key, v))}
 					onblur={() => fieldEditor.blur(field.key, (v) => saveNumber(field.key, v))}
 					onclick={(e) => e.stopPropagation()}
+					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
+					onpaste={() => readonlyPasteDrop(field.key, ro)}
+					ondrop={() => readonlyPasteDrop(field.key, ro)}
 				/>
 			{:else if field.type === 'password'}
 				<input
@@ -224,6 +252,9 @@
 					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, saveFn(field.key))}
 					onblur={() => fieldEditor.blur(field.key, saveFn(field.key))}
 					onclick={(e) => e.stopPropagation()}
+					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
+					onpaste={() => readonlyPasteDrop(field.key, ro)}
+					ondrop={() => readonlyPasteDrop(field.key, ro)}
 				/>
 			{:else if field.type === 'text'}
 				<input
@@ -237,6 +268,9 @@
 					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, saveFn(field.key))}
 					onblur={() => fieldEditor.blur(field.key, saveFn(field.key))}
 					onclick={(e) => e.stopPropagation()}
+					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
+					onpaste={() => readonlyPasteDrop(field.key, ro)}
+					ondrop={() => readonlyPasteDrop(field.key, ro)}
 				/>
 			{:else}
 				<!-- code / api_key / form_builder MUST be in customFieldKeys

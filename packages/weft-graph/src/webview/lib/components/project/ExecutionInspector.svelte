@@ -2,10 +2,10 @@
 	import { Search } from '@lucide/svelte';
 	import type { NodeExecution } from '../../types';
 	import type { BusInspectorEvent, BusMeta, CorruptionSite, LoopInspectorEvent, LoopIteration } from '../../../../shared/protocol';
-	import { parseStoredFile } from '../../../../shared/protocol';
+	import { parseFileValue } from '../../../../shared/protocol';
 	import { displayStatus, getStatusIcon } from '../../utils/status';
 	import JsonTree from './JsonTree.svelte';
-	import StoredFileCard from './StoredFileCard.svelte';
+	import FileCard from './FileCard.svelte';
 	import CopyButton from '../ui/CopyButton.svelte';
 	import * as Dialog from '../ui/dialog';
 
@@ -310,9 +310,9 @@
 				<div class="overflow-auto flex-1 p-2">
 					{#if selected.input && typeof selected.input === 'object' && Object.keys(selected.input as Record<string, unknown>).length > 0}
 						{#each Object.entries(selected.input as Record<string, unknown>) as [key, value]}
-							{@const file = parseStoredFile(value)}
+							{@const file = parseFileValue(value)}
 							{#if file}
-								<StoredFileCard label={key} {file} />
+								<FileCard label={key} {file} />
 							{:else}
 								<JsonTree data={value} label={key} defaultExpanded={true} />
 							{/if}
@@ -377,9 +377,9 @@
 				<div class="overflow-auto flex-1 p-2">
 					{#if selected.output && typeof selected.output === 'object' && Object.keys(selected.output as Record<string, unknown>).length > 0}
 						{#each Object.entries(selected.output as Record<string, unknown>) as [key, value]}
-							{@const file = parseStoredFile(value)}
+							{@const file = parseFileValue(value)}
 							{#if file}
-								<StoredFileCard label={key} {file} />
+								<FileCard label={key} {file} />
 							{:else}
 								<JsonTree data={value} label={key} defaultExpanded={true} />
 							{/if}

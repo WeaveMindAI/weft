@@ -61,12 +61,14 @@ export const ALL_PRIMITIVE_TYPES: WeftPrimitive[] = [
 	"Image", "Video", "Audio", "Blob", "Empty",
 ];
 
-// SYNC: NAMED_UNIONS <-> crates/weft-core/src/weft_type.rs WeftType::named_union
-/** Named union aliases. The ONE place a union name expands (mirrors the
- *  backend registry). `Media` = media-proper (Image|Video|Audio); `File`
- *  = any stored file (Media + the Blob catch-all). Resolved generically,
- *  never a per-name branch in the parser; future user-defined unions
- *  register here. */
+// SYNC: NAMED_UNIONS <-> crates/weft-core/src/weft_type.rs WeftType::UNION_ALIASES
+/** Named union aliases. The ONE table both name resolution (parse) and
+ *  rendering (`weftTypeToString`) read, so an alias round-trips to its
+ *  NAME instead of leaking the structural expansion (mirrors the backend
+ *  registry). `Media` = media-proper (Image|Video|Audio); `File` = any
+ *  stored file (Media + the Blob catch-all). Resolved generically, never
+ *  a per-name branch in the parser; future user-defined unions register
+ *  here. */
 export const NAMED_UNIONS: Record<string, WeftPrimitive[]> = {
 	Media: ["Image", "Video", "Audio"],
 	File: ["Image", "Video", "Audio", "Blob"],
@@ -214,7 +216,26 @@ export function parseWeftType(s: string): WeftType | null {
 	return parseSingleType(trimmed);
 }
 
-/** Convert a parsed type back to string form. */
+/** The alias NAME of a structural union, if its members are exactly one
+ *  alias's primitive set (order-insensitive). The rendering half of the
+ *  alias round-trip; the type itself stays structural. */
+function unionAliasName(types: WeftType[]): string | null {
+	const prims: WeftPrimitive[] = [];
+	for (const t of types) {
+		if (t.kind !== 'primitive') return null;
+		prims.push(t.value);
+	}
+	for (const [name, members] of Object.entries(NAMED_UNIONS)) {
+		if (members.length === prims.length && members.every((m) => prims.includes(m))) {
+			return name;
+		}
+	}
+	return null;
+}
+
+/** Convert a parsed type back to string form. An alias's member set
+ *  renders under its NAME (`File`/`Media` survive a parse -> string round
+ *  trip), matching the backend's rendering. */
 export function weftTypeToString(t: WeftType): string {
 	switch (t.kind) {
 		case 'primitive': return t.value;
@@ -222,7 +243,7 @@ export function weftTypeToString(t: WeftType): string {
 		case 'dict': return `Dict[${weftTypeToString(t.key)}, ${weftTypeToString(t.value)}]`;
 		case 'json_dict': return 'JsonDict';
 		case 'bus': return 'Bus';
-		case 'union': return t.types.map(weftTypeToString).join(' | ');
+		case 'union': return unionAliasName(t.types) ?? t.types.map(weftTypeToString).join(' | ');
 		case 'typevar': return t.name;
 		case 'must_override': return 'MustOverride';
 	}
@@ -408,7 +429,8 @@ export interface PortDefinition {
 // TODO: add 'openai' and 'anthropic' providers when we support direct API keys for those
 export type ApiKeyProvider = "openrouter" | "elevenlabs" | "tavily" | "apollo";
 
-export type FieldType = "text" | "textarea" | "code" | "select" | "multiselect" | "number" | "checkbox" | "password" | "api_key" | "form_builder";
+// SYNC: FieldType 'file_drop' <-> packages/weft-graph/src/protocol.ts FieldKind, crates/weft-core/src/node.rs FieldType::FileDrop
+export type FieldType = "text" | "textarea" | "code" | "select" | "multiselect" | "number" | "checkbox" | "password" | "api_key" | "form_builder" | "file_drop";
 
 export interface FieldDefinition {
 	key: string;
@@ -419,6 +441,8 @@ export interface FieldDefinition {
 	defaultValue?: unknown;
 	description?: string;
 	provider?: ApiKeyProvider; // For api_key fields: which platform key to use
+	accept?: string; // For file_drop fields: narrows the type-derived HTML-accept filter
+	fileType?: string; // For file_drop fields: the declared weft file type (Image/Audio/.../File)
 	min?: number; // For number fields: minimum allowed value (clamped on blur)
 	max?: number; // For number fields: maximum allowed value (clamped on blur)
 	step?: number; // For number fields: granularity of the input (used by slider/number)

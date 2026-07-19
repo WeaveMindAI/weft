@@ -23,10 +23,13 @@ use super::StorageScope;
 /// by the broker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallerAuth {
-    /// A worker pod of `project_id` in `tenant`, currently driving
-    /// `color` (verified: the color's owning pod is the caller).
-    /// `color` is None when the worker presented no color claim
-    /// (then execution-scoped keys are unreachable).
+    /// A caller acting within `tenant`/`project_id`: a worker pod of that
+    /// project (verified via its token), or the dispatcher acting for the
+    /// tenant's editor session on the admin upload surface (the dispatcher
+    /// vouches for the tenant, the broker re-checks the key against it).
+    /// `color` is the execution being driven (verified: the color's owning
+    /// pod is the caller); None when no color claim was presented (then
+    /// execution-scoped keys are unreachable).
     Worker {
         tenant: String,
         project_id: String,
@@ -44,6 +47,13 @@ pub enum KeyScope {
     Exec { color: String },
     Project { project_id: String },
     Shared { name: String },
+    /// `asset/<project_id>/<sha256>`: a project ASSET, the published copy of a
+    /// file the project's source references via a media `@file` ref. The id is
+    /// the content hash, so existence == "this exact content is uploaded".
+    /// Sync-managed derived state: created/deleted only by the pre-build asset
+    /// sync (through the control-plane surface); workers of the project READ
+    /// it like project scope but may not write it.
+    Asset { project_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +72,20 @@ pub struct ParsedKey {
 /// prefixers) goes through `is_scope_tag` / `KeyScope::from_tag` so a new
 /// or renamed scope is changed in exactly one place. Keep this in sync with
 /// the `KeyScope` variants + `KeyScope::tag`.
-pub const SCOPE_TAGS: [&str; 3] = ["exec", "project", "shared"];
+// SYNC: SCOPE_TAGS <-> weavemind/website/src/lib/graph/runtime-files.ts Tier
+pub const SCOPE_TAGS: [&str; 4] = ["exec", "project", "shared", "asset"];
+
+/// Is `s` a TENANT-LESS runtime storage key (`<scope>/<owner>/<id>`, every
+/// segment in the wall's grammar)? The short address a human writes in source
+/// (`@asset("project/<id>/<file>", Image)`) and the form `weft files` shows;
+/// the build's resolution re-anchors it to the acting tenant. Distinguishes a
+/// storage address from an ordinary project path by the scope-tag first
+/// segment plus exact 3-segment shape.
+pub fn is_scope_key(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('/').collect();
+    matches!(parts.as_slice(),
+        [tag, owner, id] if is_scope_tag(tag) && valid_segment(owner) && valid_segment(id))
+}
 
 /// Is `s` a known on-wire scope tag? The one predicate every "looks like a
 /// scope key" check consults (so the tag set never forks across files).
@@ -79,16 +102,18 @@ impl KeyScope {
             "exec" => Some(KeyScope::Exec { color: owner.to_string() }),
             "project" => Some(KeyScope::Project { project_id: owner.to_string() }),
             "shared" => Some(KeyScope::Shared { name: owner.to_string() }),
+            "asset" => Some(KeyScope::Asset { project_id: owner.to_string() }),
             _ => None,
         }
     }
 
-    /// The on-wire scope tag (`exec`/`project`/`shared`).
+    /// The on-wire scope tag (`exec`/`project`/`shared`/`asset`).
     fn tag(&self) -> &'static str {
         match self {
             KeyScope::Exec { .. } => "exec",
             KeyScope::Project { .. } => "project",
             KeyScope::Shared { .. } => "shared",
+            KeyScope::Asset { .. } => "asset",
         }
     }
 
@@ -98,6 +123,7 @@ impl KeyScope {
             KeyScope::Exec { color } => color,
             KeyScope::Project { project_id } => project_id,
             KeyScope::Shared { name } => name,
+            KeyScope::Asset { project_id } => project_id,
         }
     }
 }
@@ -126,6 +152,31 @@ impl ParsedKey {
         } else {
             Err(format!("invalid tenant segment '{tenant}' for a storage list prefix"))
         }
+    }
+
+    /// The `<tenant>/project/<project_id>/` prefix covering one project's
+    /// persistent runtime files: the range the project reclaimer wipes.
+    pub fn project_prefix(tenant: &str, project: &str) -> Result<String, String> {
+        Self::owned_prefix(tenant, "project", project)
+    }
+
+    /// The `<tenant>/asset/<project_id>/` prefix covering one project's
+    /// published assets: the range the pre-build sync diffs against and the
+    /// project reclaimer wipes.
+    pub fn asset_prefix(tenant: &str, project: &str) -> Result<String, String> {
+        Self::owned_prefix(tenant, "asset", project)
+    }
+
+    /// A validated `<tenant>/<tag>/<owner>/` prefix: both segments pass the
+    /// key grammar, so a built prefix can never range outside the tenant.
+    fn owned_prefix(tenant: &str, tag: &str, owner: &str) -> Result<String, String> {
+        if !valid_segment(tenant) {
+            return Err(format!("invalid tenant segment '{tenant}' for a {tag} prefix"));
+        }
+        if !valid_segment(owner) {
+            return Err(format!("invalid owner segment '{owner}' for a {tag} prefix"));
+        }
+        Ok(format!("{tenant}/{tag}/{owner}/"))
     }
 }
 
@@ -171,14 +222,17 @@ pub fn parse_key(key: &str) -> Result<ParsedKey, String> {
         return Err(format!("malformed storage key '{key}': bad id segment"));
     }
     let scope = KeyScope::from_tag(scope_tag, owner).ok_or_else(|| {
-        format!("malformed storage key '{key}': unknown scope '{scope_tag}' (exec|project|shared)")
+        format!(
+            "malformed storage key '{key}': unknown scope '{scope_tag}' ({})",
+            SCOPE_TAGS.join("|")
+        )
     })?;
     Ok(ParsedKey { tenant: tenant.to_string(), scope, id: id.to_string() })
 }
 
 /// Validate that `prefix` is one of the two scope-anchored boundaries
 /// `wipe_prefix` may delete, each ending in `/`:
-///   - `<tenant>/<exec|project|shared>/<owner>/` : one owner's space
+///   - `<tenant>/<scope>/<owner>/` (any tag in [`SCOPE_TAGS`]) : one owner's space
 ///     (the dispatcher's `weft rm` / `weft clean <color>` / project-delete).
 ///   - `<tenant>/` : the WHOLE tenant (a tenant-delete wiping every
 ///     object under the tenant's prefix).
@@ -209,7 +263,8 @@ pub fn validate_wipe_prefix(prefix: &str) -> Result<(), String> {
             }
             if !is_scope_tag(scope_tag) {
                 return Err(format!(
-                    "wipe prefix '{prefix}': unknown scope '{scope_tag}' (exec|project|shared)"
+                    "wipe prefix '{prefix}': unknown scope '{scope_tag}' ({})",
+                    SCOPE_TAGS.join("|")
                 ));
             }
             if !valid_segment(owner) {
@@ -218,8 +273,8 @@ pub fn validate_wipe_prefix(prefix: &str) -> Result<(), String> {
             Ok(())
         }
         _ => Err(format!(
-            "wipe prefix '{prefix}' must be <tenant>/ or <tenant>/<scope>/<owner>/ \
-             (exec|project|shared)"
+            "wipe prefix '{prefix}' must be <tenant>/ or <tenant>/<scope>/<owner>/ ({})",
+            SCOPE_TAGS.join("|")
         )),
     }
 }
@@ -267,6 +322,11 @@ fn owned_scope_segments<'a>(
         }
         StorageScope::Project => ("project", owned("project", project_id)?),
         StorageScope::Shared { name } => ("shared", owned("shared-space name", name)?),
+        // Assets are keyed like project scope (owner = the caller's project).
+        // WHO may put here is route policy, not grammar: the worker data path
+        // refuses asset-scope writes (assets are sync-managed), the
+        // control-plane surface allows them; both build keys through this.
+        StorageScope::Asset => ("asset", owned("project", project_id)?),
     };
     Ok((tenant, tag, owner))
 }
@@ -352,6 +412,17 @@ pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), S
                 Err("denied: project-scoped file belongs to a different project".into())
             }
         }
+        // Assets read like project scope: any worker of the owning project may
+        // fetch them (the compiled config references them by key). Writes never
+        // reach here from workers (the data-path upload verbs refuse the Asset
+        // scope; assets are sync-managed).
+        KeyScope::Asset { project_id: key_project } => {
+            if key_project == project_id {
+                Ok(())
+            } else {
+                Err("denied: asset belongs to a different project".into())
+            }
+        }
         // Naming a shared key IS the opt-in (the grant table records it
         // for audit/listing; it never denies a worker of the tenant).
         // Safe because the tenant wall above already confirmed the caller
@@ -380,10 +451,68 @@ mod tests {
     }
 
     #[test]
+    fn is_scope_key_accepts_tenant_less_keys_only() {
+        for ok in ["exec/c1/f1", "project/p1/f2", "shared/team/f3", "asset/p1/f4"] {
+            assert!(is_scope_key(ok), "{ok}");
+        }
+        for no in [
+            "t1/project/p1/f2",  // tenant-anchored (4 segments)
+            "assets/pic.png",    // ordinary project path
+            "project/p1",        // missing id
+            "project//f",        // empty owner
+            "banana/p1/f",       // unknown scope tag
+            "https://ex.com/a",  // URL
+        ] {
+            assert!(!is_scope_key(no), "{no}");
+        }
+    }
+
+    #[test]
     fn to_key_is_the_exact_inverse_of_parse() {
-        for k in ["t1/exec/c1/f1", "t1/project/p1/f2", "t1/shared/team/f3"] {
+        for k in ["t1/exec/c1/f1", "t1/project/p1/f2", "t1/shared/team/f3", "t1/asset/p1/f4"] {
             assert_eq!(parse_key(k).unwrap().to_key(), k, "round-trip {k}");
         }
+    }
+
+    /// The asset scope's grammar: parses like project scope (owner = project),
+    /// a 64-hex sha256 passes as the id segment (the content-hash identity the
+    /// sync relies on), and the wall admits the OWNING project's workers
+    /// (reads) while denying every other project and the control plane on the
+    /// data path, exactly like project scope.
+    #[test]
+    fn asset_scope_parses_walls_and_takes_hash_ids() {
+        let sha = "a".repeat(64);
+        let key = format!("t1/asset/p1/{sha}");
+        let parsed = parse_key(&key).unwrap();
+        assert_eq!(parsed.scope, KeyScope::Asset { project_id: "p1".into() });
+        assert_eq!(parsed.id, sha);
+        assert_eq!(parsed.to_key(), key);
+
+        // Same-project worker may read; another project's worker may not; the
+        // control plane uses the admin surface, not the data path.
+        let asset = pk("t1", KeyScope::Asset { project_id: "p1".into() });
+        assert!(check_key_access(&worker(None), &asset).is_ok());
+        assert!(check_key_access(&worker(Some("c1")), &asset).is_ok());
+        let other = CallerAuth::Worker {
+            tenant: "t1".into(),
+            project_id: "p2".into(),
+            color: None,
+        };
+        assert!(check_key_access(&other, &asset).is_err());
+        assert!(check_key_access(&CallerAuth::ControlPlane, &asset).is_err());
+        // The tenant wall holds first: a worker of another tenant is denied.
+        let foreign = pk("t2", KeyScope::Asset { project_id: "p1".into() });
+        assert!(check_key_access(&worker(None), &foreign).is_err());
+
+        // key_for_put builds the asset key from the caller's own project (the
+        // route layer decides WHO may put; the grammar just builds).
+        let put = key_for_put(&worker(None), &StorageScope::Asset, &sha).unwrap();
+        assert_eq!(put.to_key(), key);
+        // And the list prefix ranges exactly the project's assets.
+        assert_eq!(
+            prefix_for_list(&worker(None), &StorageScope::Asset).unwrap(),
+            "t1/asset/p1/"
+        );
     }
 
     #[test]
@@ -610,6 +739,18 @@ mod tests {
         assert_eq!(ParsedKey::tenant_prefix("alice").unwrap(), "alice/");
         for bad in ["", "..", ".", "a/b", "a b"] {
             assert!(ParsedKey::tenant_prefix(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    /// `asset_prefix` is the range the pre-build sync diffs + the project
+    /// reclaimer wipes; both segments are validated so it can never range
+    /// outside the tenant.
+    #[test]
+    fn asset_prefix_builds_and_walls() {
+        assert_eq!(ParsedKey::asset_prefix("alice", "p1").unwrap(), "alice/asset/p1/");
+        // A traversal / slashed / spaced segment on either side is rejected.
+        for (t, p) in [("..", "p"), ("alice", ".."), ("a/b", "p"), ("alice", "a b"), ("alice", "")] {
+            assert!(ParsedKey::asset_prefix(t, p).is_err(), "should reject {t:?}/{p:?}");
         }
     }
 

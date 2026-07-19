@@ -733,9 +733,12 @@ impl EndpointHandle {
 /// `ContextHandle` storage methods; the handle itself only carries
 /// the chosen scope.
 ///
-/// Key-addressed verbs accept either a stored-file value (the
-/// concrete `__weft_<kind>__` reference an upstream node emitted) or a
-/// raw key string wrapped in a JSON string; see [`StoredFile::key_from`].
+/// File-addressed verbs accept any file value (the concrete
+/// `__weft_<kind>__` reference an upstream node emitted, key- or
+/// url-backed) or a raw key string wrapped in a JSON string; see
+/// [`crate::storage::FileHandle::from_value`]. Verbs that only make
+/// sense on bucket-stored bytes (`delete`, `keep`) error loud on a
+/// url-backed value.
 #[derive(Clone)]
 pub struct StorageHandle {
     handle: Arc<dyn ContextHandle>,
@@ -800,14 +803,16 @@ impl StorageHandle {
         self.handle.storage_put_from_url(&self.scope, url, filename, keep).await
     }
 
-    /// Stream a stored file's bytes. Accepts a stored-file value or a
-    /// raw key (JSON string). Counts as access (bumps a kept file's TTL).
+    /// Stream a file's bytes. Accepts any file value (a bucket-backed
+    /// `key` marker, an external `url` marker) or a raw key (JSON string).
+    /// For a bucket-backed file this counts as access (bumps a kept file's
+    /// TTL); a url-backed value has no stored TTL to bump. The node holds
+    /// an ADDRESS and this reads the bytes behind it, whichever form.
     pub async fn get(
         &self,
         file_or_key: &Value,
     ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
-        let key = crate::storage::StoredFile::key_from(file_or_key)?;
-        self.handle.storage_get(&key, None).await
+        self.get_with_range(file_or_key, None).await
     }
 
     /// Range read: stream only `range` of the file. The home of the
@@ -818,8 +823,26 @@ impl StorageHandle {
         file_or_key: &Value,
         range: crate::storage::ByteRange,
     ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
-        let key = crate::storage::StoredFile::key_from(file_or_key)?;
-        self.handle.storage_get(&key, Some(range)).await
+        self.get_with_range(file_or_key, Some(range)).await
+    }
+
+    /// The one read dispatch behind `get` / `get_range`: parse the file value's
+    /// HANDLE and route to the bucket (a `key`) or an external fetch (a `url`).
+    /// A `url`-backed file is fetched directly by the worker, which is safe
+    /// because that fetch only ever runs inside the isolated worker (the same
+    /// reason `put_from_url` is safe). The node-facing surface is identical
+    /// either way.
+    async fn get_with_range(
+        &self,
+        file_or_key: &Value,
+        range: Option<crate::storage::ByteRange>,
+    ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
+        match crate::storage::FileHandle::from_value(file_or_key)? {
+            crate::storage::FileHandle::Key(key) => self.handle.storage_get(&key, range).await,
+            crate::storage::FileHandle::Url { url, mime_type, filename, size_bytes } => {
+                self.handle.storage_get_url(&url, &mime_type, &filename, size_bytes, range).await
+            }
+        }
     }
 
     /// Convenience: [`Self::get`] fully collected into memory. Only
@@ -836,8 +859,10 @@ impl StorageHandle {
     }
 
     /// Delete a stored file. Space is reclaimed in place, instantly.
+    /// Bucket-only: a url-backed file value has nothing in storage to
+    /// delete and errors loud.
     pub async fn delete(&self, file_or_key: &Value) -> WeftResult<()> {
-        let key = crate::storage::StoredFile::key_from(file_or_key)?;
+        let key = Self::bucket_key(file_or_key, "delete")?;
         self.handle.storage_delete(&key).await
     }
 
@@ -849,12 +874,14 @@ impl StorageHandle {
     /// Mark an existing execution-scoped file to survive the
     /// terminate sweep (the after-the-fact twin of `put(.., keep)`).
     /// Keep is purely ADDITIVE: there is no un-keep / keep-only verb.
+    /// Bucket-only: a url-backed file value is not subject to the
+    /// terminate sweep (the bytes were never in storage) and errors loud.
     pub async fn keep(
         &self,
         file_or_key: &Value,
         ttl: crate::storage::KeepTtl,
     ) -> WeftResult<()> {
-        let key = crate::storage::StoredFile::key_from(file_or_key)?;
+        let key = Self::bucket_key(file_or_key, "keep")?;
         self.handle.storage_keep(&key, ttl).await
     }
 
@@ -862,15 +889,36 @@ impl StorageHandle {
     /// external URL-accepting API; the external service streams
     /// directly from the storage bucket. `ttl_secs: None` uses the
     /// service default (~15 min). The URL is an explicit, per-file,
-    /// expiring artifact; the stored-file VALUE never carries it. Counts
-    /// as access (bumps a kept file's TTL).
+    /// expiring artifact; the stored-file VALUE never carries it. For a
+    /// bucket-backed file this counts as access (bumps a kept file's
+    /// TTL). A url-backed file value is
+    /// ALREADY a URL an external service can fetch: presign returns it
+    /// as-is (no expiry to mint, nothing in the bucket to sign), so the
+    /// caller's contract ("a URL to hand out") holds for both handles.
     pub async fn presign(
         &self,
         file_or_key: &Value,
         ttl_secs: Option<u64>,
     ) -> WeftResult<String> {
-        let key = crate::storage::StoredFile::key_from(file_or_key)?;
-        self.handle.storage_presign(&key, ttl_secs).await
+        match crate::storage::FileHandle::from_value(file_or_key)? {
+            crate::storage::FileHandle::Key(key) => {
+                self.handle.storage_presign(&key, ttl_secs).await
+            }
+            crate::storage::FileHandle::Url { url, .. } => Ok(url),
+        }
+    }
+
+    /// Parse a file value down to its bucket key for the verbs that only
+    /// make sense on stored bytes (`delete`, `keep`). A url-backed value
+    /// errors loud with the verb's name: the bytes live at an external
+    /// URL, there is nothing in storage to act on.
+    fn bucket_key(file_or_key: &Value, verb: &str) -> WeftResult<String> {
+        match crate::storage::FileHandle::from_value(file_or_key)? {
+            crate::storage::FileHandle::Key(key) => Ok(key),
+            crate::storage::FileHandle::Url { url, .. } => Err(WeftError::Input(format!(
+                "storage {verb}: this file value points at an external URL ({url}), not a stored file; only bucket-stored files can be {verb}ed"
+            ))),
+        }
     }
 }
 
@@ -1024,6 +1072,24 @@ pub trait ContextHandle: Send + Sync {
     async fn storage_get(
         &self,
         key: &str,
+        range: Option<crate::storage::ByteRange>,
+    ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)>;
+
+    /// Stream the bytes of a file that lives at an external URL (a file value
+    /// whose handle is a `url`, not a bucket `key`). The worker GETs the URL
+    /// directly and streams the body out; the fetch happens only inside the
+    /// isolated worker (never a trusted service), so an arbitrary URL is safe
+    /// here for the same reason `storage_put_from_url` is. `declared` carries
+    /// the marker's mime/filename/size for the returned meta; the response's
+    /// own Content-Type wins for the actual byte stream's kind. Lives on the
+    /// trait (not `StorageHandle`) because the HTTP client is an engine
+    /// dependency, not a core one.
+    async fn storage_get_url(
+        &self,
+        url: &str,
+        declared_mime: &str,
+        declared_filename: &str,
+        declared_size: u64,
         range: Option<crate::storage::ByteRange>,
     ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)>;
 

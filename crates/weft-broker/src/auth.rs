@@ -277,6 +277,30 @@ pub async fn reviewed_token(
 /// pure key-wall identity (`CallerAuth`). This is the identity authority
 /// behind the runtime-file plane's prefix wall, run IN-PROCESS by the
 /// broker's own runtime-storage handlers (the broker is both the authority
+/// Additional CONTROL-PLANE service accounts, from the deploy config:
+/// `WEFT_BROKER_EXTRA_CONTROL_PLANE_SAS` is a comma list of
+/// `namespace/serviceaccount` pairs a deployment trusts with the admin
+/// surface alongside the dispatcher. TokenReview still verifies every
+/// token; this only extends WHICH verified identities count as control
+/// plane, and each stays distinct in audit logs. Parsed once per process.
+fn is_extra_control_plane(namespace: &str, sa_name: &str) -> bool {
+    static EXTRA: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    EXTRA
+        .get_or_init(|| {
+            std::env::var("WEFT_BROKER_EXTRA_CONTROL_PLANE_SAS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|pair| {
+                    let (ns, sa) = pair.trim().split_once('/')?;
+                    (!ns.is_empty() && !sa.is_empty())
+                        .then(|| (ns.to_string(), sa.to_string()))
+                })
+                .collect()
+        })
+        .iter()
+        .any(|(ns, sa)| ns == namespace && sa == sa_name)
+}
+
 /// and the data path, so there is no relay):
 ///   - the dispatcher (`weft-dispatcher` in `weft-system`) -> ControlPlane
 ///     (the CLI admin verbs: list/usage/delete/presign/wipe for a tenant).
@@ -296,6 +320,9 @@ pub async fn resolve_storage_caller(
 ) -> Result<weft_core::storage::key::CallerAuth, (StatusCode, String)> {
     use weft_core::storage::key::CallerAuth;
     let reviewed = reviewed_token(state, headers).await?;
+    if is_extra_control_plane(&reviewed.namespace, &reviewed.sa_name) {
+        return Ok(CallerAuth::ControlPlane);
+    }
     match reviewed.sa_name.as_str() {
         DISPATCHER_SA if reviewed.namespace == DISPATCHER_NS => Ok(CallerAuth::ControlPlane),
         WORKER_SA => {

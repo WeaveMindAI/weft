@@ -14,8 +14,12 @@ use anyhow::{Context, Result};
 use sqlx::PgPool;
 
 use weft_core::storage::{
-    ListFilesResponse, PresignRequest, PresignResult, StoredFileMeta, SweepExecRequest,
-    SweepExecResponse, TenantScopeRequest, TenantUsage, WipePrefixRequest, WipePrefixResponse,
+    AdminUploadBeginRequest, ListFilesResponse, ListPrefixRequest, PartDoneRequest,
+    PresignRequest, PresignResult,
+    StoredFileMeta, SweepExecRequest, SweepExecResponse, Tenanted, TenantScopeRequest, TenantUsage,
+    UploadAbortRequest, UploadBeginResponse, UploadCompleteRequest, UploadPartsRequest,
+    UploadPartsResponse, UploadResumeRequest, UploadResumeResponse, WipePrefixRequest,
+    WipePrefixResponse,
 };
 
 use crate::state::DispatcherState;
@@ -115,31 +119,66 @@ async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response>
     anyhow::bail!("broker storage {what} returned {status}: {body}")
 }
 
-/// List one tenant's runtime files (the `weft files ls` surface).
-pub async fn tenant_list(state: &DispatcherState, tenant: &str) -> Result<Vec<StoredFileMeta>> {
+/// POST one admin verb to the broker and parse its JSON response. Every
+/// admin-surface call is this exact shape (SA bearer, JSON in, JSON out,
+/// status classified by `check`), so it lives once.
+async fn post_admin<Resp: serde::de::DeserializeOwned>(
+    state: &DispatcherState,
+    path: &str,
+    what: &str,
+    body: &impl serde::Serialize,
+) -> Result<Resp> {
     let resp = state
         .http
-        .post(admin_url(state, "/v1/storage/admin/tenant-list"))
+        .post(admin_url(state, path))
         .bearer_auth(read_token(state).await?)
-        .json(&TenantScopeRequest { tenant: tenant.to_string() })
+        .json(body)
         .send()
         .await
-        .context("broker tenant-list")?;
-    let out: ListFilesResponse = check(resp, "tenant-list").await?.json().await.context("tenant-list parse")?;
+        .with_context(|| format!("broker {what}"))?;
+    check(resp, what).await?.json().await.with_context(|| format!("{what} parse"))
+}
+
+/// Same as `post_admin` for verbs whose success response carries no body.
+async fn post_admin_unit(
+    state: &DispatcherState,
+    path: &str,
+    what: &str,
+    body: &impl serde::Serialize,
+) -> Result<()> {
+    let resp = state
+        .http
+        .post(admin_url(state, path))
+        .bearer_auth(read_token(state).await?)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("broker {what}"))?;
+    check(resp, what).await?;
+    Ok(())
+}
+
+/// List one tenant's runtime files (the `weft files ls` surface).
+pub async fn tenant_list(state: &DispatcherState, tenant: &str) -> Result<Vec<StoredFileMeta>> {
+    let out: ListFilesResponse = post_admin(
+        state,
+        "/v1/storage/admin/tenant-list",
+        "tenant-list",
+        &TenantScopeRequest { tenant: tenant.to_string() },
+    )
+    .await?;
     Ok(out.files)
 }
 
 /// One tenant's footprint (the `weft files usage` surface).
 pub async fn tenant_usage(state: &DispatcherState, tenant: &str) -> Result<TenantUsage> {
-    let resp = state
-        .http
-        .post(admin_url(state, "/v1/storage/admin/tenant-usage"))
-        .bearer_auth(read_token(state).await?)
-        .json(&TenantScopeRequest { tenant: tenant.to_string() })
-        .send()
-        .await
-        .context("broker tenant-usage")?;
-    Ok(check(resp, "tenant-usage").await?.json().await.context("tenant-usage parse")?)
+    post_admin(
+        state,
+        "/v1/storage/admin/tenant-usage",
+        "tenant-usage",
+        &TenantScopeRequest { tenant: tenant.to_string() },
+    )
+    .await
 }
 
 /// Delete one file by its tenant-anchored key (`weft files rm <key>`).
@@ -158,44 +197,171 @@ pub async fn delete_key(state: &DispatcherState, key: &str) -> Result<()> {
 /// Presign a download URL for one file (the `weft files download` handshake),
 /// with the file's name + size for the CLI.
 pub async fn presign(state: &DispatcherState, key: &str, ttl_secs: Option<u64>) -> Result<PresignResult> {
-    let resp = state
-        .http
-        .post(admin_url(state, "/v1/storage/admin/presign"))
-        .bearer_auth(read_token(state).await?)
-        .json(&PresignRequest { key: key.to_string(), ttl_secs })
-        .send()
-        .await
-        .context("broker presign")?;
-    check(resp, "presign").await?.json().await.context("presign parse")
+    post_admin(
+        state,
+        "/v1/storage/admin/presign",
+        "presign",
+        &PresignRequest { key: key.to_string(), ttl_secs },
+    )
+    .await
 }
 
 /// Wipe a whole scope/tenant prefix (`weft files rm <prefix>` / project-delete).
 pub async fn wipe_prefix(state: &DispatcherState, prefix: &str) -> Result<u64> {
-    let resp = state
-        .http
-        .post(admin_url(state, "/v1/storage/admin/wipe-prefix"))
-        .bearer_auth(read_token(state).await?)
-        .json(&WipePrefixRequest { prefix: prefix.to_string() })
-        .send()
-        .await
-        .context("broker wipe-prefix")?;
-    let out: WipePrefixResponse = check(resp, "wipe-prefix").await?.json().await.context("wipe-prefix parse")?;
+    let out: WipePrefixResponse = post_admin(
+        state,
+        "/v1/storage/admin/wipe-prefix",
+        "wipe-prefix",
+        &WipePrefixRequest { prefix: prefix.to_string() },
+    )
+    .await?;
     Ok(out.wiped)
 }
 
 /// Terminate-sweep a color's un-kept exec files: the broker reaps crashed
 /// uploads now and stamps completed files with the post-run linger expiry.
 async fn sweep_exec(state: &DispatcherState, tenant: &str, color: &str) -> Result<SweepExecResponse> {
-    let resp = state
-        .http
-        .post(admin_url(state, "/v1/storage/admin/sweep-exec"))
-        .bearer_auth(read_token(state).await?)
-        .json(&SweepExecRequest { tenant: tenant.to_string(), color: color.to_string() })
-        .send()
-        .await
-        .context("broker sweep-exec")?;
-    let out: SweepExecResponse = check(resp, "sweep-exec").await?.json().await.context("sweep-exec parse")?;
-    Ok(out)
+    post_admin(
+        state,
+        "/v1/storage/admin/sweep-exec",
+        "sweep-exec",
+        &SweepExecRequest { tenant: tenant.to_string(), color: color.to_string() },
+    )
+    .await
+}
+
+// ---------- asset upload proxy ----------
+//
+// The pre-build asset sync drives the broker's multipart upload contract
+// through here: the dispatcher resolves the acting tenant (its api layer) and
+// forwards each verb to the broker's admin upload surface. Bytes never pass
+// through: the returned part URLs are presigned for the caller, which PUTs
+// straight to the bucket.
+
+/// Begin an ASSET upload (content-addressed: `content_hash` becomes the key
+/// id); returns the minted key + part size.
+pub async fn upload_begin(
+    state: &DispatcherState,
+    tenant: &str,
+    project: &str,
+    req: UploadBeginParams,
+) -> Result<UploadBeginResponse> {
+    post_admin(
+        state,
+        "/v1/storage/admin/upload/begin",
+        "upload-begin",
+        &AdminUploadBeginRequest {
+            tenant: tenant.to_string(),
+            project: project.to_string(),
+            mime_type: req.mime_type,
+            filename: req.filename,
+            declared_size: req.declared_size,
+            content_hash: req.content_hash,
+        },
+    )
+    .await
+}
+
+/// The begin parameters the sync supplies (tenant/project are resolved by the
+/// api layer, not caller-claimed).
+pub struct UploadBeginParams {
+    pub mime_type: String,
+    pub filename: String,
+    pub declared_size: Option<u64>,
+    pub content_hash: String,
+}
+
+/// The files under one project's asset prefix: the sync's diff input.
+pub async fn asset_list(
+    state: &DispatcherState,
+    tenant: &str,
+    project: &str,
+) -> Result<Vec<StoredFileMeta>> {
+    let prefix = weft_core::storage::key::ParsedKey::asset_prefix(tenant, project)
+        .map_err(|e| anyhow::anyhow!("asset prefix: {e}"))?;
+    let out: ListFilesResponse = post_admin(
+        state,
+        "/v1/storage/admin/list-prefix",
+        "list-prefix",
+        &ListPrefixRequest { prefix },
+    )
+    .await?;
+    Ok(out.files)
+}
+
+/// Reserve + presign the next parts (browser-facing URLs).
+pub async fn upload_parts(
+    state: &DispatcherState,
+    tenant: &str,
+    req: UploadPartsRequest,
+) -> Result<UploadPartsResponse> {
+    post_admin(
+        state,
+        "/v1/storage/admin/upload/parts",
+        "upload-parts",
+        &Tenanted { tenant: tenant.to_string(), inner: req },
+    )
+    .await
+}
+
+/// Record a landed part's etag.
+pub async fn upload_part_done(
+    state: &DispatcherState,
+    tenant: &str,
+    req: PartDoneRequest,
+) -> Result<()> {
+    post_admin_unit(
+        state,
+        "/v1/storage/admin/upload/part-done",
+        "upload-part-done",
+        &Tenanted { tenant: tenant.to_string(), inner: req },
+    )
+    .await
+}
+
+/// Finalize the upload; returns the stored-file marker value the config holds.
+pub async fn upload_complete(
+    state: &DispatcherState,
+    tenant: &str,
+    req: UploadCompleteRequest,
+) -> Result<serde_json::Value> {
+    post_admin(
+        state,
+        "/v1/storage/admin/upload/complete",
+        "upload-complete",
+        &Tenanted { tenant: tenant.to_string(), inner: req },
+    )
+    .await
+}
+
+/// Fresh browser-facing URLs for the parts that never landed.
+pub async fn upload_resume(
+    state: &DispatcherState,
+    tenant: &str,
+    req: UploadResumeRequest,
+) -> Result<UploadResumeResponse> {
+    post_admin(
+        state,
+        "/v1/storage/admin/upload/resume",
+        "upload-resume",
+        &Tenanted { tenant: tenant.to_string(), inner: req },
+    )
+    .await
+}
+
+/// Cancel an in-flight editor upload, freeing its reservation.
+pub async fn upload_abort(
+    state: &DispatcherState,
+    tenant: &str,
+    req: UploadAbortRequest,
+) -> Result<()> {
+    post_admin_unit(
+        state,
+        "/v1/storage/admin/upload/abort",
+        "upload-abort",
+        &Tenanted { tenant: tenant.to_string(), inner: req },
+    )
+    .await
 }
 
 // ---------- durable terminate-sweep queue ----------

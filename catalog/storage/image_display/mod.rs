@@ -1,16 +1,17 @@
-//! ImageDisplay: a terminal preview sink that shows a stored image
-//! inline in the graph. Like Debug, it emits nothing; the graph view
-//! reads the input value off the SSE stream and, seeing a stored-image
-//! reference (`features.showImagePreview`), fetches the bytes through
-//! the SAME authenticated handshake a user download uses and renders
-//! them in place. The input port is typed `Image`, so the type system
-//! guarantees the value is an image; the node body only has to check
-//! that it is a STORED reference (a url/data-backed image has no key
-//! the preview handshake can resolve), failing loud otherwise.
+//! ImageDisplay: a terminal preview sink that shows an image inline in
+//! the graph. Like Debug, it emits nothing; the graph view reads the
+//! input value off the SSE stream and, seeing an image file value
+//! (`features.showImagePreview`), renders it in place. A key-backed
+//! image fetches its bytes through the SAME authenticated handshake a
+//! user download uses; a url-backed image is rendered straight from its
+//! URL by the viewer's browser. The input port is typed `Image`, so the
+//! type system guarantees the value is an image; the node body only has
+//! to check that it carries a resolvable handle (key or url; an inline
+//! data-backed image has neither), failing loud otherwise.
 
 use async_trait::async_trait;
 
-use weft_core::storage::StoredFile;
+use weft_core::storage::FileHandle;
 use weft_core::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
@@ -23,12 +24,11 @@ impl Node for ImageDisplayNode {
             WeftError::Input("ImageDisplay: no value on input port 'image'".into())
         })?;
         // The `Image` port type already guarantees this is an image; the
-        // only thing left to enforce is that it is a STORED reference (the
-        // editor preview resolves its key through the download handshake).
-        // A url/data-backed image has no key to resolve; fail loud.
-        StoredFile::from_value(&image).map_err(|e| {
+        // only thing left to enforce is that it carries a handle the
+        // preview can resolve (a storage key or an external URL).
+        FileHandle::from_value(&image).map_err(|e| {
             WeftError::Input(format!(
-                "ImageDisplay needs a stored image reference (e.g. from FetchToStorage): {e}"
+                "ImageDisplay needs an image with a storage key or URL (e.g. from FetchToStorage): {e}"
             ))
         })?;
         Ok(())

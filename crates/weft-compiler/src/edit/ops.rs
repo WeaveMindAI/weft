@@ -1296,15 +1296,23 @@ fn reject_uncontained_value(value: &str) -> Result<(), EditError> {
     // Exactly the tokens that reach forward are refused, on the lexed value:
     let toks = crate::cst::lexer::lex(value);
     let mut depth: i32 = 0;
+    // Brace nesting specifically: a newline INSIDE a balanced `{...}` run is
+    // part of a multi-line JSON object value, which the grammar parses in
+    // every value position (one-liner bodies and connection lines included:
+    // the parser assembles the brace-run across lines; pinned by
+    // tests/parser_multiline_object.rs). Only a newline at brace depth 0
+    // splits the VALUE itself across lines and breaks out.
+    let mut brace_depth: i32 = 0;
     for t in &toks {
         match t.kind {
             // A line comment runs to the next newline, so on a single-line body
             // it eats the `}`. Unsafe wherever it appears in a value.
             SyntaxKind::COMMENT => return bad(),
-            // A raw newline splits the value onto a new line. (A heredoc's own
-            // newlines live inside its single HEREDOC token, so they never
-            // surface as a WHITESPACE token here.)
-            SyntaxKind::WHITESPACE if t.text.contains('\n') => return bad(),
+            // A raw newline OUTSIDE any brace-run splits the value onto a new
+            // line. (Inside a brace-run it is multi-line JSON, contained; a
+            // heredoc's own newlines live inside its single HEREDOC token, so
+            // they never surface as a WHITESPACE token here.)
+            SyntaxKind::WHITESPACE if t.text.contains('\n') && brace_depth == 0 => return bad(),
             // An UNTERMINATED opaque token runs to end-of-input, swallowing the
             // rest of the file: a `[`-array missing its `]`, a heredoc/string
             // missing its closing fence/quote, a marker missing its `)`. A
@@ -1336,10 +1344,21 @@ fn reject_uncontained_value(value: &str) -> Result<(), EditError> {
                 }
             }
             // A closer with no opener inside the value would close the enclosing
-            // body/sig early. (`[...]`/`{...}` arrays are single opaque tokens
-            // above, so only the paren/brace PAIR tokens can appear here.)
-            SyntaxKind::L_BRACE | SyntaxKind::L_PAREN => depth += 1,
-            SyntaxKind::R_BRACE | SyntaxKind::R_PAREN => {
+            // body/sig early. (`[...]` arrays are single opaque tokens above;
+            // `{...}` objects lex as raw brace runs, tracked here.)
+            SyntaxKind::L_BRACE => {
+                depth += 1;
+                brace_depth += 1;
+            }
+            SyntaxKind::L_PAREN => depth += 1,
+            SyntaxKind::R_BRACE => {
+                depth -= 1;
+                brace_depth -= 1;
+                if depth < 0 {
+                    return bad();
+                }
+            }
+            SyntaxKind::R_PAREN => {
                 depth -= 1;
                 if depth < 0 {
                     return bad();

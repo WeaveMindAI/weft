@@ -4127,6 +4127,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-assets"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "weft-core",
+]
+
+[[package]]
 name = "weft-broker"
 version = "0.2.0"
 dependencies = [
@@ -4199,6 +4211,7 @@ name = "weft-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "dotenvy",
  "eventsource-client",
@@ -4213,6 +4226,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "weft-assets",
  "weft-catalog",
  "weft-compiler",
  "weft-core",

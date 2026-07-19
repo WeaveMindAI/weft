@@ -15,7 +15,6 @@ use crate::error::{CompileError, CompileResult};
 use crate::project::Project;
 use crate::validate::ValidationMode;
 use crate::worker_image;
-use crate::compile_checked;
 use weft_catalog::FsCatalog;
 
 /// Build-phase artifact. The host never holds a compiled binary
@@ -40,9 +39,9 @@ pub struct BuildResult {
     pub binary_name: String,
 }
 
-/// Full host-side compile + stage. Pipeline:
+/// Validate + codegen + stage from an ALREADY-COMPILED definition. Pipeline:
 ///
-/// 1. Parse + enrich + validate the weft source.
+/// 1. Validate the (resolved) definition, abort on any error.
 /// 2. Codegen the cargo crate at `.weft/target/build/`.
 /// 3. Emit the multi-stage Dockerfile at
 ///    `.weft/target/Dockerfile.worker`.
@@ -50,6 +49,16 @@ pub struct BuildResult {
 ///    `.weft/target/worker-image/` with `build/` and, when not
 ///    using the pre-built builder base, `weft/` too; the Dockerfile
 ///    is laid out so `docker build .` works.
+///
+/// Takes the definition + catalog the caller already produced rather than
+/// recompiling from source: the caller resolves `@asset` refs into the
+/// definition (deferred file markers become concrete file values) BEFORE
+/// this runs, and a fresh compile-from-source here would see the raw
+/// markers instead (a file-typed `@asset` reads as a `String` at parse and
+/// would fail validation against its `File` port). This is also the only
+/// validation gate on the build path, so it runs on the resolved
+/// definition, not the raw source. `Structural` (not `Runtime`): a project
+/// may build without every secret filled; runtime-rule gaps surface at run.
 ///
 /// `builder_base_tag` is the shared `weft-builder-base:<hash>` tag
 /// the CLI computed + ensured. When it kicks in (debian-family
@@ -62,32 +71,26 @@ pub struct BuildResult {
 /// the signature so future debug/release mode selection doesn't
 /// require another plumbing pass.
 pub fn build_project(
-    project_root: &Path,
+    project: &Project,
+    definition: &weft_core::project::ProjectDefinition,
+    catalog: &FsCatalog,
     _release: bool,
     builder_base_tag: &str,
 ) -> CompileResult<BuildResult> {
-    let project = Project::load(project_root)?;
-    let source = project.read_main_weft()?;
-
-    // One pipeline: compile + strict enrich + validate, abort on any
-    // error. `Structural` (not `Runtime`) because a project may build
-    // without every secret filled; runtime-rule gaps surface at run.
-    let catalog = build_project_catalog(&project.root)?;
-    let definition = compile_checked(
-        &source,
-        project.id(),
-        crate::file_reader::CompileFs::disk(&project.root),
-        &catalog,
+    let project_root = project.root.as_path();
+    crate::bail_on_errors(crate::validate::validate_with_mode(
+        definition,
+        catalog,
         ValidationMode::Structural,
-    )?;
+    ))?;
     // The crate/binary name is a project-identity property owned by the
     // manifest (`weft.toml` `[package] name`), not a parse-time property of the
     // graph. The parsed `ProjectDefinition` carries no name.
     let crate_name = project.manifest.package.name.clone();
 
     let crate_root = project_root.join(".weft").join("target").join("build");
-    let referenced_nodes = codegen::collect_node_types(&definition);
-    codegen::emit(&definition, project_root, &crate_root, &catalog, &crate_name)?;
+    let referenced_nodes = codegen::collect_node_types(definition);
+    codegen::emit(definition, project_root, &crate_root, catalog, &crate_name)?;
     let binary_name = sanitize_crate_name(&crate_name);
 
     let dockerfile_summary = worker_image::emit(

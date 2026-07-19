@@ -142,12 +142,14 @@ impl SandboxPolicy for NoSandbox {
     }
 }
 
-/// The default reclaimer: free the project's `project/`-scoped runtime files from
-/// the object store. These are the per-project files a running node wrote under
-/// `project/<id>/` (its own persistent state), which are tied to the project's
-/// lifetime by design and go away with it. `shared/`-scoped files are the owner's,
-/// not the project's, and are deliberately left untouched (they outlive the
-/// project). This runtime-files plane always exists, so it is the default.
+/// The default reclaimer: free the project's per-project storage from the
+/// object store: its `project/`-scoped runtime files (persistent state a
+/// running node wrote) AND its `asset/`-scoped published assets (the sync's
+/// derived copies of source-referenced media). Both are tied to the project's
+/// lifetime by design and go away with it. `shared/`-scoped files are the
+/// owner's, not the project's, and are deliberately left untouched (they
+/// outlive the project). This runtime-files plane always exists, so it is the
+/// default.
 pub struct WipeProjectFiles;
 
 #[async_trait]
@@ -158,8 +160,18 @@ impl ProjectReclaimer for WipeProjectFiles {
         tenant: &str,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        let prefix = format!("{tenant}/project/{project_id}/");
-        crate::storage::wipe_prefix(state, &prefix).await.map(|_| ())
+        // Both prefixes through the validated constructors: a hand-built
+        // format string would skip the segment grammar that keeps a wipe
+        // inside its owner boundary.
+        let project = project_id.to_string();
+        let project_files =
+            weft_core::storage::key::ParsedKey::project_prefix(tenant, &project)
+                .map_err(|e| anyhow::anyhow!("project wipe prefix: {e}"))?;
+        let assets = weft_core::storage::key::ParsedKey::asset_prefix(tenant, &project)
+            .map_err(|e| anyhow::anyhow!("asset wipe prefix: {e}"))?;
+        crate::storage::wipe_prefix(state, &project_files).await?;
+        crate::storage::wipe_prefix(state, &assets).await?;
+        Ok(())
     }
 }
 

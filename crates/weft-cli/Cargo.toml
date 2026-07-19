@@ -13,6 +13,7 @@ path = "src/main.rs"
 # `.env` loading at CLI startup (provider keys, local overrides).
 dotenvy = "0.15"
 weft-core = { workspace = true }
+weft-assets = { workspace = true }
 weft-compiler = { workspace = true }
 weft-catalog = { workspace = true }
 uuid = { workspace = true }
@@ -23,6 +24,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

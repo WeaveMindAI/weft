@@ -86,6 +86,8 @@ pub enum FileKind {
 
 impl FileKind {
     /// The on-wire sentinel key that tags a value of this kind.
+    // SYNC: FileKind::marker_key <-> packages/weft-graph/src/protocol.ts STORED_FILE_MARKERS,
+    //       packages/weft-graph/src/webview/lib/types/index.ts STORED_FILE_MARKER_TYPES
     pub fn marker_key(self) -> &'static str {
         match self {
             FileKind::Image => "__weft_image__",
@@ -110,6 +112,21 @@ impl FileKind {
     /// audio/* -> Audio, everything else -> Blob (the catch-all). When a
     /// future first-class type (Document/Text/...) peels out of Blob,
     /// it gets a branch here and nowhere else.
+    /// The concrete kind for a FILE primitive (`Image`/`Video`/`Audio`/`Blob`),
+    /// None for any non-file primitive. The inverse of [`Self::primitive`];
+    /// used when a DECLARED type picks a value's marker (an asset `@file` ref
+    /// typed `Image` produces an `__weft_image__` value regardless of what a
+    /// mime guess would say).
+    pub fn from_primitive(p: WeftPrimitive) -> Option<Self> {
+        match p {
+            WeftPrimitive::Image => Some(FileKind::Image),
+            WeftPrimitive::Video => Some(FileKind::Video),
+            WeftPrimitive::Audio => Some(FileKind::Audio),
+            WeftPrimitive::Blob => Some(FileKind::Blob),
+            _ => None,
+        }
+    }
+
     pub fn from_mime(mime: &str) -> Self {
         if mime.starts_with("image/") {
             FileKind::Image
@@ -210,24 +227,64 @@ impl WeftType {
         Self::union(prims.into_iter().map(WeftType::Primitive).collect())
     }
 
+    /// The builtin union aliases: the ONE table both name resolution
+    /// ([`Self::named_union`]) and rendering ([`std::fmt::Display`]) read,
+    /// so `parse -> to_string` round-trips an alias to its NAME instead of
+    /// leaking the structural expansion into user-facing surfaces (source
+    /// lines, the editor palette, metadata re-serialization). The type
+    /// itself stays STRUCTURAL (an alias is naming sugar, equality and
+    /// unification never see the name); a hand-written `Image | Video |
+    /// Audio` therefore renders under its canonical name `Media`.
+    ///
+    /// - `Media`: a picture, a clip, or a sound. Never includes Blob (a
+    ///   spreadsheet/zip is not "media").
+    /// - `File`: any stored file: media plus the Blob catch-all (and,
+    ///   later, Document/Text/Presentation as they become first-class).
+    // SYNC: WeftType::UNION_ALIASES <-> packages/weft-graph/src/webview/lib/types/index.ts NAMED_UNIONS
+    const UNION_ALIASES: &'static [(&'static str, &'static [WeftPrimitive])] = &[
+        ("Media", &[WeftPrimitive::Image, WeftPrimitive::Video, WeftPrimitive::Audio]),
+        (
+            "File",
+            &[
+                WeftPrimitive::Image,
+                WeftPrimitive::Video,
+                WeftPrimitive::Audio,
+                WeftPrimitive::Blob,
+            ],
+        ),
+    ];
+
     /// Resolve a NAMED union alias to its concrete union type, the ONE
     /// place a union name expands. `Media`/`File` are language-builtin
-    /// aliases; this is also the hook where user-defined unions
-    /// (`X = A | B | C`, for dynamic typing) will register, so name
-    /// resolution stays a single generic mechanism, never a hardcoded
-    /// per-name branch in the parser. Returns None for a non-alias name.
+    /// aliases (see [`Self::UNION_ALIASES`]); this is also the hook where
+    /// user-defined unions (`X = A | B | C`, for dynamic typing) will
+    /// register, so name resolution stays a single generic mechanism, never
+    /// a hardcoded per-name branch in the parser. Returns None for a
+    /// non-alias name.
     pub fn named_union(name: &str) -> Option<Self> {
-        use WeftPrimitive::{Audio, Blob, Image, Video};
-        let prims: &[WeftPrimitive] = match name {
-            // Media-proper: a picture, a clip, or a sound. Never includes
-            // Blob (a spreadsheet/zip is not "media").
-            "Media" => &[Image, Video, Audio],
-            // Any stored file: media plus the Blob catch-all (and, later,
-            // Document/Text/Presentation as they become first-class).
-            "File" => &[Image, Video, Audio, Blob],
-            _ => return None,
-        };
-        Some(Self::union_primitives(prims.to_vec()))
+        Self::UNION_ALIASES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, prims)| Self::union_primitives(prims.to_vec()))
+    }
+
+    /// The alias NAME of a structural union, if its members are exactly one
+    /// alias's primitive set (order-insensitive). The Display half of the
+    /// alias round-trip.
+    fn union_alias_name(types: &[WeftType]) -> Option<&'static str> {
+        let prims: Vec<&WeftPrimitive> = types
+            .iter()
+            .map(|t| match t {
+                WeftType::Primitive(p) => Some(p),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Self::UNION_ALIASES
+            .iter()
+            .find(|(_, members)| {
+                members.len() == prims.len() && members.iter().all(|m| prims.contains(&m))
+            })
+            .map(|(name, _)| *name)
     }
 
     /// The `Media` union (Image | Video | Audio). Convenience over
@@ -294,6 +351,30 @@ impl WeftType {
     /// Membership is derived from the `File` union (the generic source of
     /// truth), not a hand-listed match, so adding a file primitive in one
     /// place updates this too.
+    /// The concrete file kind this type NAMES, when it is exactly one file
+    /// primitive (`Image`/`Video`/`Audio`/`Blob`). None for the unions
+    /// (`File`/`Media`), containers, and non-file types: those don't pin a
+    /// marker kind by declaration (the value's mime decides instead).
+    pub fn concrete_file_kind(&self) -> Option<FileKind> {
+        match self {
+            WeftType::Primitive(p) => FileKind::from_primitive(*p),
+            _ => None,
+        }
+    }
+
+    /// Can a value of this type be edited IN PLACE through a `@file` ref
+    /// (the editor serializes the field's new value back to the referenced
+    /// file as text)? Each type opts in here; a type without it is only
+    /// legal in `@asset` (pull-only), and `@file` rejects it with a message
+    /// pointing there. Today the line is "text-serializable": every
+    /// non-file type. A future type can sit on either side (or both, by
+    /// being text-serializable AND file-referencing, if such a shape ever
+    /// exists).
+    pub fn supports_bidirectional_edit(&self) -> bool {
+        !self.references_file()
+    }
+
+    // SYNC: references_file <-> packages/weft-graph/src/protocol.ts typeReferencesFile
     pub fn references_file(&self) -> bool {
         match self {
             WeftType::Primitive(p) => Self::file_primitives().contains(p),
@@ -791,6 +872,13 @@ impl std::fmt::Display for WeftType {
             WeftType::List(inner) => write!(f, "List[{}]", inner),
             WeftType::Dict(k, v) => write!(f, "Dict[{}, {}]", k, v),
             WeftType::Union(types) => {
+                // An alias's member set renders under its NAME (see
+                // UNION_ALIASES): `File`/`Media` must survive a
+                // parse -> to_string round trip instead of leaking the
+                // structural expansion into source lines and metadata.
+                if let Some(name) = Self::union_alias_name(types) {
+                    return write!(f, "{name}");
+                }
                 let parts: Vec<std::string::String> = types.iter().map(|t| t.to_string()).collect();
                 write!(f, "{}", parts.join(" | "))
             }

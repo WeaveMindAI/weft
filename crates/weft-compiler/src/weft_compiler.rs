@@ -2323,15 +2323,15 @@ fn parse_kv(
             }
         }
     } else if raw.starts_with('@') {
-        // `@file(...)` is the ONLY marker valid as a config value (resolved
-        // downstream by file_ref). Any other `@...` (a typo, `@include`,
-        // `@require_one_of`, a bare `@`) is not a value and fails loud rather than
-        // becoming a literal string.
-        if crate::cst::marker::directive(raw) == "file" {
+        // `@file(...)` / `@asset(...)` are the ONLY markers valid as a config
+        // value (resolved downstream by file_ref). Any other `@...` (a typo,
+        // `@include`, `@require_one_of`, a bare `@`) is not a value and fails
+        // loud rather than becoming a literal string.
+        if matches!(crate::cst::marker::directive(raw), "file" | "asset") {
             serde_json::Value::String(raw.to_string())
         } else {
             errors.push(CompileError::at(span, format!(
-                "'{key}' has an invalid marker value `{raw}`: the only marker valid as a config value is `@file(\"path\")`."
+                "'{key}' has an invalid marker value `{raw}`: the only markers valid as a config value are `@file(\"path\")` and `@asset(\"path\", Type)`."
             )));
             return None;
         }

@@ -18,16 +18,31 @@ use crate::progress::{ActionVerb, Progress};
 use weft_compiler::project::Project;
 
 pub async fn run(ctx: Ctx) -> Result<()> {
+    let client = ctx.client();
     ctx.with_progress(ActionVerb::Build, |progress| async move {
         let cwd = env::current_dir()?;
         let project = Project::discover(&cwd)
             .map_err(|e| anyhow::anyhow!("locate project: {e}"))?;
-        // The shared build brain: compile once + stage the worker context. The base
-        // is ensured inside the image build; pass its tag through here so the staged
-        // Dockerfile FROMs it.
+        // Compile first, then resolve `@asset` refs into the definition BEFORE
+        // the plan validates + hashes it (`plan_build_from`): the hashes must
+        // cover the resolved values, so a changed asset re-hashes and
+        // re-stages exactly like a config change.
+        let (mut definition, catalog) = weft_compiler::hash::load_enriched_project(&project)
+            .map_err(|e| anyhow::anyhow!("compile project: {e}"))?;
+        crate::commands::assets::resolve_project_assets(&client, &project.root, &mut definition)
+            .await?;
+        // The shared build brain: stage the worker context from the resolved
+        // definition. The base is ensured inside the image build; pass its tag
+        // through here so the staged Dockerfile FROMs it.
         let builder_base_tag = crate::images::ensure_worker_builder_base().await?;
-        let plan = weft_compiler::build_plan::plan_build(&project.root, &builder_base_tag, &CliTagPolicy)
-            .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
+        let plan = weft_compiler::build_plan::plan_build_from(
+            &project,
+            &definition,
+            &catalog,
+            &builder_base_tag,
+            &CliTagPolicy,
+        )
+        .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
         let worker = worker_planned_image(&plan)?;
         ensure_worker_image_with_progress(
             &progress,
@@ -98,8 +113,8 @@ pub async fn ensure_worker_image_with_progress(
     }
 
     // Build from the ALREADY-STAGED worker context (produced once by
-    // `weft_compiler::build_plan::plan_build`, shared with the hashing above so the
-    // project compiles once per verb, not twice). The context's Dockerfile
+    // `weft_compiler::build_plan::plan_build_from`, shared with the hashing above so
+    // the project compiles once per verb, not twice). The context's Dockerfile
     // `FROM weft-builder-base:<hash>`s the shared base; ensure it exists first (a
     // no-op cache hit after the first clean-machine build).
     crate::images::ensure_worker_builder_base().await?;

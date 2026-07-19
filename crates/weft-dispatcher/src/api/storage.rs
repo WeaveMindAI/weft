@@ -137,6 +137,147 @@ pub async fn public_base() -> Json<PublicBaseResponse> {
     Json(PublicBaseResponse { public_base_url })
 }
 
+// ---------- editor upload (the file-drop config field) ----------
+//
+// The editor drives the broker's multipart upload contract through these
+// routes: begin mints a PROJECT-scoped key, parts/resume return part URLs
+// presigned for the browser (bytes go editor -> bucket directly), complete
+// returns the stored-file marker value the field's config holds. Keys are
+// tenant-walled exactly like the download verb.
+
+/// `POST /storage/upload/begin` body: an ASSET upload (the pre-build sync
+/// publishing a source-referenced media file). `content_hash` is the sha256
+/// that becomes the content-addressed key id.
+// SYNC: EditorUploadBeginRequest <-> crates/weft-cli/src/commands/assets.rs (DispatcherStore begin body)
+#[derive(Debug, Deserialize)]
+pub struct EditorUploadBeginRequest {
+    pub project: String,
+    pub mime_type: String,
+    pub filename: String,
+    #[serde(default)]
+    pub declared_size: Option<u64>,
+    pub content_hash: String,
+}
+
+/// POST /storage/upload/begin: start a project-scoped upload for the caller's
+/// tenant. Returns the minted key (tenant-anchored) + fixed part size.
+///
+/// The wall here is the TENANT (from auth), the same boundary every other verb
+/// on this plane holds (download/delete/list are tenant-walled, no project
+/// gate). The named project only scopes the key WITHIN the caller's own tenant
+/// (`<tenant>/project/<id>/...`), so no cross-tenant reach is possible whatever
+/// project id is claimed, and the quota charged is the caller's own.
+/// Deliberately NO project-existence check: the editor legitimately uploads
+/// into a project the dispatcher has never seen (a local project that has not
+/// been run yet registers only on first activate), and refusing that would
+/// break the file-drop field on every fresh project. The id's shape is still
+/// validated (a uuid) so a junk string cannot become a key segment.
+pub async fn upload_begin(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(req): Json<EditorUploadBeginRequest>,
+) -> Result<Json<weft_core::storage::UploadBeginResponse>, ApiError> {
+    let tenant = caller.0;
+    req.project
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "project is not a valid id".to_string()))?;
+    let out = crate::storage::upload_begin(
+        &state,
+        tenant.as_str(),
+        &req.project,
+        crate::storage::UploadBeginParams {
+            mime_type: req.mime_type,
+            filename: req.filename,
+            declared_size: req.declared_size,
+            content_hash: req.content_hash,
+        },
+    )
+    .await
+    .map_err(storage_err)?;
+    Ok(Json(out))
+}
+
+/// POST /storage/assets/list: the project's published assets (the pre-build
+/// sync's diff input). Tenant from auth; `project` names whose assets, walled
+/// by the asset-prefix grammar so it can only range the caller's tenant.
+pub async fn assets_list(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(req): Json<AssetsListRequest>,
+) -> Result<Json<FilesResponse>, ApiError> {
+    let tenant = caller.0;
+    let files = crate::storage::asset_list(&state, tenant.as_str(), &req.project)
+        .await
+        .map_err(storage_err)?;
+    Ok(Json(FilesResponse { files }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AssetsListRequest {
+    pub project: String,
+}
+
+/// POST /storage/upload/parts: reserve + presign the next parts.
+pub async fn upload_parts(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(mut req): Json<weft_core::storage::UploadPartsRequest>,
+) -> Result<Json<weft_core::storage::UploadPartsResponse>, ApiError> {
+    let tenant = caller.0;
+    req.key = ensure_tenant_key(&tenant, &req.key)?;
+    let out = crate::storage::upload_parts(&state, tenant.as_str(), req).await.map_err(storage_err)?;
+    Ok(Json(out))
+}
+
+/// POST /storage/upload/part-done: record a landed part's etag.
+pub async fn upload_part_done(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(mut req): Json<weft_core::storage::PartDoneRequest>,
+) -> Result<StatusCode, ApiError> {
+    let tenant = caller.0;
+    req.key = ensure_tenant_key(&tenant, &req.key)?;
+    crate::storage::upload_part_done(&state, tenant.as_str(), req).await.map_err(storage_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /storage/upload/complete: finalize; returns the stored-file marker
+/// value (`{"__weft_image__": {...}}` etc.) the field's config holds.
+pub async fn upload_complete(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(mut req): Json<weft_core::storage::UploadCompleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = caller.0;
+    req.key = ensure_tenant_key(&tenant, &req.key)?;
+    let out = crate::storage::upload_complete(&state, tenant.as_str(), req).await.map_err(storage_err)?;
+    Ok(Json(out))
+}
+
+/// POST /storage/upload/resume: fresh URLs for the parts that never landed.
+pub async fn upload_resume(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(mut req): Json<weft_core::storage::UploadResumeRequest>,
+) -> Result<Json<weft_core::storage::UploadResumeResponse>, ApiError> {
+    let tenant = caller.0;
+    req.key = ensure_tenant_key(&tenant, &req.key)?;
+    let out = crate::storage::upload_resume(&state, tenant.as_str(), req).await.map_err(storage_err)?;
+    Ok(Json(out))
+}
+
+/// POST /storage/upload/abort: cancel an in-flight upload.
+pub async fn upload_abort(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(mut req): Json<weft_core::storage::UploadAbortRequest>,
+) -> Result<StatusCode, ApiError> {
+    let tenant = caller.0;
+    req.key = ensure_tenant_key(&tenant, &req.key)?;
+    crate::storage::upload_abort(&state, tenant.as_str(), req).await.map_err(storage_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RemoveRequest {
     /// Exactly one of `key` (one file) or `prefix` (a whole space, e.g.

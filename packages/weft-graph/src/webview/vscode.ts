@@ -128,47 +128,102 @@ export function teardownTransport(): void {
   subscribed = false;
 }
 
-// ---- stored-file URL resolution (inline image preview) ----
+// ---- host request/reply calls ----
 //
-// The image preview can't carry an auth header on an <img src>, so it asks the
-// host to run the brokered handshake and hand back a public URL carrying a
-// short-lived capability. Correlated by requestId; resolves to a URL or rejects.
+// Several webview features ask the host something and await a correlated
+// reply (the storage handshake, the asset picker, the project-file listing).
+// ONE registry correlates them all: a reply is matched by (kind, requestId),
+// riding the same fan-out as every other host message so it rebinds on a
+// transport swap like everything else.
 
-let nextStoredFileRequestId = 1;
-const pendingStoredFileUrls = new Map<
-  number,
-  (result: { url: string } | { error: string }) => void
->();
+let nextRequestId = 1;
+const pendingReplies = new Map<string, (msg: HostMessage) => void>();
+let repliesSubscribed = false;
 
-// Stored-file URL replies ride the SAME fan-out as every other host message
-// (registered as a normal `onMessage` listener), so they rebind to a new
-// transport on swap like everything else. No separate subscription.
-let storedFileSubscribed = false;
-function ensureStoredFileSubscribed(): void {
-  if (storedFileSubscribed) return;
-  storedFileSubscribed = true;
+function ensureRepliesSubscribed(): void {
+  if (repliesSubscribed) return;
+  repliesSubscribed = true;
   onMessage((msg) => {
-    if (msg.kind === 'storedFileUrl') {
-      const pending = pendingStoredFileUrls.get(msg.requestId);
-      if (pending) {
-        pendingStoredFileUrls.delete(msg.requestId);
-        pending(msg.url !== undefined ? { url: msg.url } : { error: msg.error ?? 'unavailable' });
-      }
+    const requestId = (msg as { requestId?: number }).requestId;
+    if (requestId === undefined) return;
+    const key = `${msg.kind}:${requestId}`;
+    const pending = pendingReplies.get(key);
+    if (pending) {
+      pendingReplies.delete(key);
+      pending(msg);
     }
   });
 }
 
-/// Resolve a stored image to the box's public URL for inline rendering. The host
-/// runs the brokered handshake. Rejects with the host's reason (expired/deleted)
-/// so the caller can show a fallback.
-export function resolveStoredFileUrl(key: string): Promise<string> {
-  ensureStoredFileSubscribed();
-  const requestId = nextStoredFileRequestId++;
-  return new Promise((resolve, reject) => {
-    pendingStoredFileUrls.set(requestId, (result) => {
-      if ('url' in result) resolve(result.url);
-      else reject(new Error(result.error));
+/// Send one request-shaped message and await its correlated reply of
+/// `replyKind`. The single primitive every host request/reply pair builds on.
+function hostRequest<K extends HostMessage['kind']>(
+  replyKind: K,
+  build: (requestId: number) => WebviewMessage,
+): Promise<Extract<HostMessage, { kind: K }>> {
+  ensureRepliesSubscribed();
+  const requestId = nextRequestId++;
+  return new Promise((resolve) => {
+    pendingReplies.set(`${replyKind}:${requestId}`, (msg) => {
+      resolve(msg as Extract<HostMessage, { kind: K }>);
     });
-    send({ kind: 'resolveStoredFileUrl', key, requestId });
+    send(build(requestId));
   });
+}
+
+/// Drive one dispatcher storage verb through the host. `path` is the route
+/// under `/storage/` (e.g. `files/download`); `body` is the JSON payload.
+/// Resolves to the route's parsed response, or rejects with the host's
+/// failure reason. Module-private: consumers go through the specific
+/// wrappers (`resolveStoredFileUrl`), which name their contract.
+async function storageCall<T = unknown>(path: string, body: unknown): Promise<T> {
+  const reply = await hostRequest('storageResult', (requestId) => ({
+    kind: 'storageCall',
+    requestId,
+    path,
+    body,
+  }));
+  if (reply.error !== undefined) throw new Error(reply.error);
+  return reply.result as T;
+}
+
+/// Resolve a stored image to the box's public URL for inline rendering. Runs
+/// the download handshake through `storageCall`. Rejects with the host's reason
+/// (expired/deleted) so the caller can show a fallback.
+export async function resolveStoredFileUrl(key: string): Promise<string> {
+  const r = await storageCall<{ url?: string }>('files/download', { key });
+  if (!r?.url) throw new Error('stored file unavailable');
+  return r.url;
+}
+
+/// Ask the host to produce an asset-ref path for the file-drop field: with
+/// `dropped` the host stores the bytes as `assets/<name>` and returns that
+/// path; without, it runs its own picker (VS Code: the native dialog, whose
+/// pick is referenced in place). Resolves to the path, `null` on user cancel,
+/// rejects on failure.
+export async function pickAsset(
+  accept: string | undefined,
+  dropped?: { name: string; bytesBase64: string },
+): Promise<string | null> {
+  const reply = await hostRequest('assetPicked', (requestId) => ({
+    kind: 'pickAsset',
+    requestId,
+    accept,
+    dropped,
+  }));
+  if (reply.error !== undefined) throw new Error(reply.error);
+  return reply.path ?? null;
+}
+
+/// The project's STORED runtime files (for the "pick a stored file" picker):
+/// tenant-less keys + display metadata.
+export async function listRuntimeFiles(): Promise<
+  { key: string; filename: string; mimeType: string; sizeBytes: number }[]
+> {
+  const reply = await hostRequest('runtimeFiles', (requestId) => ({
+    kind: 'listRuntimeFiles',
+    requestId,
+  }));
+  if (reply.error !== undefined) throw new Error(reply.error);
+  return reply.files;
 }

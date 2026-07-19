@@ -235,7 +235,7 @@ pub fn enrich_collecting(
                 port_type: p.port_type.clone(),
                 required: p.required,
                 description: None,
-                configurable: p.configurable || p.port_type.is_default_configurable(),
+                configurable: meta.input_configurable(p),
                 synthesized_from_carry: false,
             })
             .collect();

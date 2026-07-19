@@ -114,8 +114,44 @@ pub enum RuntimeStoreError {
     Invalid(String),
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
+    /// The content-addressed key already exists (an asset begin raced another
+    /// sync, or the content is simply already uploaded). Distinguishable so
+    /// the sync can treat "already active" as the idempotent success it is.
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// What one upload IS, independent of transport: scope + metadata + declared
+/// size + (for the content-addressed asset scope) the explicit hash id.
+/// Collapses `begin_upload`'s parameter list; both the worker data path and
+/// the control-plane admin path build one of these from their wire envelope.
+#[derive(Debug, Clone, Copy)]
+pub struct UploadSpec<'a> {
+    pub scope: &'a StorageScope,
+    pub mime: &'a str,
+    pub filename: &'a str,
+    pub keep: Option<KeepTtl>,
+    pub declared_size: Option<u64>,
+    /// The sha256 id for `StorageScope::Asset` (required there, refused
+    /// elsewhere); every other scope mints a uuid.
+    pub content_hash: Option<&'a str>,
+}
+
+/// What a begin answered: a fresh reservation to upload into, or (asset
+/// scope only) the content already stored ACTIVE under its hash, in which
+/// case there is nothing to transfer and `key` is the existing file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginUpload {
+    Ready { key: String, part_size: u64 },
+    AlreadyStored { key: String },
+}
+
+/// Internal outcome of the begin's reservation transaction.
+enum Reserved {
+    Fresh,
+    AlreadyActive,
 }
 
 type StoreResult<T> = Result<T, RuntimeStoreError>;
@@ -346,30 +382,57 @@ impl RuntimeStore {
     /// against the byte quota (a declared over-cap upload is rejected before a
     /// single byte can land anywhere), reserve the 'pending' row with the
     /// file's metadata, and open the bucket's multipart upload. Returns the
-    /// key + the fixed part size the caller must slice to.
+    /// key + the fixed part size the caller must slice to, or
+    /// [`BeginUpload::AlreadyStored`] when a content-addressed (asset) begin
+    /// names content that is already ACTIVE: same content = same asset, so
+    /// the begin is that upload's idempotent success and there is nothing to
+    /// transfer. A PENDING collision (another upload of this content is mid
+    /// flight) stays a loud conflict.
     ///
     /// An unknown-length stream (`declared_size = None`) charges nothing here;
     /// each part is charged as it is reserved in [`Self::reserve_parts`].
     pub async fn begin_upload(
         &self,
         caller: &CallerAuth,
-        scope: &StorageScope,
-        mime: &str,
-        filename: &str,
-        keep: Option<KeepTtl>,
+        spec: &UploadSpec<'_>,
         entitlements: &dyn EntitlementSource,
-        declared_size: Option<u64>,
-    ) -> StoreResult<(String, u64)> {
-        // keep only applies to execution scope (project/shared are persistent
-        // without a flag); reject loud rather than silently dropping the flag.
+    ) -> StoreResult<BeginUpload> {
+        let UploadSpec { scope, mime, filename, keep, declared_size, content_hash } = *spec;
+        // keep only applies to execution scope (project/shared/asset are
+        // persistent without a flag); reject loud rather than silently
+        // dropping the flag.
         if keep.is_some() && !matches!(scope, StorageScope::Execution) {
             return Err(RuntimeStoreError::Invalid(
-                "keep only applies to execution-scoped files; project/shared files are \
+                "keep only applies to execution-scoped files; project/shared/asset files are \
                  persistent without a flag"
                     .into(),
             ));
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        // The file's id: the ASSET scope is content-addressed (the id IS the
+        // sha256, supplied by the pre-build sync), every other scope mints a
+        // uuid. A hash on a non-asset scope (or a missing/malformed hash on
+        // the asset scope) is a caller bug, refused loud.
+        let id = match (scope, content_hash) {
+            (StorageScope::Asset, Some(hash)) => {
+                if !weft_core::storage::is_content_hash(hash) {
+                    return Err(RuntimeStoreError::Invalid(format!(
+                        "asset id must be a 64-hex sha256 content hash, got '{hash}'"
+                    )));
+                }
+                hash.to_string()
+            }
+            (StorageScope::Asset, None) => {
+                return Err(RuntimeStoreError::Invalid(
+                    "asset uploads carry their content hash as the id".into(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(RuntimeStoreError::Invalid(
+                    "a content hash id only applies to the asset scope".into(),
+                ));
+            }
+            (_, None) => uuid::Uuid::new_v4().to_string(),
+        };
         let parsed = weft_core::storage::key::key_for_put(caller, scope, &id)
             .map_err(RuntimeStoreError::Denied)?;
         let key = parsed.to_key();
@@ -413,6 +476,31 @@ impl RuntimeStore {
             lock_tenant_storage(&mut tx, &tenant)
                 .await
                 .map_err(RuntimeStoreError::Other)?;
+            // A content-addressed (asset) key can legitimately collide: the
+            // same content uploaded twice IS the same file. Check under the
+            // lock: an ACTIVE row is this begin's idempotent success (nothing
+            // to upload), a PENDING row is another upload of the same content
+            // mid-flight (a loud conflict; rerun once it settles). Answered
+            // structurally instead of via a raw PK violation.
+            if content_hash.is_some() {
+                let existing: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM runtime_file WHERE key = $1",
+                )
+                .bind(&key)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("runtime begin_upload: check content-addressed key")
+                .map_err(RuntimeStoreError::Other)?;
+                match existing.as_deref() {
+                    Some("active") => return Ok(Reserved::AlreadyActive),
+                    Some(status) => {
+                        return Err(RuntimeStoreError::Conflict(format!(
+                            "asset '{key}' already exists ({status})"
+                        )));
+                    }
+                    None => {}
+                }
+            }
             let count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE tenant_id = $1")
                     .bind(&tenant)
@@ -469,30 +557,191 @@ impl RuntimeStore {
                 .await
                 .context("runtime begin_upload: commit reservation")
                 .map_err(RuntimeStoreError::Other)?;
-            Ok(())
+            Ok(Reserved::Fresh)
         }
         .await;
 
+        // Whenever no fresh row committed (rejection, failure, or an
+        // already-active asset), abort the multipart we opened so the bucket
+        // is not left holding an upload no row references (the very invariant
+        // this ordering exists to hold). Best-effort: on abort failure the
+        // bucket lifecycle rule is the backstop.
+        let abort_opened_multipart = || async {
+            if let Err(ab) = self.bucket.abort_multipart(&object_key(&key), &upload_id).await {
+                tracing::error!(
+                    target: "weft_broker::runtime_store",
+                    key = %key, error = %ab,
+                    "failed to abort multipart after an uncommitted begin; \
+                     the bucket lifecycle rule will reap it"
+                );
+            }
+        };
         match reserve {
-            Ok(()) => Ok((key, part_size)),
+            Ok(Reserved::Fresh) => Ok(BeginUpload::Ready { key, part_size }),
+            Ok(Reserved::AlreadyActive) => {
+                abort_opened_multipart().await;
+                Ok(BeginUpload::AlreadyStored { key })
+            }
             Err(e) => {
-                // The row never committed. Abort the multipart we opened so the
-                // bucket is not left holding an upload no row references (the very
-                // invariant this ordering exists to hold). Best-effort: on abort
-                // failure the bucket lifecycle rule is the backstop.
-                if let Err(ab) =
-                    self.bucket.abort_multipart(&object_key(&key), &upload_id).await
-                {
+                abort_opened_multipart().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// ASSEMBLY: create a stored file by concatenating EXISTING objects of
+    /// this store, the bytes never leaving the process that runs it (bucket
+    /// -> this process -> bucket, one part-sized buffer at a time). The same
+    /// ledger lifecycle as a caller-driven upload (begin reservation, part
+    /// rows, complete), so quota, sweeps, and listings see it identically;
+    /// only the byte transport differs (direct `upload_part`, no presigning
+    /// to an external caller).
+    ///
+    /// `sources` are `(object key, expected size)` pairs, concatenated in
+    /// order; `spec.declared_size` must equal their sum (the reservation is
+    /// exact) and a fetched object whose size disagrees aborts loudly. Any
+    /// failure aborts the upload, freeing the reservation.
+    pub async fn assemble(
+        &self,
+        caller: &CallerAuth,
+        spec: &UploadSpec<'_>,
+        sources: &[(String, u64)],
+        entitlements: &dyn EntitlementSource,
+    ) -> StoreResult<StoredFileMeta> {
+        let total: u64 = sources.iter().map(|(_, s)| *s).sum();
+        if spec.declared_size != Some(total) {
+            return Err(RuntimeStoreError::Invalid(format!(
+                "assemble: declared_size {:?} must equal the sources' total {total}",
+                spec.declared_size
+            )));
+        }
+        let (key, part_size) = match self.begin_upload(caller, spec, entitlements).await? {
+            BeginUpload::Ready { key, part_size } => (key, part_size),
+            // The content is already stored ACTIVE: assembling it again would
+            // produce the same file, so the existing file's meta IS this
+            // assembly's result (idempotent, like the begin itself).
+            BeginUpload::AlreadyStored { key } => {
+                let parsed = weft_core::storage::key::parse_key(&key)
+                    .map_err(RuntimeStoreError::Denied)?;
+                return self.meta(&parsed).await;
+            }
+        };
+        let assembled = async {
+            // The multipart handle, committed with the pending row by begin.
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .context("assemble: read pending row")
+                .map_err(RuntimeStoreError::Other)?;
+            let upload_id = Self::pending_row(&mut tx, &key)
+                .await
+                .map_err(RuntimeStoreError::Other)?
+                .and_then(|p| p.upload_id)
+                .ok_or_else(|| {
+                    RuntimeStoreError::Other(anyhow::anyhow!(
+                        "assemble: begin committed no upload handle for '{key}'"
+                    ))
+                })?;
+            drop(tx);
+
+            // Concatenate sources into exactly part_size-d parts (only the
+            // final one may be smaller; `reserve_parts` validates the
+            // slicing), each reserved in the ledger and uploaded directly.
+            // Each source is size-checked up front and then read in
+            // part-sized ranges, so memory stays bounded at ~one part
+            // regardless of source-object and asset size.
+            let mut buf: Vec<u8> = Vec::with_capacity(part_size as usize);
+            for (src, expected) in sources {
+                let actual = self
+                    .bucket
+                    .size(src)
+                    .await
+                    .with_context(|| format!("assemble: stat source {src}"))
+                    .map_err(RuntimeStoreError::Other)?
+                    .ok_or_else(|| {
+                        RuntimeStoreError::Invalid(format!(
+                            "assemble: source object '{src}' does not exist"
+                        ))
+                    })?;
+                if actual != *expected {
+                    return Err(RuntimeStoreError::Invalid(format!(
+                        "assemble: source '{src}' is {actual} bytes, expected {expected}"
+                    )));
+                }
+                let mut off: u64 = 0;
+                while off < *expected {
+                    let end = (*expected).min(off + part_size);
+                    let bytes = self
+                        .bucket
+                        .get_range(src, off, end)
+                        .await
+                        .with_context(|| format!("assemble: read source {src} [{off}..{end})"))
+                        .map_err(RuntimeStoreError::Other)?
+                        .ok_or_else(|| {
+                            RuntimeStoreError::Invalid(format!(
+                                "assemble: source object '{src}' vanished mid-read"
+                            ))
+                        })?;
+                    if bytes.is_empty() {
+                        return Err(RuntimeStoreError::Invalid(format!(
+                            "assemble: source '{src}' ended at {off} bytes, expected {expected}"
+                        )));
+                    }
+                    off += bytes.len() as u64;
+                    buf.extend_from_slice(&bytes);
+                    while buf.len() as u64 >= part_size {
+                        let chunk: Vec<u8> = buf.drain(..part_size as usize).collect();
+                        self.assemble_part(caller, &key, &upload_id, chunk, entitlements)
+                            .await?;
+                    }
+                }
+            }
+            if !buf.is_empty() {
+                let chunk = std::mem::take(&mut buf);
+                self.assemble_part(caller, &key, &upload_id, chunk, entitlements).await?;
+            }
+            self.complete_upload(caller, &key).await
+        }
+        .await;
+        match assembled {
+            Ok(meta) => Ok(meta),
+            Err(e) => {
+                // Free the reservation; nothing must linger on a failed assembly.
+                if let Err(ab) = self.abort_upload(caller, &key).await {
                     tracing::error!(
                         target: "weft_broker::runtime_store",
                         key = %key, error = %ab,
-                        "failed to abort multipart after reservation failed; \
-                         the bucket lifecycle rule will reap it"
+                        "failed to abort assembly after error; the sweep will reap it"
                     );
                 }
                 Err(e)
             }
         }
+    }
+
+    /// One assembled part: ledger reservation (validates the slicing exactly
+    /// like a caller-driven part) + direct upload + etag record.
+    async fn assemble_part(
+        &self,
+        caller: &CallerAuth,
+        key: &str,
+        upload_id: &str,
+        chunk: Vec<u8>,
+        entitlements: &dyn EntitlementSource,
+    ) -> StoreResult<()> {
+        let size = chunk.len() as u64;
+        let reserved = self
+            .reserve_parts(caller, key, &[size], entitlements, PresignAudience::Internal)
+            .await?;
+        let part_number = reserved[0].part_number;
+        let etag = self
+            .bucket
+            .upload_part(&object_key(key), upload_id, part_number, bytes::Bytes::from(chunk))
+            .await
+            .context("assemble: direct part upload")
+            .map_err(RuntimeStoreError::Other)?;
+        self.record_part(caller, key, part_number, &etag).await
     }
 
     /// Reserve + presign the caller's NEXT parts, in order. Every size must be
@@ -513,6 +762,7 @@ impl RuntimeStore {
         key: &str,
         sizes: &[u64],
         entitlements: &dyn EntitlementSource,
+        audience: PresignAudience,
     ) -> StoreResult<Vec<PresignedPart>> {
         Self::wall_key(caller, key)?;
         if sizes.is_empty() {
@@ -710,7 +960,7 @@ impl RuntimeStore {
                     &upload_id,
                     part_number,
                     size,
-                    PresignAudience::Internal,
+                    audience,
                     DEFAULT_PRESIGN_TTL_SECS,
                 )
                 .await
@@ -1008,6 +1258,7 @@ impl RuntimeStore {
         &self,
         caller: &CallerAuth,
         key: &str,
+        audience: PresignAudience,
     ) -> StoreResult<(u64, Vec<PresignedPart>)> {
         Self::wall_key(caller, key)?;
         let mut tx = self
@@ -1057,7 +1308,7 @@ impl RuntimeStore {
                     &upload_id,
                     part_number,
                     size as u64,
-                    PresignAudience::Internal,
+                    audience,
                     DEFAULT_PRESIGN_TTL_SECS,
                 )
                 .await
@@ -1254,6 +1505,7 @@ impl RuntimeStore {
         .context("runtime list")?;
         Ok(rows.iter().map(FileRow::to_meta).collect())
     }
+
 
     /// Every key under a prefix REGARDLESS of status (active + pending), with
     /// what a sweep needs: is it a kept ACTIVE file (spared by the terminate

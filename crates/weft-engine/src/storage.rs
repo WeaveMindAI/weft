@@ -345,7 +345,10 @@ impl WorkerStorageOps for WorkerStorage {
         // Begin: the broker mints the key, charges a declared size against the
         // quota up front, and opens the multipart upload. The broker never
         // sees the bytes.
-        let UploadBeginResponse { key, part_size } = self
+        // `already_stored` cannot fire here: the worker path never sends a
+        // content hash (only the asset scope is content-addressed, and the
+        // worker data path may not write it).
+        let UploadBeginResponse { key, part_size, already_stored: _ } = self
             .post_json(
                 "/v1/storage/upload/begin",
                 color,

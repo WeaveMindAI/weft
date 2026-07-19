@@ -17,6 +17,7 @@ import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { textTabsForPath } from './tabs';
 import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from './shared/protocol';
+import { typeReferencesFile } from './shared/protocol';
 import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
 import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
@@ -390,8 +391,15 @@ export class GraphViewController {
     // relative path (marker form) -> absolute, for the two kinds.
     const fileRel = new Set<string>();
     const includeRel = new Set<string>();
-    for (const n of response.project.nodes as Array<{ fileRefs?: Record<string, { path: string }>; includePath?: string }>) {
-      if (n.fileRefs) for (const ref of Object.values(n.fileRefs)) fileRel.add(ref.path);
+    for (const n of response.project.nodes as Array<{ fileRefs?: Record<string, { path: string; type: string }>; includePath?: string }>) {
+      // Only TEXT refs: a media ref's bytes are never read as text content
+      // (they'd ship an image as garbage, and the editor's content-save path
+      // would clobber the media file).
+      if (n.fileRefs) {
+        for (const ref of Object.values(n.fileRefs)) {
+          if (!typeReferencesFile(ref.type)) fileRel.add(ref.path);
+        }
+      }
       if (n.includePath) includeRel.add(n.includePath);
     }
     // Record the resolution base + @file set so saveFileRef and the watcher
@@ -1006,8 +1014,14 @@ export class GraphViewController {
       case 'downloadStoredFile':
         void this.runDownloadStoredFile(msg.key);
         break;
-      case 'resolveStoredFileUrl':
-        void this.runResolveStoredFileUrl(msg.key, msg.requestId);
+      case 'storageCall':
+        void this.runStorageCall(msg.requestId, msg.path, msg.body);
+        break;
+      case 'pickAsset':
+        void this.runPickAsset(msg.requestId, msg.accept, msg.dropped);
+        break;
+      case 'listRuntimeFiles':
+        void this.runListRuntimeFiles(msg.requestId);
         break;
       case 'editActiveSource':
         void this.adoptActiveSource(msg.source);
@@ -1080,20 +1094,22 @@ export class GraphViewController {
     }
   }
 
-  /// Inline preview (image display). Run the brokered handshake and
-  /// hand the webview the box's public URL; the <img> streams the
-  /// bytes DIRECTLY from the box (the CSP admits the storage origin;
-  /// the box does range requests, so this scales to video). The same
-  /// across hosts: the only thing that differs per deployment
-  /// is the origin. Correlated by requestId. A 404 (expired/swept)
-  /// becomes an `error` reply so the preview shows a fallback.
-  private async runResolveStoredFileUrl(key: string, requestId: number): Promise<void> {
+  /// Drive one storage-plane verb for the webview: POST the body to the
+  /// dispatcher's `/storage/<path>` route (the client authenticates), reply
+  /// with a correlated `storageResult`. The single brokered channel behind
+  /// every webview storage call (inline preview's download handshake, the
+  /// file-drop upload's begin/parts/part-done/complete/abort). Bytes never
+  /// pass here: the calls return presigned bucket URLs the webview uses.
+  ///
+  /// The host owns the project identity (the editor session's project), so it
+  /// stamps `project` into every body: the dispatcher scopes uploads +
+  /// downloads to it. A 404 becomes an `error` reply (a swept/expired file, or
+  /// a download for a missing key) so the caller can show its own fallback.
+  private async runStorageCall(requestId: number, path: string, body: unknown): Promise<void> {
     try {
-      const resp = await this.client.post<{ url: string }>(
-        '/storage/files/download',
-        { key, project: this.watchedProjectId ?? null },
-      );
-      this.post({ kind: 'storedFileUrl', requestId, url: resp.url });
+      const merged = { ...(body as Record<string, unknown>), project: this.watchedProjectId ?? null };
+      const result = await this.client.post<unknown>(`/storage/${path}`, merged);
+      this.post({ kind: 'storageResult', requestId, result });
     } catch (e) {
       const error =
         e instanceof HttpError && e.status === 404
@@ -1101,7 +1117,111 @@ export class GraphViewController {
           : e instanceof Error
             ? e.message
             : String(e);
-      this.post({ kind: 'storedFileUrl', requestId, error });
+      this.post({ kind: 'storageResult', requestId, error });
+    }
+  }
+
+  /// The file-drop field's asset pick. Locally a PICKED file is referenced IN
+  /// PLACE: the native dialog returns the real path, written into the
+  /// `@file(...)` ref as project-relative when under the root, absolute
+  /// otherwise (out-of-project refs are legal locally; the build's asset sync
+  /// reads them from wherever they are). A DRAG-DROPPED file arrives as bytes
+  /// (the browser hides its OS path), so it is stored as a project file under
+  /// `assets/` instead, never overwriting an existing different file.
+  private async runPickAsset(
+    requestId: number,
+    accept: string | undefined,
+    dropped: { name: string; bytesBase64: string } | undefined,
+  ): Promise<void> {
+    try {
+      const docPath = this.watchedDoc?.uri.fsPath;
+      const root = docPath ? findProjectRoot(docPath) : null;
+      if (!root) {
+        this.post({ kind: 'assetPicked', requestId, error: 'no project root (save the project first)' });
+        return;
+      }
+      if (dropped) {
+        const assetsDir = nodePath.join(root, 'assets');
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(assetsDir));
+        const bytes = Buffer.from(dropped.bytesBase64, 'base64');
+        // A clean leaf name; collisions get a numeric suffix rather than
+        // silently clobbering a different existing file.
+        const leaf = dropped.name.replace(/[\\/]/g, '_');
+        let candidate = leaf;
+        for (let n = 1; ; n++) {
+          const full = nodePath.join(assetsDir, candidate);
+          try {
+            await vscode.workspace.fs.stat(vscode.Uri.file(full));
+          } catch {
+            await vscode.workspace.fs.writeFile(vscode.Uri.file(full), bytes);
+            break;
+          }
+          const dot = leaf.lastIndexOf('.');
+          candidate = dot > 0 ? `${leaf.slice(0, dot)}-${n}${leaf.slice(dot)}` : `${leaf}-${n}`;
+        }
+        this.post({ kind: 'assetPicked', requestId, path: `assets/${candidate}` });
+        return;
+      }
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        filters: dialogFiltersForAccept(accept),
+      });
+      const fsPath = picked?.[0]?.fsPath;
+      if (!fsPath) {
+        this.post({ kind: 'assetPicked', requestId }); // user cancelled
+        return;
+      }
+      const rel = nodePath.relative(root, fsPath);
+      const inProject = !rel.startsWith('..') && !nodePath.isAbsolute(rel);
+      const path = inProject ? rel.split(nodePath.sep).join('/') : fsPath;
+      this.post({ kind: 'assetPicked', requestId, path });
+    } catch (e) {
+      this.post({
+        kind: 'assetPicked',
+        requestId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /// The project's STORED runtime files for the picker: the same listing door
+  /// `weft files` uses (the dispatcher's tenant file list), filtered to THIS
+  /// project's `project/` + `asset/` scopes, keys handed back TENANT-LESS
+  /// (the short address a picked ref writes into source).
+  private async runListRuntimeFiles(requestId: number): Promise<void> {
+    const pid = this.watchedProjectId;
+    if (!pid) {
+      this.post({
+        kind: 'runtimeFiles',
+        requestId,
+        files: [],
+        error: 'no watched project: open a project graph before picking stored files',
+      });
+      return;
+    }
+    try {
+      const resp = await this.client.get<{
+        files: { key: string; filename: string; mimeType: string; sizeBytes: number }[];
+      }>('/storage/files');
+      const files = (resp.files ?? []).flatMap((f) => {
+        const slash = f.key.indexOf('/');
+        if (slash < 0) return [];
+        const scopeKey = f.key.slice(slash + 1);
+        if (!scopeKey.startsWith(`project/${pid}/`) && !scopeKey.startsWith(`asset/${pid}/`)) {
+          return [];
+        }
+        return [{ key: scopeKey, filename: f.filename, mimeType: f.mimeType, sizeBytes: f.sizeBytes }];
+      });
+      this.post({ kind: 'runtimeFiles', requestId, files });
+    } catch (e) {
+      // A failed listing must never render as "this project has no stored
+      // files": ship the reason so the picker shows the failure.
+      this.post({
+        kind: 'runtimeFiles',
+        requestId,
+        files: [],
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 
@@ -1560,7 +1680,7 @@ export class GraphViewController {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data: ${this.storageOrigin}; media-src ${cspSource} ${this.storageOrigin}; font-src ${cspSource}; connect-src ${cspSource};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data: https: http: ${this.storageOrigin}; media-src ${cspSource} https: http: ${this.storageOrigin}; font-src ${cspSource}; connect-src ${cspSource} ${this.storageOrigin};">
 <link rel="stylesheet" href="${bundleCss}">
 <title>Weft Graph</title>
 <style>html,body,#app{margin:0;padding:0;width:100%;height:100%;overflow:hidden}</style>
@@ -1578,6 +1698,25 @@ function randomNonce(): string {
   let out = '';
   for (let i = 0; i < 24; i++) out += chars[Math.floor(Math.random() * chars.length)];
   return out;
+}
+
+/// VS Code's file dialog filters by EXTENSION, the accept filter by MIME:
+/// translate the common `<kind>/*` filters to their extension sets (mirroring
+/// the shared `EXT_MIME` guess table). An exact-mime or absent filter shows
+/// all files: steering, not blocking, exactly like the picker modal.
+function dialogFiltersForAccept(
+  accept: string | undefined,
+): { [name: string]: string[] } | undefined {
+  switch (accept) {
+    case 'image/*':
+      return { Images: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'avif'] };
+    case 'audio/*':
+      return { Audio: ['mp3', 'wav', 'ogg', 'flac', 'm4a'] };
+    case 'video/*':
+      return { Video: ['mp4', 'mov', 'webm', 'mkv'] };
+    default:
+      return undefined;
+  }
 }
 
 // isLiveDataItem + signalDisplayToLiveItems live in the shared weft-graph

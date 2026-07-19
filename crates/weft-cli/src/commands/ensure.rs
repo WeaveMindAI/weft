@@ -128,7 +128,7 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
     // can fire a structured progress error (the editor's action-bar
     // modal renders per-diagnostic info) instead of a single
     // flattened string.
-    let (definition, catalog) = match weft_compiler::hash::load_enriched_project_with_diagnostics(&project) {
+    let (mut definition, catalog) = match weft_compiler::hash::load_enriched_project_with_diagnostics(&project) {
         Ok(pair) => pair,
         Err(weft_compiler::hash::CompileLoadError::Read(msg)) => {
             anyhow::bail!("{msg}");
@@ -183,6 +183,13 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
             );
         }
     };
+
+    // Resolve `@asset` refs BEFORE the plan hashes the definition: the
+    // asset sync publishes referenced files to the project's asset plane and
+    // substitutes their stored-file values, so the hashes cover the resolved
+    // content (a changed asset re-hashes exactly like a config change).
+    crate::commands::assets::resolve_project_assets(&ctx.client(), &project.root, &mut definition)
+        .await?;
 
     // Plan the build from the already-compiled definition + catalog (no second
     // compile): the three hashes + the staged worker context + the infra image set,

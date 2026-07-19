@@ -264,7 +264,7 @@ pub fn render_diagnostics(diagnostics: &[Diagnostic]) -> String {
 /// Turn an `Error`-severity diagnostic set into a single loud
 /// `CompileError`; `Ok(())` when only warnings (or nothing) remain.
 /// One place so every aborting entry formats failures identically.
-fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> CompileResult<()> {
+pub(crate) fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> CompileResult<()> {
     if diagnostics.iter().any(|d| matches!(d.severity, Severity::Error)) {
         Err(error::CompileError::Validate(render_diagnostics(&diagnostics)))
     } else {

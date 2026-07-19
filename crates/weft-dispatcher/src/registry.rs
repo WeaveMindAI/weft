@@ -102,7 +102,7 @@ impl RegistryConfig {
 
 /// Registry-qualified image-ref NAMING for the shared build brain (what the
 /// build pushes + the supervisor pulls). Passing the `RegistryConfig`
-/// straight into `weft_compiler::build_plan::plan_build` produces the SAME image
+/// straight into `weft_compiler::build_plan::plan_build_from` produces the SAME image
 /// set as the CLI, differing only in the tag string form.
 impl weft_compiler::build_plan::TagPolicy for RegistryConfig {
     fn worker_ref(&self, binary_hash: &str) -> String {

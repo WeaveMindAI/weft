@@ -232,11 +232,14 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn media_roundtrip_display() {
       let t = WeftType::parse("Media").unwrap();
       let s = t.to_string();
-      // Media expands to its union, so display shows the expanded form.
-      assert_eq!(s, "Image | Video | Audio");
-      // Re-parsing the expanded form gives the same type.
+      // The alias renders under its NAME (the expansion leaking into
+      // user-facing surfaces was a real bug); re-parsing gives the same
+      // structural type back.
+      assert_eq!(s, "Media");
       let reparsed = WeftType::parse(&s).unwrap();
       assert_eq!(t, reparsed);
+      // The structural spelling still parses to the identical type.
+      assert_eq!(WeftType::parse("Image | Video | Audio").unwrap(), t);
   }
 
   #[test]
@@ -1482,4 +1485,33 @@ fn file_url(mime: &str) -> serde_json::Value {
       assert_eq!(null_or_str.zero_value(), json!(""));
       // A purely-nullish type zeroes to null.
       assert_eq!(WeftType::Primitive(WeftPrimitive::Null).zero_value(), json!(null));
+  }
+
+  #[test]
+  fn union_aliases_round_trip_through_display_and_serde() {
+      // `File`/`Media` are naming sugar over structural unions; parse ->
+      // to_string must yield the NAME back (the expansion leaking into
+      // source lines / re-serialized metadata was a real regression), and
+      // serde rides Display, so the wire shape is the alias string too.
+      for name in ["File", "Media"] {
+          let ty = WeftType::parse(name).unwrap();
+          assert_eq!(ty.to_string(), name);
+          assert_eq!(serde_json::to_string(&ty).unwrap(), format!("\"{name}\""));
+          let back: WeftType = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+          assert_eq!(back, ty);
+      }
+      // A hand-written structural spelling of an alias renders under its
+      // canonical name (same type, one rendering); order is insensitive.
+      let media_reordered = WeftType::union(vec![
+          WeftType::Primitive(WeftPrimitive::Audio),
+          WeftType::Primitive(WeftPrimitive::Image),
+          WeftType::Primitive(WeftPrimitive::Video),
+      ]);
+      assert_eq!(media_reordered.to_string(), "Media");
+      // A NON-alias union still renders structurally.
+      let other = WeftType::union(vec![
+          WeftType::Primitive(WeftPrimitive::Image),
+          WeftType::Primitive(WeftPrimitive::Null),
+      ]);
+      assert_eq!(other.to_string(), "Image | Null");
   }
