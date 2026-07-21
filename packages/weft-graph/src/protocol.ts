@@ -190,24 +190,32 @@ export type FieldKind =
   | 'api_key'
   | 'form_builder';
 
+// Every key a `field_type` object may carry, one per Rust variant payload.
+// No index signature: the Rust side rejects unknown keys, so a key that is
+// not listed here cannot survive a metadata load and must not typecheck.
+// SYNC: FieldType <-> crates/weft-core/src/node.rs FieldType
 export interface FieldType {
   kind: FieldKind | string;
+  /// code
   language?: string;
+  /// select, multiselect
   options?: string[];
+  /// file_drop: narrows the filter derived from `type`.
   accept?: string;
   /// file_drop: the declared weft file type (Image/Audio/Video/Blob/File).
   // SYNC: FieldType.type <-> crates/weft-core/src/node.rs FieldType::FileDrop file_type
   type?: string;
+  /// api_key
   provider?: ApiKeyProvider;
+  /// number
   min?: number;
+  /// number
   max?: number;
+  /// number: the input's granularity (arrow/slider increment).
   step?: number;
-  maxLength?: number;
-  minLength?: number;
-  pattern?: string;
-  [key: string]: unknown;
 }
 
+// SYNC: FieldDef <-> crates/weft-core/src/node.rs FieldDef
 export interface FieldDef {
   key: string;
   label: string;
@@ -218,6 +226,7 @@ export interface FieldDef {
   placeholder?: string;
 }
 
+// SYNC: PortDef <-> crates/weft-core/src/node.rs PortDef
 export interface PortDef {
   name: string;
   type: string;

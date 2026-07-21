@@ -210,10 +210,10 @@ function flattenField(f: FieldDef): FieldDefinition {
 	if (ft.options) flat.options = ft.options;
 	if (ft.min !== undefined) flat.min = ft.min;
 	if (ft.max !== undefined) flat.max = ft.max;
+	if (ft.step !== undefined) flat.step = ft.step;
 	if (ft.provider) flat.provider = ft.provider;
 	if (ft.accept) flat.accept = ft.accept;
 	if (ft.type) flat.fileType = ft.type;
-	if (ft.placeholder) flat.placeholder = ft.placeholder;
 	if (f.placeholder) flat.placeholder = f.placeholder;
 	if (f.default_value !== undefined && f.default_value !== null)
 		flat.defaultValue = f.default_value;

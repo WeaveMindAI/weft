@@ -848,6 +848,19 @@ pub enum CatalogError {
 #[cfg(test)]
 mod package_tests {
     use super::*;
+
+    /// Every shipped stdlib `metadata.json` parses under the strict schema
+    /// (`deny_unknown_fields` on every nested struct). A typo or stale key in
+    /// any of them is a build-breaking error, not a silently-dropped value, so
+    /// this test is what turns "the field vanished on the wire" bugs into a
+    /// red suite the moment a catalog file drifts from the metadata types.
+    #[test]
+    fn every_stdlib_node_loads_strict() {
+        let cat = FsCatalog::discover(&stdlib_root())
+            .expect("all stdlib metadata.json must load under strict parse");
+        assert!(!cat.all().is_empty(), "catalog discovered no nodes");
+    }
+
     #[test]
     fn human_specs_loaded() {
         let cat = FsCatalog::discover(&stdlib_root()).unwrap();

@@ -313,6 +313,7 @@ impl NodeMetadata {
 /// `then` is emitted as a diagnostic. Read as "when X is true, this
 /// is a problem: Y."
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationRule {
     pub when: Condition,
     pub then: RuleDiagnostic,
@@ -340,6 +341,7 @@ impl Default for ValidationLevel {
 /// `message` are replaced from the evaluation context: `{id}` for the
 /// node id, `{port}` / `{field}` for `port`/`field` if set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleDiagnostic {
     pub message: String,
     /// When the rule runs. `structural` fires at edit/parse time;
@@ -376,7 +378,7 @@ impl Default for RuleSeverity {
 /// project). No loops, no recursion on user data; only structural
 /// boolean combinators plus a small set of graph/config queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Condition {
     /// Port has a value available at compile time: either a wired
     /// incoming edge OR a same-named config literal (when the port
@@ -416,15 +418,16 @@ pub enum Condition {
 
 /// Node-level semantic constraints. All optional; empty by default.
 ///
-/// Serde silently drops unknown fields from node metadata.json when
-/// this struct doesn't declare them, so a field that only exists in TS
-/// (or only in metadata.json) will be invisible to the dispatcher and
-/// lost on the wire back to the webview. If you add a feature here, also:
+/// `deny_unknown_fields`: a key here that this struct doesn't declare (a
+/// typo, or a feature that only exists in TS) is a loud parse error at
+/// metadata load, not a value silently dropped and lost on the wire back
+/// to the webview. If you add a feature here, also:
 ///   1. Add the matching camelCase field to `NodeFeaturesWire` in
 ///      protocol.ts.
 ///   2. Update any webview code that switches on the new feature.
 // SYNC: NodeFeatures <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeFeatures {
     /// Each inner list is a port group where at least ONE port must
     /// be non-null. If every port in a group is null/missing, the
@@ -499,6 +502,7 @@ pub struct NodeFeatures {
 /// inputs/outputs on the NodeDefinition.
 // SYNC: FormFieldSpec <-> packages/weft-graph/src/protocol.ts FormFieldSpecWire
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FormFieldSpec {
     /// Value of the field's `field_type` (or `field_type.kind`)
     /// this spec matches (e.g. "text_input", "approve_reject").
@@ -534,6 +538,7 @@ pub struct FormFieldSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FormFieldPort {
     #[serde(rename = "nameTemplate", alias = "name_template", alias = "name")]
     pub name_template: String,
@@ -590,7 +595,9 @@ pub trait NodeCatalog: Send + Sync {
     fn all(&self) -> Vec<&'static str>;
 }
 
+// SYNC: PortDef <-> packages/weft-graph/src/protocol.ts PortDef
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortDef {
     pub name: String,
     #[serde(rename = "type")]
@@ -601,9 +608,15 @@ pub struct PortDef {
     /// incoming edge). `wired_only` ports must come from upstream.
     #[serde(default)]
     pub configurable: bool,
+    /// Human-readable description shown next to the port in the editor.
+    /// The webview reads it; the compiler treats it as opaque.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
+// SYNC: FieldDef <-> packages/weft-graph/src/protocol.ts FieldDef
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldDef {
     pub key: String,
     pub label: String,
@@ -614,15 +627,21 @@ pub struct FieldDef {
     pub required: bool,
     #[serde(default)]
     pub description: Option<String>,
+    /// Hint text shown in the field's input when it is empty. The
+    /// webview reads it (`FieldStrip`); the compiler treats it as opaque.
+    #[serde(default)]
+    pub placeholder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FieldType {
     Text,
     Textarea,
     Code { language: String },
-    Number { min: Option<f64>, max: Option<f64> },
+    /// `step` is the input's granularity (the arrow/slider increment), the
+    /// third knob of a number input alongside `min`/`max`.
+    Number { min: Option<f64>, max: Option<f64>, step: Option<f64> },
     Checkbox,
     Select { options: Vec<String> },
     Multiselect { options: Vec<String> },
@@ -823,6 +842,84 @@ mod node_output_tests {
     }
 }
 
+/// A typo or stale key ANYWHERE in a `metadata.json` is a loud parse error,
+/// not a silently-dropped value. `deny_unknown_fields` lives on every struct
+/// the file deserializes into (not just the top-level `NodeMetadata`), so a
+/// misspelled key inside a port, field, feature, or form-field entry fails
+/// the node's metadata load instead of vanishing on the way to the webview.
+#[cfg(test)]
+mod deny_unknown_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base() -> serde_json::Value {
+        json!({
+            "type": "T", "label": "L", "description": "D", "category": "C"
+        })
+    }
+
+    fn err(mut meta: serde_json::Value, key: &str, entry: serde_json::Value) -> String {
+        meta.as_object_mut().unwrap().insert(key.into(), json!([entry]));
+        serde_json::from_value::<NodeMetadata>(meta)
+            .expect_err("unknown nested key must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn unknown_port_key_rejected() {
+        let e = err(base(), "inputs", json!({"name": "x", "type": "String", "requird": true}));
+        assert!(e.contains("requird"), "error names the typo'd key: {e}");
+    }
+
+    #[test]
+    fn unknown_field_key_rejected() {
+        let e = err(base(), "fields", json!({
+            "key": "k", "label": "l", "field_type": {"kind": "text"}, "palceholder": "hi"
+        }));
+        assert!(e.contains("palceholder"), "error names the typo'd key: {e}");
+    }
+
+    #[test]
+    fn placeholder_on_field_is_accepted() {
+        let mut meta = base();
+        meta.as_object_mut().unwrap().insert("fields".into(), json!([{
+            "key": "model", "label": "Model", "field_type": {"kind": "text"},
+            "placeholder": "anthropic/claude-sonnet-4.6"
+        }]));
+        let parsed: NodeMetadata = serde_json::from_value(meta).expect("valid placeholder loads");
+        assert_eq!(parsed.fields[0].placeholder.as_deref(), Some("anthropic/claude-sonnet-4.6"));
+    }
+
+    /// `min`/`max`/`step` are the number input's three knobs and all three
+    /// must survive the load: `step` used to exist only on the webview's
+    /// render type, so a declared granularity could never reach the input.
+    #[test]
+    fn number_field_carries_min_max_step() {
+        let mut meta = base();
+        meta.as_object_mut().unwrap().insert("fields".into(), json!([{
+            "key": "temperature", "label": "Temperature",
+            "field_type": {"kind": "number", "min": 0.0, "max": 2.0, "step": 0.1}
+        }]));
+        let parsed: NodeMetadata = serde_json::from_value(meta).expect("number field loads");
+        match &parsed.fields[0].field_type {
+            FieldType::Number { min, max, step } => {
+                assert_eq!((*min, *max, *step), (Some(0.0), Some(2.0), Some(0.1)));
+            }
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_feature_key_rejected() {
+        let mut meta = base();
+        meta.as_object_mut().unwrap().insert("features".into(), json!({"isTriggr": true}));
+        let e = serde_json::from_value::<NodeMetadata>(meta)
+            .expect_err("unknown feature key must be rejected")
+            .to_string();
+        assert!(e.contains("isTriggr"), "error names the typo'd key: {e}");
+    }
+}
+
 #[cfg(test)]
 mod diagnostic_wire_tests {
     use super::*;
@@ -894,6 +991,7 @@ mod input_configurable_tests {
             default_value: None,
             required: false,
             description: None,
+            placeholder: None,
         }
     }
 
@@ -908,18 +1006,21 @@ mod input_configurable_tests {
             port_type: WeftType::primitive(WeftPrimitive::Image),
             required: true,
             configurable: false,
+            description: None,
         };
         let other_file_port = PortDef {
             name: "attachment".into(),
             port_type: WeftType::primitive(WeftPrimitive::Blob),
             required: false,
             configurable: false,
+            description: None,
         };
         let text_port = PortDef {
             name: "prompt".into(),
             port_type: WeftType::primitive(WeftPrimitive::String),
             required: false,
             configurable: false,
+            description: None,
         };
         let meta = metadata_with(
             vec![file_drop_field("image")],
