@@ -6,16 +6,14 @@
   "tags": ["config", "ai", "settings", "model"],
   "icon": "Settings",
   "color": "#6b6b99",
-  "inputs": [
-    { "name": "systemPrompt", "type": "String", "required": false, "description": "Optional system prompt. Can be wired from upstream or set as a config field." }
-  ],
+  "inputs": [],
   "outputs": [
     { "name": "config", "type": "Dict[String, String | Number | Boolean]", "required": false, "description": "OpenRouter configuration object fed into one or more OpenRouterInference nodes." }
   ],
   "fields": [
     { "key": "apiKey", "label": "API Key", "field_type": { "kind": "api_key", "provider": "openrouter" }, "required": false },
     { "key": "model", "label": "Model", "field_type": { "kind": "text" }, "placeholder": "anthropic/claude-sonnet-4.6", "required": true },
-    { "key": "systemPrompt", "label": "System Prompt", "field_type": { "kind": "textarea" }, "placeholder": "You are a helpful assistant." },
+    { "key": "systemPrompt", "label": "System Prompt", "field_type": { "kind": "textarea" }, "placeholder": "You are a helpful assistant.", "description": "System prompt for every inference node wired to this config. This is the one place to set it." },
     { "key": "maxTokens", "label": "Max Tokens", "field_type": { "kind": "number" }, "placeholder": "4096" },
     { "key": "temperature", "label": "Temperature", "field_type": { "kind": "number" }, "placeholder": "0.7" },
     { "key": "topP", "label": "Top P", "field_type": { "kind": "number" }, "placeholder": "1.0" },

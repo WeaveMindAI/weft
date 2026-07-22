@@ -11,22 +11,17 @@
 use async_trait::async_trait;
 
 use weft_core::storage::FileHandle;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct DownloadLinkNode;
 
 #[async_trait]
 impl Node for DownloadLinkNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let file = ctx.input.raw("file").cloned().ok_or_else(|| {
-            WeftError::Input("DownloadLink: no value on input port 'file'".into())
-        })?;
-        FileHandle::from_value(&file).map_err(|e| {
-            WeftError::Input(format!(
-                "DownloadLink needs a file with a storage key or URL (e.g. from FetchToStorage): {e}"
-            ))
-        })?;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // Validate the value carries a resolvable handle (key or url),
+        // which is exactly what parsing into a FileHandle checks.
+        let _handle: FileHandle = ctx.ports.get("file")?;
         Ok(())
     }
 }

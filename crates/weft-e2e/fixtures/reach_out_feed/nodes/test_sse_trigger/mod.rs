@@ -10,7 +10,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::context::Phase;
 use weft_core::node::NodeOutput;
 use weft_core::signal::SseSubscribe;
 use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
@@ -20,22 +19,16 @@ pub struct TestSseTriggerNode;
 
 #[async_trait]
 impl Node for TestSseTriggerNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        match ctx.phase {
-            Phase::TriggerSetup => {
-                let url: String = ctx.config.get("url")?;
-                let event_name: String = ctx.config.get("event_name")?;
-                ctx.register_signal(SseSubscribe { url, event_name }).await
-            }
-            Phase::Fire => {
-                // The SSE listener delivers the parsed `data:` object as the
-                // wake payload. Emit its `value` field on our `value` port.
-                let data = ctx.wake_payload_object()?;
-                let value = data.get("value").cloned().unwrap_or(Value::Null);
-                ctx.pulse_downstream(NodeOutput::empty().set("value", value))
-                    .await
-            }
-            Phase::InfraSetup => Ok(()),
-        }
+    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let url: String = ctx.config.get("url")?;
+        let event_name: String = ctx.config.get("event_name")?;
+        ctx.register_signal(SseSubscribe { url, event_name }).await
+    }
+
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // The SSE listener delivers the parsed `data:` object as the
+        // wake payload. Emit its `value` field on our `value` port.
+        let value: Value = ctx.wake.get_or("value", Value::Null)?;
+        ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
 }

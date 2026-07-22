@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::weft_type::WeftType;
+use crate::weft_type::{LiteralPlacement, WeftType};
 
 // The `Node` trait is the RUNTIME node interface (it runs against the execution
 // context + infra provision context), so it is gated behind `runtime`. The
@@ -22,7 +22,7 @@ mod node_trait {
     use async_trait::async_trait;
 
     use super::NodeManifest;
-    use crate::context::{ExecutionContext, InputBag};
+    use crate::context::{ExecutionContext, ValueBag};
     use crate::error::{WeftError, WeftResult};
     use crate::infra::{InfraProvisionContext, InfraSpec};
 
@@ -30,14 +30,17 @@ mod node_trait {
     /// and user-defined nodes under `myproject/nodes/` both implement this.
     /// The identity/surface layer comes from the [`NodeManifest`]
     /// supertrait (usually `#[derive(NodeManifest)]` on the node struct,
-    /// which picks up the co-located `metadata.json`); a node only writes
-    /// `execute`.
+    /// which picks up the co-located `metadata.json`).
     ///
-    /// Infra nodes (those with `metadata.requires_infra == true`)
-    /// additionally implement `provision`, which returns an [`InfraSpec`]
-    /// the dispatcher applies BEFORE calling `execute(phase=InfraSetup)`.
-    /// Non-infra nodes leave `provision` as the default Err impl; the
-    /// dispatcher never calls it for them.
+    /// A node implements up to three separately-named bodies, and the
+    /// ENGINE picks which to call from the manifest (a node never inspects
+    /// the lifecycle phase itself):
+    ///   - every node writes `run`, its normal body;
+    ///   - a trigger (`metadata.is_trigger == true`) additionally writes
+    ///     `setup_trigger`, called at registration time instead of `run`;
+    ///   - an infra node (`metadata.requires_infra == true`) additionally
+    ///     writes `provision_infra`, called at provisioning time before
+    ///     `run`.
     #[async_trait]
     pub trait Node: NodeManifest + Send + Sync {
         /// Stable identifier for this node type. Must be unique across the
@@ -46,26 +49,41 @@ mod node_trait {
             &self.manifest().node_type
         }
 
-        /// Build the desired infrastructure for this node. Called by the
-        /// engine in `Phase::InfraSetup` BEFORE `execute`. Returns the desired
-        /// k8s state as a typed value. The default impl returns Err; nodes that
+        /// Build the desired infrastructure for this node. Returns the
+        /// desired k8s state as a typed value; the engine has it applied,
+        /// then calls `run`. The default impl returns Err; nodes that
         /// declare `requires_infra=true` MUST override.
-        async fn provision(
+        async fn provision_infra(
             &self,
             _ctx: InfraProvisionContext,
-            _input: InputBag,
+            _input: ValueBag,
         ) -> WeftResult<InfraSpec> {
             Err(WeftError::Config(format!(
-                "node '{}' declared requires_infra=true but did not implement Node::provision",
+                "node '{}' declared requires_infra=true but did not implement Node::provision_infra",
                 self.node_type()
             )))
         }
 
-        /// Run this node. `ctx` provides language primitives
+        /// Register this trigger's wake signal (`ctx.register_signal`).
+        /// The engine calls it INSTEAD of `run` when a trigger is being
+        /// set up. Only nodes whose manifest declares `is_trigger=true`
+        /// implement it; the default fails loud on the mismatch.
+        async fn setup_trigger(&self, _ctx: ExecutionContext) -> WeftResult<()> {
+            Err(WeftError::Config(format!(
+                "node '{}' declared is_trigger=true but did not implement Node::setup_trigger",
+                self.node_type()
+            )))
+        }
+
+        /// The node's normal body. `ctx` provides language primitives
         /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
         /// `provider_access`, `log`, `endpoint`). The ONLY way to fire
-        /// downstream is `ctx.pulse_downstream(output)`.
-        async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
+        /// downstream is `ctx.pulse_downstream(output)`. For a plain
+        /// (non-trigger) node the engine calls this in every lifecycle
+        /// phase (a value feeding a trigger's config must be produced at
+        /// setup time too); for a trigger it runs only on a real firing,
+        /// with the fire's payload fields on the `ctx.wake` bag.
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>;
     }
 }
 
@@ -159,7 +177,7 @@ pub struct NodeMetadata {
     /// Configurable fields (shown in the node inspector UI).
     #[serde(default)]
     pub fields: Vec<FieldDef>,
-    /// Whether this node implements `Node::provision` and needs
+    /// Whether this node implements `Node::provision_infra` and needs
     /// dispatcher-driven infrastructure (k8s pods, services, etc).
     /// Explicit flag in metadata.json; mirrored to
     /// `NodeDefinition.requires_infra` at enrich time.
@@ -291,20 +309,50 @@ impl NodeMetadata {
             .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"))
     }
 
-    /// Whether an input port may be filled from config (no incoming edge):
-    /// its own explicit flag, the type's default, or a `FileDrop` field
-    /// targeting it by name. A FileDrop declaration IS the author's statement
-    /// that the port is fillable from config: the editor uploads the file and
-    /// writes the stored-file marker under the field's key, which the runtime
-    /// folds onto the same-named port like any other config value. Without
-    /// this, file-typed ports (never default-configurable, since nobody can
-    /// hand-type a marker) would need a redundant `configurable: true`.
-    pub fn input_configurable(&self, port: &PortDef) -> bool {
-        port.configurable
-            || port.port_type.is_default_configurable()
-            || self.fields.iter().any(|f| {
-                f.key == port.name && matches!(f.field_type, FieldType::FileDrop { .. })
-            })
+    /// Where a literal value may be written for an input port: the
+    /// author's explicit level when present (winning BOTH ways), else the
+    /// type's default. A file-typed port (assignment-only by default,
+    /// since nobody can hand-type a marker into a config field) declares
+    /// `"literal": "anywhere"` explicitly to open the braces form; the
+    /// editor derives its drop/pick control from the port type.
+    pub fn input_literal(&self, port: &PortDef) -> LiteralPlacement {
+        port.literal
+            .unwrap_or_else(|| port.port_type.default_literal_placement())
+    }
+
+    /// Semantic metadata rules serde cannot express. A config field may
+    /// not share a name with an input port whose literal may sit in the
+    /// config braces: the port alone carries the value (and drives the
+    /// editor's inline control), so the duplicate declaration is exactly
+    /// the two-homes ambiguity the one-home-per-name rule removes. A
+    /// field sharing the name of a port whose literal placement excludes
+    /// the braces stays legal (independent values), EXCEPT a `FileDrop`
+    /// field: that was the old fill-the-port-from-a-field pattern, and
+    /// silently treating it as an independent field would strand the
+    /// dropped file in config where the node never reads it.
+    pub fn validate_semantics(&self) -> Result<(), String> {
+        for port in &self.inputs {
+            let Some(field) = self.fields.iter().find(|f| f.key == port.name) else {
+                continue;
+            };
+            if self.input_literal(port).allows_config() {
+                return Err(format!(
+                    "config field '{key}' shares its name with input port '{key}', whose \
+                     literal may sit in the config braces: the port alone carries the \
+                     value; drop the field",
+                    key = port.name
+                ));
+            }
+            if matches!(field.field_type, FieldType::FileDrop { .. }) {
+                return Err(format!(
+                    "FileDrop field '{key}' targets input port '{key}': this pattern moved; \
+                     drop the field and mark the port \"literal\": \"anywhere\" (the editor \
+                     derives the file picker from the port type)",
+                    key = port.name
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -381,8 +429,8 @@ impl Default for RuleSeverity {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Condition {
     /// Port has a value available at compile time: either a wired
-    /// incoming edge OR a same-named config literal (when the port
-    /// is `configurable`). This is the "is my input provided" check
+    /// incoming edge OR a body literal (where the port's literal
+    /// placement allows one). This is the "is my input provided" check
     /// that handles the literal-assignment case (e.g. `Llm { prompt:
     /// "hello" }`) the same as the wired case.
     InputSatisfied { port: String },
@@ -604,10 +652,15 @@ pub struct PortDef {
     pub port_type: WeftType,
     #[serde(default)]
     pub required: bool,
-    /// Whether this port can be filled with a config default (no
-    /// incoming edge). `wired_only` ports must come from upstream.
+    /// Where a literal value may be written for this port. An explicit
+    /// level is the author's choice and wins both ways; absent falls to
+    /// the port TYPE's default (`default_literal_placement`). `Option`
+    /// so an author can both open a type beyond its default (a file
+    /// port to `"anywhere"`) and close one below it (a String port to
+    /// `"none"`).
+    // SYNC: PortDef.literal <-> packages/weft-graph/src/protocol.ts PortDef.literal
     #[serde(default)]
-    pub configurable: bool,
+    pub literal: Option<LiteralPlacement>,
     /// Human-readable description shown next to the port in the editor.
     /// The webview reads it; the compiler treats it as opaque.
     #[serde(default)]
@@ -679,7 +732,7 @@ fn file_drop_default_type() -> crate::weft_type::WeftType {
 }
 
 /// What a node emits when it's done.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NodeOutput {
     /// One value per declared output port. Missing ports are treated
     /// as "no pulse emitted" (not "null pulse emitted").
@@ -687,18 +740,16 @@ pub struct NodeOutput {
 }
 
 impl NodeOutput {
-    pub fn empty() -> Self {
-        Self { outputs: Default::default() }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn with(port: impl Into<String>, value: Value) -> Self {
-        let mut outputs = std::collections::HashMap::new();
-        outputs.insert(port.into(), value);
-        Self { outputs }
-    }
-
-    pub fn set(mut self, port: impl Into<String>, value: Value) -> Self {
-        self.outputs.insert(port.into(), value);
+    /// Set `port`'s value. Takes anything that converts to JSON directly
+    /// (bools, numbers, strings, an already-built `Value`); a `Value`
+    /// passes through untouched, never double-wrapped. For a struct,
+    /// build the value at the call site (`serde_json::json!` / `to_value`).
+    pub fn set(mut self, port: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.outputs.insert(port.into(), value.into());
         self
     }
 
@@ -773,10 +824,26 @@ mod node_output_tests {
             .collect()
     }
 
+    /// `set` accepts plain Rust values AND an already-built `Value`; the
+    /// latter passes through byte-identical, never double-wrapped.
+    #[test]
+    fn set_converts_plain_values_and_passes_json_through_untouched() {
+        let prebuilt = json!({"nested": [1, 2, {"deep": true}]});
+        let out = NodeOutput::new()
+            .set("b", true)
+            .set("n", 42u64)
+            .set("s", "text")
+            .set("v", prebuilt.clone());
+        assert_eq!(out.outputs.get("b"), Some(&json!(true)));
+        assert_eq!(out.outputs.get("n"), Some(&json!(42)));
+        assert_eq!(out.outputs.get("s"), Some(&json!("text")));
+        assert_eq!(out.outputs.get("v"), Some(&prebuilt), "a Value must pass through unchanged");
+    }
+
     #[test]
     fn extend_from_object_fans_keys_onto_ports() {
         let src = json!({"a": 1, "b": "two", "c": null});
-        let out = NodeOutput::empty().extend_from_object(&src);
+        let out = NodeOutput::new().extend_from_object(&src);
         assert_eq!(out.outputs.len(), 3);
         assert_eq!(out.outputs.get("a"), Some(&json!(1)));
         assert_eq!(out.outputs.get("c"), Some(&Value::Null), "user-emitted null is data; engine doesn't strip it");
@@ -786,7 +853,7 @@ mod node_output_tests {
     fn extend_from_declared_only_fans_declared_keys() {
         let src = json!({"sentiment": "positive", "score": 0.9, "extra": "ignored"});
         let declared = declared_ports(&["sentiment", "score", "response"]);
-        let out = NodeOutput::empty().extend_from_declared(&src, &declared);
+        let out = NodeOutput::new().extend_from_declared(&src, &declared);
         assert_eq!(out.outputs.len(), 2, "only declared keys present in the object are fanned");
         assert!(out.outputs.contains_key("sentiment"));
         assert!(out.outputs.contains_key("score"));
@@ -799,7 +866,7 @@ mod node_output_tests {
     #[test]
     fn extend_from_object_no_op_on_non_object() {
         for src in [json!(null), json!(42), json!("string"), json!([1, 2, 3])] {
-            let out = NodeOutput::empty().extend_from_object(&src);
+            let out = NodeOutput::new().extend_from_object(&src);
             assert!(out.outputs.is_empty(), "non-object: helper leaves outputs untouched");
         }
     }
@@ -807,7 +874,7 @@ mod node_output_tests {
     #[test]
     fn extend_from_object_overwrites_a_prior_set() {
         let src = json!({"a": "new"});
-        let out = NodeOutput::empty()
+        let out = NodeOutput::new()
             .set("a", json!("prior"))
             .extend_from_object(&src);
         // Same key: the fan DOES overwrite. Chain order is precedence.
@@ -824,7 +891,7 @@ mod node_output_tests {
     #[test]
     fn extend_from_object_then_set_lets_set_win() {
         let src = json!({"a": "from_object"});
-        let out = NodeOutput::empty()
+        let out = NodeOutput::new()
             .extend_from_object(&src)
             .set("a", json!("from_set"));
         assert_eq!(out.outputs.get("a"), Some(&json!("from_set")));
@@ -834,7 +901,7 @@ mod node_output_tests {
     fn extend_from_declared_then_set_lets_set_win() {
         let src = json!({"response": "payload-shadow", "field": "x"});
         let declared = declared_ports(&["response", "field"]);
-        let out = NodeOutput::empty()
+        let out = NodeOutput::new()
             .extend_from_declared(&src, &declared)
             .set("response", json!("full-object"));
         assert_eq!(out.outputs.get("response"), Some(&json!("full-object")));
@@ -964,7 +1031,7 @@ mod diagnostic_wire_tests {
 }
 
 #[cfg(test)]
-mod input_configurable_tests {
+mod input_literal_tests {
     use super::*;
     use crate::weft_type::{WeftPrimitive, WeftType};
 
@@ -995,51 +1062,102 @@ mod input_configurable_tests {
         }
     }
 
-    /// A FileDrop field targeting a file-typed port by name makes that port
-    /// configurable (the uploaded marker fills it from config); a file port
-    /// with no matching FileDrop stays wired-only, and non-file ports keep
-    /// their type default regardless.
+    /// Literal placement comes from the port alone: its explicit level
+    /// or the type default. A file-typed port defaults to assignment
+    /// (`"literal": "anywhere"` opens the braces form); a String port
+    /// takes a literal anywhere by type default; a Bus never does.
     #[test]
-    fn file_drop_field_makes_its_port_configurable() {
+    fn literal_placement_comes_from_the_port_alone() {
         let image_port = PortDef {
             name: "image".into(),
             port_type: WeftType::primitive(WeftPrimitive::Image),
             required: true,
-            configurable: false,
-            description: None,
-        };
-        let other_file_port = PortDef {
-            name: "attachment".into(),
-            port_type: WeftType::primitive(WeftPrimitive::Blob),
-            required: false,
-            configurable: false,
+            literal: None,
             description: None,
         };
         let text_port = PortDef {
             name: "prompt".into(),
             port_type: WeftType::primitive(WeftPrimitive::String),
             required: false,
-            configurable: false,
+            literal: None,
             description: None,
         };
-        let meta = metadata_with(
-            vec![file_drop_field("image")],
-            vec![image_port.clone(), other_file_port.clone(), text_port.clone()],
-        );
-        assert!(meta.input_configurable(&image_port));
-        assert!(!meta.input_configurable(&other_file_port));
-        assert!(meta.input_configurable(&text_port)); // type default
+        let bus_port = PortDef {
+            name: "bus".into(),
+            port_type: WeftType::Bus,
+            required: false,
+            literal: None,
+            description: None,
+        };
+        let meta = metadata_with(vec![], vec![image_port.clone(), text_port.clone()]);
+        assert_eq!(meta.input_literal(&image_port), LiteralPlacement::Assignment, "file types are assignment-only by default");
+        assert_eq!(meta.input_literal(&text_port), LiteralPlacement::Anywhere, "String takes a literal anywhere by type default");
+        assert_eq!(meta.input_literal(&bus_port), LiteralPlacement::None, "a bus never takes a literal");
 
-        // A non-FileDrop field with the same key does NOT open the port.
-        let mut text_field = file_drop_field("attachment");
+        let mut explicit = image_port;
+        explicit.literal = Some(LiteralPlacement::Anywhere);
+        assert_eq!(meta.input_literal(&explicit), LiteralPlacement::Anywhere, "the explicit level opens a file port");
+
+        let mut closed = text_port;
+        closed.literal = Some(LiteralPlacement::None);
+        assert_eq!(meta.input_literal(&closed), LiteralPlacement::None, "the explicit level closes a String port");
+    }
+
+    /// One home per name: a field sharing the name of a port whose
+    /// literal may sit in the braces is a metadata error, and a
+    /// FileDrop field targeting ANY port is the moved old pattern. A
+    /// plain field on a braces-closed port stays legal (independent
+    /// values).
+    #[test]
+    fn validate_semantics_rejects_field_port_name_collisions() {
+        let text_port = PortDef {
+            name: "prompt".into(),
+            port_type: WeftType::primitive(WeftPrimitive::String),
+            required: false,
+            literal: None,
+            description: None,
+        };
+        let mut text_field = file_drop_field("prompt");
         text_field.field_type = FieldType::Text;
-        let meta = metadata_with(vec![text_field], vec![other_file_port.clone()]);
-        assert!(!meta.input_configurable(&other_file_port));
+        let meta = metadata_with(vec![text_field.clone()], vec![text_port.clone()]);
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("input port 'prompt'"), "{e}");
 
-        // An explicit `configurable: true` still wins on its own.
-        let mut explicit = other_file_port;
-        explicit.configurable = true;
-        assert!(meta.input_configurable(&explicit));
+        // FileDrop on an assignment-only file port: the moved pattern, loud.
+        let image_port = PortDef {
+            name: "image".into(),
+            port_type: WeftType::primitive(WeftPrimitive::Image),
+            required: true,
+            literal: None,
+            description: None,
+        };
+        let meta = metadata_with(vec![file_drop_field("image")], vec![image_port]);
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("this pattern moved"), "{e}");
+
+        // A plain field on a braces-closed port: independent values, legal.
+        let wired_only = PortDef {
+            name: "prompt".into(),
+            port_type: WeftType::primitive(WeftPrimitive::Blob),
+            required: false,
+            literal: None,
+            description: None,
+        };
+        let meta = metadata_with(vec![text_field], vec![wired_only]);
+        assert!(meta.validate_semantics().is_ok());
+
+        // Disjoint names: legal.
+        let meta = metadata_with(
+            vec![file_drop_field("attachment")],
+            vec![PortDef {
+                name: "prompt".into(),
+                port_type: WeftType::primitive(WeftPrimitive::String),
+                required: false,
+                literal: None,
+                description: None,
+            }],
+        );
+        assert!(meta.validate_semantics().is_ok());
     }
 }
 

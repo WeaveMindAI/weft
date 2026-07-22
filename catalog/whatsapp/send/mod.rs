@@ -6,19 +6,17 @@ use async_trait::async_trait;
 
 use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct WhatsAppSendNode;
 
 #[async_trait]
 impl Node for WhatsAppSendNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url = ctx
-            .input
-            .required_str("endpointUrl", "endpointUrl (connect a WhatsAppBridge output)")?;
-        let to = ctx.input.required_str("to", "'to' recipient")?;
-        let message = ctx.input.required_str("message", "'message' body")?;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let endpoint_url: String = ctx.ports.get("endpointUrl")?;
+        let to: String = ctx.ports.get("to")?;
+        let message: String = ctx.ports.get("message")?;
 
         let body = serde_json::json!({
             "action": "sendMessage",
@@ -30,13 +28,14 @@ impl Node for WhatsAppSendNode {
         // defensive trim: a contract violation should surface, not
         // be papered over.
         let action_url = format!("{}/action", endpoint_url.trim_end_matches('/'));
-        let resp = reqwest::Client::new()
+        let resp = ctx
+            .http()
             .post(&action_url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("POST {action_url}: {e}")))?;
+            .node_err(format!("POST {action_url}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -44,10 +43,7 @@ impl Node for WhatsAppSendNode {
                 "bridge returned {status}: {text}"
             )));
         }
-        let parsed: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| WeftError::NodeExecution(format!("parse bridge response: {e}")))?;
+        let parsed: serde_json::Value = resp.json().await.node_err("parse bridge response")?;
         // The bridge signals SOFT failures (e.g. "WhatsApp not
         // connected" when the phone isn't paired) as a 200 with
         // `result.error` (only THROWN errors become non-2xx, handled
@@ -71,7 +67,6 @@ impl Node for WhatsAppSendNode {
         // `messageId` emission already conveys "send succeeded"; if a
         // user wires a downstream `success` consumer they wire it
         // against `messageId` instead.
-        ctx.pulse_downstream(NodeOutput::empty()
-            .set("messageId", serde_json::Value::String(message_id.to_string()))).await
+        ctx.pulse_downstream(NodeOutput::new().set("messageId", message_id)).await
     }
 }

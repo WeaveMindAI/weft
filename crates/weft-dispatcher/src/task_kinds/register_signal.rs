@@ -48,6 +48,11 @@ pub struct RegisterSignalPayload {
     /// includes it. Required: a missing field would silently default
     /// to 0 and collide every await on the same frame stack.
     pub call_index: u32,
+    /// The trigger's delivered port values at registration time (an
+    /// entry registration only; `None` on resumes). Stored on the
+    /// signal row and replayed onto the trigger's ports at every fire.
+    #[serde(default)]
+    pub port_snapshot: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +334,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 spec_json,
                 consumer_kind: payload.spec.consumer_kind.clone(),
                 tags,
+                port_snapshot: payload.port_snapshot.clone(),
                 consumer_payload,
                 surface_kind: surface_kind_str,
                 mount_path,

@@ -10,8 +10,8 @@ import type { EditRpcResult } from './types';
 import type { ProjectionCatalog } from './apply';
 
 const catalog: ProjectionCatalog = {
-	Text: { defaultInputs: [], defaultOutputs: [{ name: 'value', portType: 'String', required: true, configurable: false }] },
-	Debug: { defaultInputs: [{ name: 'data', portType: 'T', required: true, configurable: false }], defaultOutputs: [] },
+	Text: { defaultInputs: [], defaultOutputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }] },
+	Debug: { defaultInputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }], defaultOutputs: [] },
 };
 
 function node(partial: Partial<NodeInstance> & { id: string; nodeType: string }): NodeInstance {
@@ -28,8 +28,8 @@ function project(nodes: NodeInstance[], edges: ProjectDefinition['edges'] = []):
 
 function baseProject(): ProjectDefinition {
 	return project([
-		node({ id: 'a', nodeType: 'Text', outputs: [{ name: 'value', portType: 'String', required: true, configurable: false }] }),
-		node({ id: 'b', nodeType: 'Debug', inputs: [{ name: 'data', portType: 'T', required: true, configurable: false }] }),
+		node({ id: 'a', nodeType: 'Text', outputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }] }),
+		node({ id: 'b', nodeType: 'Debug', inputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }] }),
 	]);
 }
 
@@ -145,7 +145,7 @@ describe('gesture to confirmation', () => {
 		// Three gestures stack while the first round-trip is in flight. The
 		// host applies them in order (chain-serialized); each reply carries
 		// the cumulative truth.
-		const p1 = project([...baseProject().nodes, node({ id: 'text_2', nodeType: 'Text', outputs: [{ name: 'value', portType: 'String', required: true, configurable: false }] })]);
+		const p1 = project([...baseProject().nodes, node({ id: 'text_2', nodeType: 'Text', outputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }] })]);
 		const p2 = project(p1.nodes, [{ id: 'e1', source: 'text_2', target: 'b', sourceHandle: 'value', targetHandle: 'data' }]);
 		const p3 = project(p2.nodes.map(n => (n.id === 'a' ? { ...n, config: { text: 'hello' } } : n)), p2.edges);
 		host.editScript.push(ok(p1, 'v1'), ok(p2, 'v2'), ok(p3, 'v3'));
@@ -169,7 +169,7 @@ describe('gesture to confirmation', () => {
 	});
 
 	it('case B: a server rejection rolls back the op, resyncs, keeps independents', async () => {
-		const withNode = project([...baseProject().nodes, node({ id: 'text_2', nodeType: 'Text', outputs: [{ name: 'value', portType: 'String', required: true, configurable: false }] })]);
+		const withNode = project([...baseProject().nodes, node({ id: 'text_2', nodeType: 'Text', outputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }] })]);
 		host.editScript.push({ kind: 'reject', reason: 'node not found: ghost' });
 		host.editScript.push(ok(withNode, 'v2'));
 		host.resyncScript.push({ project: baseProject(), weftCode: 'v0' });

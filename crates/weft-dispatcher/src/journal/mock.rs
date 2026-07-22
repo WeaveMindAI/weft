@@ -629,6 +629,7 @@ mod tests {
             spec_json: "{}".into(),
             consumer_kind: None,
             tags: vec![],
+            port_snapshot: None,
             consumer_payload: None,
             surface_kind: "public_entry".into(),
             mount_path: None,

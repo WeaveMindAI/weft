@@ -267,7 +267,7 @@ wire_enum! {
     pub enum FailureStage {
         Provision = "provision",
         Apply = "apply",
-        Execute = "execute",
+        Run = "run",
         /// Set when a supervisor-driven stop/terminate aborted.
         ApplyLifecycle = "apply_lifecycle",
     }
@@ -1130,7 +1130,7 @@ pub struct SupervisorEnqueueLifecycleResponse {
 }
 
 /// Worker-callable: enqueue an Apply lifecycle command for the
-/// tenant's supervisor. The engine uses this after `node.provision()`
+/// tenant's supervisor. The engine uses this after `node.provision_infra()`
 /// returns a fresh InfraSpec. The supervisor reads the prior
 /// `infra_node` row, compiles the new spec, hashes, and decides
 /// skip / fresh / replace internally.

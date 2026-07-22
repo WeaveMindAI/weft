@@ -4,7 +4,7 @@ import type { PortDefinition } from '../types';
  *  - 'full': required + not satisfied from code (fully filled)
  *  - 'empty': optional (outline only)
  *  - 'half': in a @require_one_of group (half-filled)
- *  - 'empty-dotted': satisfied from code via a config-fill literal (dotted
+ *  - 'empty-dotted': satisfied from code via a body-set literal (dotted
  *    outline, no fill). Overrides the declared required/oneOfRequired state
  *    visually because the value is already provided, but the port type is
  *    unchanged (a user can still wire an edge to override).
@@ -12,16 +12,16 @@ import type { PortDefinition } from '../types';
 export type PortMarkerState = 'full' | 'empty' | 'half' | 'empty-dotted';
 
 /** Pick the marker state for an input port.
- *  Config-fill takes visual precedence over required/oneOfRequired:
- *  if the port has a non-null config value and no edge, it renders as
- *  'empty-dotted' regardless of declared required state.
+ *  A literal fill takes visual precedence over required/oneOfRequired:
+ *  if the port has a non-null body-set literal and no edge, it renders
+ *  as 'empty-dotted' regardless of declared required state.
  */
 export function inputMarkerState(
 	required: boolean,
 	inOneOfRequired: boolean,
-	isConfigFilled: boolean = false,
+	isLiteralFilled: boolean = false,
 ): PortMarkerState {
-	if (isConfigFilled) return 'empty-dotted';
+	if (isLiteralFilled) return 'empty-dotted';
 	if (required) return 'full';
 	if (inOneOfRequired) return 'half';
 	return 'empty';
@@ -35,9 +35,10 @@ export function inputMarkerState(
  *  Parameters:
  *  - port: the port definition (carries required, portType)
  *  - oneOfRequiredPorts: set of input port names in a @require_one_of group
- *  - configFilledPorts: set of input port names that have a non-null config
- *    value AND no incoming edge. These render as 'empty-dotted' to signal
- *    "satisfied from code" regardless of their declared required state.
+ *  - literalFilledPorts: set of input port names filled by a non-null
+ *    body-set literal AND no incoming edge. These render as 'empty-dotted'
+ *    to signal "satisfied from code" regardless of their declared required
+ *    state.
  *  - color: the port's type color
  *  - side: 'input' (honors state) or 'output' (always full)
  *  - extraClass: optional extra Tailwind utilities
@@ -45,14 +46,14 @@ export function inputMarkerState(
 export function portMarkerStyle(
 	port: PortDefinition,
 	oneOfRequiredPorts: Set<string>,
-	configFilledPorts: Set<string>,
+	literalFilledPorts: Set<string>,
 	color: string,
 	side: 'input' | 'output',
 	extraClass: string = '',
 ): { style: string; class: string } {
 	// Outputs are always `full`, regardless of the port's `required` flag.
 	const state: PortMarkerState = side === 'input'
-		? inputMarkerState(port.required, oneOfRequiredPorts.has(port.name), configFilledPorts.has(port.name))
+		? inputMarkerState(port.required, oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name))
 		: 'full';
 
 	let style: string;

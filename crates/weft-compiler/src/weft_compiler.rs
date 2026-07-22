@@ -16,7 +16,7 @@ use weft_core::project::{
     ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, NodeDefinition,
     PortDefinition, Position, ProjectDefinition, Span,
 };
-use weft_core::weft_type::WeftType;
+use weft_core::weft_type::{LiteralPlacement, WeftType};
 
 // ─── Compiler Error ──────────────────────────────────────────────────────────
 
@@ -2496,7 +2496,7 @@ fn collect_group_definitions(
             port_type: p.port_type.clone(),
             required: p.required,
             description: None,
-            configurable: p.port_type.is_default_configurable(),
+            literal: p.port_type.default_literal_placement(),
             synthesized_from_carry: p.synthesized_from_carry,
         })
         .collect();
@@ -2508,7 +2508,7 @@ fn collect_group_definitions(
             port_type: p.port_type.clone(),
             required: false,
             description: None,
-            configurable: p.port_type.is_default_configurable(),
+            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
         })
         .collect();
@@ -2616,7 +2616,7 @@ fn flatten_group(
         port_type: p.port_type.clone(),
         required: p.required,
         description: None,
-        configurable: p.port_type.is_default_configurable(),
+        literal: p.port_type.default_literal_placement(),
         synthesized_from_carry: p.synthesized_from_carry,
     }).collect();
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
@@ -2630,7 +2630,7 @@ fn flatten_group(
             port_type: ty.clone(),
             required: false,
             description: None,
-            configurable: ty.is_default_configurable(),
+            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
         }
     }).collect();
@@ -2645,7 +2645,7 @@ fn flatten_group(
             port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number),
             required: false,
             description: None,
-            configurable: false,
+            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
         });
     }
@@ -2692,6 +2692,8 @@ fn flatten_group(
         span: None,
         header_span: None,
         config_spans: loop_spans,
+        port_literals: Default::default(),
+        port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
     });
@@ -2716,7 +2718,7 @@ fn flatten_group(
             port_type: ty.clone(),
             required,
             description: None,
-            configurable: ty.is_default_configurable(),
+            literal: ty.default_literal_placement(),
             synthesized_from_carry: false,
         }
     }).collect();
@@ -2729,7 +2731,7 @@ fn flatten_group(
             port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Boolean),
             required: false,
             description: None,
-            configurable: false,
+            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
         });
     }
@@ -2738,7 +2740,7 @@ fn flatten_group(
         port_type: p.port_type.clone(),
         required: false,
         description: None,
-        configurable: p.port_type.is_default_configurable(),
+        literal: LiteralPlacement::None,
         synthesized_from_carry: false,
     }).collect();
 
@@ -2763,6 +2765,8 @@ fn flatten_group(
         span: None,
         header_span: None,
         config_spans: Default::default(),
+        port_literals: Default::default(),
+        port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
     });
@@ -2803,7 +2807,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         port_type: p.port_type.clone(),
         required: p.required,
         description: None,
-        configurable: p.port_type.is_default_configurable(),
+        literal: p.port_type.default_literal_placement(),
         synthesized_from_carry: false,
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
@@ -2811,7 +2815,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         port_type: p.port_type.clone(),
         required: p.required,
         description: None,
-        configurable: p.port_type.is_default_configurable(),
+        literal: LiteralPlacement::None,
         synthesized_from_carry: false,
     }).collect();
     let mut features = NodeFeatures::default();
@@ -2836,6 +2840,10 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),
+        // Populated by the enrich normalization once the full port list
+        // is known; the parser leaves every body value in `config`.
+        port_literals: Default::default(),
+        port_literal_spans: Default::default(),
         file_refs: pn.file_refs.clone(),
         include_path: pn.include_path.clone(),
     }
@@ -2860,7 +2868,7 @@ fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
 //     target.port = Template { template: "hi" }.text
 //
 //     my_llm = OpenRouterInference {
-//       systemPrompt: Template { template: "{{x}}" x: other.value }.text
+//       prompt: Template { template: "{{x}}" x: other.value }.text
 //     }
 //
 // The parser recognizes the inline form natively during its main pass and

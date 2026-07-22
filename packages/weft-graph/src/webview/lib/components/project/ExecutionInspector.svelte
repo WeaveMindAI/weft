@@ -199,7 +199,7 @@
 	function costLabel(firing: {
 		costUsd: number;
 		costUnknown?: boolean;
-		costOrigin?: 'user-provided' | 'deployment' | 'mixed';
+		costOrigin?: 'user-provided' | 'runtime' | 'mixed';
 	}): string {
 		let amount: string;
 		if (firing.costUnknown) {
@@ -212,7 +212,7 @@
 		const origin =
 			firing.costOrigin === 'user-provided'
 				? ' (own key)'
-				: firing.costOrigin === 'deployment'
+				: firing.costOrigin === 'runtime'
 					? ' (platform key)'
 					: firing.costOrigin === 'mixed'
 						? ' (mixed keys)'

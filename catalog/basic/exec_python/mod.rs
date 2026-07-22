@@ -53,16 +53,16 @@ pub struct ExecPythonNode;
 
 #[async_trait]
 impl Node for ExecPythonNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let code: String = ctx.config.get("code")?;
 
         // Bind every input port value under its port name in the
-        // Python namespace. `ctx.input.iter()` only yields ports the
+        // Python namespace. `ctx.ports.iter()` only yields ports the
         // runtime delivered a pulse for (including null pulses from
         // skipped upstreams), which matches the "if this input was
         // null, branch" pattern in user code.
         let inputs: Vec<(String, Value)> = ctx
-            .input
+            .ports
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -79,7 +79,7 @@ impl Node for ExecPythonNode {
         // Assemble NodeOutput. `None` / missing keys produce no
         // pulse, matching the Python contract where returning
         // {"x": None} skips port x.
-        let mut out = NodeOutput::empty();
+        let mut out = NodeOutput::new();
         for (port, value) in result {
             if !matches!(value, Value::Null) {
                 out = out.set(port, value);

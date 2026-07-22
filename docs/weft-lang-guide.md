@@ -320,6 +320,27 @@ two phases (trigger setup, then per-fire). You wire its outputs downstream like
 any node, the difference is that an external event (a web request, a timer, a
 form submission, an event feed) fires a fresh execution carrying the event data.
 
+What runs on a fire, precisely: the fired trigger's reachable outputs, plus
+everything those outputs depend on, stopping at trigger nodes. Sibling branches
+the fired trigger cannot reach do not run. A trigger's own INPUTS are read once,
+at activation: whatever its upstream delivered during trigger setup is saved and
+replayed onto the trigger at every fire (re-activating refreshes the values).
+The fire's event data itself arrives separately, on the trigger's wake payload.
+If the fire subgraph contains other triggers, they do not run: their output
+ports close, so a node fed by several triggers proceeds with the firing branch
+and treats the idle ones as dead.
+
+Manually running a project that contains triggers behaves the same with no
+firing trigger at all: every trigger closes, and the run exercises only the
+paths that don't need one. To exercise a trigger's path, fire the trigger (the
+editor can send a hand-written payload).
+
+The compiler enforces the shapes that keep this well-defined, each a compile
+error: a cycle in the wire graph (`graph-cycle`; iterate with a `Loop`, exchange
+feedback over a bus), a trigger inside a `Loop` (`trigger-in-loop`), a trigger
+wired into another trigger (`trigger-into-trigger`), and a trigger wired into an
+infra node (`trigger-into-infra`; provisioning happens before any fire exists).
+
 The built-in / common trigger kinds (see `authoring-nodes.md` for the full
 table and how to author your own):
 

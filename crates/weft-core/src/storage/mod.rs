@@ -396,6 +396,21 @@ impl FileHandle {
     }
 }
 
+/// Deserializing a `FileHandle` parses a FILE VALUE (the `__weft_<kind>__`
+/// marker an upstream node emitted, or a bare key string), via
+/// [`FileHandle::from_value`]. This is what makes
+/// `ctx.get::<FileHandle>("port")` work: files are just another type to the
+/// accessors, and the parse fails loud on a value with no readable handle.
+impl<'de> serde::Deserialize<'de> for FileHandle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        FileHandle::from_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 // The worker <-> broker runtime-file HTTP envelopes (requests + responses).
 // Defined ONCE here (the broker and the engine's worker client both depend on
 // `weft-core`), so a field rename is a single edit that both sides pick up.
@@ -756,6 +771,38 @@ mod tests {
             t,
             crate::weft_type::WeftType::Primitive(crate::weft_type::WeftPrimitive::Audio)
         );
+    }
+
+    /// Deserializing a FileHandle parses a FILE VALUE via `from_value`,
+    /// which is what makes `ctx.get::<FileHandle>(..)` work: key-backed
+    /// and url-backed markers and bare key strings parse; a data-backed
+    /// or non-file value fails loud through serde.
+    #[test]
+    fn file_handle_deserializes_through_from_value() {
+        let key_backed = json!({"__weft_image__": {
+            "key": "k1", "mimeType": "image/png", "sizeBytes": 3, "filename": "a.png"
+        }});
+        assert_eq!(
+            serde_json::from_value::<FileHandle>(key_backed).unwrap(),
+            FileHandle::Key("k1".into())
+        );
+        let url_backed = json!({"__weft_image__": {
+            "url": "https://x.com/a.png", "mimeType": "image/png", "sizeBytes": 3, "filename": "a.png"
+        }});
+        assert!(matches!(
+            serde_json::from_value::<FileHandle>(url_backed).unwrap(),
+            FileHandle::Url { url, .. } if url == "https://x.com/a.png"
+        ));
+        assert_eq!(
+            serde_json::from_value::<FileHandle>(json!("bare-key")).unwrap(),
+            FileHandle::Key("bare-key".into())
+        );
+        let data_backed = json!({"__weft_image__": {
+            "data": "aGk=", "mimeType": "image/png", "sizeBytes": 2, "filename": "a.png"
+        }});
+        let e = serde_json::from_value::<FileHandle>(data_backed).unwrap_err().to_string();
+        assert!(e.contains("no readable handle"), "{e}");
+        assert!(serde_json::from_value::<FileHandle>(json!(42)).is_err());
     }
 
     #[test]

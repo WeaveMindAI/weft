@@ -83,6 +83,125 @@ out.data = hi.value
 }
 
 #[test]
+fn a_port_wired_and_body_set_is_a_double_driver_error() {
+    // FetchToStorage's `url` is a body-settable input port: setting it in
+    // the body routes the value onto the port. Wiring the SAME port from
+    // upstream gives it two drivers; validate rejects it.
+    let project = parse_enrich(
+        r#"
+n = Text { value: "https://x.com/a" }
+f = FetchToStorage { url: "https://x.com/b" }
+f.url = n.value
+out = Debug
+out.data = f.file
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hits: Vec<_> =
+        d.iter().filter(|e| e.code.as_deref() == Some("double-driven-port")).collect();
+    assert_eq!(hits.len(), 1, "expected one double-driven-port error, got {d:?}");
+    assert!(hits[0].message.contains("'url'"), "{}", hits[0].message);
+
+    // The body-only form (no wire) stays legal: one driver.
+    let project = parse_enrich(
+        r#"
+f = FetchToStorage { url: "https://x.com/b" }
+out = Debug
+out.data = f.file
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        !codes(&d).contains(&"double-driven-port"),
+        "body-only config must not trip the rule: {d:?}"
+    );
+}
+
+#[test]
+fn literal_placement_gates_where_a_literal_may_drive_a_port() {
+    // `literal: none` (OpenRouterInference's `config` port): no literal
+    // in ANY form. The braces form...
+    let project = parse_enrich(
+        r#"
+n = OpenRouterInference -> (response: String) { config: {"temperature": 0.5} }
+n.prompt = "hi"
+out = Debug
+out.data = n.response
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("port-literal-placement"));
+    assert!(hit.is_some_and(|e| e.message.contains("takes no literal")), "braces literal on a none port must error: {d:?}");
+
+    // ...and the assignment form are both rejected.
+    let project = parse_enrich(
+        r#"
+n = OpenRouterInference -> (response: String) {}
+n.config = {"temperature": 0.5}
+n.prompt = "hi"
+out = Debug
+out.data = n.response
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("port-literal-placement"));
+    assert!(hit.is_some_and(|e| e.message.contains("takes no literal")), "assignment literal on a none port must error: {d:?}");
+
+    // `literal: assignment` (a file-typed port, by type default): the
+    // braces form is refused with the assignment remediation...
+    let project = parse_enrich(
+        r#"
+n = ImageDisplay { image: "not-a-file" }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("port-literal-placement"));
+    assert!(hit.is_some_and(|e| e.message.contains("only as an assignment")), "braces literal on an assignment port must error: {d:?}");
+
+    // ...but the assignment form is legal and normalizes into
+    // `port_literals`, exactly like a wire would deliver it.
+    let project = parse_enrich(
+        r#"
+n = ImageDisplay
+n.image = "a-literal"
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        !codes(&d).contains(&"port-literal-placement"),
+        "assignment literal on an assignment port is legal: {d:?}"
+    );
+    let node = project.nodes.iter().find(|n| n.id == "n").unwrap();
+    assert!(
+        node.port_literals.contains_key("image"),
+        "the literal must normalize into port_literals: {:?}",
+        node.port_literals
+    );
+
+    // A none port that is BOTH wired and body-assigned is one mistake,
+    // not two: double-driven-port owns it ("remove one driver"), and
+    // the placement error ("wire it") must stay silent, since the port
+    // is already wired.
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig {}
+n = OpenRouterInference -> (response: String) {}
+n.config = cfg.config
+n.config = {"temperature": 0.5}
+n.prompt = "hi"
+out = Debug
+out.data = n.response
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"double-driven-port"), "{d:?}");
+    assert!(
+        !codes(&d).contains(&"port-literal-placement"),
+        "double-driven-port owns the wired-and-assigned case: {d:?}"
+    );
+}
+
+#[test]
 fn node_named_after_a_type_is_flagged() {
     // Naming a node after a catalog type (`Debug`) is ambiguous: a later
     // `Debug.port` reference would parse as an inline Debug node. Flagged as a
@@ -191,9 +310,9 @@ out.data = one.value
 #[test]
 fn config_type_mismatch_is_flagged() {
     use weft_core::weft_type::{WeftPrimitive, WeftType};
-    // Construct a scenario where a port IS configurable and typed:
-    // manually inject an input port with a String type and set
-    // config to a number. The rule flags incompatible literal.
+    // Construct a scenario where a port takes literals anywhere and is
+    // typed: manually inject an input port with a String type and drive
+    // it with a number literal. The rule flags the incompatible literal.
     let mut project = parse_enrich(r#"
 t = Text
 "#);
@@ -203,10 +322,10 @@ t = Text
         port_type: WeftType::primitive(WeftPrimitive::String),
         required: false,
         description: None,
-        configurable: true,
+        literal: weft_core::weft_type::LiteralPlacement::Anywhere,
         synthesized_from_carry: false,
     });
-    t.config = serde_json::json!({ "value": 42 });
+    t.port_literals.insert("value".into(), serde_json::json!(42));
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"config-type-mismatch"), "{d:?}");
 }
@@ -225,7 +344,7 @@ t = Text { value: "ok" }
         ),
         required: true,
         description: None,
-        configurable: false,
+        literal: weft_core::weft_type::LiteralPlacement::None,
         synthesized_from_carry: false,
     });
     let d = validate(&project, &catalog());
@@ -797,4 +916,90 @@ fetch = FetchToStorage -> (file: Number) { keep: false }
         msg.contains("incompatible with catalog type"),
         "error should explain the narrow is incompatible: {msg}"
     );
+}
+
+// ── graph-shape rules (cycles, trigger placement) ────────────────────────────
+
+#[test]
+fn a_wire_cycle_is_a_compile_error() {
+    let mut project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+b = Text
+b.value = a.value
+out = Debug
+out.data = b.value
+"#,
+    );
+    // Hand-close the cycle (the parser has no syntax that lowers to a
+    // back edge today; the rule guards the definition shape itself).
+    project.edges.push(weft_core::project::Edge {
+        id: "back".into(),
+        source: "b".into(),
+        target: "a".into(),
+        source_handle: Some("value".into()),
+        target_handle: Some("value".into()),
+        span: None,
+    });
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"graph-cycle"), "{d:?}");
+}
+
+#[test]
+fn trigger_wiring_rules_are_compile_errors() {
+    // trigger-into-trigger, via a plain node in between (transitive).
+    let project = parse_enrich(
+        r#"
+t1 = Cron { cron: "* * * * *" }
+mid = Debug
+mid.data = t1.scheduledTime
+t2 = HumanTrigger
+t2.fields = mid.data
+out = Debug
+out.data = t2.submitted
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"trigger-into-trigger"), "{d:?}");
+}
+
+#[test]
+fn a_trigger_inside_a_loop_is_a_compile_error() {
+    let project = parse_enrich(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    t = Cron { cron: "* * * * *" }
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"trigger-in-loop"), "{d:?}");
+}
+
+#[test]
+fn a_trigger_wired_into_an_infra_node_is_a_compile_error() {
+    // trigger-into-infra, via a plain node in between (transitive). No
+    // stdlib infra node takes inputs, so mark the sink infra by hand;
+    // the rule guards the definition shape itself.
+    let mut project = parse_enrich(
+        r#"
+t = Cron { cron: "* * * * *" }
+mid = Debug
+mid.data = t.scheduledTime
+sink = Debug
+sink.data = mid.data
+"#,
+    );
+    project
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "sink")
+        .expect("sink present")
+        .requires_infra = true;
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"trigger-into-infra"), "{d:?}");
 }

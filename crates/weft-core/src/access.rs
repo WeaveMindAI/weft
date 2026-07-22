@@ -42,7 +42,7 @@ pub enum AccessOrigin {
     /// The user's own key, their own provider account.
     UserProvided,
     /// A runtime-granted credential drawn from the runtime's configured key.
-    Deployment,
+    Runtime,
 }
 
 /// Access to a paid provider: what to authenticate with, and (for a
@@ -91,7 +91,7 @@ impl ProviderAccess {
     /// Access granted by the runtime on its configured key.
     /// `relay_url` is where calls on `credential` must be sent when the
     /// runtime relays them; `None` = straight to the provider.
-    pub fn deployment(
+    pub fn runtime(
         provider: impl Into<String>,
         credential: impl Into<String>,
         relay_url: Option<String>,
@@ -101,7 +101,7 @@ impl ProviderAccess {
             provider: provider.into(),
             credential: credential.into(),
             relay_url,
-            origin: AccessOrigin::Deployment,
+            origin: AccessOrigin::Runtime,
             window,
         }
     }
@@ -194,7 +194,7 @@ mod tests {
         assert!(!rendered.contains("sk-very-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
 
-        let managed = ProviderAccess::deployment(
+        let managed = ProviderAccess::runtime(
             "openrouter",
             "managed-credential",
             Some("http://relay.internal/v1/provider/openrouter".into()),
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(own.relay_url(), None, "a user's key goes to the provider");
         assert_eq!(own.origin(), AccessOrigin::UserProvided);
 
-        let relayed = ProviderAccess::deployment(
+        let relayed = ProviderAccess::runtime(
             "openrouter",
             "managed-credential",
             Some("http://relay.internal/v1/provider/openrouter".into()),
@@ -225,9 +225,9 @@ mod tests {
             relayed.relay_url(),
             Some("http://relay.internal/v1/provider/openrouter"),
         );
-        assert_eq!(relayed.origin(), AccessOrigin::Deployment);
+        assert_eq!(relayed.origin(), AccessOrigin::Runtime);
 
-        let direct = ProviderAccess::deployment("openrouter", "the-key", None, CALL_WINDOW);
+        let direct = ProviderAccess::runtime("openrouter", "the-key", None, CALL_WINDOW);
         assert_eq!(direct.relay_url(), None, "an unrelayed grant goes straight to the provider");
     }
 }

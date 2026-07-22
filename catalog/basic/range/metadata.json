@@ -7,17 +7,12 @@
   "icon": "Hash",
   "color": "#64748b",
   "inputs": [
-    { "name": "from", "type": "Number", "required": false, "configurable": true },
-    { "name": "to", "type": "Number", "required": true, "configurable": true },
-    { "name": "step", "type": "Number", "required": false, "configurable": true }
+    { "name": "from", "type": "Number", "required": false },
+    { "name": "to", "type": "Number", "required": true },
+    { "name": "step", "type": "Number", "required": false }
   ],
   "outputs": [
     { "name": "values", "type": "List[Number]", "required": false }
-  ],
-  "fields": [
-    { "key": "from", "label": "From (inclusive)", "field_type": { "kind": "number" }, "required": false, "default_value": 0 },
-    { "key": "to", "label": "To (exclusive)", "field_type": { "kind": "number" }, "required": true },
-    { "key": "step", "label": "Step", "field_type": { "kind": "number" }, "required": false, "default_value": 1 }
   ],
   "requires_infra": false
 }

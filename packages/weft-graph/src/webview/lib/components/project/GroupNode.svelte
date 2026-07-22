@@ -15,10 +15,10 @@
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
 	import FieldStrip from './FieldStrip.svelte';
 
-	// Group interface ports cannot be config-filled (see the rule enforced in
-	// enrichment's validate_required_ports). Pass an empty set to portMarkerStyle
-	// so they never render as 'empty-dotted'.
-	const noConfigFilled = new Set<string>();
+	// Group interface ports cannot take a body-set literal (see the rule
+	// enforced in enrichment's validate_required_ports). Pass an empty set to
+	// portMarkerStyle so they never render as 'empty-dotted'.
+	const noLiteralFilled = new Set<string>();
 
 	let { data, id, selected }: {
 		id: string;
@@ -558,7 +558,7 @@
 			{/if}
 		{:else}
 		{#each inputs as input}
-			{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, noConfigFilled, getPortTypeColor(input.portType), 'input', '!relative !inset-auto !transform-none')}
+			{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(input.portType), 'input', '!relative !inset-auto !transform-none')}
 			{@const isGhost = !!input.synthesizedFromCarry}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="expanded-port-block group" class:port-ghost={isGhost} oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}>
@@ -671,7 +671,7 @@
 			{/if}
 		{:else}
 		{#each outputs as output}
-			{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noConfigFilled, getPortTypeColor(output.portType), 'output', '!relative !inset-auto !transform-none')}
+			{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(output.portType), 'output', '!relative !inset-auto !transform-none')}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="expanded-port-block expanded-port-block-right group" oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}>
 				<div class="expanded-port-label-row expanded-port-label-row-right">
@@ -847,7 +847,7 @@
 			<!-- Input Ports -->
 			<div class="space-y-1 min-w-0 flex-1">
 				{#each inputs as input}
-					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, noConfigFilled, getPortTypeColor(input.portType), 'input')}
+					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(input.portType), 'input')}
 					{@const isGhost = !!input.synthesizedFromCarry}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="relative flex items-center gap-1 group pl-3" class:port-ghost={isGhost} oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}>
@@ -899,7 +899,7 @@
 			<!-- Output Ports -->
 			<div class="space-y-1 text-right min-w-0 flex-1">
 				{#each outputs as output}
-					{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noConfigFilled, getPortTypeColor(output.portType), 'output')}
+					{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, noLiteralFilled, getPortTypeColor(output.portType), 'output')}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="relative flex items-center gap-1 justify-end group pr-3" oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}>
 						<Handle

@@ -14,7 +14,7 @@ use weft_core::infra::{
     UnitKind,
 };
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, InfraProvisionContext, InputBag, Node, NodeManifest, WeftResult};
+use weft_core::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct MiniServiceNode;
@@ -23,10 +23,10 @@ const PORT: u16 = 8080;
 
 #[async_trait]
 impl Node for MiniServiceNode {
-    async fn provision(
+    async fn provision_infra(
         &self,
         _ctx: InfraProvisionContext,
-        _input: InputBag,
+        _input: ValueBag,
     ) -> WeftResult<InfraSpec> {
         Ok(InfraSpec {
             units: vec![Unit {
@@ -61,7 +61,7 @@ impl Node for MiniServiceNode {
         })
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // Resolve the endpoint, read its /outputs, and emit them plus the bare
         // URL. The `/outputs` key set (status) matches the declared output port.
         let api = ctx.endpoint("api").await?;
@@ -74,9 +74,9 @@ impl Node for MiniServiceNode {
         // short deadline: a genuinely-up service responds within seconds,
         // so a timeout here is a real failure, not flakiness.
         let outputs = call_with_warmup_retry(&api).await?;
-        let out = NodeOutput::empty()
+        let out = NodeOutput::new()
             .extend_from_object(&outputs)
-            .set("endpointUrl", Value::String(api.url().to_string()));
+            .set("endpointUrl", api.url());
         ctx.pulse_downstream(out).await
     }
 }

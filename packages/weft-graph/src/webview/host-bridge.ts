@@ -26,7 +26,7 @@ function toV1Port(p: HostPort): V1Port {
     portType: p.portType,
     required: p.required,
     description: p.description ?? undefined,
-    configurable: p.configurable,
+    literal: p.literal,
     synthesizedFromCarry: p.synthesizedFromCarry,
   };
 }
@@ -167,6 +167,12 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     nodeType: n.nodeType,
     label: n.label,
     config: cleanConfig,
+    // Body-set PORT values + their written forms: the two-home twin of
+    // config. Dropping these here was the bug where a port field's value
+    // vanished from the graph the moment a parse round-trip replaced the
+    // truth (the source still had it; only this translation lost it).
+    portLiterals: n.portLiterals,
+    portLiteralSpans: n.portLiteralSpans,
     position: n.position,
     parentId,
     inputs: n.inputs.map(toV1Port),

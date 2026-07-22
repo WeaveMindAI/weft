@@ -10,8 +10,13 @@
 // If the child dies unexpectedly, every pending request rejects and the next
 // request respawns it: a dead server surfaces loudly (the caller's catch posts
 // a parseError) and self-heals, it never silently stops editor feedback.
+// The spawned BINARY is watched too: a `weft install` while a window is open
+// would otherwise leave a warm server speaking the previous wire shape (the
+// webview reads fields the old server never emits), so a binary change kills
+// the child and the next request respawns on the new one.
 
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import { WeftCliError } from './cli';
 import type { EditOp, TextEdit } from './shared/protocol';
@@ -111,6 +116,7 @@ export class ParseServer {
 
     const child = spawn('weft', ['parse-server'], { cwd: this.cwd, env: process.env });
     this.child = child;
+    this.watchBinary(child);
 
     // One response per line.
     this.reader = readline.createInterface({ input: child.stdout });
@@ -159,6 +165,30 @@ export class ParseServer {
     }
   }
 
+  /** Watch the `weft` binary the child was spawned from; when it changes (a
+   *  `weft install` while this window is open), kill the child so the next
+   *  request respawns on the NEW binary. Without this the warm server keeps
+   *  answering in the previous wire shape and the webview silently renders
+   *  holes (fields the old server never emits). Watch failure (binary not
+   *  resolvable, fs.watch unsupported) degrades to the old behavior and is
+   *  logged, never fatal: the watch is an invalidation aid, not the spawn. */
+  private binaryWatcher: fs.FSWatcher | undefined;
+  private watchBinary(child: ChildProcessWithoutNullStreams): void {
+    this.binaryWatcher?.close();
+    this.binaryWatcher = undefined;
+    try {
+      const resolver = process.platform === 'win32' ? 'where' : 'which';
+      const path = execFileSync(resolver, ['weft'], { encoding: 'utf8' }).split('\n')[0].trim();
+      if (!path) return;
+      this.binaryWatcher = fs.watch(path, () => {
+        console.error('[weft parse-server] weft binary changed; restarting the parse server');
+        this.onChildGone(child, new WeftCliError(['parse-server'], null, 'weft binary changed; parse server restarted'));
+      });
+    } catch (err) {
+      console.error(`[weft parse-server] cannot watch the weft binary for changes: ${String(err)}`);
+    }
+  }
+
   /** The child died, errored, or wedged (timeout). Reap the process, reject
    *  every pending request (clearing their timeout timers), and clear the child
    *  so the next request respawns. Idempotent across the error+exit pair (only
@@ -170,6 +200,8 @@ export class ParseServer {
     this.child = undefined;
     this.reader?.close();
     this.reader = undefined;
+    this.binaryWatcher?.close();
+    this.binaryWatcher = undefined;
     child.kill();
     const pendings = [...this.pending.values()];
     this.pending.clear();
@@ -185,6 +217,8 @@ export class ParseServer {
     this.child = undefined;
     this.reader?.close();
     this.reader = undefined;
+    this.binaryWatcher?.close();
+    this.binaryWatcher = undefined;
     for (const p of this.pending.values()) {
       clearTimeout(p.timer);
       p.reject(new Error('parse server disposed'));

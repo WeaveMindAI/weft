@@ -1033,7 +1033,7 @@ impl TokenScope {
         use sqlx::Row;
         let rows = sqlx::query(
             "SELECT s.token, s.tenant_id, s.project_id, s.color, s.node_id, s.is_resume, \
-                    s.spec_json, s.consumer_kind, s.tags, \
+                    s.spec_json, s.consumer_kind, s.tags, s.port_snapshot, \
                     s.consumer_payload, \
                     s.surface_kind, s.mount_path, s.auth_kind, s.auth_config, \
                     s.kind_state \
@@ -1082,6 +1082,7 @@ impl TokenScope {
                 spec_json: r.try_get("spec_json")?,
                 consumer_kind: r.try_get("consumer_kind")?,
                 tags: r.try_get("tags")?,
+                port_snapshot: r.try_get("port_snapshot")?,
                 consumer_payload,
                 surface_kind: r.try_get("surface_kind")?,
                 mount_path: r.try_get("mount_path")?,
@@ -1344,6 +1345,7 @@ pub async fn connect_live(
     // node + project), with auth fields for the gate.
     let row = sqlx::query(
         "SELECT s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
+                s.port_snapshot, \
                 COALESCE(p.status, 'inactive') AS status \
          FROM signal s \
          LEFT JOIN project p ON p.id::text = s.project_id \
@@ -1361,6 +1363,7 @@ pub async fn connect_live(
     let status_str: String = row.try_get("status").map_err(row_err)?;
     let auth_kind: String = row.try_get("auth_kind").map_err(row_err)?;
     let auth_config: Option<Value> = row.try_get("auth_config").map_err(row_err)?;
+    let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
 
     // The signal spec carries the kind tag + the live-caller config. The
     // protocol is the kind itself (ApiEndpoint -> Http, LiveSocket -> Ws),
@@ -1422,6 +1425,7 @@ pub async fn connect_live(
         &spec,
         tenant.as_str(),
         color,
+        port_snapshot.as_ref(),
     )
     .await?;
 
@@ -1479,6 +1483,7 @@ pub async fn connect_live(
 /// pod is at the cap, spawns another and retries (bounded). A failure
 /// anywhere leaves NOTHING journaled or queued, so the caller has nothing to
 /// clean up on `Err`.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_live_execution(
     state: &DispatcherState,
     project_id: &str,
@@ -1487,6 +1492,7 @@ async fn prepare_live_execution(
     spec: &weft_core::primitive::SignalSpec,
     tenant: &str,
     color: uuid::Uuid,
+    port_snapshot: Option<&Value>,
 ) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
     let definition_hash = state
         .projects
@@ -1503,7 +1509,8 @@ async fn prepare_live_execution(
     let project_def: weft_core::ProjectDefinition = serde_json::from_str(&project_json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def parse: {e}")))?;
 
-    let kicks = crate::api::project::compute_trigger_kicks(&project_def, node_id, &Value::Null);
+    let kicks =
+        crate::api::project::compute_trigger_kicks(&project_def, node_id, &Value::Null, port_snapshot);
     if kicks.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1525,7 +1532,9 @@ async fn prepare_live_execution(
         .map(|kick| weft_journal::ExecEvent::NodeKicked {
             color,
             node_id: kick.node_id.clone(),
+            firing: kick.firing,
             payload: kick.payload.clone(),
+            port_snapshot: kick.port_snapshot.clone(),
             at_unix: now,
         })
         .collect();
@@ -1994,6 +2003,7 @@ mod public_url_tests {
             spec_json: "{}".into(),
             consumer_kind: None,
             tags: vec![],
+            port_snapshot: None,
             consumer_payload: None,
             surface_kind: surface.into(),
             mount_path: mount.map(String::from),
@@ -2160,6 +2170,7 @@ mod can_cancel_tests {
             spec_json: "{}".into(),
             consumer_kind: None,
             tags: vec![],
+            port_snapshot: None,
             consumer_payload: None,
             surface_kind: "public_entry".into(),
             mount_path: None,

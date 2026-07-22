@@ -40,7 +40,7 @@ function canonicalize(value: unknown): unknown {
   return value;
 }
 
-function sameConfigValue(a: unknown, b: unknown): boolean {
+export function sameConfigValue(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   const aUnset = a === undefined || a === null;
   const bUnset = b === undefined || b === null;

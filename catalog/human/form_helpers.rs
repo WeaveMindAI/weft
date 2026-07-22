@@ -23,7 +23,7 @@ use weft_core::signal::FormField;
 
 /// Pull the `fields` array off a node's config. The canonical shape is a
 /// JSON array (what the compiler produces); anything else means no fields.
-pub fn parse_form_fields(config: &HashMap<String, Value>) -> Vec<Value> {
+pub fn parse_form_fields(config: &serde_json::Map<String, Value>) -> Vec<Value> {
     match config.get("fields") {
         Some(Value::Array(arr)) => arr.clone(),
         _ => Vec::new(),
@@ -154,7 +154,7 @@ pub fn map_response_to_ports(
     let spec_map: HashMap<&str, &FormFieldSpec> =
         specs.iter().map(|s| (s.field_type.as_str(), s)).collect();
 
-    let mut output = NodeOutput::empty();
+    let mut output = NodeOutput::new();
     for field in raw_fields {
         let Some(field_type) = field_type_of(field) else { continue };
         let Some(key) = field.get("key").and_then(|v| v.as_str()) else { continue };

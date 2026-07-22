@@ -29,10 +29,15 @@ use crate::cst::parse;
 pub enum EditOp {
     /// Set (or insert) a config field. `value` is the already-formatted source
     /// token (`"hi"`, `42`, a `@file(...)` marker, multi-line JSON), produced
-    /// by the frontend's value formatter.
-    SetConfig { node: String, key: String, value: String },
-    /// Remove a config field.
-    RemoveConfig { node: String, key: String },
+    /// by the frontend's value formatter. `form` targets the WRITTEN form when
+    /// the same name legally exists in both (a wired-only port's literal next
+    /// to a same-named config field): `Some(Inline)` touches only the braces
+    /// field, `Some(Connection)` only the statement line (inserting one when
+    /// absent). `None` auto-routes (prefers the statement).
+    SetConfig { node: String, key: String, value: String, #[serde(default, skip_serializing_if = "Option::is_none")] form: Option<ValueForm> },
+    /// Remove a config field. `form` narrows the removal exactly like
+    /// `SetConfig`; `None` removes whichever form exists (statement first).
+    RemoveConfig { node: String, key: String, #[serde(default, skip_serializing_if = "Option::is_none")] form: Option<ValueForm> },
     /// Set or clear a node's label.
     SetLabel { node: String, label: Option<String> },
     /// Add a bare node `id = Type {}` at the end of the scope (top level when
@@ -82,6 +87,12 @@ pub enum EditOp {
     MoveLoopScope { loop_id: String, target_group: Option<String> },
     /// Rewrite a loop's port signature. Same shape as UpdateGroupPorts.
     UpdateLoopPorts { loop_id: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
+    /// Rewrite which SOURCE FORM a node's body-set port value is written
+    /// in: `inline` is a `key: value` field in the braces body,
+    /// `connection` is a `node.key = value` statement line. The value
+    /// text moves verbatim; only the wrapper changes. The editor's
+    /// form-toggle marker on a port-driven field sends this.
+    SetValueForm { node: String, key: String, form: ValueForm },
     /// Set a single loop config field (`parallel`, `over`, `carry`,
     /// `max_iters`, `trim_on_mismatch`). The value is a pre-formatted
     /// source token: `true`, `["a","b"]`, `100`, etc. Inserts the field
@@ -89,6 +100,16 @@ pub enum EditOp {
     SetLoopConfig { loop_id: String, key: String, value: String },
     /// Remove a loop config field.
     RemoveLoopConfig { loop_id: String, key: String },
+}
+
+/// The written form of a body-set port value; mirrors
+/// `ConfigOrigin` (`Inline` = braces field, `Connection` = statement).
+// SYNC: ValueForm <-> packages/weft-graph/src/protocol.ts EditOp setValueForm.form, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ValueForm {
+    Inline,
+    Connection,
 }
 
 /// A port in a signature rewrite. `required: false` renders `name: Type?`.

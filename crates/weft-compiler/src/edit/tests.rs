@@ -155,7 +155,7 @@ fn apply_text_edit_rejects_bad_offsets_loudly() {
 fn inverse_edit_restores_original_for_each_op() {
     assert_reversible(
         "t = Text {\n  value: \"old\"\n}\n",
-        vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"new\"".into() }],
+        vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"new\"".into(), form: None }],
     );
     assert_reversible(
         "t = Text {\n  value: \"x\"\n}\n",
@@ -173,7 +173,7 @@ fn inverse_edit_restores_original_for_each_op() {
     // ALL ops, not the four above).
     assert_reversible(
         "t = Text {\n  value: \"x\"\n  style: \"bold\"\n}\n",
-        vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into() }],
+        vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into(), form: None }],
     );
     assert_reversible(
         "t = Text {\n  value: \"x\"\n}\n",
@@ -226,7 +226,7 @@ fn inverse_edit_preserves_file_marker() {
     std::fs::write(dir.path().join("sys.txt"), "you are helpful").unwrap();
     let src = "t = Text {\n  value: @file(\"sys.txt\")\n}\n";
     let (new_source, inverse) = apply_edits(src, Some(dir.path()), "Untitled", &[
-        EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"replaced\"".into() },
+        EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"replaced\"".into(), form: None },
     ]).expect("edits apply");
     assert!(new_source.contains("value: \"replaced\""), "{new_source}");
     let restored = apply_text_edit(&new_source, &inverse).expect("inverse applies");
@@ -235,9 +235,46 @@ fn inverse_edit_preserves_file_marker() {
 }
 
 #[test]
+fn set_value_form_moves_a_value_between_forms_verbatim() {
+    // Braces field -> statement line: the value text moves verbatim, the
+    // field leaves the body, the line lands in the node's scope.
+    let src = "f = FetchToStorage {\n  url: \"https://x.com/a\"\n}\nout = Debug\nout.data = f.file\n";
+    let to_conn = apply(src, vec![EditOp::SetValueForm {
+        node: "f".into(), key: "url".into(), form: ValueForm::Connection,
+    }]);
+    parse_ok(&to_conn);
+    assert!(to_conn.contains("f.url = \"https://x.com/a\""), "{to_conn}");
+    assert!(!to_conn.contains("url:"), "{to_conn}");
+
+    // And back: the statement collapses into a braces field.
+    let back = apply(&to_conn, vec![EditOp::SetValueForm {
+        node: "f".into(), key: "url".into(), form: ValueForm::Inline,
+    }]);
+    parse_ok(&back);
+    assert!(back.contains("url: \"https://x.com/a\""), "{back}");
+    assert!(!back.contains("f.url ="), "{back}");
+
+    // Already in the requested form: byte-identical no-op.
+    let same = apply(&back, vec![EditOp::SetValueForm {
+        node: "f".into(), key: "url".into(), form: ValueForm::Inline,
+    }]);
+    assert_eq!(same, back);
+}
+
+#[test]
+fn set_value_form_inside_a_group_uses_the_group_scope() {
+    let src = "G = Group() -> () {\n    f = FetchToStorage {\n        url: \"https://x.com/a\"\n    }\n}\n";
+    let out = apply(src, vec![EditOp::SetValueForm {
+        node: "G.f".into(), key: "url".into(), form: ValueForm::Connection,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("f.url = \"https://x.com/a\""), "{out}");
+}
+
+#[test]
 fn set_config_inline_field_replaces_in_place() {
     let src = "t = Text {\n  value: \"old\"\n}\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"new\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"new\"".into(), form: None }]);
     assert!(out.contains("value: \"new\""), "{out}");
     assert!(!out.contains("\"old\""), "{out}");
 }
@@ -252,7 +289,7 @@ fn set_config_writes_a_stored_file_marker_object() {
     let marker = r#"{"__weft_blob__": {"key": "local/project/p/abc", "mimeType": "application/octet-stream", "sizeBytes": 52, "filename": "picked.bin"}}"#;
     let out = apply(
         src,
-        vec![EditOp::SetConfig { node: "sized".into(), key: "file".into(), value: marker.into() }],
+        vec![EditOp::SetConfig { node: "sized".into(), key: "file".into(), value: marker.into(), form: None }],
     );
     parse_ok(&out);
     // The inserted config value is exactly the marker object (a later build parses
@@ -261,7 +298,7 @@ fn set_config_writes_a_stored_file_marker_object() {
     assert!(out.contains("\"key\": \"local/project/p/abc\""), "payload present: {out}");
     // And SetConfig round-trips: writing the marker then removing it restores the
     // freshly-added-node source with no `file` config.
-    assert_reversible(src, vec![EditOp::SetConfig { node: "sized".into(), key: "file".into(), value: marker.into() }]);
+    assert_reversible(src, vec![EditOp::SetConfig { node: "sized".into(), key: "file".into(), value: marker.into(), form: None }]);
 }
 
 #[test]
@@ -274,7 +311,7 @@ fn set_config_compact_object_into_one_liner_bodies() {
     let one_liner = "t = Text { value: \"x\" }\n";
     let out = apply(
         one_liner,
-        vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: compact.into() }],
+        vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: compact.into(), form: None }],
     );
     parse_ok(&out);
     assert!(out.contains("__weft_image__"), "{out}");
@@ -282,7 +319,7 @@ fn set_config_compact_object_into_one_liner_bodies() {
     let anon = "op = ExecPython() -> (a: Number) { code: \"return 1\" }\n";
     let out = apply(
         anon,
-        vec![EditOp::SetConfig { node: "op".into(), key: "code".into(), value: compact.into() }],
+        vec![EditOp::SetConfig { node: "op".into(), key: "code".into(), value: compact.into(), form: None }],
     );
     parse_ok(&out);
     assert!(out.contains("__weft_image__"), "{out}");
@@ -301,20 +338,20 @@ fn set_config_writes_a_multiline_object_value_everywhere() {
 
     // Bodyless node (insert synthesizes the body).
     let src = "pick = ImagePick\nshow = ImageDisplay\n\nshow.image = pick.image\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "pick".into(), key: "file".into(), value: marker.into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "pick".into(), key: "file".into(), value: marker.into(), form: None }]);
     parse_ok(&out);
     assert!(out.contains("__weft_image__"), "{out}");
-    assert_reversible(src, vec![EditOp::SetConfig { node: "pick".into(), key: "file".into(), value: marker.into() }]);
+    assert_reversible(src, vec![EditOp::SetConfig { node: "pick".into(), key: "file".into(), value: marker.into(), form: None }]);
 
     // One-liner body (in-place replace of an existing scalar).
     let one_liner = "t = Text { value: \"x\" }\n";
-    let out = apply(one_liner, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: marker.into() }]);
+    let out = apply(one_liner, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: marker.into(), form: None }]);
     parse_ok(&out);
     assert!(out.contains("__weft_image__"), "{out}");
 
     // Connection-origin field (`t.style = ...` line).
     let conn = "t = Text {\n  value: \"x\"\n}\nt.style = \"a\"\n";
-    let out = apply(conn, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: marker.into() }]);
+    let out = apply(conn, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: marker.into(), form: None }]);
     parse_ok(&out);
     assert!(out.contains("t.style = {"), "keeps the connection form: {out}");
 }
@@ -331,6 +368,7 @@ fn set_config_writes_a_multiline_array_value() {
         node: "t".into(),
         key: "value".into(),
         value: arr.into(),
+        form: None,
     }]);
     parse_ok(&out);
     assert!(out.contains("[\n  1,\n  2\n]"), "{out}");
@@ -345,7 +383,7 @@ fn set_config_rejects_a_newline_outside_braces() {
         "t = Text { value: \"x\" }\n",
         None,
         "Untitled",
-        &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "1\n2".into() }],
+        &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "1\n2".into(), form: None }],
     )
     .expect_err("a bare newline-split value must be refused");
     assert!(
@@ -359,14 +397,14 @@ fn set_config_connection_field_keeps_prefix() {
     // `t.style = "a"` is a connection-line field; replacing it must keep the
     // `t.style = ` prefix, not turn into `style: `.
     let src = "t = Text {\n  value: \"x\"\n}\nt.style = \"a\"\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into(), form: None }]);
     assert!(out.contains("t.style = \"b\""), "{out}");
 }
 
 #[test]
 fn set_config_inserts_when_absent() {
     let src = "t = Text {\n  value: \"x\"\n}\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"bold\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"bold\"".into(), form: None }]);
     assert!(out.contains("style: \"bold\""), "{out}");
     parse_ok(&out);
 }
@@ -374,7 +412,7 @@ fn set_config_inserts_when_absent() {
 #[test]
 fn set_config_expands_one_liner() {
     let src = "t = Text { value: \"x\" }\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"bold\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"bold\"".into(), form: None }]);
     assert!(out.contains("value: \"x\""), "{out}");
     assert!(out.contains("style: \"bold\""), "{out}");
     parse_ok(&out);
@@ -383,7 +421,7 @@ fn set_config_expands_one_liner() {
 #[test]
 fn remove_config_drops_the_line() {
     let src = "t = Text {\n  value: \"x\"\n  style: \"bold\"\n}\n";
-    let out = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into() }]);
+    let out = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into(), form: None }]);
     assert!(!out.contains("style"), "{out}");
     assert!(out.contains("value: \"x\""), "{out}");
 }
@@ -1041,7 +1079,7 @@ fn unparseable_edit_fails_loud_not_silent() {
 
 #[test]
 fn set_config_must_not_clobber_a_wiring_edge() {
-    // Regression: a configurable input port can be driven by EITHER a config
+    // Regression: a body-settable input port can be driven by EITHER a config
     // value (`b.data = "lit"`, one endpoint) OR a real edge (`b.data = a.value`,
     // two endpoints). SetConfig/RemoveConfig only edit the one-endpoint
     // config-origin form; a real edge into the same port must be left intact, not
@@ -1050,19 +1088,19 @@ fn set_config_must_not_clobber_a_wiring_edge() {
     let src = "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value\n";
     // SetConfig on the wired port must ADD a config field, never touch the edge.
     let (out, _) = apply_edits(src, None, "Untitled",
-        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into() }]).expect("set config");
+        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into(), form: None }]).expect("set config");
     assert!(out.contains("b.data = a.value"), "wiring edge survives SetConfig: {out}");
     parse_ok(&out);
     // RemoveConfig on the wired port must NOT delete the edge.
     let (out2, _) = apply_edits(src, None, "Untitled",
-        &[EditOp::RemoveConfig { node: "b".into(), key: "data".into() }]).expect("remove config");
+        &[EditOp::RemoveConfig { node: "b".into(), key: "data".into(), form: None }]).expect("remove config");
     assert!(out2.contains("b.data = a.value"), "wiring edge survives RemoveConfig: {out2}");
     parse_ok(&out2);
 
     // The genuine config-origin form (one endpoint) is still edited in place.
     let cfg = "b = Debug\nb.data = \"old\"\n";
     let (out3, _) = apply_edits(cfg, None, "Untitled",
-        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"new\"".into() }]).expect("set config-origin");
+        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"new\"".into(), form: None }]).expect("set config-origin");
     assert!(out3.contains("b.data = \"new\"") && !out3.contains("\"old\""), "config-origin edited in place: {out3}");
     parse_ok(&out3);
 }
@@ -1079,12 +1117,12 @@ fn set_config_must_not_clobber_an_inline_expression() {
     let src = "b = Debug\nb.data = Upper { text: \"hi\" }.out\n";
     // SetConfig adds a separate config field; the inline-expr wiring is untouched.
     let (out, _) = apply_edits(src, None, "Untitled",
-        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into() }]).expect("set config");
+        &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into(), form: None }]).expect("set config");
     assert!(out.contains("Upper { text: \"hi\" }.out"), "inline-expr subgraph survives SetConfig: {out}");
     parse_ok(&out);
     // RemoveConfig must NOT delete the inline-expr wiring.
     let (out2, _) = apply_edits(src, None, "Untitled",
-        &[EditOp::RemoveConfig { node: "b".into(), key: "data".into() }]).expect("remove config");
+        &[EditOp::RemoveConfig { node: "b".into(), key: "data".into(), form: None }]).expect("remove config");
     assert!(out2.contains("Upper { text: \"hi\" }.out"), "inline-expr subgraph survives RemoveConfig: {out2}");
     parse_ok(&out2);
 }
@@ -1107,7 +1145,7 @@ fn edit_inside_anonymous_root_resolves_by_source_id() {
         src,
         None,
         "MyCleaner",
-        &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into() }],
+        &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into(), form: None }],
     )
     .expect("edit by source-id-scoped id resolves");
     assert!(out.contains("value: \"y\""), "root child config updated: {out}");
@@ -1121,7 +1159,7 @@ fn edit_inside_anonymous_root_resolves_by_source_id() {
         src,
         None,
         "Untitled",
-        &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into() }],
+        &[EditOp::SetConfig { node: "MyCleaner.strip".into(), key: "value".into(), value: "\"y\"".into(), form: None }],
     )
     .unwrap_err();
     assert!(matches!(err, EditError::AmbiguousId(_) | EditError::NodeNotFound(_)), "{err:?}");
@@ -1235,7 +1273,7 @@ fn ambiguous_bare_id_fails_loud() {
     // Two `t` in different groups: a bare `t` op must error, never guess + splice
     // the wrong node.
     let src = "g1 = Group() -> () {\n  t = Text { value: \"a\" }\n}\ng2 = Group() -> () {\n  t = Text { value: \"b\" }\n}\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"z\"".into() }]).unwrap_err();
+    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"z\"".into(), form: None }]).unwrap_err();
     assert!(matches!(err, EditError::AmbiguousId(_)), "{err:?}");
 }
 
@@ -1373,7 +1411,7 @@ fn every_name_written_into_source_is_guarded() {
         two,
         None,
         "Untitled",
-        &[EditOp::SetConfig { node: "a".into(), key: inject.into(), value: "1".into() }],
+        &[EditOp::SetConfig { node: "a".into(), key: inject.into(), value: "1".into(), form: None }],
     )
     .unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "config key: {err:?}");
@@ -1438,7 +1476,7 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
             two,
             None,
             "Untitled",
-            &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: harmful.into() }],
+            &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: harmful.into(), form: None }],
         )
         .unwrap_err();
         assert!(matches!(err, EditError::InvalidArgument(_)), "config value {harmful:?}: {err:?}");
@@ -1469,7 +1507,7 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
                 two,
                 None,
                 "Untitled",
-                &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: ok.into() }],
+                &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: ok.into(), form: None }],
             )
             .is_ok(),
             "value {ok:?} must be accepted"
@@ -1522,7 +1560,7 @@ fn keyword_shaped_names_are_refused() {
             src,
             None,
             "Untitled",
-            &[EditOp::SetConfig { node: "a".into(), key: kw.into(), value: "1".into() }],
+            &[EditOp::SetConfig { node: "a".into(), key: kw.into(), value: "1".into(), form: None }],
         )
         .unwrap_err();
         assert!(matches!(err, EditError::InvalidArgument(_)), "config key {kw:?}: {err:?}");
@@ -1624,7 +1662,7 @@ b = Debug {
   data: \"target\"
 }
 ";
-    let out = apply(src, vec![EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"changed\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"changed\"".into(), form: None }]);
     // Everything before `b`'s body is byte-identical.
     let untouched_prefix = src.split("b = Debug").next().unwrap();
     assert!(out.starts_with(untouched_prefix), "bytes before the edit are identical:\n{out}");
@@ -1639,7 +1677,7 @@ fn error_line_numbers_outside_edit_are_stable() {
     // We assert by line position: the line index of an early marker is unchanged.
     let src = "a = Text {\n  value: \"x\"\n}\nb = Debug {\n  data: \"y\"\n}\n";
     let a_line_before = src.lines().position(|l| l.contains("a = Text")).unwrap();
-    let out = apply(src, vec![EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"z\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"z\"".into(), form: None }]);
     let a_line_after = out.lines().position(|l| l.contains("a = Text")).unwrap();
     assert_eq!(a_line_before, a_line_after, "earlier line numbers unchanged by a later edit:\n{out}");
 }
@@ -1649,7 +1687,7 @@ fn comment_adjacent_to_edit_survives() {
     // A comment immediately above and a trailing comment on the edited node both
     // survive the edit (trivia attachment is structural, not luck).
     let src = "# documents t\nt = Text {\n  value: \"x\"  # inline note\n}\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"y\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"y\"".into(), form: None }]);
     assert!(out.contains("# documents t"), "leading comment survives: {out}");
     assert!(out.contains("# inline note"), "trailing inline comment survives: {out}");
     assert!(out.contains("value: \"y\""), "{out}");
@@ -1729,13 +1767,13 @@ fn edit_soak_never_corrupts() {
         for _ in 0..4 {
             let op = match next() % 23 {
                 0 => EditOp::AddNode { id: format!("n{}", next() % 1000), node_type: "Debug".into(), parent_group: None },
-                1 => EditOp::SetConfig { node: pick(next(), &targets), key: "value".into(), value: format!("\"{}\"", next() % 100) },
+                1 => EditOp::SetConfig { node: pick(next(), &targets), key: "value".into(), value: format!("\"{}\"", next() % 100), form: None },
                 2 => EditOp::AddGroup { label: format!("grp{}", next() % 1000), parent_group: None },
                 3 => EditOp::RemoveNode { node: pick(next(), &targets) },
                 4 => EditOp::SetLabel { node: pick(next(), &targets), label: Some(format!("L{}", next() % 100)) },
                 5 => EditOp::AddEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
                 6 => EditOp::RemoveEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
-                7 => EditOp::RemoveConfig { node: pick(next(), &targets), key: "value".into() },
+                7 => EditOp::RemoveConfig { node: pick(next(), &targets), key: "value".into(), form: None },
                 8 => EditOp::RemoveGroup { group: pick(next(), &targets) },
                 9 => EditOp::RenameGroup { group: pick(next(), &targets), new_label: format!("r{}", next() % 1000) },
                 10 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
@@ -1822,16 +1860,16 @@ fn set_config_does_not_double_indent_or_compound() {
     // Replacing a field must swap only the value, not re-emit leading indent
     // (which doubled it, compounding on every edit).
     let src = "n = Text {\n  value: \"x\"\n}\n";
-    let o1 = apply(src, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"y\"".into() }]);
+    let o1 = apply(src, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"y\"".into(), form: None }]);
     assert_eq!(o1, "n = Text {\n  value: \"y\"\n}\n");
-    let o2 = apply(&o1, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"z\"".into() }]);
+    let o2 = apply(&o1, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"z\"".into(), form: None }]);
     assert_eq!(o2, "n = Text {\n  value: \"z\"\n}\n", "indent must not compound");
 }
 
 #[test]
 fn set_config_preserves_trailing_comment() {
     let src = "n = Text {\n  value: \"x\"  # keep me\n}\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"y\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"y\"".into(), form: None }]);
     assert_eq!(out, "n = Text {\n  value: \"y\"  # keep me\n}\n");
 }
 
@@ -1839,7 +1877,7 @@ fn set_config_preserves_trailing_comment() {
 fn set_config_connection_origin_keeps_newline() {
     // Editing `t.style = "a"` must not eat the leading newline.
     let src = "t = Text { value: \"x\" }\nt.style = \"a\"\n";
-    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into() }]);
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into(), form: None }]);
     assert_eq!(out, "t = Text { value: \"x\" }\nt.style = \"b\"\n");
 }
 
@@ -1872,11 +1910,11 @@ fn insert_and_replace_config_value_agree_on_containment() {
     let bad = "}}}";
     // INSERT path: the key doesn't exist yet -> insert_field.
     let insert_err = apply_edits("n = Text {}\n", None, "Untitled",
-        &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into() }]).unwrap_err();
+        &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into(), form: None }]).unwrap_err();
     assert!(matches!(insert_err, EditError::InvalidArgument(_)), "insert must reject uncontained value: {insert_err:?}");
     // REPLACE path: the key already exists -> replace_value_after.
     let replace_err = apply_edits("n = Text { k: \"old\" }\n", None, "Untitled",
-        &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into() }]).unwrap_err();
+        &[EditOp::SetConfig { node: "n".into(), key: "k".into(), value: bad.into(), form: None }]).unwrap_err();
     assert!(matches!(replace_err, EditError::InvalidArgument(_)), "replace must reject uncontained value: {replace_err:?}");
 
     // And BOTH accept a well-formed multi-line heredoc value (its newlines live
@@ -1897,14 +1935,14 @@ fn insert_and_replace_config_value_agree_on_containment() {
 fn set_config_empty_value_does_not_collapse_brace() {
     // `value:` with no value: editing it must produce a clean field, not pull
     // the `}` onto the value line.
-    let out = apply("n = Text {\n  value:\n}\n", vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"x\"".into() }]);
+    let out = apply("n = Text {\n  value:\n}\n", vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"x\"".into(), form: None }]);
     assert_eq!(out, "n = Text {\n  value: \"x\"\n}\n");
 }
 
 #[test]
 fn set_config_oneliner_inline_value_keeps_space_before_brace() {
     let out = apply("g = Template { template: Upper { text: \"hi\" }.out }\n",
-        vec![EditOp::SetConfig { node: "g".into(), key: "template".into(), value: "\"plain\"".into() }]);
+        vec![EditOp::SetConfig { node: "g".into(), key: "template".into(), value: "\"plain\"".into(), form: None }]);
     assert_eq!(out, "g = Template { template: \"plain\" }\n");
 }
 
@@ -1916,7 +1954,7 @@ fn set_config_rejects_value_that_breaks_containment() {
     // position (an operator like `|` in a type expr, even an NBSP) is allowed:
     // it round-trips and the compiler flags an invalid value downstream.
     let src = "n = Text { value: \"x\" }\n";
-    let reject = |v: &str| apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: v.into() }]);
+    let reject = |v: &str| apply_edits(src, None, "Untitled", &[EditOp::SetConfig { node: "n".into(), key: "value".into(), value: v.into(), form: None }]);
     assert!(matches!(reject("}"), Err(EditError::InvalidArgument(_))), "bare close brace");
     assert!(matches!(reject("a\nb"), Err(EditError::InvalidArgument(_))), "raw newline");
     // A union type expression is legitimate value content, NOT rejected.
@@ -2345,9 +2383,8 @@ fn set_config_batched_multiple_keys_replace_in_place() {
 #[test]
 fn set_config_collapses_existing_duplicates() {
     // If the source already contains multiple fields with the same key (a
-    // legacy file or a state recovered from an earlier bug), set_config
-    // edits the first AND removes any duplicates so the next round-trip
-    // is clean.
+    // hand-edited file can hold anything), set_config edits the first AND
+    // removes any duplicates so the next round-trip is clean.
     let src = "my = Loop() -> () {\n  parallel: true\n  carry: []\n  carry: [\"a\"]\n}\n";
     let out = apply(src, vec![
         EditOp::SetLoopConfig { loop_id: "my".into(), key: "carry".into(), value: "[\n  \"b\"\n]".into() },
@@ -2374,8 +2411,8 @@ fn set_config_same_key_twice_in_batch() {
 fn set_config_node_same_key_twice_in_batch() {
     let src = "t = Text {\n  value: \"x\"\n}\n";
     let out = apply(src, vec![
-        EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"a\"".into() },
-        EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into() },
+        EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"a\"".into(), form: None },
+        EditOp::SetConfig { node: "t".into(), key: "style".into(), value: "\"b\"".into(), form: None },
     ]);
     parse_ok(&out);
     assert_eq!(out.matches("style:").count(), 1, "same-key batch should leave one: {out}");

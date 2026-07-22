@@ -7,10 +7,10 @@ import type { EditOp } from '../../../shared/protocol';
 const catalog: ProjectionCatalog = {
   Text: {
     defaultInputs: [],
-    defaultOutputs: [{ name: 'value', portType: 'String', required: true, configurable: false }],
+    defaultOutputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }],
   },
   Debug: {
-    defaultInputs: [{ name: 'data', portType: 'T', required: true, configurable: false }],
+    defaultInputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }],
     defaultOutputs: [],
   },
 };
@@ -37,21 +37,21 @@ function fixture(): ProjectDefinition {
       node({
         id: 'G', nodeType: 'Group', label: 'G',
         inputs: [],
-        outputs: [{ name: 'out', portType: 'String', required: true, configurable: false }],
+        outputs: [{ name: 'out', portType: 'String', required: true, literal: 'none' }],
       }),
       node({
         id: 'G.inner_text', nodeType: 'Text', label: null, parentId: 'G',
         config: { parentId: 'G' }, scope: ['G'],
-        outputs: [{ name: 'value', portType: 'String', required: true, configurable: false }],
+        outputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }],
       }),
       node({
         id: 'text_1', nodeType: 'Text',
-        outputs: [{ name: 'value', portType: 'String', required: true, configurable: false }],
+        outputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }],
         config: { text: 'hello' },
       }),
       node({
         id: 'debug_1', nodeType: 'Debug',
-        inputs: [{ name: 'data', portType: 'T', required: true, configurable: false }],
+        inputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }],
       }),
     ],
     edges: [
@@ -272,7 +272,7 @@ describe('applyOpsToProject: moves', () => {
     expect(p.nodes.some((n) => n.id === 'H.G.inner_text')).toBe(true);
     expect(p.edges.some((e) => e.source === 'H.G.inner_text' && e.target === 'H.G' && e.targetHandle === 'out__inner')).toBe(true);
     // Wire G's out into the parent scope: now it has an external leg and can't move back out.
-    p.nodes.push(node({ id: 'H.debug_9', nodeType: 'Debug', parentId: 'H', config: { parentId: 'H' }, inputs: [{ name: 'data', portType: 'T', required: true, configurable: false }] }));
+    p.nodes.push(node({ id: 'H.debug_9', nodeType: 'Debug', parentId: 'H', config: { parentId: 'H' }, inputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }] }));
     p.edges.push({ id: 'x', source: 'H.G', target: 'H.debug_9', sourceHandle: 'out', targetHandle: 'data' });
     expect(() => applyOpsToProject(p, ops({ op: 'moveGroupScope', group: 'H.G', targetGroup: null }), catalog))
       .toThrow(/connections/);
@@ -318,16 +318,16 @@ describe('loop carry ghost inputs', () => {
 			nodes: [
 				node({
 					id: 'seed', nodeType: 'Text',
-					outputs: [{ name: 'value', portType: 'Number', required: true, configurable: false }],
+					outputs: [{ name: 'value', portType: 'Number', required: true, literal: 'none' }],
 				}),
 				node({
 					id: 'L', nodeType: 'Loop', label: 'L',
 					config: { carry: ['acc'] },
 					inputs: [
-						{ name: 'items', portType: 'List[Number]', required: true, configurable: false },
-						{ name: 'acc', portType: 'Number', required: true, configurable: false, synthesizedFromCarry: true },
+						{ name: 'items', portType: 'List[Number]', required: true, literal: 'none' },
+						{ name: 'acc', portType: 'Number', required: true, literal: 'none', synthesizedFromCarry: true },
 					],
-					outputs: [{ name: 'acc', portType: 'Number', required: true, configurable: false }],
+					outputs: [{ name: 'acc', portType: 'Number', required: true, literal: 'none' }],
 				}),
 			],
 			edges: [
@@ -350,7 +350,7 @@ describe('loop carry ghost inputs', () => {
 		const base = loopFixture();
 		base.nodes.find((n) => n.id === 'L')!.config.carry = [];
 		base.nodes.find((n) => n.id === 'L')!.inputs = [
-			{ name: 'items', portType: 'List[Number]', required: true, configurable: false },
+			{ name: 'items', portType: 'List[Number]', required: true, literal: 'none' },
 		];
 		base.edges = [];
 		const p = applyOpsToProject(base, ops(
@@ -510,5 +510,43 @@ describe('foldOps', () => {
     ], catalog);
     expect(result.dropped).toHaveLength(0);
     expect(result.project.nodes.some((n) => n.id === 'text_9')).toBe(true);
+  });
+});
+
+describe('portLiterals projection', () => {
+  it('a setConfig(form inline) on an anywhere-placement port homes in portLiterals and survives folding', () => {
+    const project: ProjectDefinition = {
+      id: 'p', createdAt: '', updatedAt: '',
+      nodes: [node({
+        id: 'orc', nodeType: 'OpenRouterConfig',
+        inputs: [{ name: 'systemPrompt', portType: 'String', required: false, literal: 'anywhere' }],
+      })],
+      edges: [],
+    } as unknown as ProjectDefinition;
+    const pending: PendingOp[] = [{
+      opId: '1',
+      ops: [{ op: 'setConfig', node: 'orc', key: 'systemPrompt', value: '"test"', form: 'inline' } as EditOp],
+    } as unknown as PendingOp];
+    const folded = foldOps(project, pending, catalog);
+    expect(folded.dropped).toEqual([]);
+    const n = folded.project.nodes.find((x) => x.id === 'orc')!;
+    expect(n.portLiterals).toEqual({ systemPrompt: 'test' });
+    expect(n.config).toEqual({});
+  });
+
+  it('truth-side portLiterals survive a fold with no pending ops', () => {
+    const project: ProjectDefinition = {
+      id: 'p', createdAt: '', updatedAt: '',
+      nodes: [node({
+        id: 'orc', nodeType: 'OpenRouterConfig',
+        inputs: [{ name: 'systemPrompt', portType: 'String', required: false, literal: 'anywhere' }],
+        portLiterals: { systemPrompt: 'test' },
+        portLiteralSpans: { systemPrompt: { span: { startLine: 7, startColumn: 2, endLine: 7, endColumn: 44 }, origin: 'inline' } },
+      })],
+      edges: [],
+    } as unknown as ProjectDefinition;
+    const folded = foldOps(project, [], catalog);
+    const n = folded.project.nodes.find((x) => x.id === 'orc')!;
+    expect(n.portLiterals).toEqual({ systemPrompt: 'test' });
   });
 });

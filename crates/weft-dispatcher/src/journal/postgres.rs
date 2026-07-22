@@ -328,6 +328,11 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             drain_claimed_by TEXT,
             consumer_kind TEXT,
             tags TEXT[] NOT NULL DEFAULT '{}',
+            -- The trigger's delivered port values at registration time
+            -- (entry signals only). Replayed onto the trigger's ports at
+            -- every fire: a trigger's inputs are whatever they were at
+            -- trigger setup.
+            port_snapshot JSONB,
             consumer_payload TEXT,
             surface_kind TEXT NOT NULL DEFAULT 'task_callback',
             mount_path TEXT,
@@ -935,16 +940,17 @@ impl Journal for PostgresJournal {
         let res = sqlx::query(
             "INSERT INTO signal \
              (token, tenant_id, project_id, color, node_id, is_resume, \
-              spec_json, created_at, consumer_kind, tags, consumer_payload, \
+              spec_json, created_at, consumer_kind, tags, port_snapshot, consumer_payload, \
               surface_kind, mount_path, auth_kind, auth_config, kind_state, \
               listener_pod, placement_generation) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                    $17, $18 \
-             WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $17) \
+                    $17, $18, $19 \
+             WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $18) \
              ON CONFLICT (token) DO UPDATE SET \
                  spec_json = EXCLUDED.spec_json, \
                  consumer_kind = EXCLUDED.consumer_kind, \
                  tags = EXCLUDED.tags, \
+                 port_snapshot = EXCLUDED.port_snapshot, \
                  consumer_payload = EXCLUDED.consumer_payload, \
                  surface_kind = EXCLUDED.surface_kind, \
                  mount_path = EXCLUDED.mount_path, \
@@ -964,6 +970,7 @@ impl Journal for PostgresJournal {
         .bind(crate::lease::now_unix())
         .bind(sig.consumer_kind.as_deref())
         .bind(&sig.tags)
+        .bind(sig.port_snapshot.as_ref())
         .bind(payload_str)
         .bind(&sig.surface_kind)
         .bind(sig.mount_path.as_deref())
@@ -1044,31 +1051,31 @@ impl Journal for PostgresJournal {
 
 const SIGNAL_SELECT_WHERE_TOKEN: &str =
     "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
-     spec_json, consumer_kind, tags, consumer_payload, \
+     spec_json, consumer_kind, tags, port_snapshot, consumer_payload, \
      surface_kind, mount_path, auth_kind, auth_config, kind_state \
      FROM signal WHERE token = $1";
 
 const SIGNAL_SELECT_WHERE_PROJECT: &str =
     "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
-     spec_json, consumer_kind, tags, consumer_payload, \
+     spec_json, consumer_kind, tags, port_snapshot, consumer_payload, \
      surface_kind, mount_path, auth_kind, auth_config, kind_state \
      FROM signal WHERE project_id = $1";
 
 const SIGNAL_DELETE_BY_COLOR_RETURNING: &str =
     "DELETE FROM signal WHERE color = $1 RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, consumer_kind, tags, \
+     node_id, is_resume, spec_json, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
      auth_kind, auth_config, kind_state";
 
 const SIGNAL_DELETE_BY_PROJECT_RETURNING: &str =
     "DELETE FROM signal WHERE project_id = $1 RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, consumer_kind, tags, \
+     node_id, is_resume, spec_json, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
      auth_kind, auth_config, kind_state";
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     "DELETE FROM signal WHERE token = ANY($1) RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, consumer_kind, tags, \
+     node_id, is_resume, spec_json, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
      auth_kind, auth_config, kind_state";
 
@@ -1085,6 +1092,7 @@ struct SignalRow {
     spec_json: String,
     consumer_kind: Option<String>,
     tags: Vec<String>,
+    port_snapshot: Option<serde_json::Value>,
     consumer_payload: Option<String>,
     surface_kind: String,
     mount_path: Option<String>,
@@ -1122,6 +1130,7 @@ fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
         spec_json: row.spec_json,
         consumer_kind: row.consumer_kind,
         tags: row.tags,
+        port_snapshot: row.port_snapshot,
         consumer_payload,
         surface_kind: row.surface_kind,
         mount_path: row.mount_path,

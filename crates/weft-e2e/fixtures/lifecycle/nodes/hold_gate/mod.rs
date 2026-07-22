@@ -11,7 +11,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::node::NodeOutput;
 use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
@@ -23,9 +22,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 #[async_trait]
 impl Node for HoldGateNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let url: String = ctx.config.get("url")?;
-        let client = reqwest::Client::new();
+        let client = ctx.http();
         loop {
             // Transient errors (fake not yet up, connection blip) just poll
             // again: the gate's contract is "held until released", and the
@@ -40,7 +39,6 @@ impl Node for HoldGateNode {
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
-        ctx.pulse_downstream(NodeOutput::empty().set("done", Value::String("released".into())))
-            .await
+        ctx.pulse_downstream(NodeOutput::new().set("done", "released")).await
     }
 }

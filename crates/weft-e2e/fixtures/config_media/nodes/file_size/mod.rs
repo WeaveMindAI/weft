@@ -8,7 +8,6 @@
 //! asserts the count equals the payload it wrote, closing the loop.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::node::NodeOutput;
 use weft_core::storage::StorageScope;
@@ -19,17 +18,12 @@ pub struct FileSizeNode;
 
 #[async_trait]
 impl Node for FileSizeNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // The file value the resolved `@asset` config produced arrives on the
         // `file` port exactly like a wired media value; `get_bytes` reads the
         // bytes behind its handle (bucket key or URL) via the storage handle.
-        let file = ctx.input.raw("file").cloned().ok_or_else(|| {
-            weft_core::WeftError::NodeExecution("FileSize: no `file` input present".into())
-        })?;
+        let file: serde_json::Value = ctx.ports.get("file")?;
         let (_meta, bytes) = ctx.storage(StorageScope::Project).get_bytes(&file).await?;
-        ctx.pulse_downstream(
-            NodeOutput::empty().set("size", Value::from(bytes.len() as u64)),
-        )
-        .await
+        ctx.pulse_downstream(NodeOutput::new().set("size", bytes.len() as u64)).await
     }
 }

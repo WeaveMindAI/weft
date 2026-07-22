@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::weft_type::WeftType;
+use crate::weft_type::{LiteralPlacement, WeftType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
@@ -186,7 +186,7 @@ pub struct NodeDefinition {
     /// need a registry lookup per node.
     #[serde(default)]
     pub features: crate::node::NodeFeatures,
-    /// `true` if this node implements `Node::provision` and the
+    /// `true` if this node implements `Node::provision_infra` and the
     /// dispatcher must run InfraSetup before activate. Mirrored from
     /// NodeMetadata.requires_infra at enrich time.
     #[serde(default, rename = "requiresInfra")]
@@ -212,6 +212,26 @@ pub struct NodeDefinition {
     /// config block.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "configSpans")]
     pub config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// Body values that DRIVE INPUT PORTS, keyed by port name: the value
+    /// behind `n.x = 5` (the assignment form) or `M { x: 5 }` (the braces
+    /// form, `literal: anywhere` ports only). Moved out of `config` by
+    /// the enrich normalization the moment the full port list is known,
+    /// so a name has ONE home: a port's value lives here (the engine
+    /// feeds it onto the port), a config field's value lives in `config`,
+    /// and a braces-closed port may coexist with a same-named field
+    /// without colliding.
+    // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts NodeDefinition.portLiterals
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiterals")]
+    pub port_literals: std::collections::BTreeMap<String, Value>,
+    /// Source ranges + written form for `port_literals` entries, keyed by
+    /// port name. Separate from `config_spans` because a braces-closed
+    /// port's literal and a same-named config field each need their own
+    /// span. The `origin` is the form the assignment is WRITTEN in
+    /// (`Connection` = statement form, `Inline` = braces form), which is
+    /// what the editor's form-toggle rewrites.
+    // SYNC: port_literal_spans <-> packages/weft-graph/src/protocol.ts NodeDefinition.portLiteralSpans
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiteralSpans")]
+    pub port_literal_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
     /// File-backed config fields, keyed by field name. Present when a field
     /// value came from `@file("path", Type)`. `config` holds the resolved
     /// value; this records the source reference so the editor renders the
@@ -325,7 +345,7 @@ pub struct GroupBoundary {
 }
 
 /// Port shape on a NODE INSTANCE. This is the enriched version:
-/// TypeVars resolved, derived ports materialized, configurable
+/// TypeVars resolved, derived ports materialized, literal-placement
 /// defaults applied. Nodes declare their ports via NodeMetadata; the
 /// compiler resolves them and stores enriched port lists on the
 /// corresponding NodeDefinition at compile time. Runtime executes
@@ -338,18 +358,17 @@ pub struct PortDefinition {
     pub required: bool,
     #[serde(default)]
     pub description: Option<String>,
-    /// Whether this port can be filled by a same-named config field on
-    /// the node instead of a wired edge.
-    #[serde(default = "default_configurable")]
-    pub configurable: bool,
+    /// Where a literal value may be written for this port (resolved
+    /// from the metadata's explicit level or the type default).
+    // SYNC: PortDefinition.literal <-> packages/weft-graph/src/protocol.ts PortDefinition literal
+    #[serde(default)]
+    pub literal: LiteralPlacement,
     /// True for the auto-synthesized INPUT half of a loop carry port.
     /// The editor uses this to render it as a non-editable ghost mirroring
     /// the carry output of the same name. Never set on a user-declared port.
     #[serde(default, rename = "synthesizedFromCarry", skip_serializing_if = "std::ops::Not::not")]
     pub synthesized_from_carry: bool,
 }
-
-fn default_configurable() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -510,7 +529,7 @@ mod project_wire_tests {
             port_type: WeftType::primitive(crate::weft_type::WeftPrimitive::String),
             required: true,
             description: None,
-            configurable: false,
+            literal: crate::weft_type::LiteralPlacement::Assignment,
             synthesized_from_carry: false,
         };
         let node = NodeDefinition {
@@ -529,6 +548,8 @@ mod project_wire_tests {
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
             config_spans: Default::default(),
+            port_literals: Default::default(),
+            port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
         };
@@ -603,6 +624,8 @@ mod project_wire_tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            port_literals: Default::default(),
+            port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
         }

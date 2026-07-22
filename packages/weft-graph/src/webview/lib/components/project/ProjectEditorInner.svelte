@@ -13,7 +13,7 @@
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf } from "../../types";
+	import { isContainerNodeType, isLoopNodeType, containerKindOf, portLiteralPlacement } from "../../types";
 	import type { EditOp, TextEdit } from "../../../../shared/protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
@@ -23,7 +23,7 @@
 	import { formatConfigValue } from "../../value-format";
 	import { measureTextWidth, nodeLabelFont } from "../../utils/measure-text";
 	import { foldOps } from "../../projection/apply";
-	import { diffConfigOps, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
+	import { diffConfigOps, sameConfigValue, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
 	import { ProjectionEngine } from "../../projection/engine.svelte";
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
@@ -523,8 +523,8 @@
 	 *  execution row: one distinct origin passes through, disagreeing
 	 *  members read 'mixed', no cost records means no origin. */
 	function groupCostOrigin(
-		members: { costOrigin?: 'user-provided' | 'deployment' | 'mixed' }[],
-	): 'user-provided' | 'deployment' | 'mixed' | undefined {
+		members: { costOrigin?: 'user-provided' | 'runtime' | 'mixed' }[],
+	): 'user-provided' | 'runtime' | 'mixed' | undefined {
 		const origins = new Set(
 			members.map((e) => e.costOrigin).filter((o) => o !== undefined),
 		);
@@ -791,6 +791,42 @@
 					};
 					hasLayout = true;
 				}
+			}
+			if ('portLiterals' in updates && updates.portLiterals) {
+				// Port-driven values: diff against the PROJECTION's portLiterals
+				// (the same truth the fields render from) into setConfig ops
+				// stamped with each value's current written form, so an edit
+				// rewrites the value where it lives (braces vs statement) and a
+				// wired-only port's same-named config field is never touched.
+				const foldNode = fold.project.nodes.find((n) => n.id === nodeId);
+				const current = (foldNode?.portLiterals as Record<string, unknown> | undefined) ?? {};
+				const spans = (foldNode?.portLiteralSpans as Record<string, { origin: 'inline' | 'connection' }> | undefined) ?? {};
+				// A value not yet in source takes the braces form, except on an
+				// assignment-only port, where the statement form is the only
+				// legal one.
+				const defaultForm = (key: string): 'inline' | 'connection' => {
+					const port = foldNode?.inputs.find((p) => p.name === key);
+					return port !== undefined && portLiteralPlacement(port) !== 'anywhere' ? 'connection' : 'inline';
+				};
+				for (const [key, value] of Object.entries(updates.portLiterals)) {
+					if (sameConfigValue(value, current[key])) continue;
+					const form = spans[key]?.origin ?? defaultForm(key);
+					if (value === undefined || value === null) {
+						ops.push({ op: 'removeConfig', node: nodeId, key, form });
+					} else {
+						ops.push({ op: 'setConfig', node: nodeId, key, value: formatConfigValue(value), form });
+					}
+				}
+				// A key REMOVED from the update map is a cleared literal.
+				for (const key of Object.keys(current)) {
+					if (!(key in updates.portLiterals)) {
+						ops.push({ op: 'removeConfig', node: nodeId, key, form: spans[key]?.origin ?? defaultForm(key) });
+					}
+				}
+			}
+			if ('portValueForm' in updates && updates.portValueForm) {
+				const { key, form } = updates.portValueForm;
+				ops.push({ op: 'setValueForm', node: nodeId, key, form });
 			}
 			if ('inputs' in updates || 'outputs' in updates) {
 				const node = nodes.find(n => n.id === nodeId);
@@ -1114,6 +1150,11 @@
 						: n.config,
 					inputs: n.inputs,
 					outputs: n.outputs,
+					// Body-set port values + their written forms, the two-home
+					// twin of `config` (ProjectNode renders these as the
+					// marker-carrying port fields).
+					portLiterals: (n as typeof n & { portLiterals?: Record<string, unknown> }).portLiterals,
+					portLiteralSpans: (n as typeof n & { portLiteralSpans?: Record<string, unknown> }).portLiteralSpans,
 					features: n.features,
 					includePath: (n as typeof n & { includePath?: string }).includePath,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
@@ -2268,6 +2309,21 @@
 		}
 	}
 	
+	// The reconnect twin of onBeforeConnect: xyflow calls this BEFORE it
+	// rewires the edge in its (two-way-bound) edges array, so returning
+	// null here is the only veto point that leaves the old edge painted.
+	// A veto also marks the gesture handled: with the rewire blocked,
+	// onreconnect never runs, and without the flag onReconnectEnd would
+	// read the drop as landed-on-empty and delete the edge.
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	function onBeforeReconnect(newEdge: any): any {
+		if (vetoLiteralDrivenTarget(newEdge.target, newEdge.targetHandle)) {
+			reconnectSuccessful = true;
+			return null;
+		}
+		return newEdge;
+	}
+
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnect(oldEdge: any, newConnection: any) {
 		if (simplified) return; // no wiring edits in simplified view
@@ -2337,9 +2393,27 @@
 		}
 	}
 
+	// One driver per port: a target port already driven by a body-set
+	// literal cannot ALSO take a wire. The compile rejects it
+	// (`double-driven-port`); every wire-landing gesture (fresh connect,
+	// reconnect) vetoes through here with a toast so the user never
+	// authors the error. A container's self-referencing input handle
+	// carries an `__inner` suffix; portLiterals is keyed by bare port
+	// name. Returns true when the drop was vetoed.
+	function vetoLiteralDrivenTarget(target: string, targetHandle: string | null | undefined): boolean {
+		const targetPort = (targetHandle || 'value').replace(/__inner$/, '');
+		const targetNode = fold.project.nodes.find((n) => n.id === target);
+		const literal = (targetNode?.portLiterals as Record<string, unknown> | undefined)?.[targetPort];
+		if (literal === undefined || literal === null) return false;
+		toast.error(`'${targetPort}' is driven by a config assignment; unset it first to drive it with an edge.`);
+		return true;
+	}
+
 	function onBeforeConnect(connection: Connection): Edge | null {
 		// Clear pending connection since we're making a real connection
 		pendingConnection = null;
+
+		if (vetoLiteralDrivenTarget(connection.target!, connection.targetHandle)) return null;
 
 		// Record the intent and let the PROJECTION add the edge: preflight
 		// rejects cycles/locks with a toast, the apply mirrors the server's
@@ -3158,6 +3232,7 @@
 				onconnectend={onConnectEnd}
 				onbeforeconnect={onBeforeConnect}
 				onreconnectstart={onReconnectStart}
+				onbeforereconnect={onBeforeReconnect}
 				onreconnect={onReconnect}
 				onreconnectend={onReconnectEnd}
 				onnodeclick={onNodeClick}

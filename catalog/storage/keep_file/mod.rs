@@ -15,22 +15,20 @@ pub struct KeepFileNode;
 
 #[async_trait]
 impl Node for KeepFileNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let file = ctx.input.raw("file").cloned().ok_or_else(|| {
-            weft_core::WeftError::Input("KeepFile: no value on input port 'file'".into())
-        })?;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let file: serde_json::Value = ctx.ports.get("file")?;
         // 0 days = never expire; otherwise a fixed-day window that any
         // access renews. The scope is Execution because keep only
         // applies there (the box rejects keep on project/shared keys);
         // the key itself carries its scope, so the handle's scope here
         // is just the verb's home.
-        let ttl_days: u64 = ctx.config.get("ttl_days").unwrap_or(30);
+        let ttl_days: u64 = ctx.config.get_or("ttl_days", 30)?;
         let ttl = if ttl_days == 0 {
             KeepTtl::Never
         } else {
             KeepTtl::Secs { secs: ttl_days * 24 * 3600 }
         };
         ctx.storage(StorageScope::Execution).keep(&file, ttl).await?;
-        ctx.pulse_downstream(NodeOutput::with("file", file)).await
+        ctx.pulse_downstream(NodeOutput::new().set("file", file)).await
     }
 }

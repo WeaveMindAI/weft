@@ -8,13 +8,17 @@
 # CLI packs it into the broker's secret); the cheapest model keeps the run
 # nearly free.
 
-ask = OpenRouterInference -> (response: String) {
+cfg = OpenRouterConfig {
   model: "openai/gpt-4.1-nano",
   systemPrompt: "You answer with exactly one word, lowercase, no punctuation.",
-  prompt: "What color is a clear midday sky? Answer with one word.",
   temperature: 0.0,
   maxTokens: 16
 }
+
+ask = OpenRouterInference -> (response: String) {
+  prompt: "What color is a clear midday sky? Answer with one word."
+}
+ask.config = cfg.config
 
 out = Debug
 out.data = ask.response

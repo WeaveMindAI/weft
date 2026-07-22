@@ -17,6 +17,7 @@
 	let {
 		fields,
 		config,
+		portValues,
 		idPrefix,
 		onUpdate,
 		customFieldKeys,
@@ -30,13 +31,20 @@
 	}: {
 		fields: FieldDefinition[];
 		config: Record<string, unknown>;
+		/// Values for PORT-DRIVEN fields (`field.portDriven`): the node's
+		/// portLiterals map. Separate from `config` because a wired-only
+		/// port's literal may legally coexist with a same-named config
+		/// field, each with its own value.
+		portValues?: Record<string, unknown>;
 		/// Used to build unique DOM ids per field. Pass the owning
 		/// node's id; the strip prefixes `${idPrefix}-field-${key}`.
 		idPrefix: string;
-		/// Called when a field's value changes. The parent decides how
-		/// to plumb it (typically to data.onUpdate so the round-trip
-		/// turns into setConfig EditOps).
-		onUpdate: (key: string, value: unknown) => void;
+		/// Called when a field's value changes. `portDriven` says which
+		/// home the key lives in so the parent routes the write (a port
+		/// literal vs a config field). The parent decides how to plumb it
+		/// (typically to data.onUpdate so the round-trip turns into
+		/// setConfig EditOps).
+		onUpdate: (key: string, value: unknown, portDriven?: boolean) => void;
 		/// Keys the parent renders itself (api_key / form_builder /
 		/// code / file-backed). The strip skips them as primitives and
 		/// hands each to `renderCustom` instead.
@@ -92,28 +100,51 @@
 	const fieldEditorRegistry = useFieldEditorRegistry();
 	$effect(() => fieldEditorRegistry?.register(fieldEditor.flush));
 
-	function getDisplayValue(key: string): string {
-		const override = displayValueOf?.(key);
-		if (override !== undefined) return fieldEditor.display(key, override);
-		const v = config?.[key];
+	/// The field's stored value, routed by its home: a port-driven field
+	/// reads `portValues`, a config field reads `config`. This is the ONE
+	/// value lookup; every control below goes through it.
+	function fieldValue(field: FieldDefinition): unknown {
+		return field.portDriven ? portValues?.[field.key] : config?.[field.key];
+	}
+
+	/// The field's identity for DOM ids and the debounced field editor.
+	/// Port-driven fields are prefixed so the legal same-name duplicate (a
+	/// wired-only port's literal next to a same-named config field) gets
+	/// two independent editors and two DOM ids.
+	function fieldKey(field: FieldDefinition): string {
+		return field.portDriven ? `port:${field.key}` : field.key;
+	}
+
+	function domId(field: FieldDefinition): string {
+		return `${idPrefix}-field-${field.portDriven ? 'port-' : ''}${field.key}`;
+	}
+
+	function getDisplayValue(field: FieldDefinition): string {
+		const k = fieldKey(field);
+		// The override reads the CONFIG home (file-backed field content).
+		// A port-driven row shows its own literal, even when a same-named
+		// file-backed config field coexists.
+		const override = field.portDriven ? undefined : displayValueOf?.(field.key);
+		if (override !== undefined) return fieldEditor.display(k, override);
+		const v = fieldValue(field);
 		const storeStr = (v === undefined || v === null)
 			? ''
 			: (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
-		return fieldEditor.display(key, storeStr);
+		return fieldEditor.display(k, storeStr);
 	}
 
-	function saveFn(key: string): (value: string) => void {
-		return (value: string) => onUpdate(key, value);
+	function saveFn(field: FieldDefinition): (value: string) => void {
+		return (value: string) => onUpdate(field.key, value, field.portDriven);
 	}
 
-	function saveNumber(key: string, raw: string) {
+	function saveNumber(field: FieldDefinition, raw: string) {
 		if (raw.trim() === '') {
-			onUpdate(key, null);
+			onUpdate(field.key, null, field.portDriven);
 			return;
 		}
 		const n = Number(raw);
 		if (!Number.isFinite(n)) return;
-		onUpdate(key, n);
+		onUpdate(field.key, n, field.portDriven);
 	}
 
 	/// Observe a textarea's manual resize and report the new height so the
@@ -141,10 +172,13 @@
 	{#if customFieldKeys?.has(field.key)}
 		{@render renderCustom?.(field)}
 	{:else}
-		{@const ro = readonlyKeys?.has(field.key) ?? false}
+		<!-- readonlyKeys comes from the CONFIG home (file-backed field
+		     states); a port-driven row is never file-backed, so it never
+		     inherits a same-named config sibling's lock. -->
+		{@const ro = !field.portDriven && (readonlyKeys?.has(field.key) ?? false)}
 		<div class="space-y-1">
 			<div class="flex items-center justify-between">
-				<label for={`${idPrefix}-field-${field.key}`} class="text-[10px] text-muted-foreground font-medium block">
+				<label for={domId(field)} class="text-[10px] text-muted-foreground font-medium block">
 					{field.label}
 				</label>
 				{@render headerBadge?.(field)}
@@ -152,17 +186,17 @@
 
 			{#if field.type === 'textarea'}
 				<textarea
-					id={`${idPrefix}-field-${field.key}`}
+					id={domId(field)}
 					readonly={ro}
 					class="text-xs px-2 py-1.5 rounded border-none outline-none font-mono nodrag nopan box-border block w-full {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'}"
 					style="resize: vertical; min-height: 60px; {heights?.[field.key] ? `height: ${heights[field.key]}px;` : ''}"
 					placeholder={field.placeholder}
-					value={getDisplayValue(field.key)}
+					value={getDisplayValue(field)}
 					onfocusin={(e) => e.currentTarget.classList.add('nowheel')}
 					onfocusout={(e) => e.currentTarget.classList.remove('nowheel')}
-					onfocus={() => fieldEditor.focus(field.key, getDisplayValue(field.key))}
-					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, saveFn(field.key))}
-					onblur={() => fieldEditor.blur(field.key, saveFn(field.key))}
+					onfocus={() => fieldEditor.focus(fieldKey(field), getDisplayValue(field))}
+					oninput={(e) => fieldEditor.input(e.currentTarget.value, fieldKey(field), saveFn(field))}
+					onblur={() => fieldEditor.blur(fieldKey(field), saveFn(field))}
 					onclick={(e) => e.stopPropagation()}
 					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
 					onpaste={() => readonlyPasteDrop(field.key, ro)}
@@ -171,11 +205,11 @@
 				></textarea>
 			{:else if field.type === 'select' && field.options}
 				<select
-					id={`${idPrefix}-field-${field.key}`}
+					id={domId(field)}
 					disabled={ro}
 					class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none"
-					value={(config[field.key] as string) ?? field.options[0]}
-					onchange={(e) => onUpdate(field.key, e.currentTarget.value)}
+					value={(fieldValue(field) as string) ?? field.options[0]}
+					onchange={(e) => onUpdate(field.key, e.currentTarget.value, field.portDriven)}
 					onclick={(e) => e.stopPropagation()}
 				>
 					{#each field.options as option}
@@ -190,7 +224,7 @@
 				{:else}
 					<div class="flex flex-wrap gap-1 p-1.5 bg-muted rounded">
 						{#each field.options as option}
-							{@const current = (config[field.key] as string[] | undefined) ?? []}
+							{@const current = (fieldValue(field) as string[] | undefined) ?? []}
 							{@const isSelected = current.includes(option)}
 							<button
 								type="button"
@@ -201,7 +235,7 @@
 									const next = isSelected
 										? current.filter((v) => v !== option)
 										: [...current, option];
-									onUpdate(field.key, next);
+									onUpdate(field.key, next, field.portDriven);
 								}}
 							>
 								{option}
@@ -215,15 +249,15 @@
 						type="checkbox"
 						disabled={ro}
 						class="w-4 h-4 rounded border-muted-foreground/30 nodrag"
-						checked={config[field.key] === true}
-						onchange={(e) => onUpdate(field.key, e.currentTarget.checked)}
+						checked={fieldValue(field) === true}
+						onchange={(e) => onUpdate(field.key, e.currentTarget.checked, field.portDriven)}
 						onclick={(e) => e.stopPropagation()}
 					/>
 					<span class="text-xs text-muted-foreground">{field.description || field.label}</span>
 				</label>
 			{:else if field.type === 'number'}
 				<input
-					id={`${idPrefix}-field-${field.key}`}
+					id={domId(field)}
 					type="number"
 					readonly={ro}
 					class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none nodrag"
@@ -231,10 +265,10 @@
 					min={field.min}
 					max={field.max}
 					step={field.step}
-					value={getDisplayValue(field.key)}
-					onfocus={() => fieldEditor.focus(field.key, getDisplayValue(field.key))}
-					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, (v) => saveNumber(field.key, v))}
-					onblur={() => fieldEditor.blur(field.key, (v) => saveNumber(field.key, v))}
+					value={getDisplayValue(field)}
+					onfocus={() => fieldEditor.focus(fieldKey(field), getDisplayValue(field))}
+					oninput={(e) => fieldEditor.input(e.currentTarget.value, fieldKey(field), (v) => saveNumber(field, v))}
+					onblur={() => fieldEditor.blur(fieldKey(field), (v) => saveNumber(field, v))}
 					onclick={(e) => e.stopPropagation()}
 					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
 					onpaste={() => readonlyPasteDrop(field.key, ro)}
@@ -242,15 +276,15 @@
 				/>
 			{:else if field.type === 'password'}
 				<input
-					id={`${idPrefix}-field-${field.key}`}
+					id={domId(field)}
 					type="password"
 					readonly={ro}
 					class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none font-mono nodrag"
 					placeholder={field.placeholder}
-					value={getDisplayValue(field.key)}
-					onfocus={() => fieldEditor.focus(field.key, getDisplayValue(field.key))}
-					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, saveFn(field.key))}
-					onblur={() => fieldEditor.blur(field.key, saveFn(field.key))}
+					value={getDisplayValue(field)}
+					onfocus={() => fieldEditor.focus(fieldKey(field), getDisplayValue(field))}
+					oninput={(e) => fieldEditor.input(e.currentTarget.value, fieldKey(field), saveFn(field))}
+					onblur={() => fieldEditor.blur(fieldKey(field), saveFn(field))}
 					onclick={(e) => e.stopPropagation()}
 					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
 					onpaste={() => readonlyPasteDrop(field.key, ro)}
@@ -258,15 +292,15 @@
 				/>
 			{:else if field.type === 'text'}
 				<input
-					id={`${idPrefix}-field-${field.key}`}
+					id={domId(field)}
 					type="text"
 					readonly={ro}
 					class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
 					placeholder={field.placeholder}
-					value={getDisplayValue(field.key)}
-					onfocus={() => fieldEditor.focus(field.key, getDisplayValue(field.key))}
-					oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, saveFn(field.key))}
-					onblur={() => fieldEditor.blur(field.key, saveFn(field.key))}
+					value={getDisplayValue(field)}
+					onfocus={() => fieldEditor.focus(fieldKey(field), getDisplayValue(field))}
+					oninput={(e) => fieldEditor.input(e.currentTarget.value, fieldKey(field), saveFn(field))}
+					onblur={() => fieldEditor.blur(fieldKey(field), saveFn(field))}
 					onclick={(e) => e.stopPropagation()}
 					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
 					onpaste={() => readonlyPasteDrop(field.key, ro)}

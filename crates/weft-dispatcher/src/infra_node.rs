@@ -298,7 +298,7 @@ mod tests {
     fn failure_stage_as_str() {
         assert_eq!(FailureStage::Provision.as_str(), "provision");
         assert_eq!(FailureStage::Apply.as_str(), "apply");
-        assert_eq!(FailureStage::Execute.as_str(), "execute");
+        assert_eq!(FailureStage::Run.as_str(), "run");
         assert_eq!(FailureStage::ApplyLifecycle.as_str(), "apply_lifecycle");
     }
 }

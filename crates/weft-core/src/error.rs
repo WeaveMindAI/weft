@@ -33,6 +33,53 @@ pub enum WeftError {
 
 pub type WeftResult<T> = Result<T, WeftError>;
 
+/// The one door for wrapping an OUTSIDE error (an HTTP library, a JSON
+/// parser, any non-weft `Result`) into a node failure with context. A
+/// node body never names a `WeftError` variant: the ctx accessors stamp
+/// input/config errors themselves, every ctx handle already returns
+/// `WeftResult`, and everything else goes through `.node_err("doing X")`.
+pub trait NodeErrExt<T> {
+    /// Map the error to a node failure reading "`context`: `error`".
+    fn node_err(self, context: impl std::fmt::Display) -> WeftResult<T>;
+}
+
+impl<T, E: std::fmt::Display> NodeErrExt<T> for Result<T, E> {
+    fn node_err(self, context: impl std::fmt::Display) -> WeftResult<T> {
+        self.map_err(|e| WeftError::NodeExecution(format!("{context}: {e}")))
+    }
+}
+
+impl<T> NodeErrExt<T> for Option<T> {
+    /// `None` becomes a node failure reading exactly `context`, so the
+    /// message should state what was missing and why it matters.
+    fn node_err(self, context: impl std::fmt::Display) -> WeftResult<T> {
+        self.ok_or_else(|| WeftError::NodeExecution(context.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod node_err_tests {
+    use super::*;
+
+    #[test]
+    fn node_err_wraps_with_context_and_passes_ok_through() {
+        let ok: Result<u32, std::io::Error> = Ok(7);
+        assert_eq!(ok.node_err("reading").unwrap(), 7);
+
+        let err: Result<u32, &str> = Err("boom");
+        let e = err.node_err("sending to bridge").unwrap_err();
+        assert!(matches!(&e, WeftError::NodeExecution(m) if m == "sending to bridge: boom"), "{e}");
+    }
+
+    #[test]
+    fn node_err_turns_none_into_a_failure_with_the_message_verbatim() {
+        assert_eq!(Some(7).node_err("unused").unwrap(), 7);
+
+        let e = None::<u32>.node_err("no messageId on a media message").unwrap_err();
+        assert!(matches!(&e, WeftError::NodeExecution(m) if m == "no messageId on a media message"), "{e}");
+    }
+}
+
 #[cfg(feature = "runtime")]
 impl From<crate::caller::CallerError> for WeftError {
     /// A caller-connection failure surfaces as a node failure (fails

@@ -10,40 +10,25 @@
 //! connection.
 //!
 //! Flow:
-//!   1. Gate on `is_websocket()`.
-//!   2. `ws.ensure_connected()`.
-//!   3. Loop: `recv_next()` each message, log it, count it. Ends when the
+//!   1. `ctx.ws_caller()` (caller present, WebSocket, connected).
+//!   2. Loop: `recv_next()` each message, log it, count it. Ends when the
 //!      caller disconnects or the session cap fires.
-//!   4. Emit `count`.
+//!   3. Emit `count`.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
-use weft_core::caller::{CallerHandle, InboundMessage};
+use weft_core::caller::InboundMessage;
 use weft_core::context::LogLevel;
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LiveWsListenerNode;
 
 #[async_trait]
 impl Node for LiveWsListenerNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        if !ctx.is_websocket() {
-            return Err(WeftError::NodeExecution(
-                "LiveWsListener ran without a WebSocket live caller; wire it under a \
-                 LiveSocket trigger"
-                    .into(),
-            ));
-        }
-        let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
-            return Err(WeftError::NodeExecution(
-                "LiveWsListener: no WebSocket caller handle on this run".into(),
-            ));
-        };
-
-        ws.ensure_connected().await?;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let ws = ctx.ws_caller().await?;
 
         let mut count: u64 = 0;
         // `recv_next()` yields each message, or `None` when the stream ends
@@ -62,7 +47,6 @@ impl Node for LiveWsListenerNode {
                 .await?;
         }
 
-        ctx.pulse_downstream(NodeOutput::empty().set("count", Value::from(count)))
-            .await
+        ctx.pulse_downstream(NodeOutput::new().set("count", count)).await
     }
 }

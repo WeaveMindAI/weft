@@ -3,7 +3,7 @@
 	import { Handle, Position, useEdges, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
-	import { parseWeftType } from "../../types";
+	import { parseWeftType, portLiteralPlacement } from "../../types";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
 	import CodeEditor from "../CodeEditor.svelte";
@@ -18,6 +18,7 @@
 	import { isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { createPortContextMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
+	import { widgetForPortType } from "../../utils/port-widget";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
@@ -37,6 +38,10 @@
 			/// (status glyph, inspector, glow) are kept.
 			simplified?: boolean;
 			config: Record<string, unknown>;
+			/// Body-set PORT values + their written forms, the two-home
+			/// twin of `config` (see NodeInstance.portLiterals).
+			portLiterals?: Record<string, unknown>;
+			portLiteralSpans?: Record<string, { origin: 'inline' | 'connection' }>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: NodeFeatures;
@@ -140,49 +145,69 @@
 		return wired;
 	});
 
-	/** Input ports satisfied by a non-null config value and no edge. These
+	/** The node's body-set port values and their written forms (the
+	 *  `portLiterals` / `portLiteralSpans` maps of the definition: one
+	 *  home per name, separate from config). */
+	const portLiterals = $derived((data.portLiterals as Record<string, unknown>) ?? {});
+	const portLiteralSpans = $derived(
+		(data.portLiteralSpans as Record<string, { origin: 'inline' | 'connection' }>) ?? {},
+	);
+
+	/** Input ports satisfied by a body-set literal and no edge. These
 	 *  render with the 'empty-dotted' port marker to signal "filled from
-	 *  code" without changing the declared port type. */
-	const configFilledPorts: Set<string> = $derived.by(() => {
+	 *  code" without changing the declared port type; docking onto one is
+	 *  vetoed until the literal is unset (one driver per port). */
+	const literalFilledPorts: Set<string> = $derived.by(() => {
 		const filled = new Set<string>();
-		const cfg = (data.config as Record<string, unknown>) || {};
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as Array<{ name: string; configurable?: boolean }>;
-		for (const port of inputList) {
-			if (port.configurable === false) continue;
-			if (wiredInputPorts.has(port.name)) continue;
-			const v = cfg[port.name];
-			if (v !== undefined && v !== null && v !== '') filled.add(port.name);
+		for (const [name, v] of Object.entries(portLiterals)) {
+			if (wiredInputPorts.has(name)) continue;
+			if (v !== undefined && v !== null && v !== '') filled.add(name);
 		}
 		return filled;
 	});
 
-	/** Fields rendered in the expanded view: catalog fields + synthesized
-	 *  fields for configurable input ports whose config has a value and no
-	 *  edge. Synthesized fields appear when the user/AI wrote `port: value`
-	 *  in the weft source (or `node.port = value` on a connection line).
-	 *  Removed when the source removes the value or adds an edge. */
+	/** Fields rendered in the expanded view: catalog fields + a synthesized
+	 *  PORT-DRIVEN field for every unwired input port that may take a
+	 *  literal: typing into it writes the value into the source. An
+	 *  'anywhere' port's field can take either written form; an
+	 *  'assignment' port's field is locked to the statement form; a
+	 *  'none' port never gets a field (wires only). An edge hides the
+	 *  field: the wire is the driver. The control kind derives from the
+	 *  port TYPE via the one central mapping. */
 	const displayedFields: FieldDefinition[] = $derived.by(() => {
 		const catalogFields = typeConfig.fields ?? [];
 		const result: FieldDefinition[] = [...catalogFields];
-		const catalogFieldKeys = new Set(catalogFields.map(f => f.key));
-		const cfg = (data.config as Record<string, unknown>) || {};
-		const inputList = (data.inputs || typeConfig.defaultInputs || []);
+		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
 		for (const port of inputList) {
-			if (catalogFieldKeys.has(port.name)) continue; // catalog already defines a field
-			if (port.configurable === false) continue;     // wired-only port
-			if (wiredInputPorts.has(port.name)) continue;   // edge wins, don't show config
-			const value = cfg[port.name];
-			if (value === undefined || value === null) continue;
-			// Multi-line string → textarea, otherwise single-line text input.
-			const isMultiline = typeof value === 'string' && value.includes('\n');
+			if (wiredInputPorts.has(port.name)) continue; // edge wins, no field
+			if (portLiteralPlacement(port) === 'none') continue; // wires only, never a field
+			const widget = widgetForPortType(String(port.portType ?? ''));
 			result.push({
 				key: port.name,
 				label: port.name,
-				type: isMultiline ? 'textarea' : 'text',
+				type: widget,
+				portDriven: true,
+				...(widget === 'file_drop' ? { fileType: String(port.portType) } : {}),
 			});
 		}
 		return result;
 	});
+
+	/** The written form of a port-driven field's value ('inline' = braces,
+	 *  'connection' = statement). A value not yet in source defaults to
+	 *  the braces form on its first write, except on an assignment-only
+	 *  port, where the statement form is the only legal one. */
+	function portFieldForm(key: string): 'inline' | 'connection' {
+		return portLiteralSpans[key]?.origin ?? (portFieldLocked(key) ? 'connection' : 'inline');
+	}
+
+	/** An assignment-only port's field is locked to the statement form:
+	 *  the braces form cannot drive it, so the toggle is disabled. */
+	function portFieldLocked(key: string): boolean {
+		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const port = inputList.find((p) => p.name === key);
+		return port !== undefined && portLiteralPlacement(port) !== 'anywhere';
+	}
 
 
 	// Recursively remove _raw keys from objects
@@ -584,6 +609,36 @@
 	// <700ms of typing. $effect's cleanup unregisters on destroy.
 	$effect(() => fieldEditorRegistry?.register(fieldEditor.flush));
 
+	/** Write a PORT-DRIVEN field's value: the port's body literal, kept
+	 *  apart from config (one home per name). An empty string clears the
+	 *  literal (the port goes back to unset/wireable). */
+	function updatePortLiteral(key: string, value: unknown) {
+		if (!data.onUpdate) return;
+		const cleared = value === null || value === undefined || value === '';
+		const next = { ...portLiterals } as Record<string, unknown>;
+		if (cleared) delete next[key];
+		else next[key] = value;
+		data.onUpdate({ portLiterals: next });
+	}
+
+	/** Route a field edit to its home: a port-driven field writes the
+	 *  port's body literal, everything else the config field. */
+	function updateFieldValue(key: string, value: unknown, portDriven?: boolean) {
+		if (portDriven) updatePortLiteral(key, value);
+		else updateConfig(key, value as Parameters<typeof updateConfig>[1]);
+	}
+
+	/** Flip a port-driven field's WRITTEN form (braces `key: value` vs
+	 *  statement `node.key = value`); the host rewrites the source. */
+	function togglePortValueForm(key: string) {
+		if (portFieldLocked(key)) {
+			toast.error(`'${key}' takes a literal only as an assignment: ${id}.${key} = ... is the one written form.`);
+			return;
+		}
+		const next = portFieldForm(key) === 'inline' ? 'connection' : 'inline';
+		data.onUpdate?.({ portValueForm: { key, form: next } });
+	}
+
 	function getConfigDisplayValue(fieldKey: string): string {
 		const fs = fileFieldState(fieldKey);
 		if (fs) {
@@ -678,6 +733,14 @@
 		// Check for duplicate name
 		if (inputs.some((p: PortDefinition) => p.name === name)) {
 			toast.error(`Input port "${name}" already exists`);
+			return;
+		}
+		// A custom input port may not take a declared config field's name: the
+		// braces key and the port would fight over one name from two homes.
+		// Same rule the compiler enforces (enrich.rs custom-port collision);
+		// vetoing here keeps the invalid port out of the source entirely.
+		if ((typeConfig.fields ?? []).some((f) => f.key === name)) {
+			toast.error(`"${name}" is a config field of this node type; a custom port cannot share its name`);
 			return;
 		}
 		const newPort: PortDefinition = {
@@ -1117,7 +1180,7 @@
 			<!-- Input Ports -->
 			<div class="space-y-1 min-w-0 flex-1">
 				{#each inputs as input}
-					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, configFilledPorts, getPortColor(input.portType), 'input')}
+					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortColor(input.portType), 'input')}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						class="relative flex items-center gap-1 group pl-3"
@@ -1174,7 +1237,7 @@
 			<!-- Output Ports -->
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
 				{#each outputs as output}
-				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, configFilledPorts, getPortColor(output.portType), 'output')}
+				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortColor(output.portType), 'output')}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<div
 					class="relative flex items-center gap-1 justify-end group pr-3"
@@ -1270,8 +1333,9 @@
 				<FieldStrip
 					fields={displayedFields}
 					config={(data.config as Record<string, unknown>) ?? {}}
+					portValues={portLiterals}
 					idPrefix={id}
-					onUpdate={(key, value) => updateConfig(key, value as string | string[] | number | boolean | FormFieldDef[] | null)}
+					onUpdate={(key, value, portDriven) => updateFieldValue(key, value, portDriven)}
 					{customFieldKeys}
 					heights={textareaHeights}
 					onHeightChange={handleTextareaResize}
@@ -1283,7 +1347,29 @@
 				/>
 
 				{#snippet headerBadge(field: FieldDefinition)}
-					{#if fileRefOf(field.key)}
+					{#if field.portDriven}
+						{@const locked = portFieldLocked(field.key)}
+						{@const form = portFieldForm(field.key)}
+						{@const hasValue = portLiterals[field.key] !== undefined && portLiterals[field.key] !== null}
+						<!-- The form-toggle marker: which SOURCE FORM this port's
+						     value is written in. Braces `{ }` vs statement `=`;
+						     a wired-only port is locked to the statement form.
+						     Its presence is also what distinguishes a port-driven
+						     field from a plain config field at a glance. -->
+						<button
+							type="button"
+							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag transition-colors
+								{locked ? 'bg-muted text-muted-foreground/60 cursor-default' : 'bg-muted text-muted-foreground hover:bg-accent'}"
+							title={locked
+								? `Wired-only port: only the statement form (${id}.${field.key} = ...) can set it.`
+								: form === 'inline'
+									? `Written inside the node body ({ ${field.key}: ... }). Click to move it to a statement line (${id}.${field.key} = ...).`
+									: `Written as a statement (${id}.${field.key} = ...). Click to move it into the node body.`}
+							aria-label={`Toggle source form for ${field.key}`}
+							disabled={!hasValue}
+							onclick={(e) => { e.stopPropagation(); if (hasValue) togglePortValueForm(field.key); }}
+						><span aria-hidden="true">{form === 'inline' ? '{ }' : '='}</span></button>
+					{:else if fileRefOf(field.key)}
 						{@const ref = fileRefOf(field.key)}
 						<!-- The chip doubles as the marker toggle: @file (editable,
 						     edits save to the file) <-> @asset (pull-only). Only
@@ -1376,10 +1462,10 @@
 							     onto the same-named input port (or the node reads from
 							     config). Source never holds storage keys. -->
 							<FileDropField
-								value={(data.config as Record<string, unknown>)?.[field.key]}
+								value={field.portDriven ? portLiterals[field.key] : (data.config as Record<string, unknown>)?.[field.key]}
 								accept={field.accept}
 								fileType={field.fileType}
-								onUpdate={(ref) => updateConfig(field.key, ref)}
+								onUpdate={(ref) => updateFieldValue(field.key, ref, field.portDriven)}
 							/>
 						{:else if field.type === "form_builder"}
 							<div class="nodrag nopan space-y-1.5" onclick={(e) => e.stopPropagation()}>

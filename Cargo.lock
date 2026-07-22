@@ -4266,6 +4266,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "inventory",
+ "reqwest",
  "reqwest-middleware",
  "serde",
  "serde_json",

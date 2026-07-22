@@ -46,7 +46,18 @@ pub enum ExecEvent {
     NodeKicked {
         color: Color,
         node_id: String,
+        /// This kick is the FIRING trigger of the execution. Explicit,
+        /// never inferred from `payload` presence: a fire with an empty
+        /// body journals `"payload": null`, indistinguishable from an
+        /// absent payload after the JSON round trip.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        firing: bool,
         payload: Option<Value>,
+        /// The firing trigger's setup-time port snapshot, seeded onto
+        /// its ports at dispatch. `None` for every other kicked root.
+        /// On the journal so a resume refolds the same input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port_snapshot: Option<Value>,
         at_unix: u64,
     },
 
@@ -715,14 +726,16 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
     for ev in events {
         match ev {
             ExecEvent::ExecutionStarted { .. } => {}
-            ExecEvent::NodeKicked { node_id, payload, .. } => {
+            ExecEvent::NodeKicked { node_id, firing, payload, port_snapshot, .. } => {
                 // First kick wins; further kicks on the same node id are a
                 // true no-op (the documented contract). The first kick's
                 // payload and `dispatched` flag are authoritative; a later
                 // kick carrying a different payload is a writer-level bug
                 // the fold must not paper over by silently merging.
                 kicked.entry(node_id.clone()).or_insert_with(|| KickedNode {
+                    firing: *firing,
                     payload: payload.clone(),
+                    port_snapshot: port_snapshot.clone(),
                     dispatched: false,
                 });
             }
@@ -1259,7 +1272,9 @@ mod fold_pulse_tests {
             ExecEvent::NodeKicked {
                 color: color(),
                 node_id: "trigger".into(),
+                firing: true,
                 payload: Some(payload.clone()),
+                port_snapshot: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -1278,7 +1293,7 @@ mod fold_pulse_tests {
         assert_eq!(
             kick.payload.as_ref(),
             Some(&payload),
-            "wake payload preserved so resume can replay it into ctx.wake_payload()"
+            "wake payload preserved so resume can replay it into the wake bag"
         );
     }
 
@@ -2207,19 +2222,49 @@ mod fold_pulse_tests {
             ExecEvent::NodeKicked {
                 color: color(),
                 node_id: "trigger".into(),
+                firing: false,
                 payload: None,
+                port_snapshot: None,
                 at_unix: 0,
             },
             ExecEvent::NodeKicked {
                 color: color(),
                 node_id: "trigger".into(),
+                firing: true,
                 payload: Some(json!({"body": "late"})),
+                port_snapshot: None,
                 at_unix: 0,
             },
         ];
         let snap = fold_to_snapshot(color(), &events);
         let kick = snap.kicked.get("trigger").expect("trigger kick");
         assert!(kick.payload.is_none(), "first kick's payload (None) is authoritative");
+    }
+
+    /// Regression: a fire whose body is EMPTY journals `"payload": null`,
+    /// which `Option<Value>` reads back as `None`. The firing-ness must
+    /// survive the JSON round trip via the explicit flag, or the firing
+    /// trigger is mistaken for an idle one and closed instead of run
+    /// (the live-WebSocket echo bug).
+    #[test]
+    fn a_null_payload_fire_survives_the_wire_round_trip() {
+        let ev = ExecEvent::NodeKicked {
+            color: color(),
+            node_id: "sock".into(),
+            firing: true,
+            payload: Some(Value::Null),
+            port_snapshot: None,
+            at_unix: 0,
+        };
+        let back: ExecEvent =
+            serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        let ExecEvent::NodeKicked { firing, payload, .. } = &back else {
+            panic!("wrong variant: {back:?}");
+        };
+        assert!(*firing, "the explicit flag carries firing-ness");
+        assert!(payload.is_none(), "Some(Null) collapses to None over JSON; that is WHY the flag exists");
+        let snap = fold_to_snapshot(color(), &[back]);
+        assert!(snap.kicked.get("sock").expect("kick").firing);
     }
 
     /// SuspensionResolved and SuspensionRegistered are written by

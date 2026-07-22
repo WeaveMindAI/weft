@@ -168,6 +168,7 @@ impl Project {
                 node: node.to_string(),
                 key: key.to_string(),
                 value: value.to_string(),
+                form: None,
             }],
         )
         .map_err(|e| anyhow::anyhow!("set config {node}.{key} in {}: {e:?}", path.display()))?;

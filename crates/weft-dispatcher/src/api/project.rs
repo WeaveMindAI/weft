@@ -33,7 +33,14 @@ use crate::state::DispatcherState;
 #[derive(Debug, Clone)]
 pub struct Kick {
     pub node_id: String,
+    /// This kick is the firing trigger of the execution. Explicit (see
+    /// `ExecEvent::NodeKicked::firing` for why payload presence can't
+    /// carry it).
+    pub firing: bool,
     pub payload: Option<Value>,
+    /// The firing trigger's setup-time port snapshot (from its signal
+    /// row). `None` for every other kicked root.
+    pub port_snapshot: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -481,32 +488,43 @@ pub async fn run(
 }
 
 /// Compute the kicks for a manual run. Walks upstream from each
-/// target, collects the subgraph nodes, picks the ones with no
+/// target (stopping at triggers, which act as terminators exactly as
+/// at fire time), collects the subgraph nodes, picks the ones with no
 /// incoming edge inside the subgraph as roots, and returns one `Kick`
 /// per root.
 ///
-/// `payload` lands on every kicked root. Manual runs typically pass
-/// `Value::Null` (no wake payload, just "kick alive"); per-target
-/// mocks may pass a real payload to kick specific roots.
+/// A manual run has no firing trigger: every trigger in the subgraph
+/// is kicked payload-less, which the engine turns into "close all its
+/// output ports" so trigger-fed branches prune via the skip cascade
+/// and the run exercises the trigger-free paths.
+///
+/// `payload` lands on every non-trigger kicked root. Manual runs
+/// typically pass `Value::Null` (no wake payload, just "kick alive");
+/// per-target mocks may pass a real payload to kick specific roots.
 fn compute_root_kicks(
     project: &ProjectDefinition,
     targets: &[String],
     payload: &Value,
 ) -> Vec<Kick> {
     let edge_idx = EdgeIndex::build(project);
-    let in_subgraph = upstream_closure(project, &edge_idx, targets);
-    roots_of(project, &edge_idx, &in_subgraph)
+    let triggers: HashSet<String> = project
+        .nodes
+        .iter()
+        .filter(|n| n.features.is_trigger)
+        .map(|n| n.id.clone())
+        .collect();
+    let in_subgraph = upstream_closure_stop_at(project, &edge_idx, targets, &triggers);
+    roots_of_with_forced(project, &edge_idx, &in_subgraph, &triggers)
         .into_iter()
         .map(|id| Kick {
-            node_id: id,
-            // Manual-run callers pass `Value::Null` when there's no
-            // payload; convert to `None` so the kick semantics ("no
-            // wake payload") match the journal model.
-            payload: if payload.is_null() {
+            payload: if payload.is_null() || triggers.contains(&id) {
                 None
             } else {
                 Some(payload.clone())
             },
+            node_id: id,
+            firing: false,
+            port_snapshot: None,
         })
         .collect()
 }
@@ -545,7 +563,9 @@ pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
         .into_iter()
         .map(|id| Kick {
             node_id: id,
+            firing: false,
             payload: None,
+            port_snapshot: None,
         })
         .collect()
 }
@@ -581,7 +601,9 @@ pub fn compute_trigger_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
         .into_iter()
         .map(|id| Kick {
             node_id: id,
+            firing: false,
             payload: None,
+            port_snapshot: None,
         })
         .collect()
 }
@@ -690,7 +712,9 @@ async fn start_queued_execution(
         .map(|kick| weft_journal::ExecEvent::NodeKicked {
             color,
             node_id: kick.node_id.clone(),
+            firing: kick.firing,
             payload: kick.payload.clone(),
+            port_snapshot: kick.port_snapshot.clone(),
             at_unix: now,
         })
         .collect();
@@ -864,25 +888,34 @@ pub async fn await_infra_setup(
 
 /// Kicks for a trigger fire.
 ///
-/// Rule: walk upstream from every output node, but treat trigger
-/// nodes as terminators. A node ends up in the fire-time subgraph
-/// iff it is reachable upstream from some output WITHOUT passing
-/// through a trigger. Triggers themselves are included as kicks
-/// (the firing trigger carries the payload; other triggers reachable
-/// in the subgraph carry null).
+/// Rule: from the FIRING trigger, walk downstream to find the output
+/// nodes it can reach. From those outputs, walk upstream, treating
+/// every trigger node as a terminator. A node ends up in the
+/// fire-time subgraph iff one of the fired trigger's outputs depends
+/// on it without passing through a trigger. Triggers themselves are
+/// included as kicks: the firing trigger carries the payload and its
+/// setup-time port snapshot; any other trigger in the subgraph is
+/// kicked payload-less, which the engine turns into "close all its
+/// output ports" (the skip cascade prunes its exclusive branches).
 ///
-/// Why terminators: at fire time the firing trigger's outputs are
-/// the payload, not a function of its inputs. Nodes that exist only
-/// to produce inputs for triggers (e.g. setup-time config) must not
-/// re-run every time the trigger fires. If a node also feeds non-
-/// trigger paths that reach the output, it re-runs via those paths.
+/// Why terminators: at fire time a trigger's outputs are the payload,
+/// not a function of its inputs (its ports replay the setup-time
+/// snapshot). Nodes that exist only to produce inputs for triggers
+/// must not re-run every time the trigger fires. If a node also feeds
+/// non-trigger paths that reach a targeted output, it re-runs via
+/// those paths.
 ///
-/// Returns an empty vec if no output is reachable via a non-trigger
-/// path; the caller treats that as "nothing to run."
+/// Why start from the fired trigger: an output with no path from it
+/// (a sibling branch fed by another trigger or by static sources
+/// alone) is someone else's work; this fire must not re-run it.
+///
+/// Returns an empty vec if the fired trigger reaches no output; the
+/// caller treats that as "nothing to run."
 pub fn compute_trigger_kicks(
     project: &ProjectDefinition,
     firing_node_id: &str,
     payload: &Value,
+    port_snapshot: Option<&Value>,
 ) -> Vec<Kick> {
     let edge_idx = EdgeIndex::build(project);
 
@@ -899,46 +932,67 @@ pub fn compute_trigger_kicks(
         return Vec::new();
     }
 
-    // Targets = every output node in the project.
+    // Targets = the output nodes the FIRED trigger reaches downstream.
+    let reachable = downstream_closure(project, &edge_idx, firing_node_id);
     let targets: Vec<String> = project
         .nodes
         .iter()
-        .filter(|n| n.is_output())
+        .filter(|n| n.is_output() && reachable.contains(&n.id))
         .map(|n| n.id.clone())
         .collect();
     if targets.is_empty() {
         return Vec::new();
     }
 
-    // Upstream closure from outputs, stopping at triggers (include
-    // the trigger but do not walk through its incoming edges).
+    // Upstream closure from those outputs, stopping at triggers
+    // (include the trigger but do not walk through its incoming
+    // edges). The fired trigger is in this set by construction: every
+    // target was picked from its downstream closure.
     let in_subgraph = upstream_closure_stop_at(project, &edge_idx, &targets, &triggers);
-
-    // If the firing trigger isn't in the subgraph, nothing its
-    // payload would feed is reachable upstream from an output;
-    // nothing to run.
-    if !in_subgraph.contains(firing_node_id) {
-        return Vec::new();
-    }
 
     // Roots of the subgraph. Triggers are always roots (they were
     // terminators); nodes in the subgraph with no in-subgraph
-    // parent are roots too. A firing trigger carries the payload;
-    // every other root carries null.
+    // parent are roots too.
     roots_of_with_forced(project, &edge_idx, &in_subgraph, &triggers)
         .into_iter()
         .map(|id| {
-            // Only the firing trigger carries a wake payload. Other
-            // roots get `None`: they're "kick alive" entries with no
-            // wake event of their own.
-            let payload = if id == firing_node_id {
-                Some(payload.clone())
+            // Only the firing trigger carries the wake payload and the
+            // snapshot. Other roots get `None`: non-firing triggers
+            // close, plain roots are "kick alive" entries.
+            if id == firing_node_id {
+                Kick {
+                    node_id: id,
+                    firing: true,
+                    payload: Some(payload.clone()),
+                    port_snapshot: port_snapshot.cloned(),
+                }
             } else {
-                None
-            };
-            Kick { node_id: id, payload }
+                Kick { node_id: id, firing: false, payload: None, port_snapshot: None }
+            }
         })
         .collect()
+}
+
+/// BFS downstream from `start` through outgoing edges, returning
+/// every reachable node id (including `start`).
+fn downstream_closure(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    start: &str,
+) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<String> = vec![start.to_string()];
+    while let Some(node_id) = frontier.pop() {
+        if !seen.insert(node_id.clone()) {
+            continue;
+        }
+        for edge in edge_idx.get_outgoing(project, &node_id) {
+            if !seen.contains(&edge.target) {
+                frontier.push(edge.target.clone());
+            }
+        }
+    }
+    seen
 }
 
 /// BFS upstream from `targets` through incoming edges, returning
@@ -3903,7 +3957,7 @@ mod trigger_kick_tests {
             ],
             &[("a", "trigger_x"), ("trigger_x", "b"), ("b", "out")],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()));
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()), None);
         assert_eq!(
             ids(&kicks),
             vec!["trigger_x".to_string()],
@@ -3935,7 +3989,7 @@ mod trigger_kick_tests {
                 ("b", "out"),
             ],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()));
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()), None);
         assert_eq!(
             ids(&kicks),
             vec!["a".to_string(), "trigger_x".to_string()],
@@ -3963,7 +4017,7 @@ mod trigger_kick_tests {
             ],
             &[("trigger_x", "out"), ("trigger_y", "out")],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("fire".into()));
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("fire".into()), None);
         let sorted = ids(&kicks);
         assert_eq!(sorted, vec!["trigger_x".to_string(), "trigger_y".to_string()]);
         for k in &kicks {
@@ -3982,7 +4036,7 @@ mod trigger_kick_tests {
             &[("trigger_x", true, false), ("dead_end", false, false)],
             &[("trigger_x", "dead_end")],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::Null);
+        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::Null, None);
         assert!(kicks.is_empty());
     }
 
@@ -3994,7 +4048,7 @@ mod trigger_kick_tests {
             &[("a", false, false), ("out", false, true)],
             &[("a", "out")],
         );
-        let kicks = compute_trigger_kicks(&p, "a", &Value::Null);
+        let kicks = compute_trigger_kicks(&p, "a", &Value::Null, None);
         assert!(kicks.is_empty());
     }
 }

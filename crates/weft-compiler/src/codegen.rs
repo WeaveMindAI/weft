@@ -999,6 +999,8 @@ mod tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            port_literals: Default::default(),
+            port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
         }

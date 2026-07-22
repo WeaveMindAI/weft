@@ -37,8 +37,8 @@ use crate::cst::parse;
 pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditError> {
     use super::EditOp::*;
     match op {
-        SetConfig { node, key, value } => set_config(view, node, key, Some(value)),
-        RemoveConfig { node, key } => set_config(view, node, key, None),
+        SetConfig { node, key, value, form } => set_config(view, node, key, Some(value), *form),
+        RemoveConfig { node, key, form } => set_config(view, node, key, None, *form),
         SetLabel { node, label } => set_label(view, node, label.as_deref()),
         AddNode { id, node_type, parent_group } => {
             // The type is written into the source too, so it is validated at the
@@ -82,6 +82,7 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         RenameLoop { loop_id, new_label } => rename_container(view, loop_id, new_label, ContainerKind::Loop),
         MoveLoopScope { loop_id, target_group } => move_scope(view, loop_id, target_group.as_deref(), ContainerKind::Loop),
         UpdateLoopPorts { loop_id, inputs, outputs } => update_ports(view, loop_id, inputs, outputs, ContainerKind::Loop),
+        SetValueForm { node, key, form } => set_value_form(view, node, key, *form),
         SetLoopConfig { loop_id, key, value } => set_loop_config(view, loop_id, key, value),
         RemoveLoopConfig { loop_id, key } => remove_loop_config(view, loop_id, key),
     }
@@ -644,7 +645,13 @@ fn dedent_block(block: &str, from: &str) -> String {
 
 // ── ops: config / label / description ────────────────────────────────────────
 
-fn set_config(view: &FileView, node_id: &str, key: &str, value: Option<&str>) -> Result<(), EditError> {
+fn set_config(
+    view: &FileView,
+    node_id: &str,
+    key: &str,
+    value: Option<&str>,
+    form: Option<super::ValueForm>,
+) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
     // NODE-only, same kind-honesty discipline as rename/move/ports:
     // loop config rides `SetLoopConfig` / `RemoveLoopConfig` (groups
@@ -653,9 +660,30 @@ fn set_config(view: &FileView, node_id: &str, key: &str, value: Option<&str>) ->
     if !matches!(decl, Decl::Node(_)) {
         return Err(kind_mismatch("SetConfig/RemoveConfig", node_id, "Node", &decl));
     }
-    // A connection-origin field is written `node.key = value` (a CONNECTION),
-    // not `key: value` inside the body. If one exists, edit IT (keeping the
-    // `node.key = ` form), rather than adding a duplicate body field.
+    // A same name may legally exist in BOTH forms (a wired-only port's
+    // literal next to a same-named config field), so an explicit `form`
+    // targets exactly one and never routes to the other.
+    match form {
+        Some(super::ValueForm::Inline) => {
+            return match value {
+                Some(v) => set_or_insert_field(&decl, key, v),
+                None => { remove_field(&decl, key); Ok(()) }
+            };
+        }
+        Some(super::ValueForm::Connection) => {
+            return match (find_connection_origin_field(view, &decl, key), value) {
+                (Some(conn), Some(v)) => replace_connection_rhs(&conn, v),
+                (Some(conn), None) => { detach_with_leading_ws(&conn); Ok(()) }
+                (None, Some(v)) => insert_connection_value(view, node_id, key, v),
+                (None, None) => Ok(()),
+            };
+        }
+        None => {}
+    }
+    // Form-absent auto-routing: a connection-origin field is written
+    // `node.key = value` (a CONNECTION), not `key: value` inside the
+    // body. If one exists, edit IT (keeping the `node.key = ` form),
+    // rather than adding a duplicate body field.
     if let Some(conn) = find_connection_origin_field(view, &decl, key) {
         return match value {
             Some(v) => replace_connection_rhs(&conn, v),
@@ -665,6 +693,30 @@ fn set_config(view: &FileView, node_id: &str, key: &str, value: Option<&str>) ->
     match value {
         Some(v) => set_or_insert_field(&decl, key, v),
         None => { remove_field(&decl, key); Ok(()) }
+    }
+}
+
+/// Insert a fresh `node.key = value` statement line in the node's scope.
+/// Shared by the explicit-Connection set path and the form toggle.
+fn insert_connection_value(
+    view: &FileView,
+    node_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), EditError> {
+    let (scope, local) = match node_id.rsplit_once('.') {
+        Some((scope, local)) => (Some(scope), local),
+        None => (None, node_id),
+    };
+    let line = format!("{local}.{key} = {value}");
+    match target_body(view, scope)? {
+        InsertTarget::FileRoot(f) => {
+            append_to_file(&f, snippet_elements(&format!("{line}\n")));
+            Ok(())
+        }
+        InsertTarget::GroupBody { body, indent } => {
+            insert_before_close(&body, snippet_elements(&format!("{indent}{line}\n")))
+        }
     }
 }
 
@@ -883,6 +935,91 @@ fn decl_header_text(decl: &Decl) -> String {
 fn remove_field(decl: &Decl, key: &str) {
     for field in find_fields(decl, key) {
         detach_with_leading_ws(&field);
+    }
+}
+
+/// The verbatim VALUE text of a field/connection node: the token run
+/// after `sep`, minus a trailing same-line comment and trailing
+/// whitespace. The read twin of `replace_value_after`'s run
+/// computation, so a form move carries exactly what a replace would
+/// have replaced.
+fn value_text_after(node: &SyntaxNode, sep: SyntaxKind) -> Result<String, EditError> {
+    let elems: Vec<SyntaxElement> = node.children_with_tokens().collect();
+    let sep_idx = elems
+        .iter()
+        .position(|e| e.kind() == sep)
+        .ok_or_else(|| EditError::Unparseable(format!("field has no `{sep:?}` separator")))?;
+    let value_start = sep_idx + 1;
+    let mut value_end = elems.len();
+    if let Some(cpos) = elems.iter().rposition(|e| e.kind() == SyntaxKind::COMMENT) {
+        let mut keep_from = cpos;
+        if cpos > 0 && elems[cpos - 1].kind() == SyntaxKind::WHITESPACE
+            && !elems[cpos - 1].as_token().map(|t| t.text().contains('\n')).unwrap_or(false)
+        {
+            keep_from = cpos - 1;
+        }
+        if keep_from > value_start {
+            value_end = keep_from;
+        }
+    }
+    while value_end > value_start && elems[value_end - 1].kind() == SyntaxKind::WHITESPACE {
+        value_end -= 1;
+    }
+    let text: String = elems[value_start..value_end].iter().map(|e| e.to_string()).collect();
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(EditError::Unparseable("field has no value to move".into()));
+    }
+    Ok(text)
+}
+
+/// Rewrite which SOURCE FORM a node's body-set port value is written in.
+/// `Inline`: a `node.key = value` statement collapses into a
+/// `key: value` braces field. `Connection`: a braces field moves out to
+/// a statement line in the node's scope. The value text moves verbatim;
+/// already in the requested form is a no-op; no body value at all is a
+/// loud error.
+fn set_value_form(
+    view: &FileView,
+    node_id: &str,
+    key: &str,
+    form: super::ValueForm,
+) -> Result<(), EditError> {
+    let decl = resolve(view, node_id)?;
+    if !matches!(decl, Decl::Node(_)) {
+        return Err(kind_mismatch("SetValueForm", node_id, "Node", &decl));
+    }
+    validate_ident("config key", key)?;
+    let conn = find_connection_origin_field(view, &decl, key);
+    let field = find_fields(&decl, key).into_iter().next();
+    match form {
+        super::ValueForm::Inline => {
+            let Some(conn) = conn else {
+                return if field.is_some() {
+                    Ok(())
+                } else {
+                    Err(EditError::Unparseable(format!(
+                        "'{node_id}.{key}' has no body value to move"
+                    )))
+                };
+            };
+            let value = value_text_after(&conn, SyntaxKind::EQ)?;
+            detach_with_leading_ws(&conn);
+            set_or_insert_field(&decl, key, &value)
+        }
+        super::ValueForm::Connection => {
+            if conn.is_some() {
+                return Ok(());
+            }
+            let Some(field) = field else {
+                return Err(EditError::Unparseable(format!(
+                    "'{node_id}.{key}' has no body value to move"
+                )));
+            };
+            let value = value_text_after(&field, SyntaxKind::COLON)?;
+            remove_field(&decl, key);
+            insert_connection_value(view, node_id, key, &value)
+        }
     }
 }
 

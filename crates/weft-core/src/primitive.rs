@@ -319,12 +319,22 @@ pub struct SuspensionInfo {
 /// once at frames=[]. The optional `payload` carries the wake event's
 /// data for the firing trigger (the HTTP body, the SSE event JSON,
 /// the form submission, the timer info); node bodies read it via
-/// `ctx.wake_payload()` in Fire phase.
+/// the `ctx.wake` bag in Fire phase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KickedNode {
+    /// This kick IS the firing trigger of the execution. Explicit,
+    /// never inferred from payload presence: a fire with an empty
+    /// body has a `null` payload, which `Option<Value>` cannot keep
+    /// apart from "no payload" across a JSON round trip.
+    #[serde(default)]
+    pub firing: bool,
     /// Wake event payload for the firing trigger. `None` for every
     /// other kicked root.
     pub payload: Option<Value>,
+    /// The firing trigger's setup-time port snapshot, seeded onto its
+    /// ports at dispatch. `None` for every other kicked root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_snapshot: Option<Value>,
     /// Flips to `true` once the engine has dispatched this kick (the
     /// node started at root frames). A second tick that sees
     /// `dispatched` must NOT re-dispatch.

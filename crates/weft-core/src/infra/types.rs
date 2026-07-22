@@ -1,6 +1,6 @@
 //! Typed declarations for infrastructure nodes.
 //!
-//! An infra node implements `Node::provision`, which returns an
+//! An infra node implements `Node::provision_infra`, which returns an
 //! [`InfraSpec`]. The dispatcher's apply executor compiles the spec
 //! to a list of kubernetes manifests, resolves image digests, hashes
 //! the resolved spec, and applies via `kubectl`. The same spec is
@@ -24,7 +24,7 @@ use serde_json::Value;
 
 /// What an infra node wants the cluster to look like.
 ///
-/// Returned by `Node::provision`. Pure value: hashing the resolved
+/// Returned by `Node::provision_infra`. Pure value: hashing the resolved
 /// form (after image-digest resolution) yields the canonical drift
 /// signal. The compiler turns this into a list of kubernetes
 /// manifests; everything users care about is here.
@@ -874,7 +874,7 @@ fn default_stabilization_seconds() -> u32 { 60 }
 // Provision context
 // =============================================================
 
-/// Context handed to `Node::provision`. Carries runtime identity
+/// Context handed to `Node::provision_infra`. Carries runtime identity
 /// (project, node, tenant, namespace) plus arbitrary metadata that
 /// the dispatcher may inject.
 ///
@@ -882,7 +882,7 @@ fn default_stabilization_seconds() -> u32 { 60 }
 /// tags by the dispatcher's apply executor at apply time using the
 /// CLI-computed image hash map, NOT by the provision body. The body
 /// just declares the name; the dispatcher does the substitution. This
-/// keeps `Node::provision` deterministic given inputs (image tags can
+/// keeps `Node::provision_infra` deterministic given inputs (image tags can
 /// change without changing the spec the body returns).
 ///
 /// Distinct from `ExecutionContext`: provision runs BEFORE apply, so

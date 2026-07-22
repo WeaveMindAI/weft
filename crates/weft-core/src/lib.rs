@@ -115,11 +115,11 @@ pub use bus::{
 pub use cancellation::CancellationFlag;
 #[cfg(feature = "runtime")]
 pub use context::{
-    ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, InputBag, Phase,
+    ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, Phase, ValueBag,
     StorageHandle,
 };
 pub use access::{AccessOrigin, ProviderAccess, PLATFORM_KEY_SENTINEL};
-pub use error::{WeftError, WeftResult};
+pub use error::{NodeErrExt, WeftError, WeftResult};
 pub use infra::{
     Access, AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
     Container, ContainerPort, ContainerSecurityContext, EgressRule, Endpoint, EnvEntry, Expose,

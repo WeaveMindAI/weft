@@ -3,7 +3,6 @@
 //! node into the worker binary and run it.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::node::NodeOutput;
 use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
@@ -13,15 +12,12 @@ pub struct MultiplyNode;
 
 #[async_trait]
 impl Node for MultiplyNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // Both inputs are required, so the engine only fires once they are
         // present; read them loudly (`get` errors on absent/wrong type).
-        let a: f64 = ctx.input.get("a")?;
-        let b: f64 = ctx.input.get("b")?;
+        let a: f64 = ctx.ports.get("a")?;
+        let b: f64 = ctx.ports.get("b")?;
         let product = a * b;
-        ctx.pulse_downstream(
-            NodeOutput::empty().set("product", Value::from(product)),
-        )
-        .await
+        ctx.pulse_downstream(NodeOutput::new().set("product", product)).await
     }
 }

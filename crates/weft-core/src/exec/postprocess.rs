@@ -416,7 +416,7 @@ mod fan_in_tests {
             port_type: crate::weft_type::WeftType::primitive(crate::weft_type::WeftPrimitive::String),
             required: false,
             description: None,
-            configurable: false,
+            literal: crate::weft_type::LiteralPlacement::Assignment,
             synthesized_from_carry: false,
         }
     }
@@ -438,6 +438,8 @@ mod fan_in_tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            port_literals: Default::default(),
+            port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
         };

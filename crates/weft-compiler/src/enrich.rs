@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use weft_core::node::{FormFieldPort, MetadataCatalog};
 use weft_core::project::{PortDefinition, ProjectDefinition, Span};
-use weft_core::weft_type::WeftType;
+use weft_core::weft_type::{LiteralPlacement, WeftType};
 
 use crate::error::{CompileError, CompileResult};
 
@@ -40,6 +40,43 @@ impl PortDirection {
         match self {
             Self::Input => "input",
             Self::Output => "output",
+        }
+    }
+}
+
+/// Move every PORT-DRIVEN body value out of `config` into
+/// `port_literals`, now that the full input-port list is known: a braces
+/// value on a port whose literal may sit in the braces, and an
+/// assignment statement (`ConfigOrigin::Connection`) on ANY input port
+/// (the statement names the port unambiguously; validate rejects it
+/// where the port's placement forbids literals). After this pass a
+/// name has one home: a port's value lives in `port_literals` (the
+/// engine feeds it onto the port), a config field's value lives in
+/// `config`, and a braces-closed port coexists with a same-named
+/// field without colliding. A braces value on a braces-closed port
+/// with no such field stays in `config`, where validate rejects it
+/// (`port-literal-placement`).
+fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
+    use weft_core::project::ConfigOrigin;
+    let Some(cfg) = node.config.as_object_mut() else { return };
+    let moved: Vec<String> = node
+        .inputs
+        .iter()
+        .filter(|port| {
+            let literal_form = node
+                .config_spans
+                .get(&port.name)
+                .is_some_and(|s| s.origin == ConfigOrigin::Connection);
+            cfg.contains_key(&port.name) && (port.literal.allows_config() || literal_form)
+        })
+        .map(|port| port.name.clone())
+        .collect();
+    for name in moved {
+        if let Some(value) = cfg.remove(&name) {
+            node.port_literals.insert(name.clone(), value);
+        }
+        if let Some(span) = node.config_spans.remove(&name) {
+            node.port_literal_spans.insert(name, span);
         }
     }
 }
@@ -235,7 +272,7 @@ pub fn enrich_collecting(
                 port_type: p.port_type.clone(),
                 required: p.required,
                 description: None,
-                configurable: meta.input_configurable(p),
+                literal: meta.input_literal(p),
                 synthesized_from_carry: false,
             })
             .collect();
@@ -247,7 +284,7 @@ pub fn enrich_collecting(
                 port_type: p.port_type.clone(),
                 required: p.required,
                 description: None,
-                configurable: false,
+                literal: LiteralPlacement::None,
                 synthesized_from_carry: false,
             })
             .collect();
@@ -266,6 +303,22 @@ pub fn enrich_collecting(
                 derive_form_ports(&node.config, &meta.form_field_specs);
             catalog_inputs.extend(form_inputs);
             catalog_outputs.extend(form_outputs);
+        }
+
+        // A CUSTOM input port (source-declared, unknown to the catalog)
+        // may not take a declared config field's name: the field's braces
+        // key and the port would fight over one name from two homes.
+        for wp in &weft_inputs {
+            if catalog_inputs.iter().any(|cp| cp.name == wp.name) {
+                continue;
+            }
+            if meta.fields.iter().any(|f| f.key == wp.name) {
+                errors.push(EnrichError { span: node_span, message: format!(
+                    "node '{}': custom input port '{}' collides with config field '{}' \
+                     of node type {}; rename the port",
+                    node.id, wp.name, wp.name, node.node_type,
+                )});
+            }
         }
 
         let inputs = merge_ports(
@@ -292,6 +345,7 @@ pub fn enrich_collecting(
         node.features = meta.features.clone();
         node.requires_infra = meta.requires_infra;
         node.images = meta.images.clone();
+        normalize_port_literals(node);
     }
 
     // Port errors mean the topology is malformed; skip type resolution (it would
@@ -459,7 +513,7 @@ fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> Por
         port_type: port_type.clone(),
         required: !is_output,
         description: None,
-        configurable: !is_output && port_type.is_default_configurable(),
+        literal: if is_output { LiteralPlacement::None } else { port_type.default_literal_placement() },
         synthesized_from_carry: false,
     }
 }

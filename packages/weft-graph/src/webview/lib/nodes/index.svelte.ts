@@ -192,7 +192,7 @@ function flattenPort(p: PortDef): PortDefinition {
 		name: p.name,
 		portType: p.type,
 		required: p.required ?? false,
-		...(p.configurable !== undefined ? { configurable: p.configurable } : {}),
+		...(p.literal !== undefined ? { literal: p.literal } : {}),
 		...(p.description !== undefined ? { description: p.description } : {}),
 	};
 }

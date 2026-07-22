@@ -814,8 +814,19 @@ fn load_node_entry(
     let metadata: NodeMetadata =
         serde_json::from_value(value).map_err(|e| CatalogError::Parse {
             path: meta_path.clone(),
-            error: e.to_string(),
+            // A stale stdlib COPY is the common way to hold metadata this
+            // weft no longer accepts; name the one-command re-sync.
+            error: if meta_path.components().any(|c| c.as_os_str() == "base_catalog") {
+                format!("{e} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
+            } else {
+                e.to_string()
+            },
         })?;
+    // Semantic rules serde can't express (field/port name collisions).
+    metadata.validate_semantics().map_err(|error| CatalogError::Parse {
+        path: meta_path.clone(),
+        error,
+    })?;
 
     Ok(CatalogEntry {
         node_type: metadata.node_type.clone(),

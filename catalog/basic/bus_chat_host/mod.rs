@@ -25,11 +25,11 @@
 //!   7. host: pulse_downstream(done=true) on success
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use weft_core::bus::{BusEntryKind, BusOptions};
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BusChatHostNode;
@@ -46,23 +46,19 @@ const HOST_LINES: &[&str] = &["hello", "what's up", "ok bye"];
 
 #[async_trait]
 impl Node for BusChatHostNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let (mut bus, marker) = ctx.create_bus(BusOptions::default())?;
 
         // Marker emission BEFORE the guarded block: if it fails, no
         // peer is parked anywhere yet, nothing to close.
-        ctx.pulse_downstream(NodeOutput::empty().set("channel", marker))
+        ctx.pulse_downstream(NodeOutput::new().set("channel", marker))
             .await?;
 
         // Try-block guards bus.close() on every error path (see module doc).
         let result: WeftResult<()> = async {
-            bus.register("host").map_err(|e| {
-                weft_core::error::WeftError::Runtime(anyhow::anyhow!("host register: {e}"))
-            })?;
+            bus.register("host").node_err("host register")?;
 
-            bus.wait_for("guest").await.map_err(|e| {
-                weft_core::error::WeftError::Runtime(anyhow::anyhow!("waiting for guest: {e}"))
-            })?;
+            bus.wait_for("guest").await.node_err("waiting for guest")?;
 
             // One cursor filtered to guest messages; reused across
             // turns so we walk the log forward in one pass instead of
@@ -72,27 +68,18 @@ impl Node for BusChatHostNode {
             });
 
             for (turn, line) in HOST_LINES.iter().enumerate() {
-                bus.send("msg", json!(line)).map_err(|e| {
-                    weft_core::error::WeftError::Runtime(anyhow::anyhow!(
-                        "host send '{line}': {e}"
-                    ))
-                })?;
+                bus.send("msg", json!(line)).node_err(format!("host send '{line}'"))?;
                 let _reply = reply_cursor
                     .next()
                     .await
-                    .map_err(|e| {
-                        weft_core::error::WeftError::Runtime(anyhow::anyhow!(
-                            "host cursor on turn {}: {e}",
-                            turn + 1
-                        ))
-                    })?
+                    .node_err(format!("host cursor on turn {}", turn + 1))?
                     .ok_or_else(|| {
                         // A `None` cursor means the bus closed before a
                         // reply arrived. Don't assert WHO closed it: it
                         // could be the guest exiting, but also the
                         // stuck-detector tearing the bus down. State the
                         // observable fact, not a guessed culprit.
-                        weft_core::error::WeftError::Runtime(anyhow::anyhow!(
+                        WeftError::NodeExecution(format!(
                             "host: bus closed before a reply to turn {} arrived",
                             turn + 1
                         ))
@@ -110,8 +97,7 @@ impl Node for BusChatHostNode {
 
         result?;
 
-        ctx.pulse_downstream(NodeOutput::empty().set("done", Value::Bool(true)))
-            .await?;
+        ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
         Ok(())
     }
 }

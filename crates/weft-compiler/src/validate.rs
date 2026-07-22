@@ -47,11 +47,146 @@ pub fn validate_with_mode(
     check_type_compat(project, &mut d);
     check_port_coverage(project, catalog, &mut d);
     check_loop_config(project, &mut d);
+    check_double_driven_ports(project, &mut d);
     check_warnings(project, &mut d);
     check_output_reachability(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
     check_reserved_names(project, catalog, &mut d);
+    check_graph_shape(project, &mut d);
     d
+}
+
+/// Structural rules that make the trigger/fire semantics well-defined.
+///
+/// graph-cycle: the wire graph must be a DAG. Iteration is the Loop
+///   container's job and cross-node feedback is the bus's; a wire cycle
+///   has no execution order and would wedge the engine.
+/// trigger-in-loop: a trigger inside a Loop container. Registration
+///   happens once per project and fires land outside any iteration, so
+///   a per-iteration trigger has no meaning.
+/// trigger-into-trigger: a trigger wired (directly or transitively)
+///   into another trigger. The downstream trigger's inputs snapshot at
+///   setup and its upstream is never walked at fire, so the wiring
+///   could never deliver; reject until the semantics are designed.
+/// trigger-into-infra: an infra node downstream of a trigger.
+///   Provisioning happens before any fire exists, so the value can
+///   never be there.
+fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    use std::collections::{HashMap, HashSet};
+
+    // Node-level outgoing adjacency.
+    let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in &project.edges {
+        outgoing.entry(e.source.as_str()).or_default().push(e.target.as_str());
+    }
+
+    // graph-cycle: iterative DFS with a three-color marking; report each
+    // node where a back edge is found (one diagnostic per cycle entry).
+    let mut state: HashMap<&str, u8> = HashMap::new(); // 0 absent, 1 in-stack, 2 done
+    for start in project.nodes.iter().map(|n| n.id.as_str()) {
+        if state.contains_key(start) {
+            continue;
+        }
+        let mut stack: Vec<(&str, usize)> = vec![(start, 0)];
+        state.insert(start, 1);
+        while let Some((node, idx)) = stack.pop() {
+            let next = outgoing.get(node).and_then(|v| v.get(idx)).copied();
+            match next {
+                Some(child) => {
+                    stack.push((node, idx + 1));
+                    match state.get(child) {
+                        Some(1) => {
+                            let span = project
+                                .nodes
+                                .iter()
+                                .find(|n| n.id == child)
+                                .map(|n| n.header_span_or_default())
+                                .unwrap_or_default();
+                            push(d, span, Severity::Error, "graph-cycle",
+                                format!(
+                                    "the wires form a cycle through '{child}'; a wire graph \
+                                     must be acyclic (iterate with a Loop, exchange feedback \
+                                     over a bus)"
+                                ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            state.insert(child, 1);
+                            stack.push((child, 0));
+                        }
+                    }
+                }
+                None => {
+                    state.insert(node, 2);
+                }
+            }
+        }
+    }
+
+    // trigger-in-loop: a trigger whose scope chain crosses a Loop group.
+    let loop_groups: HashSet<&str> = project
+        .groups
+        .iter()
+        .filter(|g| matches!(g.kind, weft_core::project::GroupKind::Loop { .. }))
+        .map(|g| g.id.as_str())
+        .collect();
+    for node in project.nodes.iter().filter(|n| n.features.is_trigger) {
+        if node.scope.iter().any(|s| loop_groups.contains(s.as_str())) {
+            push(d, node.header_span_or_default(), Severity::Error, "trigger-in-loop",
+                format!(
+                    "trigger '{}' is inside a Loop; a trigger registers once and fires \
+                     outside any iteration, so it cannot live in a loop body",
+                    node.id
+                ));
+        }
+    }
+
+    // trigger-into-trigger / trigger-into-infra: walk downstream from
+    // each trigger.
+    let triggers: HashSet<&str> = project
+        .nodes
+        .iter()
+        .filter(|n| n.features.is_trigger)
+        .map(|n| n.id.as_str())
+        .collect();
+    let infra: HashSet<&str> = project
+        .nodes
+        .iter()
+        .filter(|n| n.requires_infra)
+        .map(|n| n.id.as_str())
+        .collect();
+    for trigger in &triggers {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut frontier: Vec<&str> = outgoing.get(trigger).cloned().unwrap_or_default();
+        while let Some(node) = frontier.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            let span = project
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .map(|n| n.header_span_or_default())
+                .unwrap_or_default();
+            if triggers.contains(node) {
+                push(d, span, Severity::Error, "trigger-into-trigger",
+                    format!(
+                        "trigger '{trigger}' is wired into trigger '{node}'; a trigger's \
+                         inputs snapshot at setup, so another trigger's output can never \
+                         reach it"
+                    ));
+            }
+            if infra.contains(node) {
+                push(d, span, Severity::Error, "trigger-into-infra",
+                    format!(
+                        "trigger '{trigger}' is wired into infra node '{node}'; \
+                         provisioning happens before any fire exists, so the value can \
+                         never be there"
+                    ));
+            }
+            frontier.extend(outgoing.get(node).cloned().unwrap_or_default());
+        }
+    }
 }
 
 /// A node or group named after a known node type is ambiguous: a reference
@@ -161,24 +296,16 @@ fn eval_condition(cond: &Condition, node: &NodeDefinition, project: &ProjectDefi
     }
 }
 
-/// Port is "satisfied" if either (a) it has a wired incoming edge,
-/// or (b) the port is `configurable` and the node's config has a
-/// non-null same-named field. This covers `Llm { prompt: "hi" }`
-/// where prompt is provided by a literal rather than a wire.
+/// Port is "satisfied" if either (a) it has a wired incoming edge, or
+/// (b) a non-null body literal drives it (`port_literals`, where the
+/// enrich normalization homes every port-driving value). This covers
+/// `Llm { prompt: "hi" }` where prompt is provided by a literal rather
+/// than a wire.
 fn input_satisfied(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
     if has_incoming_edge(node, project, port) {
         return true;
     }
-    let is_configurable = node
-        .inputs
-        .iter()
-        .find(|p| p.name == port)
-        .map(|p| p.configurable)
-        .unwrap_or(false);
-    if !is_configurable {
-        return false;
-    }
-    node.config
+    node.port_literals
         .get(port)
         .map(|v| !v.is_null())
         .unwrap_or(false)
@@ -269,6 +396,40 @@ fn check_duplicates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             ),
             None => {
                 seen.insert(&node.id, span.start_line);
+            }
+        }
+    }
+}
+
+/// double-driven-port: an input port may have ONE driver. A port that is
+/// wired from upstream AND set in the node body (a `port_literals` entry,
+/// per the enrich normalization) has two, and which value wins would be
+/// invisible at the call site; reject at compile time. Body values carry
+/// no field defaults, so a hit is always an explicit assignment. A
+/// same-named config FIELD on a braces-closed port is not a
+/// driver (it lives in `config`, not `port_literals`) and stays legal.
+fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    for node in &project.nodes {
+        for name in node.port_literals.keys() {
+            let wired = project
+                .edges
+                .iter()
+                .any(|e| e.target == node.id && e.target_handle.as_deref() == Some(name.as_str()));
+            if wired {
+                push(
+                    d,
+                    node.port_literal_spans
+                        .get(name)
+                        .map(|s| s.span)
+                        .unwrap_or_else(|| node.header_span_or_default()),
+                    Severity::Error,
+                    "double-driven-port",
+                    format!(
+                        "input '{}' of '{}' has two drivers: it is wired from upstream AND \
+                         set in the node body; remove one",
+                        name, node.id
+                    ),
+                );
             }
         }
     }
@@ -552,13 +713,16 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // v1 refs: 3515-3519 (config literal), 4224-4258 (port type
     // override incompatibility).
     for node in &project.nodes {
-        let Some(obj) = node.config.as_object() else { continue };
-        for (key, value) in obj {
+        for (key, value) in &node.port_literals {
             let Some(port) = node.inputs.iter().find(|p| p.name == *key) else { continue };
-            if !port.configurable { continue }
-            // The culprit is the config field itself; fall back to the node
-            // header if the field span is missing.
-            let span = node.config_spans.get(key).map(|s| s.span)
+            // Only type-check plain-data literals. On ports whose literal
+            // placement excludes the braces (files, TypeVars, MustOverride),
+            // the written value is a marker/handle whose inferred JSON shape
+            // does not match the port type by construction.
+            if !port.literal.allows_config() { continue }
+            // The culprit is the literal itself; fall back to the node
+            // header if the span is missing.
+            let span = node.port_literal_spans.get(key).map(|s| s.span)
                 .or(node.header_span).unwrap_or_default();
             let inferred = weft_core::weft_type::WeftType::infer(value);
             if !weft_core::weft_type::WeftType::is_compatible(&inferred, &port.port_type) {
@@ -575,10 +739,12 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 // ─── group 4: port coverage ─────────────────────────────────────────────────
 
 /// required-port-unmet: required input with no driver (no edge + no
-///   config value).
+///   body value).
 /// require-one-of-unmet: each @require_one_of group must have at
 ///   least one port driven.
-/// wired-only-port-config: configurable=false port has a config value.
+/// port-literal-placement: a literal drives a port at a placement the
+///   port forbids (a braces value where only the assignment form is
+///   legal, or any literal on a wires-only port).
 /// undeclared-port-no-custom: node doesn't support canAddInputPorts
 ///   but config has a key not matching any declared input.
 ///
@@ -602,38 +768,87 @@ fn check_port_coverage(
         }
         let span = node.header_span_or_default();
 
+        // Metadata field keys: a braces value on a braces-closed port
+        // name is only legal when it targets a declared config field of
+        // the same name (the field and the port coexist, independent
+        // values).
+        let declared_fields: std::collections::HashSet<&str> = catalog
+            .lookup(&node.node_type)
+            .map(|meta| meta.fields.iter().map(|f| f.key.as_str()).collect())
+            .unwrap_or_default();
+
         for port in &node.inputs {
             let has_edge = driven.contains(&(node.id.clone(), port.name.clone()));
-            let has_config = node
-                .config
+            // Body-supplied port value, normalized by enrich into
+            // port_literals (braces where the placement allows it,
+            // assignment statements on any port).
+            let has_literal = node
+                .port_literals
                 .get(&port.name)
                 .map(|v| !v.is_null())
                 .unwrap_or(false);
 
-            if port.required && !has_edge && !has_config {
+            // A wires-only port takes no literal in ANY form. The braces
+            // form never reaches port_literals for such a port, so this
+            // catches the assignment statement (`id.port = ...`). When the
+            // port is ALSO wired, double-driven-port owns the situation
+            // (its "remove one driver" message is the accurate one; "wire
+            // it" would tell the user to do what they already did).
+            if has_literal && !has_edge && port.literal == weft_core::weft_type::LiteralPlacement::None {
+                let lit_span = node.port_literal_spans.get(&port.name).map(|s| s.span).unwrap_or(span);
+                push(
+                    d,
+                    lit_span,
+                    Severity::Error,
+                    "port-literal-placement",
+                    format!(
+                        "port '{}.{}' takes no literal: wire it from another node",
+                        node.id, port.name
+                    ),
+                );
+            }
+
+            if port.required && !has_edge && !has_literal {
                 push(
                     d,
                     span,
                     Severity::Error,
                     "required-port-unmet",
                     format!(
-                        "required input '{}.{}' has no driver (no edge, no config)",
+                        "required input '{}.{}' has no driver (no edge, no body value)",
                         node.id, port.name
                     ),
                 );
             }
 
-            if has_config && !port.configurable {
-                push(
-                    d,
-                    span,
-                    Severity::Error,
-                    "wired-only-port-config",
+            // After enrich normalization, a config key naming a
+            // braces-closed port can only be a braces value (assignment
+            // statements were moved to port_literals). That is legal
+            // only when it targets a declared same-named config FIELD;
+            // otherwise it is a mis-aimed attempt to braces-drive a
+            // port whose placement forbids it.
+            let braces_on_port = node
+                .config
+                .get(&port.name)
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if braces_on_port
+                && !port.literal.allows_config()
+                && !declared_fields.contains(port.name.as_str())
+            {
+                let message = if port.literal.allows_literal() {
                     format!(
-                        "port '{}.{}' is wired-only but has a config value. Remove the config or make the port configurable.",
+                        "port '{}.{}' takes a literal only as an assignment: the braces \
+                         form cannot drive it. Wire it or write {}.{} = ...",
+                        node.id, port.name, node.id, port.name
+                    )
+                } else {
+                    format!(
+                        "port '{}.{}' takes no literal: wire it from another node",
                         node.id, port.name
-                    ),
-                );
+                    )
+                };
+                push(d, span, Severity::Error, "port-literal-placement", message);
             }
         }
 
@@ -646,7 +861,7 @@ fn check_port_coverage(
             let any_met = group.iter().any(|port_name| {
                 driven.contains(&(node.id.clone(), port_name.clone()))
                     || node
-                        .config
+                        .port_literals
                         .get(port_name)
                         .map(|v| !v.is_null())
                         .unwrap_or(false)

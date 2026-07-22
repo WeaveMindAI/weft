@@ -8,14 +8,14 @@
 //! call_index order.
 //!
 //! Infra-provision (the engine-side counterpart to user code's
-//! `Node::provision` returning an `InfraSpec`) is driven by the loop
+//! `Node::provision_infra` returning an `InfraSpec`) is driven by the loop
 //! driver, NOT by methods on `RunnerHandle`. The loop driver calls
 //! `node.provision`, compiles + hashes the returned spec locally,
 //! reads prior applied state via the broker, makes a local
 //! skip/fresh/replace decision, and (when not Skip) enqueues an
 //! `Apply` lifecycle command via `apply_via_supervisor`. The tenant's
 //! supervisor pod handles the kubectl work. Once apply completes,
-//! the loop driver runs `node.execute` with `Phase::InfraSetup`.
+//! the loop driver runs the node's body with `Phase::InfraSetup`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1925,6 +1925,9 @@ impl ContextHandle for RunnerHandle {
             true,
             &self.tenant_id,
             call_index,
+            // A resume registration wakes THIS parked firing; ports are
+            // live in the body, nothing to replay later.
+            None,
         )
         .await
         .map_err(|e| WeftError::Suspension(format!("request token: {e}")))?;
@@ -2228,7 +2231,7 @@ impl ContextHandle for RunnerHandle {
     /// fire spawns a fresh execution (the dispatcher's relay path
     /// enqueues route_entry instead of resuming this firing).
     /// Distinct from await_signal: no suspend-then-resume cycle.
-    async fn register_signal(&self, spec: SignalSpec) -> WeftResult<()> {
+    async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
         // Entry triggers are one-shot per node per TriggerSetup.
         // The dedup key for this enqueue is `(color, node, frames,
         // is_resume=false, call_index=0)`; a second call from the
@@ -2252,6 +2255,7 @@ impl ContextHandle for RunnerHandle {
             false,
             &self.tenant_id,
             0,
+            Some(port_snapshot),
         )
         .await
         .map_err(|e| WeftError::Suspension(format!("register_signal: {e}")))?;
@@ -2366,7 +2370,7 @@ impl ContextHandle for RunnerHandle {
         // refused: we record a non-terminal PortTypeMismatch and CLOSE the
         // port (downstream sees null) instead of letting the wrong-typed
         // value flow. Compatible ports emit together in one Values batch.
-        let mut kept = NodeOutput::empty();
+        let mut kept = NodeOutput::new();
         let mut closed: Vec<String> = Vec::new();
         for (port, value) in output.outputs {
             match self.declared_outputs.get(&port) {
@@ -2448,6 +2452,7 @@ async fn enqueue_register_signal_task(
     is_resume: bool,
     tenant_id: &str,
     call_index: u32,
+    port_snapshot: Option<Value>,
 ) -> anyhow::Result<RegisterSignalReply> {
     // Task-level dedup so retries (network blip, supervisor
     // reconnect) converge on the same token. `is_resume` is in the
@@ -2470,6 +2475,7 @@ async fn enqueue_register_signal_task(
         "spec": spec,
         "is_resume": is_resume,
         "call_index": call_index,
+        "port_snapshot": port_snapshot,
     });
     let id = tasks
         .enqueue_dedup(task_store::NewTask {
@@ -2663,9 +2669,8 @@ mod replay_tests {
             None,
             uuid::Uuid::nil(),
             weft_core::frames::LoopFrames::default(),
-            weft_core::context::ConfigBag::default(),
-            weft_core::context::InputBag::default(),
-            weft_core::context::Phase::Fire,
+            weft_core::context::ValueBag::ports(Default::default()),
+            weft_core::context::ValueBag::config(Default::default()),
             handle,
         )
     }
@@ -2678,7 +2683,7 @@ mod replay_tests {
     // origin classification, the user's own key never touching the broker,
     // and the runtime (not the node) giving runtime grants back.
     #[tokio::test]
-    async fn a_users_own_key_never_touches_the_deployment() {
+    async fn a_users_own_key_never_touches_the_runtime_broker() {
         let fake = FakePaidCallClient::new();
         let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
 
@@ -2690,9 +2695,9 @@ mod replay_tests {
     }
 
     #[tokio::test]
-    async fn a_deployment_grant_carries_the_window_and_is_given_back_by_the_runtime() {
+    async fn a_runtime_grant_carries_the_window_and_is_given_back_by_the_runtime() {
         let fake = FakePaidCallClient::new();
-        fake.set_key("openrouter", "sk-deployment");
+        fake.set_key("openrouter", "sk-runtime");
         let handle = Arc::new(handle_with_paid_calls(fake.clone()));
         let ctx = ctx_over_arc(handle.clone());
 
@@ -2705,8 +2710,8 @@ mod replay_tests {
             )
             .await
             .unwrap();
-        assert_eq!(access.origin(), weft_core::AccessOrigin::Deployment);
-        assert_eq!(access.credential(), "sk-deployment");
+        assert_eq!(access.origin(), weft_core::AccessOrigin::Runtime);
+        assert_eq!(access.credential(), "sk-runtime");
 
         let opened = fake.opened.lock().unwrap().clone();
         assert_eq!(opened.len(), 1);
@@ -2722,7 +2727,7 @@ mod replay_tests {
         // grant back once the body finished.
         assert!(fake.closed_accesses.lock().unwrap().is_empty());
         handle.close_opened_accesses().await;
-        assert_eq!(*fake.closed_accesses.lock().unwrap(), vec!["sk-deployment".to_string()]);
+        assert_eq!(*fake.closed_accesses.lock().unwrap(), vec!["sk-runtime".to_string()]);
         // Idempotent: a second sweep has nothing left to give back.
         handle.close_opened_accesses().await;
         assert_eq!(fake.closed_accesses.lock().unwrap().len(), 1);
@@ -2732,7 +2737,7 @@ mod replay_tests {
     #[tokio::test]
     async fn the_default_window_is_used_when_a_node_declares_none() {
         let fake = FakePaidCallClient::new();
-        fake.set_key("openrouter", "sk-deployment");
+        fake.set_key("openrouter", "sk-runtime");
         let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
 
         ctx.provider_access("openrouter", None).await.unwrap();
@@ -2757,7 +2762,7 @@ mod replay_tests {
     }
 
     #[tokio::test]
-    async fn a_provider_the_deployment_has_no_key_for_errors_loud() {
+    async fn a_provider_the_runtime_has_no_key_for_errors_loud() {
         let fake = FakePaidCallClient::new();
         let ctx = ctx_over(handle_with_paid_calls(fake));
         let err = ctx.provider_access("elevenlabs", None).await.unwrap_err();
@@ -3160,7 +3165,7 @@ mod replay_tests {
     }
 }
 
-/// After `node.provision()` returns, the loop driver calls this to
+/// After `node.provision_infra()` returns, the loop driver calls this to
 /// ship the spec to the supervisor and wait for it to settle.
 ///
 /// The worker doesn't compile, doesn't hash, doesn't decide

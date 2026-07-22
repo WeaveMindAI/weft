@@ -410,8 +410,12 @@ async fn route_after_started(
         })?;
     let project_def: weft_core::ProjectDefinition = serde_json::from_str(&project_json)?;
 
-    let kicks =
-        crate::api::project::compute_trigger_kicks(&project_def, &signal.node_id, &payload.payload);
+    let kicks = crate::api::project::compute_trigger_kicks(
+        &project_def,
+        &signal.node_id,
+        &payload.payload,
+        signal.port_snapshot.as_ref(),
+    );
     if kicks.is_empty() {
         anyhow::bail!(
             "trigger '{}' has no output downstream; nothing to run",
@@ -425,7 +429,9 @@ async fn route_after_started(
                 &weft_journal::ExecEvent::NodeKicked {
                     color,
                     node_id: kick.node_id.clone(),
+                    firing: kick.firing,
                     payload: kick.payload.clone(),
+                    port_snapshot: kick.port_snapshot.clone(),
                     at_unix: now,
                 },
                 &format!("route_entry:{}:kick:{}", payload.fire_id, kick.node_id),

@@ -1,17 +1,15 @@
 //! WhatsAppBridge: infra node.
 //!
-//! - `Phase::InfraSetup`: `Node::provision` returns an `InfraSpec`
-//!   declaring a Deployment + Service + PVC for the Baileys bridge.
-//!   The dispatcher's apply task compiles + applies the manifests
-//!   and writes the `infra_node` row. Then `execute` runs in
-//!   InfraSetup phase to forward the bridge's `/outputs` to the
-//!   node's pulse output ports.
-//! - `Phase::TriggerSetup` / `Phase::Fire`: `execute` queries
-//!   `endpoint_url("api")` and forwards `/outputs` as before. Provision
-//!   is skipped (infra is already up).
+//! - `provision_infra` returns an `InfraSpec` declaring a Deployment +
+//!   Service + PVC for the Baileys bridge. The dispatcher's apply task
+//!   compiles + applies the manifests and writes the `infra_node` row,
+//!   then `run` forwards the bridge's `/outputs` to the node's pulse
+//!   output ports.
+//! - On later invocations (trigger setup, a normal firing) provisioning
+//!   is skipped (infra is already up) and `run` queries
+//!   `endpoint_url("api")` and forwards `/outputs` as before.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::infra::{
     AccessMode, Container, ContainerPort, Endpoint, EnvEntry, Expose, Image, InfraSpec, Lifecycle,
@@ -19,17 +17,17 @@ use weft_core::infra::{
     VolumeKind,
 };
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, InfraProvisionContext, InputBag, Node, NodeManifest, WeftResult};
+use weft_core::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct WhatsAppBridgeNode;
 
 #[async_trait]
 impl Node for WhatsAppBridgeNode {
-    async fn provision(
+    async fn provision_infra(
         &self,
         _ctx: InfraProvisionContext,
-        _input: InputBag,
+        _input: ValueBag,
     ) -> WeftResult<InfraSpec> {
         // No programmatic inputs today; the bridge is parameterless.
         // Future: a `device_label` input could be threaded into env.
@@ -106,32 +104,29 @@ impl Node for WhatsAppBridgeNode {
         })
     }
 
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        // Bridge behaves the same in every phase: resolve the endpoint
-        // and emit it. Downstream nodes (trigger setup, fire-time data
-        // reads) all need the URL.
-        let out = query_outputs(&ctx).await?;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // Bridge behaves the same on every invocation: resolve the
+        // endpoint and emit it. Downstream nodes (trigger setup,
+        // fire-time data reads) all need the URL.
+        //
+        // One broker round-trip resolves the endpoint; the handle
+        // caches the URL so `.url()` and `.call(...)` don't repeat
+        // the lookup. Output ports: `endpointUrl` (the bare URL, so
+        // downstream nodes like WhatsAppSend can target the bridge
+        // from outside the declared-endpoint graph) plus the bridge's
+        // `/outputs` keys (status, phoneNumber, jid, pushName), each
+        // a declared port in metadata.json. The `/outputs` key set
+        // and the declared output ports must stay in sync.
+        let api = ctx.endpoint("api").await?;
+        let bridge_outputs = api
+            .call(weft_core::EndpointMethod::Get, "/outputs", None)
+            .await?;
+        // `endpointUrl` is our locally-known truth (the resolved
+        // EndpointHandle URL). Set AFTER the fan (set-after-fan wins) so a
+        // misbehaving container can't shadow it with its own value.
+        let out = NodeOutput::new()
+            .extend_from_object(&bridge_outputs)
+            .set("endpointUrl", api.url());
         ctx.pulse_downstream(out).await
     }
-}
-
-async fn query_outputs(ctx: &ExecutionContext) -> WeftResult<NodeOutput> {
-    // One broker round-trip resolves the endpoint; the handle
-    // caches the URL so `.url()` and `.call(...)` don't repeat
-    // the lookup. Output ports: `endpointUrl` (the bare URL, so
-    // downstream nodes like WhatsAppSend can target the bridge
-    // from outside the declared-endpoint graph) plus the bridge's
-    // `/outputs` keys (status, phoneNumber, jid, pushName), each
-    // a declared port in metadata.json. The `/outputs` key set
-    // and the declared output ports must stay in sync.
-    let api = ctx.endpoint("api").await?;
-    let bridge_outputs = api
-        .call(weft_core::EndpointMethod::Get, "/outputs", None)
-        .await?;
-    // `endpointUrl` is our locally-known truth (the resolved
-    // EndpointHandle URL). Set AFTER the fan (set-after-fan wins) so a
-    // misbehaving container can't shadow it with its own value.
-    Ok(NodeOutput::empty()
-        .extend_from_object(&bridge_outputs)
-        .set("endpointUrl", Value::String(api.url().to_string())))
 }

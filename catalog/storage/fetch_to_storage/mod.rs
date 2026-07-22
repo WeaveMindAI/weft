@@ -15,10 +15,10 @@ pub struct FetchToStorageNode;
 
 #[async_trait]
 impl Node for FetchToStorageNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let url = ctx.input.required_str("url", "url")?;
-        let keep: bool = ctx.config.get("keep").unwrap_or(false);
-        let filename = ctx.input.get_optional::<String>("filename")?;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let url: String = ctx.ports.get("url")?;
+        let keep: bool = ctx.config.get_or("keep", false)?;
+        let filename: Option<String> = ctx.ports.opt("filename")?;
         let keep_ttl = keep.then_some(KeepTtl::Default);
 
         // The whole fetch-stream-into-storage path is a language
@@ -30,9 +30,10 @@ impl Node for FetchToStorageNode {
             .await?;
 
         let stored = StoredFile::from_value(&file)?;
-        let out = NodeOutput::with("file", file)
-            .set("sizeBytes", serde_json::json!(stored.size_bytes))
-            .set("mimeType", serde_json::json!(stored.mime_type));
+        let out = NodeOutput::new()
+            .set("file", file)
+            .set("sizeBytes", stored.size_bytes)
+            .set("mimeType", stored.mime_type);
         ctx.pulse_downstream(out).await
     }
 }

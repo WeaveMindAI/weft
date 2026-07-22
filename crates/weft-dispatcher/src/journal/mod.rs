@@ -289,6 +289,10 @@ pub struct SignalRegistration {
     /// Used by the signal_token enumeration filter (allowed_tags
     /// overlap). Charset validated upstream by the parser.
     pub tags: Vec<String>,
+    /// The trigger's delivered port values at registration time (entry
+    /// signals only). Replayed onto the trigger's ports at every fire:
+    /// a trigger's inputs are whatever they were at trigger setup.
+    pub port_snapshot: Option<serde_json::Value>,
     /// Rendered consumer payload (form schema, decorated webhook
     /// shape, etc). Computed once at register time on the listener
     /// `/render` endpoint; cached here so consumer enumeration is

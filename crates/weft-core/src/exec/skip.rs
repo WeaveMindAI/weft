@@ -30,10 +30,10 @@ pub fn check_should_skip(
     color: Color,
     required: &HashSet<&str>,
     wired: &HashSet<&str>,
-    config_filled: &HashSet<&str>,
+    literal_filled: &HashSet<&str>,
 ) -> bool {
     // Rule 1: any wired required port that arrived as a closure -> skip.
-    // (`config_filled` never overlaps `wired`: wires are authoritative
+    // (`literal_filled` never overlaps `wired`: wires are authoritative
     // and config only fills unwired ports, so no config check here.)
     for port_name in required {
         if !wired.contains(port_name) {
@@ -57,7 +57,7 @@ pub fn check_should_skip(
     // oneOfRequired loop below.
     if !node.inputs.is_empty() {
         let all_dead = node.inputs.iter().all(|port| {
-            if config_filled.contains(port.name.as_str()) {
+            if literal_filled.contains(port.name.as_str()) {
                 return false;
             }
             if !wired.contains(port.name.as_str()) {
@@ -76,7 +76,7 @@ pub fn check_should_skip(
             continue;
         }
         let all_closed = group.iter().all(|port_name| {
-            if config_filled.contains(port_name.as_str()) {
+            if literal_filled.contains(port_name.as_str()) {
                 return false;
             }
             if !wired.contains(port_name.as_str()) {
@@ -162,9 +162,9 @@ mod tests {
         let pulses = vec![data_pulse("a", json!(null))];
         let required: HashSet<&str> = ["a"].into_iter().collect();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let config_filled = HashSet::new();
+        let literal_filled = HashSet::new();
         assert!(
-            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &config_filled),
+            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
             "user-emitted null is data; required port + null must NOT skip"
         );
     }
@@ -175,9 +175,9 @@ mod tests {
         let pulses = vec![closure_pulse("a")];
         let required: HashSet<&str> = ["a"].into_iter().collect();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let config_filled = HashSet::new();
+        let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &config_filled),
+            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
             "closure on a required port must skip"
         );
     }
@@ -188,9 +188,9 @@ mod tests {
         let pulses = vec![closure_pulse("a"), closure_pulse("b")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
-        let config_filled = HashSet::new();
+        let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &config_filled),
+            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
             "all-optional + all-closed must skip"
         );
     }
@@ -201,9 +201,9 @@ mod tests {
         let pulses = vec![data_pulse("a", json!(7)), closure_pulse("b")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
-        let config_filled = HashSet::new();
+        let literal_filled = HashSet::new();
         assert!(
-            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &config_filled),
+            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
             "all-optional + one value + one closed must NOT skip"
         );
     }
@@ -217,24 +217,24 @@ mod tests {
         let pulses = vec![closure_pulse("a")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let config_filled = HashSet::new();
+        let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &config_filled),
+            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
             "closed wire + unwired unconfigured port must skip"
         );
     }
 
     #[test]
-    fn all_optional_closed_wire_plus_config_filled_fires() {
+    fn all_optional_closed_wire_plus_literal_filled_fires() {
         // Same shape but `b` is config-filled: the body has a value
         // to act on, so it fires.
         let node = node_all_optional();
         let pulses = vec![closure_pulse("a")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let config_filled: HashSet<&str> = ["b"].into_iter().collect();
+        let literal_filled: HashSet<&str> = ["b"].into_iter().collect();
         assert!(
-            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &config_filled),
+            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
             "a config-filled port keeps the node alive"
         );
     }
@@ -245,9 +245,9 @@ mod tests {
         let pulses = vec![data_pulse("a", json!(null)), closure_pulse("b")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
-        let config_filled = HashSet::new();
+        let literal_filled = HashSet::new();
         assert!(
-            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &config_filled),
+            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
             "user-emitted null is data; one null + one closed must NOT skip"
         );
     }

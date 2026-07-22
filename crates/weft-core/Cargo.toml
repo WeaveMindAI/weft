@@ -43,6 +43,9 @@ base64 = { workspace = true, optional = true }
 # client type named in the `ContextHandle` trait. Runtime-only (no wasm32
 # support needed).
 reqwest-middleware = { workspace = true, optional = true }
+# The plain outbound HTTP capability (`ctx.http()`): the one shared, pooled
+# client for unpaid calls, so nodes never construct their own.
+reqwest = { workspace = true, optional = true }
 
 [features]
 default = ["runtime"]
@@ -58,6 +61,7 @@ runtime = [
     "dep:hmac",
     "dep:base64",
     "dep:reqwest-middleware",
+    "dep:reqwest",
 ]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into

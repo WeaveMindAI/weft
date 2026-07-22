@@ -20,6 +20,10 @@ import type {
 // webview-local copy that drifts from the wire shape).
 export type { NodeExecutionStatus };
 export type { NodeFeaturesWire as NodeFeatures } from '../../../shared/protocol';
+// The literal-placement ladder IS the wire type, re-exported for the same
+// one-definition reason.
+import type { LiteralPlacement } from '../../../protocol';
+export type { LiteralPlacement };
 
 // =============================================================================
 // PORT TYPE SYSTEM
@@ -87,7 +91,7 @@ export type WeftType =
 	| { kind: 'json_dict' }
 	// A message-bus handle: an in-process channel between co-alive nodes.
 	// A Bus output connects only to a Bus input; the payloads are not
-	// type-checked. Wired-only (a live runtime handle, never configurable).
+	// type-checked. Wires only (a live runtime handle takes no literal).
 	| { kind: 'bus' }
 	| { kind: 'union'; types: WeftType[] }
 	| { kind: 'typevar'; name: string }
@@ -358,40 +362,45 @@ export function inferTypeFromValue(value: unknown): WeftType {
 	return { kind: 'primitive', value: 'String' };
 }
 
-/** Whether a port of this type should be configurable by default (i.e.,
- *  fillable from a same-named config field). Mirrors
- *  WeftType::is_default_configurable() in Rust. File types, TypeVar, and
- *  MustOverride are wired-only; everything else (primitives, lists, dicts,
- *  JsonDict, unions of configurable types) defaults to configurable. */
-export function isDefaultConfigurable(t: WeftType): boolean {
+/** The default literal placement for a port of this type. Mirrors
+ *  WeftType::default_literal_placement() in Rust: plain data (primitives,
+ *  lists, dicts, JsonDict, unions of those) takes a literal anywhere;
+ *  file types, TypeVar, and MustOverride only as an assignment
+ *  statement; a Bus never. A union is as restrictive as its most
+ *  restrictive member. */
+export function defaultLiteralPlacement(t: WeftType): LiteralPlacement {
 	switch (t.kind) {
 		case 'primitive':
-			return !FILE_PRIMITIVES.includes(t.value);
+			return FILE_PRIMITIVES.includes(t.value) ? 'assignment' : 'anywhere';
 		case 'list':
-			return isDefaultConfigurable(t.inner);
+			return defaultLiteralPlacement(t.inner);
 		case 'dict':
-			return isDefaultConfigurable(t.value);
-		case 'union':
-			return t.types.every(isDefaultConfigurable);
+			return defaultLiteralPlacement(t.value);
+		case 'union': {
+			const order: LiteralPlacement[] = ['anywhere', 'assignment', 'none'];
+			return t.types
+				.map(defaultLiteralPlacement)
+				.reduce((worst, p) => (order.indexOf(p) > order.indexOf(worst) ? p : worst), 'anywhere');
+		}
 		case 'json_dict':
-			return true;
+			return 'anywhere';
 		case 'bus':
-			// A bus is a live runtime handle, never configurable.
-			return false;
+			// A bus is a live runtime handle: no literal ever.
+			return 'none';
 		case 'typevar':
-			return false;
+			return 'assignment';
 		case 'must_override':
-			return false;
+			return 'assignment';
 	}
 }
 
-/** Whether a port is configurable. Uses the explicit `configurable` field
- *  when set; falls back to the default determined by the port type. */
-export function isPortConfigurable(port: PortDefinition): boolean {
-	if (port.configurable !== undefined) return port.configurable;
+/** A port's literal placement. Uses the explicit `literal` level when
+ *  set; falls back to the default determined by the port type. */
+export function portLiteralPlacement(port: PortDefinition): LiteralPlacement {
+	if (port.literal !== undefined) return port.literal;
 	const parsed = parseWeftType(port.portType);
-	if (!parsed) return false;
-	return isDefaultConfigurable(parsed);
+	if (!parsed) return 'none';
+	return defaultLiteralPlacement(parsed);
 }
 
 /** Unify a list of types. If all identical, return that type. Otherwise, return a union. */
@@ -411,11 +420,11 @@ export interface PortDefinition {
 	portType: PortType;
 	required: boolean;
 	description?: string;
-	/** Whether this port can be filled by a same-named config field on the
-	 *  node (in addition to being wired by an edge). Defaults to true unless
-	 *  the type is a File type or otherwise non-configurable. Catalog
-	 *  authors opt out per port. Edge wins over config when both are present. */
-	configurable?: boolean;
+	/** Where a literal value may be written for this port ('anywhere' =
+	 *  braces or assignment, 'assignment' = statement only, 'none' =
+	 *  wires only). Absent falls to the port type's default. Edges are a
+	 *  separate axis and always legal; an edge wins over a literal. */
+	literal?: LiteralPlacement;
 	/** True iff this is the auto-synthesized input half of a loop carry port.
 	 *  The editor renders it as a ghost mirror of the carry output; the user
 	 *  edits the output's role to remove or rename it, never this side. */
@@ -436,6 +445,12 @@ export interface FieldDefinition {
 	key: string;
 	label: string;
 	type: FieldType;
+	/// This field edits a PORT's body value (an entry in the node's
+	/// portLiterals), not a config field. Its value routes through the
+	/// strip's `portValues` record, its DOM/editor identity is prefixed,
+	/// and it may legally share a key with a config field (a wired-only
+	/// port's literal next to a same-named field).
+	portDriven?: boolean;
 	placeholder?: string;
 	options?: string[];
 	defaultValue?: unknown;
@@ -485,7 +500,7 @@ export interface NodeExecution {
 	costUnknown?: boolean;
 	/// Whose key this firing's cost records spent; 'mixed' when records
 	/// disagree (e.g. a group row aggregating both kinds of member).
-	costOrigin?: 'user-provided' | 'deployment' | 'mixed';
+	costOrigin?: 'user-provided' | 'runtime' | 'mixed';
 	/// Identities of the cost records already folded into `costUsd` /
 	/// `costUnknown`. The dispatcher re-streams journal events on every
 	/// follow/reconnect (replay + live overlap), so the reducer dedups on
@@ -576,25 +591,6 @@ export type { LiveDataItem } from '../../../shared/protocol';
  * - structural: the project is correctly wired (connections, required config for structure)
  * - runtime: the project can actually execute (API keys, credentials, file data)
  */
-export type ValidationLevel = 'structural' | 'runtime';
-
-/**
- * A single validation error for a node.
- */
-export interface ValidationError {
-	field?: string;
-	port?: string;
-	message: string;
-	level: ValidationLevel;
-}
-
-/**
- * Function signature for node validation.
- * Each node can optionally implement this to validate its configuration.
- * Forward declaration - full context types defined below.
- */
-export type NodeValidateFunction = (context: ValidationContext) => ValidationError[];
-
 /**
  * NodeTemplate defines what a node TYPE looks like.
  * This is the schema/blueprint for nodes like "OpenRouterInference", "ExecPython", "Http".
@@ -622,7 +618,6 @@ export interface NodeTemplate {
 	defaultInputs: PortDefinition[];
 	defaultOutputs: PortDefinition[];
 	features?: NodeFeatures;
-	validate?: NodeValidateFunction;
 	setupGuide?: string[];
 	formFieldSpecs?: import('../utils/form-field-specs').FormFieldSpec[];
 	/** Dynamically resolve port types based on current port definitions.
@@ -660,6 +655,11 @@ export interface NodeInstance {
 	nodeType: string;
 	label: string | null;
 	config: Record<string, unknown>;
+	/// Body-set PORT values keyed by port name, the two-home twin of
+	/// `config` (braces or statement form, per the port's literal
+	/// placement). Mirrors the definition's `portLiterals`.
+	portLiterals?: Record<string, unknown>;
+	portLiteralSpans?: Record<string, import('../../../protocol').ConfigFieldSpan>;
 	position: Position;
 	parentId?: string;
 	inputs: PortDefinition[];
@@ -715,6 +715,14 @@ export interface ProjectDefinition {
 export interface NodeDataUpdates {
 	label?: string | null;
 	config?: Record<string, unknown>;
+	/// Body-set PORT values (the node's portLiterals map), kept apart
+	/// from `config`: one home per name. The handler diffs it into
+	/// setConfig/removeConfig ops stamped with the value's written form.
+	portLiterals?: Record<string, unknown>;
+	/// Flip a port value's WRITTEN form (braces vs statement); becomes a
+	/// `setValueForm` op.
+	// SYNC: portValueForm.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/protocol.ts EditOp setValueForm.form
+	portValueForm?: { key: string; form: 'inline' | 'connection' };
 	inputs?: PortDefinition[];
 	outputs?: PortDefinition[];
 	/// Set ONLY when the user dragged the resize handle. The host re-runs ELK on a
@@ -723,31 +731,6 @@ export interface NodeDataUpdates {
 	/// a move), which carry width/height too but must NOT trigger a relayout.
 	resized?: boolean;
 }
-
-// =============================================================================
-// Node Validation Types (ValidationContext defined here after NodeInstance/Edge)
-// =============================================================================
-
-/**
- * Context provided to a node's validate function.
- * Contains all information needed to validate the node's configuration.
- */
-export interface ValidationContext {
-	config: Record<string, unknown>;
-	connectedInputs: Set<string>;
-	allNodes: NodeInstance[];
-	allEdges: Edge[];
-	nodeId: string;
-}
-
-/**
- * Result of validating all nodes in a project.
- */
-export interface ProjectValidationResult {
-	valid: boolean;
-	nodeErrors: Map<string, ValidationError[]>;
-}
-
 
 /** Resolve a container node's kind. Returns null for non-containers.
  *  The single source of truth for "is this a container, and which

@@ -7,7 +7,7 @@
 //!
 //! `/sync` runs an `InfraSetup` subworkflow exec: the worker walks
 //! every `requires_infra` node + its upstream closure; each infra
-//! node calls `Node::provision`. The engine then makes a local
+//! node calls `Node::provision_infra`. The engine then makes a local
 //! skip / fresh / replace decision (comparing the compiled spec
 //! hash against the broker's stored `infra_node.applied_spec_hash`)
 //! and, when not Skip, enqueues an `Apply` lifecycle command. The

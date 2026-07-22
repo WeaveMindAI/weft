@@ -17,11 +17,9 @@
 
 use async_trait::async_trait;
 
-use serde_json::Value;
-
 use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 use weft_providers::providers::openrouter::OPENROUTER;
 use weft_providers::{CallObservation, FollowUp, MeasuredCost, ObservedCall, ProviderMeter, RouteClass};
 
@@ -32,24 +30,21 @@ pub struct AskCustomNode;
 
 #[async_trait]
 impl Node for AskCustomNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let cfg = ctx.effective_config();
-        let prompt: String = ctx.input.get("prompt")?;
-        let system_prompt: String = cfg.get_optional("systemPrompt")?.unwrap_or_default();
-        let model = cfg
-            .get_optional::<String>("model")?
-            .unwrap_or_else(|| "openai/gpt-4.1-nano".to_string());
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let prompt: String = ctx.ports.get("prompt")?;
+        let system_prompt: String = ctx.config.get_or("systemPrompt", String::new())?;
+        let model: String = ctx.config.get_or("model", "openai/gpt-4.1-nano".to_string())?;
 
         // The whole paid-call surface, against the PROJECT-DEFINED provider:
         // open access, build the generator over the metered client. The
         // runtime finds this project's own `openrouter_custom` meter and
         // measures the call's real cost behind the client.
         let access = ctx
-            .provider_access("openrouter_custom", cfg.get_optional("apiKey")?)
+            .provider_access("openrouter_custom", ctx.config.opt("apiKey")?)
             .await?;
         let generator = GeneratorInfo::openrouter(model)
             .with_api_key(access.credential())
-            .with_app_attribution("https://weavemind.ai", "Weft")
+            .with_app_attribution("https://weavemind.ai", "WeaveMind")
             .with_http_client(ctx.metered_client(&access)?);
 
         let root = ChatNode::root(system_prompt);
@@ -62,15 +57,14 @@ impl Node for AskCustomNode {
         let stream = user
             .complete_streaming(&generator, Some(&params))
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("openrouter_custom: {e}")))?;
+            .node_err("openrouter_custom")?;
         let cancelled = ctx.cancellation();
         let response = tokio::select! {
-            collected = stream.collect() => collected
-                .map_err(|e| WeftError::NodeExecution(format!("openrouter_custom: {e}")))?,
+            collected = stream.collect() => collected.node_err("openrouter_custom")?,
             _ = cancelled.cancelled() => return Err(WeftError::Cancelled),
         };
 
-        ctx.pulse_downstream(NodeOutput::with("response", Value::String(response.content))).await
+        ctx.pulse_downstream(NodeOutput::new().set("response", response.content)).await
     }
 }
 

@@ -14,7 +14,7 @@
 // scope, moves reject when the moved decl has connections).
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
-import { isContainerNodeType, isLoopNodeType, containerKindOf } from '../types';
+import { isContainerNodeType, isLoopNodeType, containerKindOf, portLiteralPlacement } from '../types';
 import type { EditOp, EditPortSig } from '../../../shared/protocol';
 import { parseConfigToken } from '../value-format';
 import type { FoldResult, PendingOp } from './types';
@@ -196,7 +196,7 @@ function updatePorts(node: NodeInstance, inputs: EditPortSig[], outputs: EditPor
     sigs.map((sig) => {
       const prior = existing.find((p) => p.name === sig.name);
       return {
-        ...(prior ?? { configurable: false }),
+        ...(prior ?? {}),
         name: sig.name,
         required: sig.required,
         portType: sig.portType ?? prior?.portType ?? 'T',
@@ -233,7 +233,7 @@ function syncLoopCarryInputs(loop: NodeInstance): void {
         name,
         portType: out.portType,
         required: out.required,
-        configurable: false,
+        literal: 'none',
         synthesizedFromCarry: true,
       });
     }
@@ -307,8 +307,42 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       if (isContainerNodeType(node.nodeType)) {
         throw new Error(`SetConfig/RemoveConfig called on '${op.node}' which is a ${node.nodeType} decl, not a Node`);
       }
+      // Mirror the compiler's enrich normalization so the optimistic
+      // projection matches the host's next parse: a value that DRIVES an
+      // input port (braces where the port's literal placement allows it,
+      // or an explicit statement-form write on any port) homes in
+      // `portLiterals`, everything else in `config`. One home per name.
+      const port = node.inputs?.find((p) => p.name === op.key);
+      const portHomed = port !== undefined && (portLiteralPlacement(port) === 'anywhere' || op.form === 'connection');
+      if (portHomed) {
+        const literals = (node.portLiterals ??= {});
+        const spans = (node.portLiteralSpans ??= {});
+        if (op.op === 'setConfig') {
+          literals[op.key] = parseConfigToken(op.value);
+          if (!spans[op.key]) {
+            // A fresh literal: record the written form so the field's
+            // marker renders before the host round-trip (span stays
+            // zeroed; only `origin` matters to the view).
+            spans[op.key] = {
+              span: { startLine: 0, startColumn: 0, endLine: 0, endColumn: 0 },
+              origin: op.form ?? 'inline',
+            };
+          }
+        } else {
+          delete literals[op.key];
+          delete spans[op.key];
+        }
+        return;
+      }
       if (op.op === 'setConfig') node.config[op.key] = parseConfigToken(op.value);
       else delete node.config[op.key];
+      return;
+    }
+    case 'setValueForm': {
+      const node = resolveDecl(project, op.node);
+      const spans = (node.portLiteralSpans ??= {});
+      const existing = spans[op.key];
+      if (existing) spans[op.key] = { ...existing, origin: op.form };
       return;
     }
     case 'setLoopConfig':

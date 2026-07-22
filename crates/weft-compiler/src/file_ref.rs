@@ -150,7 +150,14 @@ pub fn collect_runtime_key_refs(
     let mut seen = std::collections::BTreeSet::new();
     let mut refs = Vec::new();
     for node in &project.nodes {
-        for value in node.config.as_object().map(|o| o.values()).into_iter().flatten() {
+        for value in node
+            .config
+            .as_object()
+            .map(|o| o.values())
+            .into_iter()
+            .flatten()
+            .chain(node.port_literals.values())
+        {
             let Some(raw) = value.as_str() else { continue };
             let Some(Ok(file_ref)) = parse_marker(raw) else { continue };
             if is_asset_ref(&file_ref)
@@ -339,31 +346,45 @@ pub fn apply_asset_resolutions(
     map: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<(), Vec<String>> {
     let mut missing = Vec::new();
+    // An `@asset` may sit on a config field (`node.config`) or on a port
+    // (`node.port_literals`, where the enrich normalization homes
+    // port-driven body values); resolve both.
+    fn resolve_value(
+        value: &mut serde_json::Value,
+        map: &std::collections::BTreeMap<String, serde_json::Value>,
+        missing: &mut Vec<String>,
+    ) {
+        let Some(raw) = value.as_str() else { return };
+        let Some(Ok(file_ref)) = parse_marker(raw) else { return };
+        if !is_asset_ref(&file_ref) {
+            return;
+        }
+        if is_url_ref(&file_ref) {
+            *value = weft_core::storage::url_file_value(&file_ref.path, &file_ref.ty);
+            return;
+        }
+        match map.get(&file_ref.path) {
+            Some(resolved) => *value = resolved.clone(),
+            None if is_runtime_key_ref(&file_ref) => missing.push(format!(
+                "@asset({:?}, {}) names a stored file that does not exist (deleted, or \
+                 picked from another project)",
+                file_ref.path, file_ref.ty
+            )),
+            None => missing.push(format!(
+                "@asset({:?}, {}) is not a synced asset (missing file, or the build ran \
+                 without the asset sync)",
+                file_ref.path, file_ref.ty
+            )),
+        }
+    }
     for node in &mut project.nodes {
-        let Some(config) = node.config.as_object_mut() else { continue };
-        for value in config.values_mut() {
-            let Some(raw) = value.as_str() else { continue };
-            let Some(Ok(file_ref)) = parse_marker(raw) else { continue };
-            if !is_asset_ref(&file_ref) {
-                continue;
+        if let Some(config) = node.config.as_object_mut() {
+            for value in config.values_mut() {
+                resolve_value(value, map, &mut missing);
             }
-            if is_url_ref(&file_ref) {
-                *value = weft_core::storage::url_file_value(&file_ref.path, &file_ref.ty);
-                continue;
-            }
-            match map.get(&file_ref.path) {
-                Some(resolved) => *value = resolved.clone(),
-                None if is_runtime_key_ref(&file_ref) => missing.push(format!(
-                    "@asset({:?}, {}) names a stored file that does not exist (deleted, or \
-                     picked from another project)",
-                    file_ref.path, file_ref.ty
-                )),
-                None => missing.push(format!(
-                    "@asset({:?}, {}) is not a synced asset (missing file, or the build ran \
-                     without the asset sync)",
-                    file_ref.path, file_ref.ty
-                )),
-            }
+        }
+        for value in node.port_literals.values_mut() {
+            resolve_value(value, map, &mut missing);
         }
     }
     if missing.is_empty() {
@@ -382,7 +403,14 @@ pub fn collect_asset_refs(project: &weft_core::project::ProjectDefinition) -> Ve
     let mut seen = std::collections::BTreeSet::new();
     let mut refs = Vec::new();
     for node in &project.nodes {
-        for value in node.config.as_object().map(|o| o.values()).into_iter().flatten() {
+        for value in node
+            .config
+            .as_object()
+            .map(|o| o.values())
+            .into_iter()
+            .flatten()
+            .chain(node.port_literals.values())
+        {
             let Some(raw) = value.as_str() else { continue };
             let Some(Ok(file_ref)) = parse_marker(raw) else { continue };
             if is_asset_ref(&file_ref)

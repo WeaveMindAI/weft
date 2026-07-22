@@ -12,19 +12,22 @@ use crate::primitive::SignalSpec;
 use crate::weft_type::WeftType;
 use crate::Color;
 
-/// Which lifecycle phase this invocation belongs to. v2 mirrors v1's
-/// three-runtime model: infra setup provisions long-lived resources
-/// (infra pods), trigger setup wires up listeners (opens subscriptions,
-/// registers URLs), and fire runs the regular execution subgraph.
-/// Nodes branch on this to do the right thing per phase.
+/// Which lifecycle phase this invocation belongs to. Three-runtime
+/// model: infra setup provisions long-lived resources (infra pods),
+/// trigger setup wires up listeners (opens subscriptions, registers
+/// URLs), and fire runs the regular execution subgraph.
 ///
-/// - `InfraSetup`: an infra node is being provisioned. Only infra
-///   nodes run in this phase.
+/// Engine/journal vocabulary only: nodes never see it. The engine
+/// routes each phase to the right `Node` method from the manifest
+/// (`setup_trigger` for a trigger at TriggerSetup, `run` otherwise;
+/// a trigger is skipped at InfraSetup).
+///
+/// - `InfraSetup`: an infra node is being provisioned.
 /// - `TriggerSetup`: a trigger node (or its upstream) is being set
-///   up. Trigger nodes produce the wake-signal spec the listener
-///   should register.
-/// - `Fire`: the normal fire-time execution. Trigger nodes receive
-///   the payload, their outputs flow downstream.
+///   up. The trigger registers the wake signal the listener
+///   should watch.
+/// - `Fire`: the normal fire-time execution. The firing trigger
+///   receives the wake payload, its outputs flow downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -45,17 +48,17 @@ impl Phase {
     }
 }
 
-
 /// How long a node's provider work may take, unless it says otherwise
 /// ([`ExecutionContext::provider_access_within`]). Generous for a normal API
 /// call (including a stream and its cost resolution), short enough that an
 /// access left behind by a crashed worker goes stale the same quarter hour.
 pub const DEFAULT_PROVIDER_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// The per-execution context handed to `Node::execute`. Exposes the
-/// language's primitive surface (`await_signal` for mid-execution
-/// suspensions, `provider_access`/`metered_client` for paid calls, `log`)
-/// plus read helpers for config and input.
+/// The per-execution context handed to a node body (`Node::run` /
+/// `Node::setup_trigger`). Exposes the language's primitive surface
+/// (`await_signal` for mid-execution suspensions,
+/// `provider_access`/`metered_client` for paid calls, `log`) plus the
+/// two named-value bags (`ctx.ports` / `ctx.config`).
 ///
 /// ExecutionContext is constructed by the engine (inside the user's
 /// compiled binary) and passed to each node invocation. It holds an
@@ -75,13 +78,25 @@ pub struct ExecutionContext {
     pub node_label: Option<String>,
     pub color: Color,
     pub frames: LoopFrames,
-    pub config: ConfigBag,
-    pub input: InputBag,
-    /// Which lifecycle phase this invocation belongs to. Mirrors
-    /// v1's `isInfraSetup` / `isTriggerSetup` flags. Nodes use it
-    /// to branch their execute body between provisioning, wake-signal
-    /// registration, and regular fire.
-    pub phase: Phase,
+    /// The values that arrived on this node's input PORTS this firing.
+    /// A port set to a literal in the `.weft` body is delivered here
+    /// too: however a port got its value, the node reads it from
+    /// `ports`. The bags never merge; a name lives in exactly one of
+    /// them.
+    pub ports: ValueBag,
+    /// The node's design-time config FIELDS (body-assigned values), with
+    /// a `config`-port object already overlaid by the engine when the
+    /// node declares that port (the config-node pattern). Keys that name
+    /// declared input ports never appear here: those values belong to
+    /// `ports`.
+    pub config: ValueBag,
+    /// The fire event's payload fields (the HTTP body for a webhook,
+    /// the SSE event JSON for a feed, the form submission, the timer
+    /// info for a scheduled tick). Populated only when this node is the
+    /// FIRING trigger of the execution; empty everywhere else. A
+    /// non-object payload has no named fields; the whole-record read
+    /// ([`ValueBag::object`]) fails loud on it.
+    pub wake: ValueBag,
     handle: Arc<dyn ContextHandle>,
 }
 
@@ -95,14 +110,14 @@ impl ExecutionContext {
         node_label: Option<String>,
         color: Color,
         frames: LoopFrames,
-        config: ConfigBag,
-        input: InputBag,
-        phase: Phase,
+        ports: ValueBag,
+        config: ValueBag,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
+        let wake = ValueBag::wake(handle.wake_payload());
         Self {
             execution_id, project_id, node_id, node_type, node_label, color, frames,
-            config, input, phase, handle,
+            ports, config, wake, handle,
         }
     }
 
@@ -150,8 +165,14 @@ impl ExecutionContext {
         &self,
         kind: K,
     ) -> WeftResult<()> {
+        // Snapshot the trigger's delivered port values with the
+        // registration: at fire time the engine replays them onto
+        // `ctx.ports`, so a trigger's inputs are whatever they were at
+        // trigger setup (re-activation re-registers and re-snapshots).
+        let port_snapshot =
+            Value::Object(self.ports.values.clone());
         self.handle
-            .register_signal(crate::signal::to_spec(kind))
+            .register_signal(crate::signal::to_spec(kind), port_snapshot)
             .await
     }
 
@@ -219,7 +240,7 @@ impl ExecutionContext {
     /// `.set(..)` after it for ports the node computes itself; the later
     /// set wins, so a payload key can't shadow the node's own truth.
     pub fn fan_declared(&self, source: &serde_json::Value) -> crate::node::NodeOutput {
-        crate::node::NodeOutput::empty()
+        crate::node::NodeOutput::new()
             .extend_from_declared(source, self.handle.declared_output_ports())
     }
 
@@ -267,59 +288,16 @@ impl ExecutionContext {
         self.handle.bus(marker)
     }
 
-    /// Wake payload for THIS firing. `Some(value)` only when the engine
-    /// dispatched this node as the firing trigger of a fresh execution
-    /// (the HTTP body for a webhook, the SSE event JSON for an external
-    /// feed, the form submission, the timer info for a scheduled tick).
-    /// `None` everywhere else: trigger setup, infra setup, non-trigger
-    /// nodes, replays after the kick was consumed. A trigger that REQUIRES
-    /// a payload should `ok_or_else` with a clear error; the language
-    /// doesn't impose a payload contract.
-    pub fn wake_payload(&self) -> Option<&Value> {
-        self.handle.wake_payload()
-    }
-
-    /// Wake payload typed-accessor: same as [`Self::wake_payload`] but
-    /// erroring loud when the payload is absent OR not a JSON object.
-    /// Convenience for trigger nodes that have chosen an object-shaped
-    /// wake contract; nodes wanting raw bytes, a scalar, or an array
-    /// keep calling [`Self::wake_payload`] and impose their own shape.
-    pub fn wake_payload_object(&self) -> WeftResult<&Value> {
-        let payload = self
-            .handle
-            .wake_payload()
-            .ok_or_else(|| WeftError::NodeExecution(
-                "Fire: no wake payload (the dispatcher/listener delivered nothing)".into(),
-            ))?;
-        if !payload.is_object() {
-            // Truncate the rendered payload: a malformed multi-MB body
-            // would otherwise produce a multi-MB error string that
-            // floods logs and the inspector. 512 bytes is enough to
-            // diagnose shape (the first {} or [] tells the author the
-            // top-level mismatch).
-            // `truncate_user_string` walks back to a char boundary: a
-            // raw `&rendered[..512]` slice panics when a multi-byte
-            // character straddles byte 512, inside the very path whose
-            // job is producing a clean error.
-            let preview = crate::truncate_user_string(&payload.to_string(), 512);
-            return Err(WeftError::NodeExecution(format!(
-                "Fire: wake payload must be a JSON object, got {preview}"
-            )));
-        }
-        Ok(payload)
-    }
-
-    /// Convenience: read input `port` and resolve it to a bus handle in
-    /// one call. Equivalent to `ctx.bus(&ctx.input.get(port)?)` but with a
-    /// clearer error message naming the port.
-    pub fn bus_from_input(&self, port: &str) -> WeftResult<crate::bus::BusHandle> {
+    /// Convenience: read input port `name` and resolve it to a bus
+    /// handle in one call. Equivalent to `ctx.bus(ctx.ports.raw(name))`
+    /// but with a clearer error message naming the port.
+    pub fn bus_from_input(&self, name: &str) -> WeftResult<crate::bus::BusHandle> {
         let value = self
-            .input
-            .values
-            .get(port)
-            .ok_or_else(|| WeftError::Input(format!("no value on input port '{port}'")))?;
+            .ports
+            .raw(name)
+            .ok_or_else(|| WeftError::Input(format!("no value on input port '{name}'")))?;
         self.handle.bus(value).map_err(|e| {
-            WeftError::Input(format!("input port '{port}' is not a live bus: {e}"))
+            WeftError::Input(format!("input '{name}' is not a live bus: {e}"))
         })
     }
 
@@ -327,7 +305,7 @@ impl ExecutionContext {
 
     /// Resolve one of this node's declared endpoints to a handle.
     /// `name` matches an `Endpoint.name` from the InfraSpec the node
-    /// returned during `provision`. One broker round-trip; the
+    /// returned during `provision_infra`. One broker round-trip; the
     /// returned handle caches the URL and exposes `.url()` (sync)
     /// and `.call(...)` (HTTP) without further lookups.
     ///
@@ -414,7 +392,7 @@ impl ExecutionContext {
         }
         let (credential, relay_url) =
             self.handle.open_provider_access(provider, window).await?;
-        Ok(crate::access::ProviderAccess::deployment(provider, credential, relay_url, window))
+        Ok(crate::access::ProviderAccess::runtime(provider, credential, relay_url, window))
     }
 
     /// An HTTP client for paid calls on `access`: use it directly, or hand
@@ -433,16 +411,6 @@ impl ExecutionContext {
         access: &crate::access::ProviderAccess,
     ) -> WeftResult<reqwest_middleware::ClientWithMiddleware> {
         self.handle.metered_client(access)
-    }
-
-    /// This node's configuration with the `config` input port overlaid.
-    ///
-    /// The config-node pattern: a node may take a whole configuration object on
-    /// an input port named `config` (fed by a dedicated config node), and each
-    /// key it carries wins over the same key set on the node itself. A node
-    /// without that port gets its own config unchanged.
-    pub fn effective_config(&self) -> crate::context::ConfigBag {
-        self.config.overlaid(self.input.raw("config"))
     }
 
     // ----- Side-effect primitives ------------------------------------
@@ -526,6 +494,237 @@ impl ExecutionContext {
             .caller_connection()
             .map(crate::caller::CallerHandle::from_connection)
     }
+
+    /// The live HTTP caller, attached and connected, for nodes that only
+    /// make sense behind an HTTP trigger (ApiEndpoint). One call folds
+    /// the whole chain: caller present, protocol is HTTP, connection
+    /// barrier passed. A node that may serve BOTH protocols branches on
+    /// [`Self::caller`] instead.
+    pub async fn http_caller(&self) -> WeftResult<crate::caller::HttpCaller> {
+        match self.caller() {
+            Some(crate::caller::CallerHandle::Http(h)) => {
+                h.ensure_connected().await?;
+                Ok(h)
+            }
+            Some(crate::caller::CallerHandle::Websocket(_)) => Err(WeftError::Input(
+                "this node answers an HTTP caller, but the execution is attached to a \
+                 WebSocket caller; trigger it through an ApiEndpoint node"
+                    .into(),
+            )),
+            None => Err(WeftError::Input(
+                "this node answers an HTTP caller, but no live caller is attached; \
+                 trigger it through an ApiEndpoint node"
+                    .into(),
+            )),
+        }
+    }
+
+    /// The live WebSocket caller, attached and connected, for nodes that
+    /// only make sense behind a WebSocket trigger (LiveSocket). Same
+    /// contract as [`Self::http_caller`], for the other protocol.
+    pub async fn ws_caller(&self) -> WeftResult<crate::caller::WsCaller> {
+        match self.caller() {
+            Some(crate::caller::CallerHandle::Websocket(h)) => {
+                h.ensure_connected().await?;
+                Ok(h)
+            }
+            Some(crate::caller::CallerHandle::Http(_)) => Err(WeftError::Input(
+                "this node talks to a WebSocket caller, but the execution is attached to \
+                 an HTTP caller; trigger it through a LiveSocket node"
+                    .into(),
+            )),
+            None => Err(WeftError::Input(
+                "this node talks to a WebSocket caller, but no live caller is attached; \
+                 trigger it through a LiveSocket node"
+                    .into(),
+            )),
+        }
+    }
+
+    // ----- Plain outbound HTTP ---------------------------------------
+
+    /// The shared, pooled HTTP client for plain (unpaid) outbound calls.
+    /// One client per process; a node never constructs its own. The one
+    /// rule for outbound HTTP: a PAID provider call goes through
+    /// [`Self::provider_access`] + [`Self::metered_client`] (that is what
+    /// records its cost); everything else goes through here.
+    pub fn http(&self) -> &'static reqwest::Client {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                // Bound connection ESTABLISHMENT only. No overall request
+                // timeout: a node may legitimately stream a response for
+                // a long time, and user-facing waits take no deadline.
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("default reqwest client always builds")
+        })
+    }
+}
+
+/// Which side of a node's named values a bag holds, so accessor errors
+/// stamp the thing the user has to fix (the wiring vs the node's fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BagSide {
+    Ports,
+    Config,
+    Wake,
+}
+
+/// One bag of named values: the input-port values (`ctx.ports`), the
+/// design-time config fields (`ctx.config`), or the fire event's
+/// payload fields (`ctx.wake`). The namespaces never merge and a name
+/// lives in exactly one of them: a config field sharing an input
+/// port's name is that port's design-time filler, and the engine
+/// delivers the value ON the port (see [`split_node_values`]).
+#[derive(Debug, Clone)]
+pub struct ValueBag {
+    values: serde_json::Map<String, Value>,
+    side: BagSide,
+    /// Why [`Self::object`] cannot hand out the whole bag as one
+    /// record: `None` everywhere except a wake bag whose firing
+    /// delivered a missing or non-object payload.
+    no_record: Option<String>,
+}
+
+impl ValueBag {
+    pub fn ports(values: serde_json::Map<String, Value>) -> Self {
+        Self { values, side: BagSide::Ports, no_record: None }
+    }
+
+    pub fn config(values: serde_json::Map<String, Value>) -> Self {
+        Self { values, side: BagSide::Config, no_record: None }
+    }
+
+    /// The wake bag: the fire payload's top-level fields when the
+    /// payload is a JSON object, empty otherwise. Every named read on a
+    /// non-object payload therefore errors as "missing", which is the
+    /// honest answer: there is no such field. The bag remembers the
+    /// missing/non-object case so [`Self::object`] can fail loud.
+    pub fn wake(payload: Option<&Value>) -> Self {
+        let no_record = match payload {
+            Some(Value::Object(_)) => None,
+            Some(other) => Some(format!("wake payload is not an object: {other}")),
+            None => Some("no wake payload was delivered for this firing".into()),
+        };
+        let values = payload.and_then(Value::as_object).cloned().unwrap_or_default();
+        Self { values, side: BagSide::Wake, no_record }
+    }
+
+    /// The whole bag as one record. Ports and config always have one;
+    /// a wake bag fails loud when the firing delivered a missing or
+    /// non-object payload: substituting an empty record would silently
+    /// fabricate an "every field absent" reading downstream.
+    pub fn object(&self) -> WeftResult<&serde_json::Map<String, Value>> {
+        match &self.no_record {
+            None => Ok(&self.values),
+            Some(reason) => Err(self.err(reason.clone())),
+        }
+    }
+
+    /// The side's word for one named value, used in every error message.
+    fn noun(&self) -> &'static str {
+        match self.side {
+            BagSide::Ports => "input",
+            BagSide::Config => "config field",
+            BagSide::Wake => "wake field",
+        }
+    }
+
+    fn err(&self, message: String) -> WeftError {
+        match self.side {
+            BagSide::Ports => WeftError::Input(message),
+            BagSide::Config => WeftError::Config(message),
+            // A wake field is an input of the firing: same family as a
+            // port value, delivered by the event instead of a wire.
+            BagSide::Wake => WeftError::Input(message),
+        }
+    }
+
+    /// Read the required value `name`, typed. Errors loud when absent or
+    /// when the value doesn't deserialize into `T`.
+    pub fn get<T: DeserializeOwned>(&self, name: &str) -> WeftResult<T> {
+        let v = self
+            .values
+            .get(name)
+            .ok_or_else(|| self.err(format!("missing required {} '{name}'", self.noun())))?;
+        serde_json::from_value(v.clone())
+            .map_err(|e| self.err(format!("{} '{name}': {e}", self.noun())))
+    }
+
+    /// Read the optional value `name`, typed. Absent or explicitly null
+    /// is `Ok(None)`; a PRESENT value that doesn't deserialize into `T`
+    /// still errors loud, never a silent `None`.
+    pub fn opt<T: DeserializeOwned>(&self, name: &str) -> WeftResult<Option<T>> {
+        match self.values.get(name) {
+            None => Ok(None),
+            Some(v) if v.is_null() => Ok(None),
+            Some(v) => serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|e| self.err(format!("{} '{name}': {e}", self.noun()))),
+        }
+    }
+
+    /// Read the value `name` with a default: absent means `default`, but
+    /// a present wrong-typed value still errors loud. The blessed
+    /// pattern for defaulted knobs; never `.get(..).unwrap_or(..)`,
+    /// which would swallow a real type error into the default.
+    pub fn get_or<T: DeserializeOwned>(&self, name: &str, default: T) -> WeftResult<T> {
+        Ok(self.opt(name)?.unwrap_or(default))
+    }
+
+    /// The raw value behind `name`, if any. For pass-through reads that
+    /// must not reinterpret the value; a REQUIRED raw read is
+    /// `get::<Value>(name)`.
+    pub fn raw(&self, name: &str) -> Option<&Value> {
+        self.values.get(name)
+    }
+
+    /// Iterate over every named value (name + raw value). For nodes that
+    /// treat their ports as a dynamic set (exposing them as script
+    /// variables, building a form from them) and for forwarding nodes.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.values.iter()
+    }
+}
+
+/// Split a node's runtime values into the two node-facing bags. By the
+/// time this runs, "one home per name" already holds: the enrich
+/// normalization moved every port-driven body value into
+/// `node.port_literals` (which the ready paths fed onto the ports), so
+/// `node.config` carries ONLY config-field values. The one runtime
+/// concern left is the config-node pattern: when the node declares an
+/// input port named `config`, the object that arrived on it is
+/// consumed here; each non-null key naming a CONFIGURABLE declared
+/// input port fills that port if nothing else did (a wired value
+/// wins), every other non-null key overlays the config bag.
+pub fn split_node_values(
+    node: &crate::project::NodeDefinition,
+    mut ports: serde_json::Map<String, Value>,
+) -> (ValueBag, ValueBag) {
+    let mut config = node.config.as_object().cloned().unwrap_or_default();
+
+    if node.inputs.iter().any(|p| p.name == "config") {
+        if let Some(overlay) = ports.remove("config") {
+            if let Value::Object(overlay) = overlay {
+                let braces_open: std::collections::HashSet<&str> = node
+                    .inputs
+                    .iter()
+                    .filter(|p| p.literal.allows_config())
+                    .map(|p| p.name.as_str())
+                    .collect();
+                for (k, v) in overlay.into_iter().filter(|(_, v)| !v.is_null()) {
+                    if braces_open.contains(k.as_str()) {
+                        ports.entry(k).or_insert(v);
+                    } else {
+                        config.insert(k, v);
+                    }
+                }
+            }
+        }
+    }
+
+    (ValueBag::ports(ports), ValueBag::config(config))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,144 +734,6 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
-}
-
-/// Typed config access. Config is resolved at graph-load time and
-/// pre-coerced by the runtime before a node fires.
-#[derive(Debug, Clone, Default)]
-pub struct ConfigBag {
-    pub values: HashMap<String, Value>,
-}
-
-impl ConfigBag {
-    pub fn get<T: DeserializeOwned>(&self, key: &str) -> WeftResult<T> {
-        let v = self
-            .values
-            .get(key)
-            .ok_or_else(|| WeftError::Config(format!("missing config field: {key}")))?;
-        serde_json::from_value(v.clone()).map_err(|e| WeftError::Config(format!("field {key}: {e}")))
-    }
-
-    pub fn get_optional<T: DeserializeOwned>(&self, key: &str) -> WeftResult<Option<T>> {
-        match self.values.get(key) {
-            None => Ok(None),
-            Some(v) if v.is_null() => Ok(None),
-            Some(v) => serde_json::from_value(v.clone())
-                .map(Some)
-                .map_err(|e| WeftError::Config(format!("field {key}: {e}"))),
-        }
-    }
-
-    pub fn raw(&self, key: &str) -> Option<&Value> {
-        self.values.get(key)
-    }
-
-    /// This config with `overlay`'s keys winning on collision. A non-object
-    /// (or absent) overlay changes nothing. Pure: the mechanism behind
-    /// [`ExecutionContext::effective_config`].
-    pub fn overlaid(&self, overlay: Option<&Value>) -> ConfigBag {
-        let mut values = self.values.clone();
-        if let Some(object) = overlay.and_then(|v| v.as_object()) {
-            for (k, v) in object {
-                values.insert(k.clone(), v.clone());
-            }
-        }
-        ConfigBag { values }
-    }
-}
-
-#[cfg(test)]
-mod config_overlay_tests {
-    use super::*;
-
-    fn bag(json: serde_json::Value) -> ConfigBag {
-        ConfigBag { values: serde_json::from_value(json).expect("object fixture") }
-    }
-
-    /// The config-node pattern: a key from the config input wins over the same
-    /// key on the node; keys only one side has all survive.
-    #[test]
-    fn an_overlay_key_wins_and_disjoint_keys_survive() {
-        let own = bag(serde_json::json!({"model": "a", "temperature": 0.2}));
-        let overlay = serde_json::json!({"model": "b", "maxTokens": 100});
-
-        let merged = own.overlaid(Some(&overlay));
-        assert_eq!(merged.get::<String>("model").unwrap(), "b");
-        assert_eq!(merged.get::<f64>("temperature").unwrap(), 0.2);
-        assert_eq!(merged.get::<u64>("maxTokens").unwrap(), 100);
-    }
-
-    /// No overlay, or one that is not an object, leaves the config unchanged.
-    #[test]
-    fn a_missing_or_non_object_overlay_changes_nothing() {
-        let own = bag(serde_json::json!({"model": "a"}));
-        assert_eq!(own.overlaid(None).get::<String>("model").unwrap(), "a");
-        assert_eq!(
-            own.overlaid(Some(&serde_json::json!("not an object")))
-                .get::<String>("model")
-                .unwrap(),
-            "a"
-        );
-    }
-}
-
-/// Typed input access. Inputs are the resolved incoming-edge values
-/// for this node's invocation, matched to this color+frames.
-#[derive(Debug, Clone, Default)]
-pub struct InputBag {
-    pub values: HashMap<String, Value>,
-}
-
-impl InputBag {
-    pub fn get<T: DeserializeOwned>(&self, port: &str) -> WeftResult<T> {
-        let v = self
-            .values
-            .get(port)
-            .ok_or_else(|| WeftError::Input(format!("missing input on port: {port}")))?;
-        serde_json::from_value(v.clone()).map_err(|e| WeftError::Input(format!("port {port}: {e}")))
-    }
-
-    pub fn get_optional<T: DeserializeOwned>(&self, port: &str) -> WeftResult<Option<T>> {
-        match self.values.get(port) {
-            None => Ok(None),
-            Some(v) if v.is_null() => Ok(None),
-            Some(v) => serde_json::from_value(v.clone())
-                .map(Some)
-                .map_err(|e| WeftError::Input(format!("port {port}: {e}"))),
-        }
-    }
-
-    pub fn raw(&self, port: &str) -> Option<&Value> {
-        self.values.get(port)
-    }
-
-    /// Read `port` as a non-empty string. Errors loud, distinguishing
-    /// the three failure modes (absent / not a string / empty) so the
-    /// caller's inspector message names the actual fault.
-    pub fn required_str(&self, port: &str, what: &str) -> WeftResult<String> {
-        let Some(value) = self.values.get(port) else {
-            return Err(WeftError::Input(format!(
-                "missing required {what} on port '{port}'"
-            )));
-        };
-        let Some(s) = value.as_str() else {
-            return Err(WeftError::Input(format!(
-                "{what} on port '{port}' must be a string, got {value}"
-            )));
-        };
-        if s.is_empty() {
-            return Err(WeftError::Input(format!(
-                "{what} on port '{port}' is an empty string"
-            )));
-        }
-        Ok(s.to_string())
-    }
-
-    /// Iterate over every input port (name + raw value). Used by
-    /// trigger nodes that forward their input bag to output ports.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
-        self.values.iter()
-    }
 }
 
 /// HTTP method for [`EndpointHandle::call`]. GET / POST cover the
@@ -928,7 +989,12 @@ impl StorageHandle {
 #[async_trait::async_trait]
 pub trait ContextHandle: Send + Sync {
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value>;
-    async fn register_signal(&self, spec: SignalSpec) -> WeftResult<()>;
+    /// Register an entry signal. `port_snapshot` is the trigger's
+    /// delivered port values at registration time (built by
+    /// `ExecutionContext::register_signal`, never by node code); the
+    /// dispatcher stores it with the signal and replays it onto the
+    /// trigger's ports at every fire.
+    async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()>;
     /// Resolve the cluster-internal URL for a declared endpoint of
     /// the current node. Used internally by
     /// [`ExecutionContext::endpoint`] to build an `EndpointHandle`;
@@ -1131,25 +1197,216 @@ pub trait ContextHandle: Send + Sync {
 }
 
 #[cfg(test)]
-mod input_bag_tests {
+mod value_bag_tests {
     use super::*;
     use serde_json::json;
 
-    fn bag(values: serde_json::Value) -> InputBag {
-        InputBag {
-            values: values.as_object().unwrap().clone().into_iter().collect(),
-        }
+    fn ports_bag(values: serde_json::Value) -> ValueBag {
+        ValueBag::ports(values.as_object().unwrap().clone())
     }
 
+    fn config_bag(values: serde_json::Value) -> ValueBag {
+        ValueBag::config(values.as_object().unwrap().clone())
+    }
+
+    /// A ContextHandle for accessor tests: every runtime capability is
+    /// unreachable (the accessors read only the bags), and the wake
+    /// payload is absent.
+    struct DeadHandle;
+    #[async_trait::async_trait]
+    impl ContextHandle for DeadHandle {
+        async fn await_signal(&self, _: SignalSpec) -> WeftResult<Value> { unreachable!() }
+        async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
+        async fn endpoint_url(&self, _: &str) -> WeftResult<String> { unreachable!() }
+        async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
+        async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
+        async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
+        async fn open_provider_access(&self, _: &str, _: std::time::Duration) -> WeftResult<(String, Option<String>)> { unreachable!() }
+        fn metered_client(&self, _: &crate::access::ProviderAccess) -> WeftResult<reqwest_middleware::ClientWithMiddleware> { unreachable!() }
+        async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
+        fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
+        fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
+        async fn pulse_downstream(&self, _: crate::node::NodeOutput) -> WeftResult<()> { unreachable!() }
+        async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
+        fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
+        fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
+        async fn storage_put(&self, _: &crate::storage::StorageScope, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_get(&self, _: &str, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
+        async fn storage_get_url(&self, _: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
+        async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
+        async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
+        async fn storage_keep(&self, _: &str, _: crate::storage::KeepTtl) -> WeftResult<()> { unreachable!() }
+        async fn storage_presign(&self, _: &str, _: Option<u64>) -> WeftResult<String> { unreachable!() }
+        fn wake_payload(&self) -> Option<&Value> { None }
+        fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
+    }
+
+    fn ctx(ports_json: serde_json::Value, config_json: serde_json::Value) -> ExecutionContext {
+        ExecutionContext::new(
+            "exec-1".into(),
+            "project-1".into(),
+            "node-1".into(),
+            "TestNode".into(),
+            None,
+            crate::Color::nil(),
+            LoopFrames::default(),
+            ports_bag(ports_json),
+            config_bag(config_json),
+            Arc::new(DeadHandle),
+        )
+    }
+
+    /// The bag accessor family on both sides: required, optional,
+    /// defaulted, raw; per-side error stamping and the loud
+    /// wrong-type-behind-a-default rule.
     #[test]
-    fn required_str_distinguishes_the_three_failure_modes() {
-        let b = bag(json!({"num": 7, "empty": "", "ok": "v"}));
-        assert_eq!(b.required_str("ok", "thing").unwrap(), "v");
-        let absent = b.required_str("missing", "thing").unwrap_err().to_string();
-        assert!(absent.contains("missing required thing"), "{absent}");
-        let wrong = b.required_str("num", "thing").unwrap_err().to_string();
-        assert!(wrong.contains("must be a string"), "{wrong}");
-        let empty = b.required_str("empty", "thing").unwrap_err().to_string();
-        assert!(empty.contains("empty string"), "{empty}");
+    fn bags_resolve_and_stamp_errors_by_side() {
+        let c = ctx(json!({"url": "http://x", "n": "not-a-number"}), json!({"keep": true}));
+        assert_eq!(c.ports.get::<String>("url").unwrap(), "http://x");
+        assert_eq!(c.config.get::<bool>("keep").unwrap(), true);
+        assert_eq!(c.ports.opt::<String>("missing").unwrap(), None);
+        assert_eq!(c.config.get_or("ttl_days", 30u64).unwrap(), 30);
+        assert_eq!(c.ports.get::<Value>("url").unwrap(), json!("http://x"));
+        assert!(c.ports.raw("missing").is_none());
+
+        // Wrong type on a PORT stamps an input error naming the input.
+        let e = c.ports.get::<u64>("n").unwrap_err();
+        assert!(matches!(&e, WeftError::Input(m) if m.contains("input 'n'")), "{e}");
+        // Wrong type in CONFIG stamps a config error naming the field.
+        let e = c.config.get::<u64>("keep").unwrap_err();
+        assert!(matches!(&e, WeftError::Config(m) if m.contains("config field 'keep'")), "{e}");
+        // Absent required values name their side.
+        let e = c.ports.get::<String>("missing").unwrap_err().to_string();
+        assert!(e.contains("missing required input 'missing'"), "{e}");
+        let e = c.config.get::<String>("missing").unwrap_err().to_string();
+        assert!(e.contains("missing required config field 'missing'"), "{e}");
+        // A defaulted knob still errors loud on a present wrong type.
+        assert!(c.ports.get_or("n", 5u64).is_err());
+        // Explicit null reads as absent for opt.
+        let c = ctx(json!({"x": null}), json!({}));
+        assert_eq!(c.ports.opt::<String>("x").unwrap(), None);
+    }
+
+    /// A required wake-field read with no payload is a loud error,
+    /// never a default; the whole-record read fails loud too.
+    #[test]
+    fn wake_without_a_payload_fails_loud() {
+        let c = ctx(json!({}), json!({}));
+        let e = c.wake.get::<Value>("anything").unwrap_err().to_string();
+        assert!(e.contains("missing required wake field 'anything'"), "{e}");
+        let e = c.wake.object().unwrap_err().to_string();
+        assert!(e.contains("no wake payload was delivered"), "{e}");
+    }
+
+    /// An object payload's top-level fields land in the wake bag with
+    /// the full accessor family; a non-object payload has no named
+    /// fields and stays reachable raw.
+    #[test]
+    fn wake_bag_reads_object_payload_fields() {
+        let bag = ValueBag::wake(Some(&json!({"scheduledTime": "t1", "n": 3})));
+        assert_eq!(bag.get::<String>("scheduledTime").unwrap(), "t1");
+        assert_eq!(bag.get_or("absent", 7u64).unwrap(), 7);
+        assert!(bag.get::<String>("n").is_err(), "present wrong type errors loud");
+
+        let non_object = ValueBag::wake(Some(&json!([1, 2])));
+        let e = non_object.get::<Value>("x").unwrap_err().to_string();
+        assert!(e.contains("missing required wake field 'x'"), "{e}");
+        let e = non_object.object().unwrap_err().to_string();
+        assert!(e.contains("wake payload is not an object"), "{e}");
+    }
+
+    /// The whole-record read: ports and config always answer; a wake
+    /// bag answers exactly the payload's fields.
+    #[test]
+    fn object_hands_out_the_whole_bag() {
+        assert_eq!(ports_bag(json!({"a": 1})).object().unwrap().len(), 1);
+        assert_eq!(config_bag(json!({})).object().unwrap().len(), 0);
+        let wake = ValueBag::wake(Some(&json!({"a": 1, "b": 2})));
+        assert_eq!(wake.object().unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod split_node_values_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A minimal NodeDefinition: declared input port names + body config.
+    fn node(inputs: &[&str], config: serde_json::Value) -> crate::project::NodeDefinition {
+        serde_json::from_value(json!({
+            "id": "n1", "nodeType": "Test", "label": null,
+            "config": config, "position": {"x": 0.0, "y": 0.0},
+            "inputs": inputs.iter().map(|name| json!({
+                "name": name, "portType": "String", "required": false
+            })).collect::<Vec<_>>(),
+            "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
+            "requiresInfra": false, "images": []
+        }))
+        .expect("test node")
+    }
+
+    fn ports_obj(values: serde_json::Value) -> serde_json::Map<String, Value> {
+        values.as_object().unwrap().clone()
+    }
+
+    /// The bags mirror the enrich-normalized definition: ports carry
+    /// what the ready paths delivered (wired pulses + port literals),
+    /// config carries the config-field values verbatim.
+    #[test]
+    fn ports_and_config_map_straight_through() {
+        let n = node(&["to"], json!({"label": "x"}));
+        let (ports, config) = split_node_values(&n, ports_obj(json!({"to": 10})));
+        assert_eq!(ports.get::<u64>("to").unwrap(), 10);
+        assert_eq!(config.get::<String>("label").unwrap(), "x");
+        assert!(config.raw("to").is_none());
+    }
+
+    /// The config-node pattern: an object on the declared `config` port
+    /// is consumed; its keys overlay the config bag, a key naming a
+    /// declared port fills that port only if nothing else did.
+    #[test]
+    fn a_config_port_object_overlays_config_and_fills_unfilled_ports() {
+        let n = node(
+            &["prompt", "systemPrompt", "config"],
+            json!({"model": "own", "temperature": 0.2}),
+        );
+        let (ports, config) = split_node_values(
+            &n,
+            ports_obj(json!({
+                "prompt": "hi",
+                "config": {"model": "overlay", "systemPrompt": "from-config-node", "skip": null}
+            })),
+        );
+        assert!(ports.raw("config").is_none(), "the config port is consumed by the overlay");
+        assert_eq!(config.get::<String>("model").unwrap(), "overlay");
+        assert_eq!(config.get::<f64>("temperature").unwrap(), 0.2);
+        assert!(config.raw("skip").is_none(), "null overlay keys are dropped");
+        // systemPrompt names a declared port with no value: the overlay fills it.
+        assert_eq!(ports.get::<String>("systemPrompt").unwrap(), "from-config-node");
+    }
+
+    /// A wired port value beats the overlay's same-named key.
+    #[test]
+    fn a_wired_port_beats_the_overlay() {
+        let n = node(&["systemPrompt", "config"], json!({}));
+        let (ports, _config) = split_node_values(
+            &n,
+            ports_obj(json!({
+                "systemPrompt": "wired",
+                "config": {"systemPrompt": "overlay"}
+            })),
+        );
+        assert_eq!(ports.get::<String>("systemPrompt").unwrap(), "wired");
+    }
+
+    /// A node with NO declared `config` port keeps a port literally
+    /// named `config` as data (the overlay is declaration-gated).
+    #[test]
+    fn no_declared_config_port_means_no_overlay() {
+        let n = node(&[], json!({"model": "own"}));
+        let (ports, config) = split_node_values(&n, ports_obj(json!({})));
+        assert!(ports.raw("config").is_none());
+        assert_eq!(config.get::<String>("model").unwrap(), "own");
     }
 }

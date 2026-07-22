@@ -12,25 +12,19 @@
 use async_trait::async_trait;
 
 use weft_core::storage::FileHandle;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ImageDisplayNode;
 
 #[async_trait]
 impl Node for ImageDisplayNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let image = ctx.input.raw("image").cloned().ok_or_else(|| {
-            WeftError::Input("ImageDisplay: no value on input port 'image'".into())
-        })?;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // The `Image` port type already guarantees this is an image; the
         // only thing left to enforce is that it carries a handle the
-        // preview can resolve (a storage key or an external URL).
-        FileHandle::from_value(&image).map_err(|e| {
-            WeftError::Input(format!(
-                "ImageDisplay needs an image with a storage key or URL (e.g. from FetchToStorage): {e}"
-            ))
-        })?;
+        // preview can resolve (a storage key or an external URL), which
+        // is exactly what parsing into a FileHandle checks.
+        let _handle: FileHandle = ctx.ports.get("image")?;
         Ok(())
     }
 }

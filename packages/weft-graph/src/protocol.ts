@@ -8,11 +8,20 @@ export interface Span {
   endColumn: number;
 }
 
+/// Where a LITERAL value may be written for an input port in weft source:
+/// 'anywhere' = config braces or assignment statement, 'assignment' =
+/// statement only, 'none' = wires only. Edges are a separate axis and
+/// always legal (both `n.x = other.y` and `n = M { x: other.y }` lower
+/// to the same wire).
+// SYNC: LiteralPlacement <-> crates/weft-core/src/weft_type.rs LiteralPlacement
+export type LiteralPlacement = 'anywhere' | 'assignment' | 'none';
+
 export interface PortDefinition {
   name: string;
   portType: string;
   required: boolean;
-  configurable: boolean;
+  // SYNC: PortDefinition literal <-> crates/weft-core/src/project.rs PortDefinition.literal
+  literal: LiteralPlacement;
   description?: string;
   /// True iff this port was auto-synthesized by the loop-lowering pass
   /// (the input side of a carry port). The editor renders it as a ghost
@@ -105,6 +114,16 @@ export interface NodeDefinition {
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
+  /// Body values that DRIVE INPUT PORTS, keyed by port name (braces or
+  /// statement form, per the port's literal placement). One home per
+  /// name: a port's value lives here, a config field's value lives in
+  /// `config`, so a braces-closed port and a same-named field coexist. The paired spans carry each entry's
+  /// source range + written form (`origin`: 'inline' = braces,
+  /// 'connection' = statement), which is what the editor's form toggle
+  /// rewrites.
+  // SYNC: portLiterals/portLiteralSpans <-> crates/weft-core/src/project.rs NodeDefinition.port_literals/port_literal_spans
+  portLiterals?: Record<string, unknown>;
+  portLiteralSpans?: Record<string, ConfigFieldSpan>;
   fileRefs?: Record<string, FileRef>;
   /// Set on an opaque `@include` node: the included `.weft` file path. The
   /// editor renders this as an expandable group that navigates into the file.
@@ -231,7 +250,8 @@ export interface PortDef {
   name: string;
   type: string;
   required?: boolean;
-  configurable?: boolean;
+  // SYNC: PortDef literal <-> crates/weft-core/src/node.rs PortDef.literal
+  literal?: LiteralPlacement;
   description?: string;
 }
 
@@ -338,7 +358,7 @@ export interface LoopIteration {
 /// Whose key a metered call spent (the wire values of the runtime's
 /// access-origin tag).
 // SYNC: CostOrigin <-> crates/weft-core/src/access.rs AccessOrigin
-export type CostOrigin = 'user-provided' | 'deployment';
+export type CostOrigin = 'user-provided' | 'runtime';
 
 export interface NodeExecEvent {
   nodeId: string;
@@ -754,8 +774,8 @@ export type ErrorVerb = ActionVerb | 'parse' | 'catalog';
 
 /// User-visible failure for the action bar. The banner shows `message`
 /// (one-line); clicking the banner opens a modal that renders `details`
-/// in full. Keep `details` optional so legacy paths that haven't been
-/// migrated still produce a usable (if sparse) modal.
+/// in full. `details` is optional: an error without one still renders
+/// a usable (if sparse) modal.
 export interface ActionBarError {
   verb: ErrorVerb;
   message: string;
@@ -1223,8 +1243,12 @@ export function parseFileValue(value: unknown): FileValueWire | null {
 /// them to the source. All graph edits go through `applyEdits` so the language
 /// logic lives in Rust only, reusable by any frontend.
 export type EditOp =
-  | { op: 'setConfig'; node: string; key: string; value: string }
-  | { op: 'removeConfig'; node: string; key: string }
+  // `form` targets the WRITTEN form when a name legally exists in both
+  // (a wired-only port's literal next to a same-named config field):
+  // 'inline' touches only the braces field, 'connection' only the
+  // statement line. Absent auto-routes (prefers the statement).
+  | { op: 'setConfig'; node: string; key: string; value: string; form?: 'inline' | 'connection' }
+  | { op: 'removeConfig'; node: string; key: string; form?: 'inline' | 'connection' }
   | { op: 'setLabel'; node: string; label: string | null }
   | { op: 'addNode'; id: string; nodeType: string; parentGroup: string | null }
   | { op: 'removeNode'; node: string }
@@ -1247,6 +1271,11 @@ export type EditOp =
   | { op: 'renameLoop'; loopId: string; newLabel: string }
   | { op: 'moveLoopScope'; loopId: string; targetGroup: string | null }
   | { op: 'updateLoopPorts'; loopId: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
+  // Rewrite which SOURCE FORM a body-set port value is written in
+  // ('inline' = a `key: value` braces field, 'connection' = a
+  // `node.key = value` statement). The form-toggle marker sends this.
+  // SYNC: setValueForm.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
+  | { op: 'setValueForm'; node: string; key: string; form: 'inline' | 'connection' }
   | { op: 'setLoopConfig'; loopId: string; key: string; value: string }
   | { op: 'removeLoopConfig'; loopId: string; key: string };
 

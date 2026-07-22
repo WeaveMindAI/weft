@@ -7,13 +7,10 @@
   "icon": "File",
   "color": "#0ea5e9",
   "inputs": [
-    { "name": "file", "type": "File", "required": true }
+    { "name": "file", "type": "File", "required": true, "literal": "anywhere" }
   ],
   "outputs": [
     { "name": "size", "type": "Number" }
-  ],
-  "fields": [
-    { "key": "file", "label": "File", "field_type": { "kind": "file_drop", "type": "File" } }
   ],
   "requires_infra": false
 }

@@ -110,18 +110,15 @@ pub fn find_ready_nodes(
             .map(|p| p.name.as_str())
             .collect();
 
-        let mut config_filled: HashSet<&str> = HashSet::new();
-        for port in &node.inputs {
-            if !port.configurable || wired.contains(port.name.as_str()) {
-                continue;
-            }
-            if node.config.get(&port.name).map(|v| !v.is_null()).unwrap_or(false) {
-                config_filled.insert(port.name.as_str());
+        let mut literal_filled: HashSet<&str> = HashSet::new();
+        for (name, value) in &node.port_literals {
+            if !wired.contains(name.as_str()) && !value.is_null() {
+                literal_filled.insert(name.as_str());
             }
         }
 
         let groups = find_groups_for_node(
-            node, node_pulses, &required, &wired, &config_filled, has_incoming,
+            node, node_pulses, &required, &wired, &literal_filled, has_incoming,
         );
         for group in groups {
             result.push((node.id.clone(), group));
@@ -140,7 +137,7 @@ fn find_groups_for_node(
     node_pulses: &[Pulse],
     required: &HashSet<&str>,
     wired: &HashSet<&str>,
-    config_filled: &HashSet<&str>,
+    literal_filled: &HashSet<&str>,
     has_incoming: bool,
 ) -> Vec<ReadyGroup> {
     let pending: Vec<&Pulse> = node_pulses
@@ -182,7 +179,7 @@ fn find_groups_for_node(
         let should_skip = if is_out_boundary || !has_incoming {
             false
         } else {
-            check_should_skip(node, node_pulses, frames, *color, required, wired, config_filled)
+            check_should_skip(node, node_pulses, frames, *color, required, wired, literal_filled)
         };
 
         let pulse_ids: Vec<uuid::Uuid> = group_pulses.iter().map(|p| p.id).collect();
@@ -248,7 +245,7 @@ fn build_input(
         }
     }
 
-    fill_input_from_config(node, wired, &mut obj);
+    fill_input_from_literals(node, wired, &mut obj);
 
     // Runtime type enforcement on input ports: the single check point
     // (see `check_input`). A mismatch on a required port aggregates
@@ -282,49 +279,56 @@ enum InputCheck {
     Fail(String),
 }
 
-/// Insert each UNWIRED configurable input port's config value into
-/// `obj`. Wires are authoritative: a wired port whose pulse resolved
-/// to a closure stays absent (the closure means upstream produced
-/// nothing; silently substituting the config value would mask the
+/// Insert each UNWIRED input port's body-supplied literal
+/// (`node.port_literals`, populated by the enrich normalization from
+/// braces values and assignment statements, per the port's literal
+/// placement) into `obj`. Wires are authoritative: a wired port whose pulse
+/// resolved to a closure stays absent (the closure means upstream
+/// produced nothing; silently substituting the literal would mask the
 /// upstream failure AND contradict the skip layer, whose
-/// `config_filled` set deliberately excludes wired ports). Shared
+/// `literal_filled` set deliberately excludes wired ports). Shared
 /// between the pulse-driven dispatch path (`build_input`) and the
 /// kick-driven dispatch path (`build_kicked_input` below) so the two
-/// paths can't disagree on what counts as "configured".
-pub fn fill_input_from_config(
+/// paths can't disagree on what counts as "body-supplied".
+pub fn fill_input_from_literals(
     node: &NodeDefinition,
     wired: &HashSet<&str>,
     obj: &mut Map<String, Value>,
 ) {
-    for port in &node.inputs {
-        if !port.configurable
-            || wired.contains(port.name.as_str())
-            || obj.contains_key(&port.name)
-        {
+    for (name, value) in &node.port_literals {
+        if wired.contains(name.as_str()) || obj.contains_key(name) || value.is_null() {
             continue;
         }
-        if let Some(cfg) = node.config.get(&port.name) {
-            if !cfg.is_null() {
-                obj.insert(port.name.clone(), cfg.clone());
-            }
-        }
+        obj.insert(name.clone(), value.clone());
     }
 }
 
-/// Build an InputBag for a node firing from a KICK (entry node /
+/// Build the input-port values for a node firing from a KICK (entry node /
 /// trigger payload), not from upstream pulses. Starts empty and
-/// fills only from the node's config (configurable input ports).
+/// fills only from the node's body-supplied port literals.
 /// This is what makes a `Range { from: 0, to: 10, step: 2 }` orphan
-/// see its config values at runtime.
+/// see its body values at runtime.
 ///
-/// Wake payloads from trigger kicks ride a separate channel
-/// (`ctx.wake_payload()`) that the engine wires up at dispatch time,
-/// so they don't need to be merged here.
-pub fn build_kicked_input(node: &NodeDefinition) -> Value {
+/// Wake payloads from trigger kicks ride a separate channel (the
+/// `ctx.wake` bag) that the engine wires up at dispatch time, so they
+/// don't need to be merged here.
+pub fn build_kicked_input(node: &NodeDefinition, port_snapshot: Option<&Value>) -> Value {
+    // A firing trigger's ports replay the setup-time snapshot: seed the
+    // bag from it first (only keys naming declared input ports; the
+    // snapshot is runtime-written so extras would be a writer bug, and
+    // dropping them keeps the port contract the single source of shape).
     let mut obj = Map::new();
+    if let Some(snapshot) = port_snapshot.and_then(Value::as_object) {
+        for (k, v) in snapshot {
+            if node.inputs.iter().any(|p| p.name == *k) {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
     // Kicked nodes are entry points: no wired pending inputs by
-    // definition, so the wired set is empty.
-    fill_input_from_config(node, &HashSet::new(), &mut obj);
+    // definition, so the wired set is empty. Literals skip keys the
+    // snapshot already filled.
+    fill_input_from_literals(node, &HashSet::new(), &mut obj);
     Value::Object(obj)
 }
 
@@ -441,12 +445,12 @@ mod tests {
         );
     }
 
-    fn kicked_node(node_type: &str, inputs: Vec<PortDefinition>, config: serde_json::Value) -> NodeDefinition {
+    fn kicked_node(node_type: &str, inputs: Vec<PortDefinition>, literals: serde_json::Value) -> NodeDefinition {
         NodeDefinition {
             id: "k".into(),
             node_type: node_type.into(),
             label: None,
-            config,
+            config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
             inputs,
             outputs: Vec::new(),
@@ -458,83 +462,92 @@ mod tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            port_literals: literals
+                .as_object()
+                .expect("literal fixture is an object")
+                .clone()
+                .into_iter()
+                .collect(),
+            port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
         }
     }
 
     /// Regression: a kicked orphan node (entry node with no incoming
-    /// edges) used to receive an empty input bag, so a configurable
+    /// edges) used to receive an empty input bag, so a body-settable
     /// port like `Range.to` set via source config (`Range { to: 10 }`)
     /// arrived at runtime as `missing input on port: to`. The kick
     /// path now flows through `build_kicked_input` which fills
-    /// configurable ports from `node.config`.
+    /// ports from the enrich-normalized `node.port_literals`.
     #[test]
-    fn build_kicked_input_fills_configurable_ports_from_config() {
+    fn build_kicked_input_fills_ports_from_literals() {
         let inputs = vec![
             serde_json::from_value(json!({
                 "name": "from", "portType": "Number",
-                "required": false, "configurable": true,
+                "required": false, "literal": "anywhere",
             })).unwrap(),
             serde_json::from_value(json!({
                 "name": "to", "portType": "Number",
-                "required": true, "configurable": true,
+                "required": true, "literal": "anywhere",
             })).unwrap(),
             serde_json::from_value(json!({
                 "name": "step", "portType": "Number",
-                "required": false, "configurable": true,
+                "required": false, "literal": "anywhere",
             })).unwrap(),
         ];
-        let config = json!({ "from": 0, "to": 10, "step": 2 });
-        let node = kicked_node("Range", inputs, config);
-        let input = build_kicked_input(&node);
+        let node = kicked_node("Range", inputs, json!({ "from": 0, "to": 10, "step": 2 }));
+        let input = build_kicked_input(&node, None);
         assert_eq!(input, json!({ "from": 0, "to": 10, "step": 2 }));
     }
 
-    /// A wired-only port (`configurable: false`) must NOT be filled
-    /// from config even if the user accidentally put a value in the
-    /// node's config map: that's the wired-only contract.
+    /// A firing trigger's setup-time snapshot seeds its ports: declared
+    /// ports come through, a stray snapshot key (writer bug) is dropped,
+    /// and a body literal fills only what the snapshot left unset.
     #[test]
-    fn build_kicked_input_ignores_non_configurable_ports() {
+    fn build_kicked_input_seeds_the_port_snapshot() {
         let inputs = vec![
             serde_json::from_value(json!({
-                "name": "in", "portType": "String",
-                "required": true, "configurable": false,
+                "name": "endpointUrl", "portType": "String",
+                "required": true, "literal": "anywhere",
+            })).unwrap(),
+            serde_json::from_value(json!({
+                "name": "mode", "portType": "String",
+                "required": false, "literal": "anywhere",
             })).unwrap(),
         ];
-        let config = json!({ "in": "should be ignored" });
-        let node = kicked_node("X", inputs, config);
-        let input = build_kicked_input(&node);
-        assert_eq!(input, json!({}));
+        let node = kicked_node("Recv", inputs, json!({ "mode": "media" }));
+        let snapshot = json!({ "endpointUrl": "http://bridge", "ghost": 1 });
+        let input = build_kicked_input(&node, Some(&snapshot));
+        assert_eq!(input, json!({ "endpointUrl": "http://bridge", "mode": "media" }));
     }
 
-    /// Wires are authoritative: a WIRED configurable port whose pulse
-    /// resolved to a closure (so it is absent from the bag) must NOT
-    /// be silently backfilled from config. The closure means upstream
-    /// produced nothing; substituting the config value would mask the
+    /// Wires are authoritative: a WIRED port whose pulse resolved to a
+    /// closure (so it is absent from the bag) must NOT be silently
+    /// backfilled from its body literal. The closure means upstream
+    /// produced nothing; substituting the literal would mask the
     /// upstream failure and contradict the skip layer (whose
-    /// `config_filled` set excludes wired ports).
+    /// `literal_filled` set excludes wired ports).
     #[test]
-    fn fill_input_from_config_skips_wired_ports() {
+    fn fill_input_from_literals_skips_wired_ports() {
         let inputs = vec![
             serde_json::from_value(json!({
                 "name": "wired_p", "portType": "Number",
-                "required": false, "configurable": true,
+                "required": false, "literal": "anywhere",
             })).unwrap(),
             serde_json::from_value(json!({
                 "name": "free_p", "portType": "Number",
-                "required": false, "configurable": true,
+                "required": false, "literal": "anywhere",
             })).unwrap(),
         ];
-        let config = json!({ "wired_p": 1, "free_p": 2 });
-        let node = kicked_node("X", inputs, config);
+        let node = kicked_node("X", inputs, json!({ "wired_p": 1, "free_p": 2 }));
         let wired: std::collections::HashSet<&str> = ["wired_p"].into_iter().collect();
         let mut obj = serde_json::Map::new();
-        super::fill_input_from_config(&node, &wired, &mut obj);
+        super::fill_input_from_literals(&node, &wired, &mut obj);
         assert_eq!(
             serde_json::Value::Object(obj),
             json!({ "free_p": 2 }),
-            "wired port stays absent; unwired port fills from config"
+            "wired port stays absent; unwired port fills from its literal"
         );
     }
 }

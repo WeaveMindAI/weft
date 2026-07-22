@@ -86,7 +86,7 @@ struct WorkerCtx {
     /// The k8s namespace this worker pod runs in. For an infra project
     /// this is the project's own per-project namespace; for a no-infra
     /// project it is the shared worker namespace. Threaded into
-    /// `InfraProvisionContext` so `Node::provision` bodies see the
+    /// `InfraProvisionContext` so `Node::provision_infra` bodies see the
     /// runtime namespace they're being applied into. (Only infra
     /// projects provision, and those always run in their own namespace,
     /// so a provision body never sees the shared namespace.)

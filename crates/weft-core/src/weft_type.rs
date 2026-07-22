@@ -152,6 +152,38 @@ impl FileKind {
 }
 
 
+/// Where a LITERAL value may be written for an input port in weft source.
+/// The three driver forms are a ladder: the config braces (`M { x: 5 }`)
+/// imply the assignment statement (`M.x = 5`), which implies nothing.
+/// Edges are a separate axis and always legal, in BOTH spellings: the
+/// edge statement (`M.x = other.y`) and the braces endpoint form
+/// (`M { x: other.y }`) lower to the same wire and are never gated here.
+/// Ordered most-permissive first so `max()` picks the most restrictive.
+// SYNC: LiteralPlacement <-> packages/weft-graph/src/protocol.ts LiteralPlacement
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiteralPlacement {
+    /// A literal may sit in the config braces or as an assignment.
+    #[default]
+    Anywhere,
+    /// A literal only via `node.port = ...`; a braces literal is refused.
+    Assignment,
+    /// No literal ever: the port is driven by wires alone.
+    None,
+}
+
+impl LiteralPlacement {
+    /// May a literal sit in the config braces?
+    pub fn allows_config(self) -> bool {
+        self == LiteralPlacement::Anywhere
+    }
+
+    /// May a literal be written at all (braces or assignment)?
+    pub fn allows_literal(self) -> bool {
+        self != LiteralPlacement::None
+    }
+}
+
 /// Recursive port type system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeftType {
@@ -387,23 +419,32 @@ impl WeftType {
         }
     }
 
-    /// Whether a port of this type should be configurable by default. False
-    /// only for stored files (alone or in containers), TypeVar, and
-    /// MustOverride. Everything else (primitives, lists, dicts, JsonDict,
-    /// unions of the above) is configurable so users can paste literal JSON
-    /// into the config field instead of wiring a separate Text node. Catalog
-    /// authors override per port via `PortDef::wired_only(...)`.
-    pub fn is_default_configurable(&self) -> bool {
+    /// The default `LiteralPlacement` for a port of this type. Plain data
+    /// (primitives, lists, dicts, JsonDict, unions of those) takes a
+    /// literal anywhere, so users can paste values into the config braces
+    /// instead of wiring a separate Text node. Stored files (alone or in
+    /// containers) take a literal only as an assignment (`n.p = @asset(..)`:
+    /// nobody can hand-type a file marker into a config field), as do
+    /// TypeVar and MustOverride ports (their concrete type is unknown until
+    /// overridden). A Bus is a live runtime handle: no literal ever. Catalog
+    /// authors override per port via `PortDef::literal`.
+    pub fn default_literal_placement(&self) -> LiteralPlacement {
         match self {
-            WeftType::Primitive(_) => !self.references_file(),
-            WeftType::List(inner) => inner.is_default_configurable(),
-            WeftType::Dict(_, v) => v.is_default_configurable(),
-            WeftType::Union(types) => types.iter().all(|t| t.is_default_configurable()),
-            WeftType::JsonDict => true,
-            // A bus is a live runtime handle: never configurable.
-            WeftType::Bus => false,
-            WeftType::TypeVar(_) => false,
-            WeftType::MustOverride => false,
+            WeftType::Primitive(_) => {
+                if self.references_file() { LiteralPlacement::Assignment } else { LiteralPlacement::Anywhere }
+            }
+            WeftType::List(inner) => inner.default_literal_placement(),
+            WeftType::Dict(_, v) => v.default_literal_placement(),
+            // A union is as restrictive as its most restrictive member.
+            WeftType::Union(types) => types
+                .iter()
+                .map(|t| t.default_literal_placement())
+                .max()
+                .unwrap_or(LiteralPlacement::Anywhere),
+            WeftType::JsonDict => LiteralPlacement::Anywhere,
+            WeftType::Bus => LiteralPlacement::None,
+            WeftType::TypeVar(_) => LiteralPlacement::Assignment,
+            WeftType::MustOverride => LiteralPlacement::Assignment,
         }
     }
 

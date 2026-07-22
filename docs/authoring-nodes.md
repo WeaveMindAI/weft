@@ -50,17 +50,23 @@ nodes/my_node/
   deps.toml           # optional: extra cargo deps beyond the codegen base
 ```
 
-The trait (in `weft_core`):
+The trait (in `weft_core`). A node implements up to three separately
+named bodies, and the ENGINE picks which to call from the manifest; a
+node never inspects the lifecycle phase itself:
 
 ```rust
 #[async_trait]
 pub trait Node: NodeManifest + Send + Sync {
     /// Infra nodes only (`requires_infra: true`): the desired infra shape.
-    async fn provision(&self, ctx: InfraProvisionContext, input: InputBag)
+    async fn provision_infra(&self, ctx: InfraProvisionContext, input: InputBag)
         -> WeftResult<InfraSpec> { /* default: error */ }
-    /// The node's logic. The ONLY way to fire downstream is
+    /// Triggers only (`features.isTrigger: true`): register the wake
+    /// signal. Called INSTEAD of `run` at registration time.
+    async fn setup_trigger(&self, ctx: ExecutionContext)
+        -> WeftResult<()> { /* default: error */ }
+    /// The node's normal body. The ONLY way to fire downstream is
     /// `ctx.pulse_downstream(output)`.
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()>;
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>;
 }
 ```
 
@@ -77,7 +83,6 @@ A complete minimal node (the stdlib `Text`):
 //! Text: emit a literal string configured at design time.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 use weft_core::node::NodeOutput;
@@ -87,29 +92,110 @@ pub struct TextNode;
 
 #[async_trait]
 impl Node for TextNode {
-    async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let value: String = ctx.config.get("value")?;
-        ctx.pulse_downstream(NodeOutput::with("value", Value::String(value))).await
+        ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
 }
 ```
 
-What `execute` works with:
+### Reading values: `ctx.ports` and `ctx.config`
 
-- `ctx.config: ConfigBag`: the node's `.weft` config values;
-  `ctx.config.get::<T>("key")?` deserializes one (loud error when missing
-  or mistyped).
-- `ctx.input: InputBag`: the values that arrived on the input ports this
-  fire; `ctx.input.get::<T>("port")?`.
-- `ctx.pulse_downstream(NodeOutput)`: emit values on output ports and fire
-  downstream. `NodeOutput::with("port", value)` for one port; chain
-  `.set("other", value)` for more (`NodeOutput::empty()` fires nothing;
-  `.extend_from_object(json)` fans a JSON object's keys onto same-named
-  ports). A port not present in the output emits
-  no pulse (downstream of it skips, the null-propagation rule).
-- `ctx.phase: Phase`: which lifecycle phase this invocation is
-  (`InfraSetup` / `TriggerSetup` / `Fire`); non-trigger, non-infra nodes
-  only ever see `Fire`.
+A node reads its named values from two separate bags. `ctx.ports` holds
+what arrived on the node's input ports; `ctx.config` holds the node's
+design-time config fields. Each name lives in exactly one of the two, so
+the read is always unambiguous: a port value comes from `ctx.ports`, a
+config field from `ctx.config`.
+
+Both bags expose the same accessors:
+
+- `.get::<T>("name")?`: required, typed, loud error when absent or
+  mistyped (stamped as an input or config error per bag).
+- `.opt::<T>("name")?`: optional (`Ok(None)` when absent or null), but
+  a PRESENT wrong-typed value still errors loud.
+- `.get_or("name", default)?`: absent means the default, wrong type
+  still errors. The blessed pattern for defaulted knobs. (Don't write
+  `.get(..).unwrap_or(..)`: it swallows a real type error.)
+- `.raw("name")`: the optional raw JSON for pass-through reads; a
+  REQUIRED raw read is `.get::<Value>("name")?`.
+- `.iter()`: every named value, for nodes that treat their ports as a
+  dynamic set (script variables, form fields) or forward them.
+- `.object()?`: the whole bag as one `serde_json::Map`, for nodes that
+  consume or forward it as a record. Always answers on ports and
+  config; on the wake bag it fails loud when the fire delivered no
+  keyed record (a broken delivery can never pass as an empty one).
+
+File values are just types: `ctx.ports.get::<FileHandle>("image")?`
+parses the file value and fails loud when it has no readable handle.
+
+### How a port gets its value in weft source
+
+A port has exactly one driver, written in one of three forms: an edge
+(`n.x = other.y`), an assignment literal (`n.x = 5`), or a braces
+literal (`M { x: 5 }`). Giving a port two drivers is a compile error
+(`double-driven-port`).
+
+Where a LITERAL may be written is the port's `literal` level, declared
+on the port in `metadata.json` (an explicit level wins, otherwise the
+port type's default applies):
+
+- `"anywhere"`: braces or assignment. The default for plain data
+  (strings, numbers, lists, dicts).
+- `"assignment"`: only `n.x = ...`. The default for file types, e.g.
+  `n.image = @asset("i.png", Image)`.
+- `"none"`: wires only. The default for Bus ports; declare it for a
+  port that needs a real node wired, like an inference node's `config`
+  port.
+
+Edges are legal on every port, in both spellings: `n.x = other.y` and
+`M { x: other.y }` produce the same wire.
+
+Whichever form drove the port, the node reads the value from
+`ctx.ports`. A port with `literal: "assignment"` or `"none"` may share
+a name with a config field; the two hold independent values
+(`ctx.ports.get(name)` vs `ctx.config.get(name)`). A field sharing the
+name of a `literal: "anywhere"` port is a metadata error: declare only
+the port, it alone carries the value.
+
+### The config-node pattern
+
+A node may declare an input port named `config`. A configuration object
+wired to it (from a config node) is consumed by the ENGINE before
+dispatch: each key overlays the node's config bag, and a key naming one
+of the node's `literal: "anywhere"` ports fills that port instead (a
+directly wired value on that port wins). The node body just reads
+`ctx.config` and `ctx.ports` as usual.
+
+### How the editor renders ports
+
+The editor shows an inline field in the node body for every port that
+can take a literal. The control kind derives from the port TYPE through
+one central mapping: file types get a drop/pick control, Boolean a
+checkbox, Number a number box, everything else a text area. A small
+marker on the field toggles which source form the value is written in
+(braces vs statement; locked to statement for `"assignment"` ports). A
+`literal: "none"` port shows a handle only, and wiring an edge hides
+the field (one driver).
+
+### Emitting output, errors, HTTP, identity
+
+- `ctx.pulse_downstream(NodeOutput)`: emit values on output ports and
+  fire downstream. `NodeOutput::new().set("port", value)` takes anything
+  that converts to JSON directly (bools, numbers, strings, an
+  already-built `Value` passes through untouched); chain `.set` for more
+  ports; `.extend_from_object(json)` fans a JSON object's keys onto
+  same-named ports. A port not present in the output emits no pulse
+  (downstream of it skips, the null-propagation rule).
+- `.node_err("doing X")?` on any non-weft `Result` (an HTTP call, a
+  parser) turns its error into a node failure reading "doing X: ...".
+  This is the one door for error wrapping: the accessors stamp
+  input/config errors themselves, every ctx handle already returns
+  `WeftResult`, and node code has no reason to name a `WeftError`
+  variant.
+- `ctx.http()`: the shared, pooled HTTP client for plain (unpaid)
+  outbound calls. A PAID provider call goes through
+  `ctx.provider_access` + `ctx.metered_client` instead (that is what
+  records its cost).
 - Identity fields: `ctx.execution_id`, `ctx.project_id`, `ctx.node_id`,
   `ctx.node_type`, `ctx.node_label`, `ctx.color`, `ctx.frames`.
 
@@ -187,15 +273,17 @@ drop (HTTP via reqwest, DB via sqlx, sleep, file I/O via tokio::fs,
 WebSocket streams, channel receives).
 
 ```rust
-async fn execute(ctx: ExecutionContext, ...) -> WeftResult<()> {
-    let resp = reqwest::Client::new()
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    let resp = ctx.http()
         .post("https://api.anthropic.com/v1/messages")
         .json(&body)
         .send()
-        .await?
+        .await
+        .node_err("posting to the API")?
         .json::<ApiResponse>()
-        .await?;
-    ctx.pulse_downstream(NodeOutput::with("response", resp.text)).await
+        .await
+        .node_err("decoding the API response")?;
+    ctx.pulse_downstream(NodeOutput::new().set("response", resp.text)).await
 }
 ```
 
@@ -306,7 +394,8 @@ For long-running CPU work, pass the cancellation flag into the closure
 and check it between chunks:
 
 ```rust
-async fn execute(ctx: ExecutionContext, image: Vec<u8>) -> WeftResult<()> {
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    let image: Vec<u8> = todo!("read the image bytes");
     let cancel = ctx.cancellation();
     let result = tokio::task::spawn_blocking(move || {
         for chunk in chunks_of(image) {
@@ -317,7 +406,7 @@ async fn execute(ctx: ExecutionContext, image: Vec<u8>) -> WeftResult<()> {
         }
         Ok(...)
     }).await??;
-    ctx.pulse_downstream(NodeOutput::with("out", result)).await
+    ctx.pulse_downstream(NodeOutput::new().set("out", result)).await
 }
 ```
 
@@ -333,7 +422,7 @@ If you need to do something specific on cancel (notify a peer, log a
 metric, release a resource the node owns), branch on the flag:
 
 ```rust
-async fn execute(ctx: ExecutionContext, ...) -> WeftResult<()> {
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
     let mut conn = open_connection().await?;
     let cancel = ctx.cancellation();
     loop {
@@ -347,7 +436,7 @@ async fn execute(ctx: ExecutionContext, ...) -> WeftResult<()> {
             }
         }
     }
-    ctx.pulse_downstream(NodeOutput::with("done", json!(null))).await
+    ctx.pulse_downstream(NodeOutput::new().set("done", json!(null))).await
 }
 ```
 
@@ -393,7 +482,7 @@ credit, an enrichment lookup) does exactly two things:
 //    platform sentinel) asks the runtime for its configured key
 //    (<PROVIDER>_API_KEY on the runtime's broker). Your code is the
 //    same lines either way; nothing branches.
-let access = ctx.provider_access("openrouter", cfg.get_optional("apiKey")?).await?;
+let access = ctx.provider_access("openrouter", ctx.config.opt("apiKey")?).await?;
 
 // 2. An ordinary HTTP client to make the calls with. Use it directly,
 //    or hand it to any library that accepts an injected client.
@@ -487,41 +576,65 @@ hours or days later.
 
 ### `ctx.register_signal(kind)`
 
-For trigger nodes during `Phase::TriggerSetup`. Tells the listener to
-watch for a wake signal. You pass a **typed signal kind** (one of the
-structs in `weft_core::signal`, see the kinds table below), not an
-untyped spec; the framework projects it onto the wire shape. Returns
-`()` once the dispatcher acknowledges. Each external fire later spawns
-a fresh execution of the project; this registration is NOT bound to the
-current execution's firing. Any public URL is derived from the signal's
-path on the dispatcher, so nodes don't get a URL handed back.
+For a trigger's `setup_trigger` body. Tells the listener to watch for a
+wake signal. You pass a **typed signal kind** (one of the structs in
+`weft_core::signal`, see the kinds table below), not an untyped spec;
+the framework projects it onto the wire shape. Returns `()` once the
+dispatcher acknowledges. Each external fire later spawns a fresh
+execution of the project; this registration is NOT bound to the current
+execution's firing. Any public URL is derived from the signal's path on
+the dispatcher, so nodes don't get a URL handed back.
+
+A trigger writes two bodies and never inspects any phase; the engine
+calls the right one:
 
 ```rust
 use weft_core::signal::{ApiEndpoint, LiveConnectionConfig};
 
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    match ctx.phase {
-        Phase::TriggerSetup => {
-            // Build the typed kind from the node's config fields, then
-            // register it. (The live-caller kinds share a config body
-            // built by `LiveConnectionConfig::from_node_fields`.)
-            let common = LiveConnectionConfig::from_node_fields(&ctx.config.values);
-            ctx.register_signal(ApiEndpoint { common }).await?;
-            ctx.pulse_downstream(NodeOutput::with("started", json!(true))).await
-        }
-        Phase::Fire => {
-            // Run when an external fire arrives.
-            // ctx.wake_payload() returns the wake event's data (the
-            // parsed SSE event JSON, the poll body, the timer info,
-            // etc.). Returns None for non-trigger nodes and for trigger
-            // setup; trigger Fire bodies that REQUIRE a payload should
-            // `ok_or_else` with a clear error.
-            ...
-        }
-        _ => Ok(()),
+#[async_trait]
+impl Node for MyTriggerNode {
+    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // Build the typed kind from the node's values, then register
+        // it. (The live-caller kinds share a config body built by
+        // `LiveConnectionConfig::from_node_fields`.) The runtime saves
+        // a snapshot of `ctx.ports` with the registration.
+        let common = LiveConnectionConfig::from_node_fields(ctx.config.object()?);
+        ctx.register_signal(ApiEndpoint { common }).await
+    }
+
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // Runs when an external fire arrives, exactly once per fire.
+        // The fire's payload fields are on the `ctx.wake` bag (same
+        // accessors as ports/config); `ctx.ports` replays the values
+        // the trigger's inputs held at setup time.
+        let value: serde_json::Value = ctx.wake.get("value")?;
+        ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
 }
 ```
+
+**What a trigger's `run` sees, and when it runs.** A trigger's three
+value sources at fire time:
+
+- `ctx.config`: the node's design-time config, as always.
+- `ctx.ports`: a SNAPSHOT of what the trigger's inputs held when it
+  registered (its upstream runs during trigger setup, the values land,
+  and the runtime saves them with the registration). Upstream nodes do
+  not re-run for the trigger's sake at fire time, and wires into a
+  trigger deliver nothing during a fire; re-activating the project
+  re-registers and refreshes the snapshot.
+- `ctx.wake`: this fire's event payload as a bag of named fields (the
+  HTTP body, the SSE event JSON, the form submission, the timer info).
+  A trigger that forwards the whole payload reads it in one go via
+  `ctx.wake.object()?`, which fails loud when the fire delivered no
+  keyed record (so a broken delivery can never pass as an empty one).
+
+Per fire, the engine runs the subgraph the FIRED trigger reaches: its
+downstream outputs plus everything those outputs depend on (stopping
+at triggers). The fired trigger's body runs exactly once. Any other
+trigger in that subgraph does not run at all: the engine closes its
+output ports, so a node fed by several triggers sees the idle branches
+as structurally dead and proceeds with the firing one.
 
 A simpler kind takes its fields directly:
 
@@ -563,8 +676,8 @@ section):
 | `LiveSocket { common }` | An inbound WebSocket; a node holds a two-way conversation. | A live chat / interactive socket a program serves. |
 
 Both live-caller kinds share `LiveConnectionConfig` (the `common`
-field): build it from the node's config map with
-`LiveConnectionConfig::from_node_fields(&ctx.config.values)`. The wire
+field): build it from the node's merged named values with
+`LiveConnectionConfig::from_node_fields(ctx.config.object()?)`. The wire
 protocol is the KIND, not a config field (the runtime derives it from
 the tag), which is why there is no `protocol:` knob to set.
 
@@ -583,7 +696,7 @@ it takes a typed `Signal` kind.
 ```rust
 use weft_core::signal::Form;
 
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
     let answer = ctx.await_signal(Form {
         form_type: "human-query".into(),
         schema: my_form_schema(),
@@ -592,7 +705,7 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         consumer_kind: Some("human_in_the_loop".into()),
     }).await?;
     // After the user submits, `answer` is the form payload.
-    ctx.pulse_downstream(NodeOutput::with("answer", answer)).await
+    ctx.pulse_downstream(NodeOutput::new().set("answer", answer)).await
 }
 ```
 
@@ -612,13 +725,13 @@ position in the body. On replay, each call returns its own fire's
 value in order.
 
 ```rust
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
     let approval = ctx.await_signal(approval_spec()).await?;
     if approval["accepted"].as_bool() != Some(true) {
-        return ctx.pulse_downstream(NodeOutput::with("decision", json!("rejected"))).await;
+        return ctx.pulse_downstream(NodeOutput::new().set("decision", "rejected")).await;
     }
     let confirmation = ctx.await_signal(confirmation_spec()).await?;
-    ctx.pulse_downstream(NodeOutput::with("final", confirmation)).await
+    ctx.pulse_downstream(NodeOutput::new().set("final", confirmation)).await
 }
 ```
 
@@ -640,7 +753,7 @@ must be wrapped in `ctx.run`. Examples: random tokens, `now()`,
 calling an external API, writing to a database.
 
 ```rust
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
     // Mint an idempotency token ONCE; replays return the same token.
     let idem = ctx.run("idem", || async {
         Ok(json!(uuid::Uuid::new_v4().to_string()))
@@ -649,8 +762,9 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
     let approval = ctx.await_signal(approval_spec()).await?;
 
     // Call an external API ONCE; replays return the same response.
+    let http = ctx.http();
     let api_resp = ctx.run("call_billing", || async {
-        let resp = reqwest::Client::new()
+        let resp = http
             .post("https://api.billing/charge")
             .json(&json!({ "idem": idem, "approved_by": approval["who"] }))
             .send().await?
@@ -658,7 +772,7 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         Ok(resp)
     }).await?;
 
-    ctx.pulse_downstream(NodeOutput::with("receipt", api_resp)).await
+    ctx.pulse_downstream(NodeOutput::new().set("receipt", api_resp)).await
 }
 ```
 
@@ -685,7 +799,7 @@ error.
 
 What's safe between awaits:
 - Pure logic, branching on values that came from awaits or runs.
-- Reading inputs/configs from `ctx.input` / `ctx.config`.
+- Reading named values via `ctx.ports` / `ctx.config`.
 
 What's NOT safe between awaits (wrap in `ctx.run`):
 - `rand::random()`, `Uuid::new_v4()`, `Instant::now()`.
@@ -733,13 +847,17 @@ to the one worker and dies with it.
 
 A node downstream of a live trigger reaches the caller via `ctx`:
 
-- `ctx.is_api_call()` / `ctx.is_websocket()`: status reads. A node may
-  branch three ways (http / websocket / neither), so these are two
-  separate queries, never one enum. A node that REQUIRES a caller fails
-  loud when neither is true.
+- `ctx.http_caller().await?` / `ctx.ws_caller().await?`: the one-call
+  form for a node that only makes sense on one protocol. Each folds the
+  whole chain (caller present, right protocol, connection barrier
+  passed) and fails loud naming the trigger to wire it under.
 - `ctx.caller() -> Option<CallerHandle>`: the protocol-typed handle, or
   `None` on a run with no live caller. `CallerHandle` is an enum over the
-  two protocol shapes, so the type is honest about what each can do.
+  two protocol shapes, so the type is honest about what each can do. For
+  nodes that branch per protocol.
+- `ctx.is_api_call()` / `ctx.is_websocket()`: status reads. A node may
+  branch three ways (http / websocket / neither), so these are two
+  separate queries, never one enum.
 - `ctx.caller_data_type()`: the declared inbound/outbound shape (JSON /
   Text / Bytes) so a node can branch on what it sends.
 
@@ -759,54 +877,48 @@ The talk methods are protocol-specific:
   barrier (wait for the caller's socket to actually attach before
   talking).
 
-Inbound on a WebSocket is BROADCAST and **forward-only by default**, the
-same model as the bus:
+Inbound on a WebSocket is BROADCAST and forward-only by default, the
+same model as the bus.
 
-- `ws.receive()` reads messages that arrive AFTER you got the handle, not
-  prior history. The position is pinned when you obtain the handle (no
-  missed-message race between attach and your first read).
-- Every reader has its OWN position, so two nodes both see every message
-  (neither steals from the other), a responder and an observer can run off
-  the same socket.
-- To read earlier messages, mint a positioned **cursor** (same concept as
-  the bus): `ws.cursor_from_start()` (everything still retained in RAM),
-  `ws.cursor_at(offset)`, or `ws.cursor_including_last()` (forward plus the
-  single most recent message, e.g. to grab the latest state on a late
-  join). Ask `ws.now_offset()` / `ws.retained_floor()` to position
-  relative to now. Offsets are ABSOLUTE over the connection's whole life
-  (never relative to the sliding window), so a saved offset always names
-  the same message even as the window moves.
-- For the common loop, use `recv_next()`: it yields `Some(msg)` for each
-  message and `Ok(None)` when the stream ends (caller gone, session capped,
-  fell behind), so you write `while let Some(msg) = ws.recv_next().await? {}`
-  and the language does the end-of-stream classification for you. A real
-  failure (wrong protocol, transport) propagates via `?`.
-- If you need the exact outcome, `receive()` returns the TYPED
-  `CallerError` so you can `match` every case. A cursor only ever reads the
-  in-RAM window, never the DB; if your cursor's offset has been trimmed out
-  of the window you get `CallerError::FellBehind { oldest_resident }` (NOT a
-  silent substitution): the cursor is MOVED to `oldest_resident` (the
-  earliest message still retained), so your next read resumes there. One
-  field, because the inbound log is dense, the resume point and the window
-  floor are the same. (The bus's `FellBehind` carries a second `resumed_at`
-  because its log is sparse and can resume past the floor; the caller never
-  can.) The built-in forward cursor cannot hit this in normal use (it stays
-  ahead of the window).
+**Reading the stream.** `ws.receive()` reads messages that arrive after
+you got the handle; the position is pinned at the moment you obtain it,
+so there is no missed-message race between attach and your first read.
+Every reader has its own position: two nodes both see every message, so
+a responder and an observer can run off the same socket.
+
+For the common loop, use `recv_next()`. It yields `Some(msg)` for each
+message and `Ok(None)` when the stream ends (caller gone, session
+capped, fell behind), so you write
+`while let Some(msg) = ws.recv_next().await? {}` and the language does
+the end-of-stream classification for you. A real failure (wrong
+protocol, transport) propagates via `?`. When you need to distinguish
+the exact outcome, `receive()` returns the typed `CallerError` so you
+can `match` every case.
+
+**Reading history.** To read earlier messages, mint a positioned
+**cursor** (same concept as the bus): `ws.cursor_from_start()`
+(everything still retained in RAM), `ws.cursor_at(offset)`, or
+`ws.cursor_including_last()` (forward plus the single most recent
+message, e.g. to grab the latest state on a late join). Ask
+`ws.now_offset()` / `ws.retained_floor()` to position relative to now.
+Offsets are absolute over the connection's whole life, so a saved
+offset keeps naming the same message as the retention window moves.
+
+A cursor reads the in-RAM window only. When a cursor's offset has been
+trimmed out of the window, the read returns
+`CallerError::FellBehind { oldest_resident }` and the cursor is moved
+to `oldest_resident` (the earliest message still retained), so the next
+read resumes there. The built-in forward cursor stays ahead of the
+window in normal use, so it does not hit this.
 
 ### Pattern: a WebSocket conversation
 
 ```rust
-use weft_core::caller::{CallerHandle, InboundMessage, OutboundChunk};
+use weft_core::caller::{InboundMessage, OutboundChunk};
 
-async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    if !ctx.is_websocket() {
-        return Err(WeftError::NodeExecution(
-            "wire this under a LiveSocket trigger".into()));
-    }
-    let Some(CallerHandle::Websocket(ws)) = ctx.caller() else {
-        return Err(WeftError::NodeExecution("no WebSocket caller".into()));
-    };
-    ws.ensure_connected().await?;
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    // Caller present, WebSocket, connected; loud otherwise.
+    let ws = ctx.ws_caller().await?;
     // recv_next() yields each message, or None when the stream ends (caller
     // gone, session capped, fell behind). A real failure propagates via `?`.
     while let Some(msg) = ws.recv_next().await? {
@@ -818,7 +930,7 @@ async fn execute(&self, ctx: ExecutionContext) -> WeftResult<()> {
         ws.send(OutboundChunk::Json(json!({ "echo": v }))).await?;
     }
     let _ = ws.close().await;
-    ctx.pulse_downstream(NodeOutput::with("done", json!(true))).await
+    ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
 }
 ```
 
@@ -894,8 +1006,8 @@ The declared `type` (`Image`, `Audio`, `Video`, `Blob`, or the `File` union)
 drives the editor's file filter, validates drops, and is what gets written
 into source. An optional `accept` narrows the filter further (e.g.
 `"image/png"`). A field whose `key` matches an input port makes that port
-fillable from config; a field with no matching port is read via
-`ctx.config`.
+fillable from config, and the value is delivered ON the port: the node
+reads it via `ctx.ports.get`.
 
 What lands in source is ONE clean line, never a storage key:
 
@@ -1036,7 +1148,7 @@ field's `key` becomes a port name, so it must be a legal identifier
 Some nodes need a long-running process the user can't easily run
 themselves: a WhatsApp bridge daemon, a headless browser, a local LLM
 server, a database. Weft calls those *infra nodes*. The pattern: the
-node returns a typed `InfraSpec` from `provision()`, the supervisor
+node returns a typed `InfraSpec` from `provision_infra()`, the supervisor
 compiles it to Kubernetes manifests and applies them, and the node
 talks to the running pod(s) over HTTP at fire time.
 
@@ -1045,27 +1157,27 @@ typed Rust structs (`Container`, `Endpoint`, `Volume`, ...); the
 compiler turns it into Deployments, Services, PVCs, NetworkPolicies,
 HPAs, and stamps all the `weft.dev/*` labels for you.
 
-### Two methods: `provision` and `execute`
+### Two methods: `provision_infra` and `run`
 
 An infra node sets `requires_infra: true` in `metadata.json` and
 implements two methods:
 
-- **`provision(ctx, input) -> InfraSpec`**: returns the desired infra
-  shape. Pure: it emits no pulses, it just describes what should run.
-  Runs in `Phase::InfraSetup`, before `execute`. The `ctx`
+- **`provision_infra(ctx, input) -> InfraSpec`**: returns the desired
+  infra shape. Pure: it emits no pulses, it just describes what should
+  run. Called at provisioning time, before `run`. The `ctx`
   (`InfraProvisionContext`) carries `project_id`, `node_id`,
   `namespace`, `tenant_id`. The default impl returns an error, so only
   infra nodes override it.
-- **`execute(ctx) -> NodeOutput`**: the node's actual logic, same as
-  any node. By the time `execute` runs, the infra is applied and the
-  node can resolve its endpoints.
+- **`run(ctx)`**: the node's actual logic, same as any node. By the
+  time `run` executes, the infra is applied and the node can resolve
+  its endpoints.
 
-The split is the rule: **provision describes infra, execute produces
-pulses.** Provision can do async work (a registry lookup) but its job
-is the spec.
+The split is the rule: **provision_infra describes infra, run produces
+pulses.** Provisioning can do async work (a registry lookup) but its
+job is the spec.
 
 ```rust
-async fn provision(&self, _ctx: InfraProvisionContext, _input: NodeInput)
+async fn provision_infra(&self, _ctx: InfraProvisionContext, _input: InputBag)
     -> WeftResult<InfraSpec>
 {
     const PORT: u16 = 8090;
@@ -1169,12 +1281,12 @@ bridge **explicitly exporting it as an output port** and wiring it
 downstream:
 
 ```rust
-// bridge node, in execute:
+// bridge node, in run:
 let api = ctx.endpoint("api").await?;
-ctx.pulse_downstream(NodeOutput::with("apiUrl", Value::String(api.url().to_string()))).await
+ctx.pulse_downstream(NodeOutput::new().set("apiUrl", api.url())).await
 
-// send node, in execute: reads the wired URL, appends its own path
-let base = ctx.input.get("apiUrl")?;       // the bridge's exported URL
+// send node, in run: reads the wired URL, appends its own path
+let base: String = ctx.ports.get("apiUrl")?;   // the bridge's exported URL
 let resp = post(format!("{}/action", base.trim_end_matches('/')), body).await?;
 ```
 
@@ -1190,7 +1302,7 @@ them. Implement the ones you need.
 | --- | --- | --- | --- |
 | `/health` (or any path) | GET | the k8s readiness probe | Return 2xx when ready. Wire it via `Probe::http("/health", port)` on the container. The path is whatever you pass to `Probe`. |
 | `/live` | GET | the dispatcher proxy (graph body panel) | Return `{ "items": [{ "type": "text"\|"image", "label": "...", "data": "..." }] }`. The graph polls this every 3s and renders the items (a QR code, a status line). Opt in by setting `features.liveEndpoint` to the endpoint name (below). |
-| `/outputs` | GET | the declaring node's own `execute` | Return a flat JSON object; the node folds each key into an output port. The key set must match the node's declared `outputs` in metadata.json (a hand-maintained contract, not enforced). |
+| `/outputs` | GET | the declaring node's own `run` | Return a flat JSON object; the node folds each key into an output port. The key set must match the node's declared `outputs` in metadata.json (a hand-maintained contract, not enforced). |
 | `/action`, `/events`, ... | any | sibling nodes via the wired URL | Your own convention. e.g. a send node POSTs `/action`, a receive node opens an SSE stream at `/events`. The route names live in the node code, the URL comes from the wired endpoint export. |
 
 `/live` is special because the *dispatcher* (not a node) calls it, so
@@ -1324,7 +1436,7 @@ it; within your own namespace you can do what you want.
 
 ## Last warning: a loop with a wait inside a node
 
-Don't. A `loop` in your `execute` that contains an `await_signal` means
+Don't. A `loop` in your `run` body that contains an `await_signal` means
 the node is orchestrating, which is the graph's job. Use weft's `Loop(...)`
 and let each iteration fire a single-responsibility node.
 
