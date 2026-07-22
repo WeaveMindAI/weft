@@ -29,7 +29,7 @@ use serde_json::json;
 
 use weft_core::bus::{BusEntryKind, BusOptions};
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BusChatHostNode;
@@ -73,17 +73,15 @@ impl Node for BusChatHostNode {
                     .next()
                     .await
                     .node_err(format!("host cursor on turn {}", turn + 1))?
-                    .ok_or_else(|| {
-                        // A `None` cursor means the bus closed before a
-                        // reply arrived. Don't assert WHO closed it: it
-                        // could be the guest exiting, but also the
-                        // stuck-detector tearing the bus down. State the
-                        // observable fact, not a guessed culprit.
-                        WeftError::NodeExecution(format!(
-                            "host: bus closed before a reply to turn {} arrived",
-                            turn + 1
-                        ))
-                    })?;
+                    // A `None` cursor means the bus closed before a
+                    // reply arrived. Don't assert WHO closed it: it
+                    // could be the guest exiting, but also the
+                    // stuck-detector tearing the bus down. State the
+                    // observable fact, not a guessed culprit.
+                    .node_err(format!(
+                        "host: bus closed before a reply to turn {} arrived",
+                        turn + 1
+                    ))?;
             }
             Ok(())
         }

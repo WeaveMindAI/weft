@@ -19,7 +19,6 @@ use minillmlib::{
 
 use serde_json::Value;
 
-use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -89,15 +88,14 @@ impl Node for OpenRouterInferenceNode {
         let cancelled = ctx.cancellation();
         let response = tokio::select! {
             collected = stream.collect() => collected.node_err("openrouter")?,
-            _ = cancelled.cancelled() => return Err(WeftError::Cancelled),
+            err = cancelled.cancelled_err() => return Err(err),
         };
 
         if response.content.trim().is_empty() {
-            return Err(WeftError::NodeExecution(
+            weft_core::node_bail!(
                 "openrouter: provider returned no text content (function-call only or empty \
                  response)"
-                    .into(),
-            ));
+            );
         }
         let text = response.content;
 

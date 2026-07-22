@@ -4,7 +4,6 @@
 
 use async_trait::async_trait;
 
-use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -39,9 +38,7 @@ impl Node for WhatsAppSendNode {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(WeftError::NodeExecution(format!(
-                "bridge returned {status}: {text}"
-            )));
+            weft_core::node_bail!("bridge returned {status}: {text}");
         }
         let parsed: serde_json::Value = resp.json().await.node_err("parse bridge response")?;
         // The bridge signals SOFT failures (e.g. "WhatsApp not
@@ -51,16 +48,12 @@ impl Node for WhatsAppSendNode {
         // through to a misleading "missing messageId".
         let result = parsed.get("result");
         if let Some(err) = result.and_then(|r| r.get("error")).and_then(|v| v.as_str()) {
-            return Err(WeftError::NodeExecution(format!("bridge: {err}")));
+            weft_core::node_bail!("bridge: {err}");
         }
         let message_id = result
             .and_then(|r| r.get("messageId"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                WeftError::NodeExecution(format!(
-                    "bridge send response missing result.messageId: {parsed}"
-                ))
-            })?;
+            .node_err(format!("bridge send response missing result.messageId: {parsed}"))?;
         // Only emit `messageId`. The previous `success: true` port was
         // an always-true constant (every failure path errors above), so
         // its mere presence on the wire was the meaningful signal. The

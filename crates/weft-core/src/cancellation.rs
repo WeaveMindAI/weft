@@ -73,6 +73,15 @@ impl CancellationFlag {
         }
         waiter.await;
     }
+
+    /// [`Self::cancelled`] resolving to the error a node body returns
+    /// to unwind as cancelled (not failed): the select-arm door, so
+    /// node code never names the error type.
+    /// `err = cancel.cancelled_err() => return Err(err)`.
+    pub async fn cancelled_err(&self) -> crate::error::WeftError {
+        self.cancelled().await;
+        crate::error::WeftError::Cancelled
+    }
 }
 
 #[cfg(test)]

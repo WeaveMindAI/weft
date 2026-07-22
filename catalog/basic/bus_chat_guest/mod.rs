@@ -32,7 +32,7 @@ use serde_json::json;
 
 use weft_core::bus::BusEntryKind;
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BusChatGuestNode;
@@ -67,10 +67,10 @@ impl Node for BusChatGuestNode {
                 // want the demo to fail loud rather than ship a generic
                 // placeholder reply.
                 let Some(reply) = GUEST_LINES.get(reply_idx).copied() else {
-                    return Err(WeftError::NodeExecution(format!(
+                    weft_core::node_bail!(
                         "guest out of replies at turn {reply_idx}: HOST_LINES outgrew GUEST_LINES \
                          without updating the SYNC contract in bus_chat_guest/mod.rs"
-                    )));
+                    );
                 };
                 bus.send("msg", json!(reply)).node_err(format!("guest send '{reply}'"))?;
                 reply_idx += 1;

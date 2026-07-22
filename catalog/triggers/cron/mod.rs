@@ -9,10 +9,9 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 use weft_core::signal::{Timer, TimerSpec};
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct CronNode;
@@ -26,13 +25,11 @@ impl Node for CronNode {
             TimerSpec::After { duration_ms }
         } else if let Some(s) = ctx.config.opt::<String>("at")? {
             let when = chrono::DateTime::parse_from_rfc3339(&s)
-                .map_err(|e| WeftError::Config(format!("config.at not RFC-3339: {e}")))?
+                .node_err("config.at not RFC-3339")?
                 .with_timezone(&chrono::Utc);
             TimerSpec::At { when }
         } else {
-            return Err(WeftError::Config(
-                "Cron requires one of config.cron / config.after_ms / config.at".into(),
-            ));
+            weft_core::node_bail!("Cron requires one of config.cron / config.after_ms / config.at");
         };
         // Registers the signal; setup emits nothing downstream.
         ctx.register_signal(Timer { spec }).await

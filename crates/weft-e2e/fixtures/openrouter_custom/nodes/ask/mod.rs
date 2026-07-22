@@ -17,7 +17,6 @@
 
 use async_trait::async_trait;
 
-use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 use weft_providers::providers::openrouter::OPENROUTER;
@@ -61,7 +60,7 @@ impl Node for AskCustomNode {
         let cancelled = ctx.cancellation();
         let response = tokio::select! {
             collected = stream.collect() => collected.node_err("openrouter_custom")?,
-            _ = cancelled.cancelled() => return Err(WeftError::Cancelled),
+            err = cancelled.cancelled_err() => return Err(err),
         };
 
         ctx.pulse_downstream(NodeOutput::new().set("response", response.content)).await

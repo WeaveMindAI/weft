@@ -119,7 +119,7 @@ pub use context::{
     StorageHandle,
 };
 pub use access::{AccessOrigin, ProviderAccess, PLATFORM_KEY_SENTINEL};
-pub use error::{NodeErrExt, WeftError, WeftResult};
+pub use error::{node_error, NodeErrExt, WeftError, WeftResult};
 pub use infra::{
     Access, AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
     Container, ContainerPort, ContainerSecurityContext, EgressRule, Endpoint, EnvEntry, Expose,

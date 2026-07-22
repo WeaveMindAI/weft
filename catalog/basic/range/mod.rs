@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use serde_json::{Number, Value};
 
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult, WeftError};
+use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
 use weft_core::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -29,12 +29,12 @@ impl Node for RangeNode {
         // bounds run until f64 saturation or OOM. Reject loudly so the
         // user sees the config bug rather than an empty / hung output.
         if !from.is_finite() || !to.is_finite() || !step.is_finite() {
-            return Err(WeftError::NodeExecution(format!(
+            weft_core::node_bail!(
                 "Range: from/to/step must all be finite (got from={from}, to={to}, step={step})"
-            )));
+            );
         }
         if step == 0.0 {
-            return Err(WeftError::NodeExecution("Range: step cannot be zero".to_string()));
+            weft_core::node_bail!("Range: step cannot be zero");
         }
 
         // `[from, from+step, ..., to)`: half-open, negative step walks

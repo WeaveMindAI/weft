@@ -8,7 +8,6 @@ use reqwest::Method;
 use serde_json::Value;
 
 use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
-use weft_core::error::WeftError;
 use weft_core::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -20,7 +19,7 @@ impl Node for HttpRequestNode {
         let url: String = ctx.ports.get("url")?;
         let method_str: String = ctx.config.get("method")?;
         let method = Method::from_bytes(method_str.as_bytes())
-            .map_err(|e| WeftError::Config(format!("bad method '{method_str}': {e}")))?;
+            .node_err(format!("bad method '{method_str}'"))?;
 
         let body: Option<Value> = ctx.ports.opt("body")?;
         let headers: Option<HashMap<String, String>> = ctx.ports.opt("headers")?;

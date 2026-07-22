@@ -29,9 +29,9 @@
 //!   user's weather example uses
 //!   `{"weather": None, "error": "..."}`).
 //!
-//! - Python exceptions become `WeftError::NodeExecution` with the
-//!   full traceback in the message so the UI modal shows what
-//!   actually went wrong instead of a bare `ValueError`.
+//! - Python exceptions become node failures with the full traceback
+//!   in the message so the UI modal shows what actually went wrong
+//!   instead of a bare `ValueError`.
 //!
 //! Isolation: the worker pod IS the isolation boundary. We don't
 //! sandbox the Python further because a spawned pod already can't
@@ -46,7 +46,7 @@ use pyo3::ToPyObject;
 use serde_json::{Map, Number, Value};
 
 use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft_core::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ExecPythonNode;
@@ -72,9 +72,7 @@ impl Node for ExecPythonNode {
         // blocking call so we don't stall other node invocations.
         let result = tokio::task::spawn_blocking(move || run_python(&code, inputs))
             .await
-            .map_err(|e| {
-                WeftError::NodeExecution(format!("ExecPython blocking task panicked: {e}"))
-            })??;
+            .node_err("ExecPython blocking task panicked")??;
 
         // Assemble NodeOutput. `None` / missing keys produce no
         // pulse, matching the Python contract where returning
@@ -113,11 +111,7 @@ fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(Strin
         let user_fn = globals
             .get_item("__weft_user_fn")
             .map_err(|err| py_error_to_weft(py, err, "locating __weft_user_fn"))?
-            .ok_or_else(|| {
-                WeftError::NodeExecution(
-                    "internal: ExecPython wrapper did not define __weft_user_fn".into(),
-                )
-            })?;
+            .node_err("internal: ExecPython wrapper did not define __weft_user_fn")?;
 
         // Convert each input into a Python value and call the
         // wrapper as a positional-arg tuple matching the signature.
@@ -143,9 +137,7 @@ fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(Strin
                 .name()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|_| "<unknown>".to_string());
-            WeftError::NodeExecution(format!(
-                "ExecPython: expected a dict return, got {type_name}"
-            ))
+            node_error(format!("ExecPython: expected a dict return, got {type_name}"))
         })?;
 
         let mut out: Vec<(String, Value)> = Vec::new();
@@ -173,9 +165,9 @@ fn indent_block(s: &str, prefix: &str) -> String {
         .join("\n")
 }
 
-/// Format a PyErr into a `WeftError::NodeExecution` carrying the
-/// full Python traceback. Users debugging their own Python code
-/// rely on this to see line numbers and the exception type.
+/// Format a PyErr into a node failure carrying the full Python
+/// traceback. Users debugging their own Python code rely on this
+/// to see line numbers and the exception type.
 fn py_error_to_weft(py: Python<'_>, err: PyErr, stage: &str) -> WeftError {
     // Capture the Python-side formatted traceback. If that fails
     // (because e.g. the traceback module can't be imported on some
@@ -190,7 +182,7 @@ fn py_error_to_weft(py: Python<'_>, err: PyErr, stage: &str) -> WeftError {
     } else {
         format!("ExecPython failed {stage}: {value_repr}\n{traceback}")
     };
-    WeftError::NodeExecution(message)
+    node_error(message)
 }
 
 /// Convert a serde_json Value to a Python object. Types:

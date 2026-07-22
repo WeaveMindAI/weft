@@ -187,10 +187,15 @@ the field (one driver).
   same-named ports. A port not present in the output emits no pulse
   (downstream of it skips, the null-propagation rule).
 - `.node_err("doing X")?` on any non-weft `Result` (an HTTP call, a
-  parser) turns its error into a node failure reading "doing X: ...".
-  This is the one door for error wrapping: the accessors stamp
-  input/config errors themselves, every ctx handle already returns
-  `WeftResult`, and node code has no reason to name a `WeftError`
+  parser) turns its error into a node failure reading "doing X: ...";
+  on an `Option`, `None` becomes a failure carrying the message
+  verbatim. For a bad condition the node detects itself (nothing to
+  wrap), `weft_core::node_bail!("bridge rejected: {reason}")` fails the
+  node with that message in one statement; its expression cousin
+  `node_error(message)` fits `map_err`/`ok_or_else` closures that build
+  a rich message first. These are the only error doors: the accessors
+  stamp input/config errors themselves, every ctx handle already
+  returns `WeftResult`, and node code never names a `WeftError`
   variant.
 - `ctx.http()`: the shared, pooled HTTP client for plain (unpaid)
   outbound calls. A PAID provider call goes through
@@ -370,14 +375,14 @@ let mut child = tokio::process::Command::new("python")
 let cancel = ctx.cancellation();
 tokio::select! {
     status = child.wait() => Ok(format(status?)),
-    _ = cancel.cancelled() => {
+    err = cancel.cancelled_err() => {
         // SIGTERM, give it 2s to clean up, then drop kills it.
         let _ = child.start_kill();
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             child.wait()
         ).await;
-        Err(WeftError::Cancelled)
+        Err(err)
     }
 }
 ```
@@ -430,9 +435,9 @@ async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
             msg = conn.recv() => {
                 if let Some(m) = msg? { handle(m); } else { break; }
             }
-            _ = cancel.cancelled() => {
+            err = cancel.cancelled_err() => {
                 conn.send_close_message().await.ok();
-                return Err(WeftError::Cancelled);
+                return Err(err);
             }
         }
     }
