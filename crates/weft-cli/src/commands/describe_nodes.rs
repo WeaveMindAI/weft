@@ -43,7 +43,9 @@ pub async fn run(ctx: Ctx, stdlib: bool) -> Result<()> {
         if entry.metadata.features.hidden {
             continue;
         }
-        catalog.insert(entry.node_type.clone(), entry.metadata.clone());
+        // Ship RESOLVED metadata: every input's exposure + widget filled
+        // with its effective value, so the editor never re-derives either.
+        catalog.insert(entry.node_type.clone(), entry.metadata.resolved());
     }
     let resp = NodesResponse {
         catalog,

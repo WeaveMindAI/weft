@@ -7,10 +7,10 @@ import type { EditOp } from '../../../shared/protocol';
 const catalog: ProjectionCatalog = {
   Text: {
     defaultInputs: [],
-    defaultOutputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }],
+    defaultOutputs: [{ name: 'value', portType: 'String', required: true }],
   },
   Debug: {
-    defaultInputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }],
+    defaultInputs: [{ name: 'data', portType: 'T', required: true }],
     defaultOutputs: [],
   },
 };
@@ -37,21 +37,21 @@ function fixture(): ProjectDefinition {
       node({
         id: 'G', nodeType: 'Group', label: 'G',
         inputs: [],
-        outputs: [{ name: 'out', portType: 'String', required: true, literal: 'none' }],
+        outputs: [{ name: 'out', portType: 'String', required: true }],
       }),
       node({
         id: 'G.inner_text', nodeType: 'Text', label: null, parentId: 'G',
         config: { parentId: 'G' }, scope: ['G'],
-        outputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }],
+        outputs: [{ name: 'value', portType: 'String', required: true }],
       }),
       node({
         id: 'text_1', nodeType: 'Text',
-        outputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }],
+        outputs: [{ name: 'value', portType: 'String', required: true }],
         config: { text: 'hello' },
       }),
       node({
         id: 'debug_1', nodeType: 'Debug',
-        inputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }],
+        inputs: [{ name: 'data', portType: 'T', required: true }],
       }),
     ],
     edges: [
@@ -272,7 +272,7 @@ describe('applyOpsToProject: moves', () => {
     expect(p.nodes.some((n) => n.id === 'H.G.inner_text')).toBe(true);
     expect(p.edges.some((e) => e.source === 'H.G.inner_text' && e.target === 'H.G' && e.targetHandle === 'out__inner')).toBe(true);
     // Wire G's out into the parent scope: now it has an external leg and can't move back out.
-    p.nodes.push(node({ id: 'H.debug_9', nodeType: 'Debug', parentId: 'H', config: { parentId: 'H' }, inputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }] }));
+    p.nodes.push(node({ id: 'H.debug_9', nodeType: 'Debug', parentId: 'H', config: { parentId: 'H' }, inputs: [{ name: 'data', portType: 'T', required: true }] }));
     p.edges.push({ id: 'x', source: 'H.G', target: 'H.debug_9', sourceHandle: 'out', targetHandle: 'data' });
     expect(() => applyOpsToProject(p, ops({ op: 'moveGroupScope', group: 'H.G', targetGroup: null }), catalog))
       .toThrow(/connections/);
@@ -318,16 +318,16 @@ describe('loop carry ghost inputs', () => {
 			nodes: [
 				node({
 					id: 'seed', nodeType: 'Text',
-					outputs: [{ name: 'value', portType: 'Number', required: true, literal: 'none' }],
+					outputs: [{ name: 'value', portType: 'Number', required: true }],
 				}),
 				node({
 					id: 'L', nodeType: 'Loop', label: 'L',
 					config: { carry: ['acc'] },
 					inputs: [
-						{ name: 'items', portType: 'List[Number]', required: true, literal: 'none' },
-						{ name: 'acc', portType: 'Number', required: true, literal: 'none', synthesizedFromCarry: true },
+						{ name: 'items', portType: 'List[Number]', required: true },
+						{ name: 'acc', portType: 'Number', required: true, synthesizedFromCarry: true },
 					],
-					outputs: [{ name: 'acc', portType: 'Number', required: true, literal: 'none' }],
+					outputs: [{ name: 'acc', portType: 'Number', required: true }],
 				}),
 			],
 			edges: [
@@ -350,7 +350,7 @@ describe('loop carry ghost inputs', () => {
 		const base = loopFixture();
 		base.nodes.find((n) => n.id === 'L')!.config.carry = [];
 		base.nodes.find((n) => n.id === 'L')!.inputs = [
-			{ name: 'items', portType: 'List[Number]', required: true, literal: 'none' },
+			{ name: 'items', portType: 'List[Number]', required: true },
 		];
 		base.edges = [];
 		const p = applyOpsToProject(base, ops(

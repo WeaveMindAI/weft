@@ -13,9 +13,9 @@ pub struct WhatsAppSendNode;
 #[async_trait]
 impl Node for WhatsAppSendNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.ports.get("endpointUrl")?;
-        let to: String = ctx.ports.get("to")?;
-        let message: String = ctx.ports.get("message")?;
+        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let to: String = ctx.inputs.get("to")?;
+        let message: String = ctx.inputs.get("message")?;
 
         let body = serde_json::json!({
             "action": "sendMessage",

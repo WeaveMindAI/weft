@@ -15,8 +15,8 @@ impl Node for MultiplyNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // Both inputs are required, so the engine only fires once they are
         // present; read them loudly (`get` errors on absent/wrong type).
-        let a: f64 = ctx.ports.get("a")?;
-        let b: f64 = ctx.ports.get("b")?;
+        let a: f64 = ctx.inputs.get("a")?;
+        let b: f64 = ctx.inputs.get("b")?;
         let product = a * b;
         ctx.pulse_downstream(NodeOutput::new().set("product", product)).await
     }

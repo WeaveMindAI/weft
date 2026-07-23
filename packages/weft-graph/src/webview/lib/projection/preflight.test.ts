@@ -6,8 +6,8 @@ import type { ProjectionCatalog } from './apply';
 import type { EditOp } from '../../../shared/protocol';
 
 const catalog: ProjectionCatalog = {
-  Text: { defaultInputs: [], defaultOutputs: [{ name: 'value', portType: 'String', required: true, literal: 'none' }] },
-  Debug: { defaultInputs: [{ name: 'data', portType: 'T', required: true, literal: 'none' }], defaultOutputs: [] },
+  Text: { defaultInputs: [], defaultOutputs: [{ name: 'value', portType: 'String', required: true }] },
+  Debug: { defaultInputs: [{ name: 'data', portType: 'T', required: true }], defaultOutputs: [] },
 };
 
 function node(partial: Partial<NodeInstance> & { id: string; nodeType: string }): NodeInstance {

@@ -22,9 +22,9 @@ pub struct HumanTriggerNode;
 impl Node for HumanTriggerNode {
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let specs = &self.manifest().form_field_specs;
-        let raw_fields = parse_form_fields(ctx.config.object()?);
-        let title: String = ctx.config.get_or("title", String::new())?;
-        let description: Option<String> = ctx.config.opt("description")?;
+        let raw_fields = parse_form_fields(ctx.inputs.object()?);
+        let title: String = ctx.inputs.get_or("title", String::new())?;
+        let description: Option<String> = ctx.inputs.opt("description")?;
         // Triggers don't have upstream input ports at setup time; pass
         // an empty object so the helper doesn't try to project a value
         // into prefilled / display fields.
@@ -54,7 +54,7 @@ impl Node for HumanTriggerNode {
         // an approve/reject field, a synthesized `rejected: true` pulse).
         let submission = Value::Object(ctx.wake.object()?.clone());
         let specs = &self.manifest().form_field_specs;
-        let raw_fields = parse_form_fields(ctx.config.object()?);
+        let raw_fields = parse_form_fields(ctx.inputs.object()?);
         ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)).await
     }
 }

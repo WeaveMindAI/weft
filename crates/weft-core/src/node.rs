@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::weft_type::{LiteralPlacement, WeftType};
+use crate::weft_type::{Exposure, WeftPrimitive, WeftType};
 
 // The `Node` trait is the RUNTIME node interface (it runs against the execution
 // context + infra provision context), so it is gated behind `runtime`. The
@@ -140,7 +140,7 @@ pub enum Severity {
 /// defaults), and the runtime copy is [`NodeManifest::manifest`], which the
 /// `#[derive(NodeManifest)]` expansion builds by embedding the same two files.
 // SYNC: NodeMetadata (describe-nodes serialization) <-> packages/weft-graph/src/protocol.ts
-//       CatalogEntry/FieldDef/FieldType/PortDef
+//       CatalogEntry/InputSpec/Widget/OutputSpec
 // `deny_unknown_fields`: an unknown key in a `metadata.json` (a typo like
 // `providr`, or a stale key) is a loud parse error, not silently dropped. This
 // matters most for the package-root defaults file, where one typo would
@@ -168,15 +168,15 @@ pub struct NodeMetadata {
     /// a token the webview maps to a palette entry. Opaque to the compiler.
     #[serde(default)]
     pub color: Option<String>,
-    /// Input ports.
+    /// The node's inputs: ONE list covering everything a node takes,
+    /// wired data and design-time configuration alike. Each input's
+    /// `exposure` says where its value may come from; its widget (the
+    /// editor control) derives from the type unless overridden.
     #[serde(default)]
-    pub inputs: Vec<PortDef>,
+    pub inputs: Vec<InputSpec>,
     /// Output ports.
     #[serde(default)]
-    pub outputs: Vec<PortDef>,
-    /// Configurable fields (shown in the node inspector UI).
-    #[serde(default)]
-    pub fields: Vec<FieldDef>,
+    pub outputs: Vec<OutputSpec>,
     /// Whether this node implements `Node::provision_infra` and needs
     /// dispatcher-driven infrastructure (k8s pods, services, etc).
     /// Explicit flag in metadata.json; mirrored to
@@ -309,50 +309,116 @@ impl NodeMetadata {
             .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"))
     }
 
-    /// Where a literal value may be written for an input port: the
-    /// author's explicit level when present (winning BOTH ways), else the
-    /// type's default. A file-typed port (assignment-only by default,
-    /// since nobody can hand-type a marker into a config field) declares
-    /// `"literal": "anywhere"` explicitly to open the braces form; the
-    /// editor derives its drop/pick control from the port type.
-    pub fn input_literal(&self, port: &PortDef) -> LiteralPlacement {
-        port.literal
-            .unwrap_or_else(|| port.port_type.default_literal_placement())
-    }
-
-    /// Semantic metadata rules serde cannot express. A config field may
-    /// not share a name with an input port whose literal may sit in the
-    /// config braces: the port alone carries the value (and drives the
-    /// editor's inline control), so the duplicate declaration is exactly
-    /// the two-homes ambiguity the one-home-per-name rule removes. A
-    /// field sharing the name of a port whose literal placement excludes
-    /// the braces stays legal (independent values), EXCEPT a `FileDrop`
-    /// field: that was the old fill-the-port-from-a-field pattern, and
-    /// silently treating it as an independent field would strand the
-    /// dropped file in config where the node never reads it.
+    /// Semantic metadata rules serde cannot express. One name = one
+    /// input: duplicate input names are rejected (each name has exactly
+    /// one home). A select/multiselect widget must declare options (an
+    /// optionless picker can never be filled). A declared `default` must
+    /// type-check against the input's type, and a number widget's default
+    /// must sit inside its declared min/max, so a default the runtime
+    /// would later reject fails the metadata load instead.
     pub fn validate_semantics(&self) -> Result<(), String> {
-        for port in &self.inputs {
-            let Some(field) = self.fields.iter().find(|f| f.key == port.name) else {
-                continue;
-            };
-            if self.input_literal(port).allows_config() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for input in &self.inputs {
+            if !seen.insert(input.name.as_str()) {
                 return Err(format!(
-                    "config field '{key}' shares its name with input port '{key}', whose \
-                     literal may sit in the config braces: the port alone carries the \
-                     value; drop the field",
-                    key = port.name
+                    "duplicate input '{}': every input name must be unique",
+                    input.name
                 ));
             }
-            if matches!(field.field_type, FieldType::FileDrop { .. }) {
-                return Err(format!(
-                    "FileDrop field '{key}' targets input port '{key}': this pattern moved; \
-                     drop the field and mark the port \"literal\": \"anywhere\" (the editor \
-                     derives the file picker from the port type)",
-                    key = port.name
-                ));
+            match input.effective_widget() {
+                Widget::Select { options } | Widget::Multiselect { options }
+                    if options.is_empty() =>
+                {
+                    return Err(format!(
+                        "input '{}': a select/multiselect widget must declare a non-empty \
+                         `options` list",
+                        input.name
+                    ));
+                }
+                // A credential is design-time configuration by nature: it
+                // must never arrive over a wire or an assignment
+                // statement. Enforcing the exposure here lets every
+                // consumer treat "api_key input" and "config input" as
+                // the same fact instead of re-checking it.
+                Widget::ApiKey { .. } if input.effective_exposure() != Exposure::Config => {
+                    return Err(format!(
+                        "input '{}': an api_key widget requires `exposure: config`",
+                        input.name
+                    ));
+                }
+                _ => {}
+            }
+            // A widget implies the SHAPE of the value it edits. On an
+            // input whose type cannot hold that shape, the widget's own
+            // contract (a number widget's min/max, a checkbox's bool)
+            // becomes silently unenforceable downstream, so the
+            // mismatch is rejected here. Unresolved types (TypeVar,
+            // MustOverride) pass: is_compatible is permissive there and
+            // the resolved instance re-derives its widget.
+            let widget_value_type = match input.effective_widget() {
+                Widget::Number { .. } => Some(WeftType::primitive(WeftPrimitive::Number)),
+                Widget::Checkbox => Some(WeftType::primitive(WeftPrimitive::Boolean)),
+                Widget::Text
+                | Widget::Password
+                | Widget::Code { .. }
+                | Widget::ApiKey { .. }
+                | Widget::Select { .. } => Some(WeftType::primitive(WeftPrimitive::String)),
+                Widget::Multiselect { .. } => {
+                    Some(WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::String))))
+                }
+                // textarea is the GENERIC value editor (the derived
+                // default for structural types: the value is edited as
+                // JSON text), so it constrains nothing. form_builder
+                // edits the form-schema blob, file_drop a file marker;
+                // both are shape-checked elsewhere.
+                Widget::Textarea | Widget::FormBuilder | Widget::FileDrop { .. } => None,
+            };
+            if let Some(value_type) = widget_value_type {
+                if !WeftType::is_compatible(&value_type, &input.input_type) {
+                    return Err(format!(
+                        "input '{}': a {} widget edits a {} value, which type {} cannot hold",
+                        input.name,
+                        input.effective_widget().kind_name(),
+                        value_type,
+                        input.input_type
+                    ));
+                }
+            }
+            if let Some(default) = &input.default {
+                let inferred = WeftType::infer(default);
+                if !WeftType::is_compatible(&inferred, &input.input_type) {
+                    return Err(format!(
+                        "input '{}': default value has type {} but the input declares {}",
+                        input.name, inferred, input.input_type
+                    ));
+                }
+                if let Widget::Number { min, max, .. } = input.effective_widget() {
+                    if let Some(n) = default.as_f64() {
+                        if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+                            return Err(format!(
+                                "input '{}': default {} is outside the widget's min/max range",
+                                input.name, n
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// A copy with every input's `exposure` and `widget` RESOLVED to
+    /// their effective values (the author's explicit choice, else the
+    /// type-derived default). This is what ships on the wire to the
+    /// editor, so the editor never re-derives either; resolving is
+    /// idempotent (a resolved metadata re-parses to itself).
+    pub fn resolved(&self) -> Self {
+        let mut out = self.clone();
+        for input in &mut out.inputs {
+            input.exposure = Some(input.exposure.unwrap_or_else(|| input.input_type.default_exposure()));
+            input.widget = Some(input.effective_widget());
+        }
+        out
     }
 }
 
@@ -643,54 +709,101 @@ pub trait NodeCatalog: Send + Sync {
     fn all(&self) -> Vec<&'static str>;
 }
 
-// SYNC: PortDef <-> packages/weft-graph/src/protocol.ts PortDef
+/// One declared INPUT of a node: everything the node takes, wired data
+/// and design-time configuration alike, under one name in one namespace.
+/// `exposure` says where a value may come from (see [`Exposure`]);
+/// `widget` overrides the type-derived editor control; `default` is the
+/// value the runtime supplies when nothing else drives the input (never
+/// written into source).
+// NAMING CONVENTION (the three stages a graph concept lives through):
+//   *Spec       = authored intent (metadata.json / a registration): blanks are
+//                 meaningful ("derive from the type", "decide later"). InputSpec,
+//                 OutputSpec, FormFieldSpec, SignalSpec, InfraSpec.
+//   Parsed*     = raw from .weft source, pre-enrichment (compiler-internal).
+//   *Definition = compiled, fully resolved; the editor and runtime trust it
+//                 blindly and never re-derive. NodeDefinition, InputDefinition,
+//                 PortDefinition, GroupDefinition, ProjectDefinition.
+// A new type for one of these stages takes the stage's suffix.
+// SYNC: InputSpec <-> packages/weft-graph/src/protocol.ts InputSpec
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PortDef {
+pub struct InputSpec {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub input_type: WeftType,
+    #[serde(default)]
+    pub required: bool,
+    /// Where a value may come from. An explicit level is the author's
+    /// choice and wins both ways; absent falls to the input TYPE's
+    /// default (`default_exposure`). `Option` so an author can both open
+    /// a type beyond its default (a file input to `"all"`) and close one
+    /// below it (a String input to `"wire"` or `"config"`).
+    // SYNC: InputSpec.exposure <-> packages/weft-graph/src/protocol.ts InputSpec.exposure
+    #[serde(default)]
+    pub exposure: Option<Exposure>,
+    /// The editor control for this input's literal. Absent = derived
+    /// from the type ([`Widget::default_for_type`]); declared to pick a
+    /// richer control (a select over a String, an api_key, a code box).
+    #[serde(default)]
+    pub widget: Option<Widget>,
+    /// The value the runtime supplies when no wire and no literal
+    /// drives this input. Consulted at run time and rendered by the
+    /// editor as the effective value; never written into source.
+    /// `required` + `default` = satisfiable.
+    #[serde(default)]
+    pub default: Option<Value>,
+    /// Human-readable label shown on the editor field. Absent = the name.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Hint text shown in the editor field when it is empty.
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    /// Human-readable description shown next to the input in the editor.
+    /// The webview reads it; the compiler treats it as opaque.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl InputSpec {
+    /// The input's effective exposure: the author's explicit level, else
+    /// the type default.
+    pub fn effective_exposure(&self) -> Exposure {
+        self.exposure.unwrap_or_else(|| self.input_type.default_exposure())
+    }
+
+    /// The input's effective widget: the author's declared control, else
+    /// the type-derived default.
+    pub fn effective_widget(&self) -> Widget {
+        self.widget.clone().unwrap_or_else(|| Widget::default_for_type(&self.input_type))
+    }
+}
+
+// SYNC: OutputSpec <-> packages/weft-graph/src/protocol.ts OutputSpec
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputSpec {
     pub name: String,
     #[serde(rename = "type")]
     pub port_type: WeftType,
     #[serde(default)]
     pub required: bool,
-    /// Where a literal value may be written for this port. An explicit
-    /// level is the author's choice and wins both ways; absent falls to
-    /// the port TYPE's default (`default_literal_placement`). `Option`
-    /// so an author can both open a type beyond its default (a file
-    /// port to `"anywhere"`) and close one below it (a String port to
-    /// `"none"`).
-    // SYNC: PortDef.literal <-> packages/weft-graph/src/protocol.ts PortDef.literal
-    #[serde(default)]
-    pub literal: Option<LiteralPlacement>,
     /// Human-readable description shown next to the port in the editor.
     /// The webview reads it; the compiler treats it as opaque.
     #[serde(default)]
     pub description: Option<String>,
 }
 
-// SYNC: FieldDef <-> packages/weft-graph/src/protocol.ts FieldDef
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FieldDef {
-    pub key: String,
-    pub label: String,
-    pub field_type: FieldType,
-    #[serde(default)]
-    pub default_value: Option<Value>,
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Hint text shown in the field's input when it is empty. The
-    /// webview reads it (`FieldStrip`); the compiler treats it as opaque.
-    #[serde(default)]
-    pub placeholder: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The editor control an input renders. The vocabulary of the node
+/// inspector: every input has exactly one effective widget (declared, or
+/// derived from the type via [`Widget::default_for_type`]).
+// SYNC: Widget <-> packages/weft-graph/src/protocol.ts Widget/WidgetKind
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum FieldType {
+pub enum Widget {
     Text,
     Textarea,
+    /// `language` picks the syntax highlighting in the editor's code box
+    /// (e.g. "python", "javascript").
     Code { language: String },
     /// `step` is the input's granularity (the arrow/slider increment), the
     /// third knob of a number input alongside `min`/`max`.
@@ -702,26 +815,68 @@ pub enum FieldType {
     ApiKey { provider: String },
     FormBuilder,
     /// Editor file picker: the user picks a project file (drop/browse) or
-    /// pastes a URL, and the field's config value becomes a media
+    /// pastes a URL, and the input's value becomes a media
     /// `@asset("<path-or-url>", <Type>)` ref. The pre-build asset sync
     /// publishes referenced files to storage and the compile substitutes the
     /// stored-file value, so source never carries storage keys.
     ///
-    /// `file_type` is the weft file type this field picks (`Image`, `Audio`,
+    /// `file_type` is the weft file type this widget picks (`Image`, `Audio`,
     /// `Video`, `Blob`, or the `File`/`Media` unions): it drives the editor's
     /// accept filter + drop validation AND the `, <Type>)` annotation written
     /// into source. Deserializing through [`WeftType`] validates the string
     /// at the metadata boundary (a typo'd type fails the node's metadata
     /// load, not a later marker parse). `accept` optionally NARROWS the
     /// derived filter (e.g. `image/png` under `Image`).
-    // SYNC: FieldType::FileDrop <-> packages/weft-graph/src/protocol.ts FieldKind 'file_drop' + FieldType.type,
-    //       packages/weft-graph/src/webview/lib/types/index.ts FieldType 'file_drop',
+    // SYNC: Widget::FileDrop <-> packages/weft-graph/src/protocol.ts WidgetKind 'file_drop' + Widget.type,
     //       packages/weft-graph/src/webview/lib/utils/file-browser.ts acceptForFileType
     FileDrop {
         accept: Option<String>,
         #[serde(default = "file_drop_default_type", rename = "type")]
         file_type: crate::weft_type::WeftType,
     },
+}
+
+impl Widget {
+    /// Stable lowercase kind tag, matching the serde `kind` form.
+    /// The serde tag is the one source of truth; this match only exists
+    /// to hand back a `&'static str` (serde would allocate), and a test
+    /// (`kind_name_matches_the_serde_tag`) pins every arm to the tag so
+    /// the two can never drift. Adding a widget kind: the exhaustive
+    /// matches here and in `validate_semantics` are compiler-enforced.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Widget::Text => "text",
+            Widget::Textarea => "textarea",
+            Widget::Code { .. } => "code",
+            Widget::Number { .. } => "number",
+            Widget::Checkbox => "checkbox",
+            Widget::Select { .. } => "select",
+            Widget::Multiselect { .. } => "multiselect",
+            Widget::Password => "password",
+            Widget::ApiKey { .. } => "api_key",
+            Widget::FormBuilder => "form_builder",
+            Widget::FileDrop { .. } => "file_drop",
+        }
+    }
+
+    /// The ONE WeftType -> default-widget mapping. A file-valued type
+    /// gets the drop/pick control (its accept filter derives from the
+    /// same type), Boolean a checkbox, Number a number box, and
+    /// everything else (String, JSON-ish containers, mixed unions) a
+    /// text area: JSON is typed as text, exactly like the source, and
+    /// the compiler type-checks the literal against the declared type.
+    pub fn default_for_type(ty: &WeftType) -> Widget {
+        if ty.is_file_valued() {
+            return Widget::FileDrop { accept: None, file_type: ty.clone() };
+        }
+        match ty {
+            WeftType::Primitive(crate::weft_type::WeftPrimitive::Boolean) => Widget::Checkbox,
+            WeftType::Primitive(crate::weft_type::WeftPrimitive::Number) => {
+                Widget::Number { min: None, max: None, step: None }
+            }
+            _ => Widget::Textarea,
+        }
+    }
 }
 
 /// A `file_drop` field with no declared type picks ANY file (the `File`
@@ -938,39 +1093,47 @@ mod deny_unknown_tests {
         assert!(e.contains("requird"), "error names the typo'd key: {e}");
     }
 
+    /// The `fields` metadata array is GONE: a metadata.json still carrying
+    /// one fails the load loudly (deny_unknown_fields), pointing at the
+    /// unified `inputs` shape instead of silently dropping the widgets.
     #[test]
-    fn unknown_field_key_rejected() {
+    fn legacy_fields_array_rejected() {
         let e = err(base(), "fields", json!({
-            "key": "k", "label": "l", "field_type": {"kind": "text"}, "palceholder": "hi"
+            "key": "k", "label": "l", "field_type": {"kind": "text"}
         }));
-        assert!(e.contains("palceholder"), "error names the typo'd key: {e}");
+        assert!(e.contains("fields"), "error names the dead key: {e}");
     }
 
     #[test]
-    fn placeholder_on_field_is_accepted() {
+    fn input_carries_widget_default_label_placeholder() {
         let mut meta = base();
-        meta.as_object_mut().unwrap().insert("fields".into(), json!([{
-            "key": "model", "label": "Model", "field_type": {"kind": "text"},
+        meta.as_object_mut().unwrap().insert("inputs".into(), json!([{
+            "name": "model", "type": "String", "exposure": "config",
+            "widget": {"kind": "text"}, "default": "sonnet", "label": "Model",
             "placeholder": "anthropic/claude-sonnet-4.6"
         }]));
-        let parsed: NodeMetadata = serde_json::from_value(meta).expect("valid placeholder loads");
-        assert_eq!(parsed.fields[0].placeholder.as_deref(), Some("anthropic/claude-sonnet-4.6"));
+        let parsed: NodeMetadata = serde_json::from_value(meta).expect("input loads");
+        let input = &parsed.inputs[0];
+        assert_eq!(input.effective_exposure(), crate::weft_type::Exposure::Config);
+        assert_eq!(input.effective_widget(), Widget::Text);
+        assert_eq!(input.default, Some(json!("sonnet")));
+        assert_eq!(input.label.as_deref(), Some("Model"));
+        assert_eq!(input.placeholder.as_deref(), Some("anthropic/claude-sonnet-4.6"));
     }
 
-    /// `min`/`max`/`step` are the number input's three knobs and all three
-    /// must survive the load: `step` used to exist only on the webview's
-    /// render type, so a declared granularity could never reach the input.
+    /// `min`/`max`/`step` are the number widget's three knobs and all three
+    /// must survive the load.
     #[test]
-    fn number_field_carries_min_max_step() {
+    fn number_widget_carries_min_max_step() {
         let mut meta = base();
-        meta.as_object_mut().unwrap().insert("fields".into(), json!([{
-            "key": "temperature", "label": "Temperature",
-            "field_type": {"kind": "number", "min": 0.0, "max": 2.0, "step": 0.1}
+        meta.as_object_mut().unwrap().insert("inputs".into(), json!([{
+            "name": "temperature", "type": "Number", "exposure": "config",
+            "widget": {"kind": "number", "min": 0.0, "max": 2.0, "step": 0.1}
         }]));
-        let parsed: NodeMetadata = serde_json::from_value(meta).expect("number field loads");
-        match &parsed.fields[0].field_type {
-            FieldType::Number { min, max, step } => {
-                assert_eq!((*min, *max, *step), (Some(0.0), Some(2.0), Some(0.1)));
+        let parsed: NodeMetadata = serde_json::from_value(meta).expect("number widget loads");
+        match parsed.inputs[0].effective_widget() {
+            Widget::Number { min, max, step } => {
+                assert_eq!((min, max, step), (Some(0.0), Some(2.0), Some(0.1)));
             }
             other => panic!("expected Number, got {other:?}"),
         }
@@ -1031,133 +1194,218 @@ mod diagnostic_wire_tests {
 }
 
 #[cfg(test)]
-mod input_literal_tests {
+mod input_semantics_tests {
     use super::*;
-    use crate::weft_type::{WeftPrimitive, WeftType};
+    use crate::weft_type::{Exposure, WeftPrimitive, WeftType};
+    use serde_json::json;
 
-    fn metadata_with(fields: Vec<FieldDef>, inputs: Vec<PortDef>) -> NodeMetadata {
+    fn metadata_with(inputs: Vec<InputSpec>) -> NodeMetadata {
         serde_json::from_str::<NodeMetadata>(
             r#"{ "type": "T", "label": "T", "description": "", "category": "Utility" }"#,
         )
         .map(|mut m| {
-            m.fields = fields;
             m.inputs = inputs;
             m
         })
         .unwrap()
     }
 
-    fn file_drop_field(key: &str) -> FieldDef {
-        FieldDef {
-            key: key.into(),
-            label: key.into(),
-            field_type: FieldType::FileDrop {
-                accept: None,
-                file_type: crate::weft_type::WeftType::parse("Image").unwrap(),
-            },
-            default_value: None,
+    fn input(name: &str, ty: WeftType) -> InputSpec {
+        InputSpec {
+            name: name.into(),
+            input_type: ty,
             required: false,
-            description: None,
+            exposure: None,
+            widget: None,
+            default: None,
+            label: None,
             placeholder: None,
+            description: None,
         }
     }
 
-    /// Literal placement comes from the port alone: its explicit level
-    /// or the type default. A file-typed port defaults to assignment
-    /// (`"literal": "anywhere"` opens the braces form); a String port
-    /// takes a literal anywhere by type default; a Bus never does.
+    /// Exposure comes from the input alone: its explicit level or the
+    /// type default. A file-typed input defaults to assignment; a String
+    /// input to `all`; a Bus is wires-only.
     #[test]
-    fn literal_placement_comes_from_the_port_alone() {
-        let image_port = PortDef {
-            name: "image".into(),
-            port_type: WeftType::primitive(WeftPrimitive::Image),
-            required: true,
-            literal: None,
-            description: None,
-        };
-        let text_port = PortDef {
-            name: "prompt".into(),
-            port_type: WeftType::primitive(WeftPrimitive::String),
-            required: false,
-            literal: None,
-            description: None,
-        };
-        let bus_port = PortDef {
-            name: "bus".into(),
-            port_type: WeftType::Bus,
-            required: false,
-            literal: None,
-            description: None,
-        };
-        let meta = metadata_with(vec![], vec![image_port.clone(), text_port.clone()]);
-        assert_eq!(meta.input_literal(&image_port), LiteralPlacement::Assignment, "file types are assignment-only by default");
-        assert_eq!(meta.input_literal(&text_port), LiteralPlacement::Anywhere, "String takes a literal anywhere by type default");
-        assert_eq!(meta.input_literal(&bus_port), LiteralPlacement::None, "a bus never takes a literal");
+    fn exposure_comes_from_the_input_alone() {
+        let image = input("image", WeftType::primitive(WeftPrimitive::Image));
+        let text = input("prompt", WeftType::primitive(WeftPrimitive::String));
+        let bus = input("bus", WeftType::Bus);
+        assert_eq!(image.effective_exposure(), Exposure::Assignment, "file types are assignment-only by default");
+        assert_eq!(text.effective_exposure(), Exposure::All, "String is fully open by type default");
+        assert_eq!(bus.effective_exposure(), Exposure::Wire, "a bus never takes a literal");
 
-        let mut explicit = image_port;
-        explicit.literal = Some(LiteralPlacement::Anywhere);
-        assert_eq!(meta.input_literal(&explicit), LiteralPlacement::Anywhere, "the explicit level opens a file port");
+        let mut explicit = image;
+        explicit.exposure = Some(Exposure::All);
+        assert_eq!(explicit.effective_exposure(), Exposure::All, "the explicit level opens a file input");
 
-        let mut closed = text_port;
-        closed.literal = Some(LiteralPlacement::None);
-        assert_eq!(meta.input_literal(&closed), LiteralPlacement::None, "the explicit level closes a String port");
+        let mut closed = text;
+        closed.exposure = Some(Exposure::Config);
+        assert_eq!(closed.effective_exposure(), Exposure::Config, "the explicit level closes a String input");
     }
 
-    /// One home per name: a field sharing the name of a port whose
-    /// literal may sit in the braces is a metadata error, and a
-    /// FileDrop field targeting ANY port is the moved old pattern. A
-    /// plain field on a braces-closed port stays legal (independent
-    /// values).
+    /// The type-derived widget: file-valued types get the drop control,
+    /// Boolean a checkbox, Number a number box, everything else a
+    /// textarea (JSON typed as in source). Containers of files are NOT
+    /// file-valued.
     #[test]
-    fn validate_semantics_rejects_field_port_name_collisions() {
-        let text_port = PortDef {
-            name: "prompt".into(),
-            port_type: WeftType::primitive(WeftPrimitive::String),
-            required: false,
-            literal: None,
-            description: None,
-        };
-        let mut text_field = file_drop_field("prompt");
-        text_field.field_type = FieldType::Text;
-        let meta = metadata_with(vec![text_field.clone()], vec![text_port.clone()]);
-        let e = meta.validate_semantics().unwrap_err();
-        assert!(e.contains("input port 'prompt'"), "{e}");
+    fn widget_derivation_follows_the_type() {
+        let cases = [
+            ("Image", "file_drop"),
+            ("File", "file_drop"),
+            ("Image | Video", "file_drop"),
+            ("Boolean", "checkbox"),
+            ("Number", "number"),
+            ("String", "textarea"),
+            ("List[Image]", "textarea"),
+            ("List[List[String | Boolean]]", "textarea"),
+            ("Dict[String, Number]", "textarea"),
+            ("JsonDict", "textarea"),
+            ("T", "textarea"),
+        ];
+        for (ty, expected) in cases {
+            let w = Widget::default_for_type(&WeftType::parse(ty).unwrap());
+            let tag = serde_json::to_value(&w).unwrap()["kind"].as_str().unwrap().to_string();
+            assert_eq!(tag, expected, "type {ty}");
+        }
+        // The derived file_drop carries the input's own type as its filter.
+        match Widget::default_for_type(&WeftType::parse("Media").unwrap()) {
+            Widget::FileDrop { file_type, .. } => assert_eq!(file_type, WeftType::media()),
+            other => panic!("expected FileDrop, got {other:?}"),
+        }
+    }
 
-        // FileDrop on an assignment-only file port: the moved pattern, loud.
-        let image_port = PortDef {
-            name: "image".into(),
-            port_type: WeftType::primitive(WeftPrimitive::Image),
-            required: true,
-            literal: None,
-            description: None,
-        };
-        let meta = metadata_with(vec![file_drop_field("image")], vec![image_port]);
-        let e = meta.validate_semantics().unwrap_err();
-        assert!(e.contains("this pattern moved"), "{e}");
+    /// `kind_name` hands back exactly the serde `kind` tag for every
+    /// variant: the tag is the one source of truth and this pins the
+    /// convenience match to it.
+    #[test]
+    fn kind_name_matches_the_serde_tag() {
+        let all = [
+            Widget::Text,
+            Widget::Textarea,
+            Widget::Code { language: "python".into() },
+            Widget::Number { min: None, max: None, step: None },
+            Widget::Checkbox,
+            Widget::Select { options: vec!["a".into()] },
+            Widget::Multiselect { options: vec!["a".into()] },
+            Widget::Password,
+            Widget::ApiKey { provider: "p".into() },
+            Widget::FormBuilder,
+            Widget::FileDrop {
+                accept: None,
+                file_type: WeftType::primitive(WeftPrimitive::Image),
+            },
+        ];
+        for w in all {
+            let tag = serde_json::to_value(&w).unwrap()["kind"].as_str().unwrap().to_string();
+            assert_eq!(w.kind_name(), tag);
+        }
+    }
 
-        // A plain field on a braces-closed port: independent values, legal.
-        let wired_only = PortDef {
-            name: "prompt".into(),
-            port_type: WeftType::primitive(WeftPrimitive::Blob),
-            required: false,
-            literal: None,
-            description: None,
-        };
-        let meta = metadata_with(vec![text_field], vec![wired_only]);
-        assert!(meta.validate_semantics().is_ok());
+    /// A widget's value shape must fit the input type, or its own
+    /// contract (min/max, bool) is silently unenforceable downstream.
+    #[test]
+    fn validate_semantics_rejects_a_widget_whose_value_cannot_fit_the_type() {
+        // Number widget on a String input: the range could never bind.
+        let mut n = input("count", WeftType::primitive(WeftPrimitive::String));
+        n.widget = Some(Widget::Number { min: Some(0.0), max: Some(5.0), step: None });
+        let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
+        assert!(e.contains("number widget"), "{e}");
 
-        // Disjoint names: legal.
-        let meta = metadata_with(
-            vec![file_drop_field("attachment")],
-            vec![PortDef {
-                name: "prompt".into(),
-                port_type: WeftType::primitive(WeftPrimitive::String),
-                required: false,
-                literal: None,
-                description: None,
-            }],
+        // Number widget on a Number-containing union: fits.
+        let mut ok = input(
+            "count",
+            WeftType::Union(vec![
+                WeftType::primitive(WeftPrimitive::Number),
+                WeftType::primitive(WeftPrimitive::Null),
+            ]),
         );
-        assert!(meta.validate_semantics().is_ok());
+        ok.widget = Some(Widget::Number { min: Some(0.0), max: Some(5.0), step: None });
+        assert!(metadata_with(vec![ok]).validate_semantics().is_ok());
+
+        // Checkbox on Number: rejected.
+        let mut b = input("flag", WeftType::primitive(WeftPrimitive::Number));
+        b.widget = Some(Widget::Checkbox);
+        assert!(metadata_with(vec![b]).validate_semantics().is_err());
+
+        // A declared widget on an unresolved (TypeVar) input passes:
+        // the resolved instance re-derives its surface.
+        let mut t = input("value", WeftType::TypeVar("T".into()));
+        t.widget = Some(Widget::Number { min: None, max: None, step: None });
+        assert!(metadata_with(vec![t]).validate_semantics().is_ok());
+    }
+
+    /// A credential input is config-exposure by contract; any other
+    /// exposure (wired or assigned keys) is a metadata error.
+    #[test]
+    fn validate_semantics_rejects_a_wireable_api_key() {
+        let mut key = input("apiKey", WeftType::primitive(WeftPrimitive::String));
+        key.widget = Some(Widget::ApiKey { provider: "openrouter".into() });
+        // String's type-default exposure is `all` (wireable): rejected.
+        let meta = metadata_with(vec![key.clone()]);
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("requires `exposure: config`"), "{e}");
+        // Declared config exposure passes.
+        key.exposure = Some(Exposure::Config);
+        assert!(metadata_with(vec![key]).validate_semantics().is_ok());
+    }
+
+    /// One name = one input; a duplicate is a metadata error.
+    #[test]
+    fn validate_semantics_rejects_duplicate_input_names() {
+        let meta = metadata_with(vec![
+            input("prompt", WeftType::primitive(WeftPrimitive::String)),
+            input("prompt", WeftType::primitive(WeftPrimitive::Number)),
+        ]);
+        let e = meta.validate_semantics().unwrap_err();
+        assert!(e.contains("duplicate input 'prompt'"), "{e}");
+    }
+
+    /// A select/multiselect widget with no options can never be filled:
+    /// metadata-load error, not an editor banner.
+    #[test]
+    fn validate_semantics_rejects_empty_widget_options() {
+        for kind in ["select", "multiselect"] {
+            let mut i = input("method", WeftType::primitive(WeftPrimitive::String));
+            i.widget = serde_json::from_value(json!({"kind": kind, "options": []})).unwrap();
+            let e = metadata_with(vec![i]).validate_semantics().unwrap_err();
+            assert!(e.contains("non-empty"), "{kind}: {e}");
+        }
+    }
+
+    /// A default must fit the input's declared type and (for a number
+    /// widget) its min/max range.
+    #[test]
+    fn validate_semantics_checks_defaults() {
+        let mut bad_type = input("n", WeftType::primitive(WeftPrimitive::Number));
+        bad_type.default = Some(json!("not-a-number"));
+        let e = metadata_with(vec![bad_type]).validate_semantics().unwrap_err();
+        assert!(e.contains("default value has type"), "{e}");
+
+        let mut out_of_range = input("n", WeftType::primitive(WeftPrimitive::Number));
+        out_of_range.widget =
+            serde_json::from_value(json!({"kind": "number", "min": 0.0, "max": 2.0, "step": null})).unwrap();
+        out_of_range.default = Some(json!(5.0));
+        let e = metadata_with(vec![out_of_range]).validate_semantics().unwrap_err();
+        assert!(e.contains("outside"), "{e}");
+
+        let mut fine = input("n", WeftType::primitive(WeftPrimitive::Number));
+        fine.default = Some(json!(1.0));
+        assert!(metadata_with(vec![fine]).validate_semantics().is_ok());
+    }
+
+    /// `resolved()` fills every input's exposure + widget with the
+    /// effective values and is idempotent.
+    #[test]
+    fn resolved_fills_effective_values_idempotently() {
+        let meta = metadata_with(vec![input("prompt", WeftType::primitive(WeftPrimitive::String))]);
+        let resolved = meta.resolved();
+        assert_eq!(resolved.inputs[0].exposure, Some(Exposure::All));
+        assert_eq!(resolved.inputs[0].widget, Some(Widget::Textarea));
+        let again = resolved.resolved();
+        assert_eq!(again.inputs[0].exposure, resolved.inputs[0].exposure);
+        assert_eq!(again.inputs[0].widget, resolved.inputs[0].widget);
     }
 }
 

@@ -55,8 +55,15 @@ pub fn check_should_skip(
     // the body with a completely empty input bag, exactly the
     // busy-work firing this rule exists to prevent. Same shape as the
     // oneOfRequired loop below.
-    if !node.inputs.is_empty() {
-        let all_dead = node.inputs.iter().all(|port| {
+    // Only WIREABLE inputs participate: a `config`-exposure input is a
+    // design-time setting, not data flow, so it neither keeps the node
+    // alive (a node whose data wires all closed has nothing to act on,
+    // config or not) nor counts as a dead port (a node with ONLY config
+    // inputs, like Text, is an emitter and must run).
+    let wireable: Vec<&crate::project::InputDefinition> =
+        node.inputs.iter().filter(|p| p.exposure.wireable()).collect();
+    if !wireable.is_empty() {
+        let all_dead = wireable.iter().all(|port| {
             if literal_filled.contains(port.name.as_str()) {
                 return false;
             }

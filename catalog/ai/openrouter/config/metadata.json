@@ -3,27 +3,166 @@
   "label": "OpenRouter Config",
   "description": "OpenRouter model and parameters. When multiple OpenRouterInference nodes share the same settings, point them at one OpenRouterConfig node to keep maintenance simple. Only use multiple configs when you truly need different settings.",
   "category": "AI",
-  "tags": ["config", "ai", "settings", "model"],
+  "tags": [
+    "config",
+    "ai",
+    "settings",
+    "model"
+  ],
   "icon": "Settings",
   "color": "#6b6b99",
-  "inputs": [],
-  "outputs": [
-    { "name": "config", "type": "Dict[String, String | Number | Boolean]", "required": false, "description": "OpenRouter configuration object fed into one or more OpenRouterInference nodes." }
+  "inputs": [
+    {
+      "name": "apiKey",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "api_key",
+        "provider": "openrouter"
+      },
+      "label": "API Key"
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Model",
+      "placeholder": "anthropic/claude-sonnet-4.6"
+    },
+    {
+      "name": "systemPrompt",
+      "type": "String",
+      "exposure": "config",
+      "label": "System Prompt",
+      "placeholder": "You are a helpful assistant.",
+      "description": "System prompt for every inference node wired to this config. This is the one place to set it."
+    },
+    {
+      "name": "maxTokens",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Max Tokens",
+      "placeholder": "4096"
+    },
+    {
+      "name": "temperature",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": 0.0,
+        "max": 2.0,
+        "step": 0.1
+      },
+      "label": "Temperature",
+      "placeholder": "0.7"
+    },
+    {
+      "name": "topP",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05
+      },
+      "label": "Top P",
+      "placeholder": "1.0"
+    },
+    {
+      "name": "frequencyPenalty",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": -2.0,
+        "max": 2.0,
+        "step": 0.1
+      },
+      "label": "Frequency Penalty",
+      "placeholder": "0.0",
+      "description": "-2.0 to 2.0"
+    },
+    {
+      "name": "presencePenalty",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": -2.0,
+        "max": 2.0,
+        "step": 0.1
+      },
+      "label": "Presence Penalty",
+      "placeholder": "0.0",
+      "description": "-2.0 to 2.0"
+    },
+    {
+      "name": "reasoning",
+      "type": "Boolean",
+      "exposure": "config",
+      "label": "Enable Reasoning",
+      "description": "Enable extended thinking for supported models"
+    },
+    {
+      "name": "reasoningEffort",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "label": "Reasoning Effort",
+      "description": "Only used when reasoning is enabled"
+    },
+    {
+      "name": "provider",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Provider",
+      "placeholder": "(any)",
+      "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price."
+    },
+    {
+      "name": "providerFallbacks",
+      "type": "Boolean",
+      "exposure": "config",
+      "label": "Allow provider fallbacks",
+      "description": "When a provider is pinned, still fall back to others if it is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else."
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "exposure": "config",
+      "label": "Seed",
+      "placeholder": "Leave empty for random",
+      "description": "For reproducible outputs"
+    }
   ],
-  "fields": [
-    { "key": "apiKey", "label": "API Key", "field_type": { "kind": "api_key", "provider": "openrouter" }, "required": false },
-    { "key": "model", "label": "Model", "field_type": { "kind": "text" }, "placeholder": "anthropic/claude-sonnet-4.6", "required": true },
-    { "key": "systemPrompt", "label": "System Prompt", "field_type": { "kind": "textarea" }, "placeholder": "You are a helpful assistant.", "description": "System prompt for every inference node wired to this config. This is the one place to set it." },
-    { "key": "maxTokens", "label": "Max Tokens", "field_type": { "kind": "number" }, "placeholder": "4096" },
-    { "key": "temperature", "label": "Temperature", "field_type": { "kind": "number" }, "placeholder": "0.7" },
-    { "key": "topP", "label": "Top P", "field_type": { "kind": "number" }, "placeholder": "1.0" },
-    { "key": "frequencyPenalty", "label": "Frequency Penalty", "field_type": { "kind": "number" }, "placeholder": "0.0", "description": "-2.0 to 2.0" },
-    { "key": "presencePenalty", "label": "Presence Penalty", "field_type": { "kind": "number" }, "placeholder": "0.0", "description": "-2.0 to 2.0" },
-    { "key": "reasoning", "label": "Enable Reasoning", "field_type": { "kind": "checkbox" }, "description": "Enable extended thinking for supported models" },
-    { "key": "reasoningEffort", "label": "Reasoning Effort", "field_type": { "kind": "select", "options": ["low", "medium", "high"] }, "description": "Only used when reasoning is enabled" },
-    { "key": "provider", "label": "Provider", "field_type": { "kind": "text" }, "placeholder": "(any)", "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price." },
-    { "key": "providerFallbacks", "label": "Allow provider fallbacks", "field_type": { "kind": "checkbox" }, "description": "When a provider is pinned, still fall back to others if it is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else." },
-    { "key": "seed", "label": "Seed", "field_type": { "kind": "number" }, "placeholder": "Leave empty for random", "description": "For reproducible outputs" }
+  "outputs": [
+    {
+      "name": "config",
+      "type": "Dict[String, String | Number | Boolean]",
+      "required": false,
+      "description": "OpenRouter configuration object fed into one or more OpenRouterInference nodes."
+    }
   ],
   "requires_infra": false
 }

@@ -14,7 +14,7 @@
 // scope, moves reject when the moved decl has connections).
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
-import { isContainerNodeType, isLoopNodeType, containerKindOf, portLiteralPlacement } from '../types';
+import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure } from '../types';
 import type { EditOp, EditPortSig } from '../../../shared/protocol';
 import { parseConfigToken } from '../value-format';
 import type { FoldResult, PendingOp } from './types';
@@ -233,7 +233,7 @@ function syncLoopCarryInputs(loop: NodeInstance): void {
         name,
         portType: out.portType,
         required: out.required,
-        literal: 'none',
+        exposure: 'wire',
         synthesizedFromCarry: true,
       });
     }
@@ -308,12 +308,13 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         throw new Error(`SetConfig/RemoveConfig called on '${op.node}' which is a ${node.nodeType} decl, not a Node`);
       }
       // Mirror the compiler's enrich normalization so the optimistic
-      // projection matches the host's next parse: a value that DRIVES an
-      // input port (braces where the port's literal placement allows it,
-      // or an explicit statement-form write on any port) homes in
-      // `portLiterals`, everything else in `config`. One home per name.
-      const port = node.inputs?.find((p) => p.name === op.key);
-      const portHomed = port !== undefined && (portLiteralPlacement(port) === 'anywhere' || op.form === 'connection');
+      // projection matches the host's next parse: a value that DRIVES a
+      // wireable input (braces on an `all`-exposure input, or an
+      // explicit statement-form write on any input) homes in
+      // `portLiterals`; everything else (config-exposure braces values
+      // included) stays in `config`. One home per written form.
+      const input = node.inputs?.find((p) => p.name === op.key);
+      const portHomed = input !== undefined && (inputExposure(input) === 'all' || op.form === 'connection');
       if (portHomed) {
         const literals = (node.portLiterals ??= {});
         const spans = (node.portLiteralSpans ??= {});

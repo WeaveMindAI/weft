@@ -25,7 +25,7 @@ use rowan::NodeOrToken;
 
 use super::{EditError, PortSig};
 use crate::cst::kind::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
-use crate::cst::nodes::{Body, Decl, FileView, Resolution, WeftFile};
+use crate::cst::nodes::{Body, Decl, FileView, InlineExpr, Resolution, WeftFile};
 use crate::cst::parse;
 
 /// Apply one op to the mutable CST `view` (the file root + its source identity,
@@ -108,6 +108,7 @@ fn kind_name(decl: &Decl) -> &'static str {
         Decl::Loop(_) => "Loop",
         Decl::Node(_) => "Node",
         Decl::Include(_) => "Include",
+        Decl::InlineNode(_) => "inline node",
     }
 }
 
@@ -348,6 +349,37 @@ fn insert_before_close_with_indent(
         .close_brace()
         .ok_or_else(|| EditError::Unparseable("group body has no closing brace".into()))?;
     let at = brace.index();
+    // A single-line body stays single-line: `{ x: 1 }` grows to
+    // `{ x: 1, v: "2" }` (comma-joined) instead of splicing newline
+    // layout mid-line, which would mangle a one-liner (worst on an
+    // inline node's body sitting mid-value).
+    if body_is_single_line(body) {
+        let has_fields = body
+            .syntax()
+            .children()
+            .any(|n| n.kind() == SyntaxKind::CONFIG_FIELD);
+        // Own the spacing before `}`: the previous content's trailing
+        // space may live INSIDE the last field's subtree, so reach it
+        // via prev_token (crosses node boundaries) and detach it.
+        if let Some(t) = brace.prev_token() {
+            if t.kind() == SyntaxKind::WHITESPACE {
+                t.detach();
+            }
+        }
+        let at = body
+            .close_brace()
+            .map(|b| b.index())
+            .ok_or_else(|| EditError::Unparseable("close brace gone after detach".into()))?;
+        let mut elems: Vec<SyntaxElement> = if has_fields {
+            raw_token_elements(&[(SyntaxKind::COMMA, ","), (SyntaxKind::WHITESPACE, " ")])
+        } else {
+            raw_token_elements(&[(SyntaxKind::WHITESPACE, " ")])
+        };
+        elems.extend(elements);
+        elems.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, " ")]));
+        body.syntax().splice_children(at..at, elems);
+        return Ok(());
+    }
     // Detach any trailing WHITESPACE immediately before `}` so we own the
     // spacing. Without this, the previous sibling's trailing `\n` (or worse,
     // an accumulated `\n  \n  `) sits between us and `}` and we get blank
@@ -476,6 +508,222 @@ fn leading_indent(node: &SyntaxNode) -> String {
         .unwrap_or_default()
 }
 
+// ── inline-node extraction (de-inlining) ────────────────────────────────────
+//
+// Inlining is SOURCE sugar: the graph treats an anon inline node
+// (`host__key`) as an ordinary node. Any op whose graph meaning
+// conflicts with the inline form therefore DE-INLINES: the expression
+// is extracted into a named decl in its own scope (staying inside its
+// enclosing group), and the value slot it occupied either becomes an
+// explicit wire (`key: name.port`) or is dropped, per the op's meaning.
+// Re-rendering a de-inlined but graph-identical program is always
+// legal; silently deleting nested nodes, or refusing the op, is not.
+
+/// The node HOLDING an inline expression's value: its parent
+/// CONFIG_FIELD (braces form) or CONNECTION (statement form).
+fn inline_holder(inline: &InlineExpr) -> Result<SyntaxNode, EditError> {
+    let parent = inline
+        .syntax()
+        .parent()
+        .ok_or_else(|| EditError::Unparseable("inline node has no enclosing value".into()))?;
+    match parent.kind() {
+        SyntaxKind::CONFIG_FIELD | SyntaxKind::CONNECTION => Ok(parent),
+        other => Err(EditError::Unparseable(format!(
+            "inline node sits under an unexpected {other:?}"
+        ))),
+    }
+}
+
+/// An inline expression split into its DECLARATION text (`Type (sig) {
+/// body }`, everything before the trailing `.port`) and that port name.
+fn inline_decl_parts(inline: &InlineExpr) -> Result<(String, String), EditError> {
+    let elems: Vec<SyntaxElement> = inline.syntax().children_with_tokens().collect();
+    let dot = elems
+        .iter()
+        .rposition(|e| e.kind() == SyntaxKind::DOT)
+        .ok_or_else(|| EditError::Unparseable("inline expression has no trailing `.port`".into()))?;
+    let port = elems
+        .get(dot + 1)
+        .and_then(|e| e.as_token().cloned())
+        .filter(|t| t.kind() == SyntaxKind::IDENT)
+        .map(|t| t.text().to_string())
+        .ok_or_else(|| EditError::Unparseable("inline expression has no trailing `.port`".into()))?;
+    let rhs: String = elems[..dot].iter().map(|e| e.to_string()).collect();
+    Ok((rhs.trim().to_string(), port))
+}
+
+/// The scope an inline node's extraction lands in: the nearest enclosing
+/// group/loop body (with its content indent) or the file root, plus the
+/// container's SCOPED id for fresh-name probing.
+#[allow(clippy::type_complexity)]
+fn enclosing_scope(
+    view: &FileView,
+    node: &SyntaxNode,
+) -> Result<(Option<(Body, String)>, Option<String>), EditError> {
+    for anc in node.ancestors().skip(1) {
+        if matches!(anc.kind(), SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL) {
+            let decl = Decl::cast(anc.clone())
+                .ok_or_else(|| EditError::Unparseable("unreadable enclosing container".into()))?;
+            let body = decl
+                .body()
+                .ok_or_else(|| EditError::Unparseable("enclosing container has no body".into()))?;
+            let indent = group_body_indent_decl(&decl);
+            let prefix = view.scoped_id_of(&decl);
+            return Ok((Some((body, indent)), prefix));
+        }
+    }
+    Ok((None, None))
+}
+
+/// A fresh legal local id for an extracted inline node, derived from its
+/// anon id (`a__data` -> `a_data`; the `__` separator is reserved), with
+/// a numeric suffix until free in the scope.
+fn fresh_extract_local(view: &FileView, prefix: Option<&str>, anon_local: &str) -> String {
+    let base = anon_local.replace("__", "_");
+    let mut name = base.clone();
+    let mut n = 1;
+    loop {
+        let scoped = match prefix {
+            Some(p) => format!("{p}.{name}"),
+            None => name.clone(),
+        };
+        if !view.scoped_id_exists(&scoped) && !crate::weft_compiler::is_reserved_local(&name) {
+            return name;
+        }
+        n += 1;
+        name = format!("{base}_{n}");
+    }
+}
+
+/// Extract an inline expression into a named decl in its own scope.
+/// `keep_wire` replaces the value slot it occupied with an explicit wire
+/// to the extracted node's output (`key: name.port`); `false` drops the
+/// holder (field or statement) entirely: the wire is gone, the node
+/// survives. Returns the extracted decl's (local id, scoped id).
+fn extract_inline(
+    view: &FileView,
+    inline: &InlineExpr,
+    keep_wire: bool,
+) -> Result<(String, String), EditError> {
+    let holder = inline_holder(inline)?;
+    let (rhs, out_port) = inline_decl_parts(inline)?;
+    let anon_local = inline
+        .anon_local()
+        .ok_or_else(|| EditError::Unparseable("inline node has no derivable id".into()))?;
+    let (scope, prefix) = enclosing_scope(view, inline.syntax())?;
+    let local = fresh_extract_local(view, prefix.as_deref(), &anon_local);
+    let scoped = match &prefix {
+        Some(p) => format!("{p}.{local}"),
+        None => local.clone(),
+    };
+    let decl_src = format!("{local} = {rhs}");
+    match scope {
+        Some((body, indent)) => {
+            insert_before_close(&body, snippet_elements(&format!("{indent}{decl_src}\n")))?
+        }
+        None => append_to_file(view.file(), snippet_elements(&format!("\n{decl_src}\n"))),
+    }
+    if keep_wire {
+        let sep = if holder.kind() == SyntaxKind::CONFIG_FIELD {
+            SyntaxKind::COLON
+        } else {
+            SyntaxKind::EQ
+        };
+        replace_value_after(&holder, sep, &format!("{local}.{out_port}"))?;
+    } else {
+        detach_with_leading_ws(&holder);
+    }
+    Ok((local, scoped))
+}
+
+/// The DIRECT inline-expression children held by a body's config fields
+/// and statements (one level; grandchildren stay inline inside their
+/// parents' text).
+fn direct_inline_children(body: &Body) -> Vec<InlineExpr> {
+    body.syntax()
+        .children()
+        .filter(|c| matches!(c.kind(), SyntaxKind::CONFIG_FIELD | SyntaxKind::CONNECTION))
+        .filter_map(|holder| holder.children().find(|n| n.kind() == SyntaxKind::INLINE_EXPR))
+        .filter_map(InlineExpr::cast)
+        .collect()
+}
+
+/// Resolve `id` the way an edge endpoint does: an immediate child of
+/// `scope_group` first, else the id as written. The decl-flavored twin
+/// of `require_endpoint`'s two probes.
+fn resolve_in_scope(view: &FileView, scope_group: Option<&str>, id: &str) -> Option<Decl> {
+    if let Some(g) = scope_group {
+        if let Ok(gd) = resolve(view, g) {
+            if let Some(prefix) = view.scoped_id_of(&gd) {
+                let scoped = format!("{prefix}.{id}");
+                if view.scoped_id_exists(&scoped) {
+                    return resolve(view, &scoped).ok();
+                }
+            }
+        }
+    }
+    resolve(view, id).ok()
+}
+
+/// If an edge-endpoint ref names an INLINE node, extract it (keeping
+/// its existing wire) and return the extracted LOCAL id to use in its
+/// place; any other ref passes through unchanged.
+fn deinline_endpoint(
+    view: &FileView,
+    scope_group: Option<&str>,
+    id: &str,
+) -> Result<String, EditError> {
+    // `__` is reserved in source identifiers, so only an anon inline id
+    // can carry it; anything else can't be an inline and skips the probe.
+    if !id.contains("__") {
+        return Ok(id.to_string());
+    }
+    match resolve_in_scope(view, scope_group, id) {
+        Some(Decl::InlineNode(inline)) => {
+            let (local, _) = extract_inline(view, &inline, true)?;
+            Ok(local)
+        }
+        _ => Ok(id.to_string()),
+    }
+}
+
+/// If `decl.key`'s current value IS an inline expression (braces field
+/// or statement form), extract it as an ORPHAN named node first:
+/// overwriting the key with a literal (or removing it) means "replace /
+/// drop this input's driver", never "silently delete the driver node
+/// and everything nested in it".
+fn deinline_value_holder(view: &FileView, decl: &Decl, key: &str) -> Result<(), EditError> {
+    if let Some(field) = find_fields(decl, key).into_iter().next() {
+        if let Some(inline) = field
+            .children()
+            .find(|n| n.kind() == SyntaxKind::INLINE_EXPR)
+            .and_then(InlineExpr::cast)
+        {
+            extract_inline(view, &inline, false)?;
+            return Ok(());
+        }
+    }
+    if let Some(local) = decl.local_id() {
+        let scope = decl
+            .syntax()
+            .parent()
+            .unwrap_or_else(|| view.file().syntax().clone());
+        let stmt_inline = scope
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::CONNECTION)
+            .find(|c| {
+                let (t_id, t_port) = endpoint_parts(c, 0);
+                t_id.as_deref() == Some(local.as_str()) && t_port.as_deref() == Some(key)
+            })
+            .and_then(|c| c.children().find(|n| n.kind() == SyntaxKind::INLINE_EXPR))
+            .and_then(InlineExpr::cast);
+        if let Some(inline) = stmt_inline {
+            extract_inline(view, &inline, false)?;
+        }
+    }
+    Ok(())
+}
+
 // ── ops: add ────────────────────────────────────────────────────────────────
 
 /// Add a node or group decl into a scope. Rejects a duplicate local id loudly.
@@ -517,8 +765,55 @@ fn reject_if_taken(view: &FileView, parent_group: Option<&str>, local_id: &str) 
 /// handles first, then detach.
 fn remove_node(view: &FileView, node_id: &str) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
-    for c in view.connections_referencing(&decl) {
-        detach_with_leading_ws(&c);
+    // GRAPH semantics rule: removing a node deletes the node and its
+    // wires, and its NEIGHBORS survive. For an inline node that means
+    // its nested inline children (nodes feeding its inputs) are
+    // extracted as named orphans first, then the expression itself is
+    // deleted (the host input is left bare, as if a wire was removed).
+    if let Decl::InlineNode(inline) = &decl {
+        if let Some(body) = decl.body() {
+            for child in direct_inline_children(&body) {
+                extract_inline(view, &child, false)?;
+            }
+        }
+        let holder = inline_holder(inline)?;
+        detach_with_leading_ws(&holder);
+        return Ok(());
+    }
+    // A named node: its inline DRIVERS are neighbor nodes too. Extract
+    // each as an orphan (braces-form drivers in the body, statement-form
+    // drivers in the scope) before the node and its wires go, and clear
+    // braces-endpoint wires (`key: this.port` on other nodes) that
+    // would otherwise dangle. Resolve-then-mutate: collect every handle
+    // first.
+    let body_children: Vec<InlineExpr> =
+        decl.body().map(|b| direct_inline_children(&b)).unwrap_or_default();
+    let referencing = view.connections_referencing(&decl);
+    let endpoint_fields = view.endpoint_fields_referencing(&decl);
+    // Endpoint fields FIRST: one may live inside a body inline driver
+    // (`a = Sink { x: Wrap { inner: a.value }.out }`), and extraction
+    // re-parses the driver from serialized text, orphaning any handle
+    // into it. Detached first, the reference simply never appears in
+    // the extracted declaration.
+    for f in endpoint_fields {
+        detach_with_leading_ws(&f);
+    }
+    for child in body_children {
+        extract_inline(view, &child, false)?;
+    }
+    for c in referencing {
+        match c
+            .children()
+            .find(|n| n.kind() == SyntaxKind::INLINE_EXPR)
+            .and_then(InlineExpr::cast)
+        {
+            // A statement-form inline driver (`this.key = X{...}.o`):
+            // the extraction detaches the statement itself.
+            Some(inline) => {
+                extract_inline(view, &inline, false)?;
+            }
+            None => detach_with_leading_ws(&c),
+        }
     }
     detach_with_leading_ws(decl.syntax());
     Ok(())
@@ -653,13 +948,33 @@ fn set_config(
     form: Option<super::ValueForm>,
 ) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
-    // NODE-only, same kind-honesty discipline as rename/move/ports:
-    // loop config rides `SetLoopConfig` / `RemoveLoopConfig` (groups
-    // take no config at all). Silently accepting a container here
-    // would fork one operation across two op families.
-    if !matches!(decl, Decl::Node(_)) {
+    // NODE-only (inline nodes included), same kind-honesty discipline
+    // as rename/move/ports: loop config rides `SetLoopConfig` /
+    // `RemoveLoopConfig` (groups take no config at all). Silently
+    // accepting a container here would fork one operation across two
+    // op families.
+    if !matches!(decl, Decl::Node(_) | Decl::InlineNode(_)) {
         return Err(kind_mismatch("SetConfig/RemoveConfig", node_id, "Node", &decl));
     }
+    // An inline node lives INSIDE a value: its fields are only ever the
+    // braces form (no `host__key.field = ...` statement can exist, the
+    // `__` id is reserved in source), so route every edit to the body
+    // and refuse an explicit statement-form request loudly.
+    if let Decl::InlineNode(_) = &decl {
+        if form == Some(super::ValueForm::Connection) {
+            return Err(EditError::InvalidArgument(format!(
+                "'{node_id}' is an inline node: its fields live inside the expression's braces and have no statement form"
+            )));
+        }
+        return match value {
+            Some(v) => set_or_insert_field(&decl, key, v),
+            None => { remove_field(&decl, key); Ok(()) }
+        };
+    }
+    // If the key's current value is an INLINE EXPRESSION, this write
+    // replaces (or drops) that input's driver: extract the inline as an
+    // orphan named node first, never silently delete it and its subtree.
+    deinline_value_holder(view, &decl, key)?;
     // A same name may legally exist in BOTH forms (a wired-only port's
     // literal next to a same-named config field), so an explicit `form`
     // targets exactly one and never routes to the other.
@@ -801,12 +1116,13 @@ fn replace_value_after(node: &SyntaxNode, sep: SyntaxKind, value: &str) -> Resul
 
 fn set_label(view: &FileView, node_id: &str, label: Option<&str>) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
-    // A `_label` field is only valid on a Node. The merged group/loop
-    // lowering rejects a label field in a container body as a compile
-    // error, so a setLabel targeting a Group/Loop would author an
-    // uncompilable file. Fail at edit time with the honest kind error
-    // instead (containers are renamed via renameGroup / renameLoop).
-    if !matches!(decl, Decl::Node(_)) {
+    // A `_label` field is only valid on a Node (an inline node included:
+    // its label is just a body field). The merged group/loop lowering
+    // rejects a label field in a container body as a compile error, so
+    // a setLabel targeting a Group/Loop would author an uncompilable
+    // file. Fail at edit time with the honest kind error instead
+    // (containers are renamed via renameGroup / renameLoop).
+    if !matches!(decl, Decl::Node(_) | Decl::InlineNode(_)) {
         return Err(kind_mismatch("setLabel", node_id, "Node", &decl));
     }
     match label.filter(|l| !l.is_empty()) {
@@ -897,7 +1213,15 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
     // tree (the insert re-parses `key: value`, so a stray `}` closes the body
     // early). Reject loud before building, so insert and replace agree.
     reject_uncontained_value(value)?;
-    let indent = leading_indent(decl.syntax());
+    // An inline node sits MID-line (`data: Text {...}.out`), so its own
+    // leading trivia is not a line indent; the enclosing field/statement
+    // holds the line's real column.
+    let indent = match decl {
+        Decl::InlineNode(inline) => {
+            leading_indent(&inline_holder(inline)?)
+        }
+        _ => leading_indent(decl.syntax()),
+    };
     let body_indent = format!("{indent}  ");
     match decl.body() {
         // Has a body: splice the new field before its close brace, in place.
@@ -910,11 +1234,23 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
         }
         // No body: synthesize one with the single field.
         None => {
-            let header = decl_header_text(decl);
-            let rebuilt = format!(
-                "{indent}{} {{\n{body_indent}{key}: {value}\n{indent}}}",
-                header.trim()
-            );
+            let rebuilt = match decl {
+                // A bodyless inline (`data: Foo.out`) has no header node;
+                // rebuild `Type { field }.port` from its own parts, mid-line
+                // (no leading indent), keeping the trailing `.port` so the
+                // wire survives.
+                Decl::InlineNode(inline) => {
+                    let (rhs, port) = inline_decl_parts(inline)?;
+                    format!("{rhs} {{\n{body_indent}{key}: {value}\n{indent}}}.{port}")
+                }
+                _ => {
+                    let header = decl_header_text(decl);
+                    format!(
+                        "{indent}{} {{\n{body_indent}{key}: {value}\n{indent}}}",
+                        header.trim()
+                    )
+                }
+            };
             splice_decl(decl, &rebuilt)
         }
     }
@@ -927,6 +1263,11 @@ fn decl_header_text(decl: &Decl) -> String {
         Decl::Group(g) => g.header().map(|h| h.syntax().to_string()).unwrap_or_default(),
         Decl::Loop(l) => l.header().map(|h| h.syntax().to_string()).unwrap_or_default(),
         Decl::Include(i) => i.syntax().to_string(),
+        // An inline node has no header node; callers that need its
+        // declaration text rebuild it from `inline_decl_parts` (a
+        // bodyless `Foo.out` DOES parse as an INLINE_EXPR, so this arm
+        // must never feed a rebuild).
+        Decl::InlineNode(_) => String::new(),
     }
 }
 
@@ -1131,6 +1472,12 @@ fn add_edge(
     target: &str,
     target_port: &str,
 ) -> Result<(), EditError> {
+    // An endpoint naming an INLINE node (fan-out from its output, a wire
+    // into one of its inputs) de-inlines it first, keeping its existing
+    // wire, and the edge then connects to the extracted named node.
+    let source = deinline_endpoint(view, scope_group, source)?;
+    let target = deinline_endpoint(view, scope_group, target)?;
+    let (source, target) = (source.as_str(), target.as_str());
     // Both endpoints must exist (or be `self`). Refs are SCOPE-LOCAL: `x`
     // inside scope `G` means `G.x`, not a file-wide `x`.
     require_endpoint(view, scope_group, source)?;
@@ -1141,7 +1488,7 @@ fn add_edge(
     validate_ident("source port", source_port)?;
     validate_ident("target port", target_port)?;
     // Remove the existing driver of this target port in the same scope.
-    remove_driver(view, scope_group, target, target_port);
+    remove_driver(view, scope_group, target, target_port)?;
     let conn = format!("{target}.{target_port} = {source}.{source_port}");
     match target_body(view, scope_group)? {
         InsertTarget::FileRoot(f) => {
@@ -1168,6 +1515,16 @@ fn add_edge(
 /// SYNC: require_endpoint <-> crates/weft-compiler/src/weft_compiler.rs
 /// rescope_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to
 fn require_endpoint(view: &FileView, scope_group: Option<&str>, id: &str) -> Result<(), EditError> {
+    // An anon inline-node id (`host__key`; `__` is reserved in source
+    // identifiers, so nothing else carries it) cannot be an endpoint:
+    // an inline node lives inside a value and has no wireable identity
+    // in source. Refuse with the fix instead of authoring an id the
+    // compiler then rejects.
+    if id.contains("__") {
+        return Err(EditError::InvalidArgument(format!(
+            "'{id}' is an inline node: it lives inside a value and cannot be wired. Declare it as a named node to connect it"
+        )));
+    }
     if id == "self" {
         // `self` names the enclosing container; it is meaningless at file root.
         return match scope_group {
@@ -1198,11 +1555,44 @@ fn require_endpoint(view: &FileView, scope_group: Option<&str>, id: &str) -> Res
     Err(EditError::NodeNotFound(id.to_string()))
 }
 
-/// Drop the connection that currently drives `target.target_port` in the scope.
-fn remove_driver(view: &FileView, scope_group: Option<&str>, target: &str, target_port: &str) {
+/// Drop whatever currently drives `target.target_port` in the scope: a
+/// statement-form connection (plain edge or inline expression), or a
+/// braces-form value on the target's body (an inline expression or an
+/// endpoint wire). An inline driver is EXTRACTED as an orphan named
+/// node, never silently deleted; a plain braces literal is left alone
+/// (the webview vetoes docking onto literal-driven inputs and the
+/// compile rejects double drivers).
+fn remove_driver(
+    view: &FileView,
+    scope_group: Option<&str>,
+    target: &str,
+    target_port: &str,
+) -> Result<(), EditError> {
     if let Ok(conn) = find_connection(view, scope_group, target, target_port, None, None) {
-        detach_with_leading_ws(&conn);
+        match conn
+            .children()
+            .find(|n| n.kind() == SyntaxKind::INLINE_EXPR)
+            .and_then(InlineExpr::cast)
+        {
+            Some(inline) => {
+                extract_inline(view, &inline, false)?;
+            }
+            None => detach_with_leading_ws(&conn),
+        }
+        return Ok(());
     }
+    let Some(decl) = resolve_in_scope(view, scope_group, target) else { return Ok(()) };
+    let Some(field) = find_fields(&decl, target_port).into_iter().next() else { return Ok(()) };
+    if let Some(inline) = field
+        .children()
+        .find(|n| n.kind() == SyntaxKind::INLINE_EXPR)
+        .and_then(InlineExpr::cast)
+    {
+        extract_inline(view, &inline, false)?;
+    } else if field.children().any(|n| n.kind() == SyntaxKind::ENDPOINT) {
+        detach_with_leading_ws(&field);
+    }
+    Ok(())
 }
 
 /// Remove a connection matching the quad in the given scope. Loud if not found.
@@ -1214,10 +1604,60 @@ fn remove_edge(
     target: &str,
     target_port: &str,
 ) -> Result<(), EditError> {
-    let conn = find_connection(view, scope_group, target, target_port, Some(source), Some(source_port))
-        .map_err(|_| EditError::ConnectionNotFound(target.into(), target_port.into(), source.into(), source_port.into()))?;
-    detach_with_leading_ws(&conn);
-    Ok(())
+    if let Ok(conn) = find_connection(view, scope_group, target, target_port, Some(source), Some(source_port)) {
+        detach_with_leading_ws(&conn);
+        return Ok(());
+    }
+    // Value-embedded wires: `key: src.port` (braces endpoint),
+    // `key: Src {...}.port` (braces inline), `t.p = Src {...}.port`
+    // (statement inline). Each IS an edge in the compiled graph, so
+    // removing it must work from the graph. Unlinking an inline
+    // EXTRACTS it as an orphan named node (the wire is what the user
+    // removed, not the node).
+    let source_local = source.rsplit('.').next().unwrap_or(source);
+    if let Some(decl) = resolve_in_scope(view, scope_group, target) {
+        if let Some(field) = find_fields(&decl, target_port).into_iter().next() {
+            if let Some(inline) = field
+                .children()
+                .find(|n| n.kind() == SyntaxKind::INLINE_EXPR)
+                .and_then(InlineExpr::cast)
+            {
+                if inline.anon_local().as_deref() == Some(source_local) {
+                    extract_inline(view, &inline, false)?;
+                    return Ok(());
+                }
+            }
+            let endpoint_matches = field
+                .children()
+                .find(|n| n.kind() == SyntaxKind::ENDPOINT)
+                .and_then(crate::cst::nodes::Endpoint::cast)
+                .map(|ep| ep.parts())
+                .is_some_and(|(id, port)| {
+                    id.as_deref() == Some(source_local) && port.as_deref() == Some(source_port)
+                });
+            if endpoint_matches {
+                detach_with_leading_ws(&field);
+                return Ok(());
+            }
+        }
+    }
+    if let Ok(scope) = scope_body(view, scope_group) {
+        let stmt_inline = scope
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::CONNECTION)
+            .find(|c| {
+                let (t_id, t_port) = endpoint_parts(c, 0);
+                t_id.as_deref() == Some(target) && t_port.as_deref() == Some(target_port)
+            })
+            .and_then(|c| c.children().find(|n| n.kind() == SyntaxKind::INLINE_EXPR))
+            .and_then(InlineExpr::cast)
+            .filter(|inline| inline.anon_local().as_deref() == Some(source_local));
+        if let Some(inline) = stmt_inline {
+            extract_inline(view, &inline, false)?;
+            return Ok(());
+        }
+    }
+    Err(EditError::ConnectionNotFound(target.into(), target_port.into(), source.into(), source_port.into()))
 }
 
 /// Find a CONNECTION in `scope_group`'s body matching the target endpoint
@@ -1529,6 +1969,18 @@ fn move_scope(
     expected: ContainerKind,
 ) -> Result<(), EditError> {
     let decl = resolve(view, id)?;
+    // Moving an INLINE node: de-inline (wire kept) and move the named
+    // node; the same cross-scope wiring rules then apply to it. A move
+    // into its own current scope is the drag-ended-in-place no-op and
+    // must not restructure the source.
+    if let (ContainerKind::Node, Decl::InlineNode(inline)) = (expected, &decl) {
+        let (_, prefix) = enclosing_scope(view, inline.syntax())?;
+        if prefix.as_deref() == target_group {
+            return Ok(());
+        }
+        let (_, scoped) = extract_inline(view, inline, true)?;
+        return move_scope(view, &scoped, target_group, expected);
+    }
     if !expected.matches(&decl) {
         return Err(kind_mismatch(
             &format!("Move{}Scope", expected.op_name()),
@@ -1693,6 +2145,12 @@ fn update_ports(
         }
     }
     let decl = resolve(view, id)?;
+    // Editing an INLINE node's port signature: de-inline (wire kept)
+    // and rewrite the named decl's header (an inline has none).
+    if let (ContainerKind::Node, Decl::InlineNode(inline)) = (expected, &decl) {
+        let (_, scoped) = extract_inline(view, inline, true)?;
+        return update_ports(view, &scoped, inputs, outputs, expected);
+    }
     if !expected.matches(&decl) {
         return Err(kind_mismatch(
             &format!("Update{}Ports", expected.op_name()),

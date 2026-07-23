@@ -14,6 +14,7 @@
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
 	import FieldStrip from './FieldStrip.svelte';
+	import { LOOP_CONFIG_FIELDS } from '../../utils/input-field';
 
 	// Group interface ports cannot take a body-set literal (see the rule
 	// enforced in enrichment's validate_required_ports). Pass an empty set to
@@ -92,10 +93,7 @@
 	/// Field definitions for the loop config strip. over and carry no
 	/// longer live in the strip: their values are derived from the per-port
 	/// role chosen via right-click on each port, so the strip only shows
-	/// parallel, max_iters, trim_on_mismatch.
-	const loopFields: FieldDefinition[] = $derived(
-		isLoop ? ((NODE_TYPE_CONFIG.Loop?.fields ?? []) as FieldDefinition[]) : []
-	);
+	const loopFields: FieldDefinition[] = $derived(isLoop ? LOOP_CONFIG_FIELDS : []);
 
 	function updateLoopConfig(key: string, value: unknown) {
 		if (!data.onUpdate) return;

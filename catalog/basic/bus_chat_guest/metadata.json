@@ -3,15 +3,26 @@
   "label": "Bus Chat: Guest",
   "description": "Demo node. Connects to a Bus from a Bus Chat: Host, registers as 'guest', replies to the host's lines until the bus closes. Pair with a Bus Chat: Host node.",
   "category": "basic",
-  "tags": ["bus", "demo", "chat"],
+  "tags": [
+    "bus",
+    "demo",
+    "chat"
+  ],
   "icon": "MessageSquare",
   "color": "#06b6d4",
   "inputs": [
-    { "name": "channel", "type": "Bus", "required": true }
+    {
+      "name": "channel",
+      "type": "Bus",
+      "required": true
+    }
   ],
   "outputs": [
-    { "name": "done", "type": "Boolean", "required": false }
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
   ],
-  "fields": [],
   "requires_infra": false
 }

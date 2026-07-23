@@ -416,7 +416,6 @@ mod fan_in_tests {
             port_type: crate::weft_type::WeftType::primitive(crate::weft_type::WeftPrimitive::String),
             required: false,
             description: None,
-            literal: crate::weft_type::LiteralPlacement::Assignment,
             synthesized_from_carry: false,
         }
     }
@@ -428,7 +427,10 @@ mod fan_in_tests {
             label: None,
             config: Value::Null,
             position: crate::project::Position { x: 0.0, y: 0.0 },
-            inputs: inputs.into_iter().map(port).collect(),
+            inputs: inputs
+                .into_iter()
+                .map(|n| crate::project::InputDefinition::from_wire_port(port(n)))
+                .collect(),
             outputs: outputs.into_iter().map(port).collect(),
             features: Default::default(),
             scope: Vec::new(),

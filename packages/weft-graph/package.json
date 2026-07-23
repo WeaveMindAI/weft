@@ -13,12 +13,13 @@
     "./live-data": "./src/live-data.ts"
   },
   "peerDependencies": {
-    "svelte": "^5.0.0",
     "@xyflow/svelte": "^1.5.0",
-    "elkjs": "^0.11.0"
+    "elkjs": "^0.11.0",
+    "svelte": "^5.0.0"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-javascript": "^6.2.5",
     "@codemirror/lang-python": "^6.2.1",
     "@codemirror/language": "^6.12.3",
     "@codemirror/state": "^6.6.0",

@@ -1515,3 +1515,115 @@ fn file_url(mime: &str) -> serde_json::Value {
       ]);
       assert_eq!(other.to_string(), "Image | Null");
   }
+
+/// Literal lenience: `cast_value` converts a written value into the
+/// declared type when the conversion is unambiguous, recursively, and
+/// refuses everything else. The compile-time twin of the `@file` cast.
+#[test]
+fn cast_value_converts_unambiguous_shapes() {
+    use serde_json::json;
+    let t = |s: &str| WeftType::parse(s).unwrap();
+
+    // Scalars both ways.
+    assert_eq!(t("Number").cast_value(&json!("18")).unwrap(), json!(18.0));
+    assert_eq!(t("Number").cast_value(&json!(" 2.5 ")).unwrap(), json!(2.5));
+    assert_eq!(t("Boolean").cast_value(&json!("true")).unwrap(), json!(true));
+    assert_eq!(t("Boolean").cast_value(&json!("True")).unwrap(), json!(true), "case-insensitive");
+    assert_eq!(t("Boolean").cast_value(&json!("FALSE")).unwrap(), json!(false));
+    assert_eq!(t("Boolean").cast_value(&json!("1")).unwrap(), json!(true));
+    assert_eq!(t("Boolean").cast_value(&json!(1)).unwrap(), json!(true));
+    assert_eq!(t("Boolean").cast_value(&json!(0)).unwrap(), json!(false));
+    assert_eq!(t("Number").cast_value(&json!(true)).unwrap(), json!(1));
+    assert_eq!(t("Number").cast_value(&json!(false)).unwrap(), json!(0));
+    assert_eq!(t("String").cast_value(&json!(18)).unwrap(), json!("18"));
+    assert_eq!(t("String").cast_value(&json!(true)).unwrap(), json!("true"));
+
+    // An exact fit passes through untouched (an integer stays an integer).
+    assert_eq!(t("Number").cast_value(&json!(18)).unwrap(), json!(18));
+    assert_eq!(t("String").cast_value(&json!("x")).unwrap(), json!("x"));
+
+    // JSON-in-a-string parses into structural types, recursively.
+    assert_eq!(t("List[Number]").cast_value(&json!("[1, 2]")).unwrap(), json!([1, 2]));
+    assert_eq!(t("JsonDict").cast_value(&json!("{\"a\": 1}")).unwrap(), json!({"a": 1}));
+    assert_eq!(
+        t("Dict[String, Number]").cast_value(&json!({"a": "3"})).unwrap(),
+        json!({"a": 3.0}),
+        "dict values cast recursively"
+    );
+    assert_eq!(
+        t("List[Number]").cast_value(&json!(["1", 2])).unwrap(),
+        json!([1.0, 2]),
+        "list elements cast recursively"
+    );
+
+    // A union prefers the exact member, then casts only when exactly
+    // one member can (order-independent; disagreement fails loudly).
+    assert_eq!(t("String | Number").cast_value(&json!("18")).unwrap(), json!("18"));
+    assert_eq!(t("Number | Null").cast_value(&json!("18")).unwrap(), json!(18.0));
+
+    // Genuinely uncastable shapes refuse loudly.
+    assert!(t("Number").cast_value(&json!("banana")).is_err());
+    assert!(t("Boolean").cast_value(&json!("yes")).is_err());
+    assert!(t("Boolean").cast_value(&json!(2)).is_err(), "only 1/0 cast to a boolean");
+    assert!(t("Number").cast_value(&json!(null)).is_err());
+    assert!(t("List[Number]").cast_value(&json!("not json")).is_err());
+    assert!(t("JsonDict").cast_value(&json!("[1, 2]")).is_err(), "an array is not a JsonDict");
+    assert!(t("Image").cast_value(&json!("cat.png")).is_err(), "file types never cast");
+    assert!(t("Bus").cast_value(&json!("b")).is_err());
+    assert!(t("String").cast_value(&json!({"a": 1})).is_err(), "no lossy stringify of structures");
+}
+
+/// The tricky union/nesting corners of the literal cast: mixed lists
+/// over union element types, unions of containers, a JSON string
+/// feeding a nested structure, and the identity-preserving fast path
+/// (an element that already fits is never rewritten by a cast of its
+/// siblings).
+#[test]
+fn cast_value_handles_union_and_nested_shapes() {
+    use serde_json::json;
+    let t = |s: &str| WeftType::parse(s).unwrap();
+
+    // A list whose elements each pick their own union member: fitting
+    // elements pass through IDENTICALLY, misfits cast.
+    assert_eq!(
+        t("List[Number | Boolean]").cast_value(&json!([1, 0, "true"])).unwrap(),
+        json!([1, 0, true]),
+        "1 and 0 stay numbers (they already fit); only the string casts"
+    );
+
+    // A fully-compatible mixed list is untouched (no spurious cast).
+    assert_eq!(
+        t("List[String | Number]").cast_value(&json!(["1", 2])).unwrap(),
+        json!(["1", 2])
+    );
+
+    // A union of containers: the member that fits the parsed shape wins.
+    assert_eq!(
+        t("List[Number] | Dict[String, Number]")
+            .cast_value(&json!("{\"a\": \"1\"}"))
+            .unwrap(),
+        json!({"a": 1.0})
+    );
+
+    // Deep nesting through a JSON string.
+    assert_eq!(
+        t("List[List[Number]]").cast_value(&json!("[[\"1\"], [2]]")).unwrap(),
+        json!([[1.0], [2]])
+    );
+
+    // A value only ONE member can cast is unambiguous regardless of
+    // declaration order (Boolean refuses 2, so String takes it).
+    assert_eq!(t("String | Boolean").cast_value(&json!(2)).unwrap(), json!("2"));
+    assert_eq!(t("Boolean | String").cast_value(&json!(2)).unwrap(), json!("2"));
+
+    // A value SEVERAL members would cast DIFFERENTLY is ambiguous:
+    // refused loudly naming both readings, never picked by member order.
+    let err = t("Boolean | String").cast_value(&json!(1)).unwrap_err();
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(err.contains("true") && err.contains("\"1\""), "both readings named: {err}");
+    assert!(t("Number | Boolean").cast_value(&json!("1")).is_err(), "1.0 vs true is ambiguous");
+
+    // One uncastable element fails the WHOLE cast (no partial rewrite).
+    assert!(t("List[Number]").cast_value(&json!([1, "banana"])).is_err());
+    assert!(t("List[Number | Boolean]").cast_value(&json!([1, "maybe"])).is_err());
+}

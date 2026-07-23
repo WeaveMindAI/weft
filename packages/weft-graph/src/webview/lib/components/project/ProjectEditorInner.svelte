@@ -13,7 +13,7 @@
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf, portLiteralPlacement } from "../../types";
+	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure } from "../../types";
 	import type { EditOp, TextEdit } from "../../../../shared/protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
@@ -23,7 +23,7 @@
 	import { formatConfigValue } from "../../value-format";
 	import { measureTextWidth, nodeLabelFont } from "../../utils/measure-text";
 	import { foldOps } from "../../projection/apply";
-	import { diffConfigOps, sameConfigValue, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
+	import { diffConfigOps, diffPortLiteralOps, sameConfigValue, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
 	import { ProjectionEngine } from "../../projection/engine.svelte";
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
@@ -794,35 +794,16 @@
 			}
 			if ('portLiterals' in updates && updates.portLiterals) {
 				// Port-driven values: diff against the PROJECTION's portLiterals
-				// (the same truth the fields render from) into setConfig ops
-				// stamped with each value's current written form, so an edit
-				// rewrites the value where it lives (braces vs statement) and a
-				// wired-only port's same-named config field is never touched.
+				// (the same truth the fields render from) through the shared
+				// producer, so every surface emits identical ops for this home.
 				const foldNode = fold.project.nodes.find((n) => n.id === nodeId);
-				const current = (foldNode?.portLiterals as Record<string, unknown> | undefined) ?? {};
-				const spans = (foldNode?.portLiteralSpans as Record<string, { origin: 'inline' | 'connection' }> | undefined) ?? {};
-				// A value not yet in source takes the braces form, except on an
-				// assignment-only port, where the statement form is the only
-				// legal one.
-				const defaultForm = (key: string): 'inline' | 'connection' => {
-					const port = foldNode?.inputs.find((p) => p.name === key);
-					return port !== undefined && portLiteralPlacement(port) !== 'anywhere' ? 'connection' : 'inline';
-				};
-				for (const [key, value] of Object.entries(updates.portLiterals)) {
-					if (sameConfigValue(value, current[key])) continue;
-					const form = spans[key]?.origin ?? defaultForm(key);
-					if (value === undefined || value === null) {
-						ops.push({ op: 'removeConfig', node: nodeId, key, form });
-					} else {
-						ops.push({ op: 'setConfig', node: nodeId, key, value: formatConfigValue(value), form });
-					}
-				}
-				// A key REMOVED from the update map is a cleared literal.
-				for (const key of Object.keys(current)) {
-					if (!(key in updates.portLiterals)) {
-						ops.push({ op: 'removeConfig', node: nodeId, key, form: spans[key]?.origin ?? defaultForm(key) });
-					}
-				}
+				ops.push(...diffPortLiteralOps(
+					nodeId,
+					updates.portLiterals,
+					(foldNode?.portLiterals as Record<string, unknown> | undefined) ?? {},
+					(foldNode?.portLiteralSpans as Record<string, { origin: 'inline' | 'connection' }> | undefined) ?? {},
+					foldNode?.inputs ?? [],
+				));
 			}
 			if ('portValueForm' in updates && updates.portValueForm) {
 				const { key, form } = updates.portValueForm;
@@ -846,7 +827,12 @@
 					// writing one into the source signature would turn it into a real
 					// declared port that no longer dies with its carry. Strip them
 					// from every signature we emit.
-					const inputs = toPortSigs(((updates.inputs ?? node.data.inputs) as PortDefinition[]).filter(p => !p.synthesizedFromCarry));
+					// `config`-exposure inputs are metadata-derived settings,
+					// never source-declared ports: writing one into the header
+					// signature would collide with the compiler's config-input
+					// rule. Strip them, like the carry-synthesized ghosts.
+					const inputs = toPortSigs(((updates.inputs ?? node.data.inputs) as PortDefinition[])
+						.filter(p => !p.synthesizedFromCarry && inputExposure(p) !== 'config'));
 					const outputs = toPortSigs((updates.outputs ?? node.data.outputs) as PortLike[]);
 					const isContainer = node.type === 'group' || node.type === 'groupCollapsed';
 					if (isContainer) {

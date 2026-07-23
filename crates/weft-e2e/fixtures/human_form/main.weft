@@ -20,6 +20,9 @@ start = TestSseTrigger {
 review = HumanQuery {
   title: "Approve the change?"
   fields: [{
+    "fieldType": "display",
+    "key": "context"
+  }, {
     "fieldType": "approve_reject",
     "key": "decision"
   }]

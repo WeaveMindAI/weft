@@ -2669,8 +2669,7 @@ mod replay_tests {
             None,
             uuid::Uuid::nil(),
             weft_core::frames::LoopFrames::default(),
-            weft_core::context::ValueBag::ports(Default::default()),
-            weft_core::context::ValueBag::config(Default::default()),
+            weft_core::context::ValueBag::inputs(Default::default(), Default::default()),
             handle,
         )
     }

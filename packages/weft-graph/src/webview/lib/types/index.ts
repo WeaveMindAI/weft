@@ -20,10 +20,10 @@ import type {
 // webview-local copy that drifts from the wire shape).
 export type { NodeExecutionStatus };
 export type { NodeFeaturesWire as NodeFeatures } from '../../../shared/protocol';
-// The literal-placement ladder IS the wire type, re-exported for the same
-// one-definition reason.
-import type { LiteralPlacement } from '../../../protocol';
-export type { LiteralPlacement };
+// The exposure/widget vocabulary IS the wire type, re-exported for the
+// same one-definition reason.
+import type { Exposure, Widget, WidgetKind } from '../../../protocol';
+export type { Exposure, Widget, WidgetKind };
 
 // =============================================================================
 // PORT TYPE SYSTEM
@@ -362,45 +362,16 @@ export function inferTypeFromValue(value: unknown): WeftType {
 	return { kind: 'primitive', value: 'String' };
 }
 
-/** The default literal placement for a port of this type. Mirrors
- *  WeftType::default_literal_placement() in Rust: plain data (primitives,
- *  lists, dicts, JsonDict, unions of those) takes a literal anywhere;
- *  file types, TypeVar, and MustOverride only as an assignment
- *  statement; a Bus never. A union is as restrictive as its most
- *  restrictive member. */
-export function defaultLiteralPlacement(t: WeftType): LiteralPlacement {
-	switch (t.kind) {
-		case 'primitive':
-			return FILE_PRIMITIVES.includes(t.value) ? 'assignment' : 'anywhere';
-		case 'list':
-			return defaultLiteralPlacement(t.inner);
-		case 'dict':
-			return defaultLiteralPlacement(t.value);
-		case 'union': {
-			const order: LiteralPlacement[] = ['anywhere', 'assignment', 'none'];
-			return t.types
-				.map(defaultLiteralPlacement)
-				.reduce((worst, p) => (order.indexOf(p) > order.indexOf(worst) ? p : worst), 'anywhere');
-		}
-		case 'json_dict':
-			return 'anywhere';
-		case 'bus':
-			// A bus is a live runtime handle: no literal ever.
-			return 'none';
-		case 'typevar':
-			return 'assignment';
-		case 'must_override':
-			return 'assignment';
-	}
-}
-
-/** A port's literal placement. Uses the explicit `literal` level when
- *  set; falls back to the default determined by the port type. */
-export function portLiteralPlacement(port: PortDefinition): LiteralPlacement {
-	if (port.literal !== undefined) return port.literal;
-	const parsed = parseWeftType(port.portType);
-	if (!parsed) return 'none';
-	return defaultLiteralPlacement(parsed);
+/** An input's exposure. The compiler RESOLVES exposure onto every
+ *  instance input and the CLI resolves it onto every catalog input, so
+ *  the editor never re-derives it from the type. The fallback exists
+ *  ONLY for a locally-added port that has not round-tripped through a
+ *  parse yet: its type is the `MustOverride` placeholder, whose
+ *  exposure is `assignment` (no braces literal can be typed for an
+ *  unknown type). */
+export function inputExposure(port: PortDefinition): Exposure {
+	if (port.exposure !== undefined) return port.exposure;
+	return String(port.portType) === 'MustOverride' ? 'assignment' : 'all';
 }
 
 /** Unify a list of types. If all identical, return that type. Otherwise, return a union. */
@@ -420,11 +391,23 @@ export interface PortDefinition {
 	portType: PortType;
 	required: boolean;
 	description?: string;
-	/** Where a literal value may be written for this port ('anywhere' =
-	 *  braces or assignment, 'assignment' = statement only, 'none' =
-	 *  wires only). Absent falls to the port type's default. Edges are a
-	 *  separate axis and always legal; an edge wins over a literal. */
-	literal?: LiteralPlacement;
+	/** Where this input's value may come from ('all' | 'assignment' |
+	 *  'config' | 'wire'). RESOLVED by the compiler/CLI on every wire
+	 *  payload; absent only on a locally-added port pre-round-trip
+	 *  (read it through `inputExposure`). Meaningless on outputs. */
+	exposure?: Exposure;
+	/** The input's effective editor widget, resolved by the compiler/CLI
+	 *  (declared, else derived from the type). Absent on outputs and on
+	 *  locally-added ports pre-round-trip. */
+	widget?: Widget;
+	/** The input's declared default value: rendered as the effective
+	 *  value when nothing else drives the input; supplied by the runtime
+	 *  at execution. Never written into source. */
+	default?: unknown;
+	/** Editor label override (defaults to the name). */
+	label?: string;
+	/** Editor placeholder for the input's field. */
+	placeholder?: string;
 	/** True iff this is the auto-synthesized input half of a loop carry port.
 	 *  The editor renders it as a ghost mirror of the carry output; the user
 	 *  edits the output's role to remove or rename it, never this side. */
@@ -435,35 +418,32 @@ export interface PortDefinition {
 // Field Types (for node configuration UI)
 // =============================================================================
 
-// TODO: add 'openai' and 'anthropic' providers when we support direct API keys for those
-export type ApiKeyProvider = "openrouter" | "elevenlabs" | "tavily" | "apollo";
-
-// SYNC: FieldType 'file_drop' <-> packages/weft-graph/src/protocol.ts FieldKind, crates/weft-core/src/node.rs FieldType::FileDrop
-export type FieldType = "text" | "textarea" | "code" | "select" | "multiselect" | "number" | "checkbox" | "password" | "api_key" | "form_builder" | "file_drop";
-
+/// The RENDER shape of one input's editor field: the input's resolved
+/// widget flattened for the controls (`type` mirrors `Widget.kind`
+/// exactly, unknown-kind forward-compat included; there is
+/// deliberately no parallel field-type union). Built from an
+/// `InputDefinition` by `fieldForInput`; components never derive any
+/// of it themselves.
 export interface FieldDefinition {
 	key: string;
 	label: string;
-	type: FieldType;
-	/// This field edits a PORT's body value (an entry in the node's
-	/// portLiterals), not a config field. Its value routes through the
-	/// strip's `portValues` record, its DOM/editor identity is prefixed,
-	/// and it may legally share a key with a config field (a wired-only
-	/// port's literal next to a same-named field).
+	type: WidgetKind | string;
+	/// This field edits a WIREABLE input's body value (an entry in the
+	/// node's portLiterals). A `config`-exposure input's field edits the
+	/// config home instead (portDriven false). The strip routes the
+	/// value read/write accordingly.
 	portDriven?: boolean;
 	placeholder?: string;
 	options?: string[];
 	defaultValue?: unknown;
 	description?: string;
-	provider?: ApiKeyProvider; // For api_key fields: which platform key to use
+	provider?: string; // For api_key fields: which runtime key the Credits mode uses
 	accept?: string; // For file_drop fields: narrows the type-derived HTML-accept filter
 	fileType?: string; // For file_drop fields: the declared weft file type (Image/Audio/.../File)
+	language?: string; // For code fields: the CodeMirror syntax ("python", "javascript", ...)
 	min?: number; // For number fields: minimum allowed value (clamped on blur)
 	max?: number; // For number fields: maximum allowed value (clamped on blur)
 	step?: number; // For number fields: granularity of the input (used by slider/number)
-	maxLength?: number; // For text/textarea fields: max character count, enforced in UI with counter
-	minLength?: number; // For text/textarea fields: min character count
-	pattern?: string; // For text fields: HTML5 regex validation pattern
 }
 
 // =============================================================================
@@ -614,7 +594,6 @@ export interface NodeTemplate {
 	/// built from the `weft describe-nodes` payload; defaults to false
 	/// when the catalog entry doesn't declare it.
 	requiresInfra: boolean;
-	fields: FieldDefinition[];
 	defaultInputs: PortDefinition[];
 	defaultOutputs: PortDefinition[];
 	features?: NodeFeatures;

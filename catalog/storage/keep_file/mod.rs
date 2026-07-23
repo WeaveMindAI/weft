@@ -16,13 +16,15 @@ pub struct KeepFileNode;
 #[async_trait]
 impl Node for KeepFileNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let file: serde_json::Value = ctx.ports.get("file")?;
+        let file: serde_json::Value = ctx.inputs.get("file")?;
         // 0 days = never expire; otherwise a fixed-day window that any
         // access renews. The scope is Execution because keep only
         // applies there (the box rejects keep on project/shared keys);
         // the key itself carries its scope, so the handle's scope here
         // is just the verb's home.
-        let ttl_days: u64 = ctx.config.get_or("ttl_days", 30)?;
+        // `ttl_days` declares a metadata default, so the bag always
+        // holds a value; a required read keeps the default in ONE place.
+        let ttl_days: u64 = ctx.inputs.get("ttl_days")?;
         let ttl = if ttl_days == 0 {
             KeepTtl::Never
         } else {

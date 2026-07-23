@@ -16,9 +16,11 @@ pub struct FetchToStorageNode;
 #[async_trait]
 impl Node for FetchToStorageNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let url: String = ctx.ports.get("url")?;
-        let keep: bool = ctx.config.get_or("keep", false)?;
-        let filename: Option<String> = ctx.ports.opt("filename")?;
+        let url: String = ctx.inputs.get("url")?;
+        // `keep` declares a metadata default, so the bag always holds a
+        // value; a required read keeps the default in ONE place.
+        let keep: bool = ctx.inputs.get("keep")?;
+        let filename: Option<String> = ctx.inputs.opt("filename")?;
         let keep_ttl = keep.then_some(KeepTtl::Default);
 
         // The whole fetch-stream-into-storage path is a language

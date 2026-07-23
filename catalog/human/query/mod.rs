@@ -15,17 +15,19 @@ pub struct HumanQueryNode;
 #[async_trait]
 impl Node for HumanQueryNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let raw_fields = parse_form_fields(ctx.config.object()?);
+        let raw_fields = parse_form_fields(ctx.inputs.object()?);
         let specs = &self.manifest().form_field_specs;
 
-        let title: String = ctx.config.get_or("title", String::new())?;
-        let description: Option<String> = ctx.config.opt("description")?;
+        let title: String = ctx.inputs.get_or("title", String::new())?;
+        let description: Option<String> = ctx.inputs.opt("description")?;
 
-        // Project the node's input port values into a flat
-        // {key: value} map so display / prefilled / source=input
-        // fields can lift them out by key.
+        // Project the node's DATA inputs into a flat {key: value} map so
+        // display / prefilled / source=input fields can lift them out by
+        // key. `custom()` is exactly the form-derived ports plus wired
+        // values: the node's own settings (title/description/fields)
+        // are not prefill data and never appear in it.
         let mut input_obj = serde_json::Map::new();
-        for (k, v) in ctx.ports.iter() {
+        for (k, v) in ctx.inputs.custom() {
             input_obj.insert(k.clone(), v.clone());
         }
         let input_value = serde_json::Value::Object(input_obj);

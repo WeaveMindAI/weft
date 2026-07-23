@@ -3,7 +3,7 @@
 	import { Handle, Position, useEdges, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
-	import { parseWeftType, portLiteralPlacement } from "../../types";
+	import { parseWeftType, inputExposure } from "../../types";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
 	import CodeEditor from "../CodeEditor.svelte";
@@ -18,7 +18,7 @@
 	import { isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { createPortContextMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
-	import { widgetForPortType } from "../../utils/port-widget";
+	import { fieldForInput } from "../../utils/input-field";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
@@ -135,8 +135,8 @@
 	const nodeFormFieldSpecs: FormFieldSpec[] = $derived(typeConfig.formFieldSpecs ?? []);
 	const nodeFormSpecMap: Record<string, FormFieldSpec> = $derived(buildSpecMap(nodeFormFieldSpecs));
 
-	/** Ports that have an incoming edge. Used to hide synthesized config fields
-	 *  for wired ports (the edge is the source of truth, config is redundant). */
+	/** Input ports that have an incoming edge, so their field is hidden
+	 *  (the edge is the value's source of truth). */
 	const wiredInputPorts: Set<string> = $derived.by(() => {
 		const wired = new Set<string>();
 		for (const e of edgesState.current) {
@@ -166,29 +166,21 @@
 		return filled;
 	});
 
-	/** Fields rendered in the expanded view: catalog fields + a synthesized
-	 *  PORT-DRIVEN field for every unwired input port that may take a
-	 *  literal: typing into it writes the value into the source. An
-	 *  'anywhere' port's field can take either written form; an
-	 *  'assignment' port's field is locked to the statement form; a
-	 *  'none' port never gets a field (wires only). An edge hides the
-	 *  field: the wire is the driver. The control kind derives from the
-	 *  port TYPE via the one central mapping. */
+	/** Fields rendered in the expanded view: the node's INPUTS are the
+	 *  field list, one field per input, flattened from each input's
+	 *  RESOLVED widget (the editor derives nothing). Rendering rules by
+	 *  exposure: 'wire' inputs never get a field; a wired input shows no
+	 *  field (the edge is the driver); 'config' inputs edit the config
+	 *  home; 'all'/'assignment' inputs edit the port-literal home
+	 *  (portDriven), with 'assignment' locked to the statement form. */
 	const displayedFields: FieldDefinition[] = $derived.by(() => {
-		const catalogFields = typeConfig.fields ?? [];
-		const result: FieldDefinition[] = [...catalogFields];
 		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
-		for (const port of inputList) {
-			if (wiredInputPorts.has(port.name)) continue; // edge wins, no field
-			if (portLiteralPlacement(port) === 'none') continue; // wires only, never a field
-			const widget = widgetForPortType(String(port.portType ?? ''));
-			result.push({
-				key: port.name,
-				label: port.name,
-				type: widget,
-				portDriven: true,
-				...(widget === 'file_drop' ? { fileType: String(port.portType) } : {}),
-			});
+		const result: FieldDefinition[] = [];
+		for (const input of inputList) {
+			if (input.synthesizedFromCarry) continue; // carry ghost: not editable
+			if (inputExposure(input) === 'wire') continue; // wires only, never a field
+			if (wiredInputPorts.has(input.name)) continue; // edge wins, no field
+			result.push(fieldForInput(input));
 		}
 		return result;
 	});
@@ -196,17 +188,17 @@
 	/** The written form of a port-driven field's value ('inline' = braces,
 	 *  'connection' = statement). A value not yet in source defaults to
 	 *  the braces form on its first write, except on an assignment-only
-	 *  port, where the statement form is the only legal one. */
+	 *  input, where the statement form is the only legal one. */
 	function portFieldForm(key: string): 'inline' | 'connection' {
 		return portLiteralSpans[key]?.origin ?? (portFieldLocked(key) ? 'connection' : 'inline');
 	}
 
-	/** An assignment-only port's field is locked to the statement form:
+	/** An assignment-only input's field is locked to the statement form:
 	 *  the braces form cannot drive it, so the toggle is disabled. */
 	function portFieldLocked(key: string): boolean {
 		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
-		const port = inputList.find((p) => p.name === key);
-		return port !== undefined && portLiteralPlacement(port) !== 'anywhere';
+		const input = inputList.find((p) => p.name === key);
+		return input !== undefined && inputExposure(input) === 'assignment';
 	}
 
 
@@ -254,7 +246,7 @@
 
 	// Check if node has expandable content (fields, run location option, debug preview, etc.)
 	const hasExpandableContent = $derived.by(() => {
-		// Has config fields (catalog-declared or synthesized from config-filled ports)
+		// Has input fields (config/all/assignment inputs not currently wired)
 		if (displayedFields.length > 0) return true;
 		// Has debug preview (Debug node)
 		if (typeConfig.features?.showDebugPreview) return true;
@@ -306,6 +298,11 @@
 	let newInputName = $state('');
 	let newOutputName = $state('');
 	let portContextMenu = $state<{ portName: string; side: 'input' | 'output'; x: number; y: number } | null>(null);
+
+	/// api_key fields whose "Own key" mode the user opened locally
+	/// before typing a key. Purely a view state: the source stays
+	/// untouched (Credits semantics) until a key is actually typed.
+	let ownKeyOpen = $state<Set<string>>(new Set());
 
 	/// Per-secret-item reveal state, keyed by item label. A secret
 	/// is hidden by default (••••); clicking the eye icon toggles
@@ -409,6 +406,11 @@
 	}
 
 	const inputs = $derived(data.inputs || typeConfig.defaultInputs);
+	/** Inputs that render a PORT DOCK. A `config`-exposure input is a
+	 *  design-time setting the graph never wires, so it gets a field in
+	 *  the body but no handle on the edge rail. `inputs` stays the
+	 *  COMPLETE list (edits round-trip the full set). */
+	const wireableInputs = $derived(inputs.filter((p: PortDefinition) => inputExposure(p) !== 'config'));
 	const baseOutputs = $derived(data.outputs || typeConfig.defaultOutputs);
 	// _raw port is rendered separately as a square in the top-right corner
 	const outputs = $derived(baseOutputs);
@@ -417,7 +419,7 @@
 	// Accent bar (2) + header row (32) + content padding (16) + label (24) + ports gap (8) + port rows + buffer (100)
 	const PORT_ROW_HEIGHT = 25;
 	const minResizeHeight = $derived(
-		2 + 32 + 16 + 24 + 8 + Math.max(inputs.length, outputs.length) * PORT_ROW_HEIGHT + 80
+		2 + 32 + 16 + 24 + 8 + Math.max(wireableInputs.length, outputs.length) * PORT_ROW_HEIGHT + 80
 	);
 	
 	// Check if node allows adding ports based on its features
@@ -465,7 +467,11 @@
 	 *  field sets/clears it); nothing text-shaped exists to display, and
 	 *  routing its edits into a file write would clobber the media file. */
 	function fileRefOf(key: string): { path: string; type: string; marker: 'file' | 'asset' } | null {
-		const v = (data.config as Record<string, unknown>)?.[key];
+		// A name's value lives in exactly ONE home (the compiler moves
+		// port-driven values into portLiterals), so read both: a marker on
+		// a port-driven input must be found there or its edits would
+		// clobber the ref with a raw string.
+		const v = portLiterals[key] ?? (data.config as Record<string, unknown>)?.[key];
 		if (!isFileRefValue(v)) return null;
 		return typeReferencesFile(v.__weftFileRef.type) ? null : v.__weftFileRef;
 	}
@@ -639,19 +645,31 @@
 		data.onUpdate?.({ portValueForm: { key, form: next } });
 	}
 
-	function getConfigDisplayValue(fieldKey: string): string {
-		const fs = fileFieldState(fieldKey);
+	/** The stored raw value behind a field, read from the home its
+	 *  exposure routes to (port literal vs config). Every custom-field
+	 *  renderer reads through this so no branch hardcodes a home. */
+	function fieldHomeValue(field: FieldDefinition): unknown {
+		return field.portDriven
+			? portLiterals[field.key]
+			: (data.config as Record<string, unknown>)?.[field.key];
+	}
+
+	function fieldDisplayValue(field: FieldDefinition): string {
+		const fs = fileFieldState(field.key);
 		if (fs) {
 			// File-backed: show resolved content (editable). While loading or on
 			// a read error, show a status (read-only); never the marker as a
 			// value, never a silent fall back to inline content.
-			if (fs.content !== undefined) return fieldEditor.display(fieldKey, fs.content);
+			if (fs.content !== undefined) return fieldEditor.display(field.key, fs.content);
 			if (fs.error !== undefined) return `cannot read ${fs.path}: ${fs.error}`;
 			return `loading ${fs.path}...`;
 		}
-		const v = (data.config as Record<string, unknown>)?.[fieldKey];
+		// The EFFECTIVE value: the set value, else the input's declared
+		// default (what the runtime would supply). Same rule FieldStrip
+		// applies to the primitive controls.
+		const v = fieldHomeValue(field) ?? field.defaultValue;
 		const storeStr = (v === undefined || v === null) ? '' : (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
-		return fieldEditor.display(fieldKey, storeStr);
+		return fieldEditor.display(field.key, storeStr);
 	}
 
 	let addingFormField = $state(false);
@@ -730,17 +748,14 @@
 	function addInputPort() {
 		const name = newInputName.trim();
 		if (!name) return;
-		// Check for duplicate name
+		// One namespace: a user-added port may not take ANY declared
+		// input's name. `inputs` is the complete list (config-exposure
+		// inputs included), so this one check covers what used to be two
+		// (the port-dedup and the config-field collision). Same rule the
+		// compiler enforces (enrich.rs config-input collision); vetoing
+		// here keeps the invalid port out of the source entirely.
 		if (inputs.some((p: PortDefinition) => p.name === name)) {
-			toast.error(`Input port "${name}" already exists`);
-			return;
-		}
-		// A custom input port may not take a declared config field's name: the
-		// braces key and the port would fight over one name from two homes.
-		// Same rule the compiler enforces (enrich.rs custom-port collision);
-		// vetoing here keeps the invalid port out of the source entirely.
-		if ((typeConfig.fields ?? []).some((f) => f.key === name)) {
-			toast.error(`"${name}" is a config field of this node type; a custom port cannot share its name`);
+			toast.error(`"${name}" is already an input of this node`);
 			return;
 		}
 		const newPort: PortDefinition = {
@@ -1177,9 +1192,10 @@
 		
 		<!-- Ports Section -->
 		<div class="mt-2 flex justify-between text-[10px] text-zinc-500 w-full">
-			<!-- Input Ports -->
+			<!-- Input Ports (wireable inputs only; config-exposure inputs
+			     live in the body as fields, never on the edge rail) -->
 			<div class="space-y-1 min-w-0 flex-1">
-				{#each inputs as input}
+				{#each wireableInputs as input}
 					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortColor(input.portType), 'input')}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
@@ -1410,35 +1426,49 @@
 							ondrop={() => { if (fileFieldReadonly(field.key)) explainReadonlyField(field.key); }}
 						>
 								<CodeEditor
-									value={getConfigDisplayValue(field.key)}
+									value={fieldDisplayValue(field)}
 									readonly={fileFieldReadonly(field.key)}
 									placeholder={field.placeholder}
+									language={field.language}
 									minHeight="120px"
 									onchange={(newValue) => {
 										// Direct, not via fieldEditor: CodeEditor has no blur to clear
 										// the field editor's active key, which would strand the field
 										// on its local value and mask external (file -> graph) updates.
-										// updateConfig routes a file-backed field to the (serialized)
-										// file write, so per-change writes are safe, just not debounced.
-										updateConfig(field.key, newValue);
+										// A file-backed field routes to the (serialized) file write;
+										// otherwise the value goes to the home the field's exposure
+										// routes to (port literal vs config), same as every control.
+										if (fileFieldState(field.key)) {
+											updateConfig(field.key, newValue);
+										} else {
+											updateFieldValue(field.key, newValue, field.portDriven);
+										}
 									}}
 								/>
 							</div>
 						{:else if field.type === "api_key"}
-							{@const currentValue = (data.config as Record<string, string>)?.[field.key] || ""}
-							{@const isByok = currentValue !== "" && currentValue !== "__PLATFORM__"}
+							<!-- Two modes, two honest source states. Credits =
+							     the key is ABSENT from source (the runtime
+							     grants its own); Own key = the input carries
+							     the user's key string. There is no sentinel:
+							     picking "Own key" opens the field locally, and
+							     the source only changes once a key is typed.
+							     An empty typed value writes "" (the compiler
+							     flags it `empty-byok` so it can't run). -->
+							{@const currentValue = fieldHomeValue(field) as string | undefined}
+							{@const isByok = ownKeyOpen.has(field.key) || (currentValue !== undefined && currentValue !== "__PLATFORM__")}
 							<div class="space-y-1.5">
 								<div class="flex justify-center">
 									<div class="inline-flex rounded-md border border-border overflow-hidden">
 										<button
 											type="button"
 											class="text-[10px] px-3 py-1 font-medium transition-colors {!isByok ? 'bg-emerald-500 text-white' : 'bg-background text-muted-foreground hover:text-foreground'}"
-											onclick={(e) => { e.stopPropagation(); updateConfig(field.key, ''); }}
+											onclick={(e) => { e.stopPropagation(); ownKeyOpen.delete(field.key); ownKeyOpen = new Set(ownKeyOpen); updateFieldValue(field.key, null, field.portDriven); }}
 										>Credits</button>
 										<button
 											type="button"
 											class="text-[10px] px-3 py-1 font-medium transition-colors border-l border-border {isByok ? 'bg-blue-500 text-white' : 'bg-background text-muted-foreground hover:text-foreground'}"
-											onclick={(e) => { e.stopPropagation(); if (!isByok) updateConfig(field.key, '__BYOK__'); }}
+											onclick={(e) => { e.stopPropagation(); if (!isByok) { ownKeyOpen = new Set(ownKeyOpen).add(field.key); } }}
 										>Own key</button>
 									</div>
 								</div>
@@ -1447,10 +1477,10 @@
 										type="password"
 										class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none font-mono"
 										placeholder="sk-or-v1-..."
-										value={fieldEditor.display(field.key, currentValue === '__BYOK__' ? '' : currentValue)}
-										onfocus={() => fieldEditor.focus(field.key, currentValue === '__BYOK__' ? '' : currentValue)}
-										oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, (v) => updateConfig(field.key, v || '__BYOK__'))}
-										onblur={() => fieldEditor.blur(field.key, (v) => updateConfig(field.key, v || '__BYOK__'))}
+										value={fieldEditor.display(field.key, currentValue ?? '')}
+										onfocus={() => fieldEditor.focus(field.key, currentValue ?? '')}
+										oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, (v) => updateFieldValue(field.key, v, field.portDriven))}
+										onblur={() => fieldEditor.blur(field.key, (v) => updateFieldValue(field.key, v, field.portDriven))}
 										onclick={(e) => e.stopPropagation()}
 									/>
 								{/if}
@@ -1462,7 +1492,7 @@
 							     onto the same-named input port (or the node reads from
 							     config). Source never holds storage keys. -->
 							<FileDropField
-								value={field.portDriven ? portLiterals[field.key] : (data.config as Record<string, unknown>)?.[field.key]}
+								value={fieldHomeValue(field)}
 								accept={field.accept}
 								fileType={field.fileType}
 								onUpdate={(ref) => updateFieldValue(field.key, ref, field.portDriven)}

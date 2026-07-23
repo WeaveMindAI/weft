@@ -54,16 +54,16 @@ pub struct ExecPythonNode;
 #[async_trait]
 impl Node for ExecPythonNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let code: String = ctx.config.get("code")?;
+        let code: String = ctx.inputs.get("code")?;
 
-        // Bind every input port value under its port name in the
-        // Python namespace. `ctx.ports.iter()` only yields ports the
-        // runtime delivered a pulse for (including null pulses from
-        // skipped upstreams), which matches the "if this input was
-        // null, branch" pattern in user code.
+        // Bind every DATA input under its name in the Python namespace
+        // (including null values from skipped upstreams, which matches
+        // the "if this input was null, branch" pattern in user code).
+        // `custom()` is exactly the user's inline-declared ports: the
+        // node's own settings (`code`) never bind as variables.
         let inputs: Vec<(String, Value)> = ctx
-            .ports
-            .iter()
+            .inputs
+            .custom()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 

@@ -3,19 +3,53 @@
   "label": "Ask (custom provider)",
   "description": "One LLM call through a PROJECT-DEFINED provider (openrouter_custom), whose meter ships in this project. Used by the e2e rig to prove a project can define its own paid provider and have the worker discover its meter and price a real call.",
   "category": "Custom",
-  "tags": ["ai", "custom", "provider", "e2e"],
+  "tags": [
+    "ai",
+    "custom",
+    "provider",
+    "e2e"
+  ],
   "icon": "BrainCircuit",
   "color": "#7c6f9f",
   "inputs": [
-    { "name": "prompt", "type": "String", "required": true, "description": "The prompt to send." }
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "The prompt to send."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Model"
+    },
+    {
+      "name": "systemPrompt",
+      "type": "String",
+      "exposure": "config",
+      "label": "System prompt"
+    },
+    {
+      "name": "apiKey",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "api_key",
+        "provider": "openrouter_custom"
+      },
+      "label": "API key",
+      "description": "Your own key for the custom provider. Empty (or Platform) asks the runtime for a granted key; a project-defined provider has none, so the call fails loud."
+    }
   ],
   "outputs": [
-    { "name": "response", "type": "String" }
-  ],
-  "fields": [
-    { "key": "model", "label": "Model", "field_type": { "kind": "text" } },
-    { "key": "systemPrompt", "label": "System prompt", "field_type": { "kind": "textarea" } },
-    { "key": "apiKey", "label": "API key", "field_type": { "kind": "api_key", "provider": "openrouter_custom" }, "description": "Your own key for the custom provider. Empty (or Platform) asks the deployment, which refuses a project-defined provider." }
+    {
+      "name": "response",
+      "type": "String"
+    }
   ],
   "requires_infra": false
 }

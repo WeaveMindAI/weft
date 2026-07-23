@@ -420,7 +420,10 @@ fn collect_catalog(
             if meta.features.hidden {
                 continue;
             }
-            out.insert(node.node_type.clone(), meta.clone());
+            // Ship RESOLVED metadata: every input's exposure + widget
+            // filled with its effective value, so the editor never
+            // re-derives either.
+            out.insert(node.node_type.clone(), meta.resolved());
         }
     }
     out

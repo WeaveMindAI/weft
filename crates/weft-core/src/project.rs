@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::weft_type::{LiteralPlacement, WeftType};
+use crate::weft_type::{Exposure, WeftType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
@@ -159,6 +159,16 @@ impl ConfigFieldSpan {
     }
 }
 
+/// True for config keys owned by the compiler/editor rather than the
+/// node: `_`-reserved per-instance keys (`_label`, `_is_output`,
+/// `_tags`) and the `parentId` boundary pointer merged in at flatten
+/// time. These co-reside in `NodeDefinition.config` but are never node
+/// input data: the input bag skips them so node bodies only ever see
+/// their own inputs.
+pub fn is_internal_config_key(key: &str) -> bool {
+    key.starts_with('_') || key == "parentId"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDefinition {
     pub id: String,
@@ -175,9 +185,9 @@ pub struct NodeDefinition {
     /// side.
     #[serde(default, rename = "groupBoundary")]
     pub group_boundary: Option<GroupBoundary>,
-    /// Enriched input ports. Empty before compile.
+    /// Enriched inputs. Empty before compile.
     #[serde(default)]
-    pub inputs: Vec<PortDefinition>,
+    pub inputs: Vec<InputDefinition>,
     /// Enriched output ports. Empty before compile.
     #[serde(default)]
     pub outputs: Vec<PortDefinition>,
@@ -212,23 +222,21 @@ pub struct NodeDefinition {
     /// config block.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "configSpans")]
     pub config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
-    /// Body values that DRIVE INPUT PORTS, keyed by port name: the value
-    /// behind `n.x = 5` (the assignment form) or `M { x: 5 }` (the braces
-    /// form, `literal: anywhere` ports only). Moved out of `config` by
-    /// the enrich normalization the moment the full port list is known,
-    /// so a name has ONE home: a port's value lives here (the engine
-    /// feeds it onto the port), a config field's value lives in `config`,
-    /// and a braces-closed port may coexist with a same-named field
-    /// without colliding.
+    /// Literal values that DRIVE WIREABLE INPUTS, keyed by input name:
+    /// the value behind `n.x = 5` (the assignment form) or `M { x: 5 }`
+    /// (the braces form, where the input's exposure allows it). Moved
+    /// out of `config` by the enrich normalization the moment the full
+    /// input list is known, so each name has ONE home: a wireable
+    /// input's literal lives here (the engine feeds it onto the input),
+    /// a `config`-exposure input's braces value stays in `config`.
     // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts NodeDefinition.portLiterals
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiterals")]
     pub port_literals: std::collections::BTreeMap<String, Value>,
-    /// Source ranges + written form for `port_literals` entries, keyed by
-    /// port name. Separate from `config_spans` because a braces-closed
-    /// port's literal and a same-named config field each need their own
-    /// span. The `origin` is the form the assignment is WRITTEN in
-    /// (`Connection` = statement form, `Inline` = braces form), which is
-    /// what the editor's form-toggle rewrites.
+    /// Source ranges + written form for `port_literals` entries, keyed
+    /// by input name (the twin of `config_spans` for the other home).
+    /// The `origin` is the form the value is WRITTEN in (`Connection` =
+    /// statement form, `Inline` = braces form), which is what the
+    /// editor's form-toggle rewrites.
     // SYNC: port_literal_spans <-> packages/weft-graph/src/protocol.ts NodeDefinition.portLiteralSpans
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiteralSpans")]
     pub port_literal_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
@@ -344,12 +352,93 @@ pub struct GroupBoundary {
     pub role: GroupBoundaryRole,
 }
 
-/// Port shape on a NODE INSTANCE. This is the enriched version:
-/// TypeVars resolved, derived ports materialized, literal-placement
-/// defaults applied. Nodes declare their ports via NodeMetadata; the
-/// compiler resolves them and stores enriched port lists on the
-/// corresponding NodeDefinition at compile time. Runtime executes
-/// against these enriched ports.
+/// One INPUT on a NODE INSTANCE, enriched: TypeVars resolved, derived
+/// inputs materialized, exposure resolved, and the editor surface
+/// (widget/default/label/placeholder) stamped from the metadata so the
+/// editor never re-derives any of it. The instance twin of the
+/// metadata's `InputSpec`; outputs use the slim [`PortDefinition`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputDefinition {
+    pub name: String,
+    #[serde(rename = "portType")]
+    pub port_type: WeftType,
+    pub required: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Where this input's value may come from (resolved from the
+    /// metadata's explicit level or the type default).
+    // SYNC: InputDefinition.exposure <-> packages/weft-graph/src/protocol.ts InputDefinition.exposure
+    #[serde(default)]
+    pub exposure: Exposure,
+    /// The input's effective editor widget (declared, else derived from
+    /// the RESOLVED instance type after TypeVar substitution). Always
+    /// present after enrich.
+    // SYNC: InputDefinition.widget <-> packages/weft-graph/src/protocol.ts InputDefinition.widget
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget: Option<crate::node::Widget>,
+    /// The input's declared default value, if any (mirrored from the
+    /// metadata so the runtime and the editor read it off the instance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    /// Editor label override (mirrored from the metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Editor placeholder (mirrored from the metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// True for the auto-synthesized INPUT half of a loop carry port.
+    /// The editor uses this to render it as a non-editable ghost mirroring
+    /// the carry output of the same name. Never set on a user-declared input.
+    #[serde(default, rename = "synthesizedFromCarry", skip_serializing_if = "std::ops::Not::not")]
+    pub synthesized_from_carry: bool,
+    /// True when this input comes from the node TYPE's own spec (its
+    /// metadata: `code` on ExecPython, `title` on a form node), false
+    /// when it was added on this INSTANCE (a custom header port, a
+    /// form-derived port, a carry ghost). The runtime uses it to hand
+    /// node bodies their instance data ([`ValueBag::custom`]) without
+    /// each node hardcoding its own setting names.
+    // SYNC: InputDefinition.from_spec <-> packages/weft-graph/src/protocol.ts InputDefinition.fromSpec
+    #[serde(default, rename = "fromSpec", skip_serializing_if = "std::ops::Not::not")]
+    pub from_spec: bool,
+}
+
+impl InputDefinition {
+    /// An input for a pure WIRE port (a boundary passthrough side, a
+    /// source-declared custom port): exposure from the type, no editor
+    /// surface beyond what enrich later stamps.
+    pub fn from_wire_port(port: PortDefinition) -> Self {
+        Self {
+            exposure: port.port_type.default_exposure(),
+            name: port.name,
+            port_type: port.port_type,
+            required: port.required,
+            description: port.description,
+            widget: None,
+            default: None,
+            label: None,
+            placeholder: None,
+            synthesized_from_carry: port.synthesized_from_carry,
+            from_spec: false,
+        }
+    }
+
+    /// The slim wire-port view of this input (drops the input-only
+    /// surface). Used where a group/boundary interface mirrors a node's
+    /// input list.
+    pub fn to_wire_port(&self) -> PortDefinition {
+        PortDefinition {
+            name: self.name.clone(),
+            port_type: self.port_type.clone(),
+            required: self.required,
+            description: self.description.clone(),
+            synthesized_from_carry: self.synthesized_from_carry,
+        }
+    }
+}
+
+/// A pure WIRE port on a node instance's OUTPUT side or a group/loop
+/// interface: a named, typed dock for edges. Inputs are the richer
+/// [`InputDefinition`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortDefinition {
     pub name: String,
@@ -358,14 +447,9 @@ pub struct PortDefinition {
     pub required: bool,
     #[serde(default)]
     pub description: Option<String>,
-    /// Where a literal value may be written for this port (resolved
-    /// from the metadata's explicit level or the type default).
-    // SYNC: PortDefinition.literal <-> packages/weft-graph/src/protocol.ts PortDefinition literal
-    #[serde(default)]
-    pub literal: LiteralPlacement,
-    /// True for the auto-synthesized INPUT half of a loop carry port.
-    /// The editor uses this to render it as a non-editable ghost mirroring
-    /// the carry output of the same name. Never set on a user-declared port.
+    /// True for the auto-synthesized side of a loop carry port (mirrored
+    /// on the loop group's interface). The editor renders it as a
+    /// non-editable ghost of the carry output of the same name.
     #[serde(default, rename = "synthesizedFromCarry", skip_serializing_if = "std::ops::Not::not")]
     pub synthesized_from_carry: bool,
 }
@@ -444,9 +528,8 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
 ///     can make the same decision when reacting to flaky/recovered
 ///     events.
 ///
-/// Pure walk over `ProjectDefinition`; no I/O. The same function
-/// hosted by `weft-core` is the only copy : neither side maintains
-/// a mirror.
+/// Pure walk over `ProjectDefinition`; no I/O. The copy in
+/// `weft-core` is the only one: neither side maintains a mirror.
 pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
     let edge_idx = EdgeIndex::build(project);
     let triggers: Vec<&str> = project
@@ -524,13 +607,18 @@ mod project_wire_tests {
     /// fails here, not at the customer. Round-trips a populated project.
     #[test]
     fn project_definition_nested_wire_keys() {
-        let port = PortDefinition {
+        let input = InputDefinition {
             name: "inp".into(),
             port_type: WeftType::primitive(crate::weft_type::WeftPrimitive::String),
             required: true,
             description: None,
-            literal: crate::weft_type::LiteralPlacement::Assignment,
+            exposure: crate::weft_type::Exposure::Assignment,
+            widget: None,
+            default: None,
+            label: None,
+            placeholder: None,
             synthesized_from_carry: false,
+            from_spec: false,
         };
         let node = NodeDefinition {
             id: "g.n".into(),
@@ -540,7 +628,7 @@ mod project_wire_tests {
             position: Position { x: 0.0, y: 0.0 },
             scope: vec!["g".into()],
             group_boundary: None,
-            inputs: vec![port.clone()],
+            inputs: vec![input.clone()],
             outputs: vec![],
             features: Default::default(),
             requires_infra: false,
@@ -557,7 +645,7 @@ mod project_wire_tests {
             id: "g".into(),
             kind: GroupKind::Group,
             label: None,
-            in_ports: vec![port],
+            in_ports: vec![input.to_wire_port()],
             out_ports: vec![],
             one_of_required: vec![],
             parent_group_id: None,
@@ -588,6 +676,17 @@ mod project_wire_tests {
         // The renamed keys the TS side depends on:
         assert!(v["nodes"][0].get("nodeType").is_some(), "nodeType key: {v}");
         assert!(v["nodes"][0]["inputs"][0].get("portType").is_some(), "portType key: {v}");
+        // An instance input's resolved surface: `exposure` always
+        // serializes (lowercase tag), the optional members are OMITTED
+        // when absent (never `null`, which the TS optional types don't
+        // model).
+        assert_eq!(v["nodes"][0]["inputs"][0]["exposure"], "assignment", "exposure tag: {v}");
+        for absent in ["widget", "default", "label", "placeholder"] {
+            assert!(
+                v["nodes"][0]["inputs"][0].get(absent).is_none(),
+                "unset `{absent}` must be omitted: {v}"
+            );
+        }
         assert!(v["groups"][0].get("inPorts").is_some(), "inPorts key: {v}");
         assert!(v["groups"][0].get("nodeIds").is_some(), "nodeIds key: {v}");
         assert!(v.get("createdAt").is_some(), "createdAt key: {v}");

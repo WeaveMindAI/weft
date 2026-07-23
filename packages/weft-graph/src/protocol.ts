@@ -8,26 +8,46 @@ export interface Span {
   endColumn: number;
 }
 
-/// Where a LITERAL value may be written for an input port in weft source:
-/// 'anywhere' = config braces or assignment statement, 'assignment' =
-/// statement only, 'none' = wires only. Edges are a separate axis and
-/// always legal (both `n.x = other.y` and `n = M { x: other.y }` lower
-/// to the same wire).
-// SYNC: LiteralPlacement <-> crates/weft-core/src/weft_type.rs LiteralPlacement
-export type LiteralPlacement = 'anywhere' | 'assignment' | 'none';
+/// Where an input's value may come from. Exposure governs LITERALS:
+/// 'all' = braces or assignment plus wires, 'assignment' = statement
+/// only plus wires, 'config' = braces only and NOT wireable (a pure
+/// design-time setting), 'wire' = wires alone.
+// SYNC: Exposure <-> crates/weft-core/src/weft_type.rs Exposure
+export type Exposure = 'all' | 'assignment' | 'config' | 'wire';
 
+/// A pure WIRE port on a node instance's output side or a group/loop
+/// interface. Inputs are the richer `InputDefinition`.
 export interface PortDefinition {
   name: string;
   portType: string;
   required: boolean;
-  // SYNC: PortDefinition literal <-> crates/weft-core/src/project.rs PortDefinition.literal
-  literal: LiteralPlacement;
   description?: string;
   /// True iff this port was auto-synthesized by the loop-lowering pass
   /// (the input side of a carry port). The editor renders it as a ghost
   /// mirror of the matching carry output. Never user-editable; the user
   /// changes the output's role to remove the synthesized input.
   synthesizedFromCarry?: boolean;
+}
+
+/// One INPUT on a node instance, enriched: exposure resolved and the
+/// editor surface (widget/default/label/placeholder) stamped by the
+/// compiler, so the editor never re-derives any of it. The optional
+/// members are only absent on a locally-added port that has not
+/// round-tripped through a parse yet.
+// SYNC: InputDefinition <-> crates/weft-core/src/project.rs InputDefinition
+export interface InputDefinition extends PortDefinition {
+  // SYNC: InputDefinition.exposure <-> crates/weft-core/src/project.rs InputDefinition.exposure
+  exposure?: Exposure;
+  // SYNC: InputDefinition.widget <-> crates/weft-core/src/project.rs InputDefinition.widget
+  widget?: Widget;
+  default?: unknown;
+  label?: string;
+  placeholder?: string;
+  /// True when the input comes from the node type's own spec (a
+  /// setting), absent for instance-added ports (custom header ports,
+  /// form-derived ports).
+  // SYNC: InputDefinition.fromSpec <-> crates/weft-core/src/project.rs InputDefinition.from_spec
+  fromSpec?: boolean;
 }
 
 /// Source span of one config field plus how it was written. `origin` tells
@@ -107,7 +127,7 @@ export interface NodeDefinition {
   position: { x: number; y: number };
   scope: string[];
   groupBoundary: { groupId: string; role: 'In' | 'Out' } | null;
-  inputs: PortDefinition[];
+  inputs: InputDefinition[];
   outputs: PortDefinition[];
   features: NodeFeaturesWire;
   requiresInfra?: boolean;
@@ -192,10 +212,7 @@ export interface Diagnostic {
   code?: string;
 }
 
-// v1 parity: FieldDefinition carries per-kind extras. We serialize the
-// full set so the webview can render min/max/pattern/options/etc.
-export type ApiKeyProvider = 'openrouter' | 'elevenlabs' | 'tavily' | 'apollo';
-export type FieldKind =
+export type WidgetKind =
   | 'text'
   | 'textarea'
   | 'code'
@@ -204,28 +221,29 @@ export type FieldKind =
   | 'number'
   | 'checkbox'
   | 'password'
-  // SYNC: FieldKind 'file_drop' <-> crates/weft-core/src/node.rs FieldType::FileDrop
+  // SYNC: WidgetKind 'file_drop' <-> crates/weft-core/src/node.rs Widget::FileDrop
   | 'file_drop'
   | 'api_key'
   | 'form_builder';
 
-// Every key a `field_type` object may carry, one per Rust variant payload.
-// No index signature: the Rust side rejects unknown keys, so a key that is
-// not listed here cannot survive a metadata load and must not typecheck.
-// SYNC: FieldType <-> crates/weft-core/src/node.rs FieldType
-export interface FieldType {
-  kind: FieldKind | string;
-  /// code
+// The editor control an input renders. Every key a widget object may
+// carry, one per Rust variant payload. No index signature: the Rust
+// side rejects unknown keys, so a key that is not listed here cannot
+// survive a metadata load and must not typecheck.
+// SYNC: Widget <-> crates/weft-core/src/node.rs Widget
+export interface Widget {
+  kind: WidgetKind | string;
+  /// code: syntax highlighting language ("python", "javascript", ...).
   language?: string;
   /// select, multiselect
   options?: string[];
   /// file_drop: narrows the filter derived from `type`.
   accept?: string;
   /// file_drop: the declared weft file type (Image/Audio/Video/Blob/File).
-  // SYNC: FieldType.type <-> crates/weft-core/src/node.rs FieldType::FileDrop file_type
+  // SYNC: Widget.type <-> crates/weft-core/src/node.rs Widget::FileDrop file_type
   type?: string;
-  /// api_key
-  provider?: ApiKeyProvider;
+  /// api_key: the provider whose runtime key the Credits mode uses.
+  provider?: string;
   /// number
   min?: number;
   /// number
@@ -234,24 +252,28 @@ export interface FieldType {
   step?: number;
 }
 
-// SYNC: FieldDef <-> crates/weft-core/src/node.rs FieldDef
-export interface FieldDef {
-  key: string;
-  label: string;
-  field_type: FieldType;
-  default_value?: unknown;
-  required?: boolean;
-  description?: string;
-  placeholder?: string;
-}
-
-// SYNC: PortDef <-> crates/weft-core/src/node.rs PortDef
-export interface PortDef {
+// One declared INPUT of a node type, as authored in metadata.json and
+// RESOLVED by the CLI before it ships (exposure + widget always filled
+// with their effective values on this wire).
+// SYNC: InputSpec <-> crates/weft-core/src/node.rs InputSpec
+export interface InputSpec {
   name: string;
   type: string;
   required?: boolean;
-  // SYNC: PortDef literal <-> crates/weft-core/src/node.rs PortDef.literal
-  literal?: LiteralPlacement;
+  // SYNC: InputSpec.exposure <-> crates/weft-core/src/node.rs InputSpec.exposure
+  exposure?: Exposure;
+  widget?: Widget;
+  default?: unknown;
+  label?: string;
+  placeholder?: string;
+  description?: string;
+}
+
+// SYNC: OutputSpec <-> crates/weft-core/src/node.rs OutputSpec
+export interface OutputSpec {
+  name: string;
+  type: string;
+  required?: boolean;
   description?: string;
 }
 
@@ -264,7 +286,7 @@ export type NodeCategory =
   | 'Debug'
   | 'Infrastructure';
 
-// SYNC: CatalogEntry/FieldDef/FieldType/PortDef <-> crates/weft-core/src/node.rs
+// SYNC: CatalogEntry/InputSpec/Widget/OutputSpec <-> crates/weft-core/src/node.rs
 //       NodeMetadata (the `weft describe-nodes` serialization these mirror)
 export interface CatalogEntry {
   type: string;
@@ -274,9 +296,8 @@ export interface CatalogEntry {
   tags: string[];
   icon?: string;
   color?: string;
-  inputs: PortDef[];
-  outputs: PortDef[];
-  fields: FieldDef[];
+  inputs: InputSpec[];
+  outputs: OutputSpec[];
   requires_infra?: boolean;
   features?: NodeFeaturesWire;
   /** Form-field vocabulary for nodes whose `features.hasFormSchema`

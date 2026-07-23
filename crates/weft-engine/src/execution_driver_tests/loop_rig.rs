@@ -9,6 +9,12 @@
         Edge, GroupBoundary, GroupBoundaryRole, NodeDefinition, PortDefinition, Position,
         ProjectDefinition,
     };
+
+    /// Wrap bare wire ports as instance inputs (the rig declares pure
+    /// wire ports; the instance type carries the resolved input surface).
+    fn inputs_of(ports: Vec<PortDefinition>) -> Vec<weft_core::project::InputDefinition> {
+        ports.into_iter().map(weft_core::project::InputDefinition::from_wire_port).collect()
+    }
     use weft_core::pulse::PulseTable;
     use weft_core::weft_type::{WeftPrimitive, WeftType};
     use weft_journal::ExecEvent;
@@ -90,21 +96,19 @@
             position: Position { x: 0.0, y: 0.0 },
             scope: vec![],
             group_boundary: Some(GroupBoundary { group_id: group_id.clone(), role: GroupBoundaryRole::In }),
-            inputs: vec![PortDefinition {
+            inputs: inputs_of(vec![PortDefinition {
                 name: "items".into(),
                 port_type: list_of(primitive(WeftPrimitive::String)),
                 required: true,
                 description: None,
-                literal: weft_core::weft_type::LiteralPlacement::None,
                 synthesized_from_carry: false,
-            }],
+            }]),
             outputs: vec![
                 PortDefinition {
                     name: "items".into(),
                     port_type: primitive(WeftPrimitive::String),
                     required: false,
                     description: None,
-                    literal: weft_core::weft_type::LiteralPlacement::None,
                     synthesized_from_carry: false,
                 },
                 PortDefinition {
@@ -112,7 +116,6 @@
                     port_type: primitive(WeftPrimitive::Number),
                     required: false,
                     description: None,
-                    literal: weft_core::weft_type::LiteralPlacement::None,
                     synthesized_from_carry: false,
                 },
             ],
@@ -141,13 +144,12 @@
             position: Position { x: 0.0, y: 0.0 },
             scope: vec![],
             group_boundary: Some(GroupBoundary { group_id: group_id.clone(), role: GroupBoundaryRole::Out }),
-            inputs: vec![
+            inputs: inputs_of(vec![
                 PortDefinition {
                     name: "results".into(),
                     port_type: primitive(WeftPrimitive::String),
                     required: false,
                     description: None,
-                    literal: weft_core::weft_type::LiteralPlacement::None,
                     synthesized_from_carry: false,
                 },
                 PortDefinition {
@@ -155,16 +157,14 @@
                     port_type: primitive(WeftPrimitive::Boolean),
                     required: false,
                     description: None,
-                    literal: weft_core::weft_type::LiteralPlacement::None,
                     synthesized_from_carry: false,
                 },
-            ],
+            ]),
             outputs: vec![PortDefinition {
                 name: "results".into(),
                 port_type: list_of_nullable(primitive(WeftPrimitive::String)),
                 required: false,
                 description: None,
-                literal: weft_core::weft_type::LiteralPlacement::None,
                 synthesized_from_carry: false,
             }],
             features: Default::default(),
@@ -189,20 +189,18 @@
             position: Position { x: 0.0, y: 0.0 },
             scope: vec![group_id.clone()],
             group_boundary: None,
-            inputs: vec![PortDefinition {
+            inputs: inputs_of(vec![PortDefinition {
                 name: "in".into(),
                 port_type: primitive(WeftPrimitive::String),
                 required: true,
                 description: None,
-                literal: weft_core::weft_type::LiteralPlacement::None,
                 synthesized_from_carry: false,
-            }],
+            }]),
             outputs: vec![PortDefinition {
                 name: "out".into(),
                 port_type: primitive(WeftPrimitive::String),
                 required: false,
                 description: None,
-                literal: weft_core::weft_type::LiteralPlacement::None,
                 synthesized_from_carry: false,
             }],
             features: Default::default(),
@@ -225,14 +223,13 @@
             position: Position { x: 0.0, y: 0.0 },
             scope: vec![],
             group_boundary: None,
-            inputs: vec![PortDefinition {
+            inputs: inputs_of(vec![PortDefinition {
                 name: "data".into(),
                 port_type: list_of_nullable(primitive(WeftPrimitive::String)),
                 required: true,
                 description: None,
-                literal: weft_core::weft_type::LiteralPlacement::None,
                 synthesized_from_carry: false,
-            }],
+            }]),
             outputs: vec![],
             features: Default::default(),
             requires_infra: false,
@@ -906,14 +903,14 @@
             config: loop_cfg.clone(), position: Position { x: 0.0, y: 0.0 },
             scope: vec![],
             group_boundary: Some(GroupBoundary { group_id: group_id.clone(), role: GroupBoundaryRole::In }),
-            inputs: vec![
-                PortDefinition { name: "items".into(), port_type: list_of(primitive(WeftPrimitive::String)), required: true, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String),         required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-            ],
+            inputs: inputs_of(vec![
+                PortDefinition { name: "items".into(), port_type: list_of(primitive(WeftPrimitive::String)), required: true, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String),         required: false, description: None, synthesized_from_carry: false },
+            ]),
             outputs: vec![
-                PortDefinition { name: "items".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String), required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "index".into(), port_type: primitive(WeftPrimitive::Number), required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
+                PortDefinition { name: "items".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "index".into(), port_type: primitive(WeftPrimitive::Number), required: false, description: None, synthesized_from_carry: false },
             ],
             features: Default::default(), requires_infra: false, images: vec![],
             span: None, header_span: None, config_spans: Default::default(),
@@ -927,14 +924,14 @@
             config: loop_out_cfg, position: Position { x: 0.0, y: 0.0 },
             scope: vec![],
             group_boundary: Some(GroupBoundary { group_id: group_id.clone(), role: GroupBoundaryRole::Out }),
-            inputs: vec![
-                PortDefinition { name: "results".into(), port_type: primitive(WeftPrimitive::String),  required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),  required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "done".into(),    port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-            ],
+            inputs: inputs_of(vec![
+                PortDefinition { name: "results".into(), port_type: primitive(WeftPrimitive::String),  required: false, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),  required: false, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "done".into(),    port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, synthesized_from_carry: false },
+            ]),
             outputs: vec![
-                PortDefinition { name: "results".into(), port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),                   required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
+                PortDefinition { name: "results".into(), port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: false, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),                   required: false, description: None, synthesized_from_carry: false },
             ],
             features: Default::default(), requires_infra: false, images: vec![],
             span: None, header_span: None, config_spans: Default::default(),
@@ -946,12 +943,12 @@
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
             scope: vec![group_id.clone()], group_boundary: None,
-            inputs: vec![
-                PortDefinition { name: "left".into(),  port_type: primitive(WeftPrimitive::String), required: true, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "right".into(), port_type: primitive(WeftPrimitive::String), required: true, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-            ],
+            inputs: inputs_of(vec![
+                PortDefinition { name: "left".into(),  port_type: primitive(WeftPrimitive::String), required: true, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "right".into(), port_type: primitive(WeftPrimitive::String), required: true, description: None, synthesized_from_carry: false },
+            ]),
             outputs: vec![
-                PortDefinition { name: "out".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
+                PortDefinition { name: "out".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false },
             ],
             features: Default::default(), requires_infra: false, images: vec![],
             span: None, header_span: None, config_spans: Default::default(),
@@ -962,10 +959,10 @@
             id: consumer_id.clone(), node_type: "Sink".into(), label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 }, scope: vec![], group_boundary: None,
-            inputs: vec![
-                PortDefinition { name: "data".into(),  port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: true, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-                PortDefinition { name: "final".into(), port_type: primitive(WeftPrimitive::String),                    required: true, description: None, literal: weft_core::weft_type::LiteralPlacement::None, synthesized_from_carry: false },
-            ],
+            inputs: inputs_of(vec![
+                PortDefinition { name: "data".into(),  port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: true, description: None, synthesized_from_carry: false },
+                PortDefinition { name: "final".into(), port_type: primitive(WeftPrimitive::String),                    required: true, description: None, synthesized_from_carry: false },
+            ]),
             outputs: vec![], features: Default::default(), requires_infra: false, images: vec![],
             span: None, header_span: None, config_spans: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),

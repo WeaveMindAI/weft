@@ -33,6 +33,23 @@ out.data = greeting.value
 }
 
 #[test]
+fn enrich_marks_spec_inputs_and_not_instance_ports() {
+    // The spec/instance split is what `ctx.inputs.custom()` keys off:
+    // `code` comes from ExecPython's own metadata (a setting), `a` is a
+    // user-declared header port (instance data).
+    let source = r#"
+py = ExecPython(a: Number) -> (b: Number) { code: "return {'b': a}" }
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let py = project.nodes.iter().find(|n| n.id == "py").unwrap();
+    let code = py.inputs.iter().find(|i| i.name == "code").expect("spec input");
+    let a = py.inputs.iter().find(|i| i.name == "a").expect("instance port");
+    assert!(code.from_spec, "a metadata-declared input is marked from_spec");
+    assert!(!a.from_spec, "a user-declared header port is instance data");
+}
+
+#[test]
 fn enrich_resolves_typevar_through_edge() {
     let source = r#"
 

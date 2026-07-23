@@ -3,19 +3,46 @@
   "label": "WhatsApp Bridge",
   "description": "Provision a per-project WhatsApp bridge (Baileys + WhatsApp Web). Connect with a phone via QR code on first start; the bridge persists its auth state in a PVC so subsequent starts reuse the session.",
   "category": "Communication",
-  "tags": ["whatsapp", "infra", "bridge"],
+  "tags": [
+    "whatsapp",
+    "infra",
+    "bridge"
+  ],
   "icon": "MessageCircle",
   "color": "#25D366",
   "inputs": [],
   "outputs": [
-    { "name": "endpointUrl", "type": "String", "required": false },
-    { "name": "status", "type": "String", "required": false },
-    { "name": "phoneNumber", "type": "String", "required": false },
-    { "name": "jid", "type": "String", "required": false },
-    { "name": "pushName", "type": "String", "required": false }
+    {
+      "name": "endpointUrl",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "status",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "phoneNumber",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "jid",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "pushName",
+      "type": "String",
+      "required": false
+    }
   ],
-  "fields": [],
   "requires_infra": true,
-  "images": ["images/bridge"],
-  "features": { "liveEndpoint": "api" }
+  "images": [
+    "images/bridge"
+  ],
+  "features": {
+    "liveEndpoint": "api"
+  }
 }

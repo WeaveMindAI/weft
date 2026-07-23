@@ -3,18 +3,45 @@
   "label": "OpenRouter",
   "description": "AI language model completion through OpenRouter. Works out of the box with platform credits (default: anthropic/claude-sonnet-4.6). Model, system prompt, sampling parameters, and API key all come from a wired OpenRouterConfig node; without one, the defaults apply.",
   "category": "AI",
-  "tags": ["ai", "gpt", "claude", "completion", "chat", "generate"],
+  "tags": [
+    "ai",
+    "gpt",
+    "claude",
+    "completion",
+    "chat",
+    "generate"
+  ],
   "icon": "BrainCircuit",
   "color": "#7c6f9f",
   "inputs": [
-    { "name": "prompt", "type": "String", "required": true, "description": "The prompt to send to the LLM" },
-    { "name": "config", "type": "Dict[String, String | Number | Boolean]", "required": false, "description": "Optional OpenRouterConfig node carrying ALL settings (model, system prompt, parameters, key). Unwired, the defaults apply.", "literal": "none" }
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "The prompt to send to the LLM"
+    },
+    {
+      "name": "config",
+      "type": "Dict[String, String | Number | Boolean]",
+      "required": false,
+      "description": "Optional OpenRouterConfig node carrying ALL settings (model, system prompt, parameters, key). Unwired, the defaults apply.",
+      "exposure": "wire"
+    },
+    {
+      "name": "parseJson",
+      "type": "Boolean",
+      "exposure": "config",
+      "label": "Parse JSON",
+      "description": "Parse and repair JSON from the response (changes output to Dict)."
+    }
   ],
   "outputs": [
-    { "name": "response", "type": "MustOverride", "required": false, "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly." }
-  ],
-  "fields": [
-    { "key": "parseJson", "label": "Parse JSON", "field_type": { "kind": "checkbox" }, "description": "Parse and repair JSON from the response (changes output to Dict)." }
+    {
+      "name": "response",
+      "type": "MustOverride",
+      "required": false,
+      "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly."
+    }
   ],
   "requires_infra": false,
   "features": {

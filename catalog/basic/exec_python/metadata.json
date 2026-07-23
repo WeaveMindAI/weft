@@ -3,19 +3,23 @@
   "label": "Python",
   "description": "Run a Python snippet. Declare the node's inputs and outputs inline: `ExecPython(x: Number) -> (result: String) { code: \"...\" }`. Inputs arrive as Python variables named after each port. The Python code returns a dict keyed by output port name; a key set to None (or missing) emits no pulse on that port. Exceptions fail the node with the full traceback.",
   "category": "basic",
-  "tags": ["python", "script", "custom"],
+  "tags": [
+    "python",
+    "script",
+    "custom"
+  ],
   "icon": "Code2",
   "color": "#3b82f6",
-  "inputs": [],
-  "outputs": [],
-  "fields": [
+  "inputs": [
     {
-      "key": "code",
-      "label": "Python code",
-      "field_type": { "kind": "textarea" },
-      "required": true
+      "name": "code",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "label": "Python code"
     }
   ],
+  "outputs": [],
   "requires_infra": false,
   "features": {
     "canAddInputPorts": true,

@@ -334,7 +334,7 @@ pub fn build_kicked_input(node: &NodeDefinition, port_snapshot: Option<&Value>) 
 
 /// Check one incoming value against its input port type. THE single
 /// place input type enforcement lives.
-fn check_input(port: &crate::project::PortDefinition, value: &Value) -> InputCheck {
+fn check_input(port: &crate::project::InputDefinition, value: &Value) -> InputCheck {
     if value.is_null()
         || port.port_type.is_unresolved()
         || runtime_type_check(&port.port_type, value)
@@ -356,7 +356,7 @@ fn check_input(port: &crate::project::PortDefinition, value: &Value) -> InputChe
 mod tests {
     use super::{build_kicked_input, check_input, resolve_port_value, InputCheck};
     use crate::frames::LoopIteration;
-    use crate::project::{NodeDefinition, PortDefinition, Position};
+    use crate::project::{InputDefinition, NodeDefinition, Position};
     use crate::pulse::Pulse;
     use crate::NodeFeatures;
     use serde_json::json;
@@ -405,7 +405,7 @@ mod tests {
         assert!(!winner.closed);
     }
 
-    fn port(ty: &str, required: bool) -> PortDefinition {
+    fn port(ty: &str, required: bool) -> InputDefinition {
         serde_json::from_value(json!({
             "name": "p", "portType": ty, "required": required
         }))
@@ -445,7 +445,7 @@ mod tests {
         );
     }
 
-    fn kicked_node(node_type: &str, inputs: Vec<PortDefinition>, literals: serde_json::Value) -> NodeDefinition {
+    fn kicked_node(node_type: &str, inputs: Vec<InputDefinition>, literals: serde_json::Value) -> NodeDefinition {
         NodeDefinition {
             id: "k".into(),
             node_type: node_type.into(),
@@ -485,15 +485,15 @@ mod tests {
         let inputs = vec![
             serde_json::from_value(json!({
                 "name": "from", "portType": "Number",
-                "required": false, "literal": "anywhere",
+                "required": false,
             })).unwrap(),
             serde_json::from_value(json!({
                 "name": "to", "portType": "Number",
-                "required": true, "literal": "anywhere",
+                "required": true,
             })).unwrap(),
             serde_json::from_value(json!({
                 "name": "step", "portType": "Number",
-                "required": false, "literal": "anywhere",
+                "required": false,
             })).unwrap(),
         ];
         let node = kicked_node("Range", inputs, json!({ "from": 0, "to": 10, "step": 2 }));
@@ -509,11 +509,11 @@ mod tests {
         let inputs = vec![
             serde_json::from_value(json!({
                 "name": "endpointUrl", "portType": "String",
-                "required": true, "literal": "anywhere",
+                "required": true,
             })).unwrap(),
             serde_json::from_value(json!({
                 "name": "mode", "portType": "String",
-                "required": false, "literal": "anywhere",
+                "required": false,
             })).unwrap(),
         ];
         let node = kicked_node("Recv", inputs, json!({ "mode": "media" }));
@@ -533,11 +533,11 @@ mod tests {
         let inputs = vec![
             serde_json::from_value(json!({
                 "name": "wired_p", "portType": "Number",
-                "required": false, "literal": "anywhere",
+                "required": false,
             })).unwrap(),
             serde_json::from_value(json!({
                 "name": "free_p", "portType": "Number",
-                "required": false, "literal": "anywhere",
+                "required": false,
             })).unwrap(),
         ];
         let node = kicked_node("X", inputs, json!({ "wired_p": 1, "free_p": 2 }));

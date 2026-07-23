@@ -11,7 +11,7 @@ pub struct TextNode;
 #[async_trait]
 impl Node for TextNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let value: String = ctx.config.get("value")?;
+        let value: String = ctx.inputs.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
 }

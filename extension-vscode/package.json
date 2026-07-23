@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, AI streaming edits.",
-  "version": "0.2.148",
+  "version": "0.2.152",
   "publisher": "weavemind",
   "engines": {
     "vscode": "^1.90.0"
@@ -222,6 +222,7 @@
   "dependencies": {
     "@babel/runtime": "^7.29.2",
     "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-javascript": "^6.2.5",
     "@codemirror/lang-python": "^6.2.1",
     "@codemirror/language": "^6.12.3",
     "@codemirror/state": "^6.6.0",

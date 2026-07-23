@@ -3,16 +3,36 @@
   "label": "Gate",
   "description": "Forwards value when pass is true; closes the output when pass is null or false (downstream sees a structural closure, not a data null).",
   "category": "Flow",
-  "tags": ["flow", "gate", "route", "conditional", "pass"],
+  "tags": [
+    "flow",
+    "gate",
+    "route",
+    "conditional",
+    "pass"
+  ],
   "icon": "GitBranch",
   "color": "#6366f1",
   "inputs": [
-    { "name": "pass", "type": "Boolean", "required": true, "description": "true to forward value, null or false to cut flow" },
-    { "name": "value", "type": "T", "required": true, "description": "Value to forward when pass is true" }
+    {
+      "name": "pass",
+      "type": "Boolean",
+      "required": true,
+      "description": "true to forward value, null or false to cut flow"
+    },
+    {
+      "name": "value",
+      "type": "T",
+      "required": true,
+      "description": "Value to forward when pass is true"
+    }
   ],
   "outputs": [
-    { "name": "value", "type": "T", "required": false, "description": "The forwarded value; the port is closed when pass was null or false" }
+    {
+      "name": "value",
+      "type": "T",
+      "required": false,
+      "description": "The forwarded value; the port is closed when pass was null or false"
+    }
   ],
-  "fields": [],
   "requires_infra": false
 }

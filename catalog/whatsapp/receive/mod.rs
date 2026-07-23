@@ -22,7 +22,7 @@ pub struct WhatsAppReceiveNode;
 impl Node for WhatsAppReceiveNode {
     // Registers the SSE signal; setup emits nothing downstream.
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let bridge: String = ctx.ports.get("endpointUrl")?;
+        let bridge: String = ctx.inputs.get("endpointUrl")?;
         // `endpointUrl` is the bridge's bare endpoint URL (the bridge node
         // exports `ctx.endpoint("api").url()`, no path). Append our route.
         let events_url = format!("{}/events", bridge.trim_end_matches('/'));
@@ -60,7 +60,7 @@ impl Node for WhatsAppReceiveNode {
         // reference.
         let message_type = data.get("messageType").and_then(|v| v.as_str()).unwrap_or("text");
         if MEDIA_TYPES.contains(&message_type) {
-            let bridge: String = ctx.ports.get("endpointUrl")?;
+            let bridge: String = ctx.inputs.get("endpointUrl")?;
             let message_id = data
                 .get("messageId")
                 .and_then(|v| v.as_str())

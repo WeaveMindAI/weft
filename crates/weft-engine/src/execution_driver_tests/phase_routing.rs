@@ -285,7 +285,7 @@
             Ok(())
         }
         async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-            let url: String = ctx.ports.get("endpointUrl")?;
+            let url: String = ctx.inputs.get("endpointUrl")?;
             let msg: String = ctx.wake.get("messageId")?;
             self.calls.lock().unwrap().push(format!("snap:{url}:{msg}"));
             Ok(())
@@ -346,7 +346,7 @@
     }
 
     /// The firing trigger's ports replay the setup-time snapshot: the
-    /// kick's `port_snapshot` lands on `ctx.ports`, the payload on
+    /// kick's `port_snapshot` lands on `ctx.inputs`, the payload on
     /// `ctx.wake`, in the SAME single dispatch.
     #[tokio::test]
     async fn a_firing_trigger_reads_its_snapshot_and_wake_in_one_dispatch() {

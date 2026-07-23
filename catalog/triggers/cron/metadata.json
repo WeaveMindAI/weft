@@ -3,22 +3,40 @@
   "label": "Cron Schedule",
   "description": "Fire on a schedule. Standard cron expression in the `cron` field.",
   "category": "Triggers",
-  "tags": ["cron", "schedule", "timer", "trigger"],
+  "tags": [
+    "cron",
+    "schedule",
+    "timer",
+    "trigger"
+  ],
   "icon": "Clock",
   "color": "#22c55e",
-  "inputs": [],
-  "outputs": [
-    { "name": "scheduledTime", "type": "String", "required": false, "description": "ISO-8601 timestamp of the scheduled fire time" },
-    { "name": "actualTime", "type": "String", "required": false, "description": "ISO-8601 timestamp of when the firing actually happened" }
-  ],
-  "fields": [
+  "inputs": [
     {
-      "key": "cron",
-      "label": "Cron",
-      "field_type": { "kind": "text" },
+      "name": "cron",
+      "type": "String",
       "required": true,
-      "default_value": "*/5 * * * *",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "default": "*/5 * * * *",
+      "label": "Cron",
       "description": "Standard cron expression. Default fires every 5 minutes."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "scheduledTime",
+      "type": "String",
+      "required": false,
+      "description": "ISO-8601 timestamp of the scheduled fire time"
+    },
+    {
+      "name": "actualTime",
+      "type": "String",
+      "required": false,
+      "description": "ISO-8601 timestamp of when the firing actually happened"
     }
   ],
   "requires_infra": false,

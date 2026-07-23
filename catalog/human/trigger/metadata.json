@@ -3,33 +3,46 @@
   "label": "Human Trigger",
   "description": "Start an execution when a human submits a form. Form fields determine the output ports via form_field_specs.",
   "category": "Triggers",
-  "tags": ["human", "form", "trigger", "manual"],
+  "tags": [
+    "human",
+    "form",
+    "trigger",
+    "manual"
+  ],
   "icon": "User",
   "color": "#22c55e",
-  "inputs": [],
-  "outputs": [],
-  "fields": [
+  "inputs": [
     {
-      "key": "title",
+      "name": "title",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
       "label": "Title",
-      "field_type": { "kind": "text" },
       "placeholder": "Submit",
       "description": "Title the user sees at the top of the form."
     },
     {
-      "key": "description",
+      "name": "description",
+      "type": "String",
+      "exposure": "config",
       "label": "Description",
-      "field_type": { "kind": "textarea" },
       "description": "Description shown under the title."
     },
     {
-      "key": "fields",
-      "label": "Form fields",
-      "field_type": { "kind": "form_builder" },
+      "name": "fields",
+      "type": "List[JsonDict]",
       "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "form_builder"
+      },
+      "label": "Form fields",
       "description": "Each field contributes an output port per its fieldType (see form_field_specs)."
     }
   ],
+  "outputs": [],
   "requires_infra": false,
   "features": {
     "isTrigger": true,
@@ -37,7 +50,13 @@
   },
   "validate": [
     {
-      "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "fields" } },
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "fields"
+        }
+      },
       "then": {
         "message": "HumanTrigger '{id}' has no form fields; the user would see an empty form.",
         "level": "structural",

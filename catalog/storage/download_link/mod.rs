@@ -21,7 +21,7 @@ impl Node for DownloadLinkNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // Validate the value carries a resolvable handle (key or url),
         // which is exactly what parsing into a FileHandle checks.
-        let _handle: FileHandle = ctx.ports.get("file")?;
+        let _handle: FileHandle = ctx.inputs.get("file")?;
         Ok(())
     }
 }

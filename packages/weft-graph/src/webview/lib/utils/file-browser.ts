@@ -26,7 +26,7 @@ export function guessMime(filename: string): string {
 
 /// The HTML-accept filter a declared weft file type implies. An explicit
 /// `accept` on the field NARROWS this; `File`/`Blob`/unknown accept anything.
-// SYNC: acceptForFileType <-> crates/weft-core/src/node.rs FieldType::FileDrop (file_type semantics)
+// SYNC: acceptForFileType <-> crates/weft-core/src/node.rs Widget::FileDrop (file_type semantics)
 export function acceptForFileType(fileType: string | undefined, explicit: string | undefined): string | undefined {
   if (explicit) return explicit;
   switch (fileType) {

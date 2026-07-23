@@ -10,29 +10,32 @@
   ],
   "icon": "Rss",
   "color": "#0ea5e9",
-  "inputs": [],
+  "inputs": [
+    {
+      "name": "url",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "SSE URL"
+    },
+    {
+      "name": "event_name",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Event name"
+    }
+  ],
   "outputs": [
     {
       "name": "value",
       "type": "Number"
-    }
-  ],
-  "fields": [
-    {
-      "key": "url",
-      "label": "SSE URL",
-      "field_type": {
-        "kind": "text"
-      },
-      "required": true
-    },
-    {
-      "key": "event_name",
-      "label": "Event name",
-      "field_type": {
-        "kind": "text"
-      },
-      "required": true
     }
   ],
   "features": {

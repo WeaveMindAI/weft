@@ -29,7 +29,7 @@ export { nodeTags, TAGS_CONFIG_KEY } from './webview/lib/node-tags';
 // EditOps (source tokens via `formatConfigValue`), instead of a parallel
 // hand-rolled renderer + token formatter that would drift.
 export { default as FieldStrip } from './webview/lib/components/project/FieldStrip.svelte';
-export { diffConfigOps } from './webview/lib/projection/config-diff';
+export { diffConfigOps, diffPortLiteralOps } from './webview/lib/projection/config-diff';
 
 // The one snake_case -> camelCase remap for the dispatcher status payload lives
 // in `@weft/graph/status` (its own subpath so node-side consumers never pull
@@ -83,10 +83,13 @@ export {
   getAllNodes,
 } from './webview/lib/nodes';
 
-// Field + node-template metadata types, for a host rendering config editors from
-// the catalog (`NODE_TYPE_CONFIG[nodeType].fields`).
+// Field + node-template metadata types, for a host rendering config editors
+// from the catalog (`NODE_TYPE_CONFIG[nodeType].defaultInputs`, flattened to
+// render fields via `fieldForInput`).
 export type {
   FieldDefinition,
-  FieldType,
+  WidgetKind,
   NodeTemplate,
 } from './webview/lib/types';
+export { fieldForInput, LOOP_CONFIG_FIELDS } from './webview/lib/utils/input-field';
+export { inputExposure, isLoopNodeType } from './webview/lib/types';

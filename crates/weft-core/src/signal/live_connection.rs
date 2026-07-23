@@ -210,7 +210,7 @@ impl LiveConnectionConfig {
     /// common authoring fields both live-caller nodes expose). Centralized
     /// here so the two nodes (`ApiEndpoint`, `LiveSocket`) do NOT each
     /// re-implement field parsing; every non-exposed knob keeps its default.
-    /// `fields` is the node's `ctx.config.object()` map.
+    /// `fields` is the node's `ctx.inputs.object()` map.
     pub fn from_node_fields(
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Self {

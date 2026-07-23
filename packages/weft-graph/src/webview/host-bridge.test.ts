@@ -22,7 +22,11 @@ describe('translateProject', () => {
           scope: [],
           groupBoundary: null,
           inputs: [
-            { name: 'systemPrompt', portType: 'String', required: false, literal: 'anywhere' },
+            {
+              name: 'systemPrompt', portType: 'String', required: false,
+              exposure: 'all', widget: { kind: 'textarea' }, default: 'be nice',
+              label: 'System prompt', placeholder: 'You are...',
+            },
           ],
           outputs: [],
           features: {},
@@ -43,7 +47,12 @@ describe('translateProject', () => {
     const node = v1.nodes.find((n) => n.id === 'orc')!;
     expect(node.portLiterals).toEqual({ systemPrompt: 'test' });
     expect(node.portLiteralSpans?.systemPrompt?.origin).toBe('inline');
-    // The port's literal placement survives too (the marker/toggle reads it).
-    expect(node.inputs[0].literal).toBe('anywhere');
+    // The input's resolved editor surface survives too (the field
+    // renderer + form toggle read all of it off the instance).
+    expect(node.inputs[0].exposure).toBe('all');
+    expect(node.inputs[0].widget).toEqual({ kind: 'textarea' });
+    expect(node.inputs[0].default).toBe('be nice');
+    expect(node.inputs[0].label).toBe('System prompt');
+    expect(node.inputs[0].placeholder).toBe('You are...');
   });
 });

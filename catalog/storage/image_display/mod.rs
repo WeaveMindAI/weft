@@ -24,7 +24,7 @@ impl Node for ImageDisplayNode {
         // only thing left to enforce is that it carries a handle the
         // preview can resolve (a storage key or an external URL), which
         // is exactly what parsing into a FileHandle checks.
-        let _handle: FileHandle = ctx.ports.get("image")?;
+        let _handle: FileHandle = ctx.inputs.get("image")?;
         Ok(())
     }
 }

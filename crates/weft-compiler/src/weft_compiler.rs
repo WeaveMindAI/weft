@@ -13,10 +13,10 @@ use crate::file_reader::CompileFs;
 
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
-    ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, NodeDefinition,
+    ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, InputDefinition, NodeDefinition,
     PortDefinition, Position, ProjectDefinition, Span,
 };
-use weft_core::weft_type::{LiteralPlacement, WeftType};
+use weft_core::weft_type::WeftType;
 
 // ─── Compiler Error ──────────────────────────────────────────────────────────
 
@@ -886,6 +886,20 @@ fn lower_decl(
                 state.includes.push(inc);
             }
         }
+        // An INLINE_EXPR is never a direct child of a file/group body (it
+        // only occurs as a config-field or connection value); the
+        // lowering reaches it through `lower_config_field` /
+        // `lower_connection`, never through this decl dispatch. Enforce
+        // the invariant loudly: silently dropping a declaration is the
+        // one thing this dispatch must never do.
+        CstDecl::InlineNode(inline) => {
+            state.errors.push(CompileError::at(
+                li.span_of(inline.syntax()),
+                "an inline node expression cannot stand alone; give it a name (`x = ...`) \
+                 or use it as a value"
+                    .to_string(),
+            ));
+        }
     }
 }
 
@@ -1361,6 +1375,7 @@ fn lower_inline_expr(
     // RAW id (`host_local__field`); `lower_group` scopes it to `g.host__field`
     // in the same pass that rescopes the edge endpoints, so node id and edge
     // source stay in lockstep and a name-shadowing child can't double-scope.
+    // SYNC: lower_inline_expr (anon_id) <-> crates/weft-compiler/src/cst/nodes.rs InlineExpr::anon_local
     let anon_id = format!("{host_local}__{field_key}");
     // Ports: the inline expr's PORT_DECLs live directly under the INLINE_EXPR
     // (no HEADER sub-node), so read them off the node itself.
@@ -2496,7 +2511,6 @@ fn collect_group_definitions(
             port_type: p.port_type.clone(),
             required: p.required,
             description: None,
-            literal: p.port_type.default_literal_placement(),
             synthesized_from_carry: p.synthesized_from_carry,
         })
         .collect();
@@ -2508,7 +2522,6 @@ fn collect_group_definitions(
             port_type: p.port_type.clone(),
             required: false,
             description: None,
-            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
         })
         .collect();
@@ -2611,13 +2624,14 @@ fn flatten_group(
     };
 
     let in_pt_id = format!("{}__in", group.id);
-    let in_pt_inputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| PortDefinition {
-        name: p.name.clone(),
-        port_type: p.port_type.clone(),
-        required: p.required,
-        description: None,
-        literal: p.port_type.default_literal_placement(),
-        synthesized_from_carry: p.synthesized_from_carry,
+    let in_pt_inputs: Vec<InputDefinition> = group.in_ports.iter().map(|p| {
+        InputDefinition::from_wire_port(PortDefinition {
+            name: p.name.clone(),
+            port_type: p.port_type.clone(),
+            required: p.required,
+            description: None,
+            synthesized_from_carry: p.synthesized_from_carry,
+        })
     }).collect();
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
         let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
@@ -2630,7 +2644,6 @@ fn flatten_group(
             port_type: ty.clone(),
             required: false,
             description: None,
-            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
         }
     }).collect();
@@ -2645,7 +2658,6 @@ fn flatten_group(
             port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number),
             required: false,
             description: None,
-            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
         });
     }
@@ -2699,7 +2711,7 @@ fn flatten_group(
     });
 
     let out_pt_id = format!("{}__out", group.id);
-    let mut out_pt_inputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| {
+    let mut out_pt_inputs: Vec<InputDefinition> = group.out_ports.iter().map(|p| {
         let (ty, required) = if matches!(group.kind, GroupKind::Loop) {
             if loop_carry.contains(&p.name) {
                 // Carry-write port: T (engine reads optional/closed at runtime).
@@ -2713,34 +2725,31 @@ fn flatten_group(
         } else {
             (p.port_type.clone(), false)
         };
-        PortDefinition {
+        InputDefinition::from_wire_port(PortDefinition {
             name: p.name.clone(),
             port_type: ty.clone(),
             required,
             description: None,
-            literal: ty.default_literal_placement(),
             synthesized_from_carry: false,
-        }
+        })
     }).collect();
     // Implicit `self.done: Boolean` for loops. Skip if the user declared a
     // port named `done` (validate reports the reserved-name collision);
     // a duplicate port would silently shadow at the next port-by-name lookup.
     if matches!(group.kind, GroupKind::Loop) && !out_pt_inputs.iter().any(|p| p.name == "done") {
-        out_pt_inputs.push(PortDefinition {
+        out_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
             name: "done".to_string(),
             port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Boolean),
             required: false,
             description: None,
-            literal: LiteralPlacement::None,
             synthesized_from_carry: false,
-        });
+        }));
     }
     let out_pt_outputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
         port_type: p.port_type.clone(),
         required: false,
         description: None,
-        literal: LiteralPlacement::None,
         synthesized_from_carry: false,
     }).collect();
 
@@ -2802,20 +2811,20 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
     if let Some(pid) = &pn.parent_id {
         config.as_object_mut().unwrap().insert("parentId".to_string(), serde_json::Value::String(pid.clone()));
     }
-    let inputs = pn.in_ports.iter().map(|p| PortDefinition {
-        name: p.name.clone(),
-        port_type: p.port_type.clone(),
-        required: p.required,
-        description: None,
-        literal: p.port_type.default_literal_placement(),
-        synthesized_from_carry: false,
+    let inputs = pn.in_ports.iter().map(|p| {
+        InputDefinition::from_wire_port(PortDefinition {
+            name: p.name.clone(),
+            port_type: p.port_type.clone(),
+            required: p.required,
+            description: None,
+            synthesized_from_carry: false,
+        })
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
         port_type: p.port_type.clone(),
         required: p.required,
         description: None,
-        literal: LiteralPlacement::None,
         synthesized_from_carry: false,
     }).collect();
     let mut features = NodeFeatures::default();

@@ -3,41 +3,58 @@
   "label": "API Endpoint",
   "description": "Turn this program into a live HTTP endpoint. An outside caller makes a request at the project's gateway URL; the request is held open and any node downstream replies once or streams a response back via the caller handle. Fires a fresh execution per request.",
   "category": "Triggers",
-  "tags": ["live", "http", "trigger", "api", "stream"],
+  "tags": [
+    "live",
+    "http",
+    "trigger",
+    "api",
+    "stream"
+  ],
   "icon": "Globe",
   "color": "#06b6d4",
-  "inputs": [],
-  "outputs": [
-    { "name": "started", "type": "Boolean", "required": false, "description": "Fires true once when a request opens, to kick downstream work. The caller itself is reached via the caller handle, not this port." }
-  ],
-  "fields": [
+  "inputs": [
     {
-      "key": "path",
+      "name": "path",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
       "label": "Path",
-      "field_type": { "kind": "text" },
-      "required": false,
       "description": "Route suffix under the gateway. Leave empty for the project's root live URL. Must not start with '/'."
     },
     {
-      "key": "generateApiKey",
+      "name": "generateApiKey",
+      "type": "Boolean",
+      "exposure": "config",
       "label": "Require API key",
-      "field_type": { "kind": "checkbox" },
-      "required": false,
       "description": "When on, the caller must present a minted API key to open the connection. The plaintext is shown once on the node inspector."
     },
     {
-      "key": "canSuspend",
+      "name": "canSuspend",
+      "type": "Boolean",
+      "exposure": "config",
       "label": "May outlive the caller",
-      "field_type": { "kind": "checkbox" },
-      "required": false,
       "description": "Off (default): the run is tied to the caller. If a node hits a long durable wait it holds the worker briefly then the run is killed; a caller disconnect cancels the run. On: the run may suspend and resume later without the caller (it becomes a background job), and a disconnect does not kill it."
     },
     {
-      "key": "defaultHoldSecs",
+      "name": "defaultHoldSecs",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": 1
+      },
       "label": "Hold seconds before giving up on a wait",
-      "field_type": { "kind": "number", "min": 1, "max": null },
-      "required": false,
       "description": "For a caller-tied run: how long a node's wait holds the worker (keeping the connection alive) before giving up. Per-wait overrides win over this. Never unbounded."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "started",
+      "type": "Boolean",
+      "required": false,
+      "description": "Fires true once when a request opens, to kick downstream work. The caller itself is reached via the caller handle, not this port."
     }
   ],
   "requires_infra": false,
@@ -47,7 +64,11 @@
   },
   "validate": [
     {
-      "when": { "kind": "config_matches", "field": "path", "regex": "^/" },
+      "when": {
+        "kind": "config_matches",
+        "field": "path",
+        "regex": "^/"
+      },
       "then": {
         "message": "ApiEndpoint '{id}' path starts with '/'. The gateway prefixes the route automatically; drop the leading slash.",
         "level": "structural",

@@ -30,16 +30,16 @@ pub struct AskCustomNode;
 #[async_trait]
 impl Node for AskCustomNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let prompt: String = ctx.ports.get("prompt")?;
-        let system_prompt: String = ctx.config.get_or("systemPrompt", String::new())?;
-        let model: String = ctx.config.get_or("model", "openai/gpt-4.1-nano".to_string())?;
+        let prompt: String = ctx.inputs.get("prompt")?;
+        let system_prompt: String = ctx.inputs.get_or("systemPrompt", String::new())?;
+        let model: String = ctx.inputs.get_or("model", "openai/gpt-4.1-nano".to_string())?;
 
         // The whole paid-call surface, against the PROJECT-DEFINED provider:
         // open access, build the generator over the metered client. The
         // runtime finds this project's own `openrouter_custom` meter and
         // measures the call's real cost behind the client.
         let access = ctx
-            .provider_access("openrouter_custom", ctx.config.opt("apiKey")?)
+            .provider_access("openrouter_custom", ctx.inputs.opt("apiKey")?)
             .await?;
         let generator = GeneratorInfo::openrouter(model)
             .with_api_key(access.credential())

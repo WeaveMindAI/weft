@@ -11,8 +11,8 @@
  * `$derived` reads on first render see a populated registry.
  */
 
-import type { NodeTemplate, NodeCategory, FieldDefinition, PortDefinition } from '../types';
-import type { CatalogEntry, FieldDef, PortDef } from '../../../protocol';
+import type { NodeTemplate, NodeCategory, PortDefinition } from '../types';
+import type { CatalogEntry, InputSpec, OutputSpec } from '../../../protocol';
 import type { Component } from 'svelte';
 import {
 	Activity,
@@ -179,45 +179,34 @@ function resolveIcon(name: string | undefined): Component {
 // The catalog entry shape is the ONE wire definition in `protocol.ts`
 // (`CatalogEntry`), matching Rust's `weft describe-nodes` serialization. This
 // module consumes it directly (no local re-declaration) and transforms it into
-// the webview's render types (`NodeTemplate` / `FieldDefinition` /
-// `PortDefinition`): the wire nests a field's kind under `field_type` and names a
-// port's type `type`, while the components read flat `type`/`portType`.
+// the webview's render types (`NodeTemplate` / `PortDefinition`): the wire
+// names a port's type `type`, while the components read flat `portType`.
+// Inputs arrive RESOLVED (exposure + widget always filled by the CLI), so the
+// template carries them verbatim; the editor derives nothing.
 
-/// Wire port (`{ name, type, ... }`) -> render port (`{ name, portType, ... }`).
-/// The rename is the whole reason a raw catalog entry can't be used as a template
-/// directly: skip it and every catalog-default port lands with `portType`
-/// undefined (typeless ports on freshly-added nodes + palette previews).
-function flattenPort(p: PortDef): PortDefinition {
+/// Wire input (`{ name, type, exposure, widget, ... }`) -> render port.
+function flattenInput(i: InputSpec): PortDefinition {
+	return {
+		name: i.name,
+		portType: i.type,
+		required: i.required ?? false,
+		...(i.exposure !== undefined ? { exposure: i.exposure } : {}),
+		...(i.widget !== undefined ? { widget: i.widget } : {}),
+		...(i.default !== undefined ? { default: i.default } : {}),
+		...(i.label !== undefined ? { label: i.label } : {}),
+		...(i.placeholder !== undefined ? { placeholder: i.placeholder } : {}),
+		...(i.description !== undefined ? { description: i.description } : {}),
+	};
+}
+
+/// Wire output (`{ name, type, ... }`) -> render port.
+function flattenOutput(p: OutputSpec): PortDefinition {
 	return {
 		name: p.name,
 		portType: p.type,
 		required: p.required ?? false,
-		...(p.literal !== undefined ? { literal: p.literal } : {}),
 		...(p.description !== undefined ? { description: p.description } : {}),
 	};
-}
-
-function flattenField(f: FieldDef): FieldDefinition {
-	const ft = f.field_type ?? { kind: 'text' };
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const flat: any = {
-		key: f.key,
-		label: f.label,
-		type: ft.kind,
-		required: f.required,
-		description: f.description,
-	};
-	if (ft.options) flat.options = ft.options;
-	if (ft.min !== undefined) flat.min = ft.min;
-	if (ft.max !== undefined) flat.max = ft.max;
-	if (ft.step !== undefined) flat.step = ft.step;
-	if (ft.provider) flat.provider = ft.provider;
-	if (ft.accept) flat.accept = ft.accept;
-	if (ft.type) flat.fileType = ft.type;
-	if (f.placeholder) flat.placeholder = f.placeholder;
-	if (f.default_value !== undefined && f.default_value !== null)
-		flat.defaultValue = f.default_value;
-	return flat as FieldDefinition;
 }
 
 function toTemplate(entry: CatalogEntry): NodeTemplate {
@@ -237,9 +226,8 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		// infra-backed. Without it the subgraph "eye" finds no
 		// seeds and shows an empty subgraph.
 		requiresInfra: entry.requires_infra ?? false,
-		fields: (entry.fields ?? []).map(flattenField),
-		defaultInputs: (entry.inputs ?? []).map(flattenPort),
-		defaultOutputs: (entry.outputs ?? []).map(flattenPort),
+		defaultInputs: (entry.inputs ?? []).map(flattenInput),
+		defaultOutputs: (entry.outputs ?? []).map(flattenOutput),
 		features: entry.features,
 		// `weft describe-nodes` ships the field-type vocabulary inline
 		// for nodes whose features.hasFormSchema is true; the
@@ -311,7 +299,6 @@ function registerBuiltins(): void {
 			category: 'Flow' as NodeCategory,
 			tags: ['group', 'container', 'scope'],
 			requiresInfra: false,
-			fields: [],
 			defaultInputs: [],
 			defaultOutputs: [],
 			features: {},
@@ -327,27 +314,8 @@ function registerBuiltins(): void {
 			category: 'Flow' as NodeCategory,
 			tags: ['loop', 'iterate', 'container', 'scope'],
 			requiresInfra: false,
-			fields: [
-				{
-					key: 'parallel',
-					label: 'Parallel',
-					type: 'checkbox',
-					description: 'Run all iterations concurrently (incompatible with carry / self.done).',
-				},
-				{
-					key: 'max_iters',
-					label: 'Max iterations',
-					type: 'number',
-					min: 0,
-					description: 'Hard cap on iteration count. Leave blank for no cap.',
-				},
-				{
-					key: 'trim_on_mismatch',
-					label: 'Trim on length mismatch',
-					type: 'checkbox',
-					description: 'Zip iter inputs to the shortest length. Off = crash loud on mismatch.',
-				},
-			],
+			// The loop-config knobs (parallel / max_iters / trim_on_mismatch)
+			// are editor-only UI owned by GroupNode.svelte, not template data.
 			defaultInputs: [],
 			defaultOutputs: [],
 			features: {},

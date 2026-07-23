@@ -18,7 +18,7 @@ pub struct OpenRouterConfigNode;
 impl Node for OpenRouterConfigNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // The node's whole job is forwarding its config fields as one object.
-        let out = ctx.config.object()?.clone();
+        let out = ctx.inputs.object()?.clone();
         ctx.pulse_downstream(NodeOutput::new().set("config", Value::Object(out))).await
     }
 }

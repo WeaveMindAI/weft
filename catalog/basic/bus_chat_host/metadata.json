@@ -3,14 +3,25 @@
   "label": "Bus Chat: Host",
   "description": "Demo node. Creates a Bus, registers as 'host', waits for a 'guest' to connect, then chats a few lines (host opens the conversation) and closes the bus. Pair with a Bus Chat: Guest node.",
   "category": "basic",
-  "tags": ["bus", "demo", "chat"],
+  "tags": [
+    "bus",
+    "demo",
+    "chat"
+  ],
   "icon": "MessageCircle",
   "color": "#8b5cf6",
   "inputs": [],
   "outputs": [
-    { "name": "channel", "type": "Bus", "required": false },
-    { "name": "done", "type": "Boolean", "required": false }
+    {
+      "name": "channel",
+      "type": "Bus",
+      "required": false
+    },
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
   ],
-  "fields": [],
   "requires_infra": false
 }

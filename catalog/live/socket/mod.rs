@@ -22,7 +22,7 @@ pub struct LiveSocketNode;
 #[async_trait]
 impl Node for LiveSocketNode {
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let common = LiveConnectionConfig::from_node_fields(ctx.config.object()?);
+        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?);
         ctx.register_signal(LiveSocket { common }).await
     }
 

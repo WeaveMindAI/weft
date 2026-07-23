@@ -12,6 +12,7 @@ import type {
   Edge as HostEdge,
   GroupDefinition as HostGroup,
   PortDefinition as HostPort,
+  InputDefinition as HostInput,
 } from '../shared/protocol';
 import type {
   ProjectDefinition as V1Project,
@@ -20,13 +21,21 @@ import type {
   PortDefinition as V1Port,
 } from './lib/types';
 
-function toV1Port(p: HostPort): V1Port {
+function toV1Port(p: HostPort | HostInput): V1Port {
+  // An INPUT additionally carries its resolved editor surface
+  // (exposure/widget/default/label/placeholder); a pure wire port
+  // (outputs, group interfaces) leaves those absent.
+  const input = p as HostInput;
   return {
     name: p.name,
     portType: p.portType,
     required: p.required,
     description: p.description ?? undefined,
-    literal: p.literal,
+    exposure: input.exposure,
+    widget: input.widget,
+    default: input.default,
+    label: input.label,
+    placeholder: input.placeholder,
     synthesizedFromCarry: p.synthesizedFromCarry,
   };
 }

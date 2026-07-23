@@ -664,6 +664,14 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             .find(|p| Some(p.name.as_str()) == edge.target_handle.as_deref())
         else { continue };
 
+        // An edge onto a non-wireable input is illegal as a whole;
+        // input-not-wireable (check_port_coverage) owns that situation,
+        // and stacking type-level diagnostics on an edge that cannot
+        // exist would bury the real cause.
+        if !tgt_port.exposure.wireable() {
+            continue;
+        }
+
         if src_port.port_type.is_must_override() {
             push(d, span, Severity::Error, "must-override-unmet",
                 format!(
@@ -713,24 +721,46 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // v1 refs: 3515-3519 (config literal), 4224-4258 (port type
     // override incompatibility).
     for node in &project.nodes {
-        for (key, value) in &node.port_literals {
-            let Some(port) = node.inputs.iter().find(|p| p.name == *key) else { continue };
-            // Only type-check plain-data literals. On ports whose literal
-            // placement excludes the braces (files, TypeVars, MustOverride),
-            // the written value is a marker/handle whose inferred JSON shape
-            // does not match the port type by construction.
-            if !port.literal.allows_config() { continue }
+        // Literal values live in TWO stores by written form: wireable
+        // drivers in `port_literals`, `config`-exposure braces values in
+        // `config`. Type-check both against the declared input type.
+        let literal_values = node
+            .port_literals
+            .iter()
+            .map(|(k, v)| (k, v, node.port_literal_spans.get(k).map(|s| s.span)))
+            .chain(
+                node.config
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, v)| (k, v, node.config_spans.get(k).map(|s| s.span))),
+            );
+        for (key, value, span) in literal_values {
+            let Some(input) = node.inputs.iter().find(|p| p.name == *key) else { continue };
+            // Only type-check plain-data literals: braces values on
+            // `all`/`config` inputs. On assignment-only inputs (files,
+            // TypeVars, MustOverride) the written value is a
+            // marker/handle whose inferred JSON shape does not match the
+            // input type by construction.
+            if !input.exposure.allows_braces_literal() { continue }
             // The culprit is the literal itself; fall back to the node
             // header if the span is missing.
-            let span = node.port_literal_spans.get(key).map(|s| s.span)
-                .or(node.header_span).unwrap_or_default();
+            let span = span.or(node.header_span).unwrap_or_default();
             let inferred = weft_core::weft_type::WeftType::infer(value);
-            if !weft_core::weft_type::WeftType::is_compatible(&inferred, &port.port_type) {
-                push(d, span, Severity::Error, "config-type-mismatch",
-                    format!(
-                        "config '{}.{}: {}' incompatible with port type '{}'",
-                        node.id, key, inferred, port.port_type,
-                    ));
+            // Enrich already cast every castable literal in place, so a
+            // shape still mismatching here is a GENUINE type error iff
+            // the cast refuses too; the refusal reason names WHY. A
+            // still-castable value only occurs when a caller validates
+            // an un-enriched graph, where the value is fine (the
+            // compile pass will cast it), so no diagnostic fires.
+            if !weft_core::weft_type::WeftType::is_compatible(&inferred, &input.port_type) {
+                if let Err(why) = input.port_type.cast_value(value) {
+                    push(d, span, Severity::Error, "config-type-mismatch",
+                        format!(
+                            "config '{}.{}: {}' incompatible with input type '{}': {}",
+                            node.id, key, inferred, input.port_type, why,
+                        ));
+                }
             }
         }
     }
@@ -768,87 +798,182 @@ fn check_port_coverage(
         }
         let span = node.header_span_or_default();
 
-        // Metadata field keys: a braces value on a braces-closed port
-        // name is only legal when it targets a declared config field of
-        // the same name (the field and the port coexist, independent
-        // values).
-        let declared_fields: std::collections::HashSet<&str> = catalog
-            .lookup(&node.node_type)
-            .map(|meta| meta.fields.iter().map(|f| f.key.as_str()).collect())
-            .unwrap_or_default();
-
-        for port in &node.inputs {
-            let has_edge = driven.contains(&(node.id.clone(), port.name.clone()));
-            // Body-supplied port value, normalized by enrich into
-            // port_literals (braces where the placement allows it,
-            // assignment statements on any port).
+        for input in &node.inputs {
+            let exposure = input.exposure;
+            let has_edge = driven.contains(&(node.id.clone(), input.name.clone()));
+            // Body-supplied driving value, normalized by enrich into
+            // port_literals (braces on `all` inputs, assignment
+            // statements on any input).
             let has_literal = node
                 .port_literals
-                .get(&port.name)
+                .get(&input.name)
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            // A `config`-exposure input's braces value stays in `config`.
+            let braces_value = node
+                .config
+                .get(&input.name)
                 .map(|v| !v.is_null())
                 .unwrap_or(false);
 
-            // A wires-only port takes no literal in ANY form. The braces
-            // form never reaches port_literals for such a port, so this
-            // catches the assignment statement (`id.port = ...`). When the
-            // port is ALSO wired, double-driven-port owns the situation
-            // (its "remove one driver" message is the accurate one; "wire
-            // it" would tell the user to do what they already did).
-            if has_literal && !has_edge && port.literal == weft_core::weft_type::LiteralPlacement::None {
-                let lit_span = node.port_literal_spans.get(&port.name).map(|s| s.span).unwrap_or(span);
+            // input-not-wireable: a `config` input is design-time
+            // configuration; no wire (edge, braces endpoint, inline
+            // expression: they all lower to edges) may drive it.
+            if has_edge && !exposure.wireable() {
+                let edge_span = project
+                    .edges
+                    .iter()
+                    .find(|e| e.target == node.id && e.target_handle.as_deref() == Some(&input.name))
+                    .and_then(|e| e.span)
+                    .unwrap_or(span);
                 push(
                     d,
-                    lit_span,
+                    edge_span,
                     Severity::Error,
-                    "port-literal-placement",
+                    "input-not-wireable",
                     format!(
-                        "port '{}.{}' takes no literal: wire it from another node",
-                        node.id, port.name
+                        "input '{}.{}' is configuration-only: it cannot be driven by a \
+                         wire. Set it in the config braces instead",
+                        node.id, input.name
                     ),
                 );
             }
 
-            if port.required && !has_edge && !has_literal {
+            // A wires-only input takes no literal in ANY form (this
+            // catches the assignment statement, `id.input = ...`). A
+            // `config` input takes its literal only in the braces, so an
+            // assignment statement on it is misplaced too. When the
+            // input is ALSO wired, double-driven-port owns the situation
+            // (its "remove one driver" message is the accurate one).
+            if has_literal && !has_edge && !exposure.allows_assignment_literal() {
+                let lit_span = node.port_literal_spans.get(&input.name).map(|s| s.span).unwrap_or(span);
+                let message = if exposure.allows_braces_literal() {
+                    format!(
+                        "input '{}.{}' takes a literal only in the config braces: write \
+                         it as {{ {}: ... }} on the node",
+                        node.id, input.name, input.name
+                    )
+                } else {
+                    format!(
+                        "input '{}.{}' takes no literal: wire it from another node",
+                        node.id, input.name
+                    )
+                };
+                push(d, lit_span, Severity::Error, "port-literal-placement", message);
+            }
+
+            // required + default = satisfiable: the runtime supplies the
+            // default when nothing else drives the input.
+            if input.required && !has_edge && !has_literal && !braces_value && input.default.is_none() {
                 push(
                     d,
                     span,
                     Severity::Error,
                     "required-port-unmet",
                     format!(
-                        "required input '{}.{}' has no driver (no edge, no body value)",
-                        node.id, port.name
+                        "required input '{}.{}' has no driver (no edge, no body value, no default)",
+                        node.id, input.name
                     ),
                 );
             }
 
-            // After enrich normalization, a config key naming a
-            // braces-closed port can only be a braces value (assignment
-            // statements were moved to port_literals). That is legal
-            // only when it targets a declared same-named config FIELD;
-            // otherwise it is a mis-aimed attempt to braces-drive a
-            // port whose placement forbids it.
-            let braces_on_port = node
-                .config
-                .get(&port.name)
-                .map(|v| !v.is_null())
-                .unwrap_or(false);
-            if braces_on_port
-                && !port.literal.allows_config()
-                && !declared_fields.contains(port.name.as_str())
-            {
-                let message = if port.literal.allows_literal() {
+            // A braces value naming an input whose exposure excludes the
+            // braces form is a mis-aimed literal (it stayed in `config`
+            // because enrich only homes `all`-exposure braces values in
+            // port_literals).
+            if braces_value && !exposure.allows_braces_literal() {
+                let cfg_span = node.config_spans.get(&input.name).map(|s| s.span).unwrap_or(span);
+                let message = if exposure.allows_literal() {
                     format!(
-                        "port '{}.{}' takes a literal only as an assignment: the braces \
+                        "input '{}.{}' takes a literal only as an assignment: the braces \
                          form cannot drive it. Wire it or write {}.{} = ...",
-                        node.id, port.name, node.id, port.name
+                        node.id, input.name, node.id, input.name
                     )
                 } else {
                     format!(
-                        "port '{}.{}' takes no literal: wire it from another node",
-                        node.id, port.name
+                        "input '{}.{}' takes no literal: wire it from another node",
+                        node.id, input.name
                     )
                 };
-                push(d, span, Severity::Error, "port-literal-placement", message);
+                push(d, cfg_span, Severity::Error, "port-literal-placement", message);
+            }
+
+            // The widget-level literal checks: the value is wherever the
+            // input's written form homed it, read only from a home the
+            // exposure legally allows. A MIS-PLACED literal (a braces
+            // value on an assignment-only input, an assignment on a
+            // config input) already gets port-literal-placement; running
+            // the widget checks on it too would stack a second error on
+            // one mistake.
+            let literal_value = node
+                .port_literals
+                .get(&input.name)
+                .filter(|_| exposure.allows_assignment_literal())
+                .or_else(|| {
+                    node.config
+                        .get(&input.name)
+                        .filter(|_| exposure.allows_braces_literal())
+                });
+            let literal_span = || {
+                node.port_literal_spans
+                    .get(&input.name)
+                    .or_else(|| node.config_spans.get(&input.name))
+                    .map(|s| s.span)
+                    .unwrap_or(span)
+            };
+            match &input.widget {
+                // empty-byok: "own key" selected but no key pasted. An
+                // ABSENT key means runtime-granted access (fine); an
+                // empty-string literal means the user picked their own
+                // key and left it blank, which would send "" as a bearer
+                // token.
+                Some(weft_core::node::Widget::ApiKey { .. }) => {
+                    if literal_value.and_then(|v| v.as_str()).is_some_and(|s| s.trim().is_empty()) {
+                        push(
+                            d,
+                            literal_span(),
+                            Severity::Error,
+                            "empty-byok",
+                            format!(
+                                "input '{}.{}': the key is empty and would be sent as the \
+                                 credential; paste a key, or remove the entry to use \
+                                 runtime-granted access",
+                                node.id, input.name
+                            ),
+                        );
+                    }
+                }
+                // literal-out-of-range: a number widget's min/max bound
+                // the literal at compile time (the editor clamps on
+                // blur; this is the backstop for hand-written source).
+                Some(weft_core::node::Widget::Number { min, max, .. }) => {
+                    // Range-check the CAST value so a stringified number
+                    // in an un-enriched graph is bounded consistently
+                    // with the type check. An uncastable value is not
+                    // silently passed: config-type-mismatch reports it.
+                    let cast_num = literal_value
+                        .and_then(|v| input.port_type.cast_value(v).ok())
+                        .and_then(|v| v.as_f64());
+                    if let Some(n) = cast_num {
+                        if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+                            push(
+                                d,
+                                literal_span(),
+                                Severity::Error,
+                                "literal-out-of-range",
+                                format!(
+                                    "input '{}.{}': {} is outside the allowed range [{}, {}]",
+                                    node.id,
+                                    input.name,
+                                    n,
+                                    min.map_or("-inf".into(), |m| m.to_string()),
+                                    max.map_or("inf".into(), |m| m.to_string()),
+                                ),
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -883,31 +1008,40 @@ fn check_port_coverage(
 
         // undeclared-port-no-custom: if the node can't accept custom
         // inputs (features.can_add_input_ports == false), every
-        // config key must name a real port (input or output, since
-        // literal-emitter nodes like Text drive their output via
-        // config) or a declared form field.
-        if !node.features.can_add_input_ports && !node.features.has_form_schema {
+        // config key must name a declared input or output (literal-
+        // emitter nodes like Text drive their output via config). The
+        // unified namespace means node.inputs already covers what used
+        // to be "fields". LoopIn/LoopOut carry the loop config (`over`,
+        // `parallel`, ...) in their config blob; check_loop_config
+        // validates those keys exhaustively against its own known-keys
+        // list, so exactly those two types are exempt here (matched by
+        // node_type, the same key check_loop_config selects on, so the
+        // two checks partition the space with no gap).
+        // An unknown node type (a lenient-parse placeholder in the
+        // editor; a hard enrich error in a strict compile) has no
+        // declared inputs at all, so every config key would
+        // false-positive here.
+        if !node.features.can_add_input_ports
+            && !node.features.has_form_schema
+            && !matches!(node.node_type.as_str(), "LoopIn" | "LoopOut")
+            && catalog.lookup(&node.node_type).is_some()
+        {
             let Some(obj) = node.config.as_object() else { continue };
             let known_inputs: std::collections::HashSet<&str> =
                 node.inputs.iter().map(|p| p.name.as_str()).collect();
             let known_outputs: std::collections::HashSet<&str> =
                 node.outputs.iter().map(|p| p.name.as_str()).collect();
-            // Metadata-declared fields are also valid config keys;
-            // their values drive node behavior at runtime.
-            let Some(meta) = catalog.lookup(&node.node_type) else { continue };
-            let known_fields: std::collections::HashSet<&str> =
-                meta.fields.iter().map(|f| f.key.as_str()).collect();
             for key in obj.keys() {
-                // Reserved per-instance keys (`_label`, `_is_output`,
-                // `_tags`) are validated by the parser and never need
-                // to match a declared port. `parentId` / `fields` are
-                // layout-side keys co-resident in the same config blob.
-                if key.starts_with('_') || key == "parentId" || key == "fields" {
+                // Compiler/editor plumbing keys (`_`-reserved,
+                // `parentId`) are validated by the parser / merged at
+                // flatten time and never need to match a declared
+                // input. `fields` is the layout-side form-schema blob
+                // co-resident in the same config.
+                if weft_core::project::is_internal_config_key(key) || key == "fields" {
                     continue;
                 }
                 if known_inputs.contains(key.as_str())
                     || known_outputs.contains(key.as_str())
-                    || known_fields.contains(key.as_str())
                 {
                     continue;
                 }
@@ -917,7 +1051,7 @@ fn check_port_coverage(
                     Severity::Error,
                     "undeclared-port-no-custom",
                     format!(
-                        "node '{}' does not accept custom inputs; config key '{}' doesn't match any declared port or field",
+                        "node '{}' does not accept custom inputs; config key '{}' doesn't match any declared input or output",
                         node.id, key
                     ),
                 );
@@ -936,11 +1070,15 @@ fn check_port_coverage(
         // `value`/`value`). Crossing the chain would false-positive
         // every passthrough that happens to declare a form schema.
         if node.features.has_form_schema {
-            for ports in [&node.inputs, &node.outputs] {
+            let sides: [Vec<&str>; 2] = [
+                node.inputs.iter().map(|p| p.name.as_str()).collect(),
+                node.outputs.iter().map(|p| p.name.as_str()).collect(),
+            ];
+            for names in sides {
                 let mut seen: std::collections::HashSet<&str> =
                     std::collections::HashSet::new();
-                for port in ports.iter() {
-                    if !seen.insert(port.name.as_str()) {
+                for name in names {
+                    if !seen.insert(name) {
                         push(
                             d,
                             span,
@@ -948,7 +1086,7 @@ fn check_port_coverage(
                             "form-field-conflict",
                             format!(
                                 "form field key '{}' duplicates a port of the same direction on '{}'",
-                                port.name, node.id
+                                name, node.id
                             ),
                         );
                     }
@@ -1268,9 +1406,13 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // node has outputs. Terminal nodes (no outputs) exist
         // explicitly to run on every invocation (Debug, DLQ, audit
         // sinks); we don't flag them.
-        if !node.inputs.is_empty()
+        // Only WIREABLE inputs count: a `config`-exposure input is a
+        // design-time setting, not upstream data, so it neither makes
+        // the node "have inputs" nor satisfies the warning.
+        let wireable: Vec<_> = node.inputs.iter().filter(|p| p.exposure.wireable()).collect();
+        if !wireable.is_empty()
             && !node.outputs.is_empty()
-            && node.inputs.iter().all(|p| !p.required)
+            && wireable.iter().all(|p| !p.required)
             && node.features.one_of_required.is_empty()
         {
             push(

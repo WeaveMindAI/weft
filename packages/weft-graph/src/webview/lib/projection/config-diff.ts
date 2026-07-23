@@ -9,6 +9,8 @@
 // exactly what changed.
 
 import type { EditOp } from '../../../shared/protocol';
+import type { PortDefinition } from '../types';
+import { inputExposure } from '../types';
 import { formatConfigValue } from '../value-format';
 
 /// Keys that are view-state (layout file) or webview plumbing, never source.
@@ -76,6 +78,46 @@ export function diffConfigOps(
       ops.push(isLoopConfig
         ? { op: 'setLoopConfig', loopId: nodeId, key, value: formatConfigValue(value) }
         : { op: 'setConfig', node: nodeId, key, value: formatConfigValue(value) });
+    }
+  }
+  return ops;
+}
+
+/** Source ops for PORT-DRIVEN values (the `portLiterals` home). Diffs
+ *  `updated` against the node's projected `portLiterals` and stamps every
+ *  op with the value's current WRITTEN form (`spans[key].origin`), so an
+ *  edit rewrites the value where it lives (braces vs statement) and a
+ *  same-named config entry is never touched. A key present in `current`
+ *  but absent from `updated` is a cleared literal (remove). A value not
+ *  yet in source takes the braces form, except on an assignment-only
+ *  input, where the statement form is the only legal one.
+ *
+ *  The ONE producer for this home: the canvas and every off-canvas
+ *  config surface route through it so their ops can never drift. */
+export function diffPortLiteralOps(
+  nodeId: string,
+  updated: Record<string, unknown>,
+  current: Record<string, unknown>,
+  spans: Record<string, { origin: 'inline' | 'connection' }>,
+  inputs: PortDefinition[],
+): EditOp[] {
+  const defaultForm = (key: string): 'inline' | 'connection' => {
+    const input = inputs.find((p) => p.name === key);
+    return input !== undefined && inputExposure(input) !== 'all' ? 'connection' : 'inline';
+  };
+  const ops: EditOp[] = [];
+  for (const [key, value] of Object.entries(updated)) {
+    if (sameConfigValue(value, current[key])) continue;
+    const form = spans[key]?.origin ?? defaultForm(key);
+    if (value === undefined || value === null) {
+      ops.push({ op: 'removeConfig', node: nodeId, key, form });
+    } else {
+      ops.push({ op: 'setConfig', node: nodeId, key, value: formatConfigValue(value), form });
+    }
+  }
+  for (const key of Object.keys(current)) {
+    if (!(key in updated)) {
+      ops.push({ op: 'removeConfig', node: nodeId, key, form: spans[key]?.origin ?? defaultForm(key) });
     }
   }
   return ops;

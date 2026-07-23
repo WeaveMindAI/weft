@@ -22,7 +22,7 @@ impl Node for FileSizeNode {
         // The file value the resolved `@asset` config produced arrives on the
         // `file` port exactly like a wired media value; `get_bytes` reads the
         // bytes behind its handle (bucket key or URL) via the storage handle.
-        let file: serde_json::Value = ctx.ports.get("file")?;
+        let file: serde_json::Value = ctx.inputs.get("file")?;
         let (_meta, bytes) = ctx.storage(StorageScope::Project).get_bytes(&file).await?;
         ctx.pulse_downstream(NodeOutput::new().set("size", bytes.len() as u64)).await
     }

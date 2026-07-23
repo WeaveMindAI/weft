@@ -17,12 +17,11 @@ use serde::{Deserialize, Serialize};
 // element iteration is explicit via `Loop(over: [...])`, never inferred
 // from a type difference across an edge.
 //
-// In backend.rs node definitions, types are string literals:
-//   PortDef::new("name", "String", true)
-//   PortDef::new("items", "List[String]", false)
-//   PortDef::new("headers", "Dict[String, String]", false)
-//   PortDef::new("value", "T", false)           : type variable
-//   PortDef::new("value", "MustOverride", false) : user must declare type
+// In metadata.json input/output declarations, types are string literals:
+//   { "name": "items", "type": "List[String]" }
+//   { "name": "headers", "type": "Dict[String, String]" }
+//   { "name": "value", "type": "T" }            : type variable
+//   { "name": "value", "type": "MustOverride" } : user must declare type
 // =============================================================================
 
 macro_rules! define_primitives {
@@ -152,35 +151,59 @@ impl FileKind {
 }
 
 
-/// Where a LITERAL value may be written for an input port in weft source.
-/// The three driver forms are a ladder: the config braces (`M { x: 5 }`)
-/// imply the assignment statement (`M.x = 5`), which implies nothing.
-/// Edges are a separate axis and always legal, in BOTH spellings: the
-/// edge statement (`M.x = other.y`) and the braces endpoint form
-/// (`M { x: other.y }`) lower to the same wire and are never gated here.
-/// Ordered most-permissive first so `max()` picks the most restrictive.
-// SYNC: LiteralPlacement <-> packages/weft-graph/src/protocol.ts LiteralPlacement
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// Where a value may come from for an input, the one knob a node author
+/// sets per input. Exposure governs LITERALS: whether a literal may sit
+/// in the config braces (`M { x: 5 }`) and/or as an assignment statement
+/// (`M.x = 5`). Wires (an edge, `M { x: other.y }`, an inline expression)
+/// are a separate axis: every exposure is wireable EXCEPT `Config`, which
+/// is a pure design-time setting the graph never drives.
+// SYNC: Exposure <-> packages/weft-graph/src/protocol.ts Exposure
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum LiteralPlacement {
-    /// A literal may sit in the config braces or as an assignment.
+pub enum Exposure {
+    /// Everything: braces literal, assignment literal, wires.
     #[default]
-    Anywhere,
-    /// A literal only via `node.port = ...`; a braces literal is refused.
+    All,
+    /// A literal only via `node.input = ...`; a braces literal is
+    /// refused. Wireable.
     Assignment,
-    /// No literal ever: the port is driven by wires alone.
-    None,
+    /// A literal only in the config braces. NOT wireable: the value is
+    /// design-time configuration, never graph data.
+    Config,
+    /// No literal ever: the input is driven by wires alone.
+    Wire,
 }
 
-impl LiteralPlacement {
+impl Exposure {
     /// May a literal sit in the config braces?
-    pub fn allows_config(self) -> bool {
-        self == LiteralPlacement::Anywhere
+    pub fn allows_braces_literal(self) -> bool {
+        matches!(self, Exposure::All | Exposure::Config)
+    }
+
+    /// May a literal be written as an assignment statement?
+    pub fn allows_assignment_literal(self) -> bool {
+        matches!(self, Exposure::All | Exposure::Assignment)
+    }
+
+    /// May the input be driven by a wire (edge, braces endpoint,
+    /// inline expression)?
+    pub fn wireable(self) -> bool {
+        !matches!(self, Exposure::Config)
     }
 
     /// May a literal be written at all (braces or assignment)?
     pub fn allows_literal(self) -> bool {
-        self != LiteralPlacement::None
+        !matches!(self, Exposure::Wire)
+    }
+
+    /// Stable lowercase tag, matching the serde/wire form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Exposure::All => "all",
+            Exposure::Assignment => "assignment",
+            Exposure::Config => "config",
+            Exposure::Wire => "wire",
+        }
     }
 }
 
@@ -419,32 +442,58 @@ impl WeftType {
         }
     }
 
-    /// The default `LiteralPlacement` for a port of this type. Plain data
+    /// The default `Exposure` for an input of this type. Plain data
     /// (primitives, lists, dicts, JsonDict, unions of those) takes a
-    /// literal anywhere, so users can paste values into the config braces
-    /// instead of wiring a separate Text node. Stored files (alone or in
-    /// containers) take a literal only as an assignment (`n.p = @asset(..)`:
-    /// nobody can hand-type a file marker into a config field), as do
-    /// TypeVar and MustOverride ports (their concrete type is unknown until
-    /// overridden). A Bus is a live runtime handle: no literal ever. Catalog
-    /// authors override per port via `PortDef::literal`.
-    pub fn default_literal_placement(&self) -> LiteralPlacement {
+    /// literal anywhere and wires (`All`), so users can paste values into
+    /// the config braces instead of wiring a separate Text node. Stored
+    /// files (alone or in containers) take a literal only as an assignment
+    /// (`n.p = @asset(..)`: nobody can hand-type a file marker into a
+    /// config field), as do TypeVar and MustOverride inputs (their
+    /// concrete type is unknown until overridden). A Bus is a live runtime
+    /// handle: wires alone. Node authors override per input via
+    /// `InputSpec::exposure` (including the `Config` mode, which no type
+    /// defaults to).
+    pub fn default_exposure(&self) -> Exposure {
         match self {
             WeftType::Primitive(_) => {
-                if self.references_file() { LiteralPlacement::Assignment } else { LiteralPlacement::Anywhere }
+                if self.references_file() { Exposure::Assignment } else { Exposure::All }
             }
-            WeftType::List(inner) => inner.default_literal_placement(),
-            WeftType::Dict(_, v) => v.default_literal_placement(),
+            WeftType::List(inner) => inner.default_exposure(),
+            WeftType::Dict(_, v) => v.default_exposure(),
             // A union is as restrictive as its most restrictive member.
-            WeftType::Union(types) => types
-                .iter()
-                .map(|t| t.default_literal_placement())
-                .max()
-                .unwrap_or(LiteralPlacement::Anywhere),
-            WeftType::JsonDict => LiteralPlacement::Anywhere,
-            WeftType::Bus => LiteralPlacement::None,
-            WeftType::TypeVar(_) => LiteralPlacement::Assignment,
-            WeftType::MustOverride => LiteralPlacement::Assignment,
+            // Only the three type-derived levels can occur here (`Config`
+            // is author-only), so the fold is: any wires-only member makes
+            // the union wires-only, else any assignment-only member makes
+            // it assignment-only, else it stays open.
+            WeftType::Union(types) => {
+                let members: Vec<Exposure> =
+                    types.iter().map(|t| t.default_exposure()).collect();
+                if members.contains(&Exposure::Wire) {
+                    Exposure::Wire
+                } else if members.contains(&Exposure::Assignment) {
+                    Exposure::Assignment
+                } else {
+                    Exposure::All
+                }
+            }
+            WeftType::JsonDict => Exposure::All,
+            WeftType::Bus => Exposure::Wire,
+            WeftType::TypeVar(_) => Exposure::Assignment,
+            WeftType::MustOverride => Exposure::Assignment,
+        }
+    }
+
+    /// True when this type names a stored file as a WHOLE value: a bare
+    /// file primitive, or a union whose every member is one (the
+    /// `File`/`Media` aliases). Containers of files (`List[Image]`) are
+    /// NOT file-valued: their literal is typed as JSON, not picked as one
+    /// file. Drives the default widget (a file-valued input gets the
+    /// drop/pick control).
+    pub fn is_file_valued(&self) -> bool {
+        match self {
+            WeftType::Primitive(p) => Self::file_primitives().contains(p),
+            WeftType::Union(types) => types.iter().all(|t| t.is_file_valued()),
+            _ => false,
         }
     }
 
@@ -659,6 +708,151 @@ impl WeftType {
     /// self-describes its exact type.
     pub fn file_marker(kind: FileKind, payload: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ kind.marker_key(): payload })
+    }
+
+    /// Cast a JSON value into this type, when the conversion is
+    /// UNAMBIGUOUS. The literal-lenience rule: a value written in weft
+    /// source (by a human or an AI) that plainly means a value of the
+    /// declared type is converted at compile time instead of failing
+    /// dumbly; anything genuinely ambiguous or lossy is refused and the
+    /// caller reports the mismatch. The sibling of [`Self::cast_text`]
+    /// (the `@file` cast), which handles TEXT; this handles an
+    /// already-parsed JSON value.
+    ///
+    /// Rules (recursive):
+    /// - a value already compatible with the type passes through as-is;
+    /// - String -> Number parses the trimmed scalar;
+    /// - String -> Boolean accepts true/false in any case ("True",
+    ///   "FALSE") plus "1"/"0"; Number -> Boolean accepts exactly 1/0
+    ///   (any other number is ambiguous and refused);
+    /// - Boolean -> Number is 1/0; Number / Boolean -> String
+    ///   stringifies the scalar;
+    /// - String -> a structural type (List/Dict/JsonDict) parses the
+    ///   string as JSON, then recurses;
+    /// - List / Dict recurse into elements / values;
+    /// - a union tries exact compatibility first; failing that, EVERY
+    ///   member's cast is attempted: exactly one success (or several
+    ///   agreeing on the same value) wins, and members disagreeing on
+    ///   the result is an AMBIGUOUS cast, refused loudly naming the
+    ///   readings (never silently picked by declaration order);
+    /// - Null, Bus, TypeVar, MustOverride, and file types never cast
+    ///   (a file value is a marker, not convertible data).
+    pub fn cast_value(&self, value: &serde_json::Value) -> Result<serde_json::Value, std::string::String> {
+        use serde_json::Value;
+        // Exact fit: hand it back untouched (preserves the written form).
+        if Self::is_compatible(&Self::infer(value), self) {
+            return Ok(value.clone());
+        }
+        if value.is_null() {
+            return Err("null has no cast".into());
+        }
+        if self.is_unresolved() || self.references_file() || matches!(self, WeftType::Bus) {
+            return Err(format!("no cast into {self}"));
+        }
+        match self {
+            WeftType::Primitive(WeftPrimitive::Number) => match value {
+                Value::String(s) => {
+                    let n: f64 = s.trim().parse().map_err(|_| {
+                        format!("{s:?} is not a number")
+                    })?;
+                    serde_json::Number::from_f64(n)
+                        .map(Value::Number)
+                        .ok_or_else(|| format!("{n} is not finite"))
+                }
+                Value::Bool(b) => Ok(Value::from(if *b { 1 } else { 0 })),
+                _ => Err(format!("no cast from {} into Number", Self::infer(value))),
+            },
+            WeftType::Primitive(WeftPrimitive::Boolean) => match value {
+                Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" => Ok(Value::Bool(true)),
+                    "false" | "0" => Ok(Value::Bool(false)),
+                    other => Err(format!("{other:?} is not a boolean")),
+                },
+                // Exactly 1/0; any other number is ambiguous, refused.
+                Value::Number(n) => match n.as_f64() {
+                    Some(x) if x == 1.0 => Ok(Value::Bool(true)),
+                    Some(x) if x == 0.0 => Ok(Value::Bool(false)),
+                    _ => Err(format!("{n} is not a boolean (only 1/0 cast)")),
+                },
+                _ => Err(format!("no cast from {} into Boolean", Self::infer(value))),
+            },
+            WeftType::Primitive(WeftPrimitive::String) => match value {
+                Value::Number(n) => Ok(Value::String(n.to_string())),
+                Value::Bool(b) => Ok(Value::String(b.to_string())),
+                _ => Err(format!("no cast from {} into String", Self::infer(value))),
+            },
+            WeftType::List(inner) => match value {
+                Value::Array(items) => items
+                    .iter()
+                    .map(|v| inner.cast_value(v))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Value::Array),
+                Value::String(s) => {
+                    let parsed: Value = serde_json::from_str(s.trim())
+                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
+                    self.cast_value(&parsed)
+                }
+                _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+            },
+            WeftType::Dict(_, v_ty) => match value {
+                Value::Object(map) => {
+                    let mut out = serde_json::Map::new();
+                    for (k, v) in map {
+                        out.insert(k.clone(), v_ty.cast_value(v)?);
+                    }
+                    Ok(Value::Object(out))
+                }
+                Value::String(s) => {
+                    let parsed: Value = serde_json::from_str(s.trim())
+                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
+                    self.cast_value(&parsed)
+                }
+                _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+            },
+            WeftType::JsonDict => match value {
+                Value::String(s) => {
+                    let parsed: Value = serde_json::from_str(s.trim())
+                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
+                    match parsed {
+                        Value::Object(_) => Ok(parsed),
+                        other => Err(format!("expected a JSON object, got {}", Self::infer(&other))),
+                    }
+                }
+                _ => Err(format!("no cast from {} into JsonDict", Self::infer(value))),
+            },
+            // Exact compatibility was tried above; now EVERY member's
+            // cast. One success (or several agreeing) wins; members
+            // disagreeing on the result is ambiguous and refused with
+            // both readings, so the writer disambiguates instead of the
+            // compiler guessing.
+            WeftType::Union(members) => {
+                let successes: Vec<(&WeftType, serde_json::Value)> = members
+                    .iter()
+                    .filter_map(|m| m.cast_value(value).ok().map(|v| (m, v)))
+                    .collect();
+                match successes.as_slice() {
+                    [] => Err(format!("no member of {self} can cast {}", Self::infer(value))),
+                    [(_, v)] => Ok(v.clone()),
+                    all => {
+                        let (_, first) = &all[0];
+                        if all.iter().all(|(_, v)| v == first) {
+                            Ok(first.clone())
+                        } else {
+                            let readings: Vec<std::string::String> = all
+                                .iter()
+                                .map(|(m, v)| format!("{v} ({m})"))
+                                .collect();
+                            Err(format!(
+                                "ambiguous cast into {self}: could be {}; write the value \
+                                 in its exact type",
+                                readings.join(" or ")
+                            ))
+                        }
+                    }
+                }
+            }
+            _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+        }
     }
 
     /// Unify a list of types into a single type.

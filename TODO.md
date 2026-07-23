@@ -47,7 +47,7 @@ mechanisms today:
    history (a corrupt row in a long-settled branch only degrades the
    replay view), but the SAME skip runs when the corrupt row is on the
    RESUME FRONTIER (a `PulseEmitted` feeding a suspended node's input,
-   a `NodeResumed`'s absorbed-pulse list) — there it silently rebuilds
+   a `NodeResumed`'s absorbed-pulse list); there it silently rebuilds
    the suspended node's state wrong and resumes on garbage.
 
 Both (1) and (2) are the SAME underlying thing: **the journal has a
@@ -320,6 +320,52 @@ carries it as ordinary `Dict` data today.
 (`NodeStarted`), how PORT VALUES are journaled (`NodeCompleted.output` /
 `PulseEmitted`), the metadata field-definition shape, or the inspector's
 config rendering, revisit this entry.
+
+## A closed port carries no reason
+
+**Problem.** A closure says "nothing will arrive here" and nothing
+more: `Pulse::closure` sets `closed: true` with `value: Null` and no
+other field (`crates/weft-core/src/pulse.rs:82-98`). Three unrelated
+situations produce a byte-identical signal at the consumer:
+
+1. the producer FAILED (its body errored, so its ports closed),
+2. the producer deliberately declined to emit (a `Gate` whose `pass`
+   was false, an unselected branch),
+3. the producer was never going to run (a different trigger fired and
+   this branch is dead, so its ports closed at Fire).
+
+Downstream they are the same nothing. A consumer can branch on ABSENCE
+(that's the null-propagation model working as designed) but not on
+CAUSE. So the graph cannot express "retry this when it actually broke,
+but leave it alone when the gate deliberately said no", or "route real
+failures to an alert and ignore deliberate skips": the retry loop
+cannot tell the two apart and retries both.
+
+Second half of the same gap: node code cannot observe a closure at all.
+An optional port that was closed is indistinguishable, from inside the
+body, from an optional port that was never wired. The bag accessors
+answer "do I have a value", never "did something upstream close this".
+
+**Direction.** Deliberately unspecified. Two shapes are visible (a
+closure that carries a reason tag readable by node code; or failure
+propagating as a genuinely distinct signal from deliberate-skip) and
+neither is clearly right, so this entry records the problem and the
+evidence WITHOUT picking a shape. Park it until a real use case bites
+and shows which distinction actually needs to be drawn; designing it
+from the hypothetical would bake in the wrong seam.
+
+**Why deferred.** No design yet, on purpose (see above). Surfaced while
+mapping the node-request corpus (`discord-export/node-requests-ranked.md`)
+against the language: retry-on-real-failure is wanted by essentially
+every flaky-external-API node, and it is the retry/error-handling item
+`ROADMAP.md` names, reached from the other end. Note this is NOT a
+missing retry construct: retry is expressible today as a `Loop` with a
+stop condition, and that stays the explicit way to do it. The gap is
+only that the loop cannot see WHY it got nothing.
+
+[Update Notice Warning] If we touch `Pulse::closure` / the `closed`
+flag, the skip-cascade in `handle_node_skip`, or the `ValueBag`
+accessors, revisit this entry.
 
 ## Held suspensions (warm-worker model)
 

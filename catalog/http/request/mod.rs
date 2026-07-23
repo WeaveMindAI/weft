@@ -16,13 +16,13 @@ pub struct HttpRequestNode;
 #[async_trait]
 impl Node for HttpRequestNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let url: String = ctx.ports.get("url")?;
-        let method_str: String = ctx.config.get("method")?;
+        let url: String = ctx.inputs.get("url")?;
+        let method_str: String = ctx.inputs.get("method")?;
         let method = Method::from_bytes(method_str.as_bytes())
             .node_err(format!("bad method '{method_str}'"))?;
 
-        let body: Option<Value> = ctx.ports.opt("body")?;
-        let headers: Option<HashMap<String, String>> = ctx.ports.opt("headers")?;
+        let body: Option<Value> = ctx.inputs.opt("body")?;
+        let headers: Option<HashMap<String, String>> = ctx.inputs.opt("headers")?;
 
         let mut req = ctx.http().request(method, &url);
         if let Some(map) = headers {

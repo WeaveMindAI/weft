@@ -1106,25 +1106,23 @@ fn set_config_must_not_clobber_a_wiring_edge() {
 }
 
 #[test]
-fn set_config_must_not_clobber_an_inline_expression() {
-    // An inline-expr RHS (`b.data = Upper{...}.out`) is a node+edge SYNTHESIS, not
-    // a config field: the lowering makes a real `Upper` node and wires it. It has
-    // exactly ONE endpoint (the inline-expr is a node, not a 2nd endpoint), so the
-    // old one-endpoint guard misclassified it as a config field and SetConfig/
-    // RemoveConfig destroyed the subgraph. The shared `connection_is_config_origin`
-    // (mirroring the lowering's `literal_config_fill`) now rejects an inline-expr
-    // RHS, so the wiring survives.
+fn set_config_never_destroys_an_inline_expression() {
+    // An inline-expr RHS (`b.data = Upper{...}.out`) is a node+edge
+    // SYNTHESIS. Writing a literal over that key means "replace the
+    // driver": the inline node is EXTRACTED as a named orphan (never
+    // silently deleted with its subgraph) and the literal takes the
+    // slot. RemoveConfig likewise drops the driver but keeps the node.
     let src = "b = Debug\nb.data = Upper { text: \"hi\" }.out\n";
-    // SetConfig adds a separate config field; the inline-expr wiring is untouched.
     let (out, _) = apply_edits(src, None, "Untitled",
         &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into(), form: None }]).expect("set config");
-    assert!(out.contains("Upper { text: \"hi\" }.out"), "inline-expr subgraph survives SetConfig: {out}");
     parse_ok(&out);
-    // RemoveConfig must NOT delete the inline-expr wiring.
+    assert!(out.contains("b_data = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out}");
+    assert!(compiled_edges(&out).is_empty(), "the literal replaced the wire: {out}");
     let (out2, _) = apply_edits(src, None, "Untitled",
         &[EditOp::RemoveConfig { node: "b".into(), key: "data".into(), form: None }]).expect("remove config");
-    assert!(out2.contains("Upper { text: \"hi\" }.out"), "inline-expr subgraph survives RemoveConfig: {out2}");
     parse_ok(&out2);
+    assert!(out2.contains("b_data = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out2}");
+    assert!(compiled_edges(&out2).is_empty(), "the driver is dropped: {out2}");
 }
 
 #[test]
@@ -1940,10 +1938,12 @@ fn set_config_empty_value_does_not_collapse_brace() {
 }
 
 #[test]
-fn set_config_oneliner_inline_value_keeps_space_before_brace() {
+fn set_config_over_a_oneliner_inline_extracts_then_sets() {
     let out = apply("g = Template { template: Upper { text: \"hi\" }.out }\n",
         vec![EditOp::SetConfig { node: "g".into(), key: "template".into(), value: "\"plain\"".into(), form: None }]);
-    assert_eq!(out, "g = Template { template: \"plain\" }\n");
+    parse_ok(&out);
+    assert!(out.contains("g_template = Upper { text: \"hi\" }"), "old driver extracted: {out}");
+    assert_eq!(compiled_config(&out, "g", "template"), Some(serde_json::json!("plain")), "{out}");
 }
 
 #[test]
@@ -2617,4 +2617,490 @@ fn move_container_into_own_descendant_is_rejected_before_mutating() {
         msg2.contains("itself or its own descendant"),
         "error names the actual problem: {msg2}"
     );
+}
+
+// ── inline-expression nodes are addressable ─────────────────────────────────
+//
+// The graph renders an inline expression's synthesized anon node
+// (`host__key`) as a normal node; these pin that the edit layer can
+// resolve and edit it in place (SetConfig / RemoveConfig), remove the
+// whole expression (RemoveNode), and refuses everything that would need
+// the anon id to exist in source (wiring, renaming, labeling).
+
+/// Fetch a compiled node's config value, to prove an edit's value
+/// round-trips source -> parse -> value (not just source text).
+fn compiled_config(src: &str, node_id: &str, key: &str) -> Option<serde_json::Value> {
+    let (project, _) = crate::weft_compiler::compile_lenient(
+        src,
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::none(),
+        crate::weft_compiler::IncludeMode::Interface,
+        None,
+    );
+    let node = project.nodes.iter().find(|n| n.id == node_id)?;
+    node.config.get(key).cloned()
+}
+
+#[test]
+fn set_config_edits_an_inline_node_in_config_field_form() {
+    let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a__data".into(), key: "value".into(), value: "\"bye\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("value: \"bye\""), "{out}");
+    assert_eq!(compiled_config(&out, "a__data", "value"), Some(serde_json::json!("bye")));
+    assert_reversible(src, vec![EditOp::SetConfig {
+        node: "a__data".into(), key: "value".into(), value: "\"bye\"".into(), form: None,
+    }]);
+}
+
+#[test]
+fn set_config_edits_an_inline_node_in_assignment_form() {
+    let src = "b = Debug\nb.data = Text { value: \"x\" }.value\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "b__data".into(), key: "value".into(), value: "\"y\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("value: \"y\""), "{out}");
+    assert_eq!(compiled_config(&out, "b__data", "value"), Some(serde_json::json!("y")));
+}
+
+#[test]
+fn set_config_edits_a_nested_inline_node() {
+    // The inner inline is the value of the outer inline's `value` field:
+    // its anon id is `a__data__value` (host `a__data`, key `value`).
+    let src = "a = Debug\na.data = Text { value: Template { template: \"t\" }.text }.value\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a__data__value".into(), key: "template".into(), value: "\"u\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("template: \"u\""), "{out}");
+    assert_eq!(compiled_config(&out, "a__data__value", "template"), Some(serde_json::json!("u")));
+}
+
+#[test]
+fn set_config_edits_a_group_scoped_inline_node() {
+    let src = "g = Group() -> () {\n  b = Debug\n  b.data = Text { value: \"x\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "g.b__data".into(), key: "value".into(), value: "\"z\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("value: \"z\""), "{out}");
+    assert_eq!(compiled_config(&out, "g.b__data", "value"), Some(serde_json::json!("z")));
+}
+
+#[test]
+fn set_config_inserts_a_fresh_field_on_an_inline_node() {
+    let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a__data".into(), key: "style".into(), value: "\"loud\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert_eq!(compiled_config(&out, "a__data", "style"), Some(serde_json::json!("loud")));
+}
+
+#[test]
+fn remove_config_on_an_inline_node_removes_the_field() {
+    let src = "a = Debug {\n  data: Text { value: \"hi\" style: \"soft\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveConfig {
+        node: "a__data".into(), key: "style".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(!out.contains("style"), "{out}");
+    assert!(out.contains("value: \"hi\""), "the other field survives: {out}");
+}
+
+#[test]
+fn set_config_on_an_inline_node_refuses_the_statement_form() {
+    let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\n";
+    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig {
+        node: "a__data".into(), key: "value".into(), value: "\"x\"".into(),
+        form: Some(ValueForm::Connection),
+    }])
+    .expect_err("an inline node's fields have no statement form");
+    assert!(format!("{err}").contains("inline node"), "{err}");
+}
+
+#[test]
+fn remove_node_on_an_inline_deletes_the_whole_expression() {
+    // Config-field form: the field goes, the host node stays.
+    let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n  style: \"loud\"\n}\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "a__data".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("Text"), "{out}");
+    assert!(out.contains("style: \"loud\""), "sibling field survives: {out}");
+    assert!(out.contains("a = Debug"), "host survives: {out}");
+
+    // Assignment form: the statement line goes, the host stays bare.
+    let src = "b = Debug\nb.data = Text { value: \"x\" }.value\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "b__data".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("Text"), "{out}");
+    assert!(out.contains("b = Debug"), "{out}");
+}
+
+#[test]
+fn wiring_an_inline_node_de_inlines_it_with_the_wire_kept() {
+    // Fan-out from an inline's output: the inline is extracted as a
+    // named node, its wire to the host becomes explicit, and the new
+    // edge lands on the extracted node.
+    let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\nc = Sink\n";
+    let out = apply(src, vec![EditOp::AddEdge {
+        source: "a__data".into(), source_port: "value".into(),
+        target: "c".into(), target_port: "input".into(), scope_group: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("a_data = Text"), "extracted named node: {out}");
+    assert!(out.contains("data: a_data.value"), "the host wire became explicit: {out}");
+    assert!(out.contains("c.input = a_data.value"), "the new edge exists: {out}");
+    let edges = compiled_edges(&out);
+    assert!(edges.contains(&("a_data".into(), "a".into())), "host wire survives: {edges:?}");
+    assert!(edges.contains(&("a_data".into(), "c".into())), "new edge exists: {edges:?}");
+}
+
+#[test]
+fn labeling_an_inline_node_works_in_place() {
+    let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::SetLabel {
+        node: "a__data".into(), label: Some("My Text".into()),
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("_label: \"My Text\""), "{out}");
+    assert!(out.contains("data: Text {"), "still inline: {out}");
+}
+
+#[test]
+fn moving_an_inline_within_its_own_scope_is_a_no_op() {
+    let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\n";
+    let (out, _) = apply_edits(src, None, "Untitled", &[EditOp::MoveNodeScope {
+        node: "a__data".into(), target_group: None,
+    }]).expect("in-place move is a no-op");
+    assert_eq!(out, src, "a drag ended in place must not restructure the source");
+}
+
+// ── per-widget value round-trips ────────────────────────────────────────────
+//
+// One value per widget-kind value SHAPE: set through the edit layer,
+// re-parse, and compare the COMPILED value (not source text), so a
+// formatter/parser drift on any shape fails here. (defect 6 of the
+// unified-input audit: no such round-trip existed, which is how dead
+// defaults and dropped members survived.)
+#[test]
+fn per_widget_value_shapes_round_trip_through_source() {
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        ("\"text value\"", serde_json::json!("text value")),          // text/textarea/password/api_key/select/code
+        ("2.5", serde_json::json!(2.5)),                              // number (float)
+        ("42", serde_json::json!(42)),                                // number (integer)
+        ("true", serde_json::json!(true)),                            // checkbox
+        ("[\"a\", \"b\"]", serde_json::json!(["a", "b"])),           // multiselect
+        (
+            "[{\"fieldType\": \"display\", \"key\": \"k\"}]",
+            serde_json::json!([{"fieldType": "display", "key": "k"}]),
+        ),                                                            // form_builder
+    ];
+    for (token, expected) in cases {
+        let src = "t = Text\n";
+        let out = apply(src, vec![EditOp::SetConfig {
+            node: "t".into(), key: "value".into(), value: token.into(), form: None,
+        }]);
+        parse_ok(&out);
+        assert_eq!(
+            compiled_config(&out, "t", "value"),
+            Some(expected.clone()),
+            "shape {token} must survive set -> source -> parse"
+        );
+    }
+}
+
+#[test]
+fn set_config_edits_a_three_level_nested_inline_node() {
+    // X's field v holds Y, whose field w holds Z: anon ids chain
+    // `a__data`, `a__data__v`, `a__data__v__w`.
+    let src = "a = Debug\na.data = X { v: Y { w: Z { u: \"1\" }.o }.o }.o\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a__data__v__w".into(), key: "u".into(), value: "\"2\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("u: \"2\""), "{out}");
+    assert_eq!(compiled_config(&out, "a__data__v__w", "u"), Some(serde_json::json!("2")));
+
+    // Editing the MIDDLE of the chain works too (a fresh field lands in
+    // Y's body, not in X's or Z's).
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a__data__v".into(), key: "extra".into(), value: "5".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert_eq!(compiled_config(&out, "a__data__v", "extra"), Some(serde_json::json!(5)));
+    assert_eq!(compiled_config(&out, "a__data", "extra"), None, "the outer inline is untouched");
+    assert_eq!(compiled_config(&out, "a__data__v__w", "extra"), None, "the inner inline is untouched");
+}
+
+#[test]
+fn remove_node_on_a_middle_inline_extracts_its_children() {
+    // GRAPH semantics: deleting Y removes Y and its wires; Z (Y's own
+    // driver) survives, DE-INLINED into a named orphan node. The outer
+    // X keeps its other fields and simply loses its `v` driver.
+    let src = "a = Debug\na.data = X { v: Y { w: Z { u: \"1\" }.o }.o keep: \"k\" }.o\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "a__data__v".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("Y {"), "the removed inline is gone: {out}");
+    assert!(out.contains("X {"), "the outer inline survives: {out}");
+    assert!(out.contains("keep: \"k\""), "the outer inline's sibling field survives: {out}");
+    // Z survives as a named node with its config intact.
+    assert!(out.contains("= Z {"), "the nested child was extracted, not deleted: {out}");
+    let nodes = compiled_node_ids(&out);
+    assert!(nodes.iter().any(|n| n == "a_data_v_w"), "extracted orphan exists: {nodes:?}");
+    assert_eq!(compiled_config(&out, "a_data_v_w", "u"), Some(serde_json::json!("1")));
+}
+
+#[test]
+fn sibling_inline_nodes_edit_independently() {
+    let src = "h = Sink {\n  x: Text { value: \"1\" }.value\n  y: Text { value: \"2\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "h__x".into(), key: "value".into(), value: "\"changed\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert_eq!(compiled_config(&out, "h__x", "value"), Some(serde_json::json!("changed")));
+    assert_eq!(compiled_config(&out, "h__y", "value"), Some(serde_json::json!("2")), "the sibling is untouched");
+}
+
+/// Inline GROUPS stay forbidden: the source parses (so the graph can
+/// render the error) but the compile rejects it loudly, and the edit
+/// layer can still cleanly DELETE the bad expression (the recovery),
+/// while in-place edits on it behave like any inline (no corruption).
+#[test]
+fn inline_groups_are_rejected_by_compile_and_removable_by_edit() {
+    let src = "a = Debug {\n  data: Group { }.out\n}\n";
+    let (_, errors) = crate::weft_compiler::compile_lenient(
+        src,
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::none(),
+        crate::weft_compiler::IncludeMode::Interface,
+        None,
+    );
+    assert!(
+        errors.iter().any(|e| e.message.contains("Groups cannot be inlined")),
+        "{errors:?}"
+    );
+
+    // The recovery: removing the anon node deletes the whole bad value.
+    let out = apply(src, vec![EditOp::RemoveNode { node: "a__data".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("Group"), "{out}");
+    assert!(out.contains("a = Debug"), "{out}");
+}
+
+/// Compiled node ids + edges of a source, for asserting graph shape
+/// after de-inlining ops (the source text may legally differ as long as
+/// the graph is the same).
+fn compiled_node_ids(src: &str) -> Vec<String> {
+    let (project, _) = crate::weft_compiler::compile_lenient(
+        src,
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::none(),
+        crate::weft_compiler::IncludeMode::Interface,
+        None,
+    );
+    project.nodes.iter().map(|n| n.id.clone()).collect()
+}
+
+fn compiled_edges(src: &str) -> Vec<(String, String)> {
+    let (project, _) = crate::weft_compiler::compile_lenient(
+        src,
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::none(),
+        crate::weft_compiler::IncludeMode::Interface,
+        None,
+    );
+    project.edges.iter().map(|e| (e.source.clone(), e.target.clone())).collect()
+}
+
+#[test]
+fn removing_the_synthesized_wire_extracts_the_inline_as_an_orphan() {
+    // Statement form: unlink `a__data.value -> a.data`. The wire goes,
+    // the node survives named, the host input is bare.
+    let src = "a = Debug\na.data = Text { value: \"x\" }.value\n";
+    let out = apply(src, vec![EditOp::RemoveEdge {
+        source: "a__data".into(), source_port: "value".into(),
+        target: "a".into(), target_port: "data".into(), scope_group: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("a_data = Text"), "orphan extracted: {out}");
+    assert!(compiled_edges(&out).is_empty(), "the wire is gone: {out}");
+    assert_eq!(compiled_config(&out, "a_data", "value"), Some(serde_json::json!("x")));
+
+    // Braces form: same semantics.
+    let src = "a = Debug {\n  data: Text { value: \"x\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveEdge {
+        source: "a__data".into(), source_port: "value".into(),
+        target: "a".into(), target_port: "data".into(), scope_group: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("a_data = Text"), "orphan extracted: {out}");
+    assert!(compiled_edges(&out).is_empty(), "the wire is gone: {out}");
+}
+
+#[test]
+fn removing_a_braces_endpoint_wire_drops_the_field() {
+    let src = "t = Text { value: \"v\" }\na = Debug {\n  data: t.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveEdge {
+        source: "t".into(), source_port: "value".into(),
+        target: "a".into(), target_port: "data".into(), scope_group: None,
+    }]);
+    parse_ok(&out);
+    assert!(compiled_edges(&out).is_empty(), "{out}");
+    assert!(out.contains("t = Text"), "the source node survives: {out}");
+}
+
+#[test]
+fn replacing_an_inline_driver_with_an_edge_extracts_it_as_an_orphan() {
+    let src = "t = Text { value: \"new\" }\na = Debug\na.data = Old { v: \"1\" }.o\n";
+    let out = apply(src, vec![EditOp::AddEdge {
+        source: "t".into(), source_port: "value".into(),
+        target: "a".into(), target_port: "data".into(), scope_group: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("a_data = Old"), "old driver survives as an orphan: {out}");
+    let edges = compiled_edges(&out);
+    assert!(edges.contains(&("t".into(), "a".into())), "{edges:?}");
+    assert!(!edges.iter().any(|(s, _)| s == "a_data"), "old driver is unwired: {edges:?}");
+}
+
+#[test]
+fn replacing_a_braces_endpoint_driver_removes_that_field() {
+    let src = "t = Text { value: \"1\" }\nu = Text { value: \"2\" }\na = Debug {\n  data: t.value\n}\n";
+    let out = apply(src, vec![EditOp::AddEdge {
+        source: "u".into(), source_port: "value".into(),
+        target: "a".into(), target_port: "data".into(), scope_group: None,
+    }]);
+    parse_ok(&out);
+    let edges = compiled_edges(&out);
+    assert!(edges.contains(&("u".into(), "a".into())), "{edges:?}");
+    assert!(!edges.contains(&("t".into(), "a".into())), "old driver replaced: {edges:?}");
+}
+
+#[test]
+fn set_config_over_an_inline_driven_key_extracts_the_old_driver() {
+    let src = "a = Debug {\n  data: Text { value: \"x\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a".into(), key: "data".into(), value: "\"literal\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("a_data = Text"), "old driver survives as an orphan: {out}");
+    assert_eq!(compiled_config(&out, "a_data", "value"), Some(serde_json::json!("x")));
+    // The literal now drives the input (it lands in the compiled
+    // definition on the host).
+    let (project, _) = crate::weft_compiler::compile_lenient(
+        &out, uuid::Uuid::nil(), crate::file_reader::CompileFs::none(),
+        crate::weft_compiler::IncludeMode::Interface, None,
+    );
+    let a = project.nodes.iter().find(|n| n.id == "a").unwrap();
+    let value = a.port_literals.get("data").or_else(|| a.config.get("data"));
+    assert_eq!(value, Some(&serde_json::json!("literal")), "{out}");
+}
+
+#[test]
+fn removing_a_host_extracts_its_inline_drivers_as_orphans() {
+    // Braces AND statement drivers, plus a braces-endpoint wire from a
+    // third node: deleting the host keeps every neighbor alive.
+    let src = "t = Text { value: \"t\" }\na = Sink {\n  x: One { v: \"1\" }.o\n  y: t.value\n}\na.z = Two { w: \"2\" }.o\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "a".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("a = Sink"), "{out}");
+    assert!(out.contains("a_x = One"), "braces inline driver extracted: {out}");
+    assert!(out.contains("a_z = Two"), "statement inline driver extracted: {out}");
+    assert!(out.contains("t = Text"), "plain neighbor survives: {out}");
+    assert!(compiled_edges(&out).is_empty(), "every wire died with the node: {out}");
+    assert_eq!(compiled_config(&out, "a_x", "v"), Some(serde_json::json!("1")));
+    assert_eq!(compiled_config(&out, "a_z", "w"), Some(serde_json::json!("2")));
+}
+
+#[test]
+fn removing_a_node_clears_braces_endpoint_wires_to_it() {
+    // `a` consumes `t.value` in braces form; deleting `t` must clear
+    // that field or it dangles into a compile error.
+    let src = "t = Text { value: \"v\" }\na = Debug {\n  data: t.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "t".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("t.value"), "the dangling braces wire is cleared: {out}");
+    assert!(out.contains("a = Debug"), "{out}");
+}
+
+#[test]
+fn inserting_into_a_one_line_body_keeps_it_one_line() {
+    // A one-liner grows comma-joined instead of having newline layout
+    // spliced mid-line (which would mangle an inline node's body).
+    let src = "a = Debug\na.data = Custom { x: 1 }.out\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a__data".into(), key: "v".into(), value: "\"2\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("Custom { x: 1, v: \"2\" }.out"), "one line stays one line: {out}");
+    assert_eq!(compiled_config(&out, "a__data", "v"), Some(serde_json::json!("2")), "{out}");
+}
+
+#[test]
+fn set_config_on_a_bodyless_inline_synthesizes_a_body_and_keeps_the_wire() {
+    // `data: Foo.out` parses as a BODYLESS inline expression. Inserting
+    // a field must rebuild `Foo { v: "x" }.out` (type + port intact),
+    // never degrade the value into a JSON object literal (which would
+    // silently delete the node and its wire).
+    let src = "a = Debug {\n  data: Foo.out\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "a__data".into(), key: "v".into(), value: "\"x\"".into(), form: None,
+    }]);
+    parse_ok(&out);
+    let nodes = compiled_node_ids(&out);
+    assert!(nodes.iter().any(|n| n == "a__data"), "the inline node survives: {nodes:?}\n{out}");
+    assert!(
+        compiled_edges(&out).iter().any(|(s, t)| s == "a__data" && t == "a"),
+        "the wire survives: {out}"
+    );
+    assert_eq!(compiled_config(&out, "a__data", "v"), Some(serde_json::json!("x")), "{out}");
+}
+
+#[test]
+fn removing_a_host_clears_a_self_reference_inside_its_own_inline_driver() {
+    // The braces-endpoint wire back to the host lives INSIDE the
+    // host's own inline driver. Extraction re-parses the driver, so
+    // the reference must be cleared BEFORE the extraction or the
+    // extracted orphan keeps a dangling `a.value`.
+    let src = "a = Debug {\n  data: Custom {\n    inner: a.value\n  }.out\n}\n";
+    let out = apply(src, vec![EditOp::RemoveNode { node: "a".into() }]);
+    parse_ok(&out);
+    assert!(!out.contains("a.value"), "no dangling reference to the removed host: {out}");
+    let nodes = compiled_node_ids(&out);
+    assert!(nodes.iter().any(|n| n == "a_data"), "the driver survives as an orphan: {nodes:?}\n{out}");
+    assert!(!nodes.iter().any(|n| n == "a"), "{nodes:?}");
+    assert!(
+        compiled_edges(&out).iter().all(|(s, t)| s != "a" && t != "a"),
+        "no compiled edge references the removed host: {out}"
+    );
+}
+
+#[test]
+fn extraction_inside_a_group_stays_in_the_group() {
+    let src = "g = Group() -> () {\n  b = Debug\n  b.data = Text { value: \"x\" }.value\n}\n";
+    let out = apply(src, vec![EditOp::RemoveEdge {
+        source: "g.b__data".into(), source_port: "value".into(),
+        target: "b".into(), target_port: "data".into(), scope_group: Some("g".into()),
+    }]);
+    parse_ok(&out);
+    let nodes = compiled_node_ids(&out);
+    assert!(nodes.iter().any(|n| n == "g.b_data"), "orphan lives INSIDE the group: {nodes:?}\n{out}");
+}
+
+#[test]
+fn updating_ports_on_an_inline_de_inlines_it() {
+    let src = "a = Debug\na.data = Custom { v: \"1\" }.o\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "a__data".into(),
+        inputs: vec![],
+        outputs: vec![PortSig { name: "o".into(), required: false, port_type: Some("String".into()) }],
+    }]);
+    parse_ok(&out);
+    assert!(out.contains("a_data = Custom"), "{out}");
+    assert!(out.contains("-> (o: String?)") || out.contains("-> (o: String)"), "signature written: {out}");
+    assert!(compiled_edges(&out).contains(&("a_data".into(), "a".into())), "wire kept: {out}");
 }

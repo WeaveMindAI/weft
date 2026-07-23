@@ -58,7 +58,7 @@ pub const DEFAULT_PROVIDER_WINDOW: std::time::Duration = std::time::Duration::fr
 /// `Node::setup_trigger`). Exposes the language's primitive surface
 /// (`await_signal` for mid-execution suspensions,
 /// `provider_access`/`metered_client` for paid calls, `log`) plus the
-/// two named-value bags (`ctx.ports` / `ctx.config`).
+/// two named-value bags (`ctx.inputs` / `ctx.wake`).
 ///
 /// ExecutionContext is constructed by the engine (inside the user's
 /// compiled binary) and passed to each node invocation. It holds an
@@ -78,18 +78,13 @@ pub struct ExecutionContext {
     pub node_label: Option<String>,
     pub color: Color,
     pub frames: LoopFrames,
-    /// The values that arrived on this node's input PORTS this firing.
-    /// A port set to a literal in the `.weft` body is delivered here
-    /// too: however a port got its value, the node reads it from
-    /// `ports`. The bags never merge; a name lives in exactly one of
-    /// them.
-    pub ports: ValueBag,
-    /// The node's design-time config FIELDS (body-assigned values), with
-    /// a `config`-port object already overlaid by the engine when the
-    /// node declares that port (the config-node pattern). Keys that name
-    /// declared input ports never appear here: those values belong to
-    /// `ports`.
-    pub config: ValueBag,
+    /// The node's INPUTS this firing, one bag: wired pulse values,
+    /// braces/assignment literals from the `.weft` body, and declared
+    /// defaults for anything still absent. However an input got its
+    /// value, the node reads it here. Precedence: wire/literal >
+    /// default. No name is special: an object wired to an input arrives
+    /// as that object.
+    pub inputs: ValueBag,
     /// The fire event's payload fields (the HTTP body for a webhook,
     /// the SSE event JSON for a feed, the form submission, the timer
     /// info for a scheduled tick). Populated only when this node is the
@@ -110,14 +105,13 @@ impl ExecutionContext {
         node_label: Option<String>,
         color: Color,
         frames: LoopFrames,
-        ports: ValueBag,
-        config: ValueBag,
+        inputs: ValueBag,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
         let wake = ValueBag::wake(handle.wake_payload());
         Self {
             execution_id, project_id, node_id, node_type, node_label, color, frames,
-            ports, config, wake, handle,
+            inputs, wake, handle,
         }
     }
 
@@ -165,12 +159,12 @@ impl ExecutionContext {
         &self,
         kind: K,
     ) -> WeftResult<()> {
-        // Snapshot the trigger's delivered port values with the
-        // registration: at fire time the engine replays them onto
-        // `ctx.ports`, so a trigger's inputs are whatever they were at
-        // trigger setup (re-activation re-registers and re-snapshots).
+        // Snapshot the trigger's input values with the registration: at
+        // fire time the engine replays them onto `ctx.inputs`, so a
+        // trigger's inputs are whatever they were at trigger setup
+        // (re-activation re-registers and re-snapshots).
         let port_snapshot =
-            Value::Object(self.ports.values.clone());
+            Value::Object(self.inputs.values.clone());
         self.handle
             .register_signal(crate::signal::to_spec(kind), port_snapshot)
             .await
@@ -288,12 +282,12 @@ impl ExecutionContext {
         self.handle.bus(marker)
     }
 
-    /// Convenience: read input port `name` and resolve it to a bus
-    /// handle in one call. Equivalent to `ctx.bus(ctx.ports.raw(name))`
-    /// but with a clearer error message naming the port.
+    /// Convenience: read input `name` and resolve it to a bus
+    /// handle in one call. Equivalent to `ctx.bus(ctx.inputs.raw(name))`
+    /// but with a clearer error message naming the input.
     pub fn bus_from_input(&self, name: &str) -> WeftResult<crate::bus::BusHandle> {
         let value = self
-            .ports
+            .inputs
             .raw(name)
             .ok_or_else(|| WeftError::Input(format!("no value on input port '{name}'")))?;
         self.handle.bus(value).map_err(|e| {
@@ -563,20 +557,17 @@ impl ExecutionContext {
 }
 
 /// Which side of a node's named values a bag holds, so accessor errors
-/// stamp the thing the user has to fix (the wiring vs the node's fields).
+/// stamp the thing the user has to fix (the node's inputs vs the fire
+/// event's payload).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BagSide {
-    Ports,
-    Config,
+    Inputs,
     Wake,
 }
 
-/// One bag of named values: the input-port values (`ctx.ports`), the
-/// design-time config fields (`ctx.config`), or the fire event's
-/// payload fields (`ctx.wake`). The namespaces never merge and a name
-/// lives in exactly one of them: a config field sharing an input
-/// port's name is that port's design-time filler, and the engine
-/// delivers the value ON the port (see [`split_node_values`]).
+/// One bag of named values: the node's inputs (`ctx.inputs`: wired
+/// values, body literals, remaining braces-config values, declared
+/// defaults) or the fire event's payload fields (`ctx.wake`).
 #[derive(Debug, Clone)]
 pub struct ValueBag {
     values: serde_json::Map<String, Value>,
@@ -585,15 +576,18 @@ pub struct ValueBag {
     /// record: `None` everywhere except a wake bag whose firing
     /// delivered a missing or non-object payload.
     no_record: Option<String>,
+    /// Names of the node TYPE's own spec-declared inputs (its settings),
+    /// so [`Self::custom`] can hand back just the instance data. Empty
+    /// on wake and nested bags.
+    spec_names: std::collections::HashSet<String>,
 }
 
 impl ValueBag {
-    pub fn ports(values: serde_json::Map<String, Value>) -> Self {
-        Self { values, side: BagSide::Ports, no_record: None }
-    }
-
-    pub fn config(values: serde_json::Map<String, Value>) -> Self {
-        Self { values, side: BagSide::Config, no_record: None }
+    pub fn inputs(
+        values: serde_json::Map<String, Value>,
+        spec_names: std::collections::HashSet<String>,
+    ) -> Self {
+        Self { values, side: BagSide::Inputs, no_record: None, spec_names }
     }
 
     /// The wake bag: the fire payload's top-level fields when the
@@ -608,11 +602,11 @@ impl ValueBag {
             None => Some("no wake payload was delivered for this firing".into()),
         };
         let values = payload.and_then(Value::as_object).cloned().unwrap_or_default();
-        Self { values, side: BagSide::Wake, no_record }
+        Self { values, side: BagSide::Wake, no_record, spec_names: Default::default() }
     }
 
-    /// The whole bag as one record. Ports and config always have one;
-    /// a wake bag fails loud when the firing delivered a missing or
+    /// The whole bag as one record. The inputs bag always has one; a
+    /// wake bag fails loud when the firing delivered a missing or
     /// non-object payload: substituting an empty record would silently
     /// fabricate an "every field absent" reading downstream.
     pub fn object(&self) -> WeftResult<&serde_json::Map<String, Value>> {
@@ -625,20 +619,15 @@ impl ValueBag {
     /// The side's word for one named value, used in every error message.
     fn noun(&self) -> &'static str {
         match self.side {
-            BagSide::Ports => "input",
-            BagSide::Config => "config field",
+            BagSide::Inputs => "input",
             BagSide::Wake => "wake field",
         }
     }
 
     fn err(&self, message: String) -> WeftError {
-        match self.side {
-            BagSide::Ports => WeftError::Input(message),
-            BagSide::Config => WeftError::Config(message),
-            // A wake field is an input of the firing: same family as a
-            // port value, delivered by the event instead of a wire.
-            BagSide::Wake => WeftError::Input(message),
-        }
+        // Both sides are inputs of the firing: one delivered by
+        // wires/config, one by the wake event.
+        WeftError::Input(message)
     }
 
     /// Read the required value `name`, typed. Errors loud when absent or
@@ -680,51 +669,96 @@ impl ValueBag {
         self.values.get(name)
     }
 
-    /// Iterate over every named value (name + raw value). For nodes that
-    /// treat their ports as a dynamic set (exposing them as script
-    /// variables, building a form from them) and for forwarding nodes.
+    /// The OBJECT behind `name` as its own bag, with the full accessor
+    /// family. The one-call way to consume a config-node's output (or
+    /// any object-valued input): absent/null reads as an EMPTY bag
+    /// (every knob at its default), while a present non-object value
+    /// errors loud, never a silent empty.
+    pub fn nested(&self, name: &str) -> WeftResult<ValueBag> {
+        let values = match self.values.get(name) {
+            None | Some(Value::Null) => serde_json::Map::new(),
+            Some(Value::Object(map)) => map.clone(),
+            Some(other) => {
+                return Err(self.err(format!(
+                    "{} '{name}' is not an object: {other}",
+                    self.noun()
+                )))
+            }
+        };
+        Ok(Self { values, side: self.side, no_record: None, spec_names: Default::default() })
+    }
+
+    /// Iterate over every named value (name + raw value), the node's
+    /// own settings included. For forwarding nodes; a node projecting
+    /// its instance DATA inputs wants [`Self::custom`] instead.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.values.iter()
     }
+
+    /// The node's instance DATA inputs: every entry except the node
+    /// type's own spec-declared settings (`code` on ExecPython,
+    /// `title`/`fields` on a form node). What remains is what exists
+    /// on THIS instance only: custom header ports, form-derived
+    /// ports, carry ghosts. Nodes that project "whatever the user
+    /// wired in" (Python variable bindings, form prefill data) read
+    /// this instead of hardcoding their own setting names.
+    pub fn custom(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.values.iter().filter(|(k, _)| !self.spec_names.contains(k.as_str()))
+    }
 }
 
-/// Split a node's runtime values into the two node-facing bags. By the
-/// time this runs, "one home per name" already holds: the enrich
-/// normalization moved every port-driven body value into
-/// `node.port_literals` (which the ready paths fed onto the ports), so
-/// `node.config` carries ONLY config-field values. The one runtime
-/// concern left is the config-node pattern: when the node declares an
-/// input port named `config`, the object that arrived on it is
-/// consumed here; each non-null key naming a CONFIGURABLE declared
-/// input port fills that port if nothing else did (a wired value
-/// wins), every other non-null key overlays the config bag.
-pub fn split_node_values(
+/// Build a node's ONE input bag for a firing. `delivered` is what the
+/// ready paths handed over: wired pulse values plus the body literals
+/// the enrich normalization homed in `node.port_literals`. On top of
+/// that, in precedence order (earlier wins):
+///
+///   1. `delivered` (wires + `all`/`assignment`-form literals);
+///   2. the node's remaining `config` object verbatim (braces literals
+///      on `config`-exposure inputs, reserved `_` keys, passthrough
+///      keys on nodes that accept them);
+///   3. declared defaults, for declared inputs still absent, unless the
+///      input's wire arrived CLOSED (`closed_ports`): a closure means
+///      upstream produced nothing, and silently substituting the
+///      default would mask that.
+///
+/// No name is special: an object wired to an input (a config node's
+/// output, say) arrives AS that object, and the node decides what to
+/// read out of it.
+pub fn node_input_bag(
     node: &crate::project::NodeDefinition,
-    mut ports: serde_json::Map<String, Value>,
-) -> (ValueBag, ValueBag) {
-    let mut config = node.config.as_object().cloned().unwrap_or_default();
-
-    if node.inputs.iter().any(|p| p.name == "config") {
-        if let Some(overlay) = ports.remove("config") {
-            if let Value::Object(overlay) = overlay {
-                let braces_open: std::collections::HashSet<&str> = node
-                    .inputs
-                    .iter()
-                    .filter(|p| p.literal.allows_config())
-                    .map(|p| p.name.as_str())
-                    .collect();
-                for (k, v) in overlay.into_iter().filter(|(_, v)| !v.is_null()) {
-                    if braces_open.contains(k.as_str()) {
-                        ports.entry(k).or_insert(v);
-                    } else {
-                        config.insert(k, v);
-                    }
-                }
+    mut delivered: serde_json::Map<String, Value>,
+    closed_ports: &[String],
+) -> ValueBag {
+    // The braces store under-lays what the ready paths delivered.
+    // Compiler/editor plumbing keys co-resident in the config blob
+    // (`parentId`, `_`-reserved) are not input data and never reach
+    // the bag; the engine reads them from `node.config` directly.
+    if let Some(cfg) = node.config.as_object() {
+        for (k, v) in cfg {
+            if crate::project::is_internal_config_key(k) {
+                continue;
             }
+            delivered.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 
-    (ValueBag::ports(ports), ValueBag::config(config))
+    for input in &node.inputs {
+        let Some(default) = &input.default else { continue };
+        if closed_ports.iter().any(|p| p == &input.name) {
+            continue;
+        }
+        delivered
+            .entry(input.name.clone())
+            .or_insert_with(|| default.clone());
+    }
+
+    let spec_names = node
+        .inputs
+        .iter()
+        .filter(|i| i.from_spec)
+        .map(|i| i.name.clone())
+        .collect();
+    ValueBag::inputs(delivered, spec_names)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1201,12 +1235,8 @@ mod value_bag_tests {
     use super::*;
     use serde_json::json;
 
-    fn ports_bag(values: serde_json::Value) -> ValueBag {
-        ValueBag::ports(values.as_object().unwrap().clone())
-    }
-
-    fn config_bag(values: serde_json::Value) -> ValueBag {
-        ValueBag::config(values.as_object().unwrap().clone())
+    fn inputs_bag(values: serde_json::Value) -> ValueBag {
+        ValueBag::inputs(values.as_object().unwrap().clone(), Default::default())
     }
 
     /// A ContextHandle for accessor tests: every runtime capability is
@@ -1242,7 +1272,7 @@ mod value_bag_tests {
         fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
     }
 
-    fn ctx(ports_json: serde_json::Value, config_json: serde_json::Value) -> ExecutionContext {
+    fn ctx(inputs_json: serde_json::Value) -> ExecutionContext {
         ExecutionContext::new(
             "exec-1".into(),
             "project-1".into(),
@@ -1251,48 +1281,41 @@ mod value_bag_tests {
             None,
             crate::Color::nil(),
             LoopFrames::default(),
-            ports_bag(ports_json),
-            config_bag(config_json),
+            inputs_bag(inputs_json),
             Arc::new(DeadHandle),
         )
     }
 
-    /// The bag accessor family on both sides: required, optional,
-    /// defaulted, raw; per-side error stamping and the loud
-    /// wrong-type-behind-a-default rule.
+    /// The bag accessor family: required, optional, defaulted, raw;
+    /// error stamping and the loud wrong-type-behind-a-default rule.
     #[test]
-    fn bags_resolve_and_stamp_errors_by_side() {
-        let c = ctx(json!({"url": "http://x", "n": "not-a-number"}), json!({"keep": true}));
-        assert_eq!(c.ports.get::<String>("url").unwrap(), "http://x");
-        assert_eq!(c.config.get::<bool>("keep").unwrap(), true);
-        assert_eq!(c.ports.opt::<String>("missing").unwrap(), None);
-        assert_eq!(c.config.get_or("ttl_days", 30u64).unwrap(), 30);
-        assert_eq!(c.ports.get::<Value>("url").unwrap(), json!("http://x"));
-        assert!(c.ports.raw("missing").is_none());
+    fn bag_resolves_and_stamps_errors() {
+        let c = ctx(json!({"url": "http://x", "n": "not-a-number", "keep": true}));
+        assert_eq!(c.inputs.get::<String>("url").unwrap(), "http://x");
+        assert_eq!(c.inputs.get::<bool>("keep").unwrap(), true);
+        assert_eq!(c.inputs.opt::<String>("missing").unwrap(), None);
+        assert_eq!(c.inputs.get_or("ttl_days", 30u64).unwrap(), 30);
+        assert_eq!(c.inputs.get::<Value>("url").unwrap(), json!("http://x"));
+        assert!(c.inputs.raw("missing").is_none());
 
-        // Wrong type on a PORT stamps an input error naming the input.
-        let e = c.ports.get::<u64>("n").unwrap_err();
+        // Wrong type stamps an input error naming the input.
+        let e = c.inputs.get::<u64>("n").unwrap_err();
         assert!(matches!(&e, WeftError::Input(m) if m.contains("input 'n'")), "{e}");
-        // Wrong type in CONFIG stamps a config error naming the field.
-        let e = c.config.get::<u64>("keep").unwrap_err();
-        assert!(matches!(&e, WeftError::Config(m) if m.contains("config field 'keep'")), "{e}");
         // Absent required values name their side.
-        let e = c.ports.get::<String>("missing").unwrap_err().to_string();
+        let e = c.inputs.get::<String>("missing").unwrap_err().to_string();
         assert!(e.contains("missing required input 'missing'"), "{e}");
-        let e = c.config.get::<String>("missing").unwrap_err().to_string();
-        assert!(e.contains("missing required config field 'missing'"), "{e}");
         // A defaulted knob still errors loud on a present wrong type.
-        assert!(c.ports.get_or("n", 5u64).is_err());
+        assert!(c.inputs.get_or("n", 5u64).is_err());
         // Explicit null reads as absent for opt.
-        let c = ctx(json!({"x": null}), json!({}));
-        assert_eq!(c.ports.opt::<String>("x").unwrap(), None);
+        let c = ctx(json!({"x": null}));
+        assert_eq!(c.inputs.opt::<String>("x").unwrap(), None);
     }
 
     /// A required wake-field read with no payload is a loud error,
     /// never a default; the whole-record read fails loud too.
     #[test]
     fn wake_without_a_payload_fails_loud() {
-        let c = ctx(json!({}), json!({}));
+        let c = ctx(json!({}));
         let e = c.wake.get::<Value>("anything").unwrap_err().to_string();
         assert!(e.contains("missing required wake field 'anything'"), "{e}");
         let e = c.wake.object().unwrap_err().to_string();
@@ -1316,29 +1339,48 @@ mod value_bag_tests {
         assert!(e.contains("wake payload is not an object"), "{e}");
     }
 
-    /// The whole-record read: ports and config always answer; a wake
+    /// `nested`: an object-valued input read as its own bag. Absent =
+    /// an empty bag (defaulted reads all answer); a present non-object
+    /// value errors loud, never a silent empty.
+    #[test]
+    fn nested_reads_an_object_input_as_a_bag() {
+        let bag = inputs_bag(json!({"config": {"model": "m", "temperature": 0.2}, "bad": 5}));
+        let cfg = bag.nested("config").unwrap();
+        assert_eq!(cfg.get::<String>("model").unwrap(), "m");
+        assert_eq!(cfg.get_or("absent", 7u64).unwrap(), 7);
+
+        let empty = bag.nested("missing").unwrap();
+        assert_eq!(empty.get_or("model", "default".to_string()).unwrap(), "default");
+
+        let e = bag.nested("bad").unwrap_err().to_string();
+        assert!(e.contains("not an object"), "{e}");
+    }
+
+    /// The whole-record read: the inputs bag always answers; a wake
     /// bag answers exactly the payload's fields.
     #[test]
     fn object_hands_out_the_whole_bag() {
-        assert_eq!(ports_bag(json!({"a": 1})).object().unwrap().len(), 1);
-        assert_eq!(config_bag(json!({})).object().unwrap().len(), 0);
+        assert_eq!(inputs_bag(json!({"a": 1})).object().unwrap().len(), 1);
+        assert_eq!(inputs_bag(json!({})).object().unwrap().len(), 0);
         let wake = ValueBag::wake(Some(&json!({"a": 1, "b": 2})));
         assert_eq!(wake.object().unwrap().len(), 2);
     }
 }
 
 #[cfg(test)]
-mod split_node_values_tests {
+mod node_input_bag_tests {
     use super::*;
     use serde_json::json;
 
-    /// A minimal NodeDefinition: declared input port names + body config.
-    fn node(inputs: &[&str], config: serde_json::Value) -> crate::project::NodeDefinition {
+    /// A minimal NodeDefinition: declared inputs (name, optional default)
+    /// + body config.
+    fn node(inputs: &[(&str, Option<Value>)], config: serde_json::Value) -> crate::project::NodeDefinition {
         serde_json::from_value(json!({
             "id": "n1", "nodeType": "Test", "label": null,
             "config": config, "position": {"x": 0.0, "y": 0.0},
-            "inputs": inputs.iter().map(|name| json!({
-                "name": name, "portType": "String", "required": false
+            "inputs": inputs.iter().map(|(name, default)| json!({
+                "name": name, "portType": "String", "required": false,
+                "default": default
             })).collect::<Vec<_>>(),
             "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
             "requiresInfra": false, "images": []
@@ -1346,67 +1388,100 @@ mod split_node_values_tests {
         .expect("test node")
     }
 
-    fn ports_obj(values: serde_json::Value) -> serde_json::Map<String, Value> {
+    fn delivered(values: serde_json::Value) -> serde_json::Map<String, Value> {
         values.as_object().unwrap().clone()
     }
 
-    /// The bags mirror the enrich-normalized definition: ports carry
-    /// what the ready paths delivered (wired pulses + port literals),
-    /// config carries the config-field values verbatim.
+    /// Delivered values and braces config values land in the ONE bag;
+    /// delivered wins over a same-named braces value.
     #[test]
-    fn ports_and_config_map_straight_through() {
-        let n = node(&["to"], json!({"label": "x"}));
-        let (ports, config) = split_node_values(&n, ports_obj(json!({"to": 10})));
-        assert_eq!(ports.get::<u64>("to").unwrap(), 10);
-        assert_eq!(config.get::<String>("label").unwrap(), "x");
-        assert!(config.raw("to").is_none());
+    fn delivered_and_config_merge_delivered_wins() {
+        let n = node(&[("to", None)], json!({"label": "x", "to": "braces"}));
+        let bag = node_input_bag(&n, delivered(json!({"to": 10})), &[]);
+        assert_eq!(bag.get::<u64>("to").unwrap(), 10, "delivered beats the braces value");
+        assert_eq!(bag.get::<String>("label").unwrap(), "x");
     }
 
-    /// The config-node pattern: an object on the declared `config` port
-    /// is consumed; its keys overlay the config bag, a key naming a
-    /// declared port fills that port only if nothing else did.
+    /// No name is special: an OBJECT wired to an input (a config node's
+    /// output, an input that happens to be named `config`) arrives as
+    /// that object, never spread into the bag. The node reads it and
+    /// decides what to do with it.
     #[test]
-    fn a_config_port_object_overlays_config_and_fills_unfilled_ports() {
-        let n = node(
-            &["prompt", "systemPrompt", "config"],
-            json!({"model": "own", "temperature": 0.2}),
-        );
-        let (ports, config) = split_node_values(
+    fn a_wired_object_arrives_as_that_object() {
+        let n = node(&[("prompt", None), ("config", None)], json!({"own": "braces"}));
+        let bag = node_input_bag(
             &n,
-            ports_obj(json!({
+            delivered(json!({
                 "prompt": "hi",
-                "config": {"model": "overlay", "systemPrompt": "from-config-node", "skip": null}
+                "config": {"model": "from-config-node", "temperature": 0.2}
             })),
+            &[],
         );
-        assert!(ports.raw("config").is_none(), "the config port is consumed by the overlay");
-        assert_eq!(config.get::<String>("model").unwrap(), "overlay");
-        assert_eq!(config.get::<f64>("temperature").unwrap(), 0.2);
-        assert!(config.raw("skip").is_none(), "null overlay keys are dropped");
-        // systemPrompt names a declared port with no value: the overlay fills it.
-        assert_eq!(ports.get::<String>("systemPrompt").unwrap(), "from-config-node");
+        assert_eq!(
+            bag.get::<Value>("config").unwrap(),
+            json!({"model": "from-config-node", "temperature": 0.2}),
+            "the object is data on its input, not spread"
+        );
+        assert!(bag.raw("model").is_none(), "no key of the object leaks into the bag");
+        assert_eq!(bag.get::<String>("own").unwrap(), "braces");
     }
 
-    /// A wired port value beats the overlay's same-named key.
+    /// Defaults fill last: an absent declared input gets its default;
+    /// wires and braces values beat it; a CLOSED wired input stays
+    /// absent (the closure is not masked by the default).
     #[test]
-    fn a_wired_port_beats_the_overlay() {
-        let n = node(&["systemPrompt", "config"], json!({}));
-        let (ports, _config) = split_node_values(
-            &n,
-            ports_obj(json!({
-                "systemPrompt": "wired",
-                "config": {"systemPrompt": "overlay"}
-            })),
+    fn defaults_fill_last_and_never_mask_a_closure() {
+        let n = node(
+            &[("method", Some(json!("GET"))), ("model", Some(json!("base")))],
+            json!({}),
         );
-        assert_eq!(ports.get::<String>("systemPrompt").unwrap(), "wired");
+        let bag = node_input_bag(&n, delivered(json!({"model": "wired"})), &[]);
+        assert_eq!(bag.get::<String>("method").unwrap(), "GET", "absent input reads its default");
+        assert_eq!(bag.get::<String>("model").unwrap(), "wired", "a wired value beats the default");
+        // The default shows through the whole-record read too: the bag
+        // is one consistent view, get/object/iter never disagree.
+        assert_eq!(bag.object().unwrap().get("method"), Some(&json!("GET")));
+
+        let bag = node_input_bag(&n, delivered(json!({})), &["method".to_string()]);
+        assert!(bag.raw("method").is_none(), "a closed input is not defaulted");
     }
 
-    /// A node with NO declared `config` port keeps a port literally
-    /// named `config` as data (the overlay is declaration-gated).
+    /// Compiler/editor plumbing keys living in the config blob
+    /// (`parentId`, `_`-reserved) never reach the bag: node bodies
+    /// only ever see their own inputs.
     #[test]
-    fn no_declared_config_port_means_no_overlay() {
-        let n = node(&[], json!({"model": "own"}));
-        let (ports, config) = split_node_values(&n, ports_obj(json!({})));
-        assert!(ports.raw("config").is_none());
-        assert_eq!(config.get::<String>("model").unwrap(), "own");
+    fn internal_config_keys_never_reach_the_bag() {
+        let n = node(
+            &[("url", None)],
+            json!({"url": "http://x", "parentId": "g1", "_label": "My node", "_tags": ["a"]}),
+        );
+        let bag = node_input_bag(&n, delivered(json!({})), &[]);
+        assert_eq!(bag.get::<String>("url").unwrap(), "http://x");
+        assert!(bag.raw("parentId").is_none(), "parentId is compiler plumbing, not input data");
+        assert!(bag.raw("_label").is_none(), "_-reserved keys are editor plumbing, not input data");
+        assert!(bag.raw("_tags").is_none());
+        assert_eq!(bag.object().unwrap().len(), 1, "the whole-record read agrees");
+    }
+
+    /// `custom()` hands back the instance's DATA inputs only: the node
+    /// type's own spec-declared settings are excluded, without the node
+    /// body hardcoding its setting names.
+    #[test]
+    fn custom_excludes_the_specs_own_settings() {
+        let n: crate::project::NodeDefinition = serde_json::from_value(json!({
+            "id": "n1", "nodeType": "ExecPython", "label": null,
+            "config": {"code": "return {}"},
+            "position": {"x": 0.0, "y": 0.0}, "scope": [],
+            "inputs": [
+                {"name": "code", "portType": "String", "required": true, "fromSpec": true},
+                {"name": "a", "portType": "Number", "required": false},
+            ],
+            "outputs": [],
+        }))
+        .expect("node json");
+        let bag = node_input_bag(&n, delivered(json!({"a": 7})), &[]);
+        let data: Vec<&str> = bag.custom().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(data, vec!["a"], "settings are excluded, instance ports remain");
+        assert!(bag.raw("code").is_some(), "the setting is still readable by name");
     }
 }

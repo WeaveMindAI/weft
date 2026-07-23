@@ -3,23 +3,40 @@
   "label": "Keep File",
   "description": "Mark a stored execution file to survive the end-of-run sweep, then pass the reference through unchanged. Put this at the end of a pipeline so only the file(s) you actually want survive; everything left un-kept is swept when the run ends. No effect on project/shared files (those are persistent already).",
   "category": "Storage",
-  "tags": ["storage", "keep", "persist", "file"],
+  "tags": [
+    "storage",
+    "keep",
+    "persist",
+    "file"
+  ],
   "icon": "Pin",
   "color": "#8b5cf6",
   "inputs": [
-    { "name": "file", "type": "File", "required": true, "description": "Stored execution file to keep (any type)." }
+    {
+      "name": "file",
+      "type": "File",
+      "required": true,
+      "description": "Stored execution file to keep (any type)."
+    },
+    {
+      "name": "ttl_days",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": 0
+      },
+      "default": 30,
+      "label": "Keep for (days, 0 = forever)",
+      "description": "How long the kept file lives. Any access (download, read, presign) resets the clock. 0 means never expire."
+    }
   ],
   "outputs": [
-    { "name": "file", "type": "File", "required": false, "description": "The same reference, now flagged to survive the run." }
-  ],
-  "fields": [
     {
-      "key": "ttl_days",
-      "label": "Keep for (days, 0 = forever)",
-      "field_type": { "kind": "number", "min": 0 },
+      "name": "file",
+      "type": "File",
       "required": false,
-      "default_value": 30,
-      "description": "How long the kept file lives. Any access (download, read, presign) resets the clock. 0 means never expire."
+      "description": "The same reference, now flagged to survive the run."
     }
   ],
   "requires_infra": false

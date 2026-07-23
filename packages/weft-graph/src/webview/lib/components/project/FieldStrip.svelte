@@ -13,6 +13,7 @@
 	import type { FieldDefinition } from '../../types';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
+	import { clampToRange } from '../../utils/input-field';
 
 	let {
 		fields,
@@ -119,6 +120,15 @@
 		return `${idPrefix}-field-${field.portDriven ? 'port-' : ''}${field.key}`;
 	}
 
+	/// The field's EFFECTIVE stored value: the set value, else the
+	/// input's declared default (what the runtime would supply). One
+	/// fallback rule for every control, so the field always shows what
+	/// the node will actually read.
+	function effectiveValue(field: FieldDefinition): unknown {
+		const v = fieldValue(field);
+		return v === undefined || v === null ? field.defaultValue : v;
+	}
+
 	function getDisplayValue(field: FieldDefinition): string {
 		const k = fieldKey(field);
 		// The override reads the CONFIG home (file-backed field content).
@@ -126,7 +136,7 @@
 		// file-backed config field coexists.
 		const override = field.portDriven ? undefined : displayValueOf?.(field.key);
 		if (override !== undefined) return fieldEditor.display(k, override);
-		const v = fieldValue(field);
+		const v = effectiveValue(field);
 		const storeStr = (v === undefined || v === null)
 			? ''
 			: (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
@@ -137,6 +147,9 @@
 		return (value: string) => onUpdate(field.key, value, field.portDriven);
 	}
 
+	/// Save a number field, CLAMPED to its declared min/max: the widget's
+	/// range is a contract (the compiler rejects out-of-range literals),
+	/// so the editor never writes a value outside it.
 	function saveNumber(field: FieldDefinition, raw: string) {
 		if (raw.trim() === '') {
 			onUpdate(field.key, null, field.portDriven);
@@ -144,7 +157,7 @@
 		}
 		const n = Number(raw);
 		if (!Number.isFinite(n)) return;
-		onUpdate(field.key, n, field.portDriven);
+		onUpdate(field.key, clampToRange(n, field.min, field.max), field.portDriven);
 	}
 
 	/// Observe a textarea's manual resize and report the new height so the
@@ -204,52 +217,56 @@
 					use:observeTextareaResize={field.key}
 				></textarea>
 			{:else if field.type === 'select' && field.options}
+				<!-- The shown value is the EFFECTIVE one (set value, else the
+				     input's declared default). With neither, an explicit
+				     "(unset)" placeholder is selected: the control never lies
+				     by displaying an option the node would not receive. -->
+				{@const selected = effectiveValue(field) as string | undefined}
 				<select
 					id={domId(field)}
 					disabled={ro}
 					class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none"
-					value={(fieldValue(field) as string) ?? field.options[0]}
+					value={selected ?? ''}
 					onchange={(e) => onUpdate(field.key, e.currentTarget.value, field.portDriven)}
 					onclick={(e) => e.stopPropagation()}
 				>
+					{#if selected === undefined}
+						<option value="" disabled>(unset)</option>
+					{/if}
 					{#each field.options as option}
 						<option value={option}>{option}</option>
 					{/each}
 				</select>
 			{:else if field.type === 'multiselect' && field.options}
-				{#if field.options.length === 0}
-					<div class="text-[10px] text-muted-foreground/60 italic px-1.5 py-1">
-						(no options)
-					</div>
-				{:else}
-					<div class="flex flex-wrap gap-1 p-1.5 bg-muted rounded">
-						{#each field.options as option}
-							{@const current = (fieldValue(field) as string[] | undefined) ?? []}
-							{@const isSelected = current.includes(option)}
-							<button
-								type="button"
-								disabled={ro}
-								class="text-[10px] px-1.5 py-0.5 rounded transition-colors whitespace-nowrap nodrag {isSelected ? 'bg-primary text-primary-foreground' : 'bg-background text-muted-foreground hover:bg-accent'}"
-								onclick={(e) => {
-									e.stopPropagation();
-									const next = isSelected
-										? current.filter((v) => v !== option)
-										: [...current, option];
-									onUpdate(field.key, next, field.portDriven);
-								}}
-							>
-								{option}
-							</button>
-						{/each}
-					</div>
-				{/if}
+				<!-- Empty options cannot reach here: an optionless
+				     select/multiselect widget fails the node's metadata load. -->
+				<div class="flex flex-wrap gap-1 p-1.5 bg-muted rounded">
+					{#each field.options as option}
+						{@const current = (effectiveValue(field) as string[] | undefined) ?? []}
+						{@const isSelected = current.includes(option)}
+						<button
+							type="button"
+							disabled={ro}
+							class="text-[10px] px-1.5 py-0.5 rounded transition-colors whitespace-nowrap nodrag {isSelected ? 'bg-primary text-primary-foreground' : 'bg-background text-muted-foreground hover:bg-accent'}"
+							onclick={(e) => {
+								e.stopPropagation();
+								const next = isSelected
+									? current.filter((v) => v !== option)
+									: [...current, option];
+								onUpdate(field.key, next, field.portDriven);
+							}}
+						>
+							{option}
+						</button>
+					{/each}
+				</div>
 			{:else if field.type === 'checkbox'}
 				<label class="flex items-center gap-2 cursor-pointer">
 					<input
 						type="checkbox"
 						disabled={ro}
 						class="w-4 h-4 rounded border-muted-foreground/30 nodrag"
-						checked={fieldValue(field) === true}
+						checked={effectiveValue(field) === true}
 						onchange={(e) => onUpdate(field.key, e.currentTarget.checked, field.portDriven)}
 						onclick={(e) => e.stopPropagation()}
 					/>

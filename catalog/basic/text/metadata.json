@@ -3,19 +3,26 @@
   "label": "Text",
   "description": "Emit a literal string. Useful for prompts, labels, and config values.",
   "category": "basic",
-  "tags": ["literal", "string"],
+  "tags": [
+    "literal",
+    "string"
+  ],
   "icon": "Type",
   "color": "#64748b",
-  "inputs": [],
-  "outputs": [
-    { "name": "value", "type": "String", "required": false }
-  ],
-  "fields": [
+  "inputs": [
     {
-      "key": "value",
-      "label": "Value",
-      "field_type": { "kind": "textarea" },
-      "required": true
+      "name": "value",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "label": "Value"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "value",
+      "type": "String",
+      "required": false
     }
   ],
   "requires_infra": false

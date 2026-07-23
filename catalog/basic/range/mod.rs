@@ -20,9 +20,9 @@ pub struct RangeNode;
 #[async_trait]
 impl Node for RangeNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let from: f64 = ctx.ports.get_or("from", 0.0)?;
-        let to: f64 = ctx.ports.get("to")?;
-        let step: f64 = ctx.ports.get_or("step", 1.0)?;
+        let from: f64 = ctx.inputs.get_or("from", 0.0)?;
+        let to: f64 = ctx.inputs.get("to")?;
+        let step: f64 = ctx.inputs.get_or("step", 1.0)?;
 
         // Non-finite bounds (NaN / Infinity) silently produce nonsense:
         // NaN comparisons always evaluate false (empty list), Infinity

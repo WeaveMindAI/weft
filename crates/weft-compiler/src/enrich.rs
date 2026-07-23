@@ -13,9 +13,9 @@
 
 use serde_json::Value;
 
-use weft_core::node::{FormFieldPort, MetadataCatalog};
-use weft_core::project::{PortDefinition, ProjectDefinition, Span};
-use weft_core::weft_type::{LiteralPlacement, WeftType};
+use weft_core::node::{FormFieldPort, MetadataCatalog, Widget};
+use weft_core::project::{InputDefinition, PortDefinition, ProjectDefinition, Span};
+use weft_core::weft_type::{Exposure, WeftType};
 
 use crate::error::{CompileError, CompileResult};
 
@@ -44,17 +44,18 @@ impl PortDirection {
     }
 }
 
-/// Move every PORT-DRIVEN body value out of `config` into
-/// `port_literals`, now that the full input-port list is known: a braces
-/// value on a port whose literal may sit in the braces, and an
-/// assignment statement (`ConfigOrigin::Connection`) on ANY input port
-/// (the statement names the port unambiguously; validate rejects it
-/// where the port's placement forbids literals). After this pass a
-/// name has one home: a port's value lives in `port_literals` (the
-/// engine feeds it onto the port), a config field's value lives in
-/// `config`, and a braces-closed port coexists with a same-named
-/// field without colliding. A braces value on a braces-closed port
-/// with no such field stays in `config`, where validate rejects it
+/// Move every body value that DRIVES a wireable input out of `config`
+/// into `port_literals`, now that the full input list is known: a
+/// braces value on an `all`-exposure input, and an assignment statement
+/// (`ConfigOrigin::Connection`) on ANY input (the statement names the
+/// input unambiguously; validate rejects it where the input's exposure
+/// forbids it). After this pass a value has one home per FORM: a
+/// wireable input's driving value lives in `port_literals` (the engine
+/// feeds it onto the input), while a `config`-exposure input's braces
+/// value stays in `config` (it is design-time configuration, merged
+/// into the runtime bag at construction, and edited through the config
+/// home in the editor). A braces value on an assignment-/wire-only
+/// input also stays in `config`, where validate rejects it
 /// (`port-literal-placement`).
 fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
     use weft_core::project::ConfigOrigin;
@@ -62,14 +63,14 @@ fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
     let moved: Vec<String> = node
         .inputs
         .iter()
-        .filter(|port| {
+        .filter(|input| {
             let literal_form = node
                 .config_spans
-                .get(&port.name)
+                .get(&input.name)
                 .is_some_and(|s| s.origin == ConfigOrigin::Connection);
-            cfg.contains_key(&port.name) && (port.literal.allows_config() || literal_form)
+            cfg.contains_key(&input.name) && (input.exposure == Exposure::All || literal_form)
         })
-        .map(|port| port.name.clone())
+        .map(|input| input.name.clone())
         .collect();
     for name in moved {
         if let Some(value) = cfg.remove(&name) {
@@ -81,43 +82,72 @@ fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
     }
 }
 
-fn merge_ports(
-    catalog_ports: &[PortDefinition],
-    weft_ports: &[PortDefinition],
+/// The name/type/required core the input and output merges share. The
+/// two directions genuinely need distinct instance types (an input
+/// carries exposure + editor surface, an output is a bare wire port),
+/// but the source-vs-catalog merge logic is one rule; this trait keeps
+/// it written once.
+trait MergeSlot: Clone {
+    fn name(&self) -> &str;
+    fn slot_type(&self) -> &WeftType;
+    fn set_slot_type(&mut self, ty: WeftType);
+    fn required(&self) -> bool;
+    fn set_required(&mut self, required: bool);
+}
+
+impl MergeSlot for InputDefinition {
+    fn name(&self) -> &str { &self.name }
+    fn slot_type(&self) -> &WeftType { &self.port_type }
+    fn set_slot_type(&mut self, ty: WeftType) { self.port_type = ty; }
+    fn required(&self) -> bool { self.required }
+    fn set_required(&mut self, required: bool) { self.required = required; }
+}
+
+impl MergeSlot for PortDefinition {
+    fn name(&self) -> &str { &self.name }
+    fn slot_type(&self) -> &WeftType { &self.port_type }
+    fn set_slot_type(&mut self, ty: WeftType) { self.port_type = ty; }
+    fn required(&self) -> bool { self.required }
+    fn set_required(&mut self, required: bool) { self.required = required; }
+}
+
+fn merge_ports<T: MergeSlot>(
+    catalog_ports: &[T],
+    weft_ports: &[T],
     can_add: bool,
     node_id: &str,
     span: Span,
     direction: PortDirection,
     errors: &mut Vec<EnrichError>,
-) -> Vec<PortDefinition> {
+) -> Vec<T> {
     use std::collections::HashMap;
 
-    let catalog_by_name: HashMap<&str, &PortDefinition> = catalog_ports
+    let catalog_by_name: HashMap<&str, &T> = catalog_ports
         .iter()
-        .map(|p| (p.name.as_str(), p))
+        .map(|p| (p.name(), p))
         .collect();
 
-    let mut result: Vec<PortDefinition> = catalog_ports
+    let mut result: Vec<T> = catalog_ports
         .iter()
         .map(|cp| {
-            let Some(wp) = weft_ports.iter().find(|w| w.name == cp.name) else {
+            let Some(wp) = weft_ports.iter().find(|w| w.name() == cp.name()) else {
                 return cp.clone();
             };
             let mut merged = cp.clone();
-            merged.required = wp.required;
-            if !wp.port_type.is_must_override() {
-                if cp.port_type.is_must_override()
-                    || WeftType::is_compatible(&wp.port_type, &cp.port_type)
+            merged.set_required(wp.required());
+            if !wp.slot_type().is_must_override() {
+                if cp.slot_type().is_must_override()
+                    || WeftType::is_compatible(wp.slot_type(), cp.slot_type())
                 {
-                    merged.port_type = wp.port_type.clone();
+                    merged.set_slot_type(wp.slot_type().clone());
                 } else {
                     errors.push(EnrichError { span, message: format!(
                         "node '{}': {} port '{}' declared type {} incompatible with catalog type {}",
                         node_id,
                         direction.as_str(),
-                        cp.name,
-                        wp.port_type,
-                        cp.port_type,
+                        cp.name(),
+                        wp.slot_type(),
+                        cp.slot_type(),
                     )});
                 }
             }
@@ -126,7 +156,7 @@ fn merge_ports(
         .collect();
 
     for wp in weft_ports {
-        if catalog_by_name.contains_key(wp.name.as_str()) {
+        if catalog_by_name.contains_key(wp.name()) {
             continue;
         }
         if !can_add {
@@ -142,7 +172,7 @@ fn merge_ports(
                 "node '{}': declares custom {} port '{}' but node type does not support custom {} ports",
                 node_id,
                 direction.as_str(),
-                wp.name,
+                wp.name(),
                 direction.as_str(),
             )});
             continue;
@@ -153,12 +183,12 @@ fn merge_ports(
         // it (the user just added it), and surface the missing-type as an
         // error diagnostic instead. Without this, the round-trip silently
         // ate the port and it vanished from the canvas.
-        if wp.port_type.is_must_override() {
+        if wp.slot_type().is_must_override() {
             errors.push(EnrichError { span, message: format!(
                 "node '{}': custom {} port '{}' needs a concrete type",
                 node_id,
                 direction.as_str(),
-                wp.name,
+                wp.name(),
             )});
         }
         result.push(wp.clone());
@@ -264,16 +294,24 @@ pub fn enrich_collecting(
         let weft_inputs = std::mem::take(&mut node.inputs);
         let weft_outputs = std::mem::take(&mut node.outputs);
 
-        let catalog_inputs: Vec<PortDefinition> = meta
+        let catalog_inputs: Vec<InputDefinition> = meta
             .inputs
             .iter()
-            .map(|p| PortDefinition {
-                name: p.name.clone(),
-                port_type: p.port_type.clone(),
-                required: p.required,
-                description: None,
-                literal: meta.input_literal(p),
+            .map(|spec| InputDefinition {
+                name: spec.name.clone(),
+                port_type: spec.input_type.clone(),
+                required: spec.required,
+                description: spec.description.clone(),
+                exposure: spec.effective_exposure(),
+                // The DECLARED widget only; the type-derived default is
+                // stamped after TypeVar resolution (see the final pass),
+                // so a `T` input resolved to Image gets a file picker.
+                widget: spec.widget.clone(),
+                default: spec.default.clone(),
+                label: spec.label.clone(),
+                placeholder: spec.placeholder.clone(),
                 synthesized_from_carry: false,
+                from_spec: true,
             })
             .collect();
         let mut catalog_outputs: Vec<PortDefinition> = meta
@@ -283,8 +321,7 @@ pub fn enrich_collecting(
                 name: p.name.clone(),
                 port_type: p.port_type.clone(),
                 required: p.required,
-                description: None,
-                literal: LiteralPlacement::None,
+                description: p.description.clone(),
                 synthesized_from_carry: false,
             })
             .collect();
@@ -305,19 +342,22 @@ pub fn enrich_collecting(
             catalog_outputs.extend(form_outputs);
         }
 
-        // A CUSTOM input port (source-declared, unknown to the catalog)
-        // may not take a declared config field's name: the field's braces
-        // key and the port would fight over one name from two homes.
+        // A header PORT declaration naming a `config`-exposure input is
+        // a collision, not a merge: a config input is not wireable, so
+        // "I declared it as a port" can only mean the user expects to
+        // wire it. Every input name is in ONE namespace now, so this is
+        // the whole collision rule (a custom port can no longer shadow a
+        // config input silently, the hole the old field/port split had).
         for wp in &weft_inputs {
-            if catalog_inputs.iter().any(|cp| cp.name == wp.name) {
-                continue;
-            }
-            if meta.fields.iter().any(|f| f.key == wp.name) {
-                errors.push(EnrichError { span: node_span, message: format!(
-                    "node '{}': custom input port '{}' collides with config field '{}' \
-                     of node type {}; rename the port",
-                    node.id, wp.name, wp.name, node.node_type,
-                )});
+            if let Some(cp) = catalog_inputs.iter().find(|cp| cp.name == wp.name) {
+                if cp.exposure == Exposure::Config {
+                    errors.push(EnrichError { span: node_span, message: format!(
+                        "node '{}': input '{}' of node type {} is configuration-only \
+                         (exposure `config`); it cannot be declared as a port. Set it in \
+                         the config braces instead",
+                        node.id, wp.name, node.node_type,
+                    )});
+                }
             }
         }
 
@@ -357,7 +397,65 @@ pub fn enrich_collecting(
             errors.push(EnrichError { span: Span::default(), message: format!("{e}") });
         }
     }
+
+    // Effective-widget stamping, AFTER TypeVar resolution so a `T` input
+    // resolved to Image gets the file picker its concrete type implies.
+    // Declared widgets are already in place from the catalog mapping;
+    // everything still blank (type-derived inputs, user-added ports,
+    // form-derived inputs) fills from the RESOLVED instance type. Runs
+    // even when errors were collected: the editor renders lenient
+    // parses and needs every input's widget regardless.
+    for node in project.nodes.iter_mut() {
+        for input in node.inputs.iter_mut() {
+            if input.widget.is_none() {
+                input.widget = Some(Widget::default_for_type(&input.port_type));
+            }
+        }
+        cast_literals(node);
+    }
     errors
+}
+
+/// Literal lenience: a written literal whose JSON shape doesn't match
+/// its input's declared type but UNAMBIGUOUSLY converts (a `"18"` on a
+/// Number input, a JSON-in-a-string on a structural input) is cast in
+/// place at compile time, in the compiled definition only (source keeps
+/// what the author wrote). One cast site: validate, the runtime, and
+/// the editor all read the cast value. A value that cannot cast is left
+/// untouched, so validate reports the genuine mismatch
+/// (`config-type-mismatch`). Same gate as validate's literal
+/// type-check: only inputs whose exposure admits a braces literal
+/// (assignment-only inputs hold markers/handles, never castable data).
+fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
+    for input in &node.inputs {
+        // Only `all`/`config` inputs carry castable plain data.
+        // Assignment-only inputs (files, TypeVars, MustOverride, or an
+        // author-closed input) hold markers/handles whose written JSON
+        // shape intentionally differs from the input type, so they are
+        // deliberately excluded from casting AND from validate's
+        // type-check (same gate there); the omission is a design
+        // choice, not a gap.
+        if !input.exposure.allows_braces_literal() {
+            continue;
+        }
+        let stores = [
+            node.port_literals.get(&input.name).cloned(),
+            node.config.get(&input.name).cloned(),
+        ];
+        for (idx, value) in stores.into_iter().enumerate() {
+            let Some(value) = value else { continue };
+            if WeftType::is_compatible(&WeftType::infer(&value), &input.port_type) {
+                continue;
+            }
+            if let Ok(cast) = input.port_type.cast_value(&value) {
+                if idx == 0 {
+                    node.port_literals.insert(input.name.clone(), cast);
+                } else if let Some(cfg) = node.config.as_object_mut() {
+                    cfg.insert(input.name.clone(), cast);
+                }
+            }
+        }
+    }
 }
 
 fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
@@ -428,8 +526,11 @@ fn substitute_type_var(
         return false;
     };
     let mut changed = false;
-    for port in node.inputs.iter_mut().chain(node.outputs.iter_mut()) {
-        changed |= replace_in_type(&mut port.port_type, var_name, concrete);
+    for input in node.inputs.iter_mut() {
+        changed |= replace_in_type(&mut input.port_type, var_name, concrete);
+    }
+    for output in node.outputs.iter_mut() {
+        changed |= replace_in_type(&mut output.port_type, var_name, concrete);
     }
     changed
 }
@@ -464,7 +565,7 @@ fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bo
 fn derive_form_ports(
     config: &Value,
     specs: &[weft_core::FormFieldSpec],
-) -> (Vec<PortDefinition>, Vec<PortDefinition>) {
+) -> (Vec<InputDefinition>, Vec<PortDefinition>) {
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     let Some(fields) = config.get("fields").and_then(|f| f.as_array()) else {
@@ -493,7 +594,7 @@ fn derive_form_ports(
         };
 
         for port in &spec.adds_inputs {
-            inputs.push(materialize_port(port, key, false));
+            inputs.push(InputDefinition::from_wire_port(materialize_port(port, key, false)));
         }
         for port in &spec.adds_outputs {
             outputs.push(materialize_port(port, key, true));
@@ -510,10 +611,9 @@ fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> Por
     };
     PortDefinition {
         name,
-        port_type: port_type.clone(),
+        port_type,
         required: !is_output,
         description: None,
-        literal: if is_output { LiteralPlacement::None } else { port_type.default_literal_placement() },
         synthesized_from_carry: false,
     }
 }

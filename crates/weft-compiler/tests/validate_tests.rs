@@ -312,20 +312,27 @@ fn config_type_mismatch_is_flagged() {
     use weft_core::weft_type::{WeftPrimitive, WeftType};
     // Construct a scenario where a port takes literals anywhere and is
     // typed: manually inject an input port with a String type and drive
-    // it with a number literal. The rule flags the incompatible literal.
+    // it with an UNCASTABLE literal (an object). A castable value (say
+    // a bare number) is deliberately silent here: validate only flags
+    // what the compile's cast pass cannot fix, and names why.
     let mut project = parse_enrich(r#"
 t = Text
 "#);
     let t = &mut project.nodes[0];
-    t.inputs.push(weft_core::project::PortDefinition {
+    t.inputs.push(weft_core::project::InputDefinition {
         name: "value".into(),
         port_type: WeftType::primitive(WeftPrimitive::String),
         required: false,
         description: None,
-        literal: weft_core::weft_type::LiteralPlacement::Anywhere,
+        exposure: weft_core::weft_type::Exposure::All,
+        widget: None,
+        default: None,
+        label: None,
+        placeholder: None,
         synthesized_from_carry: false,
+        from_spec: false,
     });
-    t.port_literals.insert("value".into(), serde_json::json!(42));
+    t.port_literals.insert("value".into(), serde_json::json!({"not": "a string"}));
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"config-type-mismatch"), "{d:?}");
 }
@@ -337,15 +344,20 @@ fn required_port_unmet_is_flagged() {
     let mut project = parse_enrich(r#"
 t = Text { value: "ok" }
 "#);
-    project.nodes[0].inputs.push(weft_core::project::PortDefinition {
+    project.nodes[0].inputs.push(weft_core::project::InputDefinition {
         name: "foo".into(),
         port_type: weft_core::weft_type::WeftType::primitive(
             weft_core::weft_type::WeftPrimitive::String,
         ),
         required: true,
         description: None,
-        literal: weft_core::weft_type::LiteralPlacement::None,
+        exposure: weft_core::weft_type::Exposure::Wire,
+        widget: None,
+        default: None,
+        label: None,
+        placeholder: None,
         synthesized_from_carry: false,
+        from_spec: false,
     });
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"required-port-unmet"), "{d:?}");
@@ -473,6 +485,14 @@ self.results = p.value
         loop_in.config.get("parallel"),
         Some(&serde_json::Value::Bool(false)),
         "flatten materializes the sequential default"
+    );
+    // The loop config keys (`over`, materialized `parallel`) live on
+    // the LoopIn boundary node, which declares no matching inputs;
+    // check_loop_config owns their validation, so the generic
+    // undeclared-key check must not fire on boundary nodes.
+    assert!(
+        !cs.contains(&"undeclared-port-no-custom"),
+        "loop config keys are not undeclared inputs: {cs:?}"
     );
 }
 
@@ -1002,4 +1022,174 @@ sink.data = mid.data
         .requires_infra = true;
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"trigger-into-infra"), "{d:?}");
+}
+
+// ── unified-input diagnostics ───────────────────────────────────────────────
+
+#[test]
+fn wiring_a_config_input_is_input_not_wireable() {
+    // HttpRequest's `method` is a `config`-exposure input (a select):
+    // design-time configuration, never graph data.
+    let project = parse_enrich(
+        r#"
+t = Text { value: "GET" }
+req = HttpRequest { url: "http://x" method: "GET" }
+req.method = t.value
+out = Debug
+out.data = req.body
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"input-not-wireable"), "{:?}", d);
+}
+
+#[test]
+fn a_type_mismatched_wire_onto_a_config_input_fires_only_input_not_wireable() {
+    // The edge is illegal as a whole; input-not-wireable owns it. The
+    // type machinery must stay silent instead of stacking type-mismatch
+    // on top of the real cause.
+    let project = parse_enrich(
+        r#"
+n = Range { from: 1, to: 3 }
+req = HttpRequest { url: "http://x", method: "GET" }
+req.method = n.values
+out = Debug
+out.data = req.body
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let cs = codes(&d);
+    assert!(cs.contains(&"input-not-wireable"), "{d:?}");
+    assert!(!cs.contains(&"type-mismatch"), "one mistake, one diagnostic: {d:?}");
+}
+
+#[test]
+fn an_empty_own_key_is_empty_byok() {
+    // An EMPTY key literal means "own key selected but never pasted";
+    // sending "" as a bearer token can only fail at the provider.
+    // An ABSENT key stays legal (runtime-granted access).
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig { model: "m" apiKey: "" }
+out = Debug
+out.data = cfg.config
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"empty-byok"), "{:?}", d);
+
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig { model: "m" }
+out = Debug
+out.data = cfg.config
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"empty-byok"), "absent key is runtime-granted: {:?}", d);
+}
+
+#[test]
+fn a_number_literal_outside_the_widget_range_is_rejected() {
+    // OpenRouterConfig's `temperature` widget declares max 2.0.
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig { model: "m" temperature: 5.0 }
+out = Debug
+out.data = cfg.config
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"literal-out-of-range"), "{:?}", d);
+
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig { model: "m" temperature: 0.7 }
+out = Debug
+out.data = cfg.config
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"literal-out-of-range"), "{:?}", d);
+}
+
+#[test]
+fn a_required_input_with_a_default_is_satisfied() {
+    // HttpRequest's `method` is required but declares default "GET":
+    // dragging the node and running without touching Method must compile
+    // (the runtime supplies the default). This is the audit's defect 1.
+    let project = parse_enrich(
+        r#"
+req = HttpRequest { url: "http://x" }
+out = Debug
+out.data = req.body
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        !codes(&d).iter().any(|c| *c == "required-port-unmet"),
+        "a defaulted required input needs no driver: {:?}",
+        d
+    );
+}
+
+#[test]
+fn declaring_a_config_input_as_a_header_port_is_an_enrich_error() {
+    let mut project = compile(
+        r#"
+req = HttpRequest(method: String) { url: "http://x" }
+out = Debug
+out.data = req.body
+"#,
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+    )
+    .expect("compile ok");
+    let err = enrich(&mut project, &catalog()).expect_err("config input as port must fail enrich");
+    let msg = format!("{err}");
+    assert!(msg.contains("configuration-only"), "{msg}");
+}
+
+#[test]
+fn a_castable_literal_is_cast_instead_of_failing() {
+    // `temperature: "0.7"` (a string on a Number input): unambiguously a
+    // number, so the compile CASTS it in the compiled definition rather
+    // than failing dumbly. The range check then runs on the cast value.
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig { model: "m" temperature: "0.7" }
+out = Debug
+out.data = cfg.config
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"config-type-mismatch"), "{:?}", d);
+    let cfg = project.nodes.iter().find(|n| n.id == "cfg").unwrap();
+    assert_eq!(
+        cfg.config.get("temperature"),
+        Some(&serde_json::json!(0.7)),
+        "the compiled definition carries the CAST number"
+    );
+
+    // An out-of-range value stays out of range after the cast.
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig { model: "m" temperature: "5.0" }
+out = Debug
+out.data = cfg.config
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"literal-out-of-range"), "{:?}", d);
+
+    // A genuinely uncastable literal still fails loudly.
+    let project = parse_enrich(
+        r#"
+cfg = OpenRouterConfig { model: "m" temperature: "banana" }
+out = Debug
+out.data = cfg.config
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"config-type-mismatch"), "{:?}", d);
 }

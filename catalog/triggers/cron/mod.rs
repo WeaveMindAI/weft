@@ -19,11 +19,11 @@ pub struct CronNode;
 #[async_trait]
 impl Node for CronNode {
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let spec = if let Some(expression) = ctx.config.opt::<String>("cron")? {
+        let spec = if let Some(expression) = ctx.inputs.opt::<String>("cron")? {
             TimerSpec::Cron { expression }
-        } else if let Some(duration_ms) = ctx.config.opt::<u64>("after_ms")? {
+        } else if let Some(duration_ms) = ctx.inputs.opt::<u64>("after_ms")? {
             TimerSpec::After { duration_ms }
-        } else if let Some(s) = ctx.config.opt::<String>("at")? {
+        } else if let Some(s) = ctx.inputs.opt::<String>("at")? {
             let when = chrono::DateTime::parse_from_rfc3339(&s)
                 .node_err("config.at not RFC-3339")?
                 .with_timezone(&chrono::Utc);

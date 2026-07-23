@@ -20,9 +20,9 @@ impl Node for GateNode {
         // engine bug. Read them loudly (required accessors) instead of
         // defaulting to Null, which would mask the bug as a legitimate
         // "cut flow" and silently drop the value.
-        let pass: bool = ctx.ports.get("pass")?;
+        let pass: bool = ctx.inputs.get("pass")?;
         if pass {
-            let value: serde_json::Value = ctx.ports.get("value")?;
+            let value: serde_json::Value = ctx.inputs.get("value")?;
             ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
         } else {
             // pass == false: cut the flow (downstream learns "no value

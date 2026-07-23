@@ -16,7 +16,7 @@ pub struct DebugNode;
 #[async_trait]
 impl Node for DebugNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let data = ctx.ports.raw("data").cloned().unwrap_or(Value::Null);
+        let data = ctx.inputs.raw("data").cloned().unwrap_or(Value::Null);
         let label = ctx.node_label.as_deref().unwrap_or(&ctx.node_id);
         ctx.log(LogLevel::Info, format!("[{}] {}", label, data)).await?;
         Ok(())

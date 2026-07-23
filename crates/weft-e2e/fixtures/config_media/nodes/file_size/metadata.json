@@ -3,14 +3,27 @@
   "label": "File Size",
   "description": "Read a media/File input's bytes and emit their count. A project-local custom node used by the e2e rig to prove a resolved @asset config value is consumed as a normal media input at run time.",
   "category": "Custom",
-  "tags": ["storage", "media", "custom", "e2e"],
+  "tags": [
+    "storage",
+    "media",
+    "custom",
+    "e2e"
+  ],
   "icon": "File",
   "color": "#0ea5e9",
   "inputs": [
-    { "name": "file", "type": "File", "required": true, "literal": "anywhere" }
+    {
+      "name": "file",
+      "type": "File",
+      "required": true,
+      "exposure": "all"
+    }
   ],
   "outputs": [
-    { "name": "size", "type": "Number" }
+    {
+      "name": "size",
+      "type": "Number"
+    }
   ],
   "requires_infra": false
 }

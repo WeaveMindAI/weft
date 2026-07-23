@@ -1301,14 +1301,14 @@ async fn drive(
             // dispatch path (skip, fail, passthrough, loop, body) carries
             // it. Don't ship a second one here.
             //
-            // The one split point between the node's two value bags:
-            // ports get everything the ready paths delivered (wired
-            // pulses + body literals), config gets
-            // the remaining body fields with a `config`-port object
-            // overlaid when the node declares that port.
-            let (ports, config) = weft_core::context::split_node_values(
+            // The node's ONE input bag: everything the ready paths
+            // delivered (wired pulses + body literals), the remaining
+            // braces config values, and declared defaults for whatever
+            // is still absent (a closed wire is never defaulted).
+            let inputs = weft_core::context::node_input_bag(
                 node_def,
                 group.input.as_object().cloned().unwrap_or_default(),
+                &group.closed_ports,
             );
             // Hand the per-(node, frames) await sequence to the
             // handle. The body's `await_signal` calls pop entries
@@ -1362,8 +1362,7 @@ async fn drive(
                 node_def.label.clone(),
                 group.color,
                 group.frames.clone(),
-                ports,
-                config,
+                inputs,
                 handle,
             );
 
@@ -1412,9 +1411,13 @@ async fn drive(
             let provision_tenant_id = tenant_id.to_string();
             let provision_namespace = namespace.to_string();
             let provision_clients = clients.clone();
-            // Port values for provisioning (mirrors the run-time ports bag).
-            let provision_input = weft_core::context::ValueBag::ports(
+            // Input values for provisioning (the same one-bag build the
+            // run-time dispatch uses, so provision bodies read the same
+            // view a `run` body would).
+            let provision_input = weft_core::context::node_input_bag(
+                node_def,
                 group.input.as_object().cloned().unwrap_or_default(),
+                &group.closed_ports,
             );
             let abort_handle = in_flight.spawn(async move {
                 if is_infra_setup_provision {

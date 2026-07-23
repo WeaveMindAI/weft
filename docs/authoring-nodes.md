@@ -46,7 +46,7 @@ A node is a directory under the project's `nodes/` root:
 ```
 nodes/my_node/
   mod.rs              # the Rust impl (a `Node` trait impl)
-  metadata.json       # the node's declared surface (ports, fields, features)
+  metadata.json       # the node's declared surface (inputs, outputs, features)
   deps.toml           # optional: extra cargo deps beyond the codegen base
 ```
 
@@ -58,7 +58,7 @@ node never inspects the lifecycle phase itself:
 #[async_trait]
 pub trait Node: NodeManifest + Send + Sync {
     /// Infra nodes only (`requires_infra: true`): the desired infra shape.
-    async fn provision_infra(&self, ctx: InfraProvisionContext, input: InputBag)
+    async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag)
         -> WeftResult<InfraSpec> { /* default: error */ }
     /// Triggers only (`features.isTrigger: true`): register the wake
     /// signal. Called INSTEAD of `run` at registration time.
@@ -93,24 +93,26 @@ pub struct TextNode;
 #[async_trait]
 impl Node for TextNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let value: String = ctx.config.get("value")?;
+        let value: String = ctx.inputs.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
 }
 ```
 
-### Reading values: `ctx.ports` and `ctx.config`
+### Reading values: `ctx.inputs`
 
-A node reads its named values from two separate bags. `ctx.ports` holds
-what arrived on the node's input ports; `ctx.config` holds the node's
-design-time config fields. Each name lives in exactly one of the two, so
-the read is always unambiguous: a port value comes from `ctx.ports`, a
-config field from `ctx.config`.
+A node reads its named values from ONE bag: `ctx.inputs`. However an
+input got its value (a wire, a body literal, or the input's declared
+default), the node reads it here; every input name is unique on a node,
+so the read is always unambiguous. Precedence when several sources
+could supply a value: a wire or body literal wins, then the declared
+default. (A trigger's fire payload is the separate `ctx.wake` bag,
+below.)
 
 Both bags expose the same accessors:
 
 - `.get::<T>("name")?`: required, typed, loud error when absent or
-  mistyped (stamped as an input or config error per bag).
+  mistyped (the error names the input).
 - `.opt::<T>("name")?`: optional (`Ok(None)` when absent or null), but
   a PRESENT wrong-typed value still errors loud.
 - `.get_or("name", default)?`: absent means the default, wrong type
@@ -118,64 +120,96 @@ Both bags expose the same accessors:
   `.get(..).unwrap_or(..)`: it swallows a real type error.)
 - `.raw("name")`: the optional raw JSON for pass-through reads; a
   REQUIRED raw read is `.get::<Value>("name")?`.
-- `.iter()`: every named value, for nodes that treat their ports as a
-  dynamic set (script variables, form fields) or forward them.
+- `.iter()`: every named value, settings included.
+- `.custom()`: the instance's DATA inputs only: every value except the
+  node type's own metadata-declared settings. The accessor for nodes
+  that treat "whatever the user wired in" as a dynamic set (script
+  variables, form prefill); never re-filter your own setting names by
+  hand.
 - `.object()?`: the whole bag as one `serde_json::Map`, for nodes that
-  consume or forward it as a record. Always answers on ports and
-  config; on the wake bag it fails loud when the fire delivered no
-  keyed record (a broken delivery can never pass as an empty one).
+  consume or forward it as a record. Always answers on inputs; on the
+  wake bag it fails loud when the fire delivered no keyed record (a
+  broken delivery can never pass as an empty one).
 
-File values are just types: `ctx.ports.get::<FileHandle>("image")?`
+File values are just types: `ctx.inputs.get::<FileHandle>("image")?`
 parses the file value and fails loud when it has no readable handle.
 
-### How a port gets its value in weft source
+### Declaring inputs: exposure, widget, default
 
-A port has exactly one driver, written in one of three forms: an edge
-(`n.x = other.y`), an assignment literal (`n.x = 5`), or a braces
-literal (`M { x: 5 }`). Giving a port two drivers is a compile error
-(`double-driven-port`).
+Every entry in the metadata's `inputs` list is one input:
 
-Where a LITERAL may be written is the port's `literal` level, declared
-on the port in `metadata.json` (an explicit level wins, otherwise the
-port type's default applies):
+```json
+{
+  "name": "method",
+  "type": "String",
+  "required": true,
+  "exposure": "config",
+  "widget": { "kind": "select", "options": ["GET", "POST"] },
+  "default": "GET",
+  "label": "Method",
+  "placeholder": "..."
+}
+```
 
-- `"anywhere"`: braces or assignment. The default for plain data
-  (strings, numbers, lists, dicts).
-- `"assignment"`: only `n.x = ...`. The default for file types, e.g.
-  `n.image = @asset("i.png", Image)`.
-- `"none"`: wires only. The default for Bus ports; declare it for a
-  port that needs a real node wired, like an inference node's `config`
-  port.
+`exposure` says where a value may come from. It governs LITERALS; wires
+are a separate axis (every exposure is wireable except `config`):
 
-Edges are legal on every port, in both spellings: `n.x = other.y` and
-`M { x: other.y }` produce the same wire.
+- `"all"`: braces literal (`M { x: 5 }`), assignment literal
+  (`n.x = 5`), or a wire. The default for plain data (strings, numbers,
+  lists, dicts).
+- `"assignment"`: literal only as `n.x = ...`, plus wires. The default
+  for file types, e.g. `n.image = @asset("i.png", Image)`.
+- `"config"`: literal only in the braces, and NOT wireable: a pure
+  design-time setting (what a select, an API-key picker, a form builder
+  configure). No type defaults to it; declare it.
+- `"wire"`: wires only, no literal ever. The default for Bus inputs;
+  declare it for an input that needs a real node wired, like an
+  inference node's `config` input.
 
-Whichever form drove the port, the node reads the value from
-`ctx.ports`. A port with `literal: "assignment"` or `"none"` may share
-a name with a config field; the two hold independent values
-(`ctx.ports.get(name)` vs `ctx.config.get(name)`). A field sharing the
-name of a `literal: "anywhere"` port is a metadata error: declare only
-the port, it alone carries the value.
+An input has exactly one driver; two is a compile error
+(`double-driven-port`), and a wire on a `"config"` input is
+`input-not-wireable`.
+
+`widget` overrides the editor control. Absent, the control derives from
+the TYPE through one central mapping (file-valued types get a drop/pick
+control, Boolean a checkbox, Number a number box, everything else a
+text area, with JSON typed as text for complex types). Declare a widget
+for a richer control: `select`/`multiselect` (with `options`), `code`
+(with `language`), `number` (with `min`/`max`/`step`, enforced by the
+editor's clamp and the compiler's `literal-out-of-range`), `api_key`
+(with `provider`), `password`, `form_builder`, `file_drop`.
+
+`default` is the value the runtime supplies when nothing else drives
+the input. It is consulted at run time and rendered by the editor as
+the effective value, never written into source; `required` plus
+`default` is satisfiable with no driver.
 
 ### The config-node pattern
 
-A node may declare an input port named `config`. A configuration object
-wired to it (from a config node) is consumed by the ENGINE before
-dispatch: each key overlays the node's config bag, and a key naming one
-of the node's `literal: "anywhere"` ports fills that port instead (a
-directly wired value on that port wins). The node body just reads
-`ctx.config` and `ctx.ports` as usual.
+A config node is nothing engine-special: it emits ONE plain object, and
+the consuming node declares an ordinary object-typed input (usually
+`exposure: "wire"`, so a real node must be wired) and reads that object
+itself, deciding what each key means. `ctx.inputs.nested(name)` reads
+an object-valued input as its own bag with the same typed accessors
+(absent = an empty bag, every knob at its default; a present non-object
+value errors loud):
 
-### How the editor renders ports
+```rust
+let cfg = ctx.inputs.nested("config")?;
+let model: String = cfg.get_or("model", "default-model".into())?;
+```
 
-The editor shows an inline field in the node body for every port that
-can take a literal. The control kind derives from the port TYPE through
-one central mapping: file types get a drop/pick control, Boolean a
-checkbox, Number a number box, everything else a text area. A small
-marker on the field toggles which source form the value is written in
-(braces vs statement; locked to statement for `"assignment"` ports). A
-`literal: "none"` port shows a handle only, and wiring an edge hides
-the field (one driver).
+No input name triggers hidden behavior; an object wired to an input
+always arrives as that object.
+
+### How the editor renders inputs
+
+Every input renders as an inline field in the node body from its
+resolved widget, except `"wire"` inputs (handle only) and wired inputs
+(the edge is the driver, the field hides). `"config"` inputs render a
+field but no handle on the edge rail. A small marker on a wireable
+input's field toggles which source form the value is written in (braces
+vs statement; locked to statement for `"assignment"` inputs).
 
 ### Emitting output, errors, HTTP, identity
 
@@ -206,8 +240,8 @@ the field (one driver).
 
 `metadata.json` declares the surface (see `weft_core::NodeMetadata` for
 every field): `type`, `label`, `description`, `category`, `tags`, `icon`,
-`color`, `inputs`/`outputs` (`{ name, type, required, description }`),
-`fields` (config the editor collects: `{ key, label, field_type, required,
+`color`, `inputs` (`{ name, type, required, exposure, widget, default,
+label, placeholder, description }`), `outputs` (`{ name, type, required,
 description }`), `requires_infra`, `images`, `features`, `validate`.
 
 `deps.toml` lists extra cargo dependencies beyond the always-available
@@ -487,7 +521,7 @@ credit, an enrichment lookup) does exactly two things:
 //    platform sentinel) asks the runtime for its configured key
 //    (<PROVIDER>_API_KEY on the runtime's broker). Your code is the
 //    same lines either way; nothing branches.
-let access = ctx.provider_access("openrouter", ctx.config.opt("apiKey")?).await?;
+let access = ctx.provider_access("openrouter", ctx.inputs.opt("apiKey")?).await?;
 
 // 2. An ordinary HTTP client to make the calls with. Use it directly,
 //    or hand it to any library that accepts an injected client.
@@ -563,14 +597,14 @@ Writing one, and getting a project's meter promoted to a weft-shipped one
 (so the platform keys in app.weavemind.ai can pay for it too), is all in
 `docs/authoring-provider-meters.md`.
 
-The key input itself is an ordinary config field with the `api_key` field
-type, naming the provider so the editor renders the "Credits / Own key"
-choice:
+The key input itself is an ordinary `config`-exposure input with the
+`api_key` widget, naming the provider so the editor renders the
+"Credits / Own key" choice:
 
 ```jsonc
-// metadata.json, in configFields
-{ "key": "apiKey", "label": "API key",
-  "field_type": { "kind": "api_key", "provider": "tavily" } }
+// metadata.json, in inputs
+{ "name": "apiKey", "type": "String", "exposure": "config",
+  "widget": { "kind": "api_key", "provider": "tavily" }, "label": "API key" }
 ```
 
 ## Durable execution: `await_signal`, `register_signal`, `ctx.run`
@@ -602,27 +636,26 @@ impl Node for MyTriggerNode {
         // Build the typed kind from the node's values, then register
         // it. (The live-caller kinds share a config body built by
         // `LiveConnectionConfig::from_node_fields`.) The runtime saves
-        // a snapshot of `ctx.ports` with the registration.
-        let common = LiveConnectionConfig::from_node_fields(ctx.config.object()?);
+        // a snapshot of `ctx.inputs` with the registration.
+        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?);
         ctx.register_signal(ApiEndpoint { common }).await
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // Runs when an external fire arrives, exactly once per fire.
         // The fire's payload fields are on the `ctx.wake` bag (same
-        // accessors as ports/config); `ctx.ports` replays the values
-        // the trigger's inputs held at setup time.
+        // accessors); `ctx.inputs` replays the values the trigger's
+        // inputs held at setup time.
         let value: serde_json::Value = ctx.wake.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
 }
 ```
 
-**What a trigger's `run` sees, and when it runs.** A trigger's three
+**What a trigger's `run` sees, and when it runs.** A trigger's two
 value sources at fire time:
 
-- `ctx.config`: the node's design-time config, as always.
-- `ctx.ports`: a SNAPSHOT of what the trigger's inputs held when it
+- `ctx.inputs`: a SNAPSHOT of what the trigger's inputs held when it
   registered (its upstream runs during trigger setup, the values land,
   and the runtime saves them with the registration). Upstream nodes do
   not re-run for the trigger's sake at fire time, and wires into a
@@ -682,7 +715,7 @@ section):
 
 Both live-caller kinds share `LiveConnectionConfig` (the `common`
 field): build it from the node's merged named values with
-`LiveConnectionConfig::from_node_fields(ctx.config.object()?)`. The wire
+`LiveConnectionConfig::from_node_fields(ctx.inputs.object()?)`. The wire
 protocol is the KIND, not a config field (the runtime derives it from
 the tag), which is why there is no `protocol:` knob to set.
 
@@ -804,7 +837,7 @@ error.
 
 What's safe between awaits:
 - Pure logic, branching on values that came from awaits or runs.
-- Reading named values via `ctx.ports` / `ctx.config`.
+- Reading named values via `ctx.inputs`.
 
 What's NOT safe between awaits (wrap in `ctx.run`):
 - `rand::random()`, `Uuid::new_v4()`, `Instant::now()`.
@@ -992,27 +1025,24 @@ knob. The files are reachable independently of the editor (e.g. the `weft`
 CLI lists/downloads/removes them by scope), so `Shared` data a project
 wrote remains accessible after the project is gone.
 
-## Media config: the `file_drop` field and project assets
+## Media config: the file-drop widget and project assets
 
 When your node needs a user-supplied file (an image to display, an audio
-clip to transcribe), declare a `file_drop` field with the weft file type it
-picks:
+clip to transcribe), declare a file-typed input; the drop/pick control
+derives from the type automatically:
 
 ```json
 "inputs": [
-  { "name": "image", "type": "Image", "required": true }
-],
-"fields": [
-  { "key": "image", "label": "Image", "field_type": { "kind": "file_drop", "type": "Image" } }
+  { "name": "image", "type": "Image", "required": true, "exposure": "all" }
 ]
 ```
 
-The declared `type` (`Image`, `Audio`, `Video`, `Blob`, or the `File` union)
+The input's type (`Image`, `Audio`, `Video`, `Blob`, or the `File` union)
 drives the editor's file filter, validates drops, and is what gets written
-into source. An optional `accept` narrows the filter further (e.g.
-`"image/png"`). A field whose `key` matches an input port makes that port
-fillable from config, and the value is delivered ON the port: the node
-reads it via `ctx.ports.get`.
+into source. A declared `"widget": { "kind": "file_drop", "accept": "image/png" }`
+narrows the filter further. The value is delivered on the input; the node
+reads it via `ctx.inputs.get`. (`exposure: "all"` opens the braces form; a
+file type's default is assignment-only.)
 
 What lands in source is ONE clean line, never a storage key:
 
@@ -1182,7 +1212,7 @@ pulses.** Provisioning can do async work (a registry lookup) but its
 job is the spec.
 
 ```rust
-async fn provision_infra(&self, _ctx: InfraProvisionContext, _input: InputBag)
+async fn provision_infra(&self, _ctx: InfraProvisionContext, _input: ValueBag)
     -> WeftResult<InfraSpec>
 {
     const PORT: u16 = 8090;
@@ -1291,7 +1321,7 @@ let api = ctx.endpoint("api").await?;
 ctx.pulse_downstream(NodeOutput::new().set("apiUrl", api.url())).await
 
 // send node, in run: reads the wired URL, appends its own path
-let base: String = ctx.ports.get("apiUrl")?;   // the bridge's exported URL
+let base: String = ctx.inputs.get("apiUrl")?;  // the bridge's exported URL
 let resp = post(format!("{}/action", base.trim_end_matches('/')), body).await?;
 ```
 

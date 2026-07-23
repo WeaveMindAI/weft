@@ -2,7 +2,9 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { EditorView, keymap, lineNumbers, placeholder as placeholderExt } from '@codemirror/view';
 	import { EditorState } from '@codemirror/state';
+	import type { Extension } from '@codemirror/state';
 	import { python } from '@codemirror/lang-python';
+	import { javascript } from '@codemirror/lang-javascript';
 	import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 	import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 	import { githubLight } from '@uiw/codemirror-theme-github';
@@ -12,14 +14,40 @@
 		placeholder = '',
 		readonly = false,
 		minHeight = '80px',
+		language,
 		onchange,
 	}: {
 		value?: string;
 		placeholder?: string;
 		readonly?: boolean;
 		minHeight?: string;
+		/// The code widget's declared syntax (metadata `language`). The
+		/// Rust widget always carries one; absence is a malformed state
+		/// and surfaces loudly, never a silent default language.
+		language?: string;
 		onchange?: (value: string) => void;
 	} = $props();
+
+	/// The one language -> CodeMirror-extension table. An unknown or
+	/// missing language is a LOUD console error and renders as plain
+	/// text; it is never silently highlighted as some other language.
+	function languageExtensions(lang: string | undefined): Extension[] {
+		if (lang === undefined) {
+			console.error('CodeEditor: code widget carries no language; rendering plain text');
+			return [];
+		}
+		switch (lang) {
+			case 'python':
+				return [python()];
+			case 'javascript':
+				return [javascript()];
+			default:
+				console.error(
+					`CodeEditor: no syntax support for language '${lang}' (known: python, javascript); rendering plain text`,
+				);
+				return [];
+		}
+	}
 
 	let container: HTMLDivElement;
 	let view: EditorView | null = null;
@@ -27,7 +55,7 @@
 
 	onMount(() => {
 		const extensions = [
-			python(),
+			...languageExtensions(language),
 			githubLight,
 			lineNumbers(),
 			EditorView.lineWrapping,

@@ -23,7 +23,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(300);
 #[async_trait]
 impl Node for HoldGateNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let url: String = ctx.config.get("url")?;
+        let url: String = ctx.inputs.get("url")?;
         let client = ctx.http();
         loop {
             // Transient errors (fake not yet up, connection blip) just poll

@@ -3,43 +3,61 @@
   "label": "Human",
   "description": "Pause execution and wait for a human to submit a form. Uses the await_form language primitive. Form fields determine the visible inputs/outputs via form_field_specs.",
   "category": "AI",
-  "tags": ["human", "form", "hitl", "suspension", "review"],
+  "tags": [
+    "human",
+    "form",
+    "hitl",
+    "suspension",
+    "review"
+  ],
   "icon": "User",
   "color": "#ec4899",
   "inputs": [
-    { "name": "context", "type": "String", "required": false, "description": "Optional context shown to the reviewer alongside the form." }
-  ],
-  "outputs": [],
-  "fields": [
     {
-      "key": "title",
+      "name": "title",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
       "label": "Title",
-      "field_type": { "kind": "text" },
       "placeholder": "Review request",
       "description": "Title the reviewer sees at the top of the form."
     },
     {
-      "key": "description",
+      "name": "description",
+      "type": "String",
+      "exposure": "config",
       "label": "Description",
-      "field_type": { "kind": "textarea" },
       "placeholder": "What you want the reviewer to do.",
       "description": "Description shown under the title."
     },
     {
-      "key": "fields",
-      "label": "Form fields",
-      "field_type": { "kind": "form_builder" },
+      "name": "fields",
+      "type": "List[JsonDict]",
       "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "form_builder"
+      },
+      "label": "Form fields",
       "description": "Each field contributes inputs/outputs per its fieldType (see form_field_specs)."
     }
   ],
+  "outputs": [],
   "requires_infra": false,
   "features": {
     "hasFormSchema": true
   },
   "validate": [
     {
-      "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "fields" } },
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "fields"
+        }
+      },
       "then": {
         "message": "HumanQuery '{id}' has no form fields; the human would see an empty form.",
         "level": "structural",

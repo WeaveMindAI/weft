@@ -2725,7 +2725,7 @@
     #[async_trait]
     impl Node for GatherSink {
         async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-            let data = ctx.ports.raw("data").cloned().unwrap_or(Value::Null);
+            let data = ctx.inputs.raw("data").cloned().unwrap_or(Value::Null);
             *self.got.lock().unwrap() = Some(data);
             Ok(())
         }

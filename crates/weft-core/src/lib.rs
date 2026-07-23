@@ -27,7 +27,7 @@ pub mod running_policy;
 pub mod signal;
 #[cfg(feature = "runtime")]
 pub mod signed_token;
-// Mostly pure (key grammar, wire types, marker builders — the compiler needs
+// Mostly pure (key grammar, wire types, marker builders: the compiler needs
 // them, so the WASM parse build compiles them too); only its byte-stream
 // aliases are runtime-gated, inside the module.
 pub mod storage;
@@ -130,8 +130,9 @@ pub use infra::{
 };
 pub use frames::{LoopFrames, LoopIteration};
 pub use node::{
-    Condition, FieldDef, FormFieldPort, FormFieldSpec, MetadataCatalog,
-    NodeFeatures, NodeManifest, NodeMetadata, NodeOutput, PortDef, RuleDiagnostic, RuleSeverity,
+    Condition, FormFieldPort, FormFieldSpec, InputSpec, MetadataCatalog,
+    NodeFeatures, NodeManifest, NodeMetadata, NodeOutput, OutputSpec, RuleDiagnostic, RuleSeverity,
+    Widget,
     ValidationLevel, ValidationRule,
 };
 // The `NodeManifest` DERIVE (same name as the trait, macro namespace):
@@ -148,7 +149,7 @@ pub use primitive::{
 };
 pub use project::{
     has_infra, Edge, EdgeIndex, GroupBoundary, GroupBoundaryRole, GroupDefinition, GroupKind,
-    NodeDefinition, PortDefinition, Position, ProjectDefinition,
+    InputDefinition, NodeDefinition, PortDefinition, Position, ProjectDefinition,
 };
 pub use pulse::Pulse;
 pub use running_policy::RunningPolicy;

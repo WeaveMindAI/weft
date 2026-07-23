@@ -48,6 +48,7 @@ macro_rules! typed_node {
 
 typed_node!(WeftFile, WEFT_FILE);
 typed_node!(NodeDecl, NODE_DECL);
+typed_node!(InlineExpr, INLINE_EXPR);
 typed_node!(GroupDecl, GROUP_DECL);
 typed_node!(LoopDecl, LOOP_DECL);
 typed_node!(IncludeDecl, INCLUDE_DECL);
@@ -79,14 +80,18 @@ impl WeftFile {
     }
 }
 
-/// Any declaration kind (node, group, include). The shared notion the resolver
-/// walks: each carries a local id (the leading IDENT) and may nest a body.
+/// Any declaration kind (node, group, include, inline node). The shared notion
+/// the resolver walks: each carries a local id and may nest a body. An INLINE
+/// node (`key: Type { ... }.port` / `t.p = Type { ... }.port`) is a synthesized
+/// declaration: its local id is derived from its position (`{host}__{key}`, the
+/// same scheme the lowering's `lower_inline_expr` writes), never from a header.
 #[derive(Debug, Clone)]
 pub enum Decl {
     Node(NodeDecl),
     Group(GroupDecl),
     Loop(LoopDecl),
     Include(IncludeDecl),
+    InlineNode(InlineExpr),
 }
 
 impl Decl {
@@ -96,6 +101,7 @@ impl Decl {
             SyntaxKind::GROUP_DECL => GroupDecl::cast(node).map(Decl::Group),
             SyntaxKind::LOOP_DECL => LoopDecl::cast(node).map(Decl::Loop),
             SyntaxKind::INCLUDE_DECL => IncludeDecl::cast(node).map(Decl::Include),
+            SyntaxKind::INLINE_EXPR => InlineExpr::cast(node).map(Decl::InlineNode),
             _ => None,
         }
     }
@@ -106,6 +112,7 @@ impl Decl {
             Decl::Group(g) => g.syntax(),
             Decl::Loop(l) => l.syntax(),
             Decl::Include(i) => i.syntax(),
+            Decl::InlineNode(x) => x.syntax(),
         }
     }
 
@@ -115,6 +122,7 @@ impl Decl {
             Decl::Group(g) => g.local_id(),
             Decl::Loop(l) => l.local_id(),
             Decl::Include(i) => first_ident(i.syntax()).map(|t| t.text().to_string()),
+            Decl::InlineNode(x) => x.anon_local(),
         }
     }
 
@@ -124,6 +132,43 @@ impl Decl {
             Decl::Group(g) => child(g.syntax(), SyntaxKind::BODY).and_then(Body::cast),
             Decl::Loop(l) => child(l.syntax(), SyntaxKind::BODY).and_then(Body::cast),
             Decl::Include(_) => None,
+            Decl::InlineNode(x) => child(x.syntax(), SyntaxKind::BODY).and_then(Body::cast),
+        }
+    }
+}
+
+impl InlineExpr {
+    /// The anon local id the lowering gives this inline node
+    /// (`{host_local}__{key}`), derived from its POSITION: a config-field
+    /// value's host is the enclosing decl (recursively, so a nested
+    /// inline is `a__b__c`); a connection RHS's host is the target
+    /// endpoint. None only on a malformed tree.
+    /// SYNC: InlineExpr::anon_local <-> crates/weft-compiler/src/weft_compiler.rs lower_inline_expr (anon_id)
+    pub fn anon_local(&self) -> Option<String> {
+        let parent = self.0.parent()?;
+        match parent.kind() {
+            SyntaxKind::CONFIG_FIELD => {
+                let key = first_ident(&parent)?.text().to_string();
+                // CONFIG_FIELD -> BODY -> owning decl (a NODE_DECL, or a
+                // nested INLINE_EXPR whose own anon local recurses).
+                let body = parent.parent()?;
+                let owner = body.parent()?;
+                let host = match owner.kind() {
+                    SyntaxKind::NODE_DECL => NodeDecl::cast(owner)?.local_id()?,
+                    SyntaxKind::INLINE_EXPR => InlineExpr::cast(owner)?.anon_local()?,
+                    _ => return None,
+                };
+                Some(format!("{host}__{key}"))
+            }
+            SyntaxKind::CONNECTION => {
+                let target = parent
+                    .children()
+                    .find(|n| n.kind() == SyntaxKind::ENDPOINT)
+                    .and_then(Endpoint::cast)?;
+                let (id, port) = target.parts();
+                Some(format!("{}__{}", id?, port?))
+            }
+            _ => None,
         }
     }
 }
@@ -394,6 +439,38 @@ impl<'a> FileView<'a> {
         out
     }
 
+    /// Every CONFIG_FIELD whose value is a braces ENDPOINT (`key: other.port`)
+    /// resolving to `target`, scope-aware, wherever it sits (a node body, an
+    /// inline expression's body). The braces endpoint is a WIRE in the
+    /// compiled graph, so removing a node must clear these exactly like the
+    /// statement-form connections `connections_referencing` finds; missing
+    /// them leaves a dangling reference the compile then rejects.
+    pub fn endpoint_fields_referencing(&self, target: &Decl) -> Vec<SyntaxNode> {
+        let Some(target_scoped) = self.scoped_id_of(target) else { return Vec::new() };
+        let mut all_ids = std::collections::HashSet::new();
+        self.walk_decls(&mut |scoped, _| {
+            all_ids.insert(scoped.to_string());
+        });
+        let mut out = Vec::new();
+        self.walk_scoped(self.file.syntax(), &mut Vec::new(), &mut |scope, node| {
+            if !matches!(node.kind(), SyntaxKind::NODE_DECL | SyntaxKind::INLINE_EXPR) {
+                return;
+            }
+            let Some(body) = child(node, SyntaxKind::BODY) else { return };
+            for field in body.children().filter(|n| n.kind() == SyntaxKind::CONFIG_FIELD) {
+                let Some(ep) = field
+                    .children()
+                    .find(|n| n.kind() == SyntaxKind::ENDPOINT)
+                    .and_then(Endpoint::cast)
+                else { continue };
+                if endpoint_resolves_to(&ep, scope, &all_ids).as_deref() == Some(target_scoped.as_str()) {
+                    out.push(field.clone());
+                }
+            }
+        });
+        out
+    }
+
     /// The local id of a decl for scoped-id composition: its own local id, or the
     /// file's `source_id` for an anonymous group (empty local). This is the one
     /// place the anon-group prefix enters; it must match the id the lowering's
@@ -436,15 +513,56 @@ impl<'a> FileView<'a> {
                     f(prefix, &node);
                     if let Some(decl) = Decl::cast(node.clone()) {
                         if let Some(body) = decl.body() {
-                            if matches!(&decl, Decl::Group(_) | Decl::Loop(_)) {
-                                prefix.push(self.decl_local(&decl));
-                                self.walk_scoped(body.syntax(), prefix, f);
-                                prefix.pop();
+                            match &decl {
+                                Decl::Group(_) | Decl::Loop(_) => {
+                                    prefix.push(self.decl_local(&decl));
+                                    self.walk_scoped(body.syntax(), prefix, f);
+                                    prefix.pop();
+                                }
+                                // A NODE body nests no scope but may hold
+                                // inline-expression nodes (config-field
+                                // values, statement-form fills), which the
+                                // lowering synthesizes as siblings in the
+                                // node's own scope. Visit them so an anon
+                                // node (`host__key`) is addressable.
+                                Decl::Node(_) => self.walk_inline_exprs(body.syntax(), prefix, f),
+                                _ => {}
                             }
                         }
                     }
                 }
-                SyntaxKind::CONNECTION => f(prefix, &node),
+                SyntaxKind::CONNECTION => {
+                    f(prefix, &node);
+                    // A connection RHS may BE an inline expression
+                    // (`t.p = Type { ... }.out`), whose anon node lives in
+                    // this scope.
+                    self.walk_inline_exprs(&node, prefix, f);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Visit every INLINE_EXPR nested under `parent` (a node/inline BODY
+    /// or a CONNECTION), depth-first: the expression itself, then any
+    /// inline expressions inside its own body (nested inlines,
+    /// `a__b__c`). Mirrors the recursion `lower_config_body` /
+    /// `lower_inline_expr` run, so every anon node the lowering
+    /// synthesizes has exactly one visit here.
+    fn walk_inline_exprs(&self, parent: &SyntaxNode, prefix: &mut Vec<String>, f: &mut impl FnMut(&[String], &SyntaxNode)) {
+        for child in parent.children() {
+            match child.kind() {
+                SyntaxKind::INLINE_EXPR => {
+                    f(prefix, &child);
+                    if let Some(body) = child.children().find(|n| n.kind() == SyntaxKind::BODY) {
+                        self.walk_inline_exprs(&body, prefix, f);
+                    }
+                }
+                // A config field's value, or a statement inside a body,
+                // may carry the inline expression one level down.
+                SyntaxKind::CONFIG_FIELD | SyntaxKind::CONNECTION => {
+                    self.walk_inline_exprs(&child, prefix, f);
+                }
                 _ => {}
             }
         }
