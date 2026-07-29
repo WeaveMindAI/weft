@@ -41,8 +41,9 @@ wherever a measured call is required, never a silent wrong number).
 
 The place a meter lives decides one thing: who can pay for the provider.
 
-- **Your own key** (you set it on the node) works with ANY meter, wherever it
-  lives. A project-defined provider is used exactly this way.
+- **Your own connection** (your key or your signed-in account, connected on
+  the access node) works with ANY meter, wherever it lives. A
+  project-defined provider is used exactly this way.
 - **The platform key** (app.weavemind.ai pays, the user sets no key) is only
   ever spent on a provider weft ships a meter for. A project-defined provider
   is refused the platform key, with a message pointing at how to request it.
@@ -53,7 +54,8 @@ The place a meter lives decides one thing: who can pay for the provider.
 
 Meters are the trusted artifact of the whole paid-call system. A node never
 states a cost and has no way to: the runtime runs the provider's meter
-around every call made on `ctx.metered_client`, and every cost figure in
+around every call made on an opened connection's client, and every cost
+figure in
 the system is a meter's output. **The meter author must be careful so that
 the node author can be careless**: a node cannot produce an incorrect bill,
 no matter what it does, because it is never asked.
@@ -61,7 +63,7 @@ no matter what it does, because it is never asked.
 Adding a provider's meter here is also what makes it a **supported
 provider**: a platform-held key is only ever spent on a provider with a
 meter (there would be no honest way to account for it otherwise). A
-provider without a meter still works on a key the user sets themselves; its
+provider without a meter still works on the user's own connection; its
 calls simply carry no cost figure.
 
 ## The trait, verb by verb
@@ -69,7 +71,7 @@ calls simply carry no cost figure.
 ```rust
 #[async_trait::async_trait]
 impl ProviderMeter for MyProviderMeter {
-    fn provider(&self) -> &'static str;   // the key identity: <NAME>_API_KEY
+    fn service(&self) -> &'static str;    // the SERVICE this meter measures
     fn base_url(&self) -> &'static str;   // where the provider REALLY lives
     fn classify(&self, method: &str, path: &str) -> RouteClass;
     fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
@@ -78,6 +80,10 @@ impl ProviderMeter for MyProviderMeter {
     fn observe(&self) -> Box<dyn CallObservation>;
     async fn resolve(&self, observed: ObservedCall, follow_up: FollowUp<'_>)
         -> MeasuredCost;
+    fn observe_session(&self, path: &str, query: &str)
+        -> anyhow::Result<Box<dyn SessionObservation>>;
+    fn session_slice_usd(&self, path: &str) -> anyhow::Result<f64>;
+    fn session_max_frame_bytes(&self, path: &str) -> anyhow::Result<usize>;
 }
 ```
 
@@ -117,6 +123,25 @@ impl ProviderMeter for MyProviderMeter {
   library are never involved and never trusted to do it. A cost that
   genuinely cannot be resolved is an honest `amount_usd: None`, recorded
   as unknown, **never a fake $0** (a fake zero silently leaks money).
+- **`observe_session`** mints the per-session tap for a route classified
+  `BillableSession`: it is fed every frame in both directions
+  (`on_frame_to_provider` / `on_frame_to_caller`), answers the running
+  `accrued_usd`, and closes into a `MeasuredCost` via `end`. REQUIRED for
+  any meter that classifies a route `BillableSession`; the default
+  refuses loudly. The `query` is the session URL's query string, where
+  format parameters that decide the price per unit usually live.
+- **`session_slice_usd`** is the amount one admission slice of the
+  session reserves up front, the session analogue of `ceiling_usd`: a
+  session has no total knowable before it runs, so admission carves a
+  slice (price the dearest configuration for a fixed span, e.g. one
+  minute), and the slice is re-carved as the accrued cost approaches it.
+  Only prepaid admission reads it; a session on the caller's own
+  credential needs `observe_session` alone.
+- **`session_max_frame_bytes`** bounds one frame: the largest single
+  frame a session admission accepts, sized so one frame can never
+  accrue more than one slice's worth at the route's dearest rate
+  (account for the wire form, e.g. base64 expansion). Implemented
+  alongside `session_slice_usd`; the default refuses loudly.
 
 ## Route classification, and the double-charge trap
 
@@ -130,6 +155,7 @@ OpenRouter's routes:
 | `POST chat/completions` | `Billable(Metered)` | the actual spend; only measurement prices it |
 | `GET generation` | `Free` | the cost LOOKUP for a spend |
 | `GET models` | `Free` | the public price catalog |
+| `GET speech-to-text/realtime` (ElevenLabs) | `BillableSession` | a long-lived two-way channel; cost accrues from the frames in both directions, no total knowable up front |
 | anything else | `Unknown` | cannot be measured, so cannot be billed |
 
 A `Billable` route also declares HOW it prices, which doubles as the
@@ -188,6 +214,11 @@ Look at `providers/openrouter.rs` for the shapes; every meter needs its own:
   on every call it prices low.
 - **Interruption honesty** (Layer 2): an interrupted observation with
   nothing to anchor a lookup on resolves to `None`, never `Some(0.0)`.
+- **Sessions, when the meter has any** (Layer 1): the session route
+  classifies `BillableSession`; an observation fed recorded frames in
+  both directions accrues and closes to the expected dollars; the slice
+  prices the dearest configuration. `providers/elevenlabs.rs` is the
+  worked session example the way `openrouter.rs` is for per-call shapes.
 
 ## Write it as a pure function of bytes
 
@@ -195,4 +226,6 @@ A meter must not assume anything about the process running it. Write it as
 a pure function of the request/response bytes plus its own follow-up query,
 and it measures correctly wherever a paid call is measured: no globals
 beyond your own rate caches, no environment reads beyond what `FollowUp`
-hands you.
+hands you (an already-signed-in client and the base URL; a meter never
+touches a credential, which is exactly why the same meter works on a
+pasted key and on a sign-in).

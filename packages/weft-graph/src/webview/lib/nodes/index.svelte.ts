@@ -233,6 +233,13 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		// for nodes whose features.hasFormSchema is true; the
 		// form_builder editor reads it via `typeConfig.formFieldSpecs`.
 		formFieldSpecs: entry.formFieldSpecs,
+		// The service recipe (personal access nodes only): the connect
+		// flow reads which fields to paste / whether a consent runs.
+		service: entry.service,
+		// The project's OAuth apps (inherited from the package root),
+		// keyed by service name. The access node resolves its own app
+		// here and sends it on connect.
+		accessApps: entry.accessApps,
 	};
 }
 

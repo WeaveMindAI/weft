@@ -1,0 +1,21 @@
+# The full realtime audio pipeline: a WAV asset streamed live onto a
+# bus, transcribed by ElevenLabs' realtime speech-to-text over the
+# connection's measured WebSocket, the committed segments relayed onto a
+# text bus a Debug node follows live, and the full transcript printed at
+# the end. The test connects the grant (a pasted ElevenLabs API key)
+# through the dispatcher's access store and stamps the handle before
+# running.
+
+src = AudioStream
+
+ears = ElevenLabsAccess
+
+stt = ElevenLabsTranscribe
+stt.audio = src.stream
+stt.account = ears.access
+
+live = Debug
+live.data = stt.transcript
+
+out = Debug
+out.data = stt.text

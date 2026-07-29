@@ -1,0 +1,10 @@
+# Open a real issue on a real repository through a pasted personal
+# access token. The test connects the grant through the dispatcher's
+# access store and stamps the connect handle + repo before running.
+
+gh = GitHubAccess
+issue = GitHubCreateIssue { title: "weft e2e: access proof", body: "opened by the accesses e2e; safe to close" }
+issue.account = gh.access
+
+out = Debug
+out.data = issue.url

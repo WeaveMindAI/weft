@@ -120,7 +120,7 @@ pub async fn mint_token(
         .mint_signal_token(&signal_token)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-    let url = token_url(&state.public_base_url, &token);
+    let url = token_url(state.external_base_url(), &token);
     Ok(Json(MintedToken {
         id: signal_token.id,
         token,

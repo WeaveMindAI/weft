@@ -11,6 +11,7 @@ members = [
     "crates/weft-journal",
     "crates/weft-listener",
     "crates/weft-task-store",
+    "crates/weft-access-store",
     "crates/weft-broker",
     "crates/weft-broker-client",
     "crates/weft-infra",
@@ -79,7 +80,14 @@ regex = "1"
 inventory = "0.3"
 url = "2"
 hmac = "0.12"
+aes-gcm = "0.10"
 sha2 = "0.10"
+# OAuth 1.0a request signing (an AuthStep Sign kind) is HMAC-SHA1 by spec.
+sha1 = "0.10"
+# Asymmetric push-verification schemes (access::verify::VerifyKind::Signature):
+# Ed25519 (Discord's scheme) and ECDSA P-256 (SendGrid's scheme).
+ed25519-dalek = "2"
+p256 = "0.13"
 tempfile = "3"
 parking_lot = "0.12"
 ipnet = "2"
@@ -93,6 +101,7 @@ weft-engine = { path = "crates/weft-engine" }
 weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
+weft-access-store = { path = "crates/weft-access-store" }
 weft-platform-traits = { path = "crates/weft-platform-traits" }
 weft-assets = { path = "crates/weft-assets" }
 weft-providers = { path = "crates/weft-providers" }

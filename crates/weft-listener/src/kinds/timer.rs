@@ -14,15 +14,16 @@ use tokio::time::{sleep_until, Duration, Instant};
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Signal, Timer, TimerSpec};
 
-use crate::config::ListenerConfig;
-use crate::fire_sink::FireSignalSink;
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
-use super::KindHandler;
+use async_trait::async_trait;
+
+use super::{KindHandler, SpawnCtx};
 
 pub struct TimerHandler;
 
+#[async_trait]
 impl KindHandler for TimerHandler {
     fn tag(&self) -> &'static str {
         Timer::TAG
@@ -60,29 +61,18 @@ impl KindHandler for TimerHandler {
         Ok(Value::Object(serde_json::Map::new()))
     }
 
-    fn spawn_task(
+    async fn spawn_task(
         &self,
-        token: &str,
-        tenant_id: &str,
-        placement_generation: i64,
         spec: &SignalSpec,
         kind_state: &Value,
-        sink: FireSignalSink,
-        _config: Arc<ListenerConfig>,
+        ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
         let pinned_after = kind_state
             .get("next_fire_at_unix_ms")
             .and_then(|v| v.as_i64());
-        Ok(Some(spawn_loop(
-            token.to_string(),
-            tenant_id.to_string(),
-            placement_generation,
-            timer.spec,
-            pinned_after,
-            sink,
-        )))
+        Ok(Some(spawn_loop(timer.spec, pinned_after, ctx.fire)))
     }
 
     fn process_entry(
@@ -105,12 +95,9 @@ impl KindHandler for TimerHandler {
 }
 
 fn spawn_loop(
-    token: String,
-    tenant_id: String,
-    placement_generation: i64,
     spec: TimerSpec,
     pinned_after_unix: Option<i64>,
-    sink: FireSignalSink,
+    fire: crate::event_context::FireContext,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // For After: use the pinned absolute time from kind_state if
@@ -123,7 +110,7 @@ fn spawn_loop(
             let Some((next, deadline)) = next_fire(&spec, pinned.take()) else {
                 tracing::warn!(
                     target: "weft_listener::timer",
-                    %token,
+                    token = %fire.token(),
                     "timer spec has no next fire; task exiting"
                 );
                 return;
@@ -138,13 +125,7 @@ fn spawn_loop(
                 "scheduledTime": deadline.to_rfc3339(),
                 "actualTime": Utc::now().to_rfc3339(),
             });
-            if let Err(e) = sink.fire(&token, &tenant_id, placement_generation, payload).await {
-                tracing::warn!(
-                    target: "weft_listener::timer",
-                    %token, error = %e,
-                    "fire enqueue failed; will retry on next tick if recurring"
-                );
-            }
+            fire.fire(payload, "timer").await;
 
             if matches!(spec, TimerSpec::After { .. } | TimerSpec::At { .. }) {
                 return;

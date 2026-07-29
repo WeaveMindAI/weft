@@ -84,9 +84,10 @@
                     weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "tick"
                 )
             });
-            while let Some(entry) = cursor.next().await.expect("no FellBehind on journaled bus") {
+            while let Some(entry) = cursor.next().await {
                 if let weft_core::bus::BusEntryKind::Message { from, payload, .. } = entry.kind {
-                    let payload = payload.expect("journaled payload");
+                    let payload =
+                        payload.expect("journaled payload").into_json().expect("json bus");
                     let i = payload["i"].as_i64().unwrap_or(-1);
                     self.seen.lock().unwrap().push((from, i));
                 }
@@ -191,7 +192,7 @@
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
-            paid_calls: crate::context::FakePaidCallClient::new(),
+            access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
         };
 
@@ -241,15 +242,17 @@
                 ExecEvent::BusJoined { name, .. } => {
                     join_names.push(name.clone());
                 }
-                ExecEvent::BusMessage { from, payload, .. } => {
-                    let p = payload
-                        .value()
-                        .and_then(|v| v.as_object())
-                        .and_then(|o| o.get("i"))
-                        .and_then(|v| v.as_i64())
-                        .map(|i| i.to_string())
-                        .unwrap_or_default();
-                    messages.push((from.clone(), p));
+                ExecEvent::BusWindow { messages: window, .. } => {
+                    for m in window {
+                        let p = m
+                            .payload
+                            .as_json()
+                            .and_then(|v| v.get("i"))
+                            .and_then(|v| v.as_i64())
+                            .map(|i| i.to_string())
+                            .unwrap_or_default();
+                        messages.push((m.from.clone(), p));
+                    }
                 }
                 _ => {}
             }
@@ -289,7 +292,7 @@
             // Wait forever: no peer ever sends or closes. Only
             // cancellation (task abort) can end this.
             let mut cursor = bus.cursor();
-            while cursor.next().await.expect("no FellBehind on journaled bus").is_some() {}
+            while cursor.next().await.is_some() {}
             Ok(())
         }
     }
@@ -334,7 +337,7 @@
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
-            paid_calls: crate::context::FakePaidCallClient::new(),
+            access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
         };
         let cancel = CancellationFlag::new_arc();
@@ -597,7 +600,7 @@
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
-            paid_calls: crate::context::FakePaidCallClient::new(),
+            access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
         };
         tokio::time::timeout(
@@ -684,7 +687,7 @@
             bus.register("peer").expect("register");
             // Drain until close.
             let mut cursor = bus.cursor();
-            while cursor.next().await.expect("no FellBehind on journaled bus").is_some() {}
+            while cursor.next().await.is_some() {}
             Ok(())
         })));
         let outcome = run_test(project, "creator").await;
@@ -772,7 +775,7 @@
             let mut bus = ctx.bus_from_input("ch")?;
             bus.register("consumer").expect("register");
             let mut cursor = bus.cursor();
-            while cursor.next().await.expect("no FellBehind on journaled bus").is_some() {}
+            while cursor.next().await.is_some() {}
             Ok(())
         })));
         let outcome = run_test(project, "producer").await;
@@ -875,8 +878,8 @@
                     ));
                     bus.send("ping", serde_json::json!({"v": 1})).expect("a sends ping");
                     // The close may legitimately race the deadlock tail;
-                    // a closed bus here surfaces as Ok(None), not a panic.
-                    if matches!(cursor.next().await, Ok(Some(_))) {
+                    // a closed bus here surfaces as None, not a panic.
+                    if cursor.next().await.is_some() {
                         a_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     // Now deadlock: wait for a name that never comes.
@@ -897,7 +900,7 @@
                         &e.kind,
                         weft_core::bus::BusEntryKind::Message { msg_kind, .. } if msg_kind == "ping"
                     ));
-                    if matches!(cursor.next().await, Ok(Some(_))) {
+                    if cursor.next().await.is_some() {
                         b_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // The reply can race the close; ignore a closed bus.
                         let _ = bus.send("pong", serde_json::json!({"v": 2}));
@@ -976,7 +979,7 @@
                     // parked caught-up half of the false-positive pair
                     // while B is mid-search on the ping.
                     bus.send("ping", serde_json::json!({"v": 1})).expect("a sends ping");
-                    if matches!(cursor.next().await, Ok(Some(_))) {
+                    if cursor.next().await.is_some() {
                         a_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     bus.wait_for("never").await.map_err(|e| weft_core::error::WeftError::Runtime(
@@ -1004,7 +1007,7 @@
                         }
                         hit
                     });
-                    if matches!(cursor.next().await, Ok(Some(_))) {
+                    if cursor.next().await.is_some() {
                         b_ex.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // The reply MUST succeed: a Closed here is the
                         // false positive this test exists to catch. The
@@ -1035,15 +1038,15 @@
     );
 
     weft_core::stress_test!(
-        // A cancelled node's runtime-granted provider access is given
-        // back by the RUNTIME even though the node's future is aborted
-        // mid-body (the node never runs any wrap-up code of its own; the
-        // AccessCloseGuard's drop path is what must fire). The body opens
-        // an access, signals readiness, and parks on the cancellation flag
+        // A cancelled node's opened connection is released by the
+        // RUNTIME even though the node's future is aborted mid-body
+        // (the node never runs any wrap-up code of its own; the
+        // AccessCloseGuard's drop path is what must fire). The body
+        // opens a connection, signals readiness, and parks on the flag
         // forever; the test cancels after the open is in, then asserts the
         // close landed. Stress-looped: the drop-spawned close races the
         // execution's teardown by construction.
-        name: a_cancelled_nodes_provider_access_is_given_back,
+        name: a_cancelled_nodes_metered_access_is_given_back,
         runs: 32,
         worker_threads: 4,
         async fn body() {
@@ -1065,7 +1068,9 @@
             install_body(&pid, "payer", std::sync::Arc::new(move |ctx| {
                 let ready_tx = ready_tx.clone();
                 Box::pin(async move {
-                    let _access = ctx.provider_access("openrouter", None).await?;
+                    let _conn = ctx
+                        .open(&weft_core::Access::new("conn-1", "openrouter", None))
+                        .await?;
                     if let Some(tx) = ready_tx.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
@@ -1086,8 +1091,16 @@
             journal.record_event(&ExecEvent::NodeKicked {
                 color, node_id: "payer".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
             }, None).await.unwrap();
-            let fake_paid_calls = crate::context::FakePaidCallClient::new();
-            fake_paid_calls.set_key("openrouter", "sk-platform");
+            let fake_access_broker = crate::context::FakeAccessBroker::new();
+            // Runtime-owned on purpose: only an `Ours` credential is
+            // retired on release (a user's own secrets never travel
+            // back), so that is the lane where the runtime's give-back
+            // on abort must be proven.
+            fake_access_broker.set_owned_bearer_connection(
+                "conn-1",
+                "sk-platform",
+                weft_core::CredentialOwner::Ours,
+            );
             let clients = EngineClients {
                 journal: journal.clone(),
                 tasks: Arc::new(NoopTasks),
@@ -1096,7 +1109,7 @@
                 project: Arc::new(NoopProject),
                 clock: Arc::new(weft_platform_traits::clock::SystemClock),
                 storage: crate::storage::FakeWorkerStorage::new(),
-                paid_calls: fake_paid_calls.clone(),
+                access_broker: fake_access_broker.clone(),
                 pending_costs: crate::metering::PendingCostRecords::new(),
             };
             let cancel = CancellationFlag::new_arc();
@@ -1120,16 +1133,14 @@
             // The close is drop-spawned on abort, so it may land a beat
             // after the run returns: poll briefly rather than sleep blind.
             for _ in 0..100 {
-                if !fake_paid_calls.closed_accesses.lock().unwrap().is_empty() {
+                if !fake_access_broker.released.lock().unwrap().is_empty() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            assert_eq!(
-                *fake_paid_calls.closed_accesses.lock().unwrap(),
-                vec!["sk-platform".to_string()],
-                "the aborted body's access must be given back by the runtime"
-            );
+            let released = fake_access_broker.released.lock().unwrap().clone();
+            assert_eq!(released.len(), 1, "the aborted body's connection must be released by the runtime");
+            assert_eq!(released[0].get("token").map(String::as_str), Some("sk-platform"));
         }
     );
 
@@ -1174,7 +1185,7 @@
                     let never_handle = bus.new_handle();
                     tokio::select! {
                         r = ping_cursor.next() => {
-                            if matches!(r, Ok(Some(_))) {
+                            if r.is_some() {
                                 a_got.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                         }
@@ -1360,7 +1371,7 @@
                 project: Arc::new(NoopProject),
                 clock: Arc::new(weft_platform_traits::clock::SystemClock),
                 storage: crate::storage::FakeWorkerStorage::new(),
-                paid_calls: crate::context::FakePaidCallClient::new(),
+                access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
             };
             run_one_execution(
@@ -1461,7 +1472,7 @@
                     bus.register("peer").expect("register peer");
                     let mut cursor = bus.cursor();
                     // Stay co-alive until the creator closes the bus.
-                    while cursor.next().await.expect("no FellBehind").is_some() {}
+                    while cursor.next().await.is_some() {}
                     Ok(())
                 })
             }),
@@ -1585,7 +1596,7 @@
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("peer").expect("register peer");
                     let mut cursor = bus.cursor();
-                    while cursor.next().await.expect("no FellBehind").is_some() {}
+                    while cursor.next().await.is_some() {}
                     Ok(())
                 })
             }),
@@ -1747,7 +1758,7 @@
                     let mut bus = ctx.bus_from_input("ch")?;
                     bus.register("peer").expect("register peer");
                     let mut cursor = bus.cursor();
-                    while cursor.next().await.expect("no FellBehind").is_some() {}
+                    while cursor.next().await.is_some() {}
                     Ok(())
                 })
             }),
@@ -2146,7 +2157,7 @@
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
-            paid_calls: crate::context::FakePaidCallClient::new(),
+            access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
         };
         run_one_execution(
@@ -2354,7 +2365,7 @@
                 let mut bus = ctx.bus_from_input("channel")?;
                 bus.register("drain").expect("register drain");
                 let mut cursor = bus.cursor();
-                while cursor.next().await.expect("no fellbehind").is_some() {}
+                while cursor.next().await.is_some() {}
                 Ok(())
             }
         }
@@ -2382,10 +2393,13 @@
         ).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
 
-        let msgs: Vec<i64> = journal.events.lock().unwrap().iter().filter_map(|e| match e {
-            ExecEvent::BusMessage { from, payload, .. } if from == "caller_to_bus" =>
-                payload.value().and_then(|v| v.get("i")).and_then(|v| v.as_i64()),
-            _ => None,
+        let msgs: Vec<i64> = journal.events.lock().unwrap().iter().flat_map(|e| match e {
+            ExecEvent::BusWindow { messages, .. } => messages
+                .iter()
+                .filter(|m| m.from == "caller_to_bus")
+                .filter_map(|m| m.payload.as_json().and_then(|v| v.get("i")).and_then(|v| v.as_i64()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
         }).collect();
         assert_eq!(msgs, vec![0, 1, 2], "all three caller messages journaled onto the bus in order");
     }

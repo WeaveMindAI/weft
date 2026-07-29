@@ -1,15 +1,18 @@
 //! Bus conversation assertions over a settled run's replay.
 //!
-//! A bus shows up in the event log as `bus_joined` / `bus_message` /
+//! A bus shows up in the event log as `bus_joined` / `bus_window` /
 //! `bus_left` / `bus_closed` events (plus `bus_participant` graph-wiring
 //! markers). These helpers read those out of a [`SettledRun`] so a test can
 //! assert "these participants joined", "this message was sent", "the bus
 //! closed", without JSON spelunking.
 //!
-//! A `bus_message` payload is a tagged `JournaledPayload`: `{ "kind":
-//! "journaled", "value": <v> }` for journaled buses, `{ "kind": "ephemeral" }`
-//! (metadata only) for ephemeral ones. The accessors expose the journaled
-//! value when present; an ephemeral message carries no value, only size + hash.
+//! A `bus_window` row aggregates one journal window of messages: its
+//! `messages` list carries every message for a journaled bus (payloads
+//! tagged `{ "kind": "json", "data": <v> }` or `{ "kind": "bytes",
+//! "data": "<base64>" }`), and is empty for an ephemeral bus, whose
+//! `totals` rollup (count + bytes per sender/kind) is the whole story.
+//! The accessors below unpack the windows back into per-message rows so
+//! tests read messages, not windows.
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -23,7 +26,7 @@ pub struct BusMessage {
     pub from: String,
     pub msg_kind: String,
     /// The journaled value, if the bus is journaled; `None` for ephemeral
-    /// (where the log carries only size + sha prefix).
+    /// (where the journal carries only the totals rollup).
     pub value: Option<Value>,
 }
 
@@ -49,19 +52,31 @@ impl SettledRun {
             .collect()
     }
 
-    /// Every message on `bus_id`, in event order.
+    /// Every message on `bus_id`, in event order (windows unpacked).
     pub fn bus_messages(&self, bus_id: &str) -> Vec<BusMessage> {
         self.replay
-            .by_kind("bus_message")
+            .by_kind("bus_window")
             .filter(|e| e.str_field("bus_id") == Some(bus_id))
-            .map(|e| BusMessage {
+            .flat_map(|e| {
+                e.field("messages")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .map(|m| BusMessage {
                 bus_id: bus_id.to_string(),
-                from: e.str_field("from").unwrap_or_default().to_string(),
-                msg_kind: e.str_field("msg_kind").unwrap_or_default().to_string(),
-                // payload is { kind: journaled, value } or { kind: ephemeral }.
-                value: e
-                    .field("payload")
-                    .and_then(|p| p.get("value"))
+                from: m.get("from").and_then(Value::as_str).unwrap_or_default().to_string(),
+                msg_kind: m
+                    .get("msg_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                // payload is { kind: json, data } or { kind: bytes, data: b64 };
+                // tests read the JSON shape.
+                value: m
+                    .get("payload")
+                    .filter(|p| p.get("kind").and_then(Value::as_str) == Some("json"))
+                    .and_then(|p| p.get("data"))
                     .cloned(),
             })
             .collect()

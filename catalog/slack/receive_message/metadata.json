@@ -1,0 +1,139 @@
+{
+  "type": "SlackReceiveMessage",
+  "label": "Slack Receive Message",
+  "description": "Fires an execution when a message lands in a Slack channel. Works through your own Slack app's Socket Mode token (paste it on the connection), or through Slack pushing events to a weft that is reachable from the internet. Filters run before anything fires, so only matching messages cost an execution. For 'every workspace that installed my app', use Slack App Messages instead.",
+  "category": "Triggers",
+  "tags": [
+    "slack",
+    "trigger",
+    "message"
+  ],
+  "icon": "Slack",
+  "color": "#4A154B",
+  "features": {
+    "isTrigger": true
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "channels:history"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Reading messages needs the channels:history scope, and the app must be a member of the channel."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/archives/([A-Z0-9]+)"
+          }
+        ]
+      },
+      "label": "Channel",
+      "placeholder": "Pick a channel or paste its link"
+    },
+    {
+      "name": "keyword",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Contains",
+      "placeholder": "Only fire when the text contains this",
+      "description": "Only fire on messages whose text contains this. Leave empty for every message."
+    },
+    {
+      "name": "pattern",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Matches pattern",
+      "placeholder": "A regular expression the text must match",
+      "description": "Only fire on messages whose text matches this regular expression. Leave empty for no pattern filter."
+    },
+    {
+      "name": "fromUser",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "From user",
+      "placeholder": "A Slack user id (U...)",
+      "description": "Only fire on messages sent by this user id. Leave empty for anyone."
+    },
+    {
+      "name": "includeBots",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Include bot messages",
+      "description": "Also fire on messages posted by bots (including this app's own). Off by default so a workflow that posts into its own channel cannot trigger itself."
+    },
+    {
+      "name": "replies",
+      "type": "String",
+      "exposure": "config",
+      "default": "all",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "all",
+          "top_level",
+          "thread_replies"
+        ]
+      },
+      "label": "Thread scope",
+      "description": "Which messages fire: every message, only top-level channel messages, or only replies inside threads."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "thread",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

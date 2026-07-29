@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    weft_core::net::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -46,13 +47,20 @@ async fn main() -> anyhow::Result<()> {
         weft_broker::AuthConfig { audience },
         object_store,
         entitlements,
-        // Provider keys come from this host's env (`<PROVIDER>_API_KEY`):
-        // the operator's own keys, handed to the operator's own workers.
-        std::sync::Arc::new(weft_broker::credential::EnvCredentialSource),
+        // Provider keys come from the shared-credentials file's
+        // `api_key` entries (the json file named by
+        // `WEFT_ACCESS_APPS_FILE`): the operator's own keys, handed
+        // to the operator's own workers.
+        std::sync::Arc::new(weft_broker::credential::FileCredentialSource::from_env()),
+        // The registered OAuth apps, from the same shared-credentials
+        // file: the sole source shared-door connects resolve an app
+        // from.
+        std::sync::Arc::new(weft_broker::app_provider::FileAppProvider::from_env()),
     )
     .await?;
 
     weft_broker::spawn_expiry_sweep(state.clone());
+    weft_broker::spawn_connect_sweep(state.clone());
     let app = weft_broker::router(state);
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = tokio::net::TcpListener::bind(addr)

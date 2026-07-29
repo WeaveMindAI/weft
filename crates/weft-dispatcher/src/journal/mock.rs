@@ -627,6 +627,7 @@ mod tests {
             node_id: "n".into(),
             is_resume: false,
             spec_json: "{}".into(),
+            access_id: None,
             consumer_kind: None,
             tags: vec![],
             port_snapshot: None,

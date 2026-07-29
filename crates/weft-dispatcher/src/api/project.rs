@@ -3881,7 +3881,7 @@ async fn collect_listener_urls(
         if meta.is_resume {
             continue;
         }
-        if let Some(url) = meta.public_url(&state.public_base_url) {
+        if let Some(url) = meta.public_url(state.external_base_url()) {
             out.push(ActivationUrl {
                 node_id: meta.node_id.clone(),
                 url,

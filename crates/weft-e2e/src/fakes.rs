@@ -17,7 +17,11 @@
 //!     address), which the test injects into the fixture's trigger URL.
 //!
 //! The tenant pod egress policy is `0.0.0.0/0 except {pod_cidr, service_cidr}`,
-//! so egress to the host gateway is allowed by design.
+//! so a WORKER reaches the host gateway freely. The pooled LISTENER's
+//! egress excludes every private range (user-typed watch URLs reach the
+//! public internet only); it reaches the host gateway through the one
+//! opened CIDR (`WEFT_LISTENER_ALLOW_CIDR`, defaulted to the gateway on
+//! a local kind cluster by the daemon).
 
 use std::sync::Arc;
 

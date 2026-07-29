@@ -1865,6 +1865,34 @@ fn set_config_does_not_double_indent_or_compound() {
 }
 
 #[test]
+fn set_config_on_a_bodyless_node_nested_in_a_group_matches_sibling_indent() {
+    // A bodyless decl in a group body gets a body synthesized in place. Its
+    // leading newline+indent is a SIBLING token that survives the splice, so
+    // the rebuilt text must not re-emit the indent (it used to, double-
+    // indenting the decl: two spaces became four).
+    let src = "g = Group() -> () {\n  a = Text {\n    value: \"x\"\n  }\n  t = Text\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"y\"".into(), form: None }]);
+    assert_eq!(
+        out,
+        "g = Group() -> () {\n  a = Text {\n    value: \"x\"\n  }\n  t = Text {\n    value: \"y\"\n  }\n}\n",
+        "the synthesized body sits at the sibling's indent"
+    );
+    parse_ok(&out);
+}
+
+#[test]
+fn set_config_on_a_bodyless_node_nested_in_a_loop_matches_sibling_indent() {
+    let src = "l = Loop(items: List[String]) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  x = Text\n  self.acc = x.value\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig { node: "x".into(), key: "value".into(), value: "\"y\"".into(), form: None }]);
+    assert_eq!(
+        out,
+        "l = Loop(items: List[String]) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  x = Text {\n    value: \"y\"\n  }\n  self.acc = x.value\n}\n",
+        "the synthesized body sits at the sibling's indent"
+    );
+    parse_ok(&out);
+}
+
+#[test]
 fn set_config_preserves_trailing_comment() {
     let src = "n = Text {\n  value: \"x\"  # keep me\n}\n";
     let out = apply(src, vec![EditOp::SetConfig { node: "n".into(), key: "value".into(), value: "\"y\"".into(), form: None }]);
@@ -2789,7 +2817,7 @@ fn moving_an_inline_within_its_own_scope_is_a_no_op() {
 #[test]
 fn per_widget_value_shapes_round_trip_through_source() {
     let cases: Vec<(&str, serde_json::Value)> = vec![
-        ("\"text value\"", serde_json::json!("text value")),          // text/textarea/password/api_key/select/code
+        ("\"text value\"", serde_json::json!("text value")),          // text/textarea/password/select/code
         ("2.5", serde_json::json!(2.5)),                              // number (float)
         ("42", serde_json::json!(42)),                                // number (integer)
         ("true", serde_json::json!(true)),                            // checkbox
@@ -2798,6 +2826,14 @@ fn per_widget_value_shapes_round_trip_through_source() {
             "[{\"fieldType\": \"display\", \"key\": \"k\"}]",
             serde_json::json!([{"fieldType": "display", "key": "k"}]),
         ),                                                            // form_builder
+        (
+            "{\"id\": \"grant-1\", \"identity\": \"Q @ Acme\"}",
+            serde_json::json!({"id": "grant-1", "identity": "Q @ Acme"}),
+        ),                                                            // access ({id, identity} connect handle)
+        (
+            "{\"id\": \"C42\", \"label\": \"#general\"}",
+            serde_json::json!({"id": "C42", "label": "#general"}),
+        ),                                                            // remote_select ({id, label} pick)
     ];
     for (token, expected) in cases {
         let src = "t = Text\n";
@@ -3103,4 +3139,30 @@ fn updating_ports_on_an_inline_de_inlines_it() {
     assert!(out.contains("a_data = Custom"), "{out}");
     assert!(out.contains("-> (o: String?)") || out.contains("-> (o: String)"), "signature written: {out}");
     assert!(compiled_edges(&out).contains(&("a_data".into(), "a".into())), "wire kept: {out}");
+}
+#[test]
+fn set_config_on_a_bodyless_decl_keeps_its_leading_newlines() {
+    // A decl can CARRY the newlines separating it from the previous
+    // statement as its own leading trivia. Synthesizing a body rebuilds
+    // the whole decl, so that trivia must be re-emitted verbatim; the
+    // historical failure fused the decl onto the line above
+    // (`debug_1.data = n.rowsgoogle_access_1 = GoogleAccess {`),
+    // corrupting the source. Exactly the connect gesture's shape: a
+    // bodyless access node, mid-file, receiving its connection handle.
+    let src = "google_sheets_read_1 = GoogleSheetsRead\n\ndebug_1 = Debug {}\ndebug_1.data = google_sheets_read_1.rows\n\ngoogle_access_1 = GoogleAccess\ngoogle_sheets_read_1.account = google_access_1.access\n";
+    let value = "{\n  \"id\": \"6a46700e\",\n  \"identity\": \"admin@weavemind.ai\"\n}";
+    let ops = vec![EditOp::SetConfig {
+        node: "google_access_1".into(),
+        key: "account".into(),
+        value: value.into(),
+        form: None,
+    }];
+    let out = apply(src, ops.clone());
+    parse_ok(&out);
+    assert!(!out.contains("rowsgoogle_access_1"), "newline eaten: {out}");
+    assert!(
+        out.contains("google_sheets_read_1.rows\n\ngoogle_access_1 = GoogleAccess {"),
+        "the blank line between statements survives: {out}"
+    );
+    assert_reversible(src, ops);
 }

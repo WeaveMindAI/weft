@@ -240,6 +240,21 @@ impl Project {
         Ok(())
     }
 
+    /// Run `weft activate` EXPECTING a refusal: errors if activation
+    /// succeeds, otherwise returns the CLI's combined output so the
+    /// test asserts on the refusal's message. The project is still
+    /// marked for teardown (a refused activation may have registered
+    /// state before the failing trigger; `weft rm` cleans either way).
+    pub async fn activate_refused(&mut self) -> Result<String> {
+        let out = crate::client::cli(&self.dir, &["activate"]).await?;
+        self.teardown.mark_registered();
+        anyhow::ensure!(
+            !out.success,
+            "`weft activate` unexpectedly succeeded; this scenario expects a refusal"
+        );
+        Ok(format!("{}\n{}", out.stdout, out.stderr))
+    }
+
     /// Mark the project registered without going through activate. Used by the
     /// run path, where the first `weft run` builds + registers the project as a
     /// side effect, so teardown must still remove it.

@@ -1,0 +1,11 @@
+[package]
+name = "elevenlabs"
+
+# The ElevenLabs nodes: audio AI (realtime transcription today). They
+# speak to ElevenLabs specifically (its realtime protocol, its API key),
+# which is why they are named for it rather than for "speech" in
+# general: another provider is another protocol and another key.
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"
+tokio = "1"

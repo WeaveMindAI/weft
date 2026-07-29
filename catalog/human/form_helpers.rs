@@ -16,10 +16,10 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
-use weft_core::node::FormFieldSpec;
-use weft_core::node::FormFieldPort;
-use weft_core::node::NodeOutput;
-use weft_core::signal::FormField;
+use weft::node::FormFieldSpec;
+use weft::node::FormFieldPort;
+use weft::node::NodeOutput;
+use weft::signal::FormField;
 
 /// Pull the `fields` array off a node's config. The canonical shape is a
 /// JSON array (what the compiler produces); anything else means no fields.

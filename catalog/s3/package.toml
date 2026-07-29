@@ -1,0 +1,6 @@
+[package]
+name = "s3"
+
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"

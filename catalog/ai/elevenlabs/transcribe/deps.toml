@@ -1,0 +1,4 @@
+# The provider protocol carries audio as base64 inside JSON frames.
+[dependencies]
+base64 = "0.22"
+urlencoding = "2"

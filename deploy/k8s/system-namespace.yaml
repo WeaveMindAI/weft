@@ -48,20 +48,31 @@ spec:
       ports:
         - protocol: TCP
           port: 9999
+    # The public trigger surface: the allowlisting proxy forwards
+    # /events/... and /signal/... here (deploy/k8s/public-tunnel.yaml);
+    # nothing else passes it.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: weft-public-proxy
+      ports:
+        - protocol: TCP
+          port: 9999
 ---
-# Dispatcher egress: god mode. The dispatcher is the control plane:
-# it reaches every tenant listener (admin POSTs to /register, /process,
-# etc), every tenant infra pod (endpoint resolution, health), every
-# external webhook target nodes spec, plus the kube-apiserver via
-# kubectl. Any rule that tries to enumerate "what the dispatcher
-# talks to" goes stale the moment a node author adds a new outbound
-# call from a kind impl on the dispatcher path. So: open egress for
-# the dispatcher specifically, lock it down for everything else in
-# weft-system via the baseline.
+# Dispatcher egress: a closed, enumerated set. Everything the
+# dispatcher actually dials is a rule below: Postgres and the broker
+# (weft-db), its own pooled listener pods (admin POSTs on 8080),
+# sibling dispatcher pods (headless-Service peer traffic on 9999), the
+# kube-apiserver (kubectl), and DNS. It has NO internet egress ON
+# PURPOSE: the access verbs whose work addresses external services
+# (connect test calls, OAuth token exchanges, remote_select lookups)
+# run on the broker, so the dispatcher itself makes no outside call.
+# The supervisor is coordinated through the broker + DB (no
+# dispatcher->supervisor HTTP), so it needs no rule here.
 #
-# The asymmetry with `dispatcher-ingress` (which IS tightly scoped)
-# is deliberate: ingress is the attack surface (anyone can try to
-# POST), egress is initiated by trusted code we already control.
+# If a genuinely new dispatcher-side outbound call ever appears, add
+# its exact destination here; the symptom of forgetting is that call
+# timing out in-cluster (loud), never a silent bypass.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -74,7 +85,61 @@ spec:
   policyTypes:
     - Egress
   egress:
-    - {}
+    # Postgres + broker (weft-db namespace).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: weft-db
+          podSelector:
+            matchLabels:
+              app: weft-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: weft-db
+          podSelector:
+            matchLabels:
+              app: weft-broker
+      ports:
+        - protocol: TCP
+          port: 9090
+    # Pooled listener pods (admin POSTs: register/process/rehydrate/signals).
+    - to:
+        - podSelector:
+            matchLabels:
+              weft.dev/role: listener
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Sibling dispatcher pods (headless-Service peer traffic).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: weft-dispatcher
+      ports:
+        - protocol: TCP
+          port: 9999
+    # kube-apiserver (kubectl apply/scale/delete). Scoped to the
+    # apiserver's single ClusterIP, same reasoning as the broker's rule.
+    - to:
+        - ipBlock:
+            cidr: ${WEFT_APISERVER_CLUSTERIP}/32
+      ports:
+        - protocol: TCP
+          port: 443
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
 ---
 # ServiceAccounts for the pooled, trusted, tenant-agnostic services
 # (infra-supervisor pods; listener pods, both scaled up/down by their
@@ -96,11 +161,16 @@ metadata:
   name: weft-infra-supervisor-sa
   namespace: weft-system
 ---
-# Pooled listener egress: reaches the broker (task enqueue, signal
-# rehydrate) and tenant infra pods (SSE subscribes to /events). Like
-# the dispatcher it runs trusted code we control, and its outbound set
-# (user-configured SSE/poll/socket URLs) can't be enumerated, so egress
-# is open; ingress is the controlled surface (dispatcher admin POSTs).
+# Pooled listener egress. The listener holds outbound event sources
+# (SSE / poll / socket) whose URLs a workflow supplies. Its egress is a
+# closed set of exactly what it reaches, nothing else:
+#  - the public internet minus every private range (workflow-supplied
+#    watch URLs address external services; the exclusion set matches the
+#    broker's rule);
+#  - project namespaces (`weft.dev/role: project`), the home of an infra
+#    node's own helper pod that a signal subscribes to (the WhatsApp
+#    bridge's /events SSE);
+#  - the broker (task enqueue, signal rehydrate) and DNS.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -122,7 +192,54 @@ spec:
         - protocol: TCP
           port: 8080
   egress:
-    - {}
+    # Broker (task enqueue, signal rehydrate).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: weft-db
+          podSelector:
+            matchLabels:
+              app: weft-broker
+      ports:
+        - protocol: TCP
+          port: 9090
+    # Infra project namespaces: an infra node's own helper pod (e.g. the
+    # WhatsApp bridge SSE). The ONLY sanctioned in-cluster reach.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              weft.dev/role: project
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Public internet only (user-typed watch URLs): every private range
+    # excluded so such a URL cannot be pointed inside the cluster/VPC.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - ${WEFT_CLUSTER_POD_CIDR}
+              - ${WEFT_CLUSTER_SERVICE_CIDR}
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+    # One extra CIDR watch URLs may dial despite sitting in a private
+    # range (defaults to a benign unused /32). On a local kind cluster
+    # the daemon points it at the operator's own machine, so a trigger
+    # can watch a service running right there; an operator whose feeds
+    # live on another private host sets WEFT_LISTENER_ALLOW_CIDR.
+    - to:
+        - ipBlock:
+            cidr: ${WEFT_LISTENER_ALLOW_CIDR}
 ---
 # Pooled supervisor egress: reaches the kube-apiserver (kubectl apply /
 # scale / delete across tenant namespaces), the broker, and tenant

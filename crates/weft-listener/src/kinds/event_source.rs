@@ -2,41 +2,17 @@
 //! `PollEndpoint`, `SocketListen`). All three hold or poll an external
 //! source and fire a fresh execution per event; what differs is HOW they
 //! read (held SSE stream vs periodic poll vs bidirectional socket). The
-//! fire path and the reconnect-backoff ladder are identical, so they live
-//! here once and the three handlers call in.
+//! payload coercion and the reconnect-backoff ladder are identical, so
+//! they live here once and the three handlers call in.
 
 use serde_json::Value;
 use tokio::time::{sleep, Duration};
-use tracing::warn;
-
-use crate::fire_sink::FireSignalSink;
 
 /// Coerce an event's raw text into the JSON fire payload: parse it as JSON,
 /// or wrap the raw text as a JSON string. The fire pipeline is JSON-typed
 /// end to end, so every event source funnels text through here.
 pub fn coerce_text_payload(text: String) -> Value {
     serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text))
-}
-
-/// Fire one event payload, logging (not propagating) an enqueue failure:
-/// a dropped fire must not kill the event-source loop, but is never silent.
-/// `target` is the caller's tracing target so the log names the right kind.
-/// `tenant_id` is the signal's tenant, stamped on the enqueued fire (a
-/// pooled listener serves many tenants, so it travels per-signal).
-/// `placement_generation` is the generation this pod holds the signal under,
-/// stamped on the fire so the broker can fence a stale old-pod fire during a
-/// scale-down move overlap.
-pub async fn fire_payload(
-    sink: &FireSignalSink,
-    token: &str,
-    tenant_id: &str,
-    placement_generation: i64,
-    payload: Value,
-    target: &str,
-) {
-    if let Err(e) = sink.fire(token, tenant_id, placement_generation, payload).await {
-        warn!(target: "weft_listener::event_source", kind = target, %token, error = %e, "fire enqueue failed");
-    }
 }
 
 /// Exponential reconnect backoff, shared by every event source. Starts at

@@ -91,11 +91,19 @@ pub struct DispatcherState {
     /// frees the project's `project/`-scoped runtime files from the object
     /// store. Canonical doc on the `ProjectReclaimer` trait in `placement.rs`.
     pub project_reclaimer: Arc<dyn crate::placement::ProjectReclaimer>,
-    /// Externally-reachable base URL of this dispatcher. Used to
-    /// mint user-facing signal URLs (`<base>/signal/<token>`) at
-    /// register time. Architecture-4: the dispatcher hosts every
-    /// external URL; the listener has no public surface.
+    /// The STABLE base URL users hit for this dispatcher (the local
+    /// port-forward in local dev, the ingress host on a real
+    /// cluster). Architecture-4: the dispatcher hosts every external
+    /// URL; the listener has no public surface.
     pub public_base_url: String,
+    /// An ADDITIONAL address the open internet reaches this
+    /// dispatcher at (a public tunnel's minted URL), when one exists.
+    /// Never a replacement for the base: local surfaces (the OAuth
+    /// callback shown to the operator, storage links) stay on the
+    /// stable base, and only internet-facing surfaces (activation
+    /// URLs, event pushes) prefer this one via
+    /// [`DispatcherState::external_base_url`].
+    pub internet_url: Option<String>,
     /// Cluster Pod / Service CIDRs. Threaded into rendered tenant
     /// namespace NetworkPolicies so `ipBlock except <cluster-cidrs>`
     /// expresses "internet but not other Pods." Must be the cluster
@@ -139,4 +147,15 @@ pub struct DispatcherState {
     /// handshake builds the per-pod caller URL by prefixing
     /// the pod subdomain onto this host. Empty disables live connections.
     pub gateway_base_url: String,
+}
+
+impl DispatcherState {
+    /// The base for URLs handed to OUTSIDE callers (webhook activation
+    /// URLs, addresses a provider posts events to): the additional
+    /// internet address when one exists, the stable base otherwise
+    /// (which on a real cluster is already the internet-reachable
+    /// ingress host).
+    pub fn external_base_url(&self) -> &str {
+        self.internet_url.as_deref().unwrap_or(&self.public_base_url)
+    }
 }

@@ -144,7 +144,7 @@ pub struct RecordCostPayload {
     pub amount_usd: Option<f64>,
     pub billed: bool,
     /// Whose key the call spent (the access the metered call rode).
-    pub origin: weft_core::AccessOrigin,
+    pub origin: weft_core::CredentialOwner,
     pub metadata: serde_json::Value,
 }
 
@@ -175,7 +175,7 @@ mod tests {
                 model: Some("m".into()),
                 amount_usd,
                 billed: false,
-                origin: weft_core::AccessOrigin::UserProvided,
+                origin: weft_core::CredentialOwner::TheirOwn,
                 metadata: serde_json::json!({ "tokensPrompt": 12 }),
             };
             let v = serde_json::to_value(&payload).unwrap();
@@ -187,14 +187,14 @@ mod tests {
                 serde_json::json!({
                     "color": "c1", "node_id": "ask", "frames": [{"index": 2}],
                     "service": "openrouter", "model": "m", "amount_usd": amount_usd,
-                    "billed": false, "origin": "user-provided",
+                    "billed": false, "origin": "their-own",
                     "metadata": {"tokensPrompt": 12}
                 })
             );
             let back: RecordCostPayload = serde_json::from_value(v).unwrap();
             assert_eq!(back.amount_usd, amount_usd);
             assert!(!back.billed);
-            assert_eq!(back.origin, weft_core::AccessOrigin::UserProvided);
+            assert_eq!(back.origin, weft_core::CredentialOwner::TheirOwn);
             assert_eq!(back.frames, vec![weft_core::LoopIteration { index: 2 }]);
         }
     }

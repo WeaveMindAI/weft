@@ -19,7 +19,7 @@ import * as vscode from 'vscode';
 
 import type { DispatcherClient } from './dispatcher';
 import type {
-  JournaledPayload,
+  WirePayload,
   CorruptionSite,
   HostMessage,
   LoopIteration,
@@ -68,7 +68,7 @@ export type DispatcherEvent =
   // to the exact firing. amount_usd null = the meter could not resolve the
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
-  | { kind: 'cost_reported'; color: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'user-provided' | 'runtime' }
+  | { kind: 'cost_reported'; color: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours' }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -77,20 +77,23 @@ export type DispatcherEvent =
   // log per node per bus. `bus_id` is the channel's uuid (matches
   // the uuid embedded in the bus marker JSON that flows on pulses);
   // `from` on a message is the sender's registered name (stamped by
-  // the bus on the producer side, never spoofed). For ephemeral buses
-  // `payload` is null and the size + 8-byte SHA-256 prefix describe
-  // what was sent.
+  // the bus on the producer side, never spoofed). A journaled bus's
+  // window carries its `messages`; an ephemeral bus's window carries
+  // only the `totals` rollup.
+  // SYNC: DispatcherEvent 'bus_window' messages <-> crates/weft-core/src/bus.rs WindowedBusMessage, packages/weft-graph/src/protocol.ts BusInspectorEvent 'message'
+  // SYNC: DispatcherEvent 'bus_window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals
   | { kind: 'bus_joined'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
   | { kind: 'bus_left'; color: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
-  | { kind: 'bus_message'; color: string; project_id: string; bus_id: string; offset: number; from: string; msg_kind: string; payload: JournaledPayload; payload_byte_size: number; payload_sha256_prefix: string; at_unix: number }
+  | { kind: 'bus_window'; color: string; project_id: string; bus_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; from: string; msg_kind: string; payload: WirePayload; payload_byte_size: number; at_unix: number }>; totals: Array<{ from: string; msg_kind: string; count: number; bytes: number }>; at_unix: number }
   | { kind: 'bus_closed'; color: string; project_id: string; bus_id: string; offset: number; at_unix: number }
   // Live caller connection events. One caller per execution (keyed by
   // color, no bus_id). The webview replays the caller exchange the same
-  // way it replays a bus; `payload` reuses JournaledPayload for the
-  // journaled-vs-ephemeral tradeoff.
+  // way it replays a bus; `payload` is the same tagged WirePayload a
+  // bus window's messages carry.
+  // SYNC: DispatcherEvent 'caller_inbound'/'caller_outbound' <-> crates/weft-journal/src/events.rs CallerInbound/CallerOutbound, crates/weft-dispatcher/src/events.rs CallerInbound/CallerOutbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'inbound'/'outbound'
   | { kind: 'caller_connected'; color: string; project_id: string; offset: number; protocol: string; at_unix: number }
-  | { kind: 'caller_inbound'; color: string; project_id: string; offset: number; payload: JournaledPayload; payload_byte_size: number; payload_sha256_prefix: string; at_unix: number }
-  | { kind: 'caller_outbound'; color: string; project_id: string; offset: number; payload: JournaledPayload; payload_byte_size: number; payload_sha256_prefix: string; terminal: boolean; at_unix: number }
+  | { kind: 'caller_inbound'; color: string; project_id: string; offset: number; payload: WirePayload; payload_byte_size: number; at_unix: number }
+  | { kind: 'caller_outbound'; color: string; project_id: string; offset: number; payload: WirePayload; payload_byte_size: number; terminal: boolean; at_unix: number }
   | { kind: 'caller_errored'; color: string; project_id: string; offset: number; message: string; at_unix: number }
   | { kind: 'caller_disconnected'; color: string; project_id: string; offset: number; reason: string; at_unix: number }
   // Loop events. Carry the inspector groupId + parent_frames so
@@ -350,21 +353,47 @@ export class ExecutionFollower implements vscode.Disposable {
           event: { kind: 'left', busId: e.bus_id, offset: e.offset, name: e.name, atUnix: e.at_unix },
         });
         break;
-      case 'bus_message':
-        this.post({
-          kind: 'busEvent',
-          event: {
-            kind: 'message',
-            busId: e.bus_id,
-            offset: e.offset,
-            from: e.from,
-            msgKind: e.msg_kind,
-            payload: e.payload,
-            payloadByteSize: e.payload_byte_size,
-            payloadSha256Prefix: e.payload_sha256_prefix,
-            atUnix: e.at_unix,
-          },
-        });
+      case 'bus_window':
+        // One journal row per aggregation window. A journaled bus's
+        // window unpacks into per-message panel lines (boundaries and
+        // senders kept); an ephemeral window carries only the rollup
+        // and renders as one summary line.
+        for (const m of e.messages) {
+          this.post({
+            kind: 'busEvent',
+            event: {
+              kind: 'message',
+              busId: e.bus_id,
+              offset: m.offset,
+              from: m.from,
+              msgKind: m.msg_kind,
+              payload: m.payload,
+              payloadByteSize: m.payload_byte_size,
+              atUnix: m.at_unix,
+            },
+          });
+        }
+        // An empty `messages` list IS the ephemeral discriminator: the
+        // backend never emits an empty window row, so a window without
+        // messages always carries the rollup.
+        if (e.messages.length === 0) {
+          this.post({
+            kind: 'busEvent',
+            event: {
+              kind: 'window',
+              busId: e.bus_id,
+              offset: e.first_offset,
+              lastOffset: e.last_offset,
+              totals: e.totals.map((t) => ({
+                from: t.from,
+                msgKind: t.msg_kind,
+                count: t.count,
+                bytes: t.bytes,
+              })),
+              atUnix: e.at_unix,
+            },
+          });
+        }
         break;
       case 'bus_closed':
         this.post({
@@ -397,7 +426,6 @@ export class ExecutionFollower implements vscode.Disposable {
             offset: e.offset,
             payload: e.payload,
             payloadByteSize: e.payload_byte_size,
-            payloadSha256Prefix: e.payload_sha256_prefix,
             atUnix: e.at_unix,
           },
         });
@@ -410,7 +438,6 @@ export class ExecutionFollower implements vscode.Disposable {
             offset: e.offset,
             payload: e.payload,
             payloadByteSize: e.payload_byte_size,
-            payloadSha256Prefix: e.payload_sha256_prefix,
             terminal: e.terminal,
             atUnix: e.at_unix,
           },

@@ -22,6 +22,7 @@ use weft_core::storage::{
     WipePrefixResponse,
 };
 
+use crate::broker_admin::{admin_url, read_token};
 use crate::state::DispatcherState;
 
 // ---------- broker admin client ----------
@@ -29,21 +30,10 @@ use crate::state::DispatcherState;
 // The wire envelopes live in `weft_core::storage` (single definition, shared
 // with the broker's handlers), so the two ends cannot drift.
 
-/// The dispatcher's authenticated client of the broker's runtime-file admin
-/// surface. It signs every request with the dispatcher's own SA token, which
-/// the broker resolves to the control-plane identity.
-async fn read_token(state: &DispatcherState) -> Result<String> {
-    // Re-read every call so kubelet token rotation propagates; async so the
-    // read never blocks the runtime (the token is re-projected periodically).
-    let bytes = tokio::fs::read(&state.broker_token_path)
-        .await
-        .with_context(|| format!("read dispatcher SA token at {}", state.broker_token_path.display()))?;
-    Ok(String::from_utf8(bytes).context("SA token not utf8")?.trim().to_string())
-}
-
-fn admin_url(state: &DispatcherState, path: &str) -> String {
-    format!("{}{}", state.broker_url.trim_end_matches('/'), path)
-}
+// The dispatcher's authenticated client of the broker's runtime-file admin
+// surface: SA-token signing + URL joining live in `crate::broker_admin`
+// (shared with the access-admin forwards); the typed retry classes below
+// are this surface's own.
 
 /// A sentinel in the error chain saying the broker answered 404 for a single-file
 /// op. The api layer downcasts to this so a missing file surfaces as 404 to the

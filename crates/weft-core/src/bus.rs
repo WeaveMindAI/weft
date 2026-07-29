@@ -6,7 +6,7 @@
 //! and exchange messages in RAM. The pulse path never carries the bus
 //! traffic itself (only the marker rides the pulse).
 //!
-//! ## The bus is an in-RAM log, LIVE-ONLY for now
+//! ## The bus is an in-RAM log
 //!
 //! A bus is an append-only sequence of `BusEntry` records (`Joined`,
 //! `Left`, `Message`, `Closed`), each carrying a monotonic offset. Two
@@ -19,13 +19,17 @@
 //!   the bus is closed and the cursor is at the tail.
 //!
 //! Cursors are independent. Each consumer holds its own. Reading does
-//! not consume; the same offset can be read by N cursors.
+//! not consume; the same offset can be read by N cursors. Cursors only
+//! ever read RAM: entries trimmed out of the in-RAM window are not
+//! reachable by a cursor, and a cursor positioned inside a trimmed span
+//! silently resumes forward at the next retained entry (only `Message`
+//! entries are ever trimmed; membership entries are always retained, so
+//! nothing a consumer needs can hide in a gap).
 //!
 //! A bus lives exactly as long as its worker process. It is NOT
 //! rebuilt on worker restart: nothing rehydrates a bus from the
 //! journal, and a marker resolved after a restart fails with
-//! `BusLookupError::UnknownBus`. Full bus resume is a deliberate
-//! non-goal for now. A live bus and a durable suspension
+//! `BusLookupError::UnknownBus`. A live bus and a durable suspension
 //! (`ctx.await_signal`) DO coexist: a bus-held worker resolves the
 //! suspension in process (the driver's idle loop polls the journal for
 //! the `SuspensionResolved` row while a bus keeps the worker alive). The
@@ -33,41 +37,59 @@
 //! `await_signal` AFTER it has emitted on an output port (replay would
 //! re-emit), enforced in the engine, not here.
 //!
+//! ## Windowed journaling (the inspector trail)
+//!
 //! Journaling exists for the INSPECTOR, not for resume. Every append
 //! signals a per-execution `journal_pump_notify`; the engine's
-//! bus-journal-pump task drains every live bus's unjournaled tail and
-//! ships `ExecEvent::Bus*` rows so the inspector can render the
-//! conversation. The pump owns the per-bus `journaled_through`
-//! cursor.
+//! bus-journal-pump task drains every live bus's unjournaled tail. The
+//! pump buffers each bus's `Message` entries and flushes ONE
+//! `BusWindow` journal row per bus per `journal_window` (a journaled
+//! bus's row carries every message in the window; an ephemeral bus's
+//! row carries only the per-sender/kind totals). Membership entries
+//! (`Joined` / `Left` / `Closed`) are journaled as individual rows, and
+//! any open window is flushed FIRST so the row stream never reorders
+//! against the bus log. The pump acknowledges `journaled_through` to
+//! the bus only AFTER a write succeeds, and owns the per-bus
+//! `journaled_through` cursor.
 //!
-//! ## Two payload modes
+//! ## `BusOptions` (all five knobs)
 //!
-//! `BusOptions { ephemeral, window }` picks one at create
-//! time:
+//! - **`ephemeral`**: picks the payload-retention mode (see below).
+//! - **`window`**: the in-RAM bound, in `Message` entries, for BOTH
+//!   modes (default 64).
+//! - **`payload`**: what messages carry, `Json` or `Bytes`, frozen at
+//!   creation.
+//! - **`journal_window`**: the journal aggregation window (default 1s):
+//!   one `BusWindow` row per bus per window.
+//! - **`meta`**: creator-declared stream metadata readable off the
+//!   handle by every consumer.
+//!
+//! The two payload-retention modes:
 //!
 //! - **Journaled** (default): every send writes the full payload into
-//!   the log entry, and the in-RAM log is unbounded (same growth
-//!   contract as the journal itself; chat-shaped traffic). Slow
-//!   consumers never lose data; they just lag. Oversized payloads ARE
-//!   allowed but a module-level warn threshold
+//!   the log entry and it reaches the journal via the window rows.
+//!   The in-RAM log only trims `Message` entries that are BOTH past
+//!   the window AND already shipped to the journal, so durability is
+//!   never traded for the RAM bound. Oversized payloads ARE allowed
+//!   but a module-level warn threshold
 //!   (`JOURNALED_PAYLOAD_WARN_BYTES`) logs loud at send time so the
 //!   author sees the cost.
 //! - **Ephemeral**: send stores the payload in an `EphemeralStore`
-//!   sliding window (default 64 entries) keyed by offset; the log
-//!   entry carries `payload: None` plus `payload_byte_size` and an
-//!   8-byte SHA-256 prefix, and the in-RAM log is TRUNCATED in
-//!   lockstep with the window (entries below the oldest resident
-//!   payload are dropped), so a long-running stream holds bounded
-//!   RAM. Slow consumers get a loud `CursorError::FellBehind` when
-//!   their cursor points below the retained range; the consumer body
-//!   decides how to recover. Membership history survives truncation
-//!   in a dedicated set (`ever_joined`), so `wait_for` semantics are
-//!   unaffected.
+//!   sliding window keyed by offset; the log entry carries
+//!   `payload: None` plus `payload_byte_size`, and the in-RAM log is
+//!   TRUNCATED in lockstep with the window (entries below the oldest
+//!   resident payload are dropped), so a long-running stream holds
+//!   bounded RAM. A slow consumer's cursor silently resumes at the
+//!   oldest retained entry; there is no backpressure (the camera never
+//!   stalls because a downstream lags). Membership history survives
+//!   truncation in a dedicated set (`ever_joined`), so `wait_for`
+//!   semantics are unaffected.
 //!
-//! The marker JSON grew a structured payload to match the stored-file markers:
+//! The marker JSON matches the stored-file markers' shape:
 //! `{"__weft_bus__": {"id": "<uuid>", "mode": "journaled" | "ephemeral"}}`.
-//! Mode is the only field the wire surfaces; `window` (the in-RAM bound) is a
-//! per-creator producer-side knob and is not exposed externally.
+//! `id` and `mode` are the only fields the wire surfaces; everything
+//! else (payload kind, windows, metadata) is read off the live handle
+//! a consumer resolves from the marker.
 //!
 //! ## Identity (registration)
 //!
@@ -151,6 +173,139 @@ impl BusMode {
     }
 }
 
+/// What a bus's messages carry, declared at creation and frozen: JSON
+/// values (chat-shaped traffic) or raw bytes (media frames; no base64
+/// wrapping between nodes). A consumer reads the kind off the handle
+/// (or the marker) and knows how to speak before the first message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BusPayloadKind {
+    #[default]
+    Json,
+    Bytes,
+}
+
+impl BusPayloadKind {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            BusPayloadKind::Json => "json",
+            BusPayloadKind::Bytes => "bytes",
+        }
+    }
+
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "json" => Some(BusPayloadKind::Json),
+            "bytes" => Some(BusPayloadKind::Bytes),
+            _ => None,
+        }
+    }
+}
+
+/// One message's payload, in its declared kind: a JSON value, or raw
+/// bytes (media frames; no base64 wrapping inside the process). The
+/// ONE wire payload vocabulary for every journaled exchange (bus
+/// window rows, the live caller's `Caller*` events, SSE). On the wire
+/// a byte payload serializes as `{"kind": "bytes", "data": "<base64>"}`
+/// via the [`WirePayloadRepr`] mirror below (`bytes::Bytes` itself has
+/// no serde).
+// SYNC: WirePayload <-> packages/weft-graph/src/protocol.ts WirePayload
+#[derive(Debug, Clone, PartialEq)]
+pub enum WirePayload {
+    Json(Value),
+    Bytes(bytes::Bytes),
+}
+
+/// The serde mirror of [`WirePayload`]: identical shape with the bytes
+/// carried as base64 text.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+enum WirePayloadRepr {
+    Json(Value),
+    Bytes(String),
+}
+
+impl Serialize for WirePayload {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        let wire = match self {
+            WirePayload::Json(v) => WirePayloadRepr::Json(v.clone()),
+            WirePayload::Bytes(b) => {
+                WirePayloadRepr::Bytes(base64::engine::general_purpose::STANDARD.encode(b))
+            }
+        };
+        wire.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for WirePayload {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use base64::Engine as _;
+        Ok(match WirePayloadRepr::deserialize(d)? {
+            WirePayloadRepr::Json(v) => WirePayload::Json(v),
+            WirePayloadRepr::Bytes(b64) => WirePayload::Bytes(
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map(bytes::Bytes::from)
+                    .map_err(serde::de::Error::custom)?,
+            ),
+        })
+    }
+}
+
+impl WirePayload {
+    /// The payload's JSON value; loud `None` for a byte payload (the
+    /// consumer asked with the wrong shape).
+    pub fn as_json(&self) -> Option<&Value> {
+        match self {
+            WirePayload::Json(v) => Some(v),
+            WirePayload::Bytes(_) => None,
+        }
+    }
+
+    /// The payload's JSON value by move; `None` for a byte payload.
+    pub fn into_json(self) -> Option<Value> {
+        match self {
+            WirePayload::Json(v) => Some(v),
+            WirePayload::Bytes(_) => None,
+        }
+    }
+
+    /// The payload's raw bytes by move; `None` for a JSON payload.
+    pub fn into_bytes(self) -> Option<bytes::Bytes> {
+        match self {
+            WirePayload::Bytes(b) => Some(b),
+            WirePayload::Json(_) => None,
+        }
+    }
+
+    /// The payload's raw bytes; `None` for a JSON payload.
+    pub fn as_bytes(&self) -> Option<&bytes::Bytes> {
+        match self {
+            WirePayload::Bytes(b) => Some(b),
+            WirePayload::Json(_) => None,
+        }
+    }
+
+    pub fn kind(&self) -> BusPayloadKind {
+        match self {
+            WirePayload::Json(_) => BusPayloadKind::Json,
+            WirePayload::Bytes(_) => BusPayloadKind::Bytes,
+        }
+    }
+
+    /// The payload's serialized byte size: the inspector metadata every
+    /// message entry carries whatever its kind. A JSON value always
+    /// serializes, so this cannot fail.
+    pub fn byte_size(&self) -> u64 {
+        match self {
+            WirePayload::Json(v) => {
+                serde_json::to_vec(v).expect("a serde_json::Value always serializes").len() as u64
+            }
+            WirePayload::Bytes(b) => b.len() as u64,
+        }
+    }
+}
+
 /// One observable record on a bus, in append-only order. The cursor
 /// returns these directly to consumers; the engine's journal pump
 /// projects them to `ExecEvent::Bus*` rows for replay.
@@ -179,15 +334,14 @@ pub enum BusEntryKind {
     /// name (the bus stamps it). For journaled buses, `payload` is
     /// `Some(value)`; for ephemeral buses, `payload` is `None` and the
     /// actual bytes live in the bus's `EphemeralStore` keyed by offset.
-    /// `payload_byte_size` and `payload_sha256_prefix` are ALWAYS
-    /// populated: they're the metadata the inspector renders in the
-    /// `None` case, and useful debugging info either way.
+    /// `payload_byte_size` is ALWAYS populated: it feeds the window
+    /// rows' totals (the only thing an ephemeral bus journals about a
+    /// message), and is useful debugging info either way.
     Message {
         from: String,
         msg_kind: String,
-        payload: Option<Value>,
+        payload: Option<WirePayload>,
         payload_byte_size: u64,
-        payload_sha256_prefix: [u8; 8],
     },
     /// Appended once at `close()`. Cursors never surface it as a
     /// regular `Some(entry)`; `next()` returns `None` when it reaches
@@ -196,11 +350,107 @@ pub enum BusEntryKind {
     Closed,
 }
 
+/// One message inside a journal window row: the full detail a
+/// journaled bus persists per message (boundaries, senders, payloads
+/// all kept; only the ROW granularity is windowed).
+// SYNC: WindowedBusMessage <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'message', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' messages
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowedBusMessage {
+    pub offset: u64,
+    pub from: String,
+    pub msg_kind: String,
+    pub payload: WirePayload,
+    pub payload_byte_size: u64,
+    pub at_unix: u64,
+}
+
+/// One `(sender, kind)` rollup line of a journal window row: how many
+/// messages and how many bytes passed. The whole story an ephemeral
+/// bus journals; the summary line a journaled one carries besides its
+/// messages.
+// SYNC: BusWindowTotal <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' totals
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusWindowTotal {
+    pub from: String,
+    pub msg_kind: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// A window's aggregate: what one journal row carries for one bus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BusWindowAggregate {
+    pub first_offset: u64,
+    pub last_offset: u64,
+    /// Per-message detail; empty when `include_payloads` was false
+    /// (an ephemeral bus journals metadata only).
+    pub messages: Vec<WindowedBusMessage>,
+    pub totals: Vec<BusWindowTotal>,
+    /// Append time (unix seconds) of the LAST entry in the window: the
+    /// truthful stamp for the journal row (the row describes the bus's
+    /// own appends, not the moment the pump got around to flushing).
+    pub last_at_unix: u64,
+}
+
+/// Fold one window's MESSAGE entries into the aggregate a journal row
+/// carries. Pure; the pump owns the windowing clock, this owns the
+/// shape. Non-message entries are the caller's bug (membership rows
+/// are journaled individually, never windowed). Returns `None` on an
+/// empty window (nothing to write).
+pub fn aggregate_window(entries: &[BusEntry], include_payloads: bool) -> Option<BusWindowAggregate> {
+    let mut messages = Vec::new();
+    let mut totals: Vec<BusWindowTotal> = Vec::new();
+    let mut first_offset: Option<u64> = None;
+    let mut last_offset = 0;
+    let mut last_at_unix = 0;
+    for entry in entries {
+        let BusEntryKind::Message { from, msg_kind, payload, payload_byte_size } = &entry.kind
+        else {
+            unreachable!("only Message entries are windowed");
+        };
+        first_offset.get_or_insert(entry.offset);
+        last_offset = entry.offset;
+        last_at_unix = entry.at_unix;
+        match totals.iter_mut().find(|t| &t.from == from && &t.msg_kind == msg_kind) {
+            Some(t) => {
+                t.count += 1;
+                t.bytes += payload_byte_size;
+            }
+            None => totals.push(BusWindowTotal {
+                from: from.clone(),
+                msg_kind: msg_kind.clone(),
+                count: 1,
+                bytes: *payload_byte_size,
+            }),
+        }
+        if include_payloads {
+            messages.push(WindowedBusMessage {
+                offset: entry.offset,
+                from: from.clone(),
+                msg_kind: msg_kind.clone(),
+                payload: payload
+                    .clone()
+                    .expect("a journaled bus's retained Message always carries its payload"),
+                payload_byte_size: *payload_byte_size,
+                at_unix: entry.at_unix,
+            });
+        }
+    }
+    Some(BusWindowAggregate {
+        first_offset: first_offset?,
+        last_offset,
+        messages,
+        totals,
+        last_at_unix,
+    })
+}
+
 /// Configuration the producer passes to `ctx.create_bus(opts)`.
 #[derive(Debug, Clone, Default)]
 pub struct BusOptions {
     /// `true` switches the bus to ephemeral mode (metadata-only in the
-    /// journal, slow consumers get loud `FellBehind`). `false` (default)
+    /// journal, slow consumers silently skip to the oldest retained
+    /// entry). `false` (default)
     /// is the journaled mode (full payload persisted to the journal/DB for
     /// durability). NOTE: in EITHER mode the in-RAM log is a bounded
     /// window (cursors only ever read RAM, never the DB); the mode only
@@ -215,7 +465,29 @@ pub struct BusOptions {
     /// windows let slower consumers reach further back in RAM at the cost
     /// of memory.
     pub window: Option<usize>,
+    /// What the messages carry: JSON values (default) or raw bytes
+    /// (media frames). Frozen at creation; a `send` of the other shape
+    /// is refused loudly. Consumers read it off the handle/marker.
+    pub payload: BusPayloadKind,
+    /// The journal aggregation window: the pump ships ONE journal row
+    /// per bus per window (the window's messages for a journaled bus,
+    /// the rollup for an ephemeral one) instead of a row per message.
+    /// `None` falls back to [`DEFAULT_JOURNAL_WINDOW`] (1s). A quiet
+    /// bus degenerates to per-message rows (a window holds one
+    /// message); a fast stream collapses to one row per window. Only
+    /// the JOURNAL granularity: what travels the bus is untouched.
+    pub journal_window: Option<std::time::Duration>,
+    /// Creator-declared stream metadata, frozen at creation and
+    /// readable by every consumer (off the handle or the marker):
+    /// what a per-message header would otherwise repeat (an audio
+    /// stream's sample rate and encoding, a video stream's dimensions).
+    /// Keep it small; it rides the marker. `Null` = none.
+    pub meta: Value,
 }
+
+/// Default journal aggregation window. One second keeps a chat bus
+/// visually per-message while collapsing frame-rate streams ~50x.
+pub const DEFAULT_JOURNAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Default in-RAM window for a bus (both modes). 64 entries fits the
 /// common consumer-lags-a-few-messages case without growing RAM
@@ -238,17 +510,22 @@ pub enum SendError {
     /// to stamp the message with. Call `register` first.
     #[error("cannot send before registering a name on the bus")]
     NotRegistered,
+    /// The payload's shape does not match the bus's declared payload
+    /// kind (a JSON send on a bytes bus, or the reverse). The kind is
+    /// frozen at creation; read it off the handle before sending.
+    #[error("this bus carries {expected} payloads, not {sent}")]
+    WrongPayload { expected: &'static str, sent: &'static str },
     /// The journal pump previously failed to write this JOURNALED
     /// bus's tail. The send is REJECTED BEFORE appending anything: in
     /// journaled mode the journal trail is the durability story, and
     /// silently accepting sends that may never reach it would corrupt
-    /// the inspector's replay. The caller retries after
-    /// `BusHandle::clear_journal_degraded()` (explicit acknowledgment
-    /// of the gap) or after the pump's next successful batch clears
-    /// the flag on its own. EPHEMERAL buses are never rejected on
-    /// degradation: their journal trail is diagnostic metadata, not
-    /// the data plane, and stalling live frames because Postgres
-    /// burped would invert the mode's no-backpressure design.
+    /// the inspector's replay. The flag clears on the pump's next
+    /// successful batch (the pump keeps the failed tail buffered and
+    /// retries on its next pass), after which sends proceed again.
+    /// EPHEMERAL buses are never rejected on degradation: their
+    /// journal trail is diagnostic metadata, not the data plane, and
+    /// stalling live frames because Postgres burped would invert the
+    /// mode's no-backpressure design.
     #[error("bus journal write degraded: {0}")]
     JournalDegraded(String),
 }
@@ -276,31 +553,17 @@ pub enum WaitError {
     Closed,
 }
 
-/// Why a cursor `next()` failed (distinct from "closed", which is
-/// `None`).
+/// Why a typed cursor read (`next_json` / `next_bytes`) failed
+/// (distinct from "closed", which is `None`). The raw `next()` cannot
+/// fail: gaps are bridged silently and close is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CursorError {
-    /// The cursor's offset was trimmed out of the in-RAM window (cursors
-    /// only read RAM, never the DB). Carries TWO offsets, both absolute:
-    ///   - `resumed_at`: the next retained entry at or after the cursor's
-    ///     position. The cursor is MOVED here, so the next `next()` delivers
-    ///     that entry, no per-gap stalling, no going backward. Trimmed
-    ///     message-offsets between are silently bridged (only `Message`
-    ///     entries are ever evicted; membership entries are always retained,
-    ///     so nothing the consumer needs hides in the gap).
-    ///   - `oldest_resident`: the true window floor (earliest offset still
-    ///     in RAM), informational, so the consumer knows how far back the
-    ///     window currently reaches. May equal `resumed_at` (fell behind at
-    ///     the floor) or be smaller (already past the floor going forward).
-    /// Same RESUME contract as the caller's `CallerError::FellBehind` (move
-    /// the cursor forward to the next retained entry, surface once); the bus
-    /// carries the extra `oldest_resident` because its log is SPARSE (a
-    /// resume can land past the floor on a retained membership entry), while
-    /// the caller's dense log collapses the two into one field.
-    /// Membership state is unaffected (`wait_for` reads the truncation-immune
-    /// `ever_joined` set, not the log).
-    #[error("cursor fell behind; resuming at {resumed_at} (oldest resident {oldest_resident})")]
-    FellBehind { resumed_at: u64, oldest_resident: u64 },
+    /// The consumer asked for one payload shape but the bus carries the
+    /// other (`next_json` on a bytes bus, or the reverse). Mirrors the
+    /// send side's `SendError::WrongPayload`: the kind is frozen at
+    /// creation; read it off the handle before reading.
+    #[error("this bus carries {expected} payloads, not {requested}")]
+    WrongPayload { expected: &'static str, requested: &'static str },
 }
 
 /// Identity of one node EXECUTION: the node id plus its loop-frame
@@ -469,12 +732,11 @@ impl Drop for WaitGuard {
 /// This is the load-bearing piece of the "ephemeral" mode: the
 /// producer never blocks, RAM stays bounded (the bus log truncates in
 /// lockstep with this window, see `BusHandle::send`), and slow
-/// consumers learn they fell behind loudly via
-/// `CursorError::FellBehind`. There is no backpressure: the camera
-/// does not stall because a downstream lags.
+/// consumers silently resume at the oldest retained entry. There is no
+/// backpressure: the camera does not stall because a downstream lags.
 struct EphemeralStore {
     capacity: usize,
-    entries: Mutex<VecDeque<(u64, Value)>>,
+    entries: Mutex<VecDeque<(u64, WirePayload)>>,
 }
 
 impl EphemeralStore {
@@ -492,7 +754,7 @@ impl EphemeralStore {
     /// Insert a fresh (offset, payload). Caller holds the bus log lock,
     /// so offsets are appended in order. Evicts the front when capacity
     /// is reached.
-    fn insert(&self, offset: u64, payload: Value) {
+    fn insert(&self, offset: u64, payload: WirePayload) {
         let mut q = self.entries.lock().expect("ephemeral store poisoned");
         q.push_back((offset, payload));
         while q.len() > self.capacity {
@@ -517,7 +779,7 @@ impl EphemeralStore {
     /// entry AND the payload under one log lock, and truncation never
     /// retains an entry whose payload it evicted, so a miss is a bus
     /// invariant violation, not a recoverable state.
-    fn get_resident(&self, offset: u64) -> Value {
+    fn get_resident(&self, offset: u64) -> WirePayload {
         let q = self.entries.lock().expect("ephemeral store poisoned");
         q.iter()
             .find(|(o, _)| *o == offset)
@@ -568,8 +830,8 @@ pub struct BusInner {
     /// shipped to the DB (`offset < journaled_through`), so durability
     /// is unaffected (the journal keeps it) but a live cursor cannot
     /// reach it (cursors only read RAM, never the DB). Cursors detect
-    /// the offset gaps and, by default, bridge them silently
-    /// (`strict_gaps()` opts into one `FellBehind` per gap instead).
+    /// the offset gaps and bridge them silently, resuming at the next
+    /// retained entry.
     log: Mutex<Vec<BusEntry>>,
     /// Every name that EVER registered, regardless of later `Left`
     /// entries. The single source of truth for membership waits
@@ -584,9 +846,9 @@ pub struct BusInner {
     /// reaching the `Closed` entry; further sends error.
     closed: AtomicBool,
     /// Set once when the journal pump has failed to write this bus's
-    /// tail. Cleared by `clear_journal_degraded()` (or by the next
-    /// successful pump batch). The next `send` while this is set
-    /// returns `SendError::JournalDegraded`.
+    /// tail. Cleared by the pump's next successful batch
+    /// (`acknowledge_journaled_through`). The next `send` while this
+    /// is set returns `SendError::JournalDegraded`.
     journal_degraded: AtomicBool,
     /// The last journal-pump error reason. Read by the next `send` to
     /// produce a non-empty `JournalDegraded(reason)`.
@@ -619,6 +881,12 @@ pub struct BusInner {
     journal_pump_notify: Weak<Notify>,
     /// Optional ephemeral payload store. `Some` iff `ephemeral`.
     ephemeral_store: Option<EphemeralStore>,
+    /// What the messages carry (JSON vs raw bytes). Frozen at creation.
+    payload_kind: BusPayloadKind,
+    /// The journal aggregation window (see [`BusOptions::journal_window`]).
+    journal_window: std::time::Duration,
+    /// Creator-declared stream metadata (see [`BusOptions::meta`]).
+    meta: Value,
     /// In-RAM retained-window size, in Message entries, for BOTH modes.
     /// Cursors only ever read RAM, so this bounds how far back any cursor
     /// can reach. Ephemeral trims by this with no DB backstop; journaled
@@ -839,6 +1107,22 @@ impl BusInner {
         self.ephemeral
     }
 
+    /// What the messages carry (JSON vs raw bytes).
+    pub fn payload_kind(&self) -> BusPayloadKind {
+        self.payload_kind
+    }
+
+    /// The journal aggregation window: how often the pump ships one
+    /// aggregate row for this bus.
+    pub fn journal_window(&self) -> std::time::Duration {
+        self.journal_window
+    }
+
+    /// Creator-declared stream metadata (`Null` when none was set).
+    pub fn meta(&self) -> &Value {
+        &self.meta
+    }
+
     /// The in-RAM retained window size (entries), for both modes.
     pub fn window(&self) -> usize {
         self.window
@@ -861,17 +1145,6 @@ impl BusInner {
     pub fn retained_floor(&self) -> u64 {
         let log = self.lock_log();
         log.first().map(|e| e.offset).unwrap_or(0)
-    }
-
-    /// Offset of the most recent retained Message entry, if any. Used by
-    /// `cursor_including_last` to seed a forward cursor with the latest
-    /// message. Skips membership entries (Joined/Left/Closed).
-    pub fn last_message_offset(&self) -> Option<u64> {
-        let log = self.lock_log();
-        log.iter()
-            .rev()
-            .find(|e| matches!(e.kind, BusEntryKind::Message { .. }))
-            .map(|e| e.offset)
     }
 
     /// The pump's `journaled_through` cursor (one past the highest
@@ -990,6 +1263,9 @@ impl BusHandle {
             liveness,
             journal_pump_notify,
             ephemeral_store,
+            payload_kind: opts.payload,
+            journal_window: opts.journal_window.unwrap_or(DEFAULT_JOURNAL_WINDOW),
+            meta: opts.meta,
             window,
         });
         Ok(Self {
@@ -1020,6 +1296,18 @@ impl BusHandle {
     /// Whether this bus runs in ephemeral mode.
     pub fn is_ephemeral(&self) -> bool {
         self.inner.ephemeral
+    }
+
+    /// What this bus's messages carry (JSON vs raw bytes).
+    pub fn payload_kind(&self) -> BusPayloadKind {
+        self.inner.payload_kind()
+    }
+
+    /// Creator-declared stream metadata (`Null` when none was set): the
+    /// stream-level facts a consumer needs before the first message (an
+    /// audio stream's sample rate, a video stream's dimensions).
+    pub fn meta(&self) -> &Value {
+        self.inner.meta()
     }
 
     /// Borrow the shared `Arc<BusInner>` so the engine can hold it
@@ -1090,15 +1378,34 @@ impl BusHandle {
     ///   recovery contract. Ephemeral buses are never gated on the
     ///   journal (their trail is diagnostics, not the data plane).
     pub fn send(&self, kind: impl Into<String>, payload: Value) -> Result<(), SendError> {
+        self.send_payload(kind, WirePayload::Json(payload))
+    }
+
+    /// Send raw bytes (a media frame) on a bytes-kind bus. The bytes
+    /// travel as bytes; base64 exists only at the journal boundary.
+    pub fn send_bytes(
+        &self,
+        kind: impl Into<String>,
+        payload: impl Into<bytes::Bytes>,
+    ) -> Result<(), SendError> {
+        self.send_payload(kind, WirePayload::Bytes(payload.into()))
+    }
+
+    fn send_payload(&self, kind: impl Into<String>, payload: WirePayload) -> Result<(), SendError> {
+        if payload.kind() != self.inner.payload_kind {
+            return Err(SendError::WrongPayload {
+                expected: self.inner.payload_kind.as_wire_str(),
+                sent: payload.kind().as_wire_str(),
+            });
+        }
         let from = self
             .registration
             .as_ref()
             .map(|(n, _)| n.clone())
             .ok_or(SendError::NotRegistered)?;
-        // Shared metadata derivation (same shape the live-caller events use);
-        // a `Value` always serializes, so this is infallible.
-        let (payload_byte_size, payload_sha256_prefix) =
-            crate::primitive::payload_metadata(&payload);
+        // Shared metadata derivation (same shape the live-caller events
+        // use); infallible for both payload shapes.
+        let payload_byte_size = payload.byte_size();
         let kind = kind.into();
         // Journaled mode keeps the payload in the log entry. Ephemeral
         // mode hides it from the log (the inspector renders the size +
@@ -1108,9 +1415,9 @@ impl BusHandle {
         let mut log = self.inner.lock_log();
         // Check Closed BEFORE JournalDegraded: a closed bus is the more
         // fundamental failure (no further sends will ever succeed),
-        // and a caller that observes JournalDegraded then calls
-        // clear_journal_degraded and retries should not get a fresh
-        // error type for the same impossible-to-satisfy send.
+        // and a caller retrying after the pump cleared the degraded
+        // flag should not get a fresh error type for the same
+        // impossible-to-satisfy send.
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SendError::Closed);
         }
@@ -1130,7 +1437,6 @@ impl BusHandle {
                 msg_kind: kind,
                 payload: entry_payload,
                 payload_byte_size,
-                payload_sha256_prefix,
             },
         );
         if let Some(store) = &self.inner.ephemeral_store {
@@ -1140,10 +1446,9 @@ impl BusHandle {
             // ephemeral stream holds bounded RAM. Membership entries
             // (Joined / Left / Closed) are always retained: they are
             // load-bearing for cursors and bounded by participant
-            // churn, not traffic. Cursors surface one `FellBehind`
-            // per resulting offset gap, exactly matching the old
-            // unbounded-log behavior (where the entry survived but
-            // its payload was gone). Eager (not amortized) so the
+            // churn, not traffic. Cursors bridge the resulting offset
+            // gaps silently, resuming at the next retained entry.
+            // Eager (not amortized) so the
             // invariant "a retained Message always has a resident
             // payload" holds, which is what `get_resident` panics on.
             //
@@ -1182,9 +1487,10 @@ impl BusHandle {
             // them) AND (b) older than the most recent `window` messages.
             // Membership entries (Joined/Left/Closed) are always retained
             // (load-bearing for cursors, bounded by participant churn). A
-            // cursor that had pointed into the trimmed span now reads
-            // `FellBehind`, the same RAM-only semantics ephemeral has: a
-            // cursor never reaches the DB, the window is the whole world.
+            // cursor that had pointed into the trimmed span silently
+            // resumes at the next retained entry, the same RAM-only
+            // semantics ephemeral has: a cursor never reaches the DB,
+            // the window is the whole world.
             self.inner.trim_journaled_window(&mut log);
         }
         drop(log);
@@ -1198,22 +1504,6 @@ impl BusHandle {
             );
         }
         Ok(())
-    }
-
-    /// Reset the journal-degraded flag on this bus so subsequent
-    /// `send` calls return `Ok`. Called by the node body when it has
-    /// observed the `JournalDegraded` error and chosen to keep going
-    /// (the pump itself also clears the flag on the next successful
-    /// batch, so this is the "I want to send NOW and I'm fine with the
-    /// next pump batch determining whether replay will be complete"
-    /// path).
-    pub fn clear_journal_degraded(&self) {
-        self.inner.journal_degraded.store(false, Ordering::Release);
-        self.inner
-            .degraded_reason
-            .lock()
-            .expect("degraded_reason poisoned")
-            .clear();
     }
 
     // ----- cursor API ---------------------------------------------
@@ -1238,14 +1528,6 @@ impl BusHandle {
         BusCursor::new(Arc::downgrade(&self.inner), next_offset, None, self.node.clone())
     }
 
-    /// The current "now" offset: one past the highest entry appended so
-    /// far. A forward cursor minted now starts here. Pair with
-    /// [`Self::cursor_at`] to position a cursor relative to now (e.g.
-    /// `cursor_at(now.saturating_sub(n))` to read the last `n` entries).
-    pub fn now_offset(&self) -> u64 {
-        self.inner.log_len()
-    }
-
     /// The earliest offset still resident in RAM. A cursor cannot read
     /// below this (older entries were trimmed out of the window; cursors
     /// never read the DB). [`Self::cursor_from_start`] starts here.
@@ -1254,12 +1536,12 @@ impl BusHandle {
     }
 
     /// A fresh cursor positioned at an explicit `offset`. The general
-    /// primitive behind the others: forward-from-now is `cursor_at(now)`,
-    /// history-from-the-window-start is `cursor_at(retained_floor)`,
-    /// last-`n` is `cursor_at(now - n)`. An `offset` below the retained
-    /// floor reads `FellBehind` for each missing entry (RAM-only: the
-    /// window is the whole readable world); an `offset` past `now` simply
-    /// waits for entries to arrive.
+    /// primitive behind the others: history-from-the-window-start is
+    /// `cursor_at(retained_floor)` (what [`Self::cursor_from_start`]
+    /// does); a plain forward cursor is [`Self::cursor`]. An `offset`
+    /// below the retained floor silently resumes at the oldest retained
+    /// entry (RAM-only: the window is the whole readable world); an
+    /// `offset` past the tail simply waits for entries to arrive.
     pub fn cursor_at(&self, offset: u64) -> BusCursor {
         BusCursor::new(Arc::downgrade(&self.inner), offset, None, self.node.clone())
     }
@@ -1271,16 +1553,6 @@ impl BusHandle {
     /// first.
     pub fn cursor_from_start(&self) -> BusCursor {
         self.cursor_at(self.inner.retained_floor())
-    }
-
-    /// A forward cursor that ALSO replays the single most recent message
-    /// already in the log (if any), so a late reader can grab the latest
-    /// state (e.g. a greeting / last status) without replaying all history.
-    /// Starts at the offset of the last Message entry; if there is none, it
-    /// is just a forward cursor at now.
-    pub fn cursor_including_last(&self) -> BusCursor {
-        let start = self.inner.last_message_offset().unwrap_or_else(|| self.inner.log_len());
-        self.cursor_at(start)
     }
 
     // ----- membership wait -----------------------------------------
@@ -1389,6 +1661,43 @@ impl BusHandle {
     }
 }
 
+/// A bus handle that CLOSES the bus when dropped: the shape every
+/// producer (and every consumer whose exit must not leave peers parked)
+/// wants, made unforgettable. Every exit path of the owning node body
+/// (success, error, panic-unwind) runs the close; peers' cursors read
+/// the `Closed` entry and end instead of parking forever. Derefs to
+/// [`BusHandle`], so the whole surface is available. Produced by
+/// `ctx.open_bus` / `ctx.join_bus`; a deliberate non-closing observer
+/// uses `ctx.bus_from_input` instead.
+pub struct ClosingBus {
+    handle: BusHandle,
+}
+
+impl ClosingBus {
+    pub fn new(handle: BusHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl std::ops::Deref for ClosingBus {
+    type Target = BusHandle;
+    fn deref(&self) -> &BusHandle {
+        &self.handle
+    }
+}
+
+impl std::ops::DerefMut for ClosingBus {
+    fn deref_mut(&mut self) -> &mut BusHandle {
+        &mut self.handle
+    }
+}
+
+impl Drop for ClosingBus {
+    fn drop(&mut self) {
+        self.handle.close();
+    }
+}
+
 impl Drop for BusHandle {
     /// When a registered handle goes away, append a `Left` entry and
     /// remove the name from the live set. Unregistered handles drop
@@ -1440,14 +1749,6 @@ pub struct BusCursor {
     /// Keys this cursor's waits in the engine's liveness map, so a node
     /// parked in `next()` is correctly attributed.
     node: Option<BusParticipant>,
-    /// When `true` (default), `next()` silently bridges trimmed-message
-    /// gaps and delivers the next retained entry, so a consumer walking old
-    /// history cruises through gaps without a `FellBehind` at each one. When
-    /// `false` (strict/audit), each gap surfaces one `FellBehind` so the
-    /// consumer learns exactly where messages were lost. Either way the
-    /// cursor only moves FORWARD and never skips a retained entry (only
-    /// `Message` entries are ever trimmed; membership is always retained).
-    skip_gaps: bool,
 }
 
 impl BusCursor {
@@ -1462,17 +1763,7 @@ impl BusCursor {
             next_offset,
             filter,
             node,
-            skip_gaps: true,
         }
-    }
-
-    /// Switch this cursor to STRICT gap handling: each trimmed-message gap
-    /// surfaces one `CursorError::FellBehind` instead of being bridged
-    /// silently. Use for an audit consumer that must learn where it lost
-    /// messages. Default is skip-gaps (bridge silently).
-    pub fn strict_gaps(mut self) -> Self {
-        self.skip_gaps = false;
-        self
     }
 
     /// Attach a filter closure. Non-matching entries are skipped (the
@@ -1493,9 +1784,69 @@ impl BusCursor {
         self.next_offset
     }
 
-    /// Next matching entry, `Ok(None)` on close (no more entries),
-    /// `Err(FellBehind)` when the cursor points below an ephemeral
-    /// bus's retained range.
+    /// The next MESSAGE of kind `kind`, skipping membership entries and
+    /// other kinds: `(sender, payload)`, or `None` when the bus closes.
+    /// The typed read every plain consumer wants instead of matching
+    /// the entry enum by hand. Composes with a constructed filter (both
+    /// must accept).
+    pub async fn next_message(&mut self, kind: &str) -> Option<(String, WirePayload)> {
+        loop {
+            match self.next().await {
+                None => return None,
+                Some(entry) => match entry.kind {
+                    BusEntryKind::Message { from, msg_kind, payload, .. }
+                        if msg_kind == kind =>
+                    {
+                        let payload = payload.expect(
+                            "a cursor-delivered Message always carries its payload \
+                             (ephemeral payloads are resolved before delivery)",
+                        );
+                        return Some((from, payload));
+                    }
+                    _ => continue,
+                },
+            }
+        }
+    }
+
+    /// [`Self::next_message`] for a JSON bus: `(sender, value)`. The
+    /// payload shape is frozen at bus creation, so a mismatch here is a
+    /// wiring bug (a bytes bus read as JSON), surfaced as a loud
+    /// `CursorError::WrongPayload` the caller must handle.
+    pub async fn next_json(
+        &mut self,
+        kind: &str,
+    ) -> Result<Option<(String, Value)>, CursorError> {
+        match self.next_message(kind).await {
+            None => Ok(None),
+            Some((from, payload)) => match payload.into_json() {
+                Some(value) => Ok(Some((from, value))),
+                None => Err(CursorError::WrongPayload { expected: "bytes", requested: "json" }),
+            },
+        }
+    }
+
+    /// [`Self::next_message`] for a bytes bus: `(sender, bytes)`. A
+    /// JSON payload here is the same wiring bug in the other direction,
+    /// surfaced as `CursorError::WrongPayload`.
+    pub async fn next_bytes(
+        &mut self,
+        kind: &str,
+    ) -> Result<Option<(String, bytes::Bytes)>, CursorError> {
+        match self.next_message(kind).await {
+            None => Ok(None),
+            Some((from, payload)) => match payload.into_bytes() {
+                Some(bytes) => Ok(Some((from, bytes))),
+                None => Err(CursorError::WrongPayload { expected: "json", requested: "bytes" }),
+            },
+        }
+    }
+
+    /// Next matching entry, `None` on close (no more entries). A cursor
+    /// pointing into a trimmed span (its offsets evicted from the
+    /// in-RAM window) silently resumes at the next retained entry: only
+    /// `Message` entries are ever trimmed, membership entries are
+    /// always retained, so nothing the consumer needs hides in a gap.
     ///
     /// On EPHEMERAL buses the payload lives in the store, not in the
     /// log entry. The payload is resolved from the store BEFORE the
@@ -1510,9 +1861,9 @@ impl BusCursor {
     /// read-only and zero-copy on rejection); the lock is
     /// poison-recovering (see `BusInner::lock_log`) so a panicking
     /// filter fails only its own node, not every bus participant.
-    pub async fn next(&mut self) -> Result<Option<BusEntry>, CursorError> {
+    pub async fn next(&mut self) -> Option<BusEntry> {
         let Some(inner) = self.inner.upgrade() else {
-            return Ok(None);
+            return None;
         };
         // One WaitGuard (one WaitId) per `next()` call, not per loop
         // iteration: the wait's observed/parked state in the engine's
@@ -1536,52 +1887,20 @@ impl BusCursor {
             }
             let next_after_search = {
                 let log = inner.lock_log();
+                // The scan starts at the first RETAINED entry at or past the
+                // cursor's offset: an offset inside a trimmed span (only
+                // `Message` entries are ever evicted; membership entries are
+                // always retained, so nothing the consumer needs hides in a
+                // gap) is silently bridged, and the cursor only ever moves
+                // FORWARD, never skipping a retained entry.
                 let mut idx = log.partition_point(|e| e.offset < self.next_offset);
                 let len = log.len();
-                // `expected` walks the offset line as the scan advances; a
-                // retained entry sitting PAST it means the offsets in between
-                // were evicted (only `Message` entries are ever dropped from
-                // the log; membership entries are always retained, so the
-                // evicted span is pure trimmed messages). On a gap, report
-                // the earliest still-available offset and JUMP the cursor
-                // straight to it, so the next read resumes at the oldest
-                // retained message. One `FellBehind` to learn you lost the
-                // gap, then you are caught up (identical to the caller's
-                // `CallerError::FellBehind` contract). Jumping is safe
-                // precisely because no membership entry can hide in the
-                // evicted span.
-                let mut expected = self.next_offset;
                 let mut chosen: Option<BusEntry> = None;
                 while idx < len {
                     let entry = &log[idx];
-                    if entry.offset > expected {
-                        // Gap: offsets [expected, entry.offset) were trimmed
-                        // (pure messages; membership is never evicted, so
-                        // nothing the consumer needs hides here).
-                        let resumed_at = entry.offset;
-                        if self.skip_gaps {
-                            // Default: silently bridge the gap and deliver the
-                            // next retained entry, so a consumer walking old
-                            // history (e.g. all the Joined events) cruises
-                            // through message-gaps without stalling. Advance
-                            // `expected` to the retained entry and fall
-                            // through to deliver it.
-                            self.next_offset = resumed_at;
-                            expected = resumed_at;
-                            // re-enter the body for THIS entry (now at expected)
-                        } else {
-                            // Strict (audit) mode: report each gap. Resume at
-                            // the next retained entry (forward, never
-                            // backward); the true window floor rides along.
-                            let oldest_resident =
-                                log.first().map(|e| e.offset).unwrap_or(resumed_at);
-                            self.next_offset = resumed_at;
-                            return Err(CursorError::FellBehind { resumed_at, oldest_resident });
-                        }
-                    }
                     if matches!(entry.kind, BusEntryKind::Closed) {
                         self.next_offset = entry.offset;
-                        return Ok(None);
+                        return None;
                     }
                     let needs_ephemeral_resolve = matches!(
                         &entry.kind,
@@ -1602,7 +1921,6 @@ impl BusCursor {
                             from,
                             msg_kind,
                             payload_byte_size,
-                            payload_sha256_prefix,
                             ..
                         } = &entry.kind
                         else {
@@ -1616,7 +1934,6 @@ impl BusCursor {
                                 msg_kind: msg_kind.clone(),
                                 payload: Some(value),
                                 payload_byte_size: *payload_byte_size,
-                                payload_sha256_prefix: *payload_sha256_prefix,
                             },
                         })
                     } else {
@@ -1627,7 +1944,6 @@ impl BusCursor {
                     let allow =
                         self.filter.as_ref().map_or(true, |f| f(entry_for_filter));
                     if !allow {
-                        expected = entry.offset + 1;
                         idx += 1;
                         continue;
                     }
@@ -1638,10 +1954,12 @@ impl BusCursor {
                 if chosen.is_none() && idx >= len {
                     // Scan reached the tail without a hit; next read
                     // resumes at the tail offset (one past the last
-                    // retained entry). Not bumped past so an early-
-                    // arriving entry is not skipped.
-                    self.next_offset =
-                        expected.max(log.last().map(|e| e.offset + 1).unwrap_or(0));
+                    // retained entry, so filter-rejected entries are not
+                    // rescanned). Never moved backward so a cursor
+                    // positioned past the tail keeps its place.
+                    self.next_offset = self
+                        .next_offset
+                        .max(log.last().map(|e| e.offset + 1).unwrap_or(0));
                     if inner.closed.load(Ordering::Acquire) {
                         // The log is closed and this cursor is at (or
                         // started past) its tail. Under the log lock,
@@ -1654,17 +1972,17 @@ impl BusCursor {
                         // busy loop pinning a worker thread at 100%
                         // CPU that even a surrounding timeout cannot
                         // interrupt.
-                        return Ok(None);
+                        return None;
                     }
                 }
                 chosen
             };
             if let Some(entry) = next_after_search {
-                return Ok(Some(entry));
+                return Some(entry);
             }
             // No matching entry available. Park on log_notify and
             // re-check on wake. Two completion cases: closed flag
-            // flips (we return Ok(None) on the next iteration) or new
+            // flips (we return None on the next iteration) or new
             // entry lands.
             if guard.is_none() {
                 let g = WaitGuard::new(&inner.liveness, &self.node, &inner);
@@ -1841,17 +2159,140 @@ mod tests {
         h
     }
 
+    /// A bytes bus carries raw frames end to end (no base64 inside the
+    /// process), refuses the wrong payload shape both ways, and its
+    /// marker + handle expose the declared parameters and metadata.
+    #[tokio::test]
+    async fn a_bytes_bus_carries_frames_and_declares_its_parameters() {
+        let bus = BusHandle::create_with_options(BusOptions {
+            ephemeral: true,
+            payload: BusPayloadKind::Bytes,
+            journal_window: Some(std::time::Duration::from_millis(250)),
+            meta: serde_json::json!({ "sample_rate": 16000 }),
+            ..Default::default()
+        })
+        .unwrap();
+        let producer = registered(&bus, "mic");
+        let mut cursor = bus.cursor();
+
+        // The wrong shape is refused loudly; the right one flows as bytes.
+        let err = producer.send("frame", json!({"x": 1})).unwrap_err();
+        assert!(matches!(err, SendError::WrongPayload { expected: "bytes", sent: "json" }));
+        producer.send_bytes("frame", vec![1u8, 2, 3]).unwrap();
+        let (from, frame) = cursor.next_bytes("frame").await.unwrap().unwrap();
+        assert_eq!((from.as_str(), frame.as_ref()), ("mic", &[1u8, 2, 3][..]));
+
+        // The declared parameters read back off the handle; the marker
+        // surfaces only id + mode (everything else lives on the handle
+        // a consumer resolves from it).
+        assert_eq!(bus.payload_kind(), BusPayloadKind::Bytes);
+        assert_eq!(bus.meta()["sample_rate"], 16000);
+        let marker = &bus.marker()["__weft_bus__"];
+        assert_eq!(marker["mode"], "ephemeral");
+        assert!(marker.get("payload").is_none(), "the marker carries only id + mode");
+
+        // And a JSON bus refuses bytes symmetrically.
+        let jbus = BusHandle::create();
+        let p = registered(&jbus, "chat");
+        let err = p.send_bytes("frame", vec![0u8]).unwrap_err();
+        assert!(matches!(err, SendError::WrongPayload { expected: "json", sent: "bytes" }));
+    }
+
+    /// The window aggregate keeps a journaled bus's messages whole and
+    /// reduces an ephemeral bus's window to its per-sender/kind rollup.
+    #[test]
+    fn a_window_aggregates_messages_or_metadata() {
+        let entry = |offset: u64, from: &str, kind: &str, bytes: u64| BusEntry {
+            offset,
+            at_unix: 7,
+            kind: BusEntryKind::Message {
+                from: from.into(),
+                msg_kind: kind.into(),
+                payload: Some(WirePayload::Json(json!(offset))),
+                payload_byte_size: bytes,
+            },
+        };
+        let entries =
+            vec![entry(3, "mic", "audio", 10), entry(4, "mic", "audio", 20), entry(6, "b", "x", 5)];
+
+        let journaled = aggregate_window(&entries, true).unwrap();
+        assert_eq!((journaled.first_offset, journaled.last_offset), (3, 6));
+        assert_eq!(journaled.last_at_unix, 7, "stamped from the last entry's append time");
+        assert_eq!(journaled.messages.len(), 3);
+        assert_eq!(journaled.messages[1].payload, WirePayload::Json(json!(4)));
+        assert_eq!(journaled.totals.len(), 2);
+        assert_eq!((journaled.totals[0].count, journaled.totals[0].bytes), (2, 30));
+
+        let ephemeral = aggregate_window(&entries, false).unwrap();
+        assert!(ephemeral.messages.is_empty(), "no payloads for an ephemeral window");
+        assert_eq!(ephemeral.totals, journaled.totals);
+        assert_eq!(ephemeral.last_at_unix, 7, "the stamp rides even without payloads");
+        assert!(aggregate_window(&[], true).is_none(), "an empty window writes nothing");
+    }
+
+    /// A byte payload's wire form is tagged base64 and round-trips.
+    #[test]
+    fn byte_payloads_serialize_as_tagged_base64() {
+        let p = WirePayload::Bytes(bytes::Bytes::from(vec![0u8, 255, 7]));
+        let wire = serde_json::to_value(&p).unwrap();
+        assert_eq!(wire["kind"], "bytes");
+        assert_eq!(wire["data"], "AP8H");
+        assert_eq!(serde_json::from_value::<WirePayload>(wire).unwrap(), p);
+        assert_eq!(p.byte_size(), 3);
+    }
+
+    /// A typed cursor read of the wrong shape is a loud error in BOTH
+    /// directions: `next_json` on a bytes bus and `next_bytes` on a
+    /// JSON bus, mirroring the send side's `WrongPayload`.
+    #[tokio::test]
+    async fn typed_reads_refuse_the_wrong_payload_shape_both_ways() {
+        let bytes_bus = BusHandle::create_with_options(BusOptions {
+            payload: BusPayloadKind::Bytes,
+            ..Default::default()
+        })
+        .unwrap();
+        let mic = registered(&bytes_bus, "mic");
+        let mut c = bytes_bus.cursor();
+        mic.send_bytes("frame", vec![1u8, 2]).unwrap();
+        assert_eq!(
+            c.next_json("frame").await.unwrap_err(),
+            CursorError::WrongPayload { expected: "bytes", requested: "json" }
+        );
+
+        let json_bus = BusHandle::create();
+        let chat = registered(&json_bus, "chat");
+        let mut c = json_bus.cursor();
+        chat.send("msg", json!("hi")).unwrap();
+        assert_eq!(
+            c.next_bytes("msg").await.unwrap_err(),
+            CursorError::WrongPayload { expected: "json", requested: "bytes" }
+        );
+    }
+
+    /// The close-on-drop guard: dropping a `ClosingBus` (any exit path
+    /// of the owning body) closes the bus, so a parked reader ends
+    /// instead of waiting forever.
+    #[tokio::test]
+    async fn the_closing_guard_ends_readers_on_drop() {
+        let bus = BusHandle::create();
+        let mut cursor = bus.cursor();
+        let guard = ClosingBus::new(registered(&bus, "host"));
+        guard.send("hi", json!(1)).unwrap();
+        drop(guard);
+        assert!(matches!(cursor.next_json("hi").await, Ok(Some((_, v))) if v == json!(1)));
+        assert!(cursor.next_json("hi").await.unwrap().is_none(), "closed on drop");
+        assert!(bus.is_closed());
+    }
+
     /// Drive `cursor` until its next Message entry; skips Joined/Left.
-    /// Returns `(from, kind, payload)` or None on close. Panics on
-    /// FellBehind (tests that use ephemeral mode call `cursor.next()`
-    /// directly so they can react to it).
+    /// Returns `(from, kind, payload)` or None on close.
     async fn next_message(cursor: &mut BusCursor) -> Option<(String, String, Value)> {
         loop {
-            match cursor.next().await.expect("no FellBehind in journaled-bus tests") {
+            match cursor.next().await {
                 None => return None,
                 Some(entry) => match entry.kind {
                     BusEntryKind::Message { from, msg_kind, payload, .. } => {
-                        return Some((from, msg_kind, payload.expect("journaled payload")));
+                        return Some((from, msg_kind, payload.expect("journaled payload").into_json().expect("json bus")));
                     }
                     _ => continue,
                 },
@@ -2049,7 +2490,7 @@ mod tests {
         let mut c = bus.cursor_from_start();
         let mut offsets = Vec::new();
         for _ in 0..3 {
-            let e = c.next().await.unwrap().unwrap();
+            let e = c.next().await.unwrap();
             offsets.push(e.offset);
         }
         assert_eq!(offsets, vec![0, 1, 2]);
@@ -2064,7 +2505,7 @@ mod tests {
         let mut c = bus.cursor_from_start().with_filter(|e| {
             matches!(&e.kind, BusEntryKind::Message { msg_kind, .. } if msg_kind == "b")
         });
-        let e = c.next().await.unwrap().unwrap();
+        let e = c.next().await.unwrap();
         match e.kind {
             BusEntryKind::Message { msg_kind, .. } => assert_eq!(msg_kind, "b"),
             _ => panic!("expected Message"),
@@ -2080,18 +2521,18 @@ mod tests {
         // After close, the producer handle's drop runs in scope but
         // the bus is already closed, so no Left entry is appended.
         // The log is Joined, Message, Closed. The cursor returns the
-        // first two, then `Ok(None)` on the Closed.
+        // first two, then `None` on the Closed.
         drop(p);
         let mut c = bus.cursor_from_start();
-        let _joined = c.next().await.unwrap().unwrap();
-        let _msg = c.next().await.unwrap().unwrap();
-        assert!(matches!(c.next().await, Ok(None)));
+        let _joined = c.next().await.unwrap();
+        let _msg = c.next().await.unwrap();
+        assert!(c.next().await.is_none());
     }
 
     #[tokio::test]
     async fn ephemeral_send_does_not_journal_payload_in_log_entry() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8) }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "bytes": "AAAA" })).unwrap();
         // Read entries directly out of the log to confirm payload=None.
@@ -2099,82 +2540,69 @@ mod tests {
         let msg = log
             .iter()
             .find_map(|e| match &e.kind {
-                BusEntryKind::Message { payload, payload_byte_size, payload_sha256_prefix, .. } => {
-                    Some((payload.clone(), *payload_byte_size, *payload_sha256_prefix))
+                BusEntryKind::Message { payload, payload_byte_size, .. } => {
+                    Some((payload.clone(), *payload_byte_size))
                 }
                 _ => None,
             })
             .unwrap();
         assert!(msg.0.is_none(), "ephemeral log entry must hide payload");
         assert!(msg.1 > 0, "byte size must be populated");
-        assert_ne!(msg.2, [0u8; 8], "hash prefix must be populated");
     }
 
     #[tokio::test]
     async fn ephemeral_cursor_returns_payload_when_window_still_has_it() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8) }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "n": 1 })).unwrap();
         let mut c = bus.cursor_from_start();
         // skip the Joined
-        let _j = c.next().await.unwrap().unwrap();
-        let m = c.next().await.unwrap().unwrap();
+        let _j = c.next().await.unwrap();
+        let m = c.next().await.unwrap();
         match m.kind {
             BusEntryKind::Message { payload, .. } => {
-                assert_eq!(payload.unwrap(), json!({ "n": 1 }));
+                assert_eq!(payload.unwrap(), WirePayload::Json(json!({ "n": 1 })));
             }
             _ => panic!("expected Message"),
         }
     }
 
+    /// A slow ephemeral consumer whose offsets were evicted silently
+    /// resumes at the oldest retained message: no error, no backward
+    /// motion, no message delivered twice.
     #[tokio::test]
-    async fn ephemeral_slow_consumer_gets_loud_fell_behind() {
+    async fn ephemeral_slow_consumer_silently_resumes_at_retained_floor() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(2) }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(2), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         // Create the cursor BEFORE sends so it starts at the joined-only
         // tail; the test exercises a consumer reading slowly enough that
         // the store evicts.
-        // STRICT mode: a slow consumer must be told it fell behind.
-        let mut c = bus.cursor_from_start().strict_gaps();
+        let mut c = bus.cursor_from_start();
         for i in 0..6 {
             p.send("frame", json!({ "i": i })).unwrap();
         }
         // First next() is the Joined entry (always retained, never in the
         // ephemeral store).
-        let _j = c.next().await.unwrap().unwrap();
-        // Offsets 1..=4 were evicted (window=2 keeps 5,6). In strict mode
-        // the gap surfaces ONE FellBehind that resumes at the next retained
-        // message (offset 5), reporting the floor too, rather than one error
-        // per evicted offset. The next read then delivers the live message.
-        let mut fell_behind_count = 0;
-        loop {
-            match c.next().await {
-                Err(CursorError::FellBehind { resumed_at, oldest_resident }) => {
-                    fell_behind_count += 1;
-                    assert!(resumed_at >= oldest_resident, "resume is forward of the floor");
-                }
-                Ok(Some(entry)) => {
-                    assert!(matches!(entry.kind, BusEntryKind::Message { .. }));
-                    break;
-                }
-                other => panic!("unexpected: {other:?}"),
-            }
-            assert!(fell_behind_count < 10, "should land on a live message before this");
-        }
-        // One FellBehind for the whole evicted gap (resume jumps to the next
-        // retained message), then the live message at the tail.
-        assert_eq!(fell_behind_count, 1);
+        let _j = c.next().await.unwrap();
+        // Offsets 1..=4 were evicted (window=2 keeps 5,6). The cursor
+        // bridges the gap silently: the next read delivers the oldest
+        // RETAINED message (i=4 at offset 5), then the tail one.
+        let m = c.next().await.expect("a retained message");
+        let BusEntryKind::Message { payload, .. } = m.kind else { panic!("expected Message") };
+        assert_eq!(m.offset, 5, "resumes at the oldest retained message, never backward");
+        assert_eq!(payload.unwrap(), WirePayload::Json(json!({ "i": 4 })));
     }
 
     /// A Joined entry sitting between evicted Messages must ALWAYS be
-    /// surfaced (never skipped), in BOTH gap modes. Build the sparse log:
+    /// surfaced (never skipped). Build the sparse log:
     /// Joined "a" (0), msg (1, evicted), Joined "b" (2), msg (3, live).
     fn sparse_membership_bus() -> BusHandle {
         let bus = BusHandle::create_with_options(BusOptions {
             ephemeral: true,
             window: Some(1),
+            ..Default::default()
         })
         .expect("valid options");
         let a = registered(&bus, "a");
@@ -2184,61 +2612,26 @@ mod tests {
         bus
     }
 
-    /// DEFAULT (skip-gaps): the cursor bridges the evicted-message gap
-    /// silently, surfacing BOTH Joined entries and the live message with NO
-    /// FellBehind. The load-bearing property: Joined "b" is delivered even
-    /// though it sits past a trimmed message.
+    /// The cursor bridges the evicted-message gap silently, surfacing
+    /// BOTH Joined entries and the live message. The load-bearing
+    /// property: Joined "b" is delivered even though it sits past a
+    /// trimmed message.
     #[tokio::test]
-    async fn skip_gaps_default_bridges_gap_but_keeps_joined() {
+    async fn gap_bridging_never_skips_a_joined_entry() {
         let bus = sparse_membership_bus();
         let mut c = bus.cursor_from_start();
-        let (mut joins, mut fell_behinds, mut live) = (0u32, 0u32, 0u32);
+        let (mut joins, mut live) = (0u32, 0u32);
         for _ in 0..10 {
             match c.next().await {
-                Err(CursorError::FellBehind { .. }) => fell_behinds += 1,
-                Ok(Some(entry)) => match entry.kind {
+                Some(entry) => match entry.kind {
                     BusEntryKind::Joined { .. } => joins += 1,
                     BusEntryKind::Message { .. } => { live += 1; break; }
                     _ => {}
                 },
-                Ok(None) => break,
+                None => break,
             }
         }
         assert_eq!(joins, 2, "both Joined entries surfaced (b not skipped across the gap)");
-        assert_eq!(fell_behinds, 0, "default bridges the gap silently");
-        assert_eq!(live, 1, "reaches the live message");
-    }
-
-    /// STRICT (`strict_gaps`): same sparse log, but each evicted-message
-    /// gap surfaces one FellBehind carrying both `resumed_at` (next retained,
-    /// forward) and `oldest_resident` (window floor). Joined "b" is STILL
-    /// delivered (never skipped). This is the audit mode.
-    #[tokio::test]
-    async fn strict_gaps_signals_fell_behind_but_keeps_joined() {
-        let bus = sparse_membership_bus();
-        let mut c = bus.cursor_from_start().strict_gaps();
-        let (mut joins, mut fell_behinds, mut live) = (0u32, 0u32, 0u32);
-        let mut saw_resume_forward = false;
-        for _ in 0..10 {
-            match c.next().await {
-                Err(CursorError::FellBehind { resumed_at, oldest_resident }) => {
-                    fell_behinds += 1;
-                    // resume is forward (the next retained entry), and the
-                    // floor is reported separately.
-                    assert!(resumed_at >= oldest_resident);
-                    saw_resume_forward = true;
-                }
-                Ok(Some(entry)) => match entry.kind {
-                    BusEntryKind::Joined { .. } => joins += 1,
-                    BusEntryKind::Message { .. } => { live += 1; break; }
-                    _ => {}
-                },
-                Ok(None) => break,
-            }
-        }
-        assert_eq!(joins, 2, "both Joined entries surfaced even in strict mode");
-        assert!(fell_behinds >= 1, "strict mode signals the evicted gap");
-        assert!(saw_resume_forward);
         assert_eq!(live, 1, "reaches the live message");
     }
 
@@ -2246,12 +2639,12 @@ mod tests {
     /// and Join entries C,F; all non-Join messages trimmed. A cursor sitting
     /// at E (an evicted message, mid-log) must RESUME FORWARD at the next
     /// retained entry (F, the Join) WITHOUT skipping it, and must NOT go
-    /// backward to the floor (C). Strict mode so we can read the offsets.
+    /// backward to the floor (C).
     #[tokio::test]
-    async fn strict_resume_is_forward_to_next_retained_never_backward() {
+    async fn resume_is_forward_to_next_retained_never_backward() {
         // window=1 so each new message evicts the previous one's payload;
         // Join entries are never evicted.
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(1) })
+        let bus = BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(1), ..Default::default() })
             .expect("opts");
         let a = registered(&bus, "a");        // Joined @0
         a.send("A", json!(0)).unwrap();        // @1 msg
@@ -2263,22 +2656,17 @@ mod tests {
         a.send("G", json!(6)).unwrap();        // @7 msg
         a.send("H", json!(7)).unwrap();        // @8 msg (live; window=1 keeps only this)
         // Cursor positioned AT an evicted mid-log message offset (E == @5).
-        let mut cur = bus.cursor_at(5).strict_gaps();
-        // First read: gap (5 evicted) -> FellBehind, resume FORWARD at the
-        // next retained entry, which is the Join @6 (NOT backward to @0/@3).
-        match cur.next().await {
-            Err(CursorError::FellBehind { resumed_at, oldest_resident }) => {
-                assert_eq!(resumed_at, 6, "resume forward at the next retained entry (the Join @6)");
-                assert!(oldest_resident <= resumed_at, "floor is at or before the resume point");
-                assert!(resumed_at > 5, "never resumes backward of the cursor");
-            }
-            other => panic!("expected FellBehind, got {other:?}"),
-        }
-        // Next read delivers that Join (it was NOT skipped).
-        match cur.next().await.unwrap() {
-            Some(e) => assert!(matches!(e.kind, BusEntryKind::Joined { .. }), "the Join @6 is delivered"),
-            None => panic!("expected the Join entry"),
-        }
+        // The gap is bridged silently: the first read delivers the next
+        // retained entry FORWARD of the cursor, the Join @6 (NOT backward
+        // to @0/@3, and NOT skipped).
+        let e = cur_next(&bus, 5).await;
+        assert_eq!(e.offset, 6, "resumes forward at the next retained entry (the Join @6)");
+        assert!(matches!(e.kind, BusEntryKind::Joined { .. }), "the Join @6 is delivered");
+    }
+
+    /// Helper for the resume test: one read off a fresh cursor at `offset`.
+    async fn cur_next(bus: &BusHandle, offset: u64) -> BusEntry {
+        bus.cursor_at(offset).next().await.expect("an entry")
     }
 
     #[tokio::test]
@@ -2288,8 +2676,9 @@ mod tests {
         bus.inner.mark_journal_degraded("simulated failure");
         let err = p.send("x", json!(1));
         assert!(matches!(err, Err(SendError::JournalDegraded(_))));
-        // After clear, send proceeds again.
-        p.clear_journal_degraded();
+        // A successful pump batch (the ack) clears the flag; sends
+        // proceed again.
+        bus.inner.acknowledge_journaled_through(bus.inner.log_len());
         assert!(p.send("y", json!(2)).is_ok());
     }
 
@@ -2319,7 +2708,7 @@ mod tests {
             crate::weft_type::WeftType::bus_marker_mode(&m),
             Some(BusMode::Journaled)
         );
-        let eph = BusHandle::create_with_options(BusOptions { ephemeral: true, window: None })
+        let eph = BusHandle::create_with_options(BusOptions { ephemeral: true, window: None, ..Default::default() })
             .expect("valid options");
         let me = eph.marker();
         assert_eq!(
@@ -2337,6 +2726,7 @@ mod tests {
         let err = BusHandle::create_with_options(BusOptions {
             ephemeral: true,
             window: Some(0),
+            ..Default::default()
         })
         .expect_err("zero window must fail loud");
         assert!(
@@ -2376,7 +2766,7 @@ mod tests {
         let r = tokio::time::timeout(std::time::Duration::from_millis(500), c.next())
             .await
             .expect("must resolve, not spin");
-        assert!(r.expect("no cursor error").is_none(), "end-of-stream");
+        assert!(r.is_none(), "end-of-stream");
     }
 
     /// A REGISTERED handle's `cursor()` anchors at its own `Joined`
@@ -2399,11 +2789,10 @@ mod tests {
         let got = tokio::time::timeout(std::time::Duration::from_millis(500), c.next())
             .await
             .expect("must resolve")
-            .expect("no cursor error")
             .expect("an entry");
         match got.kind {
             BusEntryKind::Message { payload, .. } => {
-                assert_eq!(payload, Some(json!("first")), "the pre-cursor message arrives");
+                assert_eq!(payload, Some(WirePayload::Json(json!("first"))), "the pre-cursor message arrives");
             }
             other => panic!("expected the host message, got {other:?}"),
         }
@@ -2431,7 +2820,7 @@ mod tests {
                         matches!(&e.kind, BusEntryKind::Message { from, .. } if from == "guest")
                     });
                     host.send("turn", json!("hello guest")).unwrap();
-                    let reply = replies.next().await.unwrap().expect("guest reply");
+                    let reply = replies.next().await.expect("guest reply");
                     assert!(matches!(reply.kind, BusEntryKind::Message { .. }));
                 });
                 let guest_task = tokio::spawn(async move {
@@ -2440,7 +2829,7 @@ mod tests {
                     let mut inbox = guest.cursor().with_filter(|e| {
                         matches!(&e.kind, BusEntryKind::Message { from, .. } if from == "host")
                     });
-                    let msg = inbox.next().await.unwrap().expect("host message");
+                    let msg = inbox.next().await.expect("host message");
                     assert!(matches!(msg.kind, BusEntryKind::Message { .. }));
                     guest.send("turn", json!("hello host")).unwrap();
                 });
@@ -2474,11 +2863,11 @@ mod tests {
                 let recv = tokio::spawn(async move {
                     let mut got = Vec::new();
                     for _ in 0..20 {
-                        let entry = c.next().await.unwrap().expect("a message");
+                        let entry = c.next().await.expect("a message");
                         let BusEntryKind::Message { payload, .. } = entry.kind else {
                             panic!("filter admits only messages");
                         };
-                        got.push(payload.unwrap());
+                        got.push(payload.unwrap().into_json().unwrap());
                     }
                     got
                 });
@@ -2518,7 +2907,7 @@ mod tests {
                     .await
                     .expect("parked cursor must wake on close")
                     .expect("join ok");
-                assert!(r.expect("no cursor error").is_none());
+                assert!(r.is_none());
                 close.await.expect("closer ok");
             }
         }
@@ -2532,7 +2921,7 @@ mod tests {
     /// over the RAM bound. The full history is still readable from RAM.
     #[tokio::test]
     async fn journaled_keeps_unshipped_entries_past_window() {
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2) })
+        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2), ..Default::default() })
             .expect("opts");
         let tx = registered(&bus, "tx");
         let rx = registered(&bus, "rx");
@@ -2552,11 +2941,12 @@ mod tests {
 
     /// Once entries are journaled (pump acked), a journaled bus DOES trim
     /// them out of RAM past the window. A cursor that reaches into the
-    /// trimmed span reads `FellBehind` (RAM-only: the window is the whole
-    /// readable world; the DB has the data but a cursor never reads it).
+    /// trimmed span silently bridges it and delivers the next retained
+    /// message (RAM-only: the window is the whole readable world; the DB
+    /// has the data but a cursor never reads it).
     #[tokio::test]
     async fn journaled_trims_shipped_entries_past_window() {
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2) })
+        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2), ..Default::default() })
             .expect("opts");
         let tx = registered(&bus, "tx");
         for i in 0..5 {
@@ -2564,67 +2954,52 @@ mod tests {
         }
         // Simulate the pump shipping everything to the DB, then one more send
         // triggers the trim of the now-shipped older messages.
-        let now = bus.now_offset();
-        bus.inner_arc().acknowledge_journaled_through(now);
+        bus.inner_arc().acknowledge_journaled_through(bus.inner.log_len());
         tx.send("m", json!({ "i": 5 })).unwrap();
 
         // Early MESSAGES were trimmed from RAM (membership entries always
-        // kept). A cursor reaching into the trimmed span only reaches the
-        // DB-shipped data via... nothing: cursors never read the DB.
-        // STRICT mode surfaces FellBehind for the trimmed span.
-        let mut strict = bus.new_handle().cursor_at(1).strict_gaps();
-        let mut fell_behind = false;
+        // kept; cursors never read the DB). The trim actually happened:
+        // the oldest retained Message sits past the trimmed span.
+        let oldest_msg = {
+            let log = bus.inner.log.lock().unwrap();
+            log.iter()
+                .find(|e| matches!(e.kind, BusEntryKind::Message { .. }))
+                .map(|e| e.offset)
+                .expect("a retained message")
+        };
+        assert!(oldest_msg > 1, "shipped messages past the window were trimmed");
+        // A cursor into the trimmed span bridges it silently and delivers
+        // the oldest RETAINED message.
+        let mut c = bus.new_handle().cursor_at(1);
+        let mut first_msg: Option<i64> = None;
         for _ in 0..10 {
-            match strict.next().await {
-                Err(CursorError::FellBehind { .. }) => { fell_behind = true; break; }
-                Ok(Some(_)) => continue,
-                Ok(None) => break,
-            }
-        }
-        assert!(fell_behind, "strict cursor below the retained message floor reads FellBehind");
-        // DEFAULT mode bridges the trimmed span silently and delivers the
-        // next retained message (no FellBehind).
-        let mut def = bus.new_handle().cursor_at(1);
-        let mut got_msg = false;
-        for _ in 0..10 {
-            match def.next().await {
-                Err(CursorError::FellBehind { .. }) => panic!("default must bridge, not error"),
-                Ok(Some(e)) => {
-                    if matches!(e.kind, BusEntryKind::Message { .. }) { got_msg = true; break; }
+            match c.next().await {
+                Some(e) => {
+                    if let BusEntryKind::Message { payload, .. } = e.kind {
+                        first_msg = Some(payload.unwrap().into_json().unwrap()["i"].as_i64().unwrap());
+                        break;
+                    }
                 }
-                Ok(None) => break,
+                None => break,
             }
         }
-        assert!(got_msg, "default cursor bridges the gap and delivers a retained message");
+        assert!(
+            first_msg.is_some_and(|i| i > 0),
+            "cursor bridged the trimmed span to a retained message, got {first_msg:?}"
+        );
     }
 
-    /// `now_offset` + `cursor_at` lets a reader position relative to now:
-    /// `cursor_at(now)` is forward-only (sees only what arrives after).
+    /// A cursor at the current tail is forward-only (sees only what
+    /// arrives after).
     #[tokio::test]
-    async fn cursor_at_now_is_forward_only() {
+    async fn cursor_at_tail_is_forward_only() {
         let bus = BusHandle::create();
         let tx = registered(&bus, "tx");
         let obs = bus.new_handle();
         tx.send("m", json!({ "i": 0 })).unwrap(); // before the cursor
-        let now = obs.now_offset();
-        let mut cursor = obs.cursor_at(now);
+        let mut cursor = obs.cursor(); // unregistered handle: tail cursor
         tx.send("m", json!({ "i": 1 })).unwrap(); // after the cursor
         let (_, _, p) = next_message(&mut cursor).await.unwrap();
         assert_eq!(p["i"].as_i64().unwrap(), 1, "forward cursor skips the pre-existing message");
-    }
-
-    /// `cursor_including_last` seeds a forward cursor with the single most
-    /// recent message, so a late reader grabs the latest state.
-    #[tokio::test]
-    async fn cursor_including_last_replays_one() {
-        let bus = BusHandle::create();
-        let tx = registered(&bus, "tx");
-        let obs = bus.new_handle();
-        tx.send("m", json!({ "i": 0 })).unwrap();
-        tx.send("m", json!({ "i": 1 })).unwrap(); // this is "the last"
-        let mut cursor = obs.cursor_including_last();
-        // First read is the last pre-existing message (i=1), not i=0.
-        let (_, _, p) = next_message(&mut cursor).await.unwrap();
-        assert_eq!(p["i"].as_i64().unwrap(), 1, "includes only the most recent prior message");
     }
 }

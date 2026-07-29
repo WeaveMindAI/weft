@@ -1,0 +1,9 @@
+# Send a real Telegram message through a pasted bot token: proves the
+# PathPrefix auth step (/bot<token>/) and the no-scopes static spec.
+
+bot = TelegramAccess
+send = TelegramSendMessage { text: "weft e2e: access proof" }
+send.account = bot.access
+
+out = Debug
+out.data = send.messageId

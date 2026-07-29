@@ -30,10 +30,6 @@ describe('fieldForInput', () => {
 		expect(sel.type).toBe('select');
 		expect(sel.options).toEqual(['GET', 'POST']);
 
-		const key = fieldForInput(base({ widget: { kind: 'api_key', provider: 'openrouter' } }));
-		expect(key.type).toBe('api_key');
-		expect(key.provider).toBe('openrouter');
-
 		const drop = fieldForInput(base({ portType: 'Image', widget: { kind: 'file_drop', type: 'Image', accept: 'image/png' } }));
 		expect(drop.type).toBe('file_drop');
 		expect(drop.fileType).toBe('Image');
@@ -56,6 +52,38 @@ describe('fieldForInput', () => {
 	it('falls back to a textarea for a not-yet-round-tripped port', () => {
 		const f = fieldForInput(base({ widget: undefined }));
 		expect(f.type).toBe('textarea');
+	});
+
+	it('flattens the access widget with its compiler-stamped service', () => {
+		const f = fieldForInput(
+			base({ exposure: 'config', widget: { kind: 'access', service: 'slack' } }),
+		);
+		expect(f.type).toBe('access');
+		expect(f.service).toBe('slack');
+		expect(f.portDriven).toBe(false);
+	});
+
+	it('flattens the remote_select widget with its sources and parents', () => {
+		const f = fieldForInput(
+			base({
+				widget: {
+					kind: 'remote_select',
+					access: 'account',
+					sources: [
+						{ kind: 'granted', from: 'repositories' },
+						{ kind: 'list', get: 'https://x/list?q={query}', items: 'channels', label: 'name', value: 'id',
+							page: { cursor_param: 'cursor', cursor_path: 'meta.next' } },
+						{ kind: 'from_url', pattern: 'x\\.com/([^/]+)' },
+					],
+					depends_on: ['repo'],
+				},
+			}),
+		);
+		expect(f.type).toBe('remote_select');
+		expect(f.access).toBe('account');
+		expect(f.sources?.length).toBe(3);
+		expect(f.sources?.[0]).toEqual({ kind: 'granted', from: 'repositories' });
+		expect(f.dependsOn).toEqual(['repo']);
 	});
 });
 

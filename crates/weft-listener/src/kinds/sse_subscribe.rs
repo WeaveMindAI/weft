@@ -16,16 +16,17 @@ use tracing::{info, warn};
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Signal, SseSubscribe};
 
-use crate::config::ListenerConfig;
-use crate::fire_sink::FireSignalSink;
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
 use super::event_source::Backoff;
-use super::KindHandler;
+use async_trait::async_trait;
+
+use super::{KindHandler, SpawnCtx};
 
 pub struct SseSubscribeHandler;
 
+#[async_trait]
 impl KindHandler for SseSubscribeHandler {
     fn tag(&self) -> &'static str {
         SseSubscribe::TAG
@@ -44,26 +45,15 @@ impl KindHandler for SseSubscribeHandler {
         })
     }
 
-    fn spawn_task(
+    async fn spawn_task(
         &self,
-        token: &str,
-        tenant_id: &str,
-        placement_generation: i64,
         spec: &SignalSpec,
         _kind_state: &Value,
-        sink: FireSignalSink,
-        _config: Arc<ListenerConfig>,
+        ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let sse: SseSubscribe = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed sse_subscribe spec: {e}"))?;
-        Ok(Some(spawn_loop(
-            token.to_string(),
-            tenant_id.to_string(),
-            placement_generation,
-            sse.url,
-            sse.event_name,
-            sink,
-        )))
+        Ok(Some(spawn_loop(sse.url, sse.event_name, spec.access.clone(), ctx)))
     }
 
     fn process_entry(
@@ -161,17 +151,24 @@ fn parse_message(block: &str) -> Option<SseMessage> {
 }
 
 fn spawn_loop(
-    token: String,
-    tenant_id: String,
-    placement_generation: i64,
     url: String,
     event_filter: String,
-    sink: FireSignalSink,
+    access: Option<weft_core::primitive::AccessRef>,
+    ctx: SpawnCtx,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
         let mut backoff = Backoff::new();
         loop {
+            // Signed-in streams resolve the connection PER CONNECT so
+            // a reconnect always subscribes with a fresh credential.
+            let client = match crate::listener_access::client_for(&access, &ctx).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(target: "weft_listener::sse_subscribe", %url, error = %format!("{e:#}"), "connection resolve failed; retrying");
+                    backoff.wait_then_climb().await;
+                    continue;
+                }
+            };
             let resp = match client
                 .get(&url)
                 .header("Accept", "text/event-stream")
@@ -179,7 +176,7 @@ fn spawn_loop(
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    info!(target: "weft_listener::sse_subscribe", %url, %token, "SSE connected");
+                    info!(target: "weft_listener::sse_subscribe", %url, token = %ctx.fire.token(), "SSE connected");
                     r
                 }
                 Ok(r) => {
@@ -240,8 +237,7 @@ fn spawn_loop(
                         continue;
                     }
                     let payload = super::event_source::coerce_text_payload(msg.data);
-                    super::event_source::fire_payload(&sink, &token, &tenant_id, placement_generation, payload, "sse_subscribe")
-                        .await;
+                    ctx.fire.fire(payload, "sse_subscribe").await;
                 }
             }
 

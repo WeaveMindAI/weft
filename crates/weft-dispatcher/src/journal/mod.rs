@@ -280,6 +280,10 @@ pub struct SignalRegistration {
     /// rehydrate after Pod restart can re-POST `/register` without
     /// re-running trigger-setup.
     pub spec_json: String,
+    /// The connection this signal acts as (`spec.access.id`),
+    /// denormalized so inbound provider pushes route account-to-
+    /// signal on one indexed column. `None` for kinds without one.
+    pub access_id: Option<String>,
     /// Free-form consumer label from `SignalSpec.consumer_kind`.
     /// `None` for fire-only signals (raw webhook entries) that
     /// have no enumeration consumer. The signal_token enumeration

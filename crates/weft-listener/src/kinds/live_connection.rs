@@ -20,12 +20,12 @@ use tokio::task::JoinHandle;
 use weft_core::primitive::{SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{ApiEndpoint, LiveConnectionConfig, LiveSocket, Signal};
 
-use crate::config::ListenerConfig;
-use crate::fire_sink::FireSignalSink;
+use async_trait::async_trait;
+
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
-use super::{public_entry_auth_to_routing, KindHandler};
+use super::{public_entry_auth_to_routing, KindHandler, SpawnCtx};
 
 /// One handler instance per live-caller tag. The behavior is identical
 /// across tags; only `tag` differs (the dispatcher recovers the protocol
@@ -34,6 +34,7 @@ pub struct LiveCallerHandler {
     tag: &'static str,
 }
 
+#[async_trait]
 impl KindHandler for LiveCallerHandler {
     fn tag(&self) -> &'static str {
         self.tag
@@ -53,15 +54,11 @@ impl KindHandler for LiveCallerHandler {
         Ok(public_entry_auth_to_routing(token, surface, &parsed.auth, secret_cache))
     }
 
-    fn spawn_task(
+    async fn spawn_task(
         &self,
-        _token: &str,
-        _tenant_id: &str,
-        _placement_generation: i64,
         _spec: &SignalSpec,
         _kind_state: &Value,
-        _sink: FireSignalSink,
-        _config: Arc<ListenerConfig>,
+        _ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         // Passive: the worker holds the connection, not the listener.
         Ok(None)
@@ -171,6 +168,7 @@ mod tests {
                 auth: SignalAuth::None,
                 auth_config: Value::Null,
             },
+            serving: Default::default(),
         };
         let out = handler().process_entry(&sig, Value::Null);
         assert!(matches!(out.target, ProcessTarget::Drop { .. }));

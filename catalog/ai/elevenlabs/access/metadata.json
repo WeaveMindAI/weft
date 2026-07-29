@@ -1,0 +1,97 @@
+{
+  "type": "ElevenLabsAccess",
+  "label": "ElevenLabs Access",
+  "description": "Connect ElevenLabs for the project's audio AI calls: pick the built-in connection, or bring your own ElevenLabs API key. Wire the access output into every ElevenLabs node; one connection, picked once, however many calls consume it.",
+  "category": "AI",
+  "tags": [
+    "ai",
+    "audio",
+    "access",
+    "credentials",
+    "key"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "elevenlabs",
+    "label": "ElevenLabs",
+    "doors": ["shared", "own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk_..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "xi-api-key",
+        "value": "{key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.elevenlabs.io/v1/user",
+      "captures": [
+        {
+          "name": "account_name",
+          "path": "first_name",
+          "optional": true
+        }
+      ]
+    },
+    "identity": "{account_name}",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://elevenlabs.io/app/settings/api-keys",
+        "steps": [
+          "Open elevenlabs.io, Settings > API Keys, and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "connection",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Connection"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The ElevenLabs access: wire it into an ElevenLabs node's account input."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "connection"
+        }
+      },
+      "then": {
+        "message": "ElevenLabsAccess '{id}' has no connection picked; pick one on the node.",
+        "level": "runtime",
+        "field": "connection"
+      }
+    }
+  ],
+  "requires_infra": false
+}

@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct WhatsAppSendNode;
@@ -38,7 +38,7 @@ impl Node for WhatsAppSendNode {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            weft_core::node_bail!("bridge returned {status}: {text}");
+            weft::node_bail!("bridge returned {status}: {text}");
         }
         let parsed: serde_json::Value = resp.json().await.node_err("parse bridge response")?;
         // The bridge signals SOFT failures (e.g. "WhatsApp not
@@ -48,7 +48,7 @@ impl Node for WhatsAppSendNode {
         // through to a misleading "missing messageId".
         let result = parsed.get("result");
         if let Some(err) = result.and_then(|r| r.get("error")).and_then(|v| v.as_str()) {
-            weft_core::node_bail!("bridge: {err}");
+            weft::node_bail!("bridge: {err}");
         }
         let message_id = result
             .and_then(|r| r.get("messageId"))

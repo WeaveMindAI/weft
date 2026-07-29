@@ -59,25 +59,32 @@
 
 	/// Short label that names the bus mode for the panel header. Empty
 	/// string for journaled (the default; no badge clutter), `[ephemeral]`
-	/// otherwise. Ephemeral panels also render messages with metadata
-	/// only (size + 8-byte SHA-256 prefix), so the header tag tells the
-	/// user up front why they see hashes instead of payloads.
+	/// otherwise. Ephemeral panels render per-window rollup lines
+	/// (count + bytes per sender/kind) instead of message payloads, so
+	/// the header tag tells the user up front why.
 	function modeBadge(meta: BusMeta | undefined): string {
 		if (!meta) return '';
 		return meta.ephemeral ? ' [ephemeral]' : '';
 	}
 
 	/// Format one message-kind line for either the on-screen IRC panel
-	/// or the copy-text. `payload.kind === 'ephemeral'` means the
-	/// journal never carried the bytes; render its size and 8-byte
-	/// hash prefix so replay is honest about what flew. `payload.kind
-	/// === 'journaled'` carries the actual value (which may legitimately
-	/// be JSON null on a journaled bus).
+	/// or the copy-text. A JSON payload renders its value (which may
+	/// legitimately be null); a binary payload renders its size (the
+	/// base64 itself is noise).
 	function formatMessageBody(event: BusInspectorEvent & { kind: 'message' }): string {
-		if (event.payload.kind === 'ephemeral') {
-			return `sent ${event.msgKind} of ${event.payloadByteSize} bytes [hash: ${event.payloadSha256Prefix}]`;
+		if (event.payload.kind === 'bytes') {
+			return `sent ${event.msgKind} of ${event.payloadByteSize} bytes (binary)`;
 		}
-		return prettyPayload(event.payload.value);
+		return prettyPayload(event.payload.data);
+	}
+
+	/// Format an ephemeral window's rollup line: what flew in one
+	/// journal-aggregation window, without the payloads (they never
+	/// reached the journal).
+	function formatWindowBody(event: BusInspectorEvent & { kind: 'window' }): string {
+		return event.totals
+			.map((t) => `${t.count} ${t.msgKind} message${t.count === 1 ? '' : 's'} (${t.bytes} bytes) from ${t.from}`)
+			.join(', ');
 	}
 
 	/// Linearize every bus log into copy-friendly text. Output mirrors
@@ -98,6 +105,7 @@
 				if (e.kind === 'joined') return `${ts}  * ${e.name} joined`;
 				if (e.kind === 'left') return `${ts}  * ${e.name} left`;
 				if (e.kind === 'closed') return `${ts}  * the bus closed here`;
+				if (e.kind === 'window') return `${ts}  * ${formatWindowBody(e)}`;
 				return `${ts}  ${e.from}: ${formatMessageBody(e)}`;
 			});
 			return [header, ...lines].join('\n');
@@ -199,7 +207,7 @@
 	function costLabel(firing: {
 		costUsd: number;
 		costUnknown?: boolean;
-		costOrigin?: 'user-provided' | 'runtime' | 'mixed';
+		credentialOwner?: 'their-own' | 'ours' | 'mixed';
 	}): string {
 		let amount: string;
 		if (firing.costUnknown) {
@@ -210,11 +218,11 @@
 			return '';
 		}
 		const origin =
-			firing.costOrigin === 'user-provided'
+			firing.credentialOwner === 'their-own'
 				? ' (own key)'
-				: firing.costOrigin === 'runtime'
+				: firing.credentialOwner === 'ours'
 					? ' (platform key)'
-					: firing.costOrigin === 'mixed'
+					: firing.credentialOwner === 'mixed'
 						? ' (mixed keys)'
 						: '';
 		return amount + origin;
@@ -423,6 +431,8 @@
 												<span class="text-zinc-400">* {e.name} left</span>
 											{:else if e.kind === 'closed'}
 												<span class="text-zinc-400 italic">* the bus closed here</span>
+											{:else if e.kind === 'window'}
+												<span class="text-zinc-500 italic">* {formatWindowBody(e)}</span>
 											{:else}
 												<span class="text-blue-700 shrink-0">{e.from}:</span>
 												<span class="text-zinc-800 break-words">{formatMessageBody(e)}</span>

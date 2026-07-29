@@ -50,15 +50,12 @@ pub trait FileReader {
 /// canonicalizes (resolving `..` and symlinks), rejects anything that escapes
 /// `base`, then reads the bytes.
 ///
-/// Threat model (unchanged from the original `@file` resolver): the project tree
-/// is TRUSTED (this runs at build time on the user's own project; referenced
-/// files are part of the project). The containment check guards an accidental
-/// `../` typo leaking a host file into the build, not a hostile tree. It is
-/// robust for that: `canonicalize` resolves `..` and follows symlinks before the
-/// prefix check, so any path (including via a symlink) that lands outside `base`
-/// is rejected. The only residual gap is the canonicalize then read TOCTOU
-/// window, irrelevant for a trusted local tree. If disk content ever becomes
-/// UNTRUSTED, switch to O_NOFOLLOW / per-component symlink rejection.
+/// The project tree is TRUSTED: this runs at build time on the user's own
+/// project, and referenced files are part of that project. The containment
+/// check guards against an accidental `../` typo pulling a file from outside
+/// `base` into the build. It is robust for that: `canonicalize` resolves `..`
+/// and follows symlinks before the prefix check, so any path that lands outside
+/// `base` (including via a symlink) is rejected.
 pub struct DiskFileReader;
 
 impl FileReader for DiskFileReader {

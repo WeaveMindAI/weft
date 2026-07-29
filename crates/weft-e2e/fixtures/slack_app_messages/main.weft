@@ -1,0 +1,12 @@
+# The APP pattern: the app-wide message firehose over the dial-out
+# socket transport. Needs a connection through the user's OWN Slack
+# app with its app-level (xapp-...) token pasted; the same fixture,
+# wired to a connection WITHOUT that token, is the negative proof
+# that a bot-pattern connection cannot open the firehose.
+
+ws = SlackAccess
+recv = SlackAppMessages
+recv.account = ws.access
+
+out = Debug
+out.data = recv.text

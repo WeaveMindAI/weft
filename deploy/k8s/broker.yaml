@@ -63,18 +63,31 @@ spec:
           ports:
             - containerPort: 9090
               name: http
-          # Operator-supplied provider keys (`<PROVIDER>_API_KEY`), packed
-          # from the CLI's environment into this Secret on daemon
-          # start/restart. Optional: absent until the operator sets one.
+          # The access store's at-rest sealing key
+          # (CREDENTIAL_ENCRYPTION_KEY), packed from the CLI's
+          # environment on daemon start/restart. Optional: absent until
+          # the operator sets one (the built-in development key is then
+          # used, loudly).
           envFrom:
             - secretRef:
-                name: weft-provider-keys
+                name: weft-sealing-key
                 optional: true
           env:
             - name: WEFT_BROKER_PORT
               value: "9090"
             - name: WEFT_BROKER_AUDIENCE
               value: "weft-broker"
+            # The deployment's public base URL (same value the
+            # dispatcher publishes): what event subscribe calls tell a
+            # provider to post to. Substituted by the daemon at apply.
+            - name: WEFT_DISPATCHER_PUBLIC_BASE_URL
+              value: "${WEFT_DISPATCHER_PUBLIC_BASE_URL}"
+            # The ADDITIONAL internet-reachable address (the public
+            # tunnel's minted URL), empty when none; event subscribe
+            # calls prefer it over the base when telling a provider
+            # where to post.
+            - name: WEFT_DISPATCHER_INTERNET_URL
+              value: "${WEFT_DISPATCHER_INTERNET_URL}"
             - name: WEFT_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -100,6 +113,23 @@ spec:
             # GCS case, where it is already public).
             - name: WEFT_OBJECT_STORE_PUBLIC_ENDPOINT
               value: "${WEFT_OBJECT_STORE_PUBLIC_ENDPOINT}"
+            # The registered OAuth apps (label + covers + credentials
+            # per service), mounted from the `weft-access-apps` Secret
+            # below. Read per lookup, so editing the file and
+            # re-applying the secret takes effect without a broker
+            # rollout. The env value is the mountPath below plus the
+            # secret key's file name; YAML cannot concatenate, so the
+            # directory appears twice and this comment binds them.
+            # SYNC: WEFT_ACCESS_APPS_FILE <-> the access-apps volumeMount below,
+            #       crates/weft-cli/src/commands/daemon.rs ACCESS_APPS_SECRET_KEY,
+            #       crates/weft-broker/src/app_provider.rs
+            - name: WEFT_ACCESS_APPS_FILE
+              value: "/etc/weft/access-apps/access-apps.json"
+          volumeMounts:
+            - name: access-apps
+              # SYNC: mountPath <-> the WEFT_ACCESS_APPS_FILE env above
+              mountPath: /etc/weft/access-apps
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -112,6 +142,14 @@ spec:
               port: 9090
             initialDelaySeconds: 10
             periodSeconds: 15
+      volumes:
+        # Optional: absent until the operator writes an apps file. The
+        # mount is then empty, the provider reads no file, and every
+        # service needs a project-declared app instead.
+        - name: access-apps
+          secret:
+            secretName: weft-access-apps
+            optional: true
 ---
 apiVersion: v1
 kind: Service
@@ -241,13 +279,18 @@ spec:
       ports:
         - protocol: TCP
           port: 443
-    # Object store (the runtime-file bucket) + any external endpoint the broker
-    # legitimately calls. The store is EXTERNAL to the cluster (reached over S3 by
-    # its configured endpoint), so the broker reaches OUT to it.
-    # The broker is a trusted control-plane component (it holds the bucket creds); a
-    # compromised broker is already game-over, so it gets plain internet egress here
-    # rather than a hand-maintained per-host allowlist. The cluster-internal CIDRs
-    # stay excluded so this doesn't become a lateral-movement path to other pods.
+    # Object store (the runtime-file bucket) + the access system's
+    # outbound calls (connect-time test calls, OAuth token exchanges,
+    # remote_select lookups), which address external services. This
+    # rule grants the PUBLIC internet only: every private range is
+    # excluded, so these calls reach outside services and nothing
+    # in-cluster. Excluded: the two cluster CIDRs (pods, services),
+    # link-local (169.254/16, incl. 169.254.169.254), and the RFC-1918
+    # + CGNAT ranges cluster nodes live on.
+    #
+    # ${WEFT_STORE_ALLOW_CIDR} re-permits one private range for an
+    # object store that sits on one: it defaults to a benign public /32
+    # (a no-op) and is set via env to the store's CIDR when needed.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -255,3 +298,11 @@ spec:
               - ${WEFT_CLUSTER_POD_CIDR}
               - ${WEFT_CLUSTER_SERVICE_CIDR}
               - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+    # Self-hoster's private-range object store (default: no-op public /32).
+    - to:
+        - ipBlock:
+            cidr: ${WEFT_STORE_ALLOW_CIDR}

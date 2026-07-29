@@ -21,7 +21,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
-# The metered paid-call client (`ctx.metered_client`): the middleware seam
+# The connection client (an opened connection's measured HTTP): the middleware seam
 # plus the provider meters it runs around each call.
 reqwest-middleware = { workspace = true }
 weft-providers = { workspace = true }
@@ -29,6 +29,11 @@ http = "1"
 # Stream adapters for put_from_url (TryStreamExt on the reqwest body),
 # and FutureExt::catch_unwind for the stress_test! macro in tests.
 futures = { workspace = true }
+# Provider WebSocket sessions (`conn.socket(url)`): the dialer signs the
+# handshake, routes the session, and taps frames for the session meter.
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
 # The worker's inbound live-caller connection server (HTTP + WS upgrade).
 # Plain HTTP/WS inside the cluster: TLS terminates at the gateway and the
 # signed routing token authenticates the connection (transport-A model,
@@ -49,3 +54,6 @@ test-helpers = []
 [dev-dependencies]
 weft-core = { workspace = true, features = ["test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+# `start_paused` for the bounded-drain test: the paused clock fires the
+# drain window the instant the silent peer yields no progress.
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,49 @@
+{
+  "type": "S3PutObject",
+  "label": "S3: Put Object",
+  "description": "Upload a text object to a bucket on the connected store.",
+  "category": "Data",
+  "tags": [
+    "s3",
+    "r2",
+    "storage",
+    "upload"
+  ],
+  "icon": "Database",
+  "color": "#e25444",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The object store access (wire an S3Access node)."
+    },
+    {
+      "name": "bucket",
+      "type": "String",
+      "required": true,
+      "label": "Bucket"
+    },
+    {
+      "name": "key",
+      "type": "String",
+      "required": true,
+      "label": "Key",
+      "placeholder": "path/to/object.txt"
+    },
+    {
+      "name": "content",
+      "type": "String",
+      "required": true,
+      "label": "Content"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "etag",
+      "type": "String",
+      "required": false,
+      "description": "The stored object's ETag."
+    }
+  ]
+}

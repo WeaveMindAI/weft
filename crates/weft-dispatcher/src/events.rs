@@ -110,9 +110,9 @@ pub enum DispatcherEvent {
         cost_id: String,
         service: String,
         amount_usd: Option<f64>,
-        /// Whose key the call spent (`user-provided` or `deployment`), so a
+        /// Whose credential the call spent (`their-own` or `ours`), so a
         /// client can say whose account a figure landed on.
-        origin: weft_core::AccessOrigin,
+        origin: weft_core::CredentialOwner,
     },
     TriggerUrlChanged { project_id: String, node_id: String, url: String },
     ProjectRegistered { project_id: String, name: String },
@@ -167,24 +167,21 @@ pub enum DispatcherEvent {
         name: String,
         at_unix: u64,
     },
-    /// A `send` landed on a bus. `from` is the registered name of the
-    /// `payload` is the tagged `JournaledPayload` (`Journaled { value }`
-    /// for journaled buses, `Ephemeral` for ephemeral). The inspector
-    /// renders metadata-only on `Ephemeral` using `payload_byte_size`
-    /// and the 8-byte SHA-256 prefix. Mirrors the journal shape so
-    /// `Journaled { value: Value::Null }` and `Ephemeral` never
-    /// collapse to the same JSON.
-    BusMessage {
+    /// One journal-aggregation window of a bus's messages (one row per
+    /// bus per window; default 1s). A journaled bus's `messages` carry
+    /// every message in the window (senders, kinds, payloads); an
+    /// ephemeral bus's `messages` are empty and `totals` (count + bytes
+    /// per sender/kind) are the whole story. The inspector unpacks
+    /// `messages` into its per-message log and renders a summary line
+    /// for a window that carries only totals.
+    BusWindow {
         color: Color,
         project_id: String,
         bus_id: String,
-        offset: u64,
-        from: String,
-        msg_kind: String,
-        payload: weft_core::primitive::JournaledPayload,
-        payload_byte_size: u64,
-        #[serde(with = "weft_core::hex_array8")]
-        payload_sha256_prefix: [u8; 8],
+        first_offset: u64,
+        last_offset: u64,
+        messages: Vec<weft_core::bus::WindowedBusMessage>,
+        totals: Vec<weft_core::bus::BusWindowTotal>,
         at_unix: u64,
     },
     /// The bus was closed. Inspector renders an explicit
@@ -206,28 +203,26 @@ pub enum DispatcherEvent {
         at_unix: u64,
     },
     /// A message arrived from the caller. `payload` is the tagged
-    /// `JournaledPayload` (journaled value vs ephemeral metadata-only), same
-    /// shape as `BusMessage`.
+    /// `WirePayload` (json value or base64 bytes), the same wire
+    /// vocabulary as a bus window's messages.
+    // SYNC: CallerInbound <-> crates/weft-journal/src/events.rs CallerInbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'inbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_inbound'
     CallerInbound {
         color: Color,
         project_id: String,
         offset: u64,
-        payload: weft_core::primitive::JournaledPayload,
+        payload: weft_core::bus::WirePayload,
         payload_byte_size: u64,
-        #[serde(with = "weft_core::hex_array8")]
-        payload_sha256_prefix: [u8; 8],
         at_unix: u64,
     },
     /// A message was sent to the caller. `terminal` marks the final
     /// outbound (HTTP respond/close, WS close).
+    // SYNC: CallerOutbound <-> crates/weft-journal/src/events.rs CallerOutbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'outbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_outbound'
     CallerOutbound {
         color: Color,
         project_id: String,
         offset: u64,
-        payload: weft_core::primitive::JournaledPayload,
+        payload: weft_core::bus::WirePayload,
         payload_byte_size: u64,
-        #[serde(with = "weft_core::hex_array8")]
-        payload_sha256_prefix: [u8; 8],
         terminal: bool,
         at_unix: u64,
     },
@@ -306,7 +301,7 @@ impl DispatcherEvent {
             | Self::InfraConfigError { project_id, .. }
             | Self::BusJoined { project_id, .. }
             | Self::BusLeft { project_id, .. }
-            | Self::BusMessage { project_id, .. }
+            | Self::BusWindow { project_id, .. }
             | Self::BusClosed { project_id, .. }
             | Self::BusParticipant { project_id, .. }
             | Self::CallerConnected { project_id, .. }
@@ -339,7 +334,7 @@ impl DispatcherEvent {
             | Self::CostReported { color, .. }
             | Self::BusJoined { color, .. }
             | Self::BusLeft { color, .. }
-            | Self::BusMessage { color, .. }
+            | Self::BusWindow { color, .. }
             | Self::BusClosed { color, .. }
             | Self::BusParticipant { color, .. }
             | Self::CallerConnected { color, .. }

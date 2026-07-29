@@ -222,11 +222,7 @@ mod tests {
     use super::*;
 
     fn spec() -> SignalSpec {
-        SignalSpec {
-            kind: "timer".into(),
-            config: serde_json::json!({ "interval_secs": 60 }),
-            consumer_kind: None,
-        }
+        SignalSpec::of_kind("timer", serde_json::json!({ "interval_secs": 60 }))
     }
 
     /// `RegisterRequest` crosses the dispatcher -> listener HTTP boundary

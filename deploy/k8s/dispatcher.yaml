@@ -121,6 +121,15 @@ spec:
           ports:
             - containerPort: 9999
               name: http
+          # The access store's at-rest sealing key
+          # (CREDENTIAL_ENCRYPTION_KEY), packed from the CLI's
+          # environment on daemon start/restart; connect flows run here
+          # and open sealed rows. Optional: absent until the operator
+          # sets one.
+          envFrom:
+            - secretRef:
+                name: weft-sealing-key
+                optional: true
           env:
             - name: WEFT_POD_ID
               valueFrom:
@@ -160,6 +169,12 @@ spec:
             # when WEFT_LOCAL_DEV is set (see below); production must set a real host.
             - name: WEFT_DISPATCHER_PUBLIC_BASE_URL
               value: "${WEFT_DISPATCHER_PUBLIC_BASE_URL}"
+            # The ADDITIONAL internet-reachable address (the public
+            # tunnel's minted URL), empty when none. Never replaces the
+            # base URL: only surfaces the open internet must reach
+            # (event pushes, activation URLs) prefer it.
+            - name: WEFT_DISPATCHER_INTERNET_URL
+              value: "${WEFT_DISPATCHER_INTERNET_URL}"
             # The BROWSER-facing object-store origin. The dispatcher serves it at
             # GET /storage/public-base; the webview adds it to its CSP img-src /
             # media-src so an <img>/<video> can load a presigned bucket URL DIRECTLY

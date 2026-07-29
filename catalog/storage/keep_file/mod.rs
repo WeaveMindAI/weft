@@ -6,9 +6,9 @@
 
 use async_trait::async_trait;
 
-use weft_core::node::NodeOutput;
-use weft_core::storage::{KeepTtl, StorageScope};
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
+use weft::storage::{KeepTtl, StorageScope};
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct KeepFileNode;
@@ -16,7 +16,7 @@ pub struct KeepFileNode;
 #[async_trait]
 impl Node for KeepFileNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let file: serde_json::Value = ctx.inputs.get("file")?;
+        let file = ctx.inputs.get("file")?;
         // 0 days = never expire; otherwise a fixed-day window that any
         // access renews. The scope is Execution because keep only
         // applies there (the box rejects keep on project/shared keys);
@@ -31,6 +31,9 @@ impl Node for KeepFileNode {
             KeepTtl::Secs { secs: ttl_days * 24 * 3600 }
         };
         ctx.storage(StorageScope::Execution).keep(&file, ttl).await?;
-        ctx.pulse_downstream(NodeOutput::new().set("file", file)).await
+        // Pass the MARKER through untouched: downstream gets exactly
+        // the reference that arrived, not a reconstruction.
+        let raw = ctx.inputs.raw("file").cloned().expect("file was just read");
+        ctx.pulse_downstream(NodeOutput::new().set("file", raw)).await
     }
 }

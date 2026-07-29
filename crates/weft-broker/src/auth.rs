@@ -419,6 +419,21 @@ pub async fn resolve_storage_caller(
     }
 }
 
+/// Resolve + require a control-plane caller for an admin request
+/// (runtime-storage admin, access admin). The dispatcher signs with its
+/// own SA token; anything else is refused.
+pub(crate) async fn control_plane(
+    state: &Arc<BrokerState>,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    match resolve_storage_caller(state, headers, None).await? {
+        weft_core::storage::key::CallerAuth::ControlPlane => Ok(()),
+        weft_core::storage::key::CallerAuth::Worker { .. } => {
+            Err((StatusCode::FORBIDDEN, "the admin surface is dispatcher-only".into()))
+        }
+    }
+}
+
 /// Resolve the namespace's owning tenant. Authoritative lookup: the
 /// dispatcher writes a row to `weft_namespace_tenant` whenever it
 /// creates a namespace, so the broker doesn't have to parse the

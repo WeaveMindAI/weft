@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 
-use weft_core::signal::{Form, FormSchema};
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::signal::{Form, FormSchema};
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 use super::form_helpers::{build_form_fields, map_response_to_ports, parse_form_fields};
 

@@ -1,0 +1,11 @@
+# Stale connection: the access node's handle references a connection id
+# the store does not hold (an imported project, a deleted connection).
+# The type system allows it (the handle is just a reference); resolution
+# refuses it loudly at run time, naming the fix.
+
+ws = SlackAccess
+send = SlackSendMessage { channel: "C000", text: "never sent" }
+send.account = ws.access
+
+out = Debug
+out.data = send.ts

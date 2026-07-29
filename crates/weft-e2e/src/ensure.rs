@@ -57,6 +57,41 @@ fn load_repo_env() {
     }
 }
 
+/// Read a GROUP of external-service variables a test needs together,
+/// or announce ONE skip naming the whole shortfall and return `None`.
+/// Loads the repo-root `.env` first, so the check is order-independent:
+/// a test may (and should) gate on its variables BEFORE the expensive
+/// [`up`], and a single-test binary must not depend on a sibling test
+/// having loaded `.env` for it. `what` names the service the group
+/// belongs to; the returned values are in `vars` order (destructure
+/// with `<[String; N]>::try_from`).
+pub fn env_group_or_skip(what: &str, vars: &[&str]) -> Option<Vec<String>> {
+    load_repo_env();
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    let mut values = Vec::new();
+    for &var in vars {
+        match std::env::var(var) {
+            Ok(v) if !v.trim().is_empty() => {
+                present.push(var);
+                values.push(v);
+            }
+            _ => missing.push(var),
+        }
+    }
+    if missing.is_empty() {
+        Some(values)
+    } else {
+        eprintln!("SKIPPED {what}: missing {missing:?} (have {present:?})");
+        None
+    }
+}
+
+/// Single-variable form of [`env_group_or_skip`] (one implementation).
+pub fn env_or_skip(var: &str) -> Option<String> {
+    env_group_or_skip(var, &[var]).map(|mut values| values.pop().expect("one var, one value"))
+}
+
 /// Run `setup.sh` to bring the cluster to current code and wait for the dispatcher
 /// to be reachable. Latched to run once per process (the sweep is NOT here: it runs
 /// per-test in [`up`]).

@@ -1,0 +1,79 @@
+{
+  "type": "GitHubAccess",
+  "label": "GitHub Access",
+  "description": "Sign in to GitHub with a personal access token (fine-grained or classic). Wire the access output into GitHub action nodes; the token lives in the runtime's access store, never in the project file.",
+  "category": "Data",
+  "tags": [
+    "github",
+    "access",
+    "git"
+  ],
+  "icon": "Github",
+  "color": "#24292f",
+  "service": {
+    "service": "github",
+    "label": "GitHub",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "token",
+          "label": "Personal access token",
+          "placeholder": "ghp_... or github_pat_..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {token}"
+      }
+    ],
+    "test": {
+      "url": "https://api.github.com/user",
+      "captures": [
+        {
+          "name": "login",
+          "path": "login"
+        }
+      ]
+    },
+    "identity": "{login}"
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The GitHub access: wire it into GitHub action nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "GitHubAccess '{id}' has no connected account; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

@@ -52,7 +52,7 @@ pub struct InfraSpec {
     /// NetworkPolicy ingress/egress overrides on top of the project
     /// default-deny baseline.
     #[serde(default)]
-    pub access: Access,
+    pub access: NetworkAccess,
 
     /// What stop/upgrade/terminate mean for this node.
     #[serde(default)]
@@ -657,25 +657,25 @@ pub enum Expose {
     #[default]
     ClusterInternal,
     /// ClusterIP + Ingress at `<tenant-host>/<path>`. IP-level
-    /// restriction comes from `Access.ingress` (e.g. FromCidrs).
+    /// restriction comes from `NetworkAccess.ingress` (e.g. FromCidrs).
     TenantPublic { path: String },
     /// NodePort. Rare; useful for testing.
     NodePort { port: u16 },
 }
 
 // =============================================================
-// Access (NetworkPolicy)
+// NetworkAccess (NetworkPolicy)
 // =============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Access {
+pub struct NetworkAccess {
     #[serde(default = "default_ingress")]
     pub ingress: Vec<IngressRule>,
     #[serde(default = "default_egress")]
     pub egress: Vec<EgressRule>,
 }
 
-impl Default for Access {
+impl Default for NetworkAccess {
     fn default() -> Self {
         Self {
             ingress: default_ingress(),
@@ -986,7 +986,7 @@ mod tests {
                 port: "http".into(),
                 expose: Expose::ClusterInternal,
             }],
-            access: Access {
+            access: NetworkAccess {
                 ingress: vec![IngressRule::FromWorkers],
                 egress: vec![EgressRule::ToInternet],
             },
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn default_access_is_workers_in_internet_out() {
-        let access = Access::default();
+        let access = NetworkAccess::default();
         assert!(matches!(access.ingress.first(), Some(IngressRule::FromWorkers)));
         assert!(matches!(access.egress.first(), Some(EgressRule::ToInternet)));
     }

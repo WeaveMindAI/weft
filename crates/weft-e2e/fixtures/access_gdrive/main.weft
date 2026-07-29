@@ -1,0 +1,11 @@
+# List real Google Drive files through a grant seeded with a
+# pre-obtained refresh token and an already-expired access token: the
+# first resolution must run a REAL refresh against Google's token
+# endpoint (lazy, store-side) before the listing call.
+
+acct = GoogleAccess
+files = GoogleDriveListFiles { pageSize: 5 }
+files.account = acct.access
+
+out = Debug
+out.data = files.files

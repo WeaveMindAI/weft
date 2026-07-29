@@ -187,6 +187,33 @@ async function storageCall<T = unknown>(path: string, body: unknown): Promise<T>
   return reply.result as T;
 }
 
+/// Drive one access-store verb through the host: `method` + the route
+/// under `/access/` (e.g. `connect/begin`, `grants?service=slack`).
+/// The host stamps the active project into POST bodies. Resolves to
+/// the route's parsed response or rejects with the host's reason.
+/// Secrets travel INTO this call (pasted fields going editor -> store)
+/// and never back out.
+export async function accessCall<T = unknown>(
+  method: 'GET' | 'POST' | 'DELETE',
+  path: string,
+  body?: unknown,
+): Promise<T> {
+  const reply = await hostRequest('accessResult', (requestId) => ({
+    kind: 'accessCall',
+    requestId,
+    method,
+    path,
+    body,
+  }));
+  if (reply.error !== undefined) throw new Error(reply.error);
+  return reply.result as T;
+}
+
+/// Open a URL in the user's real browser (the OAuth consent page).
+export function openExternalUrl(url: string): void {
+  send({ kind: 'openExternalUrl', url });
+}
+
 /// Resolve a stored image to the box's public URL for inline rendering. Runs
 /// the download handshake through `storageCall`. Rejects with the host's reason
 /// (expired/deleted) so the caller can show a fallback.

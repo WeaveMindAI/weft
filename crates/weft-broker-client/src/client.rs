@@ -406,6 +406,42 @@ impl BrokerSignalClient {
     }
 }
 
+// ---------- Provider events (listener serving surface) ----------
+
+/// The listener's client for serving event subscriptions: resolve a
+/// connection's event source, keep a provider-side subscription
+/// alive, tear it down at unregister.
+pub struct BrokerEventsClient {
+    http: HttpCore,
+}
+
+impl BrokerEventsClient {
+    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
+        Arc::new(Self {
+            http: HttpCore::new(base_url, token),
+        })
+    }
+
+    pub async fn listener_resolve(
+        &self,
+        req: &ListenerResolveRequest,
+    ) -> Result<ListenerResolvedSource> {
+        self.http.post("/v1/access/listener-resolve", req).await
+    }
+
+    pub async fn subscription_ensure(
+        &self,
+        req: &SubscriptionEnsureRequest,
+    ) -> Result<SubscriptionEnsureResponse> {
+        self.http.post("/v1/access/subscription/ensure", req).await
+    }
+
+    pub async fn subscription_drop(&self, req: &SubscriptionDropRequest) -> Result<()> {
+        let _: serde_json::Value = self.http.post("/v1/access/subscription/drop", req).await?;
+        Ok(())
+    }
+}
+
 // ---------- Infra ----------
 
 pub struct BrokerInfraClient {
@@ -439,33 +475,33 @@ impl InfraReader for BrokerInfraClient {
     }
 }
 
-// ---------- Provider access + cost recording ----------
+// ---------- Connections + cost recording ----------
 
-/// Worker-side client for the provider-access endpoints: open access to the
-/// runtime's provider key, give it back when the node finishes. (Cost
+/// Worker-side client for the connection endpoints: resolve a
+/// connection for one firing, release it when the node finishes. (Cost
 /// records ride the generic task rail, not a dedicated endpoint.)
-pub struct BrokerPaidCallClient {
+pub struct BrokerAccessClient {
     http: HttpCore,
 }
 
-impl BrokerPaidCallClient {
+impl BrokerAccessClient {
     pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
         Arc::new(Self {
             http: HttpCore::new(base_url, token),
         })
     }
 
-    pub async fn open_provider_access(
+    pub async fn resolve_connection(
         &self,
-        req: &ProviderAccessRequest,
-    ) -> Result<ProviderAccessResponse> {
-        self.http.post("/v1/access/open", req).await
+        req: &ResolveConnectionRequest,
+    ) -> Result<ResolveConnectionResponse> {
+        self.http.post("/v1/access/resolve", req).await
     }
 
-    pub async fn close_provider_access(
+    pub async fn release_connection(
         &self,
-        req: &ProviderAccessCloseRequest,
-    ) -> Result<ProviderAccessCloseResponse> {
+        req: &ReleaseConnectionRequest,
+    ) -> Result<ReleaseConnectionResponse> {
         self.http.post("/v1/access/close", req).await
     }
 }

@@ -46,6 +46,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    weft_core::net::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

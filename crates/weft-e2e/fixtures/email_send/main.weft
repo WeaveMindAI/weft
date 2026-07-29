@@ -1,0 +1,10 @@
+# Send a real email over SMTP through a pasted-credentials mailbox
+# connection. The rig fills `to` and `subject` (a unique marker) so
+# the companion receive fixture can watch the same message arrive.
+
+mb = EmailAccess
+send = SendEmail { body: "sent by the weft email e2e" }
+send.account = mb.access
+
+out = Debug
+out.data = send.messageId

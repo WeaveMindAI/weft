@@ -12,8 +12,8 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::signal::SseSubscribe;
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::signal::SseSubscribe;
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct WhatsAppReceiveNode;
@@ -72,7 +72,7 @@ impl Node for WhatsAppReceiveNode {
             let url = format!("{}/media/{}", bridge.trim_end_matches('/'), message_id);
             let filename = format!("whatsapp-{message_id}");
             let file = ctx
-                .storage(weft_core::storage::StorageScope::Execution)
+                .storage(weft::storage::StorageScope::Execution)
                 .put_from_url(&url, Some(&filename), None)
                 .await?;
             out = out.set("file", file);

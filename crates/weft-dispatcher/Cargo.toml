@@ -22,6 +22,7 @@ weft-core = { workspace = true }
 weft-compiler = { path = "../weft-compiler", features = ["build"] }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
+weft-access-store = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
@@ -48,6 +49,9 @@ tokio-tungstenite = { workspace = true }
 dashmap = "6"
 cron = "0.12"
 sha2 = { workspace = true }
+# The events receiver forwards raw push bodies to the broker base64'd
+# (signatures hash the exact bytes; the wrapper stays JSON).
+base64 = { workspace = true }
 hex = "0.4"
 url = { workspace = true }
 # Materialize uploaded source rows to a temp dir for the compile + stage

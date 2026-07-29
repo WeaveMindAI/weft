@@ -26,10 +26,13 @@ export function fieldForInput(input: PortDefinition): FieldDefinition {
 	if (w.min !== undefined) field.min = w.min;
 	if (w.max !== undefined) field.max = w.max;
 	if (w.step !== undefined) field.step = w.step;
-	if (w.provider) field.provider = w.provider;
 	if (w.accept) field.accept = w.accept;
 	if (w.type) field.fileType = w.type;
 	if (w.language) field.language = w.language;
+	if (w.service !== undefined) field.service = w.service;
+	if (w.access) field.access = w.access;
+	if (w.sources) field.sources = w.sources;
+	if (w.depends_on) field.dependsOn = w.depends_on;
 	return field;
 }
 

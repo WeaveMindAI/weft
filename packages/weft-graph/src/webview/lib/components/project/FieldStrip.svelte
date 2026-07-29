@@ -2,7 +2,7 @@
 	/// Renders a list of FieldDefinition entries as inline form controls
 	/// against a `config` record. Handles the primitive field types:
 	/// text, textarea, select, multiselect, checkbox, number, password.
-	/// Exotic types (api_key, form_builder, code) are left to the
+	/// Exotic types (access, form_builder, code) are left to the
 	/// parent: pass a `customFieldKeys` set so the strip skips those
 	/// keys, and supply a `renderCustom` snippet that draws them inline
 	/// at the right position (the strip iterates the field list once,
@@ -46,7 +46,7 @@
 		/// (typically to data.onUpdate so the round-trip turns into
 		/// setConfig EditOps).
 		onUpdate: (key: string, value: unknown, portDriven?: boolean) => void;
-		/// Keys the parent renders itself (api_key / form_builder /
+		/// Keys the parent renders itself (access / form_builder /
 		/// code / file-backed). The strip skips them as primitives and
 		/// hands each to `renderCustom` instead.
 		customFieldKeys?: Set<string>;
@@ -324,7 +324,7 @@
 					ondrop={() => readonlyPasteDrop(field.key, ro)}
 				/>
 			{:else}
-				<!-- code / api_key / form_builder MUST be in customFieldKeys
+				<!-- code / access / form_builder MUST be in customFieldKeys
 				     and rendered by the parent's renderCustom snippet.
 				     Reaching this branch means the parent forgot to claim
 				     this key; surface loud rather than silently rendering a

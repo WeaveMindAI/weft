@@ -228,6 +228,13 @@ pub enum WeftType {
     /// universal contract). Wired-only: the value is a live runtime
     /// handle, never a config literal a user types.
     Bus,
+    /// Authorized ability to call a third party: the value an access
+    /// node emits (`{"__weft_access__": {...}}`, see
+    /// `crate::access::Access`). One general type for both kinds
+    /// (metered + personal); never parameterized per service (wrong-
+    /// service wiring fails loud at runtime). Wired-only: the marker is
+    /// minted by an access node, never typed as a literal.
+    Access,
     /// Node-scoped type variable: T, T1, T2, etc.
     /// Same name on different ports of the same node = same type.
     /// Resolved per-node when connections are made.
@@ -436,9 +443,11 @@ impl WeftType {
             WeftType::List(inner) => inner.references_file(),
             WeftType::Dict(_, v) => v.references_file(),
             WeftType::Union(types) => types.iter().any(|t| t.references_file()),
-            WeftType::JsonDict | WeftType::Bus | WeftType::TypeVar(_) | WeftType::MustOverride => {
-                false
-            }
+            WeftType::JsonDict
+            | WeftType::Bus
+            | WeftType::Access
+            | WeftType::TypeVar(_)
+            | WeftType::MustOverride => false,
         }
     }
 
@@ -478,6 +487,7 @@ impl WeftType {
             }
             WeftType::JsonDict => Exposure::All,
             WeftType::Bus => Exposure::Wire,
+            WeftType::Access => Exposure::Wire,
             WeftType::TypeVar(_) => Exposure::Assignment,
             WeftType::MustOverride => Exposure::Assignment,
         }
@@ -536,7 +546,9 @@ impl WeftType {
                 .iter()
                 .find(|t| !t.contains_null())
                 .map_or(Value::Null, |t| t.zero_value()),
-            WeftType::Bus | WeftType::TypeVar(_) | WeftType::MustOverride => Value::Null,
+            WeftType::Bus | WeftType::Access | WeftType::TypeVar(_) | WeftType::MustOverride => {
+                Value::Null
+            }
         }
     }
 
@@ -576,6 +588,9 @@ impl WeftType {
             }
             // A bus connects only to a bus; payloads are not type-checked.
             (WeftType::Bus, WeftType::Bus) => true,
+            // An access connects only to an access; the KIND/service is
+            // checked at runtime resolution, not by the type system.
+            (WeftType::Access, WeftType::Access) => true,
             // Both unions: every source variant must match at least one target variant
             (WeftType::Union(sources), WeftType::Union(targets)) => {
                 sources.iter().all(|s| targets.iter().any(|t| Self::is_compatible(s, t)))
@@ -625,6 +640,9 @@ impl WeftType {
                 }
                 if Self::detect_bus_type(obj).is_some() {
                     return WeftType::Bus;
+                }
+                if obj.contains_key(crate::access::ACCESS_MARKER_KEY) {
+                    return WeftType::Access;
                 }
                 if obj.is_empty() {
                     return WeftType::Dict(
@@ -697,9 +715,15 @@ impl WeftType {
     /// Build a Bus marker JSON value from a channel id and a mode.
     /// Takes `BusMode` (not `&str`) so the wire-vocabulary invariant
     /// is enforced at the type system; a typo can't slip through.
+    /// `id` and `mode` are the marker's whole payload: every other bus
+    /// parameter is read off the live handle a consumer resolves from
+    /// the marker.
     #[cfg(feature = "runtime")]
     pub fn bus_marker(id: &str, mode: crate::bus::BusMode) -> serde_json::Value {
-        serde_json::json!({ "__weft_bus__": { "id": id, "mode": mode.as_wire_str() } })
+        serde_json::json!({ "__weft_bus__": {
+            "id": id,
+            "mode": mode.as_wire_str(),
+        } })
     }
 
     /// Build a stored-file marker JSON value of the given concrete
@@ -746,7 +770,10 @@ impl WeftType {
         if value.is_null() {
             return Err("null has no cast".into());
         }
-        if self.is_unresolved() || self.references_file() || matches!(self, WeftType::Bus) {
+        if self.is_unresolved()
+            || self.references_file()
+            || matches!(self, WeftType::Bus | WeftType::Access)
+        {
             return Err(format!("no cast into {self}"));
         }
         match self {
@@ -991,6 +1018,10 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
         return Some(WeftType::Bus);
     }
 
+    if s == "Access" {
+        return Some(WeftType::Access);
+    }
+
     if s == "MustOverride" {
         return Some(WeftType::MustOverride);
     }
@@ -1119,6 +1150,7 @@ impl std::fmt::Display for WeftType {
             }
             WeftType::JsonDict => write!(f, "JsonDict"),
             WeftType::Bus => write!(f, "Bus"),
+            WeftType::Access => write!(f, "Access"),
             WeftType::TypeVar(name) => write!(f, "{}", name),
             WeftType::MustOverride => write!(f, "MustOverride"),
         }

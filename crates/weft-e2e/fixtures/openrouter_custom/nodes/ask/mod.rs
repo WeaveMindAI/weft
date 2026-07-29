@@ -2,23 +2,23 @@
 //!
 //! This proves the project-defined provider path: a provider weft does not
 //! ship (`openrouter_custom`), whose meter lives in the project itself, is
-//! discovered by the worker and prices a real call. The node opens access to
-//! `openrouter_custom` and calls on the metered client exactly like any paid
-//! node; the only difference from the built-in OpenRouter node is the provider
-//! name. This is the bare-node meter shape: the meter is registered at the
-//! bottom of the node's own `mod.rs` (a bare node has no package root to hold
-//! a shared file).
+//! discovered by the worker and prices a real call. The node opens its
+//! connection and calls on its client exactly like any paid node; the only
+//! difference from the built-in OpenRouter node is the service name. This is
+//! the bare-node meter shape: the meter is registered at the bottom of the
+//! node's own `mod.rs` (a bare node has no package root to hold a shared
+//! file).
 //!
 //! The meter is a thin wrapper over weft's real OpenRouter meter: it keeps the
 //! real pricing logic and the real base URL (so the call reaches OpenRouter and
-//! is priced correctly) and only renames the provider to `openrouter_custom`.
+//! is priced correctly) and only renames the service to `openrouter_custom`.
 //! That keeps the fixture honest (a real metered call) without copying 800
 //! lines of pricing code.
 
 use async_trait::async_trait;
 
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 use weft_providers::providers::openrouter::OPENROUTER;
 use weft_providers::{CallObservation, FollowUp, MeasuredCost, ObservedCall, ProviderMeter, RouteClass};
 
@@ -32,19 +32,21 @@ impl Node for AskCustomNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let prompt: String = ctx.inputs.get("prompt")?;
         let system_prompt: String = ctx.inputs.get_or("systemPrompt", String::new())?;
-        let model: String = ctx.inputs.get_or("model", "openai/gpt-4.1-nano".to_string())?;
+        // `model` declares a metadata default, so the bag always holds
+        // a value.
+        let model: String = ctx.inputs.get("model")?;
 
-        // The whole paid-call surface, against the PROJECT-DEFINED provider:
-        // open access, build the generator over the metered client. The
-        // runtime finds this project's own `openrouter_custom` meter and
-        // measures the call's real cost behind the client.
-        let access = ctx
-            .provider_access("openrouter_custom", ctx.inputs.opt("apiKey")?)
-            .await?;
+        // The whole paid-call surface, against the PROJECT-DEFINED service:
+        // open the wired connection (the service name rides in from the
+        // access widget's stamped metadata), build the generator over its
+        // client. The runtime finds this project's own `openrouter_custom`
+        // meter and measures the call's real cost behind the client.
+        let account = ctx.inputs.get("connection")?;
+        let conn = ctx.open(&account).await?;
         let generator = GeneratorInfo::openrouter(model)
-            .with_api_key(access.credential())
+            .with_api_key(conn.credential()?)
             .with_app_attribution("https://weavemind.ai", "WeaveMind")
-            .with_http_client(ctx.metered_client(&access)?);
+            .with_http_client(conn.client().clone());
 
         let root = ChatNode::root(system_prompt);
         let user = root.add_user(prompt);
@@ -67,17 +69,17 @@ impl Node for AskCustomNode {
     }
 }
 
-/// The project's own provider meter. It IS OpenRouter under the hood (real
-/// pricing, real base URL), renamed so the runtime sees it as a distinct,
-/// project-defined provider `openrouter_custom`. Every method delegates to the
-/// shipped meter except `provider()`.
+/// The project's own meter. It IS OpenRouter under the hood (real pricing,
+/// real base URL), renamed so the runtime sees it as a distinct,
+/// project-defined service `openrouter_custom`. Every method delegates to
+/// the shipped meter except `service()`.
 struct OpenRouterCustomMeter;
 
 static OPENROUTER_CUSTOM: OpenRouterCustomMeter = OpenRouterCustomMeter;
 
 #[async_trait]
 impl ProviderMeter for OpenRouterCustomMeter {
-    fn provider(&self) -> &'static str {
+    fn service(&self) -> &'static str {
         "openrouter_custom"
     }
     fn base_url(&self) -> &'static str {

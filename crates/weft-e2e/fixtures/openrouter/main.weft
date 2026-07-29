@@ -1,12 +1,15 @@
-# One real LLM call, metered end to end, on the DEPLOYMENT's key: `apiKey` is
-# unset, which the runtime reads as "use the deployment's configured key" (the
-# worker never holds it). The runtime measures the real cost off the real
-# response. The model is asked for one exact word so the answer is assertable,
-# and parseJson is off so the response is the raw string.
+# One real LLM call, metered end to end. The access node's connection is
+# stamped by the TEST (a shared-door or own-key connection, created through
+# the store exactly as the editor does); the consuming node opens it inside
+# its own firing. The runtime measures the real cost off the real response.
+# The model is asked for one exact word so the answer is assertable, and
+# parseJson is off so the response is the raw string.
 #
 # Needs OPENROUTER_API_KEY in the environment the daemon was started from (the
 # CLI packs it into the broker's secret); the cheapest model keeps the run
 # nearly free.
+
+auth = OpenRouterAccess
 
 cfg = OpenRouterConfig {
   model: "openai/gpt-4.1-nano",
@@ -18,6 +21,7 @@ cfg = OpenRouterConfig {
 ask = OpenRouterInference -> (response: String) {
   prompt: "What color is a clear midday sky? Answer with one word."
 }
+ask.account = auth.access
 ask.config = cfg.config
 
 out = Debug

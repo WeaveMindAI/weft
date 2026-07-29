@@ -228,8 +228,8 @@ impl SettledRun {
     /// money trail. A record whose amount is `null` (the meter could not
     /// resolve the figure, an honest unknown) is skipped here.
     /// Every resolved cost record: `(service, origin, amount_usd)`. Origin is
-    /// the wire string of whose key the call spent (`"user-provided"` or
-    /// `"runtime"`). Records with a null amount (an honest unknown) are
+    /// the wire string of whose key the call spent (`"their-own"` or
+    /// `"ours"`). Records with a null amount (an honest unknown) are
     /// not in this list.
     pub fn costs(&self) -> Vec<(String, String, f64)> {
         self.replay
@@ -246,7 +246,7 @@ impl SettledRun {
 
     /// Assert the execution recorded exactly one cost for `service`, resolved
     /// to a real positive amount AND spent on the expected key (`origin` is
-    /// `"user-provided"` or `"runtime"`): the call was made, it rode the
+    /// `"their-own"` or `"ours"`): the call was made, it rode the
     /// key the test set up (no silent fall-through to the other one), and the
     /// meter read a real figure off the real response. (This is measurement,
     /// not billing: on this path the cost is recorded, not charged.)

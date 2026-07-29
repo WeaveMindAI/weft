@@ -1,0 +1,9 @@
+# Upload a real (tiny) object through SigV4: proves the base_url +
+# sign steps against a real S3-compatible endpoint.
+
+store = S3Access
+put = S3PutObject { key: "weft-e2e/proof.txt", content: "weft e2e: access proof" }
+put.account = store.access
+
+out = Debug
+out.data = put.etag

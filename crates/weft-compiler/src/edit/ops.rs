@@ -1244,9 +1244,33 @@ fn insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditError> {
                     format!("{rhs} {{\n{body_indent}{key}: {value}\n{indent}}}.{port}")
                 }
                 _ => {
+                    // The decl's ONE leading-whitespace token (see
+                    // `leading_ws`) holds both the newlines separating it
+                    // from the previous statement and its line indent. The
+                    // rebuilt text replaces ONLY the decl node, so trivia the
+                    // decl CARRIES as its own first token dies in the splice
+                    // and is re-emitted verbatim (or the decl fuses onto the
+                    // line above: `...rowsgoogle_access_1 = ...`), while a
+                    // token sitting as the decl's PREVIOUS SIBLING survives
+                    // the splice already ending with the indent, so nothing
+                    // is emitted. Splitting the one token at its last newline
+                    // keeps `leading` and the indent complementary by
+                    // construction; composing separately-read tokens here
+                    // used to double-indent decls nested in a group.
+                    let ws = leading_ws(decl.syntax())
+                        .map(|t| t.text().to_string())
+                        .unwrap_or_default();
+                    let carried = decl
+                        .syntax()
+                        .first_child_or_token()
+                        .is_some_and(|t| t.kind() == SyntaxKind::WHITESPACE);
+                    let nl = ws.rfind('\n').map_or(0, |i| i + 1);
+                    let (leading, ws_indent) = ws.split_at(nl);
+                    let prefix =
+                        if carried { format!("{leading}{ws_indent}") } else { String::new() };
                     let header = decl_header_text(decl);
                     format!(
-                        "{indent}{} {{\n{body_indent}{key}: {value}\n{indent}}}",
+                        "{prefix}{} {{\n{body_indent}{key}: {value}\n{ws_indent}}}",
                         header.trim()
                     )
                 }

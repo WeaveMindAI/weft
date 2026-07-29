@@ -331,6 +331,8 @@ t = Text
         placeholder: None,
         synthesized_from_carry: false,
         from_spec: false,
+        requires_scopes: None,
+        requires_values: None,
     });
     t.port_literals.insert("value".into(), serde_json::json!({"not": "a string"}));
     let d = validate(&project, &catalog());
@@ -358,6 +360,8 @@ t = Text { value: "ok" }
         placeholder: None,
         synthesized_from_carry: false,
         from_spec: false,
+        requires_scopes: None,
+        requires_values: None,
     });
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"required-port-unmet"), "{d:?}");
@@ -1064,29 +1068,58 @@ out.data = req.body
 }
 
 #[test]
-fn an_empty_own_key_is_empty_byok() {
-    // An EMPTY key literal means "own key selected but never pasted";
-    // sending "" as a bearer token can only fail at the provider.
-    // An ABSENT key stays legal (runtime-granted access).
+fn an_access_node_stamps_its_service_and_materializes_no_permission_input() {
+    // Permissions are ticked once at connect time and live on the
+    // stored connection, never in source: enrich stamps the service
+    // name onto the access widget and materializes NOTHING else.
     let project = parse_enrich(
         r#"
-cfg = OpenRouterConfig { model: "m" apiKey: "" }
-out = Debug
-out.data = cfg.config
+ws = SlackAccess
+send = SlackSendMessage { channel: "C1", text: "hi" }
+send.account = ws.access
 "#,
     );
-    let d = validate(&project, &catalog());
-    assert!(codes(&d).contains(&"empty-byok"), "{:?}", d);
+    let ws = project.nodes.iter().find(|n| n.id == "ws").expect("ws node");
+    assert!(
+        !ws.inputs.iter().any(|i| i.name == "scopes"),
+        "no permission input is materialized; permissions live on the connection"
+    );
+    // The connect widget carries the compiler-stamped service.
+    let account = ws.inputs.iter().find(|i| i.name == "account").expect("account input");
+    match &account.widget {
+        Some(weft_core::node::Widget::Access { service }) => {
+            assert_eq!(service.as_deref(), Some("slack"));
+        }
+        other => panic!("account input is not an access widget: {other:?}"),
+    }
+    // A consumer input's declared requirement is mirrored onto the
+    // INSTANCE, for the runtime to stamp onto the marker.
+    let send = project.nodes.iter().find(|n| n.id == "send").expect("send node");
+    let account = send.inputs.iter().find(|i| i.name == "account").expect("account input");
+    assert_eq!(
+        account.requires_scopes.as_deref(),
+        Some(&["chat:write".to_string()][..]),
+        "requiresScopes rides the compiled instance"
+    );
+}
 
+#[test]
+fn a_remote_select_pick_literal_passes_the_type_check() {
+    // The channel picker stores `{id, label}` on a String input; the
+    // widget's contract legalizes the object form (the runtime unwraps
+    // it to the bare id), while a plain pasted string stays a string.
     let project = parse_enrich(
-        r#"
-cfg = OpenRouterConfig { model: "m" }
-out = Debug
-out.data = cfg.config
-"#,
+        r##"
+ws = SlackAccess
+send = SlackSendMessage { channel: {"id": "C42", "label": "#general"}, text: "hi" }
+send.account = ws.access
+"##,
     );
     let d = validate(&project, &catalog());
-    assert!(!codes(&d).contains(&"empty-byok"), "absent key is runtime-granted: {:?}", d);
+    assert!(
+        !codes(&d).contains(&"config-type-mismatch"),
+        "the {{id, label}} pick form is legal on a remote_select: {d:?}"
+    );
 }
 
 #[test]

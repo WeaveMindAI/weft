@@ -18,6 +18,8 @@ pub mod error;
 pub mod exec;
 pub mod infra;
 pub mod frames;
+#[cfg(feature = "runtime")]
+pub mod net;
 pub mod node;
 pub mod primitive;
 pub mod project;
@@ -61,49 +63,24 @@ pub fn truncate_user_string(s: &str, max_bytes: usize) -> String {
     format!("{}... [truncated, original {} bytes]", &s[..end], s.len())
 }
 
-/// Serialize a `[u8; 8]` as a 16-char lowercase hex string at the
-/// wire boundary. Used as `#[serde(with = "weft_core::hex_array8")]`
-/// on bus payload-hash-prefix fields so the journal and dispatcher
-/// event types ship hex strings instead of byte-array literals.
-pub mod hex_array8 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    const HEX_TBL: &[u8; 16] = b"0123456789abcdef";
-
-    pub fn serialize<S: Serializer>(bytes: &[u8; 8], s: S) -> Result<S::Ok, S::Error> {
-        let mut hex = [0u8; 16];
-        for (i, b) in bytes.iter().enumerate() {
-            hex[i * 2] = HEX_TBL[(b >> 4) as usize];
-            hex[i * 2 + 1] = HEX_TBL[(b & 0xf) as usize];
-        }
-        s.serialize_str(std::str::from_utf8(&hex).expect("ascii hex"))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 8], D::Error> {
-        let s = String::deserialize(d)?;
-        // ASCII check first: byte-indexed slicing below would PANIC
-        // (not error) on a 16-byte string containing a multi-byte
-        // char straddling an odd offset, and this deserializer exists
-        // exactly to guard the wire boundary with errors.
-        if s.len() != 16 || !s.is_ascii() {
-            return Err(serde::de::Error::invalid_value(
-                serde::de::Unexpected::Str(&s),
-                &"16 ascii hex chars",
-            ));
-        }
-        let mut out = [0u8; 8];
-        for i in 0..8 {
-            out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-                .map_err(|_| serde::de::Error::custom("invalid hex digit"))?;
-        }
-        Ok(out)
-    }
-}
-
 // Re-export `inventory` so the `register_signal_kind!` macro
 // expanded in third-party crates (or other workspace crates) can
 // reach the same crate version without adding a direct dep.
+pub use async_trait;
 pub use inventory;
+
+// Re-export `serde_json` so code the `NodeManifest` derive GENERATES
+// into node crates (the typed-inputs struct: structural inputs fall
+// back to `Value`) reaches the same crate version without every node
+// package declaring the dep.
+pub use serde_json;
+
+// Re-export `reqwest_middleware` so node code can NAME the client type
+// `ctx.client` / `OpenedConnection::client` hand back (e.g. a helper fn
+// taking `&weft::reqwest_middleware::ClientWithMiddleware`) without
+// every node package declaring the dep.
+#[cfg(feature = "runtime")]
+pub use reqwest_middleware;
 
 #[cfg(feature = "runtime")]
 pub use bus::{
@@ -118,13 +95,14 @@ pub use context::{
     ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, Phase, ValueBag,
     StorageHandle,
 };
-pub use access::{AccessOrigin, ProviderAccess, PLATFORM_KEY_SENTINEL};
+pub use access::spec::{AccessSpec, AppRegistration};
+pub use access::{Access, CredentialOwner};
 pub use error::{node_error, NodeErrExt, WeftError, WeftResult};
 pub use infra::{
-    Access, AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
+    AccessMode, AutoscaleBehavior, AutoscaleMetric, AutoscaleSpec, ConfigSource,
     Container, ContainerPort, ContainerSecurityContext, EgressRule, Endpoint, EnvEntry, Expose,
     HttpHeader, Image, IngressRule, InfraProvisionContext, InfraSpec, Lifecycle,
-    Mount, PodOptions, PodSecurityContext, PreStopHook, Probe, ProbeKind, Protocol,
+    Mount, NetworkAccess, PodOptions, PodSecurityContext, PreStopHook, Probe, ProbeKind, Protocol,
     ProvisionContextError, Resources, ScalingPolicy, StopBehavior, TerminateBehavior, Toleration,
     Unit, UnitHealth, UnitKind, UpgradeBehavior, Volume, VolumeKind,
 };
@@ -187,30 +165,4 @@ mod helper_tests {
         assert!(out.contains("[truncated, original 5 bytes]"), "suffix names size: {out}");
     }
 
-    #[test]
-    fn hex_array8_round_trips() {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct H(#[serde(with = "crate::hex_array8")] [u8; 8]);
-        let h = H([0x00, 0x11, 0xab, 0xcd, 0xef, 0x01, 0x99, 0xff]);
-        let json = serde_json::to_string(&h).unwrap();
-        assert_eq!(json, "\"0011abcdef0199ff\"");
-        let back: H = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.0, h.0);
-    }
-
-    #[test]
-    fn hex_array8_rejects_malformed_without_panicking() {
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)] // only deserialization failure is under test
-        struct H(#[serde(with = "crate::hex_array8")] [u8; 8]);
-        // 16 BYTES but containing a multi-byte char straddling an odd
-        // offset: byte-indexed slicing would panic; must Err instead.
-        let weird = format!("\"0{}{}\"", '\u{00e9}', "0123456789012".get(..13).unwrap());
-        let r: Result<H, _> = serde_json::from_str(&weird);
-        assert!(r.is_err(), "non-ascii 16-byte string must error");
-        let r: Result<H, _> = serde_json::from_str("\"zz11abcdef0199ff\"");
-        assert!(r.is_err(), "non-hex digits must error");
-        let r: Result<H, _> = serde_json::from_str("\"0011\"");
-        assert!(r.is_err(), "wrong length must error");
-    }
 }

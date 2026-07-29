@@ -11,8 +11,8 @@
 use async_trait::async_trait;
 use serde_json::{Number, Value};
 
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
-use weft_core::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
 pub struct RangeNode;
@@ -20,21 +20,23 @@ pub struct RangeNode;
 #[async_trait]
 impl Node for RangeNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let from: f64 = ctx.inputs.get_or("from", 0.0)?;
+        // `from`/`step` declare metadata defaults, so the bag always
+        // holds values; required reads keep each default in ONE place.
+        let from: f64 = ctx.inputs.get("from")?;
         let to: f64 = ctx.inputs.get("to")?;
-        let step: f64 = ctx.inputs.get_or("step", 1.0)?;
+        let step: f64 = ctx.inputs.get("step")?;
 
         // Non-finite bounds (NaN / Infinity) silently produce nonsense:
         // NaN comparisons always evaluate false (empty list), Infinity
         // bounds run until f64 saturation or OOM. Reject loudly so the
         // user sees the config bug rather than an empty / hung output.
         if !from.is_finite() || !to.is_finite() || !step.is_finite() {
-            weft_core::node_bail!(
+            weft::node_bail!(
                 "Range: from/to/step must all be finite (got from={from}, to={to}, step={step})"
             );
         }
         if step == 0.0 {
-            weft_core::node_bail!("Range: step cannot be zero");
+            weft::node_bail!("Range: step cannot be zero");
         }
 
         // `[from, from+step, ..., to)`: half-open, negative step walks

@@ -9,11 +9,15 @@
 //! a stateless fire would.
 
 pub mod config;
+pub mod event_context;
 pub mod fire_sink;
 pub mod kinds;
+pub mod listener_access;
 pub mod protocol;
 pub mod registry;
 pub mod router;
+pub mod socket_engine;
+pub mod stream_engine;
 
 pub use config::ListenerConfig;
 pub use router::router;
@@ -51,6 +55,9 @@ pub struct ListenerState {
     /// supervisor use one consistent load metric and a pod sheds load
     /// based on how close it actually is to its memory limit.
     pub mem_pressure: Arc<dyn MemPressure>,
+    /// The broker's event-serving surface: connection resolution and
+    /// provider subscriptions for the kinds that act as a connection.
+    pub events_broker: Arc<weft_broker_client::BrokerEventsClient>,
 }
 
 impl ListenerState {
@@ -80,6 +87,10 @@ impl ListenerState {
         token_source: TokenSource,
     ) -> anyhow::Result<Self> {
         let fire_sink = FireSignalSink::new(tasks.clone());
+        let events_broker = weft_broker_client::BrokerEventsClient::new(
+            config.broker_url.clone(),
+            token_source.clone(),
+        );
         Ok(Self {
             config: Arc::new(config),
             registry: Arc::new(Registry::new()),
@@ -88,6 +99,7 @@ impl ListenerState {
             tasks,
             token_source,
             mem_pressure: CgroupMemPressure::new(),
+            events_broker,
         })
     }
 }

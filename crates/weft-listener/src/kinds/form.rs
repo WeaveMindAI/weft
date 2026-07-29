@@ -14,15 +14,16 @@ use anyhow::Result;
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Form, Signal};
 
-use crate::config::ListenerConfig;
-use crate::fire_sink::FireSignalSink;
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
-use super::KindHandler;
+use async_trait::async_trait;
+
+use super::{KindHandler, SpawnCtx};
 
 pub struct FormHandler;
 
+#[async_trait]
 impl KindHandler for FormHandler {
     fn tag(&self) -> &'static str {
         Form::TAG
@@ -41,15 +42,11 @@ impl KindHandler for FormHandler {
         })
     }
 
-    fn spawn_task(
+    async fn spawn_task(
         &self,
-        _token: &str,
-        _tenant_id: &str,
-        _placement_generation: i64,
         _spec: &SignalSpec,
         _kind_state: &Value,
-        _sink: FireSignalSink,
-        _config: Arc<ListenerConfig>,
+        _ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         Ok(None)
     }
@@ -151,6 +148,7 @@ mod tests {
                 auth: SignalAuth::None,
                 auth_config: Value::Null,
             },
+            serving: Default::default(),
         };
         let rendered = FormHandler
             .render("tok", &sig)
@@ -177,6 +175,7 @@ mod tests {
                 auth: SignalAuth::None,
                 auth_config: Value::Null,
             },
+            serving: Default::default(),
         };
         let cache = Arc::new(DashMap::new());
         let err = FormHandler

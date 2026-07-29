@@ -29,11 +29,13 @@ const PUBLIC_FIRE_BODY_LIMIT: usize = 256 * 1024;
 pub mod project;
 pub(crate) mod execution;
 mod events;
+mod provider_events;
 mod signal_token;
 mod signal_token_names;
 mod dashboard;
 mod infra;
 pub(crate) mod signal;
+pub mod access;
 pub mod storage;
 
 /// The dispatcher routes, not yet bound to state. Additional routes can be
@@ -130,6 +132,21 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/storage/upload/complete", post(storage::upload_complete))
         .route("/storage/upload/resume", post(storage::upload_resume))
         .route("/storage/upload/abort", post(storage::upload_abort))
+        // Access store: registrations (a tenant's app identity at an
+        // OAuth service), grants (connected accounts), the connect
+        // flows the editor drives, and remote_select lookups. All
+        // tenant-authenticated; stored values never leave the store
+        // side. The OAuth callback door lives on the outside surface.
+        .route("/access/doors", post(access::doors))
+        .route("/access/mint-app", post(access::mint_app))
+        .route("/access/grants", get(access::list_grants))
+        .route("/access/grants/{id}", axum::routing::delete(access::delete_grant))
+        .route("/access/connect/direct", post(access::connect_direct))
+        .route("/access/connect/begin", post(access::connect_begin))
+        .route("/access/connect/status", get(access::connect_status))
+        .route("/access/lookup", post(access::lookup))
+        .route("/access/granted", post(access::granted))
+        .route("/access/picker/begin", post(access::picker_begin))
         // Inspector proxy: project-scoped read of signal display
         // info (mount_path, plaintext key while listener still
         // holds it, etc). Project-token gated.
@@ -188,6 +205,28 @@ fn outside_caller_routes() -> Router<DispatcherState> {
             "/connect/{*path}",
             get(signal::connect_live)
                 .post(signal::connect_live)
+                .layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
+        )
+        // The OAuth callback door: the provider redirects the user's
+        // browser here after consent. No tenant bearer rides a
+        // provider redirect; the state nonce's pending row (minted by
+        // the tenant-authenticated begin) is what authenticates the
+        // completion. More specific than the catch-all below.
+        .route("/access/oauth/callback", get(access::oauth_callback))
+        // The picker doors: the weft-served chooser page (opened in
+        // the user's browser, like the consent) and its result post.
+        // Like the OAuth callback, the state nonce's parked session
+        // (minted by the tenant-authenticated begin) is what
+        // authenticates them.
+        .route("/access/picker/{state}", get(access::picker_page))
+        .route("/access/picker/{state}/result", post(access::picker_result))
+        // The public events receiver: providers deliver the pushes
+        // serving dial-in event subscriptions here. More specific
+        // than the catch-all; verification happens broker-side, so
+        // this stays on the public surface with no gate of its own.
+        .route(
+            "/events/{service}/{topic}",
+            post(provider_events::receive_event)
                 .layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
         // Catch-all PublicEntry route: external HTTP fires land

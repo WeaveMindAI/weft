@@ -511,20 +511,17 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 at_unix: *at_unix,
             }]
         }
-        ExecEvent::BusMessage {
-            color, bus_id, offset, from, msg_kind, payload,
-            payload_byte_size, payload_sha256_prefix, at_unix,
+        ExecEvent::BusWindow {
+            color, bus_id, first_offset, last_offset, messages, totals, at_unix,
         } => {
-            vec![DispatcherEvent::BusMessage {
+            vec![DispatcherEvent::BusWindow {
                 color: *color,
                 project_id,
                 bus_id: bus_id.clone(),
-                offset: *offset,
-                from: from.clone(),
-                msg_kind: msg_kind.clone(),
-                payload: payload.clone(),
-                payload_byte_size: *payload_byte_size,
-                payload_sha256_prefix: *payload_sha256_prefix,
+                first_offset: *first_offset,
+                last_offset: *last_offset,
+                messages: messages.clone(),
+                totals: totals.clone(),
                 at_unix: *at_unix,
             }]
         }
@@ -614,9 +611,9 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
         }
         // Caller events: surfaced 1:1 so the inspector replays the live
         // caller exchange (connected / inbound / outbound / errored /
-        // disconnected) the same way it replays a bus. Payloads carry the
-        // journaled-vs-ephemeral `JournaledPayload` so high-volume streams stay
-        // metadata-only.
+        // disconnected) the same way it replays a bus. Payloads carry
+        // the same tagged `WirePayload` shape as a bus window's
+        // messages.
         ExecEvent::CallerConnected { color, offset, protocol, at_unix } => {
             vec![DispatcherEvent::CallerConnected {
                 color: *color, project_id, offset: *offset,
@@ -624,24 +621,22 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
             }]
         }
         ExecEvent::CallerInbound {
-            color, offset, payload, payload_byte_size, payload_sha256_prefix, at_unix,
+            color, offset, payload, payload_byte_size, at_unix,
         } => {
             vec![DispatcherEvent::CallerInbound {
                 color: *color, project_id, offset: *offset,
                 payload: payload.clone(),
                 payload_byte_size: *payload_byte_size,
-                payload_sha256_prefix: *payload_sha256_prefix,
                 at_unix: *at_unix,
             }]
         }
         ExecEvent::CallerOutbound {
-            color, offset, payload, payload_byte_size, payload_sha256_prefix, terminal, at_unix,
+            color, offset, payload, payload_byte_size, terminal, at_unix,
         } => {
             vec![DispatcherEvent::CallerOutbound {
                 color: *color, project_id, offset: *offset,
                 payload: payload.clone(),
                 payload_byte_size: *payload_byte_size,
-                payload_sha256_prefix: *payload_sha256_prefix,
                 terminal: *terminal,
                 at_unix: *at_unix,
             }]

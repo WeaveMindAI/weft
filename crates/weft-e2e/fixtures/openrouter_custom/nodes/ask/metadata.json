@@ -25,6 +25,7 @@
       "widget": {
         "kind": "text"
       },
+      "default": "openai/gpt-4.1-nano",
       "label": "Model"
     },
     {
@@ -34,15 +35,14 @@
       "label": "System prompt"
     },
     {
-      "name": "apiKey",
-      "type": "String",
+      "name": "connection",
+      "type": "Access",
       "exposure": "config",
       "widget": {
-        "kind": "api_key",
-        "provider": "openrouter_custom"
+        "kind": "access"
       },
-      "label": "API key",
-      "description": "Your own key for the custom provider. Empty (or Platform) asks the runtime for a granted key; a project-defined provider has none, so the call fails loud."
+      "label": "Connection",
+      "description": "Your own connection for the custom service. A project-defined service offers no shared door, so bring your own key."
     }
   ],
   "outputs": [
@@ -51,5 +51,26 @@
       "type": "String"
     }
   ],
-  "requires_infra": false
+  "requires_infra": false,
+  "service": {
+    "service": "openrouter_custom",
+    "label": "OpenRouter (custom)",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk-or-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ]
+  }
 }

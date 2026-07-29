@@ -15,15 +15,16 @@ use tracing::warn;
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{PollEndpoint, Signal};
 
-use crate::config::ListenerConfig;
-use crate::fire_sink::FireSignalSink;
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
-use super::KindHandler;
+use async_trait::async_trait;
+
+use super::{KindHandler, SpawnCtx};
 
 pub struct PollEndpointHandler;
 
+#[async_trait]
 impl KindHandler for PollEndpointHandler {
     fn tag(&self) -> &'static str {
         PollEndpoint::TAG
@@ -42,26 +43,15 @@ impl KindHandler for PollEndpointHandler {
         })
     }
 
-    fn spawn_task(
+    async fn spawn_task(
         &self,
-        token: &str,
-        tenant_id: &str,
-        placement_generation: i64,
         spec: &SignalSpec,
         _kind_state: &Value,
-        sink: FireSignalSink,
-        _config: Arc<ListenerConfig>,
+        ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
-        Ok(Some(spawn_loop(
-            token.to_string(),
-            tenant_id.to_string(),
-            placement_generation,
-            poll.url,
-            poll.interval_secs,
-            sink,
-        )))
+        Ok(Some(spawn_loop(poll.url, poll.interval_secs, spec.access.clone(), ctx)))
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -76,21 +66,28 @@ impl KindHandler for PollEndpointHandler {
 }
 
 fn spawn_loop(
-    token: String,
-    tenant_id: String,
-    placement_generation: i64,
     url: String,
     interval_secs: u64,
-    sink: FireSignalSink,
+    access: Option<weft_core::primitive::AccessRef>,
+    ctx: SpawnCtx,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
         let mut ticker = interval(Duration::from_secs(interval_secs));
         // A slow poll (response took longer than the interval) must not
         // cause a burst of catch-up polls; skip missed ticks instead.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Signed-in polls resolve the connection PER CYCLE: the
+            // credential is refreshed store-side and never frozen
+            // into this loop. No connection = a plain client.
+            let client = match crate::listener_access::client_for(&access, &ctx).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(target: "weft_listener::poll_endpoint", %url, error = %format!("{e:#}"), "connection resolve failed; will retry next tick");
+                    continue;
+                }
+            };
             let resp = match client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
@@ -110,7 +107,7 @@ fn spawn_loop(
                 }
             };
             let payload = super::event_source::coerce_text_payload(body);
-            super::event_source::fire_payload(&sink, &token, &tenant_id, placement_generation, payload, "poll_endpoint").await;
+            ctx.fire.fire(payload, "poll_endpoint").await;
         }
     })
 }

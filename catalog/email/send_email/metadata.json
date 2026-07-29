@@ -1,0 +1,68 @@
+{
+  "type": "SendEmail",
+  "label": "Send Email",
+  "description": "Send an email as the connected mailbox, over SMTP (the standard sending protocol every mail provider serves). Set replyToMessageId to answer inside an existing conversation.",
+  "category": "Communication",
+  "tags": [
+    "email",
+    "smtp"
+  ],
+  "icon": "Mail",
+  "color": "#0a84ff",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresValues": [
+        "smtp_host",
+        "smtp_port"
+      ],
+      "description": "The mailbox's access (wire an EmailAccess node). Needs the connection's outgoing (SMTP) server, which is what sending mail uses."
+    },
+    {
+      "name": "to",
+      "type": "String",
+      "required": true,
+      "label": "To"
+    },
+    {
+      "name": "subject",
+      "type": "String",
+      "required": true,
+      "label": "Subject"
+    },
+    {
+      "name": "body",
+      "type": "String",
+      "required": true,
+      "label": "Body"
+    },
+    {
+      "name": "cc",
+      "type": "String",
+      "required": false,
+      "label": "Cc"
+    },
+    {
+      "name": "bcc",
+      "type": "String",
+      "required": false,
+      "label": "Bcc"
+    },
+    {
+      "name": "replyToMessageId",
+      "type": "String",
+      "required": false,
+      "description": "The Message-ID being answered (from ReceiveEmail's messageId output); sets the reply headers so mail clients thread it."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "messageId",
+      "type": "String",
+      "required": false,
+      "description": "The sent message's Message-ID header."
+    }
+  ]
+}

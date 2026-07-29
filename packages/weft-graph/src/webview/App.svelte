@@ -482,8 +482,8 @@
                   costIds: [...seen, msg.costId],
                   costUsd: r.costUsd + (msg.amountUsd ?? 0),
                   costUnknown: (r.costUnknown ?? false) || msg.amountUsd === null,
-                  costOrigin:
-                    r.costOrigin === undefined || r.costOrigin === msg.origin
+                  credentialOwner:
+                    r.credentialOwner === undefined || r.credentialOwner === msg.origin
                       ? msg.origin
                       : 'mixed',
                 }

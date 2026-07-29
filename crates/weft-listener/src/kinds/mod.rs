@@ -32,7 +32,9 @@
 pub mod event_source;
 pub mod sse_subscribe;
 pub mod poll_endpoint;
+pub mod provider_events;
 pub mod socket_listen;
+pub mod stream_listen;
 pub mod timer;
 pub mod form;
 pub mod live_connection;
@@ -40,20 +42,45 @@ pub mod live_connection;
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use weft_core::primitive::{SignalRouting, SignalSpec};
 
+use parking_lot::Mutex;
+
 use crate::config::ListenerConfig;
+use crate::event_context::FireContext;
 use crate::fire_sink::FireSignalSink;
 use crate::protocol::{ProcessOutcome, ProcessTarget};
-use crate::registry::{RegisteredSignal, Registry, TaskGuard};
+use crate::registry::{RegisteredSignal, Registry, ServingState, TaskGuard, Transport};
+
+/// Everything a kind's background task is spawned with, bundled: the
+/// per-signal identity + fire plumbing (as a ready [`FireContext`],
+/// which carries the spec-level pre-fire filter), the listener
+/// config, the broker's event-serving client, and whether this is a
+/// FRESH registration (a fresh one may make broker calls and refuse
+/// activation loudly; a rehydrate must come up and let its task
+/// retry, or one unreachable broker at boot would fail the whole
+/// rebuild).
+#[derive(Clone)]
+pub struct SpawnCtx {
+    pub fire: FireContext,
+    pub config: Arc<ListenerConfig>,
+    pub events_broker: Arc<weft_broker_client::BrokerEventsClient>,
+    pub fresh: bool,
+    /// The signal's live serving state, shared with the registry
+    /// entry so status a serving task writes lands where /display
+    /// reads it.
+    pub serving: Arc<Mutex<ServingState>>,
+}
 
 /// Per-kind handler. One unit struct per kind, registered with the
 /// inventory below. Methods take typed config blobs from the spec;
 /// each handler parses what it needs and ignores the rest.
+#[async_trait]
 pub trait KindHandler: Send + Sync {
     /// Kind tag, matched against `SignalSpec.kind`. Must match the
     /// `Signal::TAG` constant on the corresponding data struct in
@@ -97,20 +124,18 @@ pub trait KindHandler: Send + Sync {
     /// Spawn any long-running task this kind needs (timer schedule,
     /// SSE subscriber). Returns `Ok(None)` for passive kinds that
     /// wait for an external HTTP fire (Form, live-caller). `Err` on
-    /// malformed spec so register surfaces a 400.
+    /// malformed spec (or, on a FRESH registration, an unserviceable
+    /// one) so register surfaces a 400 and activation fails loudly
+    /// instead of minting a dead trigger.
     ///
     /// `kind_state` is the opaque blob persisted on the row at
     /// register time (or read back from the row on rehydrate).
     /// Kinds interpret it however they need. Default is empty `{}`.
-    fn spawn_task(
+    async fn spawn_task(
         &self,
-        token: &str,
-        tenant_id: &str,
-        placement_generation: i64,
         spec: &SignalSpec,
         kind_state: &Value,
-        sink: FireSignalSink,
-        config: Arc<ListenerConfig>,
+        ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>>;
 
     /// Decide how a fire's payload routes for an entry-mode signal.
@@ -127,6 +152,18 @@ pub trait KindHandler: Send + Sync {
     /// SseSubscribe) and `Err` for malformed specs (so the caller
     /// surfaces a 400 instead of silently rendering empty).
     fn render(&self, token: &str, sig: &RegisteredSignal) -> Result<Option<Value>>;
+
+    /// Tear down anything the signal holds OUTSIDE this process (a
+    /// provider-side subscription). Called after the registry entry
+    /// was removed, detached from the unregister answer; a failure
+    /// must log loudly, never propagate. Default: nothing held.
+    async fn on_unregister(
+        &self,
+        _token: &str,
+        _sig: &RegisteredSignal,
+        _events_broker: &Arc<weft_broker_client::BrokerEventsClient>,
+    ) {
+    }
 
     /// Handle a kind-specific /action (e.g. `regenerate_api_key`).
     /// Default: no actions defined.
@@ -178,6 +215,23 @@ pub enum RoutingSource {
     },
 }
 
+/// The identity portion of one registered signal: everything the
+/// registry stores about WHO the signal is, as one named-field bundle
+/// so the two build sites (register, rehydrate) cannot transpose a
+/// positional argument.
+pub struct SignalIdentity {
+    pub token: String,
+    pub tenant_id: String,
+    pub node_id: String,
+    /// True iff this is a mid-execution resume (HumanQuery, etc).
+    pub is_resume: bool,
+    /// Color of the suspended execution to resume. Set iff `is_resume`.
+    pub color: Option<String>,
+    /// The placement generation under which this pod holds the signal.
+    pub placement_generation: i64,
+    pub spec: SignalSpec,
+}
+
 /// Register a signal in the in-RAM registry. Single path for both
 /// register (fresh registration from the worker) and rehydrate (boot
 /// or post-deactivate reconciliation). Returns the routing and
@@ -185,19 +239,24 @@ pub enum RoutingSource {
 /// the Restore path the returned values are the same ones that came
 /// in.
 pub async fn register_in_registry(
-    token: String,
-    tenant_id: String,
-    spec: SignalSpec,
-    node_id: String,
-    is_resume: bool,
-    color: Option<String>,
-    placement_generation: i64,
+    identity: SignalIdentity,
     source: RoutingSource,
     registry: Arc<Registry>,
     sink: FireSignalSink,
     config: Arc<ListenerConfig>,
+    events_broker: Arc<weft_broker_client::BrokerEventsClient>,
 ) -> Result<(SignalRouting, Value)> {
+    let SignalIdentity {
+        token,
+        tenant_id,
+        node_id,
+        is_resume,
+        color,
+        placement_generation,
+        spec,
+    } = identity;
     let handler = handler_or_err(&spec.kind)?;
+    let fresh = matches!(source, RoutingSource::Mint { .. });
     let (routing, kind_state_owned) = match source {
         RoutingSource::Mint { secret_cache } => {
             let r = handler.compute_routing(&token, &spec, &secret_cache)?;
@@ -211,16 +270,25 @@ pub async fn register_in_registry(
     // enqueue is stamped with both. The pod has no single tenant, so
     // tenant travels with the signal; the generation lets the broker
     // fence a stale old-pod fire during a scale-down move overlap.
-    let task = handler
-        .spawn_task(
-            &token,
-            &tenant_id,
-            placement_generation,
-            &spec,
-            &kind_state_owned,
+    // The FireContext also carries the spec-level pre-fire filter, so
+    // every kind's events pass the same gate.
+    let serving = Arc::new(Mutex::new(ServingState::default()));
+    let ctx = SpawnCtx {
+        fire: FireContext::new(
             sink.clone(),
-            config.clone(),
-        )?
+            token.clone(),
+            tenant_id.clone(),
+            placement_generation,
+            spec.match_predicates.clone(),
+        ),
+        config: config.clone(),
+        events_broker,
+        fresh,
+        serving: serving.clone(),
+    };
+    let task = handler
+        .spawn_task(&spec, &kind_state_owned, ctx)
+        .await?
         .map(|h| Arc::new(TaskGuard::new(h)));
     registry.insert(
         token,
@@ -233,6 +301,7 @@ pub async fn register_in_registry(
             placement_generation,
             task,
             routing: routing.clone(),
+            serving,
         },
     );
     Ok((routing, kind_state_owned))
@@ -293,20 +362,58 @@ pub fn render(token: &str, registry: Arc<Registry>) -> Result<Option<Value>> {
 
 /// Display payload returned to the inspector. Pulls plaintext
 /// from `secret_cache` if the listener still holds one (which is
-/// only true for the same Pod that minted it; restart loses it).
+/// only true for the same Pod that minted it; restart loses it),
+/// and the LIVE serving state for the kinds whose task reports one
+/// (which transport serves the signal, what it is doing right now).
 pub fn compute_display(
     token: &str,
     sig: &RegisteredSignal,
     secret_cache: &Arc<DashMap<String, String>>,
 ) -> Value {
     let secret = secret_cache.get(token).map(|v| v.clone());
+    let serving = {
+        let s = sig.serving.lock();
+        if s.status.is_empty() && s.transport.is_none() {
+            Value::Null
+        } else {
+            serde_json::json!({
+                "state": s.status,
+                "transport": s.transport.as_ref().map(|t| match t {
+                    Transport::Socket => "socket",
+                    Transport::Webhook => "webhook",
+                    Transport::Unservable(_) => "unservable",
+                }),
+            })
+        }
+    };
     serde_json::json!({
         "surface": sig.routing.surface,
         "auth": sig.routing.auth,
         "secret": secret,
         "kind": sig.spec.kind,
         "config": sig.spec.config,
+        "serving": serving,
     })
+}
+
+/// Run a removed signal's kind-specific EXTERNAL teardown (anything
+/// held outside this process). Called by the unregister route after
+/// the registry entry is gone; detached from the answer, loud in
+/// logs on failure, kind-agnostic here (the kind decides what, if
+/// anything, to tear down).
+pub async fn on_unregister(
+    token: &str,
+    sig: &RegisteredSignal,
+    events_broker: &Arc<weft_broker_client::BrokerEventsClient>,
+) {
+    match lookup(&sig.spec.kind) {
+        Some(handler) => handler.on_unregister(token, sig, events_broker).await,
+        None => tracing::warn!(
+            target: "weft_listener::kinds",
+            %token, kind = %sig.spec.kind,
+            "unknown signal kind at unregister; skipping external teardown"
+        ),
+    }
 }
 
 /// Dispatch an /action. Looks up the kind's handler and delegates.
@@ -403,8 +510,10 @@ mod tests {
                 "form",
                 "live_socket",
                 "poll_endpoint",
+                "provider_events",
                 "socket_listen",
                 "sse_subscribe",
+                "stream_listen",
                 "timer",
             ],
             "listener handlers must cover every core kind; update this list when adding a kind"

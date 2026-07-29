@@ -52,6 +52,7 @@ use weft_core::storage::{
 };
 use weft_platform_traits::PresignAudience;
 
+use crate::auth::control_plane;
 use crate::runtime_store::{RuntimeStore, RuntimeStoreError};
 use crate::state::BrokerState;
 
@@ -158,16 +159,6 @@ async fn worker_caller(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<
             StatusCode::FORBIDDEN,
             "control-plane callers use the admin surface, not the data path".into(),
         )),
-    }
-}
-
-/// Resolve + require a control-plane caller for an admin request.
-async fn control_plane(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<(), ApiError> {
-    match crate::auth::resolve_storage_caller(state, headers, None).await? {
-        CallerAuth::ControlPlane => Ok(()),
-        CallerAuth::Worker { .. } => {
-            Err((StatusCode::FORBIDDEN, "the admin surface is dispatcher-only".into()))
-        }
     }
 }
 

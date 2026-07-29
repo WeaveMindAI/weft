@@ -1,0 +1,11 @@
+# The runtime drift backstop: this SlackAccess node ticks chat:write
+# (the recipe default), but the test seeds its grant row with FEWER
+# granted scopes, so resolution must refuse with the reconnect message
+# before any Slack call is made.
+
+ws = SlackAccess
+send = SlackSendMessage { text: "never sent" }
+send.account = ws.access
+
+out = Debug
+out.data = send.ts

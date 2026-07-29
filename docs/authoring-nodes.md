@@ -50,7 +50,7 @@ nodes/my_node/
   deps.toml           # optional: extra cargo deps beyond the codegen base
 ```
 
-The trait (in `weft_core`). A node implements up to three separately
+The trait (in `weft`). A node implements up to three separately
 named bodies, and the ENGINE picks which to call from the manifest; a
 node never inspects the lifecycle phase itself:
 
@@ -84,8 +84,8 @@ A complete minimal node (the stdlib `Text`):
 
 use async_trait::async_trait;
 
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
-use weft_core::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
 pub struct TextNode;
@@ -99,15 +99,19 @@ impl Node for TextNode {
 }
 ```
 
+(Everything a node body needs imports from the `weft` crate; it is the
+one author-facing name.)
+
 ### Reading values: `ctx.inputs`
 
 A node reads its named values from ONE bag: `ctx.inputs`. However an
 input got its value (a wire, a body literal, or the input's declared
-default), the node reads it here; every input name is unique on a node,
-so the read is always unambiguous. Precedence when several sources
-could supply a value: a wire or body literal wins, then the declared
-default. (A trigger's fire payload is the separate `ctx.wake` bag,
-below.)
+default), and whether it is a metadata-declared input or an
+INSTANCE-added custom port, the node reads it here; every input name is
+unique on a node, so the read is always unambiguous. Precedence when
+several sources could supply a value: a wire or body literal wins, then
+the declared default. (A trigger's fire payload is the separate
+`ctx.wake` bag, below.)
 
 Both bags expose the same accessors:
 
@@ -120,19 +124,21 @@ Both bags expose the same accessors:
   `.get(..).unwrap_or(..)`: it swallows a real type error.)
 - `.raw("name")`: the optional raw JSON for pass-through reads; a
   REQUIRED raw read is `.get::<Value>("name")?`.
-- `.iter()`: every named value, settings included.
-- `.custom()`: the instance's DATA inputs only: every value except the
-  node type's own metadata-declared settings. The accessor for nodes
-  that treat "whatever the user wired in" as a dynamic set (script
-  variables, form prefill); never re-filter your own setting names by
-  hand.
+- Three ITERATION projections (the named reads above cover every
+  input uniformly; these are only for looping without knowing names):
+  `.iter()` = every named value; `.declared()` = only the node type's
+  own metadata-declared settings; `.custom()` = only the instance's
+  extras (custom header ports, form-derived ports), the projection for
+  nodes that treat "whatever the user wired in" as a dynamic set
+  (script variables, form prefill).
 - `.object()?`: the whole bag as one `serde_json::Map`, for nodes that
   consume or forward it as a record. Always answers on inputs; on the
   wake bag it fails loud when the fire delivered no keyed record (a
   broken delivery can never pass as an empty one).
 
 File values are just types: `ctx.inputs.get::<FileHandle>("image")?`
-parses the file value and fails loud when it has no readable handle.
+parses the file value (loud when it has no readable handle), and the
+storage verbs take the parsed handle directly.
 
 ### Declaring inputs: exposure, widget, default
 
@@ -176,8 +182,9 @@ control, Boolean a checkbox, Number a number box, everything else a
 text area, with JSON typed as text for complex types). Declare a widget
 for a richer control: `select`/`multiselect` (with `options`), `code`
 (with `language`), `number` (with `min`/`max`/`step`, enforced by the
-editor's clamp and the compiler's `literal-out-of-range`), `api_key`
-(with `provider`), `password`, `form_builder`, `file_drop`.
+editor's clamp and the compiler's `literal-out-of-range`),
+`password`, `form_builder`, `file_drop`, and the connection surface
+(`access`, `remote_select`; see "Connections" below).
 
 `default` is the value the runtime supplies when nothing else drives
 the input. It is consulted at run time and rendered by the editor as
@@ -224,28 +231,27 @@ vs statement; locked to statement for `"assignment"` inputs).
   parser) turns its error into a node failure reading "doing X: ...";
   on an `Option`, `None` becomes a failure carrying the message
   verbatim. For a bad condition the node detects itself (nothing to
-  wrap), `weft_core::node_bail!("bridge rejected: {reason}")` fails the
+  wrap), `weft::node_bail!("bridge rejected: {reason}")` fails the
   node with that message in one statement; its expression cousin
   `node_error(message)` fits `map_err`/`ok_or_else` closures that build
   a rich message first. These are the only error doors: the accessors
   stamp input/config errors themselves, every ctx handle already
   returns `WeftResult`, and node code never names a `WeftError`
   variant.
-- `ctx.http()`: the shared, pooled HTTP client for plain (unpaid)
-  outbound calls. A PAID provider call goes through
-  `ctx.provider_access` + `ctx.metered_client` instead (that is what
-  records its cost).
+- `ctx.http()`: the shared, pooled HTTP client for plain outbound
+  calls. A call on a CONNECTION goes through `ctx.open` /
+  `ctx.client` instead (that is what signs it and records its cost).
 - Identity fields: `ctx.execution_id`, `ctx.project_id`, `ctx.node_id`,
   `ctx.node_type`, `ctx.node_label`, `ctx.color`, `ctx.frames`.
 
-`metadata.json` declares the surface (see `weft_core::NodeMetadata` for
+`metadata.json` declares the surface (see `weft::NodeMetadata` for
 every field): `type`, `label`, `description`, `category`, `tags`, `icon`,
 `color`, `inputs` (`{ name, type, required, exposure, widget, default,
 label, placeholder, description }`), `outputs` (`{ name, type, required,
 description }`), `requires_infra`, `images`, `features`, `validate`.
 
 `deps.toml` lists extra cargo dependencies beyond the always-available
-base (weft-core, tokio, serde, serde_json, async-trait, anyhow, tracing,
+base (weft, tokio, serde, serde_json, async-trait, anyhow, tracing,
 uuid):
 
 ```toml
@@ -501,7 +507,7 @@ anything special for cancel; the engine handles it.
 | Streaming receive (WS / SSE)            | Yes, instant        | Nothing                    |
 | Suspended via `await_signal`            | Yes (engine path)   | Nothing                    |
 | Subprocess                              | Process leaks       | `.kill_on_drop(true)`      |
-| Paid call (metered client)              | Yes, instant        | Nothing (the metering settles on its own) |
+| Measured call (a connection's client)   | Yes, instant        | Nothing (the metering settles on its own) |
 | CPU-bound `spawn_blocking`              | Future returns, thread leaks | Pass flag, poll `is_cancelled()` |
 | External resource needing cleanup       | Best effort         | `tokio::select!` branch on the flag |
 
@@ -510,102 +516,348 @@ only when you spawn a subprocess, run blocking CPU work, or hold a
 resource that needs explicit cleanup before drop, and treat that cleanup
 as best-effort (the abort races it).
 
-## Paid calls: the access and the metered client
+## Connections: the one way a node calls a third party
 
-A node that spends money on a third-party API (an LLM call, a search
-credit, an enrichment lookup) does exactly two things:
+`Access` is the weft port type for "authorized ability to call a third
+party". An **access node** owns the connect for a service and emits an
+`Access` value: a reference to a CONNECTION in the access store (the
+credential material, the granted permissions, the identity, which app
+was used; everything secret lives in the store, source carries an id
+and nothing else). Action nodes wire the value in and open it per
+firing:
 
 ```rust
-// 1. Your access to the provider: what to authenticate with. A key on
-//    the node's key input is the user's own; an empty input (or the
-//    platform sentinel) asks the runtime for its configured key
-//    (<PROVIDER>_API_KEY on the runtime's broker). Your code is the
-//    same lines either way; nothing branches.
-let access = ctx.provider_access("openrouter", ctx.inputs.opt("apiKey")?).await?;
+let account = ctx.inputs.get("account")?;      // Access (the reference)
+let conn = ctx.open(&account).await?;          // one resolve, one lease for this firing
 
-// 2. An ordinary HTTP client to make the calls with. Use it directly,
-//    or hand it to any library that accepts an injected client.
-let http = ctx.metered_client(&access)?;
+conn.client()       // -> &ClientWithMiddleware: signed in, measured when a meter exists
+conn.credential()?  // -> &str: ONLY when the sign-in is one string (a bearer key)
+```
 
-// An HTTP library: give it the credential and the client.
+`ctx.client(&account)` is sugar for the overwhelmingly common case
+(open + hand back the client), so a node that just makes HTTP calls is
+one line. When the node's body finishes (any outcome), the runtime
+releases the lease on its own; nothing node-facing closes it.
+
+For a service's realtime API, the same connection opens a WebSocket:
+
+```rust
+let mut session = conn.socket("wss://api.example.com/v1/realtime?model=m").await?;
+session.send(SocketMessage::Text(payload)).await?;
+while let Some(frame) = session.recv().await? { /* ... */ }
+session.close().await?;
+```
+
+Same rules as the client: the runtime signs the handshake (the
+credential rides the handshake only, never a frame), routes the
+session, and measures it when the service's meter prices sessions.
+Never hand-roll a socket client for a provider.
+
+**Secrets go through connections, never through config.** Never add a
+config field that asks the user to paste an API key, a token, or a
+password: node config and port values travel the execution journal and
+render in the inspector in plaintext, while a connection's values are
+sealed in the access store and only ever exist in the worker's memory while
+your node runs. If your service needs a pasted key, declare it as an
+access node with a paste acquisition (see
+[the access system](access-system.md)) and the whole problem
+disappears.
+
+**A node declares only which service it needs.** Whether calls are
+MEASURED follows from whether a price rule (a meter) is registered for
+that service; whether they are BILLED follows from who owns the stored
+credential (the user's own, or the runtime's). Neither is ever declared
+on the node, node code cannot tell, and the same node, same metadata,
+same source runs correctly in every combination.
+
+```rust
+// A library call: hand it the client (and the derived credential
+// where the library insists on a raw string).
 let generator = GeneratorInfo::openrouter(model)
-    .with_api_key(access.credential())
-    .with_http_client(http);
+    .with_api_key(conn.credential()?)
+    .with_http_client(conn.client().clone());
 
-// A hand-built request: same two values.
-let response = ctx.metered_client(&access)?
-    .post("https://api.tavily.com/search")
-    .bearer_auth(access.credential())
+// A hand-built request: just use the client.
+let response = conn.client()
+    .post("https://slack.com/api/chat.postMessage")
     .json(&body)
     .send()
     .await?;
 ```
 
-That is the whole surface: open the access, make the calls. **The runtime
-measures what each call really cost** (the provider's meter runs around the
-call, behind the client) and records it on the execution's cost trail. A
-node states no cost and has no way to; the number is always the runtime's
-measurement, so you cannot misbill no matter what your code does. A Stop
-mid-generation is equally not your problem: the metering outlives your
-future and still resolves the interrupted call's real cost.
-
-When the node's body finishes (any outcome), the runtime gives a
-runtime-granted access back on its own; nothing node-facing closes it.
-
 Rules that matter:
 
-- **Never construct your own HTTP client for a paid call**; always take it
-  from `ctx.metered_client(&access)`. A call on a hand-rolled client is
-  invisible to the cost trail, and a runtime-granted credential only
-  works through the metered client's routing. (A library that refuses an
-  injected client cannot be used for a paid call, and that is a smell in
-  that library.)
-- Address the provider's REAL API. The client does any routing a
-  runtime-granted access needs; your code never rewrites a URL for it.
-- Do not stash `.credential()` anywhere (an output port, a log, an error,
-  a struct that outlives the call).
-- A missing runtime key is a loud error naming the fix ("set your own
-  key"); do not paper over it.
-- On a runtime-granted access, requests do not follow redirects: a
-  provider that answers "go ask this other address instead" is an error,
-  not a second request. Every API we support answers directly. (A user's
-  own key is unaffected: those requests are yours.)
-- Sending media? Declare what you know about it on the media objects
-  (`AudioData::with_duration`, `ImageData::with_dimensions`, ...): it
-  sharpens the pre-flight cost estimate for the call. It never changes
-  what is actually billed (that is always the measured cost).
+- **Never construct your own HTTP client for a connection's calls**;
+  always take it from the opened connection. A call on a hand-rolled
+  client is invisible to the cost trail, and a runtime-supplied
+  credential only works through the connection client's routing.
+- Address the service's REAL API. The client does any routing a
+  runtime-supplied credential needs; your code never rewrites a URL.
+- Do not stash `.credential()` anywhere (an output port, a log, an
+  error, a struct that outlives the call). It exists for libraries
+  that insist on a raw string, nothing else, and it only exists at all
+  when the service's resolved auth is one step interpolating one
+  stored value; anything else fails loudly naming the service.
+- A refusal to supply the runtime's own credential is a loud error
+  naming the fix ("connect your own"); do not paper over it.
+- Redirects behave like any ordinary HTTP client's, on every lane:
+  followed, with the standard convention that the well-known
+  `Authorization`/cookie headers do not cross a host change. Nothing
+  weft-specific to learn.
+- Sending media on a measured call? Declare what you know about it on
+  the media objects (`AudioData::with_duration`,
+  `ImageData::with_dimensions`, ...): it sharpens the pre-flight cost
+  estimate. It never changes what is billed (always the measured cost).
 
-`provider_access` assumes your provider work fits the default window (15
-minutes): that is how long a runtime-granted credential is guaranteed
-usable if your node crashes without finishing. A node wrapping a genuinely
-long action declares its own:
-`ctx.provider_access_within(provider, key_input, Duration::from_secs(...))`.
+Every connection call (`ctx.client` included; it opens the connection
+for you) assumes your provider work fits the default window (15
+minutes): that is how long a runtime-supplied credential stays usable
+if your node crashes without finishing. On your own connected account
+the window changes nothing. A node wrapping a genuinely long action on
+a runtime-supplied credential declares its own:
+`ctx.open_within(&access, Duration::from_secs(...))`.
 
-### Which providers
+### Measuring: meters, keyed by service name
 
-The provider name you pass to `ctx.provider_access` is the key's identity:
-the runtime's key for it lives in `<NAME>_API_KEY` (uppercased). Any
-provider works with the user's own key. The runtime only supplies ITS
-configured key for providers whose spend it can measure: the ones weft
-ships a reviewed meter for.
+A meter is the small piece of code that measures what a call really
+cost, keyed by the SERVICE name; a registered meter for a service IS
+the declaration that its calls are measured. Weft ships meters for the
+services it supports, and **your project can define its own** for a
+service weft does not ship yet (it lives beside the nodes that call it,
+and works with your own connection right away). A meter never touches a
+credential (its follow-up queries ride a signed-in client), which is
+exactly why the same meter works on a pasted key and on a sign-in.
+Writing one, and getting a project's meter promoted to a weft-shipped
+one (so the platform keys in app.weavemind.ai can pay for it too), is
+all in `docs/authoring-provider-meters.md`.
 
-A meter is the small piece of code that measures what a call really cost.
-Weft ships meters for the providers it supports, and **your project can
-define its own meter** for a provider weft does not ship yet (it lives
-beside the nodes that call it, and works with your own key right away).
-Writing one, and getting a project's meter promoted to a weft-shipped one
-(so the platform keys in app.weavemind.ai can pay for it too), is all in
-`docs/authoring-provider-meters.md`.
+## The access node: a service is declared data
 
-The key input itself is an ordinary `config`-exposure input with the
-`api_key` widget, naming the provider so the editor renders the
-"Credits / Own key" choice:
+One node per service owns the connect. The whole feature is declared
+data: a service is an **`AccessSpec`** in the access node's
+`metadata.json` under the `service` key (how a credential is acquired,
+how requests are signed, the permission catalogue, how it is verified,
+how events arrive), and there is never per-service Rust. The runtime's
+access store owns the sign-in, the credential storage, and the lazy
+refresh; the node's body is a pure pass-through:
 
 ```jsonc
-// metadata.json, in inputs
-{ "name": "apiKey", "type": "String", "exposure": "config",
-  "widget": { "kind": "api_key", "provider": "tavily" }, "label": "API key" }
+// metadata.json (the shape; the recipe language reference is
+// docs/access-system.md)
+{
+  "type": "SlackAccess",
+  "service": {
+    "service": "slack",
+    "doors": ["shared", "own"],
+    "acquisition": { "kind": "oauth2", /* or "static", "mint_jwt" */ },
+    "auth": [ { "kind": "header", "name": "Authorization", "value": "Bearer {token}" } ],
+    "permissions": [ /* the catalogue, one human sentence each */ ],
+    "test": { "url": "https://slack.com/api/auth.test", "method": "POST" },
+    "identity": "{team}"
+  },
+  "inputs": [
+    { "name": "account", "type": "JsonDict", "exposure": "config",
+      "widget": { "kind": "access" }, "label": "Workspace" }
+  ],
+  "outputs": [ { "name": "access", "type": "Access" } ]
+}
 ```
+
+```rust
+// mod.rs: the WHOLE body. Every access node's body is the same
+// pass-through (the runtime sealed the handle + service into the bag
+// value), so it is one macro declaration and can never drift:
+weft::access_node!(SlackAccessNode);
+
+// A node whose access input is not named `account` names it:
+weft::access_node!(OpenRouterAccessNode, "connection");
+```
+
+The full recipe language (acquisition kinds, auth steps, doors and the
+"Your own" page, the verification ladder, event topics, the registered
+apps file) is **[docs/access-system.md](access-system.md)**; that page
+is the reference for writing a new service. Two authoring rules worth
+repeating here:
+
+- Templates interpolate STORED VALUES by name; the worker receives
+  everything the connection stores except the store's own keep-alive
+  material (refresh tokens, app secrets), whatever shape the
+  credential takes. A mechanism no declared step expresses becomes a
+  new typed variant in weft, never author code.
+- Non-HTTP credentials (a Postgres connection string, mTLS certs) do
+  NOT fit this model on purpose: take those as ordinary inputs.
+
+### The consumer node
+
+```rust
+let access = ctx.inputs.get("account")?;
+let repo: String = ctx.inputs.get("repo")?;
+let gh = ctx.client(&access).await?;   // fetch + lazy refresh + auth steps + metering
+gh.post(format!("https://api.github.com/repos/{repo}/issues")).json(&body).send().await.node_err("github")?;
+```
+
+Byte-identical across a pasted token, an OAuth grant, a minted
+installation token, and the runtime's own credential. A connection
+the provider revoked is a loud "needs reconnecting" error, never a
+silent retry.
+
+### Declaring what your node needs
+
+A consumer node states its needs on its access INPUT, and the checks
+run where the answer lives (live in the editor when a connection is
+picked, at connect, and at run-time resolution; there is deliberately
+no compile-time check, because source holds only a connection id):
+
+```jsonc
+{ "name": "account", "type": "Access", "required": true,
+  "requiresScopes": ["chat:write"],                 // permissions
+  "requiresValues": ["imap_host", "imap_port"] }    // stored values
+```
+
+- `requiresScopes`: declare ONLY what the node's own runtime calls
+  need on every path. A permission that only one `remote_select`
+  source needs (a browse-everything scope backing a `list` source)
+  belongs on that source's `requires`, never here, or it locks out
+  every connection that would have used the picker or a pasted link.
+  A VERIFIED shortfall is a hard error; a claimed/unknown one is let
+  through, because nobody actually knows (a pasted key on a service
+  that reports nothing must not be refused).
+- `requiresValues`: for services whose optional fields decide what a
+  connection can DO (a mailbox holding the incoming half, the
+  outgoing half, or both; the service declares the groups as
+  `capabilities`). Unlike a permission set the answer is never
+  unknown (a value is stored or it is not), so a shortfall ALWAYS
+  refuses, naming the value to add. Use this whenever one service's
+  optional fields unlock separate capabilities; do not build two
+  access nodes for one account.
+
+How permissions are recorded (verified vs claimed), the verification
+ladder, the `capabilities` rules, and grant coexistence
+(`coexisting` / `exclusive`) are all in
+[docs/access-system.md](access-system.md).
+
+### Working without a connection at all
+
+Some providers serve a link-shared resource with no sign-in at all:
+Google's spreadsheet CSV export, GitHub's normal API. **When a
+provider does, the node should support that path.** It costs the
+author little and turns "connect your Google account" into "paste the
+link" for the many people whose file is already shared. State the two
+limits in the same breath: it only ever works for a resource you
+already have the link to, never for browsing or searching, and it only
+exists where the provider genuinely serves anonymously (Google's
+export address and GitHub's API do; Notion and Airtable never do).
+
+Best case, one address serves BOTH worlds (GitHub's API answers with
+and without a token) and the body has no branch at all. Verify that
+before assuming it: Google's CSV export is anonymous-only (it is the
+browser's cookie endpoint and ignores a bearer token, answering 404
+for a private sheet), while its Sheets API is signed-in-only, so the
+sheets node branches on whether an account is connected. Both branches
+must answer identically (share the parsing).
+
+This needs no new metadata: an access input declared
+`"required": false` IS the declaration. `ctx.client` accepts the
+absent connection (`ctx.client(account.as_ref())` on an
+`Option<Access>`) and answers a plain client; on a `required: true`
+input an absent value is an ordinary missing-input error, never a
+quiet bare request. See `catalog/google/sheets_read` for the worked
+example: works signed in (Sheets API) and with nothing but a share
+link (public CSV export), one shared parsing step.
+
+### Picking resources: the `remote_select` widget
+
+A connection says WHICH ACCOUNT; almost every real node then needs
+WHICH THING in it (a spreadsheet, a channel, a repo). One field, a
+declared list of SOURCES in preference order; the editor uses the
+richest one the picked connection actually supports and silently drops
+each source whose requirement is not met:
+
+| kind | where the options come from | needs |
+|---|---|---|
+| `granted` | recorded on the connection during sign-in (`from` names the capture; `label`/`value` address one item) | nothing, no call |
+| `list` | call the service and enumerate (today's declarative lookup) | its `requires` permissions |
+| `picker` | the provider's own chooser, declared entirely by YOU (`script` + `code`, below); choosing GRANTS the picked resource | a connection |
+| `from_url` | paste a link; `pattern`'s first capture group is the id | nothing at all |
+
+`from_url` needing nothing is what leaves it standing with NO
+connection: the works-without-signing-in path. See
+`catalog/google/sheets_read` again for a field declaring all of
+`list` + `picker` + `from_url`:
+
+```jsonc
+{ "name": "spreadsheet", "type": "String", "required": true,
+  "widget": { "kind": "remote_select", "access": "account", "sources": [
+    { "kind": "list", "requires": ["https://www.googleapis.com/auth/drive.readonly"],
+      "get": "https://www.googleapis.com/drive/v3/files?...", "items": "files",
+      "label": "name", "value": "id",
+      "page": { "cursor_param": "pageToken", "cursor_path": "nextPageToken" } },
+    { "kind": "picker",
+      "script": "https://apis.google.com/js/api.js",
+      "code": "await new Promise((r) => gapi.load('picker', r)); ...",
+      "grants": ["https://www.googleapis.com/auth/drive.file"],
+      "mime_types": ["application/vnd.google-apps.spreadsheet"] },
+    { "kind": "from_url", "pattern": "/spreadsheets/d/([a-zA-Z0-9_-]+)" } ] } }
+```
+
+A `picker` is yours end to end, and it is the one place a node carries
+**browser JavaScript** (the same way an ExecPython node carries
+Python): your `mod.rs` stays pure Rust and never sees any of this. The
+fields:
+
+- `script`: the https address of the provider's own chooser library
+  (the URL their "embed our picker" docs tell every web developer to
+  load).
+- `code`: plain browser JavaScript you write, usually adapted straight
+  from the provider's own sample. It runs on a small page weft serves,
+  opened in the user's browser (the same pattern as the sign-in
+  consent), AFTER `script` has loaded, inside an async function, so
+  `await` works at the top level.
+- `grants`: the permissions that choosing through this chooser grants
+  on the picked resource, recorded on the connection when the pick
+  lands (Google's `drive.file`: the picker itself is what hands the
+  app access to that one file, so the grant only exists once a pick
+  happened).
+- `mime_types`: narrows the chooser to these MIME types, threaded to
+  your glue as `weft.mimeTypes`.
+
+Your code talks to weft through one object, `weft`, already in scope:
+
+| | |
+|---|---|
+| `weft.token` | the connection's access token (the user's own), the string you hand the chooser where its docs say "your OAuth token" |
+| `weft.clientId` | the PUBLIC client id of the OAuth app behind the connection, or `null` when no app made it (a pasted key). Some choosers require an app identifier (Google's picker needs `setAppId(weft.clientId.split('-')[0])`, its Cloud project number, or picking grants the app nothing and later reads 404) |
+| `weft.mimeTypes` | your declared `mime_types`, for choosers that filter |
+| `weft.done({id, label})` | the user picked this resource: the field fills with it |
+| `weft.cancel()` | the user closed the chooser without picking: the field closes quietly |
+| `weft.fail(message)` | the chooser could not work: `message` shows on the field in red |
+
+Call exactly one of the three enders; the first call wins and later
+ones are ignored. A thrown exception (or a rejected `await`) is caught
+and becomes `weft.fail` automatically, so an unexpected provider error
+still surfaces on the field instead of hanging it. The recipe for a
+new provider is therefore: open the provider's "picker/chooser embed"
+documentation, take their sample, replace their API key / token slot
+with `weft.token`, and route their picked/cancelled callbacks into
+`weft.done` / `weft.cancel`. See
+`catalog/google/sheets_read/metadata.json` for the complete Google
+Picker glue written exactly this way. No weft change is ever needed
+for a new provider's chooser; the declaration is the integration.
+
+One environment note: many choosers (Google's included) also lean on
+the provider's own browser session, which is exactly why the page
+opens in the user's real browser: their session is already there, and
+the chooser signs in on its own.
+
+The stored value is the bare id, which is exactly what your node
+reads and what the field's declared `String` type holds; the human
+label the editor shows is a display cache, never source. A pasted raw
+id is first-class; a
+runtime value arriving on the wire bypasses all of it. Note that a
+picked resource is as person-scoped as the connection itself: both are
+re-chosen when a project changes hands, and an unresolvable one is a
+loud node error, never a silent pointer to something the new owner
+cannot open.
 
 ## Durable execution: `await_signal`, `register_signal`, `ctx.run`
 
@@ -617,7 +869,7 @@ hours or days later.
 
 For a trigger's `setup_trigger` body. Tells the listener to watch for a
 wake signal. You pass a **typed signal kind** (one of the structs in
-`weft_core::signal`, see the kinds table below), not an untyped spec;
+`weft::signal`, see the kinds table below), not an untyped spec;
 the framework projects it onto the wire shape. Returns `()` once the
 dispatcher acknowledges. Each external fire later spawns a fresh
 execution of the project; this registration is NOT bound to the current
@@ -628,7 +880,7 @@ A trigger writes two bodies and never inspects any phase; the engine
 calls the right one:
 
 ```rust
-use weft_core::signal::{ApiEndpoint, LiveConnectionConfig};
+use weft::signal::{ApiEndpoint, LiveConnectionConfig};
 
 #[async_trait]
 impl Node for MyTriggerNode {
@@ -677,7 +929,7 @@ as structurally dead and proceeds with the firing one.
 A simpler kind takes its fields directly:
 
 ```rust
-use weft_core::signal::SseSubscribe;
+use weft::signal::SseSubscribe;
 
 ctx.register_signal(SseSubscribe {
     url: events_url,
@@ -687,7 +939,7 @@ ctx.register_signal(SseSubscribe {
 
 ### Wake-signal kinds
 
-Each kind is a struct in `weft_core::signal`. A node constructs one and
+Each kind is a struct in `weft::signal`. A node constructs one and
 passes it to `register_signal` (entry trigger) or `await_signal`
 (mid-flow resume).
 
@@ -703,6 +955,7 @@ fires a fresh execution per event):
 | `SseSubscribe { url, event_name }` | Holds a one-way Server-Sent-Events stream; fires per matching event. Receive-only. | A service that pushes an SSE feed (the WhatsApp bridge). |
 | `PollEndpoint { url, interval_secs }` | Hits a URL on a timer; fires with the response body. No held connection. | A "give me what's new" endpoint (a bot getUpdates loop). |
 | `SocketListen { url, handshake?, heartbeat?, heartbeat_secs }` | Holds a bidirectional WebSocket alive, sends an optional handshake on open and an optional heartbeat frame on a schedule; fires per inbound frame. | A gateway that needs login + keepalive or it drops you (Discord, Slack socket mode). The service-specific protocol (op-codes) is YOUR concern, expressed as the literal `handshake` / `heartbeat` frames. |
+| `StreamListen { address, framing, script, replies?, heartbeat?, fire }` | Holds a raw TCP/TLS pipe for services that speak neither HTTP nor WebSocket (IMAP, MQTT, Redis, XMPP). Runs a declared connect dialogue (send frame, wait for a matching line), cuts the byte stream by the declared framing (delimiter, length prefix, or varint prefix), and fires every unit matching the `fire` pattern. Text frames interpolate `{placeholders}` from the attached connection, so credentials ride the dialogue without sitting in the spec. | Any wire protocol. The watch is the trigger; the fired body then talks the protocol properly itself (fetch the mail, decode the packet) with its own library, where code is unrestricted. See `catalog/email/receive_email` for the worked example (IMAP IDLE). |
 
 **Inbound live-caller endpoints** (an outside caller dials IN and holds
 the connection; nodes talk back via `ctx.caller()`, see the live-caller
@@ -732,7 +985,7 @@ different frame stacks keep going independently. Like `register_signal`,
 it takes a typed `Signal` kind.
 
 ```rust
-use weft_core::signal::Form;
+use weft::signal::Form;
 
 async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
     let answer = ctx.await_signal(Form {
@@ -747,7 +1000,7 @@ async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
 }
 ```
 
-(The exact `Form` fields are in `weft_core::signal::Form`; the point is
+(The exact `Form` fields are in `weft::signal::Form`; the point is
 you pass the typed kind, not a wrapper spec. Whether a registration is a
 fresh entry or a resume is decided by which method you call,
 `register_signal` vs `await_signal`, not by a flag on the kind.)
@@ -870,6 +1123,85 @@ prior `await_signal` and `ctx.run` returns instantly from the
 journal.
 
 
+## Reacting to provider events: `ProviderEvents`
+
+A trigger that fires "when something happens at the service" (a Slack
+message, a Drive change, a mail arrival) registers ONE kind, whatever
+the service and however its events travel:
+
+```rust
+async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    let account: Access = ctx.inputs.get("account")?;
+    ctx.register_signal(ProviderEvents::new(&account, "messages", vec![
+        Predicate { field: "type".into(), op: PredicateOp::Eq, value: Some("message".into()) },
+        Predicate { field: "channel".into(), op: PredicateOp::Eq, value: Some(channel) },
+    ]))
+    .await
+}
+
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    // The wake payload is the event as the service's NAMED fields.
+    let data = serde_json::Value::Object(ctx.wake.object()?.clone());
+    ctx.pulse_downstream(ctx.fan_declared(&data)).await
+}
+```
+
+The parts, and where each one's knowledge lives:
+
+- **The connection** (`&account`) says whose events. The node never
+  picks a transport: whether weft holds an outbound line to the
+  service or the service pushes to weft's public events surface is
+  decided from what the connection can do, by the runtime. Same node
+  code everywhere.
+- **The topic** (`"messages"`) names one of the event topologies the
+  service's recipe declares (`service.events` in the access node's
+  metadata: the named fields of one event, which account it concerns,
+  and the transport recipes). One service may declare several
+  (`google` declares `drive_changes` and `mailbox`).
+- **The filters** are [`Predicate`]s over the topic's NAMED fields,
+  evaluated BEFORE anything fires, so a non-matching event costs no
+  execution. Translate the node's plain config inputs (a keyword box,
+  an include-bots checkbox) into predicates here; anything the
+  predicate grammar cannot say runs as ordinary code in `run`, after
+  the fire.
+- Topics whose subscribe call needs node-supplied values (the Drive
+  file to watch) pass them with `.with_params(...)`.
+
+Registration fails LOUDLY when the trigger cannot be served: the
+connection lacks a value the dial-out transport needs, or the install
+has no public address for a push-only service (the error names
+`./setup.sh --public-url` and docs/event-triggers.md). A trigger never
+activates into a silent dead state.
+
+Everything mechanical (holding the socket, acknowledging frames,
+verifying push signatures, subscribing/renewing/stopping provider-side
+watch channels) is the runtime's; a body that finds itself doing any
+of it is wrong.
+
+### One node per expectation, never an auto-detecting hybrid
+
+A node embodies ONE user expectation. When one capability serves two
+genuinely different expectations, they are two nodes, even when the
+machinery underneath is shared; a node that silently answers a
+different question depending on what was wired into it is convoluted,
+not convenient. The test is what the USER expects, not what the code
+does:
+
+- `GoogleSheetsRead` signed in vs public-link is ONE node: the
+  expectation ("read this sheet's rows") is identical either way;
+  only the mechanics differ.
+- `SlackReceiveMessage` (your bot, your workspace, a picked channel)
+  vs `SlackAppMessages` (you own the app as a product; every
+  install's messages, tagged with which workspace) are TWO nodes: the
+  same event stream, but different questions with different inputs
+  and different outputs. The subscription scope
+  (`ProviderEvents::app_wide()`) is how the app-owner node states
+  which one it is.
+
+Corollary: which TRANSPORT serves a trigger is never a node split
+(same expectation, environment decides); which SCOPE it subscribes at
+always is (different expectation, the node decides).
+
 ## Live caller connections: `ctx.caller()`
 
 The durable primitives above (`await_signal`) are a DISCONNECTED wait:
@@ -952,7 +1284,7 @@ window in normal use, so it does not hit this.
 ### Pattern: a WebSocket conversation
 
 ```rust
-use weft_core::caller::{InboundMessage, OutboundChunk};
+use weft::caller::{InboundMessage, OutboundChunk};
 
 async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
     // Caller present, WebSocket, connected; loud otherwise.
@@ -990,6 +1322,49 @@ seeds `LiveConnectionConfig`):
 
 A disconnect's meaning is derived purely from this one axis, there is no
 separate disconnect setting to contradict it.
+
+## Buses: live channels between co-alive nodes
+
+A bus is an in-process message channel: one node creates it and emits
+its marker on a `Bus`-typed output; downstream nodes resolve the marker
+and exchange messages in RAM. The producer ritual (create, emit the
+marker, register a name, and close on EVERY exit so readers never park
+forever) is one call, and so is the consuming side:
+
+```rust
+// Producer: the returned guard closes the bus when dropped.
+let bus = ctx.open_bus("channel", BusOptions::default(), "host").await?;
+bus.send("msg", json!("hello"))?;
+drop(bus); // the close IS the end-of-stream signal
+
+// Consumer that participates (registers + closes on exit):
+let bus = ctx.join_bus("channel", "guest")?;
+let mut cursor = bus.cursor();
+while let Some((from, value)) = cursor.next_json("msg").await? { /* ... */ }
+
+// Observer that must NOT close the bus (a debug tap):
+let bus = ctx.bus_from_input("channel")?;
+```
+
+`BusOptions` declares the channel's shape at creation, and every
+consumer reads it back off the handle (or the marker):
+
+- `payload`: what messages carry. `Json` (default) for chat-shaped
+  traffic; `Bytes` for media frames (`send_bytes` / `next_bytes`, raw
+  bytes end to end, no base64 between nodes). Frozen; the wrong shape
+  is refused loudly.
+- `meta`: creator-declared stream metadata (an audio stream's sample
+  rate and encoding), read via `bus.meta()`, so a consumer knows the
+  format before the first message instead of every frame repeating it.
+- `ephemeral`: `true` keeps payloads out of the journal entirely (a
+  sliding in-RAM window; a consumer that falls behind silently resumes
+  at the oldest retained frame) for streams where the bytes are
+  transient by nature.
+- `journal_window`: the journal granularity (default 1s). The pump
+  writes ONE journal row per bus per window: a journaled bus's window
+  carries every message in it (nothing lost, fewer rows), an ephemeral
+  one carries the rollup (count + bytes per sender/kind). What travels
+  the bus is untouched; this is only how the trail is stored.
 
 ## Storage: `ctx.storage`
 
@@ -1041,8 +1416,8 @@ The input's type (`Image`, `Audio`, `Video`, `Blob`, or the `File` union)
 drives the editor's file filter, validates drops, and is what gets written
 into source. A declared `"widget": { "kind": "file_drop", "accept": "image/png" }`
 narrows the filter further. The value is delivered on the input; the node
-reads it via `ctx.inputs.get`. (`exposure: "all"` opens the braces form; a
-file type's default is assignment-only.)
+reads it via `ctx.inputs.get::<FileHandle>`. (`exposure: "all"` opens the
+braces form; a file type's default is assignment-only.)
 
 What lands in source is ONE clean line, never a storage key:
 

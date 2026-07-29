@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::Color;
 
@@ -44,6 +43,64 @@ pub struct SignalSpec {
     /// `[A-Za-z0-9_-]{1,64}` (validated in `signal::to_spec`).
     #[serde(default, rename = "consumerKind", alias = "consumer_kind", skip_serializing_if = "Option::is_none")]
     pub consumer_kind: Option<String>,
+    /// The connection this signal acts AS, when it needs one: an
+    /// authed poll, a subscribed stream, a socket whose URL is minted
+    /// by an authenticated call. Kind-independent on purpose: the
+    /// listener resolves it through the broker at every use (each poll
+    /// cycle, each reconnect) and applies the service's auth steps to
+    /// whatever outbound call the kind makes, so no kind reimplements
+    /// signing in and no credential is ever frozen onto a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessRef>,
+    /// Pre-fire predicates over the payload the kind produced.
+    /// Evaluated by shared plumbing between "the kind has a payload"
+    /// and "a fire is enqueued", for every kind: filtering is one
+    /// concept, not a per-kind feature. Empty/absent = fire on
+    /// everything.
+    #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
+    pub match_predicates: Vec<crate::signal::Predicate>,
+}
+
+impl SignalSpec {
+    /// A spec carrying only a kind tag and its config: no connection,
+    /// no filter, no consumer label. The shape most callers building a
+    /// wire spec by hand want, and the one place the "everything else
+    /// is optional" default is written down.
+    pub fn of_kind(kind: impl Into<String>, config: Value) -> Self {
+        Self {
+            kind: kind.into(),
+            config,
+            consumer_kind: None,
+            access: None,
+            match_predicates: Vec::new(),
+        }
+    }
+}
+
+/// The stored connection a signal acts as; see [`SignalSpec::access`].
+/// Exactly the reference an [`crate::access::Access`] value carries
+/// (id + service), never a credential: the listener re-resolves it per
+/// use, behind the tenant wall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessRef {
+    pub id: String,
+    pub service: String,
+    /// The stored values the trigger's input declared it needs
+    /// (`requiresValues`), carried so the listener's resolve refuses a
+    /// connection missing one instead of dialing with a blank address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_values: Vec<String>,
+}
+
+impl From<&crate::access::Access> for AccessRef {
+    fn from(access: &crate::access::Access) -> Self {
+        Self {
+            id: access.access_id().to_string(),
+            service: access.service().to_string(),
+            required_values: access.required_values().to_vec(),
+        }
+    }
 }
 
 /// Where the signal lives on the public HTTP surface.
@@ -384,62 +441,6 @@ impl LoopWrite {
             LoopWrite::Closed => None,
         }
     }
-}
-
-/// How a value rides (or doesn't ride) in a journaled event: the full
-/// value, or metadata-only with the bytes kept elsewhere. A GENERAL
-/// payload mode reused by every feature with the journaled-vs-ephemeral
-/// tradeoff (the bus's `BusMessage`, the live caller's `Caller*` events,
-/// future high-volume streams), NOT bus-specific (hence the neutral name).
-///
-/// The tag distinguishes "journaled, payload IS Value::Null" from
-/// "ephemeral, payload not in journal". Default serde on `Option<Value>`
-/// collapses `Some(Value::Null)` and `None` to the same JSON form, so a
-/// `Some(Null)` payload (a node legitimately sending JSON null) would
-/// round-trip indistinguishable from an ephemeral message. The surrounding
-/// event carries `payload_byte_size` and `payload_sha256_prefix` so the
-/// inspector can render a stable identifier even on `Ephemeral`.
-// SYNC: JournaledPayload <-> packages/weft-graph/src/protocol.ts JournaledPayload
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum JournaledPayload {
-    /// Journaled mode: full payload (which may be `Value::Null`) rides in
-    /// the event so consumers can read history.
-    Journaled { value: Value },
-    /// Ephemeral mode: payload was stored in an in-RAM sliding window only;
-    /// the journal carries the metadata so the inspector can render it
-    /// without the value.
-    Ephemeral,
-}
-
-impl JournaledPayload {
-    pub fn value(&self) -> Option<&Value> {
-        match self {
-            JournaledPayload::Journaled { value } => Some(value),
-            JournaledPayload::Ephemeral => None,
-        }
-    }
-
-    pub fn into_value(self) -> Option<Value> {
-        match self {
-            JournaledPayload::Journaled { value } => Some(value),
-            JournaledPayload::Ephemeral => None,
-        }
-    }
-}
-
-/// The journaled metadata for a payload `Value`: its serialized byte size
-/// and the first 8 bytes of its SHA-256. ONE derivation shared by every
-/// journaled-event producer (the bus and the live-caller connection both
-/// stamp this on their events), so the size/hash shape can never drift
-/// between them. A `Value` always serializes, so the serialize cannot fail.
-pub fn payload_metadata(value: &Value) -> (u64, [u8; 8]) {
-    let bytes = serde_json::to_vec(value).expect("a serde_json::Value always serializes");
-    let size = bytes.len() as u64;
-    let digest = Sha256::digest(&bytes);
-    let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&digest[..8]);
-    (size, prefix)
 }
 
 /// Folded view of one live `LoopInstance`. The engine reads this on

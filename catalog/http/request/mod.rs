@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::Value;
 
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
-use weft_core::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
 pub struct HttpRequestNode;

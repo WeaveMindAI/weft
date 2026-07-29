@@ -1,0 +1,76 @@
+{
+  "type": "GitHubCreateIssue",
+  "label": "GitHub: Create Issue",
+  "description": "Open an issue on a repository. The repo picker searches the connected account's repositories, or paste a repo URL / owner/name directly.",
+  "category": "Data",
+  "tags": [
+    "github",
+    "issue",
+    "git"
+  ],
+  "icon": "Github",
+  "color": "#24292f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The GitHub access (wire a GitHubAccess or GitHubAppAccess node)."
+    },
+    {
+      "name": "repo",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "granted",
+            "from": "repositories",
+            "label": "full_name",
+            "value": "full_name"
+          },
+          {
+            "kind": "list",
+            "get": "https://api.github.com/search/repositories?q={query}%20user:@me&per_page=30",
+            "items": "items",
+            "label": "full_name",
+            "value": "full_name"
+          },
+          {
+            "kind": "from_url",
+            "pattern": "github\\.com/([^/\\s]+/[^/\\s?#]+)"
+          }
+        ]
+      },
+      "label": "Repository",
+      "placeholder": "owner/name"
+    },
+    {
+      "name": "title",
+      "type": "String",
+      "required": true,
+      "label": "Title"
+    },
+    {
+      "name": "body",
+      "type": "String",
+      "label": "Body"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "url",
+      "type": "String",
+      "required": false,
+      "description": "The created issue's web URL."
+    },
+    {
+      "name": "number",
+      "type": "Number",
+      "required": false,
+      "description": "The created issue's number."
+    }
+  ]
+}

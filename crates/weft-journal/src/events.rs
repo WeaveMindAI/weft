@@ -323,7 +323,7 @@ pub enum ExecEvent {
         /// Whose key the call spent: the user's own, or the platform's
         /// (app.weavemind.ai). Part of the money trail (a figure without "whose key" is
         /// half an answer).
-        origin: weft_core::AccessOrigin,
+        origin: weft_core::CredentialOwner,
         metadata: Value,
         at_unix: u64,
     },
@@ -385,21 +385,20 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
-    BusMessage {
+    /// One journal-aggregation window of a bus's messages: the pump
+    /// ships ONE row per bus per window (default 1s) instead of a row
+    /// per message. A journaled bus's `messages` carry every message
+    /// (boundaries, senders, payloads all kept); an ephemeral bus's
+    /// `messages` are empty and the `totals` rollup is the whole
+    /// journaled story. A quiet bus degenerates to one message per
+    /// window, so slow traffic reads exactly as before.
+    BusWindow {
         color: Color,
         bus_id: String,
-        offset: u64,
-        from: String,
-        msg_kind: String,
-        /// Tagged `Journaled { value }` vs `Ephemeral`. The earlier
-        /// shape used `Option<Value>` which silently conflated
-        /// `Some(Value::Null)` (a journaled bus where the body
-        /// legitimately sent `null`) with `None` (ephemeral; payload
-        /// not journaled). See `weft_core::primitive::JournaledPayload`.
-        payload: weft_core::primitive::JournaledPayload,
-        payload_byte_size: u64,
-        #[serde(with = "weft_core::hex_array8")]
-        payload_sha256_prefix: [u8; 8],
+        first_offset: u64,
+        last_offset: u64,
+        messages: Vec<weft_core::bus::WindowedBusMessage>,
+        totals: Vec<weft_core::bus::BusWindowTotal>,
         at_unix: u64,
     },
 
@@ -416,10 +415,10 @@ pub enum ExecEvent {
     // there is no `bus_id`: the color IS the connection's identity. The
     // exchange is recorded as a replayable per-color event stream the
     // graph view replays exactly like a bus. `offset` is the monotonic
-    // per-execution position in the caller stream. Message payloads reuse
-    // `JournaledPayload` (journaled = full value, ephemeral = metadata-only +
-    // sliding window) so a high-volume stream does not bloat the journal,
-    // identical to the bus's journaled-vs-ephemeral tradeoff.
+    // per-execution position in the caller stream. Message payloads use
+    // the same wire vocabulary as the bus's window rows
+    // (`weft_core::bus::WirePayload`: tagged json-or-base64-bytes), so
+    // every journaled exchange speaks one payload shape.
 
     /// The caller attached. The first event in any caller stream.
     CallerConnected {
@@ -431,26 +430,24 @@ pub enum ExecEvent {
     },
 
     /// A message arrived FROM the caller (HTTP request body, WS inbound).
+    // SYNC: CallerInbound <-> crates/weft-dispatcher/src/events.rs CallerInbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'inbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_inbound'
     CallerInbound {
         color: Color,
         offset: u64,
-        payload: weft_core::primitive::JournaledPayload,
+        payload: weft_core::bus::WirePayload,
         payload_byte_size: u64,
-        #[serde(with = "weft_core::hex_array8")]
-        payload_sha256_prefix: [u8; 8],
         at_unix: u64,
     },
 
     /// A message went TO the caller (HTTP write/respond chunk, WS send).
     /// `terminal` marks the final outbound (HTTP respond/close, WS close)
     /// so the inspector renders "* the response completed here".
+    // SYNC: CallerOutbound <-> crates/weft-dispatcher/src/events.rs CallerOutbound, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'outbound', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_outbound'
     CallerOutbound {
         color: Color,
         offset: u64,
-        payload: weft_core::primitive::JournaledPayload,
+        payload: weft_core::bus::WirePayload,
         payload_byte_size: u64,
-        #[serde(with = "weft_core::hex_array8")]
-        payload_sha256_prefix: [u8; 8],
         terminal: bool,
         at_unix: u64,
     },
@@ -537,7 +534,7 @@ impl ExecEvent {
             | Self::ExecutionCancelled { color, .. }
             | Self::BusJoined { color, .. }
             | Self::BusLeft { color, .. }
-            | Self::BusMessage { color, .. }
+            | Self::BusWindow { color, .. }
             | Self::BusClosed { color, .. }
             | Self::CallerConnected { color, .. }
             | Self::CallerInbound { color, .. }
@@ -574,7 +571,7 @@ impl ExecEvent {
             Self::ExecutionCancelled { .. } => "execution_cancelled",
             Self::BusJoined { .. } => "bus_joined",
             Self::BusLeft { .. } => "bus_left",
-            Self::BusMessage { .. } => "bus_message",
+            Self::BusWindow { .. } => "bus_window",
             Self::BusClosed { .. } => "bus_closed",
             Self::CallerConnected { .. } => "caller_connected",
             Self::CallerInbound { .. } => "caller_inbound",
@@ -1207,7 +1204,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
             | ExecEvent::ExecutionCancelled { .. }
             | ExecEvent::BusJoined { .. }
             | ExecEvent::BusLeft { .. }
-            | ExecEvent::BusMessage { .. }
+            | ExecEvent::BusWindow { .. }
             | ExecEvent::BusClosed { .. }
             | ExecEvent::CallerConnected { .. }
             | ExecEvent::CallerInbound { .. }
@@ -2316,7 +2313,7 @@ mod fold_pulse_tests {
 mod caller_event_wire_tests {
     use super::*;
     use uuid::Uuid;
-    use weft_core::primitive::JournaledPayload;
+    use weft_core::bus::WirePayload;
 
     fn color() -> Color {
         Uuid::nil()
@@ -2348,25 +2345,21 @@ mod caller_event_wire_tests {
     }
 
     #[test]
-    fn inbound_journaled_and_ephemeral_round_trip() {
+    fn inbound_json_and_null_round_trip() {
         round_trip(ExecEvent::CallerInbound {
             color: color(),
             offset: 1,
-            payload: JournaledPayload::Journaled {
-                value: serde_json::json!({"q": "hi"}),
-            },
+            payload: WirePayload::Json(serde_json::json!({"q": "hi"})),
             payload_byte_size: 10,
-            payload_sha256_prefix: [1, 2, 3, 4, 5, 6, 7, 8],
             at_unix: 8,
         });
-        // Ephemeral mode: metadata only, no value; must not collapse with
-        // a journaled null.
+        // A literal JSON null payload is a real value and must survive
+        // the round trip (the tagged wire shape keeps it explicit).
         round_trip(ExecEvent::CallerInbound {
             color: color(),
             offset: 2,
-            payload: JournaledPayload::Ephemeral,
-            payload_byte_size: 999,
-            payload_sha256_prefix: [9; 8],
+            payload: WirePayload::Json(serde_json::Value::Null),
+            payload_byte_size: 4,
             at_unix: 9,
         });
     }
@@ -2376,11 +2369,8 @@ mod caller_event_wire_tests {
         round_trip(ExecEvent::CallerOutbound {
             color: color(),
             offset: 3,
-            payload: JournaledPayload::Journaled {
-                value: serde_json::json!("chunk"),
-            },
+            payload: WirePayload::Json(serde_json::json!("chunk")),
             payload_byte_size: 5,
-            payload_sha256_prefix: [0; 8],
             terminal: true,
             at_unix: 10,
         });
@@ -2432,8 +2422,8 @@ mod caller_event_wire_tests {
             },
             ExecEvent::CallerInbound {
                 color: color(), offset: 1,
-                payload: JournaledPayload::Ephemeral,
-                payload_byte_size: 1, payload_sha256_prefix: [0; 8], at_unix: 1,
+                payload: WirePayload::Json(serde_json::json!("hi")),
+                payload_byte_size: 4, at_unix: 1,
             },
             ExecEvent::CallerDisconnected {
                 color: color(), offset: 2, reason: "done".into(), at_unix: 2,

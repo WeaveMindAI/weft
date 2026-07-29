@@ -214,6 +214,10 @@ fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 /// - K8s (real cluster): the operator MUST set
 ///   WEFT_DISPATCHER_PUBLIC_BASE_URL to the external ingress host;
 ///   WEFT_LOCAL_DEV is empty, so a loopback there fails loud.
+/// - WEFT_DISPATCHER_INTERNET_URL is the ADDITIONAL internet-reachable
+///   address (the public tunnel mints it), never a replacement: the
+///   base URL keeps every local surface stable, and only the surfaces
+///   the open internet must reach prefer this one.
 async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, String)>> {
     check_cidr(&cfg.service_cidr, true)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
@@ -221,6 +225,30 @@ async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_POD_CIDR='{}': {e}", cfg.pod_cidr))?;
     let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
+
+    // The broker's egress denies every private range so an access
+    // outbound call reaches external services only. An object store
+    // that sits on a private range opens exactly that range here; the
+    // default is a benign public /32 that re-permits nothing (a store
+    // reached over a public S3 endpoint stays at the default).
+    let store_allow_cidr =
+        std::env::var("WEFT_STORE_ALLOW_CIDR").unwrap_or_else(|_| "192.0.2.0/32".into());
+    check_cidr(&store_allow_cidr, false)
+        .map_err(|e| anyhow::anyhow!("WEFT_STORE_ALLOW_CIDR='{store_allow_cidr}': {e}"))?;
+
+    // The one extra private CIDR a listener's watch URLs may dial. On
+    // kind it defaults to the operator's own machine (the docker
+    // network gateway), so a trigger can watch a service running right
+    // there; on a real cluster it defaults to a benign unused /32.
+    let listener_allow_cidr = match std::env::var("WEFT_LISTENER_ALLOW_CIDR") {
+        Ok(v) => v,
+        Err(_) => match cfg.backend {
+            ClusterBackend::Kind => format!("{}/32", kind_network_gateway_ipv4().await?),
+            ClusterBackend::K8s => "192.0.2.0/32".into(),
+        },
+    };
+    check_cidr(&listener_allow_cidr, false)
+        .map_err(|e| anyhow::anyhow!("WEFT_LISTENER_ALLOW_CIDR='{listener_allow_cidr}': {e}"))?;
 
     let (public_base_url, local_dev) = match cfg.backend {
         ClusterBackend::Kind => {
@@ -311,8 +339,17 @@ async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str
     Ok(vec![
         ("WEFT_CLUSTER_SERVICE_CIDR", cfg.service_cidr.clone()),
         ("WEFT_CLUSTER_POD_CIDR", cfg.pod_cidr.clone()),
+        ("WEFT_STORE_ALLOW_CIDR", store_allow_cidr),
+        ("WEFT_LISTENER_ALLOW_CIDR", listener_allow_cidr),
         ("WEFT_APISERVER_CLUSTERIP", apiserver_ip),
         ("WEFT_DISPATCHER_PUBLIC_BASE_URL", public_base_url),
+        // The ADDITIONAL internet-reachable address (the public
+        // tunnel's minted URL), empty when none: the base URL above
+        // stays the stable local address either way.
+        (
+            "WEFT_DISPATCHER_INTERNET_URL",
+            std::env::var("WEFT_DISPATCHER_INTERNET_URL").unwrap_or_default(),
+        ),
         ("WEFT_LOCAL_DEV", local_dev),
         ("GATEWAY_HOST", gateway_host),
         ("WEFT_GATEWAY_BASE_URL", gateway_base_url),
@@ -346,19 +383,25 @@ fn apiserver_clusterip(service_cidr: &str) -> std::result::Result<String, String
 }
 
 pub enum DaemonAction {
-    Start { rebuild: bool },
+    Start { rebuild: bool, public_url: Option<bool> },
     Stop,
     Status,
-    Restart { rebuild: bool },
+    Restart { rebuild: bool, public_url: Option<bool> },
     Logs { tail: usize, follow: bool },
 }
 
 pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Start { rebuild } => start(&ctx, rebuild).await,
+        DaemonAction::Start { rebuild, public_url } => {
+            set_public_url_choice(public_url)?;
+            start(&ctx, rebuild).await
+        }
         DaemonAction::Stop => stop().await,
         DaemonAction::Status => status(&ctx).await,
-        DaemonAction::Restart { rebuild } => restart(&ctx, rebuild).await,
+        DaemonAction::Restart { rebuild, public_url } => {
+            set_public_url_choice(public_url)?;
+            restart(&ctx, rebuild).await
+        }
         DaemonAction::Logs { tail, follow } => logs(tail, follow).await,
     }
 }
@@ -406,16 +449,28 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // idempotent: unchanged manifests are no-ops at the
     // kube-apiserver layer (resourceVersion match).
     let manifests_changed = apply_static_manifests(cfg).await?;
-    // Re-pack the operator's provider keys on every restart; a changed
-    // key set rolls the broker below (env is read at pod start).
-    let provider_keys_changed = apply_provider_keys_secret(cfg).await?;
+    // Re-pack the sealing key on every restart; a change rolls the
+    // dispatcher and broker below (env is read at pod start). Provider
+    // keys ride the access-apps secret (a mounted file, re-read per
+    // lookup: no rollout needed for a key edit).
+    let sealing_key_changed = apply_sealing_key_secret(cfg).await?;
+    // The OAuth apps file rides along. It mounts as a FILE and is read
+    // per lookup: a content EDIT of an already-mounted secret needs no
+    // rollout (the kubelet refreshes the mount in place), but a secret
+    // CREATED after the broker pod started never attaches to the
+    // running pod (optional secret volumes are not retroactively
+    // mounted), so a change here rolls the broker below.
+    let apps_changed = apply_access_apps_secret(cfg).await?;
 
+    // The apps file mounts on the BROKER alone, so on its own it rolls
+    // only the broker (below, after this block); everything else here
+    // needs the dispatcher-first rollout order.
     if dispatcher_built
         || listener_built
         || broker_built
         || supervisor_built
         || manifests_changed
-        || provider_keys_changed
+        || sealing_key_changed
     {
         if cfg.backend == ClusterBackend::Kind {
             // System tags are reused (`:local`), so tag presence on the
@@ -463,7 +518,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         //     dispatcher created dynamically (same rationale as listeners).
         let db_namespace = cfg.db_namespace.to_string();
         let broker_rollout = async move {
-            if broker_built || provider_keys_changed {
+            if broker_built || sealing_key_changed || apps_changed {
                 let _ = kubectl(&[
                     "-n", &db_namespace, "rollout", "restart", "deployment/weft-broker",
                 ])
@@ -490,6 +545,23 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
             supervisor_rollout,
         )?;
         println!("daemon refreshed; new image / manifests rolled out");
+    } else if apps_changed {
+        // Only the shared-credentials secret changed: the file mounts on
+        // the broker alone, so roll just it and leave the dispatcher
+        // (and its port-forwards) untouched.
+        let status = kubectl(&[
+            "-n",
+            &cfg.db_namespace,
+            "rollout",
+            "restart",
+            "deployment/weft-broker",
+        ])
+        .status()
+        .await?;
+        if !status.success() {
+            anyhow::bail!("broker rollout restart failed");
+        }
+        println!("shared-credentials secret changed; broker rolled to mount it");
     } else {
         // Nothing to roll out, but a port-forward the daemon owns may be missing
         // or dead: a background `kubectl port-forward` dies if its pod restarts out
@@ -609,6 +681,26 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     let repo_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let manifests = repo_root.join("deploy/k8s");
+    let template_vars = manifest_template_vars(cfg).await?;
+    let mut any_changed = false;
+    // Namespaces first: everything below (the tunnel included) lands
+    // inside them, and on a fresh cluster they do not exist yet.
+    for name in ["system-namespace.yaml", "db-namespace.yaml"] {
+        any_changed |= kubectl_apply_changed(&manifests.join(name), &template_vars).await?;
+    }
+    // The public tunnel next, when opted in: its minted address is an
+    // ADDITIONAL internet-reachable door, substituted into the
+    // dispatcher + broker manifests below. It never replaces the base
+    // URL: everything local (the OAuth callback, storage links) keeps
+    // the stable loopback address, and only the surfaces the open
+    // internet must reach (event pushes, activation URLs) prefer the
+    // tunnel.
+    let tunnel_url = reconcile_public_tunnel(&manifests).await?;
+    if let Some(url) = &tunnel_url {
+        // The template var reader consults the env; the tunnel's
+        // address takes the same seat an operator override would.
+        std::env::set_var("WEFT_DISPATCHER_INTERNET_URL", url);
+    }
     // broker + dispatcher carry ${...} placeholders (CIDRs, and for
     // the dispatcher the public base URL + local-dev flag), all
     // substituted from `template_vars`; the others have no
@@ -619,8 +711,11 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     // dispatcher creates at first infra apply. Cluster-scoped; in the
     // rolling-apply list so RBAC drift (e.g. the supervisor's surface
     // growing) stays in sync.
+    //
+    // Recomputed here (not reused from the namespace pass) because the
+    // tunnel's address just landed in the env above and the dispatcher
+    // manifest interpolates it.
     let template_vars = manifest_template_vars(cfg).await?;
-    let mut any_changed = false;
     for name in [
         "system-namespace.yaml",
         "db-namespace.yaml",
@@ -636,7 +731,8 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     ] {
         // Every manifest goes through the same applier with the
         // template vars; substitution is a no-op for the manifests
-        // without placeholders (broker + dispatcher are the only ones).
+        // without placeholders (system-namespace, broker, dispatcher,
+        // gateway carry them).
         any_changed |= kubectl_apply_changed(&manifests.join(name), &template_vars).await?;
     }
     Ok(any_changed)
@@ -645,6 +741,124 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
 pub fn data_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     home.join(".local/share/weft")
+}
+
+// ----- The opt-in public trigger surface ------------------------------
+//
+// `--public-url` runs a filtering proxy + an outbound tunnel inside
+// the cluster (deploy/k8s/public-tunnel.yaml) so a local install gets
+// a public https address for exactly its public trigger surface
+// (`/events/...`, `/signal/...`) and nothing else. The choice is
+// PERSISTED (a marker file) so every later daemon start keeps it
+// until `--no-public-url`.
+
+fn public_url_marker() -> PathBuf {
+    data_dir().join("public-url-enabled")
+}
+
+/// Where the live public address is recorded, so anything that needs
+/// it after the daemon ran (the installer's summary, `daemon status`)
+/// reads ONE place instead of re-deriving it from pod logs.
+fn public_url_file() -> PathBuf {
+    data_dir().join("public-url")
+}
+
+/// The public address this install currently answers at, or `None`
+/// when the surface is closed.
+pub fn current_public_url() -> Option<String> {
+    if !public_url_enabled() {
+        return None;
+    }
+    std::fs::read_to_string(public_url_file())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Record the operator's choice when the flag was given; keep the
+/// persisted one when it was not.
+fn set_public_url_choice(choice: Option<bool>) -> Result<()> {
+    match choice {
+        None => Ok(()),
+        Some(true) => {
+            std::fs::create_dir_all(data_dir())?;
+            std::fs::write(public_url_marker(), b"")?;
+            Ok(())
+        }
+        Some(false) => {
+            match std::fs::remove_file(public_url_marker()) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+}
+
+fn public_url_enabled() -> bool {
+    public_url_marker().exists()
+}
+
+/// Bring the tunnel + filtering proxy up (or tear them down) to match
+/// the persisted choice, and answer the public https address when one
+/// is up. The address is read from the tunnel's own logs: a quick
+/// tunnel mints a RANDOM address per start, so the logs are the only
+/// authority.
+async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<String>> {
+    let manifest = manifests.join("public-tunnel.yaml");
+    if !public_url_enabled() {
+        // Idempotent teardown; nothing to report when it was never up.
+        let _ = kubectl(&["delete", "-f", manifest.to_str().unwrap(), "--ignore-not-found"])
+            .output()
+            .await;
+        let _ = std::fs::remove_file(public_url_file());
+        return Ok(None);
+    }
+    let status = kubectl(&["apply", "-f", manifest.to_str().unwrap()]).status().await?;
+    if !status.success() {
+        anyhow::bail!("applying the public tunnel manifest failed");
+    }
+    let url = wait_for_tunnel_url().await?;
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(public_url_file(), &url)?;
+    println!("public trigger surface reachable at {url}");
+    println!("  exposed through the filtering proxy: /events/... (provider event pushes) and /signal/... (per-signal fire tokens); everything else answers 404.");
+    println!("  Rerun with --no-public-url to close it.");
+    println!("  NOTE: this address changes whenever the tunnel restarts; re-run the daemon start to re-wire active triggers after one.");
+    Ok(Some(url))
+}
+
+/// The tunnel address, from the cloudflared pod's logs. The quick
+/// tunnel prints its minted `https://<random>.trycloudflare.com` a
+/// few seconds after start; poll the logs until it shows.
+async fn wait_for_tunnel_url() -> Result<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let out = kubectl(&[
+            "-n",
+            "weft-system",
+            "logs",
+            "deployment/weft-tunnel",
+            "--tail",
+            "200",
+        ])
+        .output()
+        .await?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(url) = text
+            .split_whitespace()
+            .find(|w| w.starts_with("https://") && w.contains(".trycloudflare.com"))
+        {
+            return Ok(url.trim_end_matches('/').to_string());
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "the tunnel never reported its public address.\n\
+                 Check its logs: `kubectl -n weft-system logs deployment/weft-tunnel`"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// A background `kubectl port-forward` the daemon owns. Each forward
@@ -784,7 +998,11 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     let repo_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let manifests = repo_root.join("deploy/k8s");
-    kubectl_apply_file(&manifests.join("system-namespace.yaml")).await?;
+    // system-namespace carries cluster-specific placeholders (the
+    // dispatcher's and pooled listener's egress-NetworkPolicy CIDRs +
+    // apiserver ClusterIP), so it goes through the templated applier.
+    let template_vars = manifest_template_vars(cfg).await?;
+    kubectl_apply_templated(&manifests.join("system-namespace.yaml"), &template_vars).await?;
     kubectl_apply_file(&manifests.join("db-namespace.yaml")).await?;
     // No per-tenant namespace exists anymore: storage is a shared pooled
     // pod in the control-plane namespace (placed lazily on first write),
@@ -797,10 +1015,11 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // dispatcher's CIDRs + public base URL + local-dev flag);
     // substitute them so a non-kind operator sets them once via env
     // instead of hand-editing manifests.
-    let template_vars = manifest_template_vars(cfg).await?;
-    // Provider keys before the broker: its pods import the secret via
-    // `envFrom` at start, so it must exist when they come up.
-    apply_provider_keys_secret(cfg).await?;
+    // Provider keys + OAuth apps before the broker: its pods import the
+    // key secret via `envFrom` and MOUNT the apps secret at start, so
+    // both must exist when they come up.
+    apply_sealing_key_secret(cfg).await?;
+    apply_access_apps_secret(cfg).await?;
     kubectl_apply_templated(&manifests.join("broker.yaml"), &template_vars).await?;
     wait_for_deployment_ready_in_ns("weft-broker", &cfg.db_namespace).await?;
     kubectl_apply_templated(&manifests.join("dispatcher.yaml"), &template_vars).await?;
@@ -902,6 +1121,16 @@ async fn status(ctx: &Ctx) -> Result<()> {
         Err(e) => {
             println!("daemon: unreachable at {}: {e}", ctx.client().base());
         }
+    }
+    // The public trigger surface, when it is open: what providers
+    // deliver events to, and what a trigger's setup instructions ask
+    // the operator to paste at the provider.
+    match current_public_url() {
+        Some(url) => println!(
+            "public trigger surface: {url} (events + signal fire routes only; \
+             ./setup.sh --no-public-url closes it)"
+        ),
+        None => println!("public trigger surface: closed"),
     }
     Ok(())
 }
@@ -1583,29 +1812,83 @@ async fn kubectl_apply_stdin(manifest: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pack every `<PROVIDER>_API_KEY` in the CLI's environment (the shell,
-/// or the `.env` the CLI loaded at startup) into the
-/// `weft-provider-keys` Secret the broker imports via `envFrom`: a key
-/// set on the operator's machine IS the broker's key for that
-/// provider. Applied on every daemon start/restart so added and removed
-/// keys both propagate. Returns whether the key set changed since the
-/// last apply (the broker reads env at pod start, so a change needs a
-/// broker rollout).
-async fn apply_provider_keys_secret(cfg: &ClusterConfig) -> Result<bool> {
+/// Pack `CREDENTIAL_ENCRYPTION_KEY` (the access store's at-rest sealing
+/// key, from the shell or the `.env` the CLI loaded) into the
+/// `weft-sealing-key` Secret. Dispatcher and broker both open sealed
+/// rows, so it is applied in BOTH namespaces (Secrets are
+/// namespace-scoped) on every daemon start/restart. Provider API keys
+/// are NOT env-packed: the runtime's own keys are `api_key` entries in
+/// the shared-credentials file, which ships whole via
+/// [`apply_access_apps_secret`]. Returns whether the key changed since
+/// the last apply (pods read env at start, so a change needs a rollout).
+async fn apply_sealing_key_secret(cfg: &ClusterConfig) -> Result<bool> {
     let keys: std::collections::BTreeMap<String, String> = std::env::vars()
-        .filter(|(name, value)| name.ends_with("_API_KEY") && !value.is_empty())
+        .filter(|(name, value)| name == "CREDENTIAL_ENCRYPTION_KEY" && !value.is_empty())
         .collect();
+    let mut changed = false;
+    for namespace in [&cfg.db_namespace, &cfg.system_namespace] {
+        let secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "weft-sealing-key", "namespace": namespace },
+            "type": "Opaque",
+            "stringData": &keys,
+        })
+        .to_string();
+        kubectl_apply_stdin(&secret, "weft-sealing-key secret").await?;
+        changed |= manifest_apply_changed_by_stamp(
+            Path::new(&format!("sealing-key-secret-{namespace}")),
+            &secret,
+        );
+    }
+    Ok(changed)
+}
+
+/// The OAuth apps file, packed into the `weft-access-apps`
+/// Secret the broker mounts. `WEFT_ACCESS_APPS_FILE` (the shell, or the
+/// `.env` the CLI loaded) names it; the default is `access-apps.json`
+/// in the working directory. Absent = an empty secret, so the broker
+/// simply has no apps configured and every service needs a
+/// project-declared one. Returns whether the secret's content changed
+/// since the last apply. The kubelet's in-place mount refresh only
+/// works for a secret that already existed when the pod started; a
+/// secret created AFTER the pod started never mounts into the running
+/// pod, so a change here must roll the broker.
+/// A file that IS named but unreadable is loud:
+/// silently shipping no apps would surface later as a confusing
+/// "no app configured" on a node the operator thought was set up.
+async fn apply_access_apps_secret(cfg: &ClusterConfig) -> Result<bool> {
+    let path = std::env::var(weft_core::access::spec::APPS_FILE_ENV)
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "access-apps.json".to_string());
+    let explicit = std::env::var(weft_core::access::spec::APPS_FILE_ENV).is_ok();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::new(e)).with_context(|| {
+                format!("read access apps file '{path}' (from WEFT_ACCESS_APPS_FILE)")
+            })
+        }
+    };
     let secret = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": { "name": "weft-provider-keys", "namespace": cfg.db_namespace },
+        "metadata": { "name": "weft-access-apps", "namespace": cfg.db_namespace },
         "type": "Opaque",
-        "stringData": keys,
+        "stringData": { ACCESS_APPS_SECRET_KEY: contents },
     })
     .to_string();
-    kubectl_apply_stdin(&secret, "weft-provider-keys secret").await?;
-    Ok(manifest_apply_changed_by_stamp(Path::new("provider-keys-secret"), &secret))
+    kubectl_apply_stdin(&secret, "weft-access-apps secret").await?;
+    Ok(manifest_apply_changed_by_stamp(Path::new("access-apps-secret"), &secret))
 }
+
+/// The key the apps json is stored under in the secret, and therefore
+/// the file name it mounts as in the broker pod.
+// SYNC: ACCESS_APPS_SECRET_KEY <-> deploy/k8s/broker.yaml (volume subPath +
+//       WEFT_ACCESS_APPS_FILE)
+const ACCESS_APPS_SECRET_KEY: &str = "access-apps.json";
 
 /// Per-manifest content stamp: returns true iff `manifest` differs from the
 /// last applied content for `path` (or there is no prior stamp). Mirrors the

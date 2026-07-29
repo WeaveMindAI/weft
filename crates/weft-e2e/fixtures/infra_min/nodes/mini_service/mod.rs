@@ -9,12 +9,12 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::infra::{
+use weft::infra::{
     Container, ContainerPort, Endpoint, Expose, Image, InfraSpec, Probe, Protocol, Resources, Unit,
     UnitKind,
 };
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct MiniServiceNode;
@@ -86,7 +86,7 @@ impl Node for MiniServiceNode {
 /// that is genuinely down still fails loudly (the retry only smooths the
 /// brief post-Ready network-warmup window, it never hides a real outage).
 async fn call_with_warmup_retry(
-    api: &weft_core::EndpointHandle,
+    api: &weft::EndpointHandle,
 ) -> WeftResult<Value> {
     use std::time::{Duration, Instant};
     const WARMUP_DEADLINE: Duration = Duration::from_secs(30);
@@ -94,7 +94,7 @@ async fn call_with_warmup_retry(
     let start = Instant::now();
     loop {
         match api
-            .call(weft_core::EndpointMethod::Get, "/outputs", None)
+            .call(weft::EndpointMethod::Get, "/outputs", None)
             .await
         {
             Ok(v) => return Ok(v),

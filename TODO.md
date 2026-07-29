@@ -246,81 +246,6 @@ enforces, not "we assume they can't".
 stamping, `PodOptions`, `project_namespace.rs` policies/RBAC, or the
 supervisor apply path, revisit.
 
-## Sensitive values: encrypt in journal, redact in inspector
-
-**Problem.** A node config field can hold a secret (an LLM `apiKey`, a
-third-party API token typed directly into a node). Today those values
-flow through the journal verbatim (in the `NodeStarted` input/config)
-and show up in the execution inspector in plaintext. A secret must
-SURVIVE resume (the worker re-folds the journal and needs the real
-value to make the call) but must NEVER be readable in logs or the
-inspector. The webhook-trigger API key already solves a NARROWER
-version of this (sha256 on the signal row, plaintext only in the
-listener's in-RAM cache, served via `/display`), but that path is
-specific to listener-minted auth, not to arbitrary node config a user
-types in.
-
-**Direction.** A language-generic "sensitive value" mechanism, NOT an
-LLM-node special case:
-
-- A way for the language to KNOW a value is sensitive. This is the
-  central design fork (pick before building): a `sensitive: true` flag
-  on the metadata field definition, a dedicated `Secret` weft-type, or
-  a naming convention. The flag-on-field-definition shape is the
-  current front-runner (most local, no new type-system surface) but
-  needs deciding.
-- Encrypt-at-journal / decrypt-at-fold: the engine encrypts a sensitive
-  value before it's written to the journal and decrypts after fold, so
-  the worker has the real value to make its call but the at-rest journal
-  row carries only ciphertext.
-- Inspector redaction: the inspector shows `••••` (or similar) for a
-  sensitive value, never the plaintext or the ciphertext.
-
-**Reuse, don't reinvent.** The crypto primitive already exists in the
-old code: `crates-v1/weft-api/src/crypto.rs` is a working AES-256-GCM
-implementation keyed off `CREDENTIAL_ENCRYPTION_KEY` (already present in
-`.env.example`, with a cloud-mode-panics / local-dev-key fallback).
-Port that shape into a v2 home rather than writing new crypto.
-
-**Requirements.**
-- Language-generic: any node config field can be marked sensitive; the
-  engine/journal/inspector handle it uniformly. No per-node code.
-- Survives resume: the decrypt-at-fold path gives the worker the real
-  value on replay.
-- Never readable outside the worker: not in the journal at rest, not in
-  logs, not in the inspector.
-- Key from the environment (`CREDENTIAL_ENCRYPTION_KEY`), cloud-mode
-  panics if unset, local-dev fallback key with a loud warning (the v1
-  policy, kept).
-
-**Why deferred.** It's a real subsystem spanning weft-core (the marker
-+ crypto), weft-engine (encrypt-before-journal / decrypt-after-fold),
-weft-journal (the encrypted field), and the extension inspector
-(redaction), and the marker mechanism is itself a design fork. Surfaced
-from the feat-bus review (FORK-2): LLM `apiKey` and similar node-typed
-secrets currently land in the journal and inspector in plaintext.
-
-**Also covers the config-node BYOK path (surfaced in the provider
-review).** The OpenRouterConfig node emits its whole config map, incl.
-`apiKey`, on its `config` OUTPUT port; a downstream inference node reads
-the key from its overlaid effective config. So a user's own key does not
-just sit in one node's config, it RIDES AN EDGE: it is journaled in the
-config node's `NodeCompleted.output` AND in the inference node's
-`NodeStarted.input`, both in plaintext, on every run. The narrow
-alternative (drop `apiKey` from what the config node emits, so each
-inference node reads it only from its own directly-typed field) was
-rejected in favor of this general sensitive-value mechanism, because
-"config node carries shared provider settings" is a pattern users want
-and amputating the key from it degrades the feature. When this lands, the
-mechanism must redact a sensitive value that travels an EDGE (a port
-value), not only one sitting in a node's own config: the `config` port
-carries it as ordinary `Dict` data today.
-
-[Update Notice Warning] If we touch how node config is journaled
-(`NodeStarted`), how PORT VALUES are journaled (`NodeCompleted.output` /
-`PulseEmitted`), the metadata field-definition shape, or the inspector's
-config rendering, revisit this entry.
-
 ## A closed port carries no reason
 
 **Problem.** A closure says "nothing will arrive here" and nothing
@@ -435,20 +360,29 @@ When this flips ON, revisit alongside setup.sh's flag set and the
 image/tag + manifest + project-layout conventions; the migration logic
 lives wherever setup.sh sequences install/upgrade.
 
-## Note Q
-Remember to double check for ephemeral journaling we should buffer so that if there is 60 exchanger per second it should only store a log for every X second and what happened on this window. I don't remmber if I did it already, need to check. Maybe also should be done for non ephemeral with aggregated logs.
-## Provider proxy: WebSocket support
+## Project-scoped meta log (observability outside the journal)
 
-The broker's provider proxy (`crates/weft-broker/src/provider_proxy.rs`)
-forwards any HTTP method (request bodies buffered so the stand-in can be
-swapped for the real key; responses streamed, SSE included). It does NOT
-handle protocol upgrades, so a node cannot use a provider's WebSocket API on
-a DEPLOYMENT access (its own key works: those requests never touch the proxy).
+Design a per-project log surface for everything that is ABOUT a project
+but is not execution data, so debugging held connections stops meaning
+kubectl. What goes there:
 
-Known case: ElevenLabs' WebSocket TTS. Its HTTP streaming endpoint is
-equivalent for our purposes, so the constraint is narrow today.
+- What the listener sees for the project's signals: connect cycles,
+  dialogue progress on a raw pipe (which step, what matched), fires,
+  reconnects, why a fire was filtered out. Today this lands in the
+  pooled listener's pod logs, interleaved across tenants and invisible
+  to the project owner. Debugging "my email trigger never fires" needs
+  this legible per project.
+- A node-facing info log (`ctx.log(...)`-shaped): breadcrumbs a node
+  author wants while developing, deliberately NOT journal events
+  (journaling every log line would bloat the durable record; these are
+  ephemeral, ring-buffered, lossy by design).
+- Later candidates: subscription renewals, access refreshes, tunnel
+  address changes.
 
-Fix when a real node needs it: accept the upgrade at the proxy, open the
-upstream WS with the real key substituted into the handshake, and pipe frames
-both ways (no substitution inside frames: the credential only rides the
-handshake). Also revisit the broker's replica count then (see below).
+Shape to think through: one ring buffer per project (bounded, lossy,
+queryable via dispatcher + shown in the dashboard/extension), what the
+pooled tiers may write to it (tenant isolation: a pooled listener
+writes only to the project the signal belongs to), and rate-limiting
+so a chatty loop cannot flood it. Related: "Note Q" above (ephemeral
+journal buffering) and the unified error-surfacing entry; a design
+should look at all three together before building any one of them.

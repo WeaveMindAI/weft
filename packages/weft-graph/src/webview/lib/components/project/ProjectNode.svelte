@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { untrack } from "svelte";
-	import { Handle, Position, useEdges, NodeResizer, type ResizeParams } from "@xyflow/svelte";
+	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
 	import { parseWeftType, inputExposure } from "../../types";
@@ -23,11 +23,15 @@
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
 	import FileDropField from './FileDropField.svelte';
+	import AccessField from './AccessField.svelte';
+	import RemoteSelectField from './RemoteSelectField.svelte';
+	import { grantsForService, grantsGeneration } from './grants-cache.svelte';
 	import FilePreview from './FilePreview.svelte';
 	import type { FileValueWire } from "../../../../shared/protocol";
 	import { parseFileValue, typeReferencesFile } from "../../../../shared/protocol";
 
 	const edgesState = useEdges();
+	const nodesState = useNodes();
 
 	let { data, id, selected }: {
 		data: {
@@ -88,18 +92,23 @@
 		selected?: boolean;
 	} = $props();
 
-	const typeConfig = $derived(NODE_TYPE_CONFIG[data.nodeType as NodeType] ?? {
-		type: data.nodeType,
-		label: data.nodeType,
-		description: 'Unknown node type',
-		icon: BadgeQuestionMark,
-		color: '#999',
-		category: 'Logic' as const,
-		tags: [],
-		fields: [],
-		defaultInputs: [],
-		defaultOutputs: [],
-	});
+	// Typed as NodeTemplate so the fallback and the registry entries are
+	// ONE shape: every `typeConfig.<key>` read typechecks against the
+	// template, never against an ad-hoc literal that silently lacks keys.
+	const typeConfig = $derived<import('../../types').NodeTemplate>(
+		NODE_TYPE_CONFIG[data.nodeType as NodeType] ?? {
+			type: data.nodeType,
+			label: data.nodeType,
+			description: 'Unknown node type',
+			icon: BadgeQuestionMark,
+			color: '#999',
+			category: 'Logic',
+			tags: [],
+			requiresInfra: false,
+			defaultInputs: [],
+			defaultOutputs: [],
+		},
+	);
 
 	// Opaque `@include` block: carries a file path, navigates into the file
 	// on Open. Renders ports + an Open affordance, no config/body.
@@ -252,8 +261,6 @@
 		if (typeConfig.features?.showDebugPreview) return true;
 		// Has a stored-file preview (ImageDisplay / DownloadLink)
 		if (typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink) return true;
-		// Has setup guide
-		if (typeConfig.setupGuide && typeConfig.setupGuide.length > 0) return true;
 		return false;
 	});
 
@@ -285,7 +292,6 @@
 			});
 		}
 	}
-	let showSetupGuide = $state(false);
 	let editingLabel = $state(false);
 	// Seed the editable label from the prop's initial value (deliberately a
 	// one-time, non-reactive read via `untrack`: while editing, the input is the
@@ -298,11 +304,6 @@
 	let newInputName = $state('');
 	let newOutputName = $state('');
 	let portContextMenu = $state<{ portName: string; side: 'input' | 'output'; x: number; y: number } | null>(null);
-
-	/// api_key fields whose "Own key" mode the user opened locally
-	/// before typing a key. Purely a view state: the source stays
-	/// untouched (Credits semantics) until a key is actually typed.
-	let ownKeyOpen = $state<Set<string>>(new Set());
 
 	/// Per-secret-item reveal state, keyed by item label. A secret
 	/// is hidden by default (••••); clicking the eye icon toggles
@@ -502,10 +503,10 @@
 
 	/// Field keys this node renders itself rather than delegating to the
 	/// shared FieldStrip primitive renderer: only the exotic types (code,
-	/// api_key, form_builder). File-backed primitives render through
+	/// form_builder). File-backed primitives render through
 	/// FieldStrip via its displayValueOf / readonlyKeys / headerBadge
 	/// capabilities.
-	const EXOTIC_FIELD_TYPES = new Set(['code', 'api_key', 'form_builder', 'file_drop']);
+	const EXOTIC_FIELD_TYPES = new Set(['code', 'access', 'remote_select', 'form_builder', 'file_drop']);
 	const customFieldKeys = $derived.by(() => {
 		const keys = new Set<string>();
 		for (const field of displayedFields) {
@@ -652,6 +653,171 @@
 		return field.portDriven
 			? portLiterals[field.key]
 			: (data.config as Record<string, unknown>)?.[field.key];
+	}
+
+	/** Resolve a remote_select's authenticating access STRUCTURALLY:
+	 *  follow this node's `accessInput` wire back to the feeding access
+	 *  node and read the grant id it persisted when the user clicked
+	 *  Connect (plus its service, off its template's recipe). There is
+	 *  no data flow between nodes at edit time; this graph walk is what
+	 *  makes the dropdown live with nothing running. */
+	function traceAccessRef(accessInput: string): { accessId: string; service: string } | null {
+		const edge = edgesState.current.find(
+			(e: Edge) => e.target === id && e.targetHandle === accessInput,
+		);
+		if (!edge) return null;
+		const src = nodesState.current.find((n) => n.id === edge.source);
+		if (!src) return null;
+		const srcData = src.data as {
+			nodeType?: string;
+			config?: Record<string, unknown>;
+			inputs?: PortDefinition[];
+		};
+		const tpl = NODE_TYPE_CONFIG[srcData.nodeType as NodeType];
+		const service = tpl?.service?.service;
+		if (!service) return null;
+		const srcInputs = (srcData.inputs ?? tpl?.defaultInputs ?? []) as PortDefinition[];
+		const connectInput = srcInputs.find((i) => i.widget?.kind === 'access');
+		if (!connectInput) return null;
+		const handle = srcData.config?.[connectInput.name];
+		const grantId =
+			handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
+		return typeof grantId === 'string' ? { accessId: grantId, service } : null;
+	}
+
+	/// The traced connections' summaries, keyed by the ACCESS INPUT
+	/// name they were traced through: what the live permission check
+	/// and the resource sources read. Refetched when the traced ids
+	/// change (a rewire, a reconnect).
+	let tracedGrants = $state<
+		Record<string, { scopes: string[]; verified: boolean; valueNames: string[] }>
+	>({});
+
+	/// Which access inputs to watch: every Access-typed input declaring
+	/// `requiresScopes` or `requiresValues`, plus every remote_select's
+	/// authenticating input (its sources filter on the granted set).
+	const watchedAccessInputs = $derived.by(() => {
+		const names = new Set<string>();
+		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		for (const i of inputList) {
+			if (i.requiresScopes && i.requiresScopes.length > 0) names.add(i.name);
+			if (i.requiresValues && i.requiresValues.length > 0) names.add(i.name);
+			if (i.widget?.kind === 'remote_select' && i.widget.access) names.add(i.widget.access);
+		}
+		return [...names];
+	});
+
+	/// The traced (input name, access ref) pairs, hoisted out of the
+	/// effect so the trace itself is a derivation.
+	const tracedRefs = $derived(
+		watchedAccessInputs
+			.map((name) => ({ name, ref: traceAccessRef(name) }))
+			.filter((x): x is { name: string; ref: { accessId: string; service: string } } => x.ref != null),
+	);
+	/// Stable string key of the traced pairs: the ONE thing the fetch
+	/// effect tracks. Drags/hovers mutate edgesState/nodesState without
+	/// changing the traced ids, so they change neither this key nor
+	/// refire the HTTP checks.
+	const tracedRefsKey = $derived(JSON.stringify(tracedRefs));
+
+	/// Why the grant fetch behind the live permission/value checks
+	/// failed, if it did; renders a muted "the check is dark" line so
+	/// the user knows the banners' absence proves nothing. The check
+	/// stays advisory: a failure never marks the node (the resolve-time
+	/// backstop still holds).
+	let grantCheckError = $state<string | null>(null);
+
+	$effect(() => {
+		void tracedRefsKey;
+		// A Forget or a fresh connect bumps the generation, so an OPEN
+		// node re-checks instead of showing the old answer until an
+		// unrelated re-trace.
+		void grantsGeneration();
+		const refs = untrack(() => tracedRefs);
+		let cancelled = false;
+		(async () => {
+			const next: Record<
+				string,
+				{ scopes: string[]; verified: boolean; valueNames: string[] }
+			> = {};
+			let failure: string | null = null;
+			for (const { name, ref } of refs) {
+				try {
+					const grants = await grantsForService(ref.service);
+					const grant = grants.find((g) => g.id === ref.accessId);
+					if (grant)
+						next[name] = {
+							scopes: grant.scopes,
+							verified: grant.permissions_verified,
+							valueNames: grant.value_names ?? [],
+						};
+				} catch (e) {
+					failure = e instanceof Error ? e.message : String(e);
+				}
+			}
+			if (!cancelled) {
+				tracedGrants = next;
+				grantCheckError = failure;
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	/// The live permission check that replaces the old compile-time
+	/// diagnostic: a picked connection VERIFIED to miss a permission
+	/// this node requires marks the node immediately. Claimed/unknown
+	/// sets never mark (nobody actually knows what they hold).
+	const permissionShortfalls = $derived.by(() => {
+		const out: string[] = [];
+		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		for (const i of inputList) {
+			const required = i.requiresScopes ?? [];
+			if (required.length === 0) continue;
+			const grant = tracedGrants[i.name];
+			if (!grant || !grant.verified) continue;
+			for (const r of required) {
+				if (!grant.scopes.includes(r)) {
+					out.push(`'${i.name}' needs permission ${r}; the picked connection does not hold it. Reconnect or upgrade it on the access node.`);
+				}
+			}
+		}
+		return out;
+	});
+
+	/// The live VALUE check: a picked connection that does not store a
+	/// value this node needs marks the node. Unlike permissions there
+	/// is no unknown case (the connection stores it or it does not), so
+	/// this marks whenever the grant was read.
+	const valueShortfalls = $derived.by(() => {
+		const out: string[] = [];
+		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		for (const i of inputList) {
+			const required = i.requiresValues ?? [];
+			if (required.length === 0) continue;
+			const grant = tracedGrants[i.name];
+			if (!grant) continue;
+			for (const r of required) {
+				if (!grant.valueNames.includes(r)) {
+					out.push(`'${i.name}' needs the connection's ${r}, which it does not store. Add it to the connection on the access node.`);
+				}
+			}
+		}
+		return out;
+	});
+
+	/** A remote_select's picked parent values (`dependsOn` drill-down):
+	 *  each parent's stored id. A pick stores the bare id, so this is a
+	 *  read, not an unwrap. */
+	function remoteSelectParents(field: FieldDefinition): Record<string, string> {
+		const out: Record<string, string> = {};
+		for (const parent of field.dependsOn ?? []) {
+			const v =
+				portLiterals[parent] ?? (data.config as Record<string, unknown>)?.[parent];
+			if (typeof v === 'string' && v) out[parent] = v;
+		}
+		return out;
 	}
 
 	function fieldDisplayValue(field: FieldDefinition): string {
@@ -1317,33 +1483,38 @@
 			</div>
 		{/if}
 
+		<!-- Live permission check: a picked connection VERIFIED to miss
+		     a permission this node requires. Replaces the deleted
+		     compile-time diagnostic; the resolve-time backstop remains. -->
+		{#each permissionShortfalls as shortfall}
+			<div class="mt-1.5 text-[10px] text-red-500 bg-red-50 rounded px-2 py-1">{shortfall}</div>
+		{/each}
+
+		<!-- Live value check: a picked connection missing a value this
+		     node needs (a mailbox with no receiving server wired into a
+		     mail trigger). Always marks; a stored value is knowable. -->
+		{#each valueShortfalls as shortfall}
+			<div class="mt-1.5 text-[10px] text-red-500 bg-red-50 rounded px-2 py-1">{shortfall}</div>
+		{/each}
+
+		<!-- The live checks went dark: the grant fetch failed, so the
+		     absence of a shortfall banner proves nothing. Muted, not
+		     alarming; the resolve-time backstop still holds. -->
+		{#if grantCheckError}
+			<div class="mt-1.5 text-[10px] text-muted-foreground bg-muted rounded px-2 py-1">
+				Could not check this node's connection permissions: {grantCheckError}
+			</div>
+		{/if}
+
 		<!-- Expanded Config Fields -->
 		{#if expanded}
 			<div class="mt-3 pt-3 border-t space-y-2 overflow-auto min-h-0 flex-1">
-				<!-- Setup Guide -->
-				{#if typeConfig.setupGuide && typeConfig.setupGuide.length > 0}
-					<button
-						class="w-full flex items-center gap-1.5 text-[10px] text-blue-500 hover:text-blue-600 font-medium transition-colors"
-						onclick={(e) => { e.stopPropagation(); showSetupGuide = !showSetupGuide; }}
-					>
-						<span class="text-xs">{showSetupGuide ? '▾' : '▸'}</span>
-						<span>Setup Guide</span>
-					</button>
-					{#if showSetupGuide}
-						<div class="text-[10px] text-zinc-500 bg-blue-50 rounded px-2.5 py-2 space-y-1 leading-relaxed">
-							{#each typeConfig.setupGuide as step}
-								<p>{step}</p>
-							{/each}
-						</div>
-					{/if}
-				{/if}
-
 				<!-- Primitive fields (text / textarea / select / multiselect /
 				     checkbox / number / password) render through the shared
 				     FieldStrip, including file-backed ones (displayValueOf
 				     supplies the resolved content, readonlyKeys locks unready
 				     fields, headerBadge shows the path chip). The exotic kinds
-				     (code / api_key / form_builder) are claimed via
+				     (code / form_builder) are claimed via
 				     customFieldKeys and drawn inline by the renderCustom
 				     snippet below, in the same authored order. -->
 				<FieldStrip
@@ -1446,45 +1617,37 @@
 									}}
 								/>
 							</div>
-						{:else if field.type === "api_key"}
-							<!-- Two modes, two honest source states. Credits =
-							     the key is ABSENT from source (the runtime
-							     grants its own); Own key = the input carries
-							     the user's key string. There is no sentinel:
-							     picking "Own key" opens the field locally, and
-							     the source only changes once a key is typed.
-							     An empty typed value writes "" (the compiler
-							     flags it `empty-byok` so it can't run). -->
-							{@const currentValue = fieldHomeValue(field) as string | undefined}
-							{@const isByok = ownKeyOpen.has(field.key) || (currentValue !== undefined && currentValue !== "__PLATFORM__")}
-							<div class="space-y-1.5">
-								<div class="flex justify-center">
-									<div class="inline-flex rounded-md border border-border overflow-hidden">
-										<button
-											type="button"
-											class="text-[10px] px-3 py-1 font-medium transition-colors {!isByok ? 'bg-emerald-500 text-white' : 'bg-background text-muted-foreground hover:text-foreground'}"
-											onclick={(e) => { e.stopPropagation(); ownKeyOpen.delete(field.key); ownKeyOpen = new Set(ownKeyOpen); updateFieldValue(field.key, null, field.portDriven); }}
-										>Credits</button>
-										<button
-											type="button"
-											class="text-[10px] px-3 py-1 font-medium transition-colors border-l border-border {isByok ? 'bg-blue-500 text-white' : 'bg-background text-muted-foreground hover:text-foreground'}"
-											onclick={(e) => { e.stopPropagation(); if (!isByok) { ownKeyOpen = new Set(ownKeyOpen).add(field.key); } }}
-										>Own key</button>
-									</div>
+						{:else if field.type === "access"}
+							<!-- The connect control on a personal ACCESS NODE. The
+							     config value is only the small {id, identity} handle;
+							     pasted secrets go editor -> store through the host's
+							     access channel and never touch node config. -->
+							{#if typeConfig.service}
+								<AccessField
+									spec={typeConfig.service}
+									projectApp={typeConfig.accessApps?.[typeConfig.service.service]}
+									nodeType={data.nodeType}
+									value={fieldHomeValue(field) as { id: string; identity?: string } | undefined}
+									onUpdate={(v) => updateFieldValue(field.key, v, field.portDriven)}
+								/>
+							{:else}
+								<div class="text-[10px] text-red-500">
+									This node's metadata declares no `service` recipe; the access widget has nothing to connect.
 								</div>
-								{#if isByok}
-									<input
-										type="password"
-										class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none font-mono"
-										placeholder="sk-or-v1-..."
-										value={fieldEditor.display(field.key, currentValue ?? '')}
-										onfocus={() => fieldEditor.focus(field.key, currentValue ?? '')}
-										oninput={(e) => fieldEditor.input(e.currentTarget.value, field.key, (v) => updateFieldValue(field.key, v, field.portDriven))}
-										onblur={() => fieldEditor.blur(field.key, (v) => updateFieldValue(field.key, v, field.portDriven))}
-										onclick={(e) => e.stopPropagation()}
-									/>
-								{/if}
-							</div>
+							{/if}
+						{:else if field.type === "remote_select"}
+							<!-- Pick a resource on the connected service. The lookup
+							     runs through the dispatcher on the stored access,
+							     found by tracing this node's access wire structurally
+							     (no worker, no data flow at edit time). -->
+							<RemoteSelectField
+								{field}
+								value={fieldHomeValue(field) as string | undefined}
+								accessRef={field.access ? traceAccessRef(field.access) : null}
+								grantedScopes={field.access ? (tracedGrants[field.access]?.scopes ?? null) : null}
+								parents={remoteSelectParents(field)}
+								onUpdate={(v) => updateFieldValue(field.key, v, field.portDriven)}
+							/>
 						{:else if field.type === "file_drop"}
 							<!-- Writes an `@asset("<path-or-url>", <Type>)` ref into
 							     config; the pre-build asset sync publishes the file and the

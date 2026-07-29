@@ -29,6 +29,86 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/../.." || exit 1
 
+# ---------- Auto-provisioned dependencies ----------
+# Everything a test needs that a local machine can serve is provisioned
+# HERE, automatically, and torn down when the suite passes (a failing
+# run keeps it up, like the cluster, for inspection). Only genuinely
+# external services (Slack, GitHub, Google, Telegram, a real mailbox,
+# an OpenRouter key) come from the operator's env / repo-root .env.
+# Nothing is overridden: any WEFT_E2E_* var already set wins.
+
+CLEANUP=()
+cleanup_provisioned() {
+  for c in "${CLEANUP[@]}"; do eval "$c"; done
+}
+
+# The cluster itself must exist before anything can be port-forwarded;
+# the first test's ensure step re-runs setup.sh anyway (idempotent), so
+# this only pays the bring-up when the cluster is absent outright.
+if ! kubectl get namespace weft-db >/dev/null 2>&1; then
+  echo "cluster not up; running setup.sh first"
+  ./setup.sh || exit 1
+fi
+
+# The store's Postgres, for the tests that seed rows directly: a
+# port-forward of the cluster's own weft-postgres (the local-dev creds
+# from deploy/k8s/postgres.yaml).
+if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
+  kubectl -n weft-db port-forward svc/weft-postgres 15433:5432 >/dev/null 2>&1 &
+  PF_PID=$!
+  CLEANUP+=("kill $PF_PID 2>/dev/null || true")
+  export WEFT_E2E_DATABASE_URL="postgres://weft:weft-local-dev@127.0.0.1:15433/weft"
+  for _ in $(seq 1 30); do
+    (exec 3<>/dev/tcp/127.0.0.1/15433) 2>/dev/null && break
+    sleep 1
+  done
+  echo "provisioned: WEFT_E2E_DATABASE_URL via port-forward (pid $PF_PID)"
+fi
+
+# An S3 store: the daemon ALREADY runs SeaweedFS as a host docker
+# container ('weft-object-store', S3 gateway on WEFT_SEAWEED_PORT,
+# local-dev identities); reuse it with a dedicated e2e bucket rather
+# than spawning a second store. Pods reach it at the kind docker
+# network's gateway address; the broker's egress denies private
+# ranges, so that address is opened via WEFT_STORE_ALLOW_CIDR (the
+# knob that exists exactly for a private-range object store), applied
+# by the first test's setup.sh run.
+if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
+  KIND_GATEWAY="$(docker network inspect kind \
+    --format '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+  if [ -n "$KIND_GATEWAY" ] && [ -n "$(docker ps -q -f name='^weft-object-store$')" ]; then
+    # The bucket stays across runs (it is the store the daemon owns,
+    # not ours to tear down), so "already exists" is as good as
+    # created. Any OTHER failure must not export the S3 vars: the test
+    # would then fail deep inside the run instead of skipping loudly.
+    # weed shell's exit code and chatter are both unreliable (it prints
+    # "created" even for an existing bucket and exits 0 on errors), so
+    # the create is fire-and-forget and the LIST afterwards is the one
+    # source of truth: the bucket exists or the S3 e2e skips.
+    docker exec weft-object-store sh -c \
+      'echo "s3.bucket.create -name weft-e2e" | weed shell' >/dev/null 2>&1
+    BUCKET_OUT="$(docker exec weft-object-store sh -c \
+      'echo "s3.bucket.list" | weed shell' 2>&1)"
+    BUCKET_STATUS=$?
+    if [ "$BUCKET_STATUS" -eq 0 ] && printf '%s\n' "$BUCKET_OUT" | grep -q 'weft-e2e'; then
+      export WEFT_E2E_S3_ENDPOINT="http://$KIND_GATEWAY:${WEFT_SEAWEED_PORT:-9096}"
+      export WEFT_E2E_S3_REGION="us-east-1"
+      export WEFT_E2E_S3_ACCESS_KEY_ID="weft-local"
+      export WEFT_E2E_S3_SECRET_ACCESS_KEY="weft-local-dev-secret"
+      export WEFT_E2E_S3_BUCKET="weft-e2e"
+      export WEFT_STORE_ALLOW_CIDR="${WEFT_STORE_ALLOW_CIDR:-$KIND_GATEWAY/32}"
+      echo "provisioned: S3 vars pointed at the daemon's SeaweedFS ($WEFT_E2E_S3_ENDPOINT, bucket weft-e2e)"
+    else
+      echo "SKIP: the weft-e2e bucket does not exist in the daemon's SeaweedFS (list exit $BUCKET_STATUS);" >&2
+      echo "      not exporting WEFT_E2E_S3_* so the S3 e2e skips instead of failing deep. weed shell said:" >&2
+      printf '%s\n' "$BUCKET_OUT" >&2
+    fi
+  else
+    echo "warning: no running weft-object-store container (or no kind network); the S3 e2e will skip" >&2
+  fi
+fi
+
 # Test binaries are DISCOVERED from crates/weft-e2e/tests/*.rs (never a
 # hardcoded list, which silently drops a newly-added test if someone forgets
 # to update it). A new `tests/<name>.rs` is picked up automatically.
@@ -117,9 +197,11 @@ for t in "${TESTS[@]}"; do
     echo "  (passing tests already cleaned up; this one's project + any clones"
     echo "   are kept. See crates/weft-e2e/README.md for allowed read-only probes.)"
     echo "########################################################################"
+    echo "  (the auto-provisioned postgres port-forward is kept up too.)"
     exit 1
   fi
 done
 
+cleanup_provisioned
 echo ""
 echo "All e2e tests passed."

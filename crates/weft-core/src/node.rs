@@ -77,7 +77,7 @@ mod node_trait {
 
         /// The node's normal body. `ctx` provides language primitives
         /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
-        /// `provider_access`, `log`, `endpoint`). The ONLY way to fire
+        /// `metered_access`, `log`, `endpoint`). The ONLY way to fire
         /// downstream is `ctx.pulse_downstream(output)`. For a plain
         /// (non-trigger) node the engine calls this in every lifecycle
         /// phase (a value feeding a trigger's config must be produced at
@@ -220,17 +220,39 @@ pub struct NodeMetadata {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub form_field_specs: Vec<FormFieldSpec>,
+    /// The service recipe, present ONLY on an ACCESS NODE (the node
+    /// owning the connect for a service). Declares how a connection is
+    /// acquired, how requests are authenticated, the permission
+    /// catalogue, and the doors; see
+    /// [`crate::access::spec::AccessSpec`]. The editor ships it to the
+    /// store at connect time; the compiler stamps the service name
+    /// onto the node's `access` widget.
+    // SYNC: NodeMetadata.service <-> packages/weft-graph/src/protocol.ts CatalogEntry.service
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<crate::access::spec::AccessSpec>,
+    /// PUBLIC (PKCE, secretless) OAuth apps this project ships, keyed
+    /// by service name. A package root declares its apps here once and
+    /// every member node inherits them (via [`merge_package_defaults`]);
+    /// at connect the "Your own" door uses the project's app when the
+    /// user pastes none. An entry carrying a `client_secret` fails the
+    /// metadata load: project metadata is source, and source never
+    /// holds secrets (a confidential app goes editor -> store on the
+    /// "Your own" page instead). Empty in the shipped catalog.
+    // SYNC: NodeMetadata.access_apps <-> packages/weft-graph/src/protocol.ts CatalogEntry.accessApps
+    #[serde(
+        default,
+        rename = "accessApps",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub access_apps: std::collections::BTreeMap<String, crate::access::spec::AppRegistration>,
 }
 
 /// The one charset a provider name may use: lowercase ASCII letters,
-/// digits, and `_`. This is what makes the name the key's identity with no
-/// aliasing: the runtime key lives in `<NAME>_API_KEY`, derived by
-/// uppercasing the name (`credential::provider_env_var`). Restricting to
-/// this set makes that derivation injective (two distinct names can never
-/// share one env var) and rules out a name that would form a malformed or
-/// surprising env var (spaces, dots, `-` vs `_`, unicode, empty). A raw
-/// string comparison of names is therefore exactly a comparison of key
-/// identities. Enforced where a provider name enters the system (the
+/// digits, and `_`. The name is the identity everything keys on (the
+/// shared-credentials file's entries, the meter registry, the
+/// connection rows), so it must be exact-comparable with no aliasing
+/// or surprising characters (spaces, dots, `-` vs `_`, unicode,
+/// empty). Enforced where a provider name enters the system (the
 /// access request handler), so a bad name is refused loudly at the door.
 pub fn is_valid_provider_name(name: &str) -> bool {
     !name.is_empty()
@@ -335,18 +357,95 @@ impl NodeMetadata {
                         input.name
                     ));
                 }
-                // A credential is design-time configuration by nature: it
-                // must never arrive over a wire or an assignment
-                // statement. Enforcing the exposure here lets every
-                // consumer treat "api_key input" and "config input" as
-                // the same fact instead of re-checking it.
-                Widget::ApiKey { .. } if input.effective_exposure() != Exposure::Config => {
+                // A connected-account handle is design-time
+                // configuration by nature: it must never arrive over a
+                // wire or an assignment statement. Enforcing the
+                // exposure here lets every consumer treat "access
+                // input" and "config input" as the same fact instead
+                // of re-checking it.
+                Widget::Access { .. } if input.effective_exposure() != Exposure::Config => {
                     return Err(format!(
-                        "input '{}': an api_key widget requires `exposure: config`",
+                        "input '{}': an access widget requires `exposure: config`",
                         input.name
                     ));
                 }
+                Widget::Access { .. } if self.service.is_none() => {
+                    return Err(format!(
+                        "input '{}': an access widget needs the node metadata to declare a \
+                         `service` recipe (the sign-in it connects)",
+                        input.name
+                    ));
+                }
+                Widget::RemoteSelect { access, sources, depends_on } => {
+                    let names_access_input = self.inputs.iter().any(|i| {
+                        i.name == *access && i.input_type == WeftType::Access
+                    });
+                    if !names_access_input {
+                        return Err(format!(
+                            "input '{}': remote_select's `access` must name an Access-typed \
+                             input on this node ('{}' is not one)",
+                            input.name, access
+                        ));
+                    }
+                    if sources.is_empty() {
+                        return Err(format!(
+                            "input '{}': remote_select needs at least one source",
+                            input.name
+                        ));
+                    }
+                    for source in sources {
+                        match source {
+                            ResourceSource::FromUrl { pattern } => {
+                                if let Err(e) = regex::Regex::new(pattern.as_str()) {
+                                    return Err(format!(
+                                        "input '{}': from_url pattern does not parse: {e}",
+                                        input.name
+                                    ));
+                                }
+                            }
+                            ResourceSource::Picker { script, code, .. } => {
+                                if !script.starts_with("https://") {
+                                    return Err(format!(
+                                        "input '{}': a picker's script must be an https:// \
+                                         address, got '{script}'",
+                                        input.name
+                                    ));
+                                }
+                                if code.trim().is_empty() {
+                                    return Err(format!(
+                                        "input '{}': a picker needs its glue `code` (the \
+                                         statements that open the chooser and call \
+                                         weft.done)",
+                                        input.name
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for parent in depends_on {
+                        if !self.inputs.iter().any(|i| i.name == *parent) {
+                            return Err(format!(
+                                "input '{}': remote_select depends_on '{}', which is not an \
+                                 input of this node",
+                                input.name, parent
+                            ));
+                        }
+                    }
+                }
                 _ => {}
+            }
+            if input.requires_scopes.is_some() && input.input_type != WeftType::Access {
+                return Err(format!(
+                    "input '{}': `requiresScopes` is only legal on an Access-typed input",
+                    input.name
+                ));
+            }
+            if input.requires_values.is_some() && input.input_type != WeftType::Access {
+                return Err(format!(
+                    "input '{}': `requiresValues` is only legal on an Access-typed input",
+                    input.name
+                ));
             }
             // A widget implies the SHAPE of the value it edits. On an
             // input whose type cannot hold that shape, the widget's own
@@ -361,11 +460,22 @@ impl NodeMetadata {
                 Widget::Text
                 | Widget::Password
                 | Widget::Code { .. }
-                | Widget::ApiKey { .. }
                 | Widget::Select { .. } => Some(WeftType::primitive(WeftPrimitive::String)),
                 Widget::Multiselect { .. } => {
                     Some(WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::String))))
                 }
+                // remote_select's runtime value is the picked id (the
+                // cached label is stripped when the bag is built).
+                Widget::RemoteSelect { .. } => Some(WeftType::primitive(WeftPrimitive::String)),
+                // The access widget's STORED value is the small
+                // {id, identity} handle object (shape-checked by the
+                // connect flow), but the value the node READS is the
+                // Access marker the input bag builds from it, so the
+                // input's declared type is Access. Typing it here is
+                // what lets the requiresScopes/requiresValues legality
+                // rules and remote_select's `access` reference bind on
+                // the access node's own input.
+                Widget::Access { .. } => Some(WeftType::Access),
                 // textarea is the GENERIC value editor (the derived
                 // default for structural types: the value is edited as
                 // JSON text), so it constrains nothing. form_builder
@@ -402,6 +512,34 @@ impl NodeMetadata {
                         }
                     }
                 }
+            }
+        }
+        if let Some(spec) = &self.service {
+            spec.validate()?;
+            let connect_inputs = self
+                .inputs
+                .iter()
+                .filter(|i| matches!(i.effective_widget(), Widget::Access { .. }))
+                .count();
+            if connect_inputs != 1 {
+                return Err(format!(
+                    "a node declaring a `service` recipe needs exactly ONE input with the \
+                     `access` widget (the connect control); found {connect_inputs}"
+                ));
+            }
+        }
+        // A project-declared app is source that ships with the project,
+        // so it may never carry a secret: only a public (PKCE) client
+        // is shareable this way. A confidential app belongs on the
+        // "Your own" page, where its secret goes editor -> store.
+        for (service, app) in &self.access_apps {
+            if app.client_secret.is_some() {
+                return Err(format!(
+                    "accessApps.{service}: a project-declared app must not carry a \
+                     client_secret (project metadata is source, and source never holds \
+                     secrets); declare only a public (PKCE) client here, or connect \
+                     through the editor's \"Your own\" page instead"
+                ));
             }
         }
         Ok(())
@@ -743,7 +881,7 @@ pub struct InputSpec {
     pub exposure: Option<Exposure>,
     /// The editor control for this input's literal. Absent = derived
     /// from the type ([`Widget::default_for_type`]); declared to pick a
-    /// richer control (a select over a String, an api_key, a code box).
+    /// richer control (a select over a String, a code box).
     #[serde(default)]
     pub widget: Option<Widget>,
     /// The value the runtime supplies when no wire and no literal
@@ -762,6 +900,43 @@ pub struct InputSpec {
     /// The webview reads it; the compiler treats it as opaque.
     #[serde(default)]
     pub description: Option<String>,
+    /// The permissions THIS consumer needs on the wired connection
+    /// (only legal on an `Access`-typed input). Checked where a
+    /// connection's real granted set is knowable: live in the editor
+    /// when one is picked, at connect time, and at run-time resolution
+    /// (the drift backstop). A VERIFIED shortfall is a hard error; a
+    /// claimed/unknown one passes, because nobody actually knows (a
+    /// pasted key on a service that reports nothing must not be
+    /// refused). Never checked by the compiler: source holds only a
+    /// connection id, so source alone cannot answer.
+    // SYNC: InputSpec.requires_scopes <-> packages/weft-graph/src/protocol.ts InputSpec.requiresScopes
+    #[serde(
+        default,
+        rename = "requiresScopes",
+        alias = "requires_scopes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requires_scopes: Option<Vec<String>>,
+    /// The stored VALUES this consumer needs on the wired connection
+    /// (only legal on an `Access`-typed input). The sibling of
+    /// [`Self::requires_scopes`] for services whose optional fields
+    /// decide what a connection can do rather than a permission
+    /// grant: a mailbox with only the sending server filled can send
+    /// and cannot receive, and each node says which half it needs.
+    ///
+    /// Checked in the same three places, and unlike permissions the
+    /// answer is never "unknown": either the connection stores the
+    /// value or it does not, so a shortfall is ALWAYS a hard error
+    /// naming the missing value. Still not compiler-checkable: source
+    /// holds only a connection id.
+    // SYNC: InputSpec.requires_values <-> packages/weft-graph/src/protocol.ts InputSpec.requiresValues
+    #[serde(
+        default,
+        rename = "requiresValues",
+        alias = "requires_values",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requires_values: Option<Vec<String>>,
 }
 
 impl InputSpec {
@@ -812,7 +987,35 @@ pub enum Widget {
     Select { options: Vec<String> },
     Multiselect { options: Vec<String> },
     Password,
-    ApiKey { provider: String },
+    /// The connection picker on an ACCESS NODE (the node whose
+    /// metadata carries the `service` recipe). Renders the connection
+    /// list (existing connections plus the declared doors of "+ Add a
+    /// connection"); the stored config value is the small
+    /// `{"id": "<connection id>", "identity": "..."}` handle, never a
+    /// secret. `service` is COMPILER-STAMPED from the node metadata's
+    /// `service.service` at enrich time; authors write only
+    /// `{"kind": "access"}`.
+    Access { service: Option<String> },
+    /// Pick a resource on the connected service (a spreadsheet, a
+    /// channel, a repo) on ONE field with several declared SOURCES;
+    /// the editor uses the richest source the chosen connection
+    /// actually supports (free beats a call, a call beats a popup, a
+    /// popup beats typing), dropping each unusable one silently. The
+    /// stored config value is `{"id": "...", "label": "..."}` (label
+    /// cached for display); the runtime hands the node the bare id
+    /// string.
+    RemoteSelect {
+        /// The name of this node's Access input that authenticates
+        /// the sources needing one.
+        access: String,
+        /// The ways this field can be filled, in preference order.
+        sources: Vec<ResourceSource>,
+        /// Parent inputs for drill-down (`{repo}` in a list URL); the
+        /// editor substitutes their current values and clears this
+        /// field when a parent changes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        depends_on: Vec<String>,
+    },
     FormBuilder,
     /// Editor file picker: the user picks a project file (drop/browse) or
     /// pastes a URL, and the input's value becomes a media
@@ -853,7 +1056,8 @@ impl Widget {
             Widget::Select { .. } => "select",
             Widget::Multiselect { .. } => "multiselect",
             Widget::Password => "password",
-            Widget::ApiKey { .. } => "api_key",
+            Widget::Access { .. } => "access",
+            Widget::RemoteSelect { .. } => "remote_select",
             Widget::FormBuilder => "form_builder",
             Widget::FileDrop { .. } => "file_drop",
         }
@@ -884,6 +1088,120 @@ impl Widget {
 /// `, File)`.
 fn file_drop_default_type() -> crate::weft_type::WeftType {
     crate::weft_type::WeftType::file()
+}
+
+/// One way a `remote_select` field can be filled. Declared as a LIST
+/// in preference order; the editor uses the richest one the chosen
+/// connection supports and silently drops each source whose
+/// requirement is not met:
+///
+/// - `granted`: the resources were recorded on the connection during
+///   sign-in (a GitHub App's installed repos); free, no call at all.
+///   Requires the connection to have recorded them; contributes
+///   nothing on services whose consent never names resources.
+/// - `list`: call the service and enumerate. Requires the listed
+///   permissions on the connection.
+/// - `picker`: open the provider's own chooser, where choosing GRANTS
+///   the picked resource. Requires a connection, nothing more.
+/// - `from_url`: the user pastes a link; a pattern extracts the id.
+///   Requires nothing at all, so it is the one source left standing
+///   with NO connection (the works-without-signing-in path).
+// SYNC: ResourceSource <-> packages/weft-graph/src/protocol.ts ResourceSource
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceSource {
+    /// Read the options off the connection row itself: `from` names
+    /// the stored value (captured at connect) holding a JSON array.
+    /// `label` / `value` are dotted paths into one array item (same
+    /// vocabulary as [`Lookup`]), defaulting to `label` / `id`.
+    Granted {
+        from: String,
+        #[serde(default = "granted_default_label")]
+        label: String,
+        #[serde(default = "granted_default_value")]
+        value: String,
+    },
+    /// Today's declarative lookup, unchanged, as one source.
+    List {
+        #[serde(flatten)]
+        lookup: Lookup,
+        /// The permissions the lookup call needs on the connection;
+        /// the editor drops this source when they are not held.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requires: Vec<String>,
+    },
+    /// The provider's own chooser widget, declared ENTIRELY by the
+    /// node: the provider script to load and the glue that runs it.
+    /// Choosing opens a weft-served page in the user's browser (the
+    /// same pattern as the sign-in consent) that loads `script`, runs
+    /// `code`, and hands the picked resource back; weft ships no
+    /// per-provider chooser code, ever. The glue runs scoped on that
+    /// page, with the connection's own token, nowhere near the editor.
+    Picker {
+        /// The chooser script's address, loaded by the picker page.
+        script: String,
+        /// The glue, written by the node author: JS statements run on
+        /// the picker page after `script` loads, with `weft.token`
+        /// (the connection's access token), `weft.clientId` (the app's
+        /// public client id, or null for a pasted key),
+        /// `weft.mimeTypes`, `weft.done({id, label})`, `weft.cancel()`
+        /// and `weft.fail(message)` in scope.
+        code: String,
+        /// The permissions that choosing a resource GRANTS (recorded
+        /// on the picked value, e.g. Google's `drive.file`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        grants: Vec<String>,
+        /// Narrow the chooser to these MIME types, threaded to the
+        /// glue as `weft.mimeTypes`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mime_types: Vec<String>,
+    },
+    /// Regex extracting the id from a pasted URL; first capture group
+    /// wins.
+    FromUrl { pattern: String },
+}
+
+fn granted_default_label() -> String {
+    "label".into()
+}
+
+fn granted_default_value() -> String {
+    "id".into()
+}
+
+/// The declarative list request behind a `remote_select` widget's
+/// `list` source: ask the service for options given what the user
+/// typed (`{query}`) and what's picked above (`{<parent>}` from
+/// `depends_on`). The dispatcher runs it through the stored access;
+/// the editor only ever sees label/value pairs.
+// SYNC: Lookup <-> packages/weft-graph/src/protocol.ts Lookup
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lookup {
+    /// GET URL. `{query}` interpolates the user's search text
+    /// (url-encoded); `{<parent input name>}` interpolates a
+    /// `depends_on` parent's picked id.
+    pub get: String,
+    /// Dotted path to the items array in the response.
+    pub items: String,
+    /// Field (dotted path, relative to one item) shown as the label.
+    pub label: String,
+    /// Field (dotted path, relative to one item) stored as the id.
+    pub value: String,
+    /// Cursor pagination, for services whose list is windowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageSpec>,
+}
+
+/// Cursor pagination on a [`Lookup`]: the request param the cursor is
+/// sent in, and the response path the next cursor is read from (empty
+/// or absent = no more pages).
+// SYNC: PageSpec <-> packages/weft-graph/src/protocol.ts PageSpec
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageSpec {
+    pub cursor_param: String,
+    pub cursor_path: String,
 }
 
 /// What a node emits when it's done.
@@ -1221,6 +1539,8 @@ mod input_semantics_tests {
             label: None,
             placeholder: None,
             description: None,
+            requires_scopes: None,
+            requires_values: None,
         }
     }
 
@@ -1290,7 +1610,12 @@ mod input_semantics_tests {
             Widget::Select { options: vec!["a".into()] },
             Widget::Multiselect { options: vec!["a".into()] },
             Widget::Password,
-            Widget::ApiKey { provider: "p".into() },
+            Widget::Access { service: None },
+            Widget::RemoteSelect {
+                access: "account".into(),
+                sources: vec![ResourceSource::FromUrl { pattern: "(x)".into() }],
+                depends_on: vec![],
+            },
             Widget::FormBuilder,
             Widget::FileDrop {
                 accept: None,
@@ -1336,19 +1661,108 @@ mod input_semantics_tests {
         assert!(metadata_with(vec![t]).validate_semantics().is_ok());
     }
 
-    /// A credential input is config-exposure by contract; any other
-    /// exposure (wired or assigned keys) is a metadata error.
+    /// The access widget's rules bind on the access node's OWN input:
+    /// its declared type must be Access (the marker the node reads),
+    /// and the Access type's Wire exposure default never satisfies the
+    /// widget's `exposure: config` requirement, so an author must
+    /// declare it explicitly.
     #[test]
-    fn validate_semantics_rejects_a_wireable_api_key() {
-        let mut key = input("apiKey", WeftType::primitive(WeftPrimitive::String));
-        key.widget = Some(Widget::ApiKey { provider: "openrouter".into() });
-        // String's type-default exposure is `all` (wireable): rejected.
-        let meta = metadata_with(vec![key.clone()]);
+    fn validate_semantics_types_the_access_widget_input() {
+        // Default (Wire) exposure: the config requirement fires.
+        let mut n = input("account", WeftType::Access);
+        n.widget = Some(Widget::Access { service: None });
+        let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
+        assert!(e.contains("exposure: config"), "{e}");
+
+        // With the service recipe present: an Access-typed input
+        // passes, a JsonDict-typed one is rejected by the widget's
+        // value-shape check (the value the node reads is the Access
+        // marker, which JsonDict cannot hold).
+        let with_service = |ty: WeftType| -> NodeMetadata {
+            let mut n = input("account", ty);
+            n.exposure = Some(Exposure::Config);
+            n.widget = Some(Widget::Access { service: None });
+            let mut m = metadata_with(vec![n]);
+            m.service = Some(
+                serde_json::from_value(json!({
+                    "service": "tg",
+                    "acquisition": {"kind": "static", "fields": [
+                        {"name": "token", "label": "Token"}]}
+                }))
+                .expect("spec"),
+            );
+            m
+        };
+        assert!(with_service(WeftType::Access).validate_semantics().is_ok());
+        let e = with_service(WeftType::JsonDict).validate_semantics().unwrap_err();
+        assert!(e.contains("access widget edits"), "{e}");
+    }
+
+    /// A remote_select needs at least one source, and a from_url
+    /// source's pattern must parse, so a typo'd extractor fails the
+    /// metadata load instead of silently never matching a paste.
+    #[test]
+    fn validate_semantics_checks_remote_select_sources() {
+        let account = input("account", WeftType::Access);
+        let mut field = input("sheet", WeftType::primitive(WeftPrimitive::String));
+        field.widget = Some(Widget::RemoteSelect {
+            access: "account".into(),
+            sources: vec![],
+            depends_on: vec![],
+        });
+        let e = metadata_with(vec![account.clone(), field.clone()])
+            .validate_semantics()
+            .unwrap_err();
+        assert!(e.contains("at least one source"), "{e}");
+
+        field.widget = Some(Widget::RemoteSelect {
+            access: "account".into(),
+            sources: vec![ResourceSource::FromUrl { pattern: "([unclosed".into() }],
+            depends_on: vec![],
+        });
+        let e = metadata_with(vec![account.clone(), field.clone()])
+            .validate_semantics()
+            .unwrap_err();
+        assert!(e.contains("from_url"), "{e}");
+
+        field.widget = Some(Widget::RemoteSelect {
+            access: "account".into(),
+            sources: vec![ResourceSource::FromUrl {
+                pattern: "/spreadsheets/d/([a-zA-Z0-9_-]+)".into(),
+            }],
+            depends_on: vec![],
+        });
+        assert!(metadata_with(vec![account, field]).validate_semantics().is_ok());
+    }
+
+    /// A project-declared app may never carry a secret: project
+    /// metadata is source, and source never holds secrets.
+    #[test]
+    fn validate_semantics_rejects_a_confidential_project_app() {
+        let mut meta = metadata_with(vec![]);
+        meta.access_apps.insert(
+            "google".into(),
+            crate::access::spec::AppRegistration {
+                label: "My app".into(),
+                client_id: "cid".into(),
+                client_secret: Some("sec".into()),
+                extra: Default::default(),
+            },
+        );
         let e = meta.validate_semantics().unwrap_err();
-        assert!(e.contains("requires `exposure: config`"), "{e}");
-        // Declared config exposure passes.
-        key.exposure = Some(Exposure::Config);
-        assert!(metadata_with(vec![key]).validate_semantics().is_ok());
+        assert!(e.contains("client_secret"), "{e}");
+
+        let mut public = metadata_with(vec![]);
+        public.access_apps.insert(
+            "google".into(),
+            crate::access::spec::AppRegistration {
+                label: "My app".into(),
+                client_id: "cid".into(),
+                client_secret: None,
+                extra: Default::default(),
+            },
+        );
+        assert!(public.validate_semantics().is_ok());
     }
 
     /// One name = one input; a duplicate is a metadata error.
@@ -1467,6 +1881,45 @@ mod package_defaults_tests {
             let err = merge_package_defaults(&mut member, &defaults).unwrap_err();
             assert!(err.contains(key), "refusal names `{key}`: {err}");
         }
+    }
+
+    /// `accessApps` declared at a package root reaches a member node
+    /// that declares none of its own, and lands as typed metadata: the
+    /// app is declared once and inherited, keyed by service name.
+    #[test]
+    fn access_apps_inherit_from_the_package_root() {
+        let mut member = serde_json::json!({
+            "type": "SlackSendMessage",
+            "label": "Send Slack message",
+            "description": "d",
+            "category": "communication",
+            "inputs": [],
+            "outputs": []
+        });
+        let defaults: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({
+                "accessApps": {
+                    "slack": { "label": "Slack", "client_id": "cid" }
+                }
+            }),
+        )
+        .unwrap();
+        merge_package_defaults(&mut member, &defaults).unwrap();
+        let meta: NodeMetadata = serde_json::from_value(member).unwrap();
+        let app = meta.access_apps.get("slack").expect("inherited the slack app");
+        assert_eq!(app.client_id, "cid");
+        assert_eq!(app.label, "Slack");
+        assert!(app.client_secret.is_none(), "a project app is a public client");
+
+        // A member's OWN app for a service wins wholesale over the root's.
+        let mut member = serde_json::json!({
+            "type": "T", "label": "l", "description": "d", "category": "c",
+            "inputs": [], "outputs": [],
+            "accessApps": { "slack": { "label": "Mine", "client_id": "mine" } }
+        });
+        merge_package_defaults(&mut member, &defaults).unwrap();
+        let meta: NodeMetadata = serde_json::from_value(member).unwrap();
+        assert_eq!(meta.access_apps["slack"].client_id, "mine", "member wins wholesale");
     }
 }
 

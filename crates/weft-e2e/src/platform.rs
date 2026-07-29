@@ -688,6 +688,82 @@ impl Platform {
         Ok(rows)
     }
 
+    /// Recent logs of EVERY pod in the listener pool, concatenated:
+    /// where a trigger's refusal to arm surfaces today (a fatal
+    /// prepare logs and gives up; no project-facing signal status
+    /// exists yet, see the root TODO's project-scoped meta log entry).
+    /// Pods are enumerated by the manifests' role label
+    /// (`weft.dev/role=listener`) in every namespace the registry
+    /// shows a live listener in, so no pod's log is skipped. A kubectl
+    /// failure is an error carrying its stderr, never an empty string.
+    pub async fn listener_pool_logs(&self) -> Result<String> {
+        let namespaces: std::collections::BTreeSet<String> =
+            self.live_listener_pods().await?.into_iter().map(|row| row.namespace).collect();
+        let mut all = String::new();
+        for namespace in &namespaces {
+            let out = tokio::process::Command::new("kubectl")
+                .args([
+                    "get", "pods", "-n", namespace, "-l", "weft.dev/role=listener",
+                    "-o", "jsonpath={.items[*].metadata.name}",
+                ])
+                .output()
+                .await
+                .with_context(|| format!("kubectl get listener pods -n {namespace}"))?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "kubectl get listener pods -n {namespace} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let names = String::from_utf8_lossy(&out.stdout).to_string();
+            for pod in names.split_whitespace() {
+                let out = tokio::process::Command::new("kubectl")
+                    .args(["logs", pod, "-n", namespace, "--tail", "500"])
+                    .output()
+                    .await
+                    .with_context(|| format!("kubectl logs {pod} -n {namespace}"))?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "kubectl logs {pod} -n {namespace} failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                all.push_str(&String::from_utf8_lossy(&out.stdout));
+            }
+        }
+        Ok(all)
+    }
+
+    /// Wait until `needle` shows in the listener pool's logs, via
+    /// [`crate::client::poll_until`]. `what` names the awaited state
+    /// for the timeout message, which also carries the tail of the
+    /// last logs read so a timeout is diagnosable on the spot.
+    pub async fn wait_for_listener_log(
+        &self,
+        what: &str,
+        needle: &str,
+        deadline: std::time::Duration,
+    ) -> Result<()> {
+        let last_logs = std::sync::Mutex::new(String::new());
+        let result = poll_until(what, deadline, std::time::Duration::from_secs(2), || {
+            let last_logs = &last_logs;
+            async move {
+                let logs = self.listener_pool_logs().await?;
+                let hit = logs.contains(needle);
+                *last_logs.lock().expect("log mutex") = logs;
+                Ok(hit.then_some(()))
+            }
+        })
+        .await;
+        result.map_err(|e| {
+            let logs = last_logs.into_inner().expect("log mutex");
+            e.context(format!(
+                "listener pool log tail:\n{}",
+                crate::client::tail(&logs, 2000)
+            ))
+        })
+    }
+
     /// The `owner_pod_id` (the dispatcher pod that manages this listener)
     /// for a listener pod. A clone inherits this so it is drained/reaped
     /// by the real dispatcher rather than stranded under a synthetic owner.

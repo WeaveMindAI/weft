@@ -1,0 +1,105 @@
+{
+  "type": "EmailAccess",
+  "label": "Email Access",
+  "description": "Sign in to a mailbox with its address and password. Mail uses two separate protocols, one per direction: IMAP reads what arrives, SMTP sends. Fill the half you need (both, to receive and send through one connection). Works with every provider that serves them, which is essentially all of them: Gmail (imap.gmail.com / smtp.gmail.com, with an app password), Outlook, Fastmail, iCloud, a company server, a self-hosted box.",
+  "category": "Communication",
+  "tags": [
+    "email",
+    "imap",
+    "smtp",
+    "access"
+  ],
+  "icon": "Mail",
+  "color": "#0a84ff",
+  "service": {
+    "service": "email",
+    "label": "Email",
+    "identity": "{user}",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "user",
+          "label": "Email address",
+          "secret": false,
+          "placeholder": "you@example.com"
+        },
+        {
+          "name": "password",
+          "label": "Password",
+          "placeholder": "For Gmail/Outlook: an app password, not the account password"
+        },
+        {
+          "name": "imap_host",
+          "label": "Incoming server (IMAP)",
+          "secret": false,
+          "optional": true,
+          "placeholder": "imap.gmail.com (leave empty if you only send)"
+        },
+        {
+          "name": "imap_port",
+          "label": "Incoming port",
+          "secret": false,
+          "optional": true,
+          "placeholder": "993"
+        },
+        {
+          "name": "smtp_host",
+          "label": "Outgoing server (SMTP)",
+          "secret": false,
+          "optional": true,
+          "placeholder": "smtp.gmail.com (leave empty if you only receive)"
+        },
+        {
+          "name": "smtp_port",
+          "label": "Outgoing port",
+          "secret": false,
+          "optional": true,
+          "placeholder": "465, or 587"
+        },
+        {
+          "name": "send_as",
+          "label": "Send as",
+          "secret": false,
+          "optional": true,
+          "placeholder": "Only if you send from an alias: Your Name <alias@example.com>"
+        }
+      ]
+    },
+    "capabilities": [
+      {
+        "label": "receive mail",
+        "fields": [
+          "imap_host",
+          "imap_port"
+        ]
+      },
+      {
+        "label": "send mail",
+        "fields": [
+          "smtp_host",
+          "smtp_port"
+        ]
+      }
+    ]
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Mailbox"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The mailbox's access: wire it into the email trigger and action nodes."
+    }
+  ]
+}

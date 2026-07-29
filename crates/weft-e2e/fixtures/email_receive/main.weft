@@ -1,0 +1,11 @@
+# A mail-arrival trigger over the raw-pipe listener: the listener
+# dials the mailbox's IMAP server over TLS, walks the sign-in
+# dialogue, idles, and fires when a message lands. The rig fills
+# `subjectContains` with the send fixture's unique marker.
+
+mb = EmailAccess
+recv = ReceiveEmail
+recv.account = mb.access
+
+out = Debug
+out.data = recv.subject

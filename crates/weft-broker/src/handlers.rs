@@ -623,98 +623,149 @@ pub async fn project_fetch_definition(
     }))
 }
 
-// ---------- Provider access ----------
+// ---------- Connections ----------
 
-/// Worker opens access to a provider on the runtime's configured key. The
-/// caller's execution scope anchors the tenant; the runtime's
-/// `CredentialSource` decides whether THIS node may use its key and answers
-/// with the credential to authenticate with, plus (when it relays) where
-/// calls on it go.
+/// The worker-caller prologue every connection verb shares: the caller
+/// must be a worker, and the color it names must belong to a tenant it
+/// may act for. Hands back that tenant.
+async fn require_worker_color(
+    state: &BrokerState,
+    caller: &crate::auth::CallerIdentity,
+    color: &str,
+) -> Result<String, (StatusCode, String)> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "worker only".into()));
+    }
+    scope::require_color_owned_by(&state.scope_cache, &state.pool, caller, color).await
+}
+
+/// Worker resolves a connection for one firing. The store fetches the
+/// row (tenant wall, lazy single-flight refresh, required-permission
+/// drift backstop) and answers EXACTLY the stored values the service's
+/// auth steps interpolate; refresh tokens and app secrets never leave
+/// the store side. For a row whose credential the RUNTIME supplies,
+/// the credential source answers instead: it decides whether THIS node
+/// may use the runtime's credential and hands back what to
+/// authenticate with, plus (when it relays) where calls on it go.
 ///
 /// The node declares how long its provider work may take
 /// (`expected_duration_secs`) and the runtime does not second-guess it: a
 /// legitimately long action (a multi-day agent, a slow batch job) says so and
 /// gets a window that long. There is no ceiling here.
-pub async fn open_provider_access(
+pub async fn resolve_connection(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<ProviderAccessRequest>,
-) -> Resp<ProviderAccessResponse> {
-    if caller.role != Role::Worker {
-        return Err((StatusCode::FORBIDDEN, "worker only".into()));
-    }
-    // The provider name arrives on the wire from the worker. It is the string
-    // the runtime's key is derived from (`<NAME>_API_KEY`), so it is held to
-    // the same charset it is validated against where it is DECLARED
-    // (`weft_core::node::is_valid_provider_name`). Without this, the derivation
-    // would run on an arbitrary caller-supplied string.
-    if !weft_core::node::is_valid_provider_name(&req.provider) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "provider name '{}' is invalid: use only lowercase letters, digits, and '_'",
-                req.provider
-            ),
-        ));
-    }
-    let tenant =
-        scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color)
-            .await?;
-    let key_req = crate::credential::KeyRequest {
-        tenant,
-        color: req.color.clone(),
-        project_id: req.project_id,
-        node_id: req.node_id,
-        frames: req.frames,
-        node_type: req.node_type,
-        provider: req.provider.clone(),
-        pod_name: caller.pod_name.clone(),
-        window: std::time::Duration::from_secs(req.expected_duration_secs),
+    Json(req): Json<ResolveConnectionRequest>,
+) -> Resp<ResolveConnectionResponse> {
+    let tenant = require_worker_color(&state, &caller, &req.color).await?;
+    let connection_id: uuid::Uuid = req.connection_id.parse().map_err(|_| {
+        (StatusCode::BAD_REQUEST, format!("malformed connection id '{}'", req.connection_id))
+    })?;
+    let resolved = weft_access_store::resolve_for_worker(
+        &state.pool,
+        &tenant,
+        connection_id,
+        &req.service,
+        &req.required_permissions,
+        &req.required_values,
+    )
+    .await
+    .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
+        Some(weft_access_store::AccessError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            "this connection does not exist here; pick one on the access node".into(),
+        ),
+        Some(weft_access_store::AccessError::Invalid(_))
+        | Some(weft_access_store::AccessError::NeedsReconnect { .. }) => {
+            (StatusCode::CONFLICT, format!("{e}"))
+        }
+        None => internal(e),
+    })?;
+
+    let response = match resolved.owner {
+        weft_core::CredentialOwner::TheirOwn => ResolveConnectionResponse {
+            values: resolved.values,
+            auth: resolved.auth,
+            identity: resolved.identity,
+            relay_url: None,
+            owner: resolved.owner,
+        },
+        weft_core::CredentialOwner::Ours => {
+            // The row's service (already matched against the request)
+            // keys the credential source; nothing here trusts a
+            // caller-supplied name for anything but that equality.
+            let names = weft_core::access::spec::worker_value_names_of(&resolved.auth)
+                .map_err(|e| internal(anyhow::anyhow!(e)))?;
+            let [name] = names.as_slice() else {
+                return Err(internal(anyhow::anyhow!(
+                    "an ours-owned '{}' connection must authenticate through exactly one \
+                     stored value; its auth steps interpolate {}",
+                    resolved.service,
+                    names.len()
+                )));
+            };
+            let key_req = crate::credential::KeyRequest {
+                tenant,
+                color: req.color.clone(),
+                project_id: req.project_id,
+                node_id: req.node_id,
+                frames: req.frames,
+                node_type: req.node_type,
+                service: resolved.service.clone(),
+                auth: resolved.auth.clone(),
+                pod_name: caller.pod_name.clone(),
+                window: std::time::Duration::from_secs(req.expected_duration_secs),
+            };
+            match state.credentials.resolve(&state.pool, &key_req).await.map_err(internal)? {
+                crate::credential::KeyResolution::Access { credential, relay_url } => {
+                    let mut values = std::collections::BTreeMap::new();
+                    values.insert(name.clone(), credential);
+                    ResolveConnectionResponse {
+                        values,
+                        auth: resolved.auth,
+                        identity: resolved.identity,
+                        relay_url,
+                        owner: resolved.owner,
+                    }
+                }
+                crate::credential::KeyResolution::NotConfigured => {
+                    return Err((
+                        StatusCode::PRECONDITION_FAILED,
+                        format!(
+                            "no credential is configured for '{}'; connect your own on the \
+                             access node",
+                            resolved.service
+                        ),
+                    ))
+                }
+                crate::credential::KeyResolution::Denied { reason } => {
+                    return Err((StatusCode::FORBIDDEN, reason))
+                }
+            }
+        }
     };
-    match state.credentials.resolve(&state.pool, &key_req).await.map_err(internal)? {
-        crate::credential::KeyResolution::Access { credential, relay_url } => {
-            Ok(Json(ProviderAccessResponse { credential, relay_url }))
-        }
-        crate::credential::KeyResolution::NotConfigured => Err((
-            StatusCode::PRECONDITION_FAILED,
-            format!(
-                "no key is configured for '{}'; set your own key on the \
-                 node's key input",
-                req.provider
-            ),
-        )),
-        crate::credential::KeyResolution::Denied { reason } => {
-            Err((StatusCode::FORBIDDEN, reason))
-        }
-    }
+    Ok(Json(response))
 }
 
-/// Runtime gives a runtime-granted access back (the node that opened it
-/// finished): a source that hands out time-bounded credentials retires this
-/// one now, rather than leaving it usable to its window (the crash
-/// backstop).
-///
-/// The color scope check keeps a worker from retiring another tenant's
-/// accesses; the source's close is scoped to the caller's tenant, so a
-/// credential it does not own is simply not found (and closing is
-/// idempotent).
-pub async fn close_provider_access(
+/// The firing that resolved a connection finished: give the lease back
+/// NOW, rather than leaving a runtime-supplied credential usable to
+/// its window (the crash backstop). Serves RUNTIME-OWNED releases:
+/// the engine calls it only for an `Ours`-owned connection (a
+/// runtime-supplied credential is the only thing there is to retire;
+/// a user's own stored values never travel back). Closing is
+/// idempotent, and a value the source never supplied is simply not
+/// found. The color scope check keeps a worker from retiring another
+/// tenant's credentials.
+pub async fn release_connection(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<ProviderAccessCloseRequest>,
-) -> Resp<ProviderAccessCloseResponse> {
-    if caller.role != Role::Worker {
-        return Err((StatusCode::FORBIDDEN, "worker only".into()));
+    Json(req): Json<ReleaseConnectionRequest>,
+) -> Resp<ReleaseConnectionResponse> {
+    let tenant = require_worker_color(&state, &caller, &req.color).await?;
+    for value in req.values.values() {
+        state.credentials.close(&state.pool, value, &tenant).await.map_err(internal)?;
     }
-    let tenant =
-        scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color)
-            .await?;
-    state
-        .credentials
-        .close(&state.pool, &req.credential, &tenant)
-        .await
-        .map_err(internal)?;
-    Ok(Json(ProviderAccessCloseResponse {}))
+    Ok(Json(ReleaseConnectionResponse {}))
 }
 
 // ---------- Supervisor surface ----------

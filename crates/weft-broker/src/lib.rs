@@ -14,6 +14,9 @@ pub mod auth;
 pub mod credential;
 pub mod entitlement;
 pub mod handlers;
+pub mod access_admin;
+pub mod app_provider;
+pub mod events;
 pub mod runtime_storage;
 pub mod runtime_store;
 pub mod scope;
@@ -48,6 +51,33 @@ pub fn spawn_expiry_sweep(state: Arc<BrokerState>) {
                 Err(e) => tracing::warn!(
                     target: "weft_broker::runtime_store", error = %format!("{e:#}"),
                     "runtime-file expiry sweep failed; will retry next tick"
+                ),
+            }
+        }
+    });
+}
+
+/// Spawn the periodic sweep for abandoned connect rows (a consent the
+/// user never finished, a parked outcome the editor never polled).
+/// Their TTL was only ever checked on read, so without this they live
+/// forever. Stateless + idempotent, so every broker replica may run it
+/// concurrently.
+pub fn spawn_connect_sweep(state: Arc<BrokerState>) {
+    tokio::spawn(async move {
+        // The rows go stale after 15 minutes; a five-minute cadence
+        // keeps the backlog at most a handful of rows.
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            match weft_access_store::sweep_expired_connects(&state.pool).await {
+                Ok(n) if n > 0 => tracing::info!(
+                    target: "weft_broker::access_admin", swept = n,
+                    "abandoned connect rows deleted"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    target: "weft_broker::access_admin", error = %format!("{e:#}"),
+                    "connect-row sweep failed; will retry next tick"
                 ),
             }
         }
@@ -101,10 +131,14 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/project/fetch_definition",
             post(handlers::project_fetch_definition),
         )
-        // Provider access (worker data path). Cost records ride the generic
+        // Connections (worker data path). Cost records ride the generic
         // task rail (`/v1/task/enqueue_dedup`, kind `record_cost`).
-        .route("/v1/access/open", post(handlers::open_provider_access))
-        .route("/v1/access/close", post(handlers::close_provider_access))
+        // One resolve for every connection: the worker sends a
+        // connection id and the row decides everything (whose
+        // credential, lazy refresh store-side, or the runtime's
+        // credential source for an ours-owned row).
+        .route("/v1/access/resolve", post(handlers::resolve_connection))
+        .route("/v1/access/close", post(handlers::release_connection))
         // Signals (listener-only rehydrate read, by placement = pod)
         .route(
             "/v1/signal/list_for_pod",
@@ -195,5 +229,13 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         // The broker is the single gatekeeper (resolves the caller in-process,
         // runs the key wall, enforces quota, signs the bucket).
         .merge(runtime_storage::router())
+        // Access admin: the connect/lookup verbs whose work makes an
+        // outbound call to a tenant-influenced URL; they run here
+        // because the broker's egress is locked to the public internet
+        // (the dispatcher forwards them, like the file admin verbs).
+        .merge(access_admin::routes())
+        // Provider events: the listener's serving surface and the
+        // receive-side verification the dispatcher forwards to.
+        .merge(events::routes())
         .with_state(state)
 }

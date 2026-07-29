@@ -1,0 +1,4 @@
+[package]
+name = "e2e_slack_receive"
+id = "00000000-0000-0000-0000-000000000041"
+version = "0.1.0"

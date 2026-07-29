@@ -477,6 +477,15 @@ enum DaemonAction {
         /// Force-rebuild the dispatcher and listener images.
         #[arg(long)]
         rebuild: bool,
+        /// Expose the PUBLIC TRIGGER SURFACE (/events/..., /signal/...)
+        /// to the internet through an outbound tunnel + filtering
+        /// proxy, so providers can deliver event pushes to this local
+        /// install. Persisted until --no-public-url.
+        #[arg(long, overrides_with = "no_public_url")]
+        public_url: bool,
+        /// Close the public trigger surface (tear the tunnel down).
+        #[arg(long)]
+        no_public_url: bool,
     },
     /// Stop the running daemon. Scales the dispatcher Deployment to
     /// 0 and tears down the local port-forward. The kind cluster
@@ -488,6 +497,11 @@ enum DaemonAction {
     Restart {
         #[arg(long)]
         rebuild: bool,
+        /// See `daemon start --public-url`.
+        #[arg(long, overrides_with = "no_public_url")]
+        public_url: bool,
+        #[arg(long)]
+        no_public_url: bool,
     },
     /// Tail the daemon's stderr log.
     Logs {
@@ -539,13 +553,33 @@ impl InfraAction {
     }
 }
 
+/// The tri-state the daemon persists: flagged on, flagged off, or
+/// unflagged (keep the persisted choice).
+fn public_url_choice(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        (false, false) => None,
+    }
+}
+
 impl From<DaemonAction> for commands::daemon::DaemonAction {
     fn from(value: DaemonAction) -> Self {
         match value {
-            DaemonAction::Start { rebuild } => commands::daemon::DaemonAction::Start { rebuild },
+            DaemonAction::Start { rebuild, public_url, no_public_url } => {
+                commands::daemon::DaemonAction::Start {
+                    rebuild,
+                    public_url: public_url_choice(public_url, no_public_url),
+                }
+            }
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
             DaemonAction::Status => commands::daemon::DaemonAction::Status,
-            DaemonAction::Restart { rebuild } => commands::daemon::DaemonAction::Restart { rebuild },
+            DaemonAction::Restart { rebuild, public_url, no_public_url } => {
+                commands::daemon::DaemonAction::Restart {
+                    rebuild,
+                    public_url: public_url_choice(public_url, no_public_url),
+                }
+            }
             DaemonAction::Logs { tail, follow } => {
                 commands::daemon::DaemonAction::Logs { tail, follow }
             }
@@ -555,9 +589,10 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Provider keys (`<PROVIDER>_API_KEY`) and local overrides come from
-    // the nearest `.env` up from the invoking directory. Real env vars
-    // win over the file; no file is normal; a malformed file fails loud.
+    weft_core::net::install_crypto_provider();
+    // Local overrides (the sealing key, ports, paths) come from the
+    // nearest `.env` up from the invoking directory. Real env vars win
+    // over the file; no file is normal; a malformed file fails loud.
     match dotenvy::dotenv() {
         Ok(_) => {}
         Err(e) if e.not_found() => {}

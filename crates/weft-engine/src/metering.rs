@@ -1,15 +1,29 @@
-//! The worker side of metered paid calls: the middleware behind
-//! `ctx.metered_client`.
+//! The worker side of measured calls: the middleware stack behind an
+//! opened connection's client.
 //!
-//! For each request on a provider access, the middleware
-//!   1. routes it (straight to the provider, or to the runtime's relay
-//!      when the access carries one),
-//!   2. on a direct billable route, runs the provider's meter around it:
+//! ONE composition serves every connection:
+//!
+//! ```text
+//! client = base
+//!        + MeteringMiddleware   when a meter is registered for the service
+//!        + AuthMiddleware       always (the service's resolved auth steps)
+//! ```
+//!
+//! For each request, the metering middleware
+//!   1. routes it (straight to the service, or to the runtime's relay
+//!      when the resolved credential carries one),
+//!   2. on a direct billable route, runs the service's meter around it:
 //!      prepare the request so its cost becomes reportable, TAP the response
 //!      stream (the caller sees every chunk in real time; nothing is
 //!      buffered or delayed), and
 //!   3. when the response ends (cleanly or cut), resolves the meter's
 //!      figure and records it durably on the execution's cost trail.
+//!
+//! The auth middleware runs INSIDE the metering one, so the meter
+//! classifies the URL the node wrote while the credential lands on the
+//! final request; the meter's own follow-up query rides a separate
+//! signed-in client and never sees a credential. That composition is
+//! what makes a sign-in that costs money measurable at all.
 //!
 //! A relayed call is not measured here: the relay is where the runtime's
 //! own measuring happens, and this side's only job is to route the call
@@ -98,13 +112,49 @@ pub struct CostSink {
     pub color: Color,
     pub node_id: String,
     pub frames: LoopFrames,
-    pub provider: String,
-    /// Whose key the access rides; recorded on every figure so the cost
-    /// trail says whose key spent.
-    pub origin: weft_core::AccessOrigin,
+    pub service: String,
+    /// Whose credential the connection rides; recorded on every figure
+    /// so the cost trail says whose account spent.
+    pub origin: weft_core::CredentialOwner,
 }
 
 impl CostSink {
+    /// Book one finished observation's figure: resolve `cost` and write
+    /// it down durably, detached from the caller's future (which may be
+    /// aborted at any point) and tracked by the pending counter so the
+    /// pod cannot exit while money is still being written. The one
+    /// begin/spawn/record/end sequence behind every finalizer, HTTP and
+    /// session alike; a session hands a ready future, an HTTP call the
+    /// meter's resolve.
+    pub(crate) fn book(
+        self: Arc<Self>,
+        cost: impl std::future::Future<Output = MeasuredCost> + Send + 'static,
+    ) {
+        self.pending.begin();
+        let dedup_key = format!("metered_cost:{}", uuid::Uuid::new_v4());
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let cost = cost.await;
+                    self.record(dedup_key, cost).await;
+                    self.pending.end();
+                });
+            }
+            Err(_) => {
+                // No runtime to spawn on (the process is tearing down
+                // outside tokio): the record cannot be written. Say so
+                // loudly; never drop money silently.
+                self.pending.end();
+                tracing::error!(
+                    target: "weft_engine::metering",
+                    "COST RECORD LOST for node {} ({}): the async runtime was already torn \
+                     down when this call's figure was due, so it could not be written down",
+                    self.node_id, self.service,
+                );
+            }
+        }
+    }
+
     /// Enqueue the durable `RecordCost` task. One record per physical call
     /// (a replayed body that calls again spends again, and gets its own
     /// record), so the dedup key is minted per call and only guards
@@ -115,7 +165,7 @@ impl CostSink {
             color: self.color.to_string(),
             node_id: self.node_id.clone(),
             frames: self.frames.clone(),
-            service: self.provider.clone(),
+            service: self.service.clone(),
             model: cost.model,
             amount_usd: cost.amount_usd,
             billed: false,
@@ -128,7 +178,7 @@ impl CostSink {
                 tracing::error!(
                     target: "weft_engine::metering",
                     "COST RECORD LOST for node {} ({}): payload serialize failed: {e}",
-                    self.node_id, self.provider,
+                    self.node_id, self.service,
                 );
                 return;
             }
@@ -159,7 +209,7 @@ impl CostSink {
                     tracing::error!(
                         target: "weft_engine::metering",
                         "COST RECORD LOST for node {} ({}): enqueue failed after retries: {e:#}",
-                        self.node_id, self.provider,
+                        self.node_id, self.service,
                     );
                 }
             }
@@ -169,65 +219,70 @@ impl CostSink {
 
 // ---------- The middleware ----------
 
-/// Per-access metering middleware; see the module docs.
+/// Per-connection metering middleware; see the module docs.
 pub struct MeteringMiddleware {
-    /// The provider's meter, when this runtime ships one. `None` = the
-    /// call passes through unmeasured (a provider without a meter has no
-    /// cost figure at all).
+    /// The service's meter, when one is registered. `None` = the call
+    /// passes through unmeasured (a service without a meter has no cost
+    /// figure at all).
     meter: Option<&'static dyn ProviderMeter>,
-    /// The runtime's relay for calls on this access; `None` = direct.
+    /// The runtime's relay for calls on this connection; `None` = direct.
     relay_url: Option<String>,
-    /// The access credential, for the meter's own follow-up query on the
-    /// direct lane.
-    credential: String,
+    /// A signed-in client for the meter's own follow-up query on the
+    /// direct lane (the same auth the original call rode, on the
+    /// bounded follow-up pool). The meter itself never sees a
+    /// credential.
+    follow_up: reqwest_middleware::ClientWithMiddleware,
     sink: Arc<CostSink>,
 }
 
-/// Build the metered client for one access. Fails loud when the access is
-/// relayed but this runtime has no meter for the provider: routing to a
-/// relay needs the provider's base URL to strip, and only a meter knows it.
-pub fn metered_client(
-    provider: &str,
-    credential: &str,
+/// Build the signed-in (and, when a meter is registered, measured)
+/// client for one opened connection: the ONE composition every
+/// connection's calls ride. `steps` are the service's auth steps
+/// already resolved against the connection's values. Fails loud when
+/// the connection is relayed but no meter is registered for the
+/// service: routing to a relay needs the service's base URL to strip,
+/// and only a meter knows it.
+pub fn connection_client(
+    service: &str,
+    steps: Vec<weft_core::access::client::AppliedStep>,
     relay_url: Option<&str>,
-    sink: CostSink,
+    sink: Arc<CostSink>,
 ) -> WeftResult<reqwest_middleware::ClientWithMiddleware> {
-    let meter = weft_providers::meter_for(provider);
+    let meter = weft_providers::meter_for(service);
     if relay_url.is_some() && meter.is_none() {
         return Err(WeftError::NodeExecution(format!(
-            "the runtime relays calls for provider '{provider}', but it has no \
-             provider definition to route them by; set your own key on the node"
+            "the runtime relays calls for service '{service}', but no meter is registered \
+             to route them by; connect your own credential on the node"
         )));
     }
+    let follow_up = reqwest_middleware::ClientBuilder::new(follow_up_client().clone())
+        .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
+        .build();
     let middleware = MeteringMiddleware {
         meter,
         relay_url: relay_url.map(str::to_string),
-        credential: credential.to_string(),
-        sink: Arc::new(sink),
+        follow_up,
+        sink,
     };
-    Ok(reqwest_middleware::ClientBuilder::new(base_client().clone())
-        .with(middleware)
-        .build())
-}
-
-/// The shared connection pool under every metered client. No total timeout
-/// (streams run long); the connect timeout bounds a dead host. Redirects
-/// disabled: a redirect could re-aim a spliced credential at another host.
-fn base_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("metered base client")
-    })
+    // Metering OUTER (classifies the URL the node wrote, rewrites to
+    // the relay), auth INNER (the credential lands on the final
+    // request either lane).
+    // The pool is the shared connection hygiene base (standard
+    // redirect handling included, on both lanes).
+    Ok(reqwest_middleware::ClientBuilder::new(
+        weft_core::access::client::base_client().clone(),
+    )
+    .with(middleware)
+    .with(weft_core::access::client::AuthMiddleware::new(steps))
+    .build())
 }
 
 /// The client a meter's own follow-up query rides. Separate from the
-/// metered pool on purpose: a follow-up must be bounded (the pending-record
-/// tracker relies on every resolve finishing), so it carries a total
-/// request timeout.
+/// shared pool on purpose: a follow-up must be bounded (the
+/// pending-record tracker relies on every resolve finishing), so it
+/// carries a total request timeout. Redirects are disabled because a
+/// follow-up addresses a route on the meter's own base_url and must
+/// never leave that origin.
 fn follow_up_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -264,11 +319,11 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
             // relay does the measuring; this side does none.
             let Some(route) = route else {
                 return Err(middleware_err(format!(
-                    "this call ({}) is not under provider '{}''s API ({}), so the runtime \
-                     cannot relay it; calls on a runtime-granted access must address the \
-                     provider's own API",
+                    "this call ({}) is not under service '{}''s API ({}), so the runtime \
+                     cannot relay it; calls on a runtime-supplied credential must address \
+                     the service's own API",
                     req.url(),
-                    self.sink.provider,
+                    self.sink.service,
                     self.meter.map(|m| m.base_url()).unwrap_or("<unknown>"),
                 )));
             };
@@ -311,7 +366,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
                 return Err(middleware_err(format!(
                     "billable call on '{}' has a streaming body, which cannot be prepared \
                      for metering; send the body buffered (a byte payload, not a stream)",
-                    self.sink.provider,
+                    self.sink.service,
                 )))
             }
         }
@@ -336,7 +391,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
             finalizer: Some(Finalizer {
                 observer,
                 meter,
-                credential: self.credential.clone(),
+                follow_up: self.follow_up.clone(),
                 sink: self.sink.clone(),
             }),
         };
@@ -359,51 +414,26 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
 struct Finalizer {
     observer: Box<dyn CallObservation>,
     meter: &'static dyn ProviderMeter,
-    credential: String,
+    /// The signed-in follow-up client (bounded pool + the connection's
+    /// auth); the meter never sees a credential.
+    follow_up: reqwest_middleware::ClientWithMiddleware,
     sink: Arc<CostSink>,
 }
 
 impl Finalizer {
-    /// End the observation and spawn the resolve + record, tracked by the
-    /// pending counter so the pod cannot exit under it. Detached on
-    /// purpose: the caller's future may be aborted at any point, and the
-    /// money must still be written down.
+    /// End the observation and book the resolve + record through
+    /// [`CostSink::book`] (detached, tracked, loud on loss).
     fn finish(self, interrupted: bool) {
         let observed = self.observer.end(interrupted);
         let meter = self.meter;
-        let credential = self.credential;
-        let sink = self.sink;
-        sink.pending.begin();
-        let dedup_key = format!("metered_cost:{}", uuid::Uuid::new_v4());
-        let sink_on_no_runtime = sink.clone();
-        let task = async move {
+        let follow_up_http = self.follow_up;
+        self.sink.book(async move {
             let follow_up = FollowUp {
-                http: follow_up_client(),
+                http: &follow_up_http,
                 base_url: meter.base_url(),
-                credential: &credential,
             };
-            let cost = meter.resolve(observed, follow_up).await;
-            sink.record(dedup_key, cost).await;
-            sink.pending.end();
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(task);
-            }
-            Err(_) => {
-                // No runtime to spawn on (the process is tearing down
-                // outside tokio): the record cannot be written. Say so
-                // loudly; never drop money silently.
-                sink_on_no_runtime.pending.end();
-                tracing::error!(
-                    target: "weft_engine::metering",
-                    "COST RECORD LOST for provider '{}': the async runtime was already torn \
-                     down when this call's cost resolution was due (a stream dropped during \
-                     process shutdown), so the figure could not be written down",
-                    sink_on_no_runtime.provider,
-                );
-            }
-        }
+            meter.resolve(observed, follow_up).await
+        });
     }
 }
 
@@ -545,7 +575,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProviderMeter for TestMeter {
-        fn provider(&self) -> &'static str {
+        fn service(&self) -> &'static str {
             "testprov"
         }
         fn base_url(&self) -> &'static str {
@@ -644,13 +674,17 @@ mod tests {
             color: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
-            provider: "testprov".into(),
-            origin: weft_core::AccessOrigin::UserProvided,
+            service: "testprov".into(),
+            origin: weft_core::CredentialOwner::TheirOwn,
         };
+        // The follow-up client of the rig: same signed-in shape the
+        // production composition builds (auth-free here; the test meter
+        // makes no follow-up call).
+        let follow_up = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let middleware = MeteringMiddleware {
             meter: Some(Box::leak(Box::new(TestMeter { base }))),
             relay_url,
-            credential: "sk-key".into(),
+            follow_up,
             sink: Arc::new(sink),
         };
         let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
@@ -714,6 +748,160 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// L3, THE POINT OF THE FOLD: a SIGN-IN service with a registered
+    /// meter. The one composed client applies the connection's auth
+    /// steps (the wire really carries the header) AND measures the
+    /// call, recording `origin: their-own, billed: false`. This case
+    /// was unreachable before metering became credential-blind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signed_in_connection_is_measured_on_its_own_composed_client() {
+        let (base, chunk_tx, received) = spawn_sse_server().await;
+        let base: &'static str = Box::leak(base.into_boxed_str());
+        // Register the test meter under a unique service name via the
+        // production composition (not the hand-built rig).
+        let meter: &'static TestMeter = Box::leak(Box::new(TestMeter { base }));
+        // `connection_client` looks meters up in the global registry;
+        // inject through the same code path by registering.
+        struct Registered;
+        impl Registered {
+            fn client(
+                meter: &'static TestMeter,
+                tasks: Arc<RecordingTaskStore>,
+                pending: Arc<PendingCostRecords>,
+            ) -> reqwest_middleware::ClientWithMiddleware {
+                let steps = weft_core::access::client::resolve_steps(
+                    &[weft_core::access::spec::AuthStep::Header {
+                        name: "Authorization".into(),
+                        value: weft_core::access::spec::Template::new("Bearer {token}"),
+                    }],
+                    &[("token".to_string(), "signed-in-token".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .unwrap();
+                let sink = CostSink {
+                    tasks,
+                    pending,
+                    project_id: "p1".into(),
+                    tenant_id: "t1".into(),
+                    color: uuid::Uuid::nil(),
+                    node_id: "node-x".into(),
+                    frames: LoopFrames::default(),
+                    service: "testprov".into(),
+                    origin: weft_core::CredentialOwner::TheirOwn,
+                };
+                // The exact production stack (metering outer, auth inner),
+                // with the meter injected directly since the global
+                // registry is keyed by the shipped services.
+                let follow_up = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+                    .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
+                    .build();
+                reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+                    .with(MeteringMiddleware {
+                        meter: Some(meter),
+                        relay_url: None,
+                        follow_up,
+                        sink: Arc::new(sink),
+                    })
+                    .with(weft_core::access::client::AuthMiddleware::new(steps))
+                    .build()
+            }
+        }
+        let tasks = Arc::new(RecordingTaskStore::default());
+        let pending = PendingCostRecords::new();
+        let client = Registered::client(meter, tasks.clone(), pending.clone());
+
+        chunk_tx
+            .send(Bytes::from("data: {\"usage\":{\"cost\":0.5}}\n\ndata: [DONE]\n\n"))
+            .unwrap();
+        drop(chunk_tx);
+        let response = client
+            .post(format!("{base}/chat/completions"))
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .expect("send");
+        response.bytes().await.expect("body");
+
+        wait_recorded(&tasks, &pending).await;
+        let payloads = recorded_payloads(&tasks);
+        assert_eq!(payloads.len(), 1, "the sign-in call was measured");
+        assert_eq!(payloads[0].amount_usd, Some(0.5));
+        assert!(!payloads[0].billed, "measured, never billed worker-side");
+        assert_eq!(payloads[0].origin, weft_core::CredentialOwner::TheirOwn);
+        // The wire really carried the auth step: the request reached
+        // the server (it answered), and the recorded body proves the
+        // prepared rewrite went out on the SAME request.
+        assert_eq!(received.lock().unwrap()[0]["usage"]["include"], true);
+    }
+
+    /// A service with NO registered meter records nothing: the client
+    /// signs in and passes through unmeasured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_meterless_service_records_nothing() {
+        let (base, chunk_tx, received) = spawn_sse_server().await;
+        let steps = weft_core::access::client::resolve_steps(
+            &[weft_core::access::spec::AuthStep::Header {
+                name: "Authorization".into(),
+                value: weft_core::access::spec::Template::new("Bearer {token}"),
+            }],
+            &[("token".to_string(), "tok-1".to_string())].into_iter().collect(),
+        )
+        .unwrap();
+        let tasks = Arc::new(RecordingTaskStore::default());
+        let pending = PendingCostRecords::new();
+        let sink = CostSink {
+            tasks: tasks.clone(),
+            pending: pending.clone(),
+            project_id: "p1".into(),
+            tenant_id: "t1".into(),
+            color: uuid::Uuid::nil(),
+            node_id: "node-x".into(),
+            frames: LoopFrames::default(),
+            service: "no_such_meterless_service".into(),
+            origin: weft_core::CredentialOwner::TheirOwn,
+        };
+        let client =
+            connection_client("no_such_meterless_service", steps, None, Arc::new(sink))
+                .expect("builds");
+
+        chunk_tx.send(Bytes::from("data: [DONE]\n\n")).unwrap();
+        drop(chunk_tx);
+        let response = client
+            .post(format!("{base}/chat/completions"))
+            .json(&serde_json::json!({"model": "m"}))
+            .send()
+            .await
+            .expect("send");
+        response.bytes().await.expect("body");
+        pending.wait_zero().await;
+        assert!(tasks.enqueued.lock().unwrap().is_empty(), "no meter = no record");
+        // The auth step still applied.
+        assert!(received.lock().unwrap()[0].get("usage").is_none(), "no meter = no prepare");
+
+        // And a RELAYED connection without a meter is refused at build.
+        let steps2 = Vec::new();
+        let sink2 = CostSink {
+            tasks: tasks.clone(),
+            pending: pending.clone(),
+            project_id: "p1".into(),
+            tenant_id: "t1".into(),
+            color: uuid::Uuid::nil(),
+            node_id: "node-x".into(),
+            frames: LoopFrames::default(),
+            service: "no_such_meterless_service".into(),
+            origin: weft_core::CredentialOwner::Ours,
+        };
+        let err = connection_client(
+            "no_such_meterless_service",
+            steps2,
+            Some("http://relay"),
+            Arc::new(sink2),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no meter is registered"), "{err}");
     }
 
     /// L3, the streaming tap: the caller receives chunk N in REAL TIME
@@ -836,5 +1024,125 @@ mod tests {
             .await
             .expect_err("a non-provider URL cannot be relayed");
         assert!(err.to_string().contains("cannot relay"), "{err}");
+    }
+
+    /// L3, the redirect policy: STANDARD library handling, nothing
+    /// custom. A redirect is followed (this is what un-broke
+    /// redirect-serving endpoints like Google's CSV export), and the
+    /// request's headers ride along per ordinary HTTP-client
+    /// convention: a custom auth header reaches the hop's origin. The
+    /// only convention exception is the library's own (the well-known
+    /// `Authorization`/cookie headers drop when the host changes),
+    /// which is every HTTP tool's behavior, not a weft rule.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_hop_carries_the_connections_auth_to_the_new_origin() {
+        use axum::routing::get;
+
+        // Target server (origin B): records the auth header it saw.
+        let seen: Arc<Mutex<Option<String>>> = Arc::default();
+        let seen_in = seen.clone();
+        let target_app = axum::Router::new().route(
+            "/landed",
+            get(move |headers: axum::http::HeaderMap| {
+                let seen_in = seen_in.clone();
+                async move {
+                    *seen_in.lock().unwrap() = headers
+                        .get("x-custom-token")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    "ok"
+                }
+            }),
+        );
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/landed", target.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(target, target_app).await.unwrap() });
+
+        // Source server (origin A): answers 307 to origin B.
+        let redirect_to = target_url.clone();
+        let source_app = axum::Router::new().route(
+            "/start",
+            get(move || {
+                let redirect_to = redirect_to.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(307)
+                        .header("location", redirect_to)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}/start", source.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(source, source_app).await.unwrap() });
+
+        // A custom auth header, forwarded across the hop per standard
+        // client convention (only the well-known Authorization/cookie
+        // headers are host-scoped).
+        let steps = weft_core::access::client::resolve_steps(
+            &[weft_core::access::spec::AuthStep::Header {
+                name: "x-custom-token".into(),
+                value: weft_core::access::spec::Template::new("tok-{token}"),
+            }],
+            &[("token".to_string(), "42".to_string())].into_iter().collect(),
+        )
+        .unwrap();
+        let client = weft_core::access::client::authed_client(steps);
+
+        let resp = client.get(&source_url).send().await.expect("follow the hop");
+        assert!(resp.status().is_success());
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("tok-42"),
+            "the hop re-applied the connection's auth on the new origin"
+        );
+    }
+
+    /// The follow-up client never leaves its origin: a redirect answer
+    /// comes back as a status, not a followed hop (the client carries
+    /// the connection's auth middleware, which would re-apply auth on
+    /// the hop's target).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_follow_up_client_does_not_follow_redirects() {
+        use axum::routing::get;
+
+        let landed: Arc<Mutex<bool>> = Arc::default();
+        let landed_in = landed.clone();
+        let target_app = axum::Router::new().route(
+            "/landed",
+            get(move || {
+                let landed_in = landed_in.clone();
+                async move {
+                    *landed_in.lock().unwrap() = true;
+                    "ok"
+                }
+            }),
+        );
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/landed", target.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(target, target_app).await.unwrap() });
+
+        let redirect_to = target_url.clone();
+        let source_app = axum::Router::new().route(
+            "/generation",
+            get(move || {
+                let redirect_to = redirect_to.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(307)
+                        .header("location", redirect_to)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}/generation", source.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(source, source_app).await.unwrap() });
+
+        let resp = follow_up_client().get(&source_url).send().await.expect("answers");
+        assert_eq!(resp.status(), 307, "the redirect is an answer, not a hop");
+        assert!(!*landed.lock().unwrap(), "the hop's target was never contacted");
     }
 }

@@ -233,6 +233,20 @@ async fn fire_signal_inner(
     apply_lifecycle_gate(state, token, &routing, payload).await
 }
 
+/// Fire one registered signal through the shared lifecycle gate:
+/// look up its routing by token, then park / refuse / dispatch. What
+/// the public events receiver calls per matched subscription, so a
+/// provider push passes exactly the gate every other external fire
+/// does.
+pub(crate) async fn fire_registered_signal(
+    state: &DispatcherState,
+    token: &str,
+    payload: Value,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let routing = lookup_signal_routing(state, token).await?;
+    apply_lifecycle_gate(state, token, &routing, payload).await
+}
+
 /// One chokepoint for every external fire. Reads the project's
 /// lifecycle (status + accepting/visible/deadline) and decides:
 ///
@@ -1033,7 +1047,7 @@ impl TokenScope {
         use sqlx::Row;
         let rows = sqlx::query(
             "SELECT s.token, s.tenant_id, s.project_id, s.color, s.node_id, s.is_resume, \
-                    s.spec_json, s.consumer_kind, s.tags, s.port_snapshot, \
+                    s.spec_json, s.access_id, s.consumer_kind, s.tags, s.port_snapshot, \
                     s.consumer_payload, \
                     s.surface_kind, s.mount_path, s.auth_kind, s.auth_config, \
                     s.kind_state \
@@ -1080,6 +1094,7 @@ impl TokenScope {
                 node_id: r.try_get("node_id")?,
                 is_resume: r.try_get("is_resume")?,
                 spec_json: r.try_get("spec_json")?,
+                access_id: r.try_get("access_id")?,
                 consumer_kind: r.try_get("consumer_kind")?,
                 tags: r.try_get("tags")?,
                 port_snapshot: r.try_get("port_snapshot")?,
@@ -2001,6 +2016,7 @@ mod public_url_tests {
             node_id: "n".into(),
             is_resume: false,
             spec_json: "{}".into(),
+            access_id: None,
             consumer_kind: None,
             tags: vec![],
             port_snapshot: None,
@@ -2168,6 +2184,7 @@ mod can_cancel_tests {
             node_id: "n".into(),
             is_resume: false,
             spec_json: "{}".into(),
+            access_id: None,
             consumer_kind: None,
             tags: vec![],
             port_snapshot: None,

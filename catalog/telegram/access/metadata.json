@@ -1,0 +1,78 @@
+{
+  "type": "TelegramAccess",
+  "label": "Telegram Access",
+  "description": "Sign in as a Telegram bot: paste the token BotFather gave you. Wire the access output into Telegram action nodes; the token lives in the runtime's access store, never in the project file.",
+  "category": "Data",
+  "tags": [
+    "telegram",
+    "access",
+    "bot"
+  ],
+  "icon": "Send",
+  "color": "#229ED9",
+  "service": {
+    "service": "telegram",
+    "label": "Telegram",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "token",
+          "label": "Bot token",
+          "placeholder": "123456789:AA..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "path_prefix",
+        "value": "/bot{token}"
+      }
+    ],
+    "test": {
+      "url": "https://api.telegram.org/getMe",
+      "captures": [
+        {
+          "name": "bot_username",
+          "path": "result.username"
+        }
+      ]
+    },
+    "identity": "@{bot_username}"
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Bot"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The bot's access: wire it into Telegram action nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "TelegramAccess '{id}' has no connected bot; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

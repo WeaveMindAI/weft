@@ -12,9 +12,9 @@
 
 use async_trait::async_trait;
 
-use weft_core::node::NodeOutput;
-use weft_core::signal::{ApiEndpoint, LiveConnectionConfig};
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
+use weft::signal::{ApiEndpoint, LiveConnectionConfig};
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ApiEndpointNode;

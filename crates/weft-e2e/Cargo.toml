@@ -46,6 +46,19 @@ weft-core = { workspace = true }
 # config field the same way the editor does (parse the CST, edit structurally,
 # reserialize), never by string-surgery on source.
 weft-compiler = { workspace = true }
+# The accesses e2e reads each proof service's AccessSpec off the SAME
+# catalog metadata the editor ships to the store (no duplicated spec
+# JSON in tests), and runs the compile-time validation chain in-process
+# (the same code path `weft validate` runs).
+weft-catalog = { workspace = true }
+# The drift-backstop / refresh e2es (tests/accesses.rs) additionally seed
+# grant rows directly in the store's Postgres (WEFT_E2E_DATABASE_URL):
+# there is deliberately no HTTP door that writes arbitrary grants. Rides
+# the platform layer's sqlx (below) with json/uuid/chrono row types.
+# The store crate itself joins for its sealing (a seeded row's secret
+# columns must be sealed exactly as the store writes them).
+weft-access-store = { workspace = true }
+chrono = { workspace = true }
 
 tokio = { workspace = true }
 reqwest = { workspace = true }
@@ -55,6 +68,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
@@ -63,7 +77,7 @@ axum = { workspace = true }
 # layer (src/platform.rs) connects to the cluster's Postgres to observe
 # worker-pod identity per execution and to backdate idle-timestamps so the
 # existing wall-clock reapers fire deterministically in a test.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"], optional = true }
 
 # Optional: only under `e2e`. Source of the worker-pod table shape and the
 # reaper threshold constants (e.g. HEARTBEAT_STALE_SECS) the backdate helpers

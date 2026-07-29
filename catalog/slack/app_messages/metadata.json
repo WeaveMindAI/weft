@@ -1,0 +1,82 @@
+{
+  "type": "SlackAppMessages",
+  "label": "Slack App Messages (all workspaces)",
+  "description": "Fires an execution for messages in EVERY workspace that installed your Slack app. For app owners distributing their app as a product: each install's events are yours. Needs a connection through your own app with its app-level (xapp-...) Socket Mode token pasted; weft dials out and holds the line, so no public address is needed. For 'a bot in my own workspace', use Slack Receive Message instead.",
+  "category": "Triggers",
+  "tags": [
+    "slack",
+    "trigger",
+    "app"
+  ],
+  "icon": "Slack",
+  "color": "#4A154B",
+  "features": {
+    "isTrigger": true
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "channels:history"
+      ],
+      "requiresValues": [
+        "app_token"
+      ],
+      "description": "A Slack connection through YOUR OWN app, with the app-level (xapp-...) token pasted on it. Reading messages needs the channels:history scope on the installs."
+    },
+    {
+      "name": "keyword",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Contains",
+      "placeholder": "Only fire when the text contains this",
+      "description": "Only fire on messages whose text contains this. Leave empty for every message."
+    },
+    {
+      "name": "includeBots",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Include bot messages",
+      "description": "Also fire on messages posted by bots (including this app's own). Off by default so a workflow that posts cannot trigger itself."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "workspace",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "thread",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

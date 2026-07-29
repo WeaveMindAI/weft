@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct HoldGateNode;

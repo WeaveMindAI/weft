@@ -21,19 +21,25 @@
 //! at startup via the `inventory` registry.
 
 pub mod auth;
+pub mod predicate;
 pub mod timer;
 pub mod form;
 pub mod sse_subscribe;
 pub mod poll_endpoint;
 pub mod socket_listen;
+pub mod stream_listen;
+pub mod provider_events;
 pub mod live_connection;
 
 pub use auth::PublicEntryAuth;
+pub use predicate::{Predicate, PredicateOp};
+pub use provider_events::{EventScope, ProviderEvents};
 pub use timer::{Timer, TimerSpec};
 pub use form::{Form, FormSchema, FormField};
 pub use sse_subscribe::SseSubscribe;
 pub use poll_endpoint::PollEndpoint;
 pub use socket_listen::{SocketFrame, SocketListen};
+pub use stream_listen::{Framing, LengthCounts, ScriptStep, StreamListen, StreamReply};
 pub use live_connection::{
     protocol_for_tag, ApiEndpoint, Backpressure, DataType, ErrorMode, JournalMode,
     LiveConnectionConfig, LiveSocket, Protocol,
@@ -42,7 +48,7 @@ pub use live_connection::{
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
-use crate::primitive::SignalSpec;
+use crate::primitive::{AccessRef, SignalSpec};
 
 /// Trait every wake-signal kind implements. Carries:
 ///   - `TAG`: discriminant string used by the wire shape and the
@@ -62,6 +68,13 @@ pub trait Signal: Serialize + DeserializeOwned + Sized {
     /// listener.
     const TAG: &'static str;
 
+    /// Does this kind mean nothing without a connection? Checked by
+    /// [`validate_spec`] against [`SignalSpec::access`], which lives
+    /// on the spec and so cannot be checked from the kind's own
+    /// config blob. Default `false`: most kinds address a public URL
+    /// and take a connection only when the author wires one.
+    const REQUIRES_ACCESS: bool = false;
+
     /// Validate the kind's configuration. Override to surface
     /// kind-specific rules (cron expression parses, URL is http(s),
     /// etc.). Default: no-op.
@@ -76,6 +89,21 @@ pub trait Signal: Serialize + DeserializeOwned + Sized {
     /// (`Form`) override this to expose it.
     fn consumer_kind(&self) -> Option<&str> {
         None
+    }
+
+    /// The connection this signal acts as, when the kind takes one.
+    /// Lifted onto [`SignalSpec::access`] by [`to_spec`], so a kind
+    /// stores the author's `Access` in its own field and the shared
+    /// listener plumbing does the resolving. Default `None`.
+    fn access(&self) -> Option<AccessRef> {
+        None
+    }
+
+    /// The pre-fire filter this signal carries, lifted onto
+    /// [`SignalSpec::match_predicates`] by [`to_spec`]. Default: none
+    /// (fire on everything the kind produces).
+    fn match_predicates(&self) -> &[Predicate] {
+        &[]
     }
 }
 
@@ -94,6 +122,8 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
     });
     SignalSpec {
         kind: K::TAG.to_string(),
+        access: kind.access(),
+        match_predicates: kind.match_predicates().to_vec(),
         config: serde_json::to_value(&kind).expect("kind serialization is infallible"),
         consumer_kind,
     }
@@ -109,6 +139,9 @@ pub struct SignalKindEntry {
     /// the typed kind's error message verbatim, or "unknown kind"
     /// when the tag isn't registered.
     pub validate_json: fn(&Value) -> Result<(), String>,
+    /// [`Signal::requires_access`], reachable from a tag alone so
+    /// `validate_spec` can check the spec-level connection.
+    pub requires_access: bool,
 }
 
 inventory::collect!(SignalKindEntry);
@@ -121,12 +154,24 @@ fn lookup(tag: &str) -> Option<&'static SignalKindEntry> {
         .find(|e| e.tag == tag)
 }
 
-/// Validate a wire-shape `SignalSpec`. Looks up the kind by tag,
-/// runs its `validate_json`. Returns Err for both unknown tags and
-/// kind-reported failures.
+/// Validate a wire-shape `SignalSpec`: the spec-level fields every
+/// kind shares (the pre-fire filter), then the kind's own config.
+/// Returns Err for unknown tags, malformed filters, and
+/// kind-reported failures alike.
 pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
     let entry = lookup(&spec.kind)
         .ok_or_else(|| format!("unknown signal kind: '{}'", spec.kind))?;
+    // Registration time is the only moment a bad filter can be
+    // refused where someone is watching; per event it would be a
+    // silent never-fires.
+    predicate::validate(&spec.match_predicates)?;
+    if entry.requires_access && spec.access.is_none() {
+        return Err(format!(
+            "signal kind '{}' acts as a connection, but none was set; build the kind with \
+             the access value the node's input carries",
+            spec.kind
+        ));
+    }
     (entry.validate_json)(&spec.config)
 }
 
@@ -148,6 +193,7 @@ macro_rules! register_signal_kind {
                         ))?;
                     <$ty as $crate::signal::Signal>::validate(&typed)
                 },
+                requires_access: <$ty as $crate::signal::Signal>::REQUIRES_ACCESS,
             }
         }
     };
@@ -176,8 +222,10 @@ mod tests {
                 "form",
                 "live_socket",
                 "poll_endpoint",
+                "provider_events",
                 "socket_listen",
                 "sse_subscribe",
+                "stream_listen",
                 "timer",
             ],
             "kinds shipped in weft-core must all register; add the new tag here when adding a kind"
@@ -186,22 +234,17 @@ mod tests {
 
     #[test]
     fn validate_spec_routes_to_kind() {
-        let spec = SignalSpec {
-            kind: "api_endpoint".into(),
-            config: serde_json::json!({ "path": "/leading-slash", "auth": { "kind": "none" } }),
-            consumer_kind: None,
-        };
+        let spec = SignalSpec::of_kind(
+            "api_endpoint",
+            serde_json::json!({ "path": "/leading-slash", "auth": { "kind": "none" } }),
+        );
         let err = validate_spec(&spec).expect_err("leading slash should fail");
         assert!(err.contains("must not start with"), "got: {err}");
     }
 
     #[test]
     fn unknown_kind_is_rejected() {
-        let spec = SignalSpec {
-            kind: "no-such-kind".into(),
-            config: serde_json::Value::Null,
-            consumer_kind: None,
-        };
+        let spec = SignalSpec::of_kind("no-such-kind", serde_json::Value::Null);
         let err = validate_spec(&spec).expect_err("unknown kind should fail");
         assert!(err.contains("unknown signal kind"), "got: {err}");
     }

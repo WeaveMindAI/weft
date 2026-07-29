@@ -11,6 +11,7 @@ use weft_listener::{router, ListenerConfig, ListenerState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    weft_core::net::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
         &state.config.pod_name,
         state.registry.clone(),
         state.config.clone(),
+        state.events_broker.clone(),
     )
     .await
     .context("registry rehydrate")?;

@@ -13,6 +13,7 @@ path = "src/main.rs"
 weft-core = { workspace = true }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
+weft-access-store = { workspace = true }
 weft-infra = { path = "../weft-infra" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
@@ -35,6 +36,12 @@ lru = "0.12"
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+# The events receive surface: raw push bodies travel base64 in the
+# dispatcher's forward, and Google-issued identity tokens are verified
+# against the published key set.
+base64 = { workspace = true }
+jsonwebtoken = "9"
+url = { workspace = true }
 getrandom = "0.2"
 parking_lot = { workspace = true }
 bytes = { workspace = true }
@@ -49,6 +56,8 @@ db-tests = []
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 futures = { workspace = true }
+# The access-apps file provider's tests write real files.
+tempfile = { workspace = true }
 # `#[sqlx::test]` provisions a fresh isolated DB per test for the Layer-3 suite.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate"] }
 # Dev-only, for the provider-declaration resolution suite: the table is

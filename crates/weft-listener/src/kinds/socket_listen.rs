@@ -1,34 +1,35 @@
-//! Persistent bidirectional outbound WebSocket handler. Dials the gateway
-//! URL, sends the optional handshake frame on open, resends the optional
-//! heartbeat frame every `heartbeat_secs`, and fires a fresh execution per
-//! inbound frame. Reconnects (with the shared backoff ladder) when the
-//! socket drops. The SERVICE protocol (Discord op-codes, Slack envelopes)
-//! is the node's concern, carried as the literal frames in the spec.
+//! Persistent bidirectional outbound WebSocket handler: parses the
+//! kind's config and drives the shared [`crate::socket_engine`]. The
+//! address is either static or minted per cycle by the declared
+//! `connect` call; the optional connection (`SignalSpec.access`)
+//! supplies the values the mint call and the frames interpolate,
+//! resolved freshly on every reconnect. The SERVICE protocol
+//! (op-codes, envelopes) stays the author's concern, carried as the
+//! literal frames and reply rules in the spec.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use base64::Engine as _;
 use dashmap::DashMap;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::FutureExt;
 use serde_json::Value;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, Duration, MissedTickBehavior};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{info, warn};
-use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
+use tokio_tungstenite::tungstenite::Message;
+use weft_core::primitive::{AccessRef, SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Signal, SocketFrame, SocketListen};
 
-use crate::config::ListenerConfig;
-use crate::fire_sink::FireSignalSink;
 use crate::protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
+use crate::socket_engine::{self, CyclePlan, PrepareError};
 
-use super::event_source::Backoff;
-use super::KindHandler;
+use super::{KindHandler, SpawnCtx};
 
 pub struct SocketListenHandler;
 
+#[async_trait]
 impl KindHandler for SocketListenHandler {
     fn tag(&self) -> &'static str {
         SocketListen::TAG
@@ -47,19 +48,28 @@ impl KindHandler for SocketListenHandler {
         })
     }
 
-    fn spawn_task(
+    async fn spawn_task(
         &self,
-        token: &str,
-        tenant_id: &str,
-        placement_generation: i64,
         spec: &SignalSpec,
         _kind_state: &Value,
-        sink: FireSignalSink,
-        _config: Arc<ListenerConfig>,
+        ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let cfg: SocketListen = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed socket_listen spec: {e}"))?;
-        Ok(Some(spawn_loop(token.to_string(), tenant_id.to_string(), placement_generation, cfg, sink)))
+        let access = spec.access.clone();
+        let fire = ctx.fire.clone();
+        let prepare_ctx = ctx.clone();
+        let prepare = Box::new(move || {
+            let cfg = cfg.clone();
+            let access = access.clone();
+            let ctx = prepare_ctx.clone();
+            async move { prepare_cycle(&cfg, &access, &ctx).await }.boxed()
+        });
+        let on_event = Box::new(move |payload: Value| {
+            let fire = fire.clone();
+            async move { fire.fire(payload, "socket_listen").await }.boxed()
+        });
+        Ok(Some(socket_engine::spawn(prepare, on_event, "socket_listen")))
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -71,125 +81,104 @@ impl KindHandler for SocketListenHandler {
     }
 }
 
-/// Convert a spec frame into a tungstenite message. Binary frames carry
-/// base64 on the wire (the spec is JSON); decode here.
-fn to_message(frame: &SocketFrame) -> Result<Message> {
-    Ok(match frame {
-        SocketFrame::Text { body } => Message::Text(body.clone()),
+/// Build one connect cycle's plan: resolve the connection (when one
+/// is set), mint the address (when the spec declares a mint call),
+/// and prepare the frames, interpolating the resolved values into
+/// text frames so a handshake can carry a fresh credential.
+async fn prepare_cycle(
+    cfg: &SocketListen,
+    access: &Option<AccessRef>,
+    ctx: &SpawnCtx,
+) -> Result<CyclePlan, PrepareError> {
+    // Resolving through the broker is transient territory (the broker
+    // may be briefly unreachable, a refresh may be mid-flight).
+    let values: BTreeMap<String, String> = match access {
+        None => BTreeMap::new(),
+        Some(access) => {
+            let source = crate::listener_access::resolve(access, ctx)
+                .await
+                .map_err(PrepareError::Transient)?;
+            let mut v = source.values;
+            v.extend(source.recipe_values);
+            v
+        }
+    };
+
+    let url = match &cfg.minted.connect {
+        None => cfg.url.clone(),
+        Some(_) => socket_engine::mint_socket_url(&cfg.minted, &values).await?,
+    };
+
+    Ok(CyclePlan {
+        url,
+        handshake: prepare_frame(cfg.handshake.as_ref(), &values)?,
+        heartbeat: prepare_frame(cfg.heartbeat.as_ref(), &values)?,
+        heartbeat_secs: cfg.heartbeat_secs,
+        replies: cfg.minted.replies.clone(),
+    })
+}
+
+/// A spec frame as a wire message. Text bodies interpolate the
+/// resolved values through the LENIENT placeholder grammar (frames
+/// are JSON text full of literal braces, so the strict template
+/// grammar cannot carry them); binary frames carry base64 and
+/// interpolate nothing. A bad frame is fatal: retrying spins on the
+/// same config.
+fn prepare_frame(
+    frame: Option<&SocketFrame>,
+    values: &BTreeMap<String, String>,
+) -> Result<Option<Message>, PrepareError> {
+    let Some(frame) = frame else { return Ok(None) };
+    Ok(Some(match frame {
+        SocketFrame::Text { body } => Message::Text(
+            interpolate_frame(body, values)
+                .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?,
+        ),
         SocketFrame::Binary { base64 } => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(base64)
-                .map_err(|e| anyhow::anyhow!("socket_listen binary frame is not valid base64: {e}"))?;
+                .map_err(|e| {
+                    PrepareError::Fatal(anyhow::anyhow!(
+                        "socket_listen binary frame is not valid base64: {e}"
+                    ))
+                })?;
             Message::Binary(bytes)
         }
-    })
+    }))
 }
 
-/// Convert an inbound message into the JSON fire payload. Text that parses
-/// as JSON fires as JSON; otherwise as a JSON string. Binary fires as a
-/// base64 JSON string (the fire pipeline is JSON-typed end to end).
-fn inbound_payload(msg: Message) -> Option<Value> {
-    match msg {
-        // Text shares the JSON-or-string coercion with the other event
-        // sources; only the binary->base64 case is socket-specific.
-        Message::Text(t) => Some(super::event_source::coerce_text_payload(t)),
-        Message::Binary(b) => Some(Value::String(
-            base64::engine::general_purpose::STANDARD.encode(b),
-        )),
-        // Ping/pong/close/frame are transport-level, not events to fire on.
-        _ => None,
-    }
-}
-
-fn spawn_loop(token: String, tenant_id: String, placement_generation: i64, cfg: SocketListen, sink: FireSignalSink) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut backoff = Backoff::new();
-        loop {
-            let stream = match connect_async(&cfg.url).await {
-                Ok((s, _resp)) => {
-                    info!(target: "weft_listener::socket_listen", url = %cfg.url, %token, "socket connected");
-                    s
-                }
-                Err(e) => {
-                    warn!(target: "weft_listener::socket_listen", url = %cfg.url, error = %e, "connect failed; retrying");
-                    backoff.wait_then_climb().await;
-                    continue;
-                }
-            };
-            let connected_at = std::time::Instant::now();
-            let (mut write, mut read) = stream.split();
-
-            // Handshake on open.
-            if let Some(frame) = &cfg.handshake {
-                match to_message(frame) {
-                    Ok(m) => {
-                        if let Err(e) = write.send(m).await {
-                            warn!(target: "weft_listener::socket_listen", error = %e, "handshake send failed; reconnecting");
-                            backoff.wait_then_climb().await;
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        // A malformed handshake frame is a config bug, not a
-                        // transient failure: log loud and stop retrying this
-                        // socket (retrying would spin on the same bad config).
-                        warn!(target: "weft_listener::socket_listen", error = %e, "handshake frame invalid; giving up on this socket");
-                        return;
-                    }
-                }
+/// Interpolate `{name}` placeholders into a frame's text. Unlike the
+/// strict [`Template`] grammar, everything that is not a well-formed
+/// `{[a-z0-9_]+}` placeholder stays literal (a JSON frame is full of
+/// braces that mean JSON). A placeholder naming a value nobody
+/// resolved is a loud error: a handshake going out with a literal
+/// `{token}` is a silent authentication failure.
+pub(crate) fn interpolate_frame(
+    body: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    static PLACEHOLDER: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\{([a-z0-9_]+)\}").expect("static regex"));
+    let mut err = None;
+    let out = PLACEHOLDER.replace_all(body, |caps: &regex::Captures<'_>| {
+        let name = &caps[1];
+        match values.get(name) {
+            Some(v) => v.clone(),
+            None => {
+                err.get_or_insert_with(|| {
+                    format!(
+                        "the frame interpolates '{{{name}}}' but the connection resolves \
+                         no value named '{name}'"
+                    )
+                });
+                String::new()
             }
-
-            // Heartbeat ticker (disabled when no heartbeat frame).
-            let heartbeat_msg = match &cfg.heartbeat {
-                Some(f) => match to_message(f) {
-                    Ok(m) => Some(m),
-                    Err(e) => {
-                        warn!(target: "weft_listener::socket_listen", error = %e, "heartbeat frame invalid; giving up on this socket");
-                        return;
-                    }
-                },
-                None => None,
-            };
-            let mut ticker = interval(Duration::from_secs(cfg.heartbeat_secs));
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            // Consume the immediate first tick so the heartbeat does not
-            // fire the instant the loop starts (right after the handshake).
-            ticker.tick().await;
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick(), if heartbeat_msg.is_some() => {
-                        if let Some(m) = &heartbeat_msg {
-                            if let Err(e) = write.send(m.clone()).await {
-                                warn!(target: "weft_listener::socket_listen", error = %e, "heartbeat send failed; reconnecting");
-                                break;
-                            }
-                        }
-                    }
-                    msg = read.next() => {
-                        match msg {
-                            Some(Ok(m)) => {
-                                if let Some(payload) = inbound_payload(m) {
-                                    super::event_source::fire_payload(&sink, &token, &tenant_id, placement_generation, payload, "socket_listen").await;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                warn!(target: "weft_listener::socket_listen", error = %e, "socket error; reconnecting");
-                                break;
-                            }
-                            None => {
-                                info!(target: "weft_listener::socket_listen", "socket closed; reconnecting");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            backoff.reset_if_healthy(connected_at.elapsed());
-            backoff.wait_then_climb().await;
         }
-    })
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(out.into_owned()),
+    }
 }
 
 inventory::submit!(&SocketListenHandler as &dyn KindHandler);
@@ -199,32 +188,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_frame_round_trips_to_message() {
-        let m = to_message(&SocketFrame::Text { body: "hi".into() }).unwrap();
-        assert!(matches!(m, Message::Text(t) if t == "hi"));
+    fn text_frames_interpolate_the_resolved_values() {
+        let values = BTreeMap::from([("token".to_string(), "xoxb-1".to_string())]);
+        let m = prepare_frame(
+            Some(&SocketFrame::Text { body: r#"{"auth":"{token}"}"#.into() }),
+            &values,
+        )
+        .ok()
+        .flatten()
+        .unwrap();
+        assert!(matches!(m, Message::Text(t) if t == r#"{"auth":"xoxb-1"}"#));
+
+        // A frame naming a value nobody resolved is fatal, never a
+        // silent literal-brace handshake.
+        let bad = prepare_frame(
+            Some(&SocketFrame::Text { body: "{missing}".into() }),
+            &BTreeMap::new(),
+        );
+        assert!(matches!(bad, Err(PrepareError::Fatal(_))));
     }
 
     #[test]
-    fn binary_frame_decodes_base64() {
+    fn binary_frames_decode_base64() {
         let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
-        let m = to_message(&SocketFrame::Binary { base64: b64 }).unwrap();
+        let m = prepare_frame(Some(&SocketFrame::Binary { base64: b64 }), &BTreeMap::new())
+            .ok()
+            .flatten()
+            .unwrap();
         assert!(matches!(m, Message::Binary(b) if b == vec![1, 2, 3]));
     }
 
     #[test]
-    fn inbound_text_json_parses() {
-        let p = inbound_payload(Message::Text("{\"a\":1}".into())).unwrap();
-        assert_eq!(p, serde_json::json!({"a": 1}));
-    }
-
-    #[test]
-    fn inbound_text_non_json_is_string() {
-        let p = inbound_payload(Message::Text("hello".into())).unwrap();
-        assert_eq!(p, Value::String("hello".into()));
-    }
-
-    #[test]
-    fn inbound_transport_frames_skipped() {
+    fn inbound_payload_shapes() {
+        use crate::socket_engine::inbound_payload;
+        assert_eq!(
+            inbound_payload(Message::Text("{\"a\":1}".into())).unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            inbound_payload(Message::Text("hello".into())).unwrap(),
+            Value::String("hello".into())
+        );
         assert!(inbound_payload(Message::Ping(vec![])).is_none());
     }
 }

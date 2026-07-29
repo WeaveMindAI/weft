@@ -480,59 +480,93 @@ pub struct InfraEndpointUrlResponse {
     pub endpoint_url: Option<String>,
 }
 
-// ---------- Provider access + cost recording ----------
+// ---------- Connections + cost recording ----------
 
-/// Worker asks the runtime for access to `provider` on ITS configured key
-/// (the node's key input was empty or the managed sentinel; a user-supplied
-/// key never makes this call). The node's identity travels with the request
-/// so the runtime's key policy can decide per node.
+/// Worker resolves a connection reference for ONE firing: asks for the
+/// short-lived pieces it needs to authenticate calls on the stored
+/// connection `connection_id`. The store refreshes lazily
+/// (single-flight) before answering; for a connection whose credential
+/// the runtime supplies, the runtime's credential source answers
+/// instead. The caller's execution scope anchors the tenant, and the
+/// row's tenant must match (the tenant wall at run time). The firing's
+/// identity travels on EVERY resolve, because any connection can be
+/// billable and every cost record must be attributable to a firing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderAccessRequest {
-    /// The requesting execution; the broker resolves + enforces the owning
-    /// tenant from it.
+pub struct ResolveConnectionRequest {
+    /// The requesting execution; the broker resolves + enforces the
+    /// owning tenant from it.
     pub color: String,
     pub project_id: String,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate, so anything the
-    /// runtime later books against this access (a measured cost) can be
-    /// attributed to the exact firing, not just the node.
+    /// runtime later books against this connection (a measured cost)
+    /// can be attributed to the exact firing, not just the node.
     pub frames: weft_core::LoopFrames,
     pub node_type: String,
-    pub provider: String,
-    /// How long the paid work this access is for may reasonably take: the
-    /// granted credential is guaranteed usable for that long, and the
-    /// runtime may retire it after (the crash backstop for a worker that
-    /// dies without giving the access back).
+    /// The connection row the marker references.
+    pub connection_id: String,
+    /// The service the marker claims; must match the row (a marker
+    /// wired at the wrong service fails loud, never resolves to a
+    /// different account).
+    pub service: String,
+    /// The permissions the consuming input declared it needs; the
+    /// store refuses a VERIFIED connection short of one (the drift
+    /// backstop). A claimed/unknown set passes. Empty = none declared.
+    #[serde(default)]
+    pub required_permissions: Vec<String>,
+    /// The stored values the consuming input declared it needs; the
+    /// store refuses a connection missing one, naming it. Unlike
+    /// permissions there is no unknown case: the value is stored or
+    /// it is not. Empty = none declared.
+    #[serde(default)]
+    pub required_values: Vec<String>,
+    /// How long the work this connection is for may reasonably take: a
+    /// runtime-supplied credential is guaranteed usable for that long,
+    /// and the runtime may retire it after (the crash backstop for a
+    /// worker that dies without releasing).
     pub expected_duration_secs: u64,
 }
 
+/// The worker handoff: EXACTLY the stored values the service's declared
+/// auth steps interpolate (never the refresh token or an app secret),
+/// plus the steps to apply them with. Time-bounded by nature (an
+/// expiring token is refreshed store-side on the next resolve).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderAccessResponse {
-    /// What to authenticate with. Used exactly like a key by the caller.
-    pub credential: String,
-    /// Where calls on `credential` must be sent when the runtime relays
-    /// them; `None` = straight to the provider's own API. The metered
-    /// client does that routing.
+pub struct ResolveConnectionResponse {
+    pub values: std::collections::BTreeMap<String, String>,
+    pub auth: Vec<weft_core::access::spec::AuthStep>,
+    /// Display identity, for log/error context only.
+    pub identity: Option<String>,
+    /// Where calls on the resolved credential must be sent when the
+    /// runtime relays them; `None` = straight to the service's own
+    /// API. The worker's connection client does that routing.
     pub relay_url: Option<String>,
+    /// Whose credential the values carry; rides every cost record so
+    /// the trail says whose account each figure landed on.
+    pub owner: weft_core::CredentialOwner,
 }
 
-/// Runtime is done with a runtime-granted access: give it back NOW,
-/// rather than leaving the credential usable to its window (which is only
-/// the crash backstop). Sent by the engine when the node that opened the
-/// access finishes; nothing node-facing makes this call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderAccessCloseRequest {
-    pub color: String,
-    pub credential: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderAccessCloseResponse {}
-
-// A metered call's cost record rides the generic task rail (a
+// A measured call's cost record rides the generic task rail (a
 // `TaskKind::RecordCost` enqueued like any worker side effect), so there is
 // no dedicated cost endpoint or wire type: `weft_task_store::RecordCostPayload`
 // is the whole contract.
+
+/// The firing that resolved a connection finished: release the lease
+/// NOW rather than leaving a runtime-supplied credential usable to its
+/// window (which is only the crash backstop). Sent by the engine ONLY
+/// for an `Ours`-owned connection (a runtime-supplied credential is
+/// the only thing there is to retire); a user's own stored values are
+/// theirs and never travel back. Nothing node-facing makes this call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseConnectionRequest {
+    pub color: String,
+    /// The resolved values being given back; the runtime's credential
+    /// source retires the ones it recognizes.
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseConnectionResponse {}
 
 // ---------- Project (worker fetches its own definition) ----------
 
@@ -1454,6 +1488,118 @@ pub struct SignalRowWire {
     pub placement_generation: i64,
 }
 
+// ---------- Provider-event serving (listener <-> broker) ----------
+
+/// The listener's event-source resolve: taken from the registered
+/// signal (the tenant traveled with it at registration). The broker
+/// answers from the store's resolve; this crate holds the wire shape
+/// so listener and broker cannot drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenerResolveRequest {
+    pub tenant: String,
+    pub access_id: String,
+    pub service: String,
+    /// The stored values the SIGNAL's input declared it needs (the
+    /// trigger half of `requiresValues`): a held pipe signing in with
+    /// the connection's own values is refused here, naming the
+    /// missing one, rather than dialing forever with a blank address.
+    #[serde(default)]
+    pub required_values: Vec<String>,
+}
+
+/// What serving a subscription needs: the connection's resolved auth
+/// (steps + exactly the values they interpolate), the service's event
+/// topics, and the extra stored values the recipes' own calls name.
+/// ONE definition (the store resolves it, the broker relays it, the
+/// listener consumes it), living beside the recipe vocabulary in
+/// weft-core; re-exported here under both its names so every wire
+/// consumer imports it from the protocol.
+pub use weft_core::access::events::ResolvedEventSource;
+pub use weft_core::access::events::ResolvedEventSource as ListenerResolvedSource;
+
+/// Ask the broker to make sure a live provider subscription serves
+/// this signal (subscribing or renewing as needed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionEnsureRequest {
+    pub tenant: String,
+    pub service: String,
+    pub topic: String,
+    pub access_id: String,
+    pub signal_token: String,
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
+/// When the provider will stop sending (unix seconds; `None` =
+/// never), so the serving loop knows when to come back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionEnsureResponse {
+    pub expires_at_unix: Option<i64>,
+}
+
+/// Stop (at the provider) and forget every subscription serving a
+/// signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionDropRequest {
+    pub tenant: String,
+    pub signal_token: String,
+}
+
+/// One raw push, as the dispatcher forwards it to the broker: the
+/// exact bytes (signatures hash them; base64 so the wrapper stays
+/// JSON), the headers, and the query string (one handshake shape
+/// answers a query parameter).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventVerifyRequest {
+    pub service: String,
+    pub topic: String,
+    pub body_b64: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub query: std::collections::BTreeMap<String, String>,
+    /// The HTTP method the provider called with; some signing schemes
+    /// cover it.
+    #[serde(default = "default_event_method")]
+    pub method: String,
+}
+
+fn default_event_method() -> String {
+    "POST".to_string()
+}
+
+/// One connection an inbound event concerns, as the broker answers it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTargetWire {
+    pub access_id: String,
+    pub tenant_id: String,
+}
+
+/// The broker's verdict on one push. `Challenge` and `Drop` end the
+/// exchange (the dispatcher relays the answer / answers 200);
+/// `Deliver` hands the dispatcher everything the match+fire needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventVerdict {
+    /// The push is the provider's address-proving handshake; relay
+    /// this body back with this content type.
+    Challenge { body: String, content_type: String },
+    /// Verified, but nothing here subscribes to it (a valid install
+    /// nobody registered a trigger for): answer 200 and drop.
+    Drop { reason: String },
+    /// Verified and routed: fire the matching subscriptions.
+    Deliver {
+        /// The event as the service's NAMED fields (predicates and
+        /// node payloads speak these).
+        named_event: serde_json::Value,
+        /// Matched by provider account: the connections the event
+        /// concerns; the dispatcher finds their subscriptions.
+        targets: Vec<EventTargetWire>,
+        /// Matched by minted subscription id: exactly one signal.
+        signal_token: Option<String>,
+    },
+}
+
 #[cfg(test)]
 mod wire_enum_roundtrips {
     use super::*;
@@ -1651,14 +1797,17 @@ mod supervisor_protocol_tests {
     }
 
     #[test]
-    fn provider_access_request_round_trip() {
-        let req = ProviderAccessRequest {
+    fn resolve_connection_request_round_trip() {
+        let req = ResolveConnectionRequest {
             color: "c1".into(),
             project_id: "p1".into(),
             node_id: "ask".into(),
             frames: vec![weft_core::LoopIteration { index: 3 }],
             node_type: "openrouter.inference".into(),
-            provider: "openrouter".into(),
+            connection_id: "11111111-2222-3333-4444-555555555555".into(),
+            service: "openrouter".into(),
+            required_permissions: vec!["drive.readonly".into()],
+            required_values: vec!["imap_host".into()],
             expected_duration_secs: 120,
         };
         // The full literal object pins the FIELD NAMES on the wire: a
@@ -1670,42 +1819,63 @@ mod supervisor_protocol_tests {
             json!({
                 "color": "c1", "project_id": "p1", "node_id": "ask",
                 "frames": [{"index": 3}], "node_type": "openrouter.inference",
-                "provider": "openrouter", "expected_duration_secs": 120
+                "connection_id": "11111111-2222-3333-4444-555555555555",
+                "service": "openrouter",
+                "required_permissions": ["drive.readonly"],
+                "required_values": ["imap_host"],
+                "expected_duration_secs": 120
             })
         );
-        let back: ProviderAccessRequest = serde_json::from_value(v).unwrap();
+        let back: ResolveConnectionRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.frames, vec![weft_core::LoopIteration { index: 3 }]);
-        assert_eq!(back.provider, "openrouter");
+        assert_eq!(back.service, "openrouter");
         assert_eq!(back.expected_duration_secs, 120);
     }
 
     #[test]
-    fn provider_access_response_round_trip_both_relay_arms() {
-        for relay_url in [Some("http://relay/prov".to_string()), None] {
-            let resp = ProviderAccessResponse {
-                credential: "cred".into(),
+    fn resolve_connection_response_round_trip_both_relay_arms() {
+        for relay_url in [Some("http://relay/svc".to_string()), None] {
+            let resp = ResolveConnectionResponse {
+                values: [("token".to_string(), "cred".to_string())].into_iter().collect(),
+                auth: vec![weft_core::access::spec::AuthStep::Header {
+                    name: "Authorization".into(),
+                    value: weft_core::access::spec::Template::new("Bearer {token}"),
+                }],
+                identity: Some("Q @ Acme".into()),
                 relay_url: relay_url.clone(),
+                owner: weft_core::CredentialOwner::Ours,
             };
             // Field names pinned literally (a symmetric rename would
             // round-trip but break the peer).
             let v = serde_json::to_value(&resp).unwrap();
             assert_eq!(
                 v,
-                json!({ "credential": "cred", "relay_url": relay_url })
+                json!({
+                    "values": { "token": "cred" },
+                    "auth": [{ "kind": "header", "name": "Authorization",
+                               "value": "Bearer {token}" }],
+                    "identity": "Q @ Acme",
+                    "relay_url": relay_url,
+                    "owner": "ours"
+                })
             );
-            let back: ProviderAccessResponse = serde_json::from_value(v).unwrap();
-            assert_eq!(back.credential, "cred");
+            let back: ResolveConnectionResponse = serde_json::from_value(v).unwrap();
+            assert_eq!(back.values["token"], "cred");
             assert_eq!(back.relay_url, relay_url);
+            assert_eq!(back.owner, weft_core::CredentialOwner::Ours);
         }
     }
 
     #[test]
-    fn provider_access_close_request_round_trip() {
-        let req = ProviderAccessCloseRequest { color: "c1".into(), credential: "cred".into() };
+    fn release_connection_request_round_trip() {
+        let req = ReleaseConnectionRequest {
+            color: "c1".into(),
+            values: [("token".to_string(), "cred".to_string())].into_iter().collect(),
+        };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v, json!({ "color": "c1", "credential": "cred" }));
-        let back: ProviderAccessCloseRequest = serde_json::from_value(v).unwrap();
-        assert_eq!(back.credential, "cred");
+        assert_eq!(v, json!({ "color": "c1", "values": { "token": "cred" } }));
+        let back: ReleaseConnectionRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.values["token"], "cred");
         assert_eq!(back.color, "c1");
     }
 
@@ -2061,6 +2231,206 @@ mod supervisor_protocol_tests {
         .to_routing()
         .unwrap();
         assert!(matches!(r.surface, SignalSurface::Internal));
+    }
+
+    #[test]
+    fn listener_resolve_request_round_trip() {
+        let req = ListenerResolveRequest {
+            tenant: "tenant-a".into(),
+            access_id: "11111111-2222-3333-4444-555555555555".into(),
+            service: "slack".into(),
+            required_values: vec!["imap_host".into()],
+        };
+        // The full literal pins the FIELD NAMES on the wire: a
+        // symmetric rename round-trips fine but breaks the peer.
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "tenant": "tenant-a",
+                "access_id": "11111111-2222-3333-4444-555555555555",
+                "service": "slack",
+                "required_values": ["imap_host"]
+            })
+        );
+        let back: ListenerResolveRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.service, "slack");
+        // required_values defaults when absent.
+        let bare: ListenerResolveRequest = serde_json::from_value(json!({
+            "tenant": "t", "access_id": "a", "service": "s"
+        }))
+        .unwrap();
+        assert!(bare.required_values.is_empty());
+    }
+
+    #[test]
+    fn listener_resolved_source_round_trip() {
+        let src = ResolvedEventSource {
+            values: [("token".to_string(), "xoxb-1".to_string())].into_iter().collect(),
+            auth: vec![weft_core::access::spec::AuthStep::Header {
+                name: "Authorization".into(),
+                value: weft_core::access::spec::Template::new("Bearer {token}"),
+            }],
+            events: serde_json::from_value(json!({
+                "messages": {
+                    "fields": { "text": "text" },
+                    "account": { "value": "team", "path": "team_id" },
+                    "webhook": { "verify": { "kind": "token_echo" } }
+                }
+            }))
+            .unwrap(),
+            recipe_values: [("app_token".to_string(), "xapp-1".to_string())]
+                .into_iter()
+                .collect(),
+            provider_account: Some("T1".into()),
+        };
+        let v = serde_json::to_value(&src).unwrap();
+        assert_eq!(v["values"], json!({ "token": "xoxb-1" }));
+        assert_eq!(
+            v["auth"],
+            json!([{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }])
+        );
+        assert_eq!(v["recipe_values"], json!({ "app_token": "xapp-1" }));
+        assert_eq!(v["provider_account"], "T1");
+        assert_eq!(v["events"]["messages"]["account"]["value"], "team");
+        let back: ResolvedEventSource = serde_json::from_value(v).unwrap();
+        assert_eq!(back.values["token"], "xoxb-1");
+        assert!(back.events.contains_key("messages"));
+        assert_eq!(back.provider_account.as_deref(), Some("T1"));
+    }
+
+    #[test]
+    fn subscription_ensure_round_trip() {
+        let req = SubscriptionEnsureRequest {
+            tenant: "tenant-a".into(),
+            service: "google".into(),
+            topic: "drive".into(),
+            access_id: "a-1".into(),
+            signal_token: "sig-1".into(),
+            params: [("target".to_string(), "file-9".to_string())].into_iter().collect(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "tenant": "tenant-a", "service": "google", "topic": "drive",
+                "access_id": "a-1", "signal_token": "sig-1",
+                "params": { "target": "file-9" }
+            })
+        );
+        let back: SubscriptionEnsureRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.params["target"], "file-9");
+
+        for expiry in [Some(1893553445i64), None] {
+            let resp = SubscriptionEnsureResponse { expires_at_unix: expiry };
+            let v = serde_json::to_value(&resp).unwrap();
+            assert_eq!(v, json!({ "expires_at_unix": expiry }));
+            let back: SubscriptionEnsureResponse = serde_json::from_value(v).unwrap();
+            assert_eq!(back.expires_at_unix, expiry);
+        }
+    }
+
+    #[test]
+    fn subscription_drop_round_trip() {
+        let req = SubscriptionDropRequest {
+            tenant: "tenant-a".into(),
+            signal_token: "sig-1".into(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v, json!({ "tenant": "tenant-a", "signal_token": "sig-1" }));
+        let back: SubscriptionDropRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.signal_token, "sig-1");
+    }
+
+    #[test]
+    fn event_verify_request_round_trip() {
+        let req = EventVerifyRequest {
+            service: "slack".into(),
+            topic: "messages".into(),
+            body_b64: "eyJ4IjoxfQ==".into(),
+            headers: [("x-slack-signature".to_string(), "v0=abc".to_string())]
+                .into_iter()
+                .collect(),
+            query: [("challenge".to_string(), "tok".to_string())].into_iter().collect(),
+            method: "POST".into(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "service": "slack", "topic": "messages", "body_b64": "eyJ4IjoxfQ==",
+                "headers": { "x-slack-signature": "v0=abc" },
+                "query": { "challenge": "tok" },
+                "method": "POST"
+            })
+        );
+        let back: EventVerifyRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.body_b64, "eyJ4IjoxfQ==");
+        // headers/query/method default when absent.
+        let bare: EventVerifyRequest = serde_json::from_value(json!({
+            "service": "s", "topic": "t", "body_b64": ""
+        }))
+        .unwrap();
+        assert_eq!(bare.method, "POST");
+        assert!(bare.headers.is_empty() && bare.query.is_empty());
+    }
+
+    #[test]
+    fn event_target_wire_round_trip() {
+        let t = EventTargetWire { access_id: "a-1".into(), tenant_id: "tenant-a".into() };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v, json!({ "access_id": "a-1", "tenant_id": "tenant-a" }));
+        let back: EventTargetWire = serde_json::from_value(v).unwrap();
+        assert_eq!(back.access_id, "a-1");
+    }
+
+    #[test]
+    fn event_verdict_round_trips_all_three_kinds() {
+        let challenge = EventVerdict::Challenge {
+            body: "tok".into(),
+            content_type: "text/plain".into(),
+        };
+        let v = serde_json::to_value(&challenge).unwrap();
+        assert_eq!(
+            v,
+            json!({ "kind": "challenge", "body": "tok", "content_type": "text/plain" })
+        );
+        assert!(matches!(
+            serde_json::from_value::<EventVerdict>(v).unwrap(),
+            EventVerdict::Challenge { body, .. } if body == "tok"
+        ));
+
+        let drop = EventVerdict::Drop { reason: "noise".into() };
+        let v = serde_json::to_value(&drop).unwrap();
+        assert_eq!(v, json!({ "kind": "drop", "reason": "noise" }));
+        assert!(matches!(
+            serde_json::from_value::<EventVerdict>(v).unwrap(),
+            EventVerdict::Drop { reason } if reason == "noise"
+        ));
+
+        let deliver = EventVerdict::Deliver {
+            named_event: json!({ "text": "hi" }),
+            targets: vec![EventTargetWire { access_id: "a-1".into(), tenant_id: "t".into() }],
+            signal_token: Some("sig-1".into()),
+        };
+        let v = serde_json::to_value(&deliver).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "kind": "deliver",
+                "named_event": { "text": "hi" },
+                "targets": [{ "access_id": "a-1", "tenant_id": "t" }],
+                "signal_token": "sig-1"
+            })
+        );
+        match serde_json::from_value::<EventVerdict>(v).unwrap() {
+            EventVerdict::Deliver { named_event, targets, signal_token } => {
+                assert_eq!(named_event["text"], "hi");
+                assert_eq!(targets.len(), 1);
+                assert_eq!(signal_token.as_deref(), Some("sig-1"));
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
     }
 
     #[test]

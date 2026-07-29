@@ -44,6 +44,12 @@ pub enum RouteClass {
     /// node re-querying its own cost harmless (it gets its answer and is
     /// billed nothing) and the meter's own follow-up query safe to make.
     Free,
+    /// A long-lived two-way channel (a WebSocket) whose cost accrues from
+    /// the frames that travel it, with no total knowable up front. Measured
+    /// by a [`SessionObservation`] fed every frame both directions; admitted
+    /// on a prepaid balance in slices ([`ProviderMeter::session_slice_usd`])
+    /// topped up as cost accrues, never by one pre-call ceiling.
+    BillableSession,
     /// Not a route this meter knows, so not one it can measure. Whether an
     /// unknown route is refused or passed through unmeasured is the
     /// caller's policy, not the meter's.
@@ -79,13 +85,15 @@ pub struct ObservedCall {
 
 /// Everything a meter needs to make its own follow-up query when the
 /// provider only reports cost out-of-band (e.g. OpenRouter's
-/// `/generation?id=...`): an HTTP client, the provider base to ask, and the
-/// credential the original call was made with. The follow-up is the METER's
-/// call, on a route the meter itself classifies as free.
+/// `/generation?id=...`): an ALREADY-SIGNED-IN HTTP client (the caller
+/// applies the same auth the original call rode) and the provider base
+/// to ask. A meter never touches a credential, which is exactly what
+/// makes the same meter work on a pasted key and on a sign-in. The
+/// follow-up is the METER's call, on a route the meter itself
+/// classifies as free.
 pub struct FollowUp<'a> {
-    pub http: &'a reqwest::Client,
+    pub http: &'a reqwest_middleware::ClientWithMiddleware,
     pub base_url: &'a str,
-    pub credential: &'a str,
 }
 
 /// A meter's verdict on what one call cost.
@@ -117,14 +125,35 @@ pub trait CallObservation: Send {
     fn end(self: Box<Self>, interrupted: bool) -> ObservedCall;
 }
 
+/// Per-session frame tap, the [`CallObservation`] twin for a
+/// [`RouteClass::BillableSession`] route. The meter mints one per session;
+/// the caller feeds it every frame's payload in BOTH directions as it
+/// passes (a tap, never a buffer) and ends it when the socket closes.
+/// `accrued_usd` may be read at any moment between frames; a prepaid
+/// admission uses it to decide when to reserve the next slice.
+pub trait SessionObservation: Send {
+    /// One frame from the caller to the provider (e.g. an audio chunk).
+    fn on_frame_to_provider(&mut self, payload: &[u8]);
+    /// One frame from the provider to the caller (e.g. a transcript).
+    fn on_frame_to_caller(&mut self, payload: &[u8]);
+    /// Dollars accrued so far. Monotone; exact for what has passed.
+    fn accrued_usd(&self) -> f64;
+    /// The session ended (cleanly or cut). The figure is final: a session
+    /// is measured from its own frames, so unlike a one-shot call there is
+    /// nothing out-of-band left to ask.
+    fn end(self: Box<Self>, interrupted: bool) -> MeasuredCost;
+}
+
 /// One provider's meter: the reviewed, trusted answer to "what did this
 /// call really cost". The same impl runs wherever the measuring happens;
 /// where it runs decides only whether its number is authoritative.
 #[async_trait::async_trait]
 pub trait ProviderMeter: Send + Sync {
-    /// The provider's name: the key identity (`<NAME>_API_KEY`) and the
-    /// string nodes pass to `ctx.provider_access`.
-    fn provider(&self) -> &'static str;
+    /// The SERVICE this meter measures: the same name the service's
+    /// access node declares. The registry is keyed by it, and the mere
+    /// existence of a registered meter for a service is the whole
+    /// declaration that its calls are measured; no flag anywhere else.
+    fn service(&self) -> &'static str;
 
     /// The provider's real API base URL (scheme + host + path prefix, no
     /// trailing '/'). The single authority for where this provider lives;
@@ -171,16 +200,68 @@ pub trait ProviderMeter: Send + Sync {
         _http: &reqwest::Client,
     ) -> anyhow::Result<f64> {
         anyhow::bail!(
-            "provider '{}' does not price calls ahead of time, so it cannot run on the \
+            "service '{}' does not price calls ahead of time, so it cannot run on the \
              app.weavemind.ai platform keys; implement `ceiling_usd` to have it promoted, or \
-             set your own '{}' key on the node to use it now",
-            self.provider(),
-            self.provider(),
+             connect your own '{}' credential on the node to use it now",
+            self.service(),
+            self.service(),
         )
     }
 
     /// A fresh observer for one Billable call's response.
     fn observe(&self) -> Box<dyn CallObservation>;
+
+    /// A fresh observer for one session on a `BillableSession` route.
+    /// `query` is the raw query string of the session URL (no leading
+    /// '?'), because a session's rate can depend on its negotiated
+    /// parameters (an audio format decides bytes-per-second). REQUIRED
+    /// for any meter that classifies a route `BillableSession`; the
+    /// default refuses so a session route without session math is a loud
+    /// meter bug, never an unmeasured spend.
+    fn observe_session(
+        &self,
+        path: &str,
+        _query: &str,
+    ) -> anyhow::Result<Box<dyn SessionObservation>> {
+        anyhow::bail!(
+            "meter for '{}' classifies '{path}' as a session route but implements no \
+             session observation; this is a meter bug",
+            self.service(),
+        )
+    }
+
+    /// The pre-carve amount a prepaid admission reserves per slice for a
+    /// session on this route (e.g. one minute of audio worth). Reserved
+    /// once at admission and again every time the accrued cost approaches
+    /// the reserved total, until the balance refuses (the session is then
+    /// cut and settled at the accrued figure). Like [`Self::ceiling_usd`],
+    /// implementing it is the bar for the route to run on the platform
+    /// keys in app.weavemind.ai; the default refuses, and a session on the
+    /// caller's OWN credential needs only [`Self::observe_session`].
+    fn session_slice_usd(&self, path: &str) -> anyhow::Result<f64> {
+        anyhow::bail!(
+            "service '{}' does not price sessions ahead of time on '{path}', so a session \
+             cannot be paid for with the platform key; connect your own '{}' credential \
+             on the node to use it now",
+            self.service(),
+            self.service(),
+        )
+    }
+
+    /// The largest single frame a session admission should accept on this
+    /// route, sized so one frame can never accrue more than one admission
+    /// slice: one slice's worth of payload at the route's dearest per-byte
+    /// rate, in its wire form (base64 expansion and envelope included).
+    /// Implemented alongside [`Self::session_slice_usd`]; the default
+    /// refuses so an admitted session without a frame bound is a loud
+    /// meter bug, never an unbounded accrual.
+    fn session_max_frame_bytes(&self, path: &str) -> anyhow::Result<usize> {
+        anyhow::bail!(
+            "meter for '{}' declares no per-frame size bound on '{path}', so a session \
+             admission cannot cap what one frame may accrue; this is a meter bug",
+            self.service(),
+        )
+    }
 
     /// Turn an observation into dollars. Pure when the provider reported
     /// the cost inline; when it only answers out-of-band, THE METER makes
@@ -220,9 +301,10 @@ pub fn meters() -> impl Iterator<Item = &'static dyn ProviderMeter> {
     inventory::iter::<MeterEntry>.into_iter().map(|e| e.meter)
 }
 
-/// The meter for `provider`, if this crate ships one.
-pub fn meter_for(provider: &str) -> Option<&'static dyn ProviderMeter> {
-    meters().find(|m| m.provider() == provider)
+/// The meter for `service`, if one is registered. `Some` IS the
+/// declaration that the service's calls are measured.
+pub fn meter_for(service: &str) -> Option<&'static dyn ProviderMeter> {
+    meters().find(|m| m.service() == service)
 }
 
 /// The relative route path of `url` under `base_url`: `Some("chat/completions")`
@@ -265,14 +347,14 @@ mod tests {
     /// catch it here rather than at a call site in production.
     #[test]
     fn the_registry_is_well_formed() {
-        let names: Vec<&str> = meters().map(|m| m.provider()).collect();
+        let names: Vec<&str> = meters().map(|m| m.service()).collect();
         assert!(!names.is_empty(), "no provider meters registered; did register_meter! run?");
         for name in &names {
-            assert!(!name.is_empty(), "a meter registered an empty provider name");
+            assert!(!name.is_empty(), "a meter registered an empty service name");
             assert_eq!(
                 names.iter().filter(|n| *n == name).count(),
                 1,
-                "provider '{name}' is registered more than once"
+                "service '{name}' is registered more than once"
             );
         }
         // Each meter's base_url is a valid prefix its own classification can
@@ -282,7 +364,7 @@ mod tests {
                 route_under(m.base_url(), m.base_url()),
                 Some(""),
                 "meter '{}' has a base_url route_under cannot parse: {}",
-                m.provider(),
+                m.service(),
                 m.base_url()
             );
         }

@@ -1,0 +1,52 @@
+{
+  "type": "GoogleDriveListFiles",
+  "label": "Google Drive: List Files",
+  "description": "List files the connected account can see (name + id + mime type), optionally filtered by a Drive query. Needs the read-all-of-Drive permission.",
+  "category": "Data",
+  "tags": [
+    "google",
+    "drive",
+    "files"
+  ],
+  "icon": "HardDrive",
+  "color": "#1FA463",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Google access (wire a GoogleAccess node). Browsing all of Drive needs the read-all-of-Drive permission; Google classes it restricted, so a shared app covering it is rare and your own app is the usual road.",
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/drive.readonly"
+      ]
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "label": "Query",
+      "placeholder": "name contains 'report'",
+      "description": "A Drive search query (the API's `q` parameter). Empty lists everything visible."
+    },
+    {
+      "name": "pageSize",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 1000,
+        "step": 1
+      },
+      "default": 25,
+      "label": "Page size"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "files",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "The listed files: {id, name, mimeType} each."
+    }
+  ]
+}

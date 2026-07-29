@@ -113,7 +113,7 @@ fn ceiling_inputs(
 
 #[async_trait::async_trait]
 impl ProviderMeter for OpenRouterMeter {
-    fn provider(&self) -> &'static str {
+    fn service(&self) -> &'static str {
         "openrouter"
     }
 
@@ -289,13 +289,9 @@ async fn query_ledger(follow_up: &FollowUp<'_>, generation_id: &str) -> Option<(
         // into a URL raw.
         percent_encode(generation_id),
     );
-    let response = follow_up
-        .http
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", follow_up.credential))
-        .send()
-        .await
-        .ok()?;
+    // The client is already signed in (the caller applies the same
+    // auth the original call rode); the meter never sees a credential.
+    let response = follow_up.http.get(&url).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -650,8 +646,8 @@ mod tests {
         obs.on_chunk(&bytes[200..]);
         let observed = obs.end(false);
 
-        let http = reqwest::Client::new();
-        let follow_up = FollowUp { http: &http, base_url: "http://unused.test", credential: "k" };
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test" };
         let cost = meter().resolve(observed, follow_up).await;
         assert_eq!(cost.amount_usd, Some(0.000096));
         assert_eq!(cost.model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
@@ -671,9 +667,9 @@ mod tests {
         let mut obs = meter().observe();
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
-        let http = reqwest::Client::new();
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(obs.end(false), FollowUp { http: &http, base_url: "http://u.test", credential: "k" })
+            .resolve(obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, Some(0.00042));
     }
@@ -697,9 +693,9 @@ mod tests {
         obs.on_chunk(&bytes[90..]);
         let observed = obs.end(false);
 
-        let http = reqwest::Client::new();
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(observed, FollowUp { http: &http, base_url: "http://u.test", credential: "k" })
+            .resolve(observed, FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, Some(0.000031));
         assert_eq!(cost.model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
@@ -711,9 +707,9 @@ mod tests {
         let mut obs = meter().observe();
         obs.on_status(401);
         obs.on_chunk(br#"{"error":{"message":"invalid key","code":401}}"#);
-        let http = reqwest::Client::new();
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(obs.end(false), FollowUp { http: &http, base_url: "http://u.test", credential: "k" })
+            .resolve(obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, Some(0.0));
     }
@@ -723,9 +719,9 @@ mod tests {
     #[tokio::test]
     async fn an_unanchored_interrupt_is_unknown_not_zero() {
         let obs = meter().observe();
-        let http = reqwest::Client::new();
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(obs.end(true), FollowUp { http: &http, base_url: "http://u.test", credential: "k" })
+            .resolve(obs.end(true), FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, None);
         assert!(cost.metadata["resolution"].as_str().unwrap().starts_with("unknown"));

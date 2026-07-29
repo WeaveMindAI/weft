@@ -1,0 +1,10 @@
+# Open a real issue as a GitHub App installation: proves the MintJwt
+# acquisition (RS256 JWT minted from the pasted key, exchanged for a
+# one-hour installation token, lazily re-minted on expiry).
+
+app = GitHubAppAccess
+issue = GitHubCreateIssue { title: "weft e2e: app access proof", body: "opened by the accesses e2e; safe to close" }
+issue.account = app.access
+
+out = Debug
+out.data = issue.url

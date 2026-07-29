@@ -1,0 +1,39 @@
+{
+  "type": "AudioStream",
+  "label": "Audio Stream",
+  "description": "Play a WAV audio file into a live Bus in real time: the file's 16-bit PCM is cut into short chunks and sent at the pace it would be spoken, so downstream realtime consumers (a live transcriber) see it exactly as a microphone would produce it. Drop a file, or wire an Audio value in.",
+  "category": "Audio",
+  "tags": [
+    "audio",
+    "stream",
+    "bus",
+    "realtime",
+    "wav"
+  ],
+  "icon": "AudioWaveform",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "audio",
+      "type": "Audio",
+      "required": true,
+      "exposure": "all",
+      "description": "The WAV file to stream (16-bit PCM, mono)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "stream",
+      "type": "Bus",
+      "required": false,
+      "description": "The live audio: a bytes Bus of raw 16-bit PCM frames ('audio' messages), its metadata declaring sample_rate and encoding; closed when the file ends."
+    },
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false,
+      "description": "True once the whole file has been streamed."
+    }
+  ],
+  "requires_infra": false
+}

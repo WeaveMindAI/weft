@@ -9,6 +9,7 @@ pub(crate) mod context;
 pub(crate) mod execution_driver;
 pub(crate) mod loop_runtime;
 pub(crate) mod metering;
+pub(crate) mod socket;
 pub mod run_pod;
 pub mod storage;
 

@@ -87,9 +87,9 @@ pub struct EngineClients {
     /// Production: `crate::storage::WorkerStorage`; tests inject a
     /// fake.
     pub storage: Arc<dyn crate::storage::WorkerStorageOps>,
-    /// The paid-call surface (`ctx.provider_access` open/close). Production:
+    /// The connection surface (`ctx.open` resolve/release). Production:
     /// the broker-backed client; tests inject a fake.
-    pub paid_calls: Arc<dyn PaidCallClient>,
+    pub access_broker: Arc<dyn AccessBroker>,
     /// Cost resolutions still in flight (a metered call's figure being
     /// resolved + recorded after its response ended). The pod's exit paths
     /// refuse to die while this is non-zero, so money is never dropped by
@@ -133,7 +133,7 @@ impl EngineClients {
                 broker_url.to_string(),
                 broker_token_path.to_path_buf(),
             ),
-            paid_calls: weft_broker_client::BrokerPaidCallClient::new(
+            access_broker: weft_broker_client::BrokerAccessClient::new(
                 broker_url.to_string(),
                 token,
             ),
@@ -231,103 +231,134 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
     }
 }
 
-/// Trait surface over `BrokerPaidCallClient` so tests can inject a fake.
-/// The paid-call access path: open access to the runtime's provider key,
-/// give it back when the node finishes. (Cost records ride the generic task
-/// rail.) Production has one impl: the broker-backed HTTP client.
+/// Trait surface over `BrokerAccessClient` so tests can inject a fake.
+/// The worker's whole connection desk: resolve a connection reference
+/// for one firing (cost records ride the generic task rail) and
+/// release it when the node finishes. Production has one impl: the
+/// broker-backed HTTP client.
 #[async_trait]
-pub trait PaidCallClient: Send + Sync {
-    async fn open_provider_access(
+pub trait AccessBroker: Send + Sync {
+    async fn resolve_connection(
         &self,
-        req: &weft_broker_client::protocol::ProviderAccessRequest,
-    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessResponse>;
+        req: &weft_broker_client::protocol::ResolveConnectionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse>;
 
-    async fn close_provider_access(
+    async fn release_connection(
         &self,
-        req: &weft_broker_client::protocol::ProviderAccessCloseRequest,
-    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessCloseResponse>;
+        req: &weft_broker_client::protocol::ReleaseConnectionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse>;
 }
 
 #[async_trait]
-impl PaidCallClient for weft_broker_client::client::BrokerPaidCallClient {
-    async fn open_provider_access(
+impl AccessBroker for weft_broker_client::client::BrokerAccessClient {
+    async fn resolve_connection(
         &self,
-        req: &weft_broker_client::protocol::ProviderAccessRequest,
-    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessResponse> {
-        self.open_provider_access(req).await
+        req: &weft_broker_client::protocol::ResolveConnectionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse> {
+        self.resolve_connection(req).await
     }
 
-    async fn close_provider_access(
+    async fn release_connection(
         &self,
-        req: &weft_broker_client::protocol::ProviderAccessCloseRequest,
-    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessCloseResponse> {
-        self.close_provider_access(req).await
+        req: &weft_broker_client::protocol::ReleaseConnectionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse> {
+        self.release_connection(req).await
     }
 }
 
-/// Hand-rolled fake `PaidCallClient`: configured keys in a map, every open
-/// and close recorded in an append-only log.
+/// Hand-rolled fake `AccessBroker`: connections in one map, every
+/// resolve/release recorded in one append-only log each.
 // Gated to `test` only (not `test-helpers`): the sole consumers are this
 // crate's own tests. Widen to `test-helpers` if a downstream crate ever needs
 // it, matching the other engine fakes.
 #[cfg(test)]
-pub struct FakePaidCallClient {
-    keys: std::sync::Mutex<HashMap<String, String>>,
-    /// The relay every granted access is routed through, when set (the
-    /// runtime-relays shape); `None` = the key goes out directly.
-    relay_url: Option<String>,
-    /// Credentials of the accesses the runtime gave back.
-    pub closed_accesses: std::sync::Mutex<Vec<String>>,
-    /// Every open request received, in order.
-    pub opened: std::sync::Mutex<Vec<weft_broker_client::protocol::ProviderAccessRequest>>,
+pub struct FakeAccessBroker {
+    /// Connections by connection id: the handoff response to answer.
+    connections: std::sync::Mutex<
+        HashMap<String, weft_broker_client::protocol::ResolveConnectionResponse>,
+    >,
+    /// Every resolve request received, in order.
+    pub resolved: std::sync::Mutex<Vec<weft_broker_client::protocol::ResolveConnectionRequest>>,
+    /// The value maps of every release received, in order.
+    pub released:
+        std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>,
 }
 
 #[cfg(test)]
-impl FakePaidCallClient {
-    /// Fake with no configured keys (opening an access fails loudly).
+impl FakeAccessBroker {
+    /// Fake with no connections (resolving fails loudly).
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            keys: std::sync::Mutex::new(HashMap::new()),
-            relay_url: None,
-            closed_accesses: std::sync::Mutex::new(Vec::new()),
-            opened: std::sync::Mutex::new(Vec::new()),
+            connections: std::sync::Mutex::new(HashMap::new()),
+            resolved: std::sync::Mutex::new(Vec::new()),
+            released: std::sync::Mutex::new(Vec::new()),
         })
     }
 
-    pub fn set_key(&self, provider: &str, key: &str) {
-        self.keys.lock().unwrap().insert(provider.to_string(), key.to_string());
+    pub fn set_connection(
+        &self,
+        connection_id: &str,
+        resp: weft_broker_client::protocol::ResolveConnectionResponse,
+    ) {
+        self.connections.lock().unwrap().insert(connection_id.to_string(), resp);
+    }
+
+    /// A one-bearer-step connection answering `key`, the common shape
+    /// tests need. User-owned (`TheirOwn`).
+    pub fn set_bearer_connection(&self, connection_id: &str, key: &str) {
+        self.set_owned_bearer_connection(
+            connection_id,
+            key,
+            weft_core::CredentialOwner::TheirOwn,
+        );
+    }
+
+    /// The same bearer shape with an explicit owner, for pinning the
+    /// owner-dependent release behavior.
+    pub fn set_owned_bearer_connection(
+        &self,
+        connection_id: &str,
+        key: &str,
+        owner: weft_core::CredentialOwner,
+    ) {
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("token".to_string(), key.to_string());
+        self.set_connection(connection_id, weft_broker_client::protocol::ResolveConnectionResponse {
+            values,
+            auth: vec![weft_core::access::spec::AuthStep::Header {
+                name: "Authorization".into(),
+                value: weft_core::access::spec::Template::new("Bearer {token}"),
+            }],
+            identity: None,
+            relay_url: None,
+            owner,
+        });
     }
 }
 
 #[cfg(test)]
 #[async_trait]
-impl PaidCallClient for FakePaidCallClient {
-    async fn open_provider_access(
+impl AccessBroker for FakeAccessBroker {
+    async fn resolve_connection(
         &self,
-        req: &weft_broker_client::protocol::ProviderAccessRequest,
-    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessResponse> {
-        match self.keys.lock().unwrap().get(&req.provider) {
-            Some(key) => {
-                self.opened.lock().unwrap().push(req.clone());
-                Ok(weft_broker_client::protocol::ProviderAccessResponse {
-                    credential: key.clone(),
-                    relay_url: self.relay_url.clone(),
-                })
-            }
+        req: &weft_broker_client::protocol::ResolveConnectionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse> {
+        self.resolved.lock().unwrap().push(req.clone());
+        match self.connections.lock().unwrap().get(&req.connection_id) {
+            Some(resp) => Ok(resp.clone()),
             None => anyhow::bail!(
-                "the runtime has no key configured for '{}'; set your own key on the \
-                 node's key input",
-                req.provider
+                "connection {} does not exist here; pick one on the access node",
+                req.connection_id
             ),
         }
     }
 
-    async fn close_provider_access(
+    async fn release_connection(
         &self,
-        req: &weft_broker_client::protocol::ProviderAccessCloseRequest,
-    ) -> anyhow::Result<weft_broker_client::protocol::ProviderAccessCloseResponse> {
-        self.closed_accesses.lock().unwrap().push(req.credential.clone());
-        Ok(weft_broker_client::protocol::ProviderAccessCloseResponse {})
+        req: &weft_broker_client::protocol::ReleaseConnectionRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse> {
+        self.released.lock().unwrap().push(req.values.clone());
+        Ok(weft_broker_client::protocol::ReleaseConnectionResponse {})
     }
 }
 
@@ -963,6 +994,10 @@ pub async fn run_bus_journal_task(
         None => return,
     };
     let mut known_buses: Vec<std::sync::Weak<BusInner>> = Vec::new();
+    // The per-bus window state (open windows + buffered cursor). Lives
+    // on the pump task, not the bus: the bus's own contract stays
+    // "entries in order"; the windowing clock is the pump's.
+    let mut windows: HashMap<uuid::Uuid, PumpBusState> = HashMap::new();
     loop {
         let notified = pump_wake.notified();
         tokio::pin!(notified);
@@ -972,7 +1007,7 @@ pub async fn run_bus_journal_task(
         // so the flag we read here on a shutdown-triggered wake is
         // already true. We still run one final drain pass first so
         // any entries that landed concurrent with the shutdown flag
-        // being set are journaled.
+        // being set are journaled (and every open window flushed).
         let should_exit = match coordinator.upgrade() {
             Some(coord) => {
                 known_buses = coord.live_bus_inners();
@@ -983,61 +1018,207 @@ pub async fn run_bus_journal_task(
             // one will fire pump_wake again.
             None => true,
         };
-        drain_buses(&known_buses, color, journal.as_ref(), &pod_name).await;
+        drain_buses(
+            &known_buses,
+            color,
+            journal.as_ref(),
+            &pod_name,
+            &mut windows,
+            /* flush_all = */ should_exit,
+        )
+        .await;
         drain_done.notify_waiters();
         if should_exit {
             return;
         }
-        notified.await;
+        // Sleep until the next open window's flush is due (so a fast
+        // stream's window closes on time even with no further appends),
+        // or until an append wakes us, whichever first.
+        let next_deadline = windows.values().map(|w| w.deadline).min();
+        match next_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+            None => notified.await,
+        }
     }
 }
 
+/// The pump's per-bus windowing state: the messages of the currently
+/// open window and the cursor of what has been pulled off the bus
+/// (buffered here or written), so a drain never double-ingests.
+struct PumpBusState {
+    entries: Vec<BusEntry>,
+    /// When the open window must flush.
+    deadline: tokio::time::Instant,
+    /// One past the highest offset already ingested (buffered or
+    /// written). `drain_journal_tail` re-serves from the bus's own
+    /// `journaled_through` (only bumped at write), so this filter is
+    /// what keeps buffered entries from being ingested twice.
+    buffered_through: u64,
+}
+
 /// One drain pass across every bus the pump knows about. Per bus:
-/// snapshot the unjournaled tail, write events, acknowledge the new
-/// `journaled_through`. On write failure: mark the bus as degraded
-/// and skip ack so the next pass retries the same tail. Takes Weak
-/// refs so the pump can run a final drain after the coordinator has
-/// dropped (the buses' Arcs may still be live via close-tokens or
-/// participant handles).
+/// ingest the unjournaled tail (messages into the open window,
+/// membership entries written immediately, flushing the window first
+/// to keep offset order), then flush any window whose deadline passed
+/// (or every window, on the final drain). Acknowledge to the bus only
+/// what was WRITTEN; on a write failure mark the bus degraded and keep
+/// the window buffered so the next pass retries. Takes Weak refs so
+/// the pump can run a final drain after the coordinator has dropped.
 async fn drain_buses(
     buses: &[std::sync::Weak<BusInner>],
     color: Color,
     journal: &dyn JournalClient,
     pod_name: &str,
+    windows: &mut HashMap<uuid::Uuid, PumpBusState>,
+    flush_all: bool,
 ) {
     for weak in buses {
         let Some(inner) = weak.upgrade() else { continue };
-        let bus_id_str = inner.id().to_string();
+        let bus_id = inner.id();
+        let bus_id_str = bus_id.to_string();
         let tail = inner.drain_journal_tail();
-        if tail.is_empty() {
-            continue;
-        }
-        for entry in tail {
-            let ev = bus_entry_to_event(color, &bus_id_str, &entry);
-            if let Err(e) = journal.record_event(&ev, Some(pod_name)).await {
-                tracing::error!(
-                    target: "weft_engine::bus",
-                    bus = %bus_id_str,
-                    offset = entry.offset,
-                    error = %e,
-                    "bus journal pump failed; marking bus degraded"
-                );
-                inner.mark_journal_degraded(format!("journal write failed: {e}"));
-                break;
+        let buffered_through =
+            windows.get(&bus_id).map(|w| w.buffered_through).unwrap_or(0);
+
+        'entries: for entry in tail {
+            if entry.offset < buffered_through {
+                continue;
             }
-            // Ack each entry as it lands so a mid-batch failure
-            // retries ONLY the unwritten suffix: acking nothing until
-            // the whole batch succeeds would make the next pass
-            // re-write the already-journaled prefix (`record_event`
-            // has no dedup on this path), duplicating bus messages in
-            // the replay.
-            inner.acknowledge_journaled_through(entry.offset + 1);
+            match &entry.kind {
+                BusEntryKind::Message { .. } => {
+                    let state = windows.entry(bus_id).or_insert_with(|| PumpBusState {
+                        entries: Vec::new(),
+                        deadline: tokio::time::Instant::now() + inner.journal_window(),
+                        buffered_through: entry.offset,
+                    });
+                    if state.entries.is_empty() {
+                        state.deadline =
+                            tokio::time::Instant::now() + inner.journal_window();
+                    }
+                    state.buffered_through = entry.offset + 1;
+                    state.entries.push(entry);
+                }
+                // Membership entries are journaled individually, in
+                // offset order: flush the open window first so the row
+                // stream never reorders against the bus log.
+                BusEntryKind::Joined { .. }
+                | BusEntryKind::Left { .. }
+                | BusEntryKind::Closed => {
+                    if let Some(state) = windows.get_mut(&bus_id) {
+                        if matches!(
+                            write_open_window(&inner, color, &bus_id_str, journal, pod_name, state)
+                                .await,
+                            WindowWrite::Degraded
+                        ) {
+                            break 'entries;
+                        }
+                    }
+                    let ev = membership_event(color, &bus_id_str, &entry);
+                    if let Err(e) = journal.record_event(&ev, Some(pod_name)).await {
+                        tracing::error!(
+                            target: "weft_engine::bus",
+                            bus = %bus_id_str,
+                            offset = entry.offset,
+                            error = %e,
+                            "bus journal pump failed; marking bus degraded"
+                        );
+                        inner.mark_journal_degraded(format!("journal write failed: {e}"));
+                        break 'entries;
+                    }
+                    inner.acknowledge_journaled_through(entry.offset + 1);
+                    if let Some(state) = windows.get_mut(&bus_id) {
+                        state.buffered_through =
+                            state.buffered_through.max(entry.offset + 1);
+                    }
+                }
+            }
+        }
+
+        // Flush the open window when its time is up (or on the final
+        // drain, so nothing stays buffered past shutdown/close).
+        if let Some(state) = windows.get_mut(&bus_id) {
+            if flush_all || state.deadline <= tokio::time::Instant::now() {
+                let _ = write_open_window(&inner, color, &bus_id_str, journal, pod_name, state)
+                    .await;
+            }
+        }
+        // A bus with nothing buffered needs no window state (and no
+        // timer wake). Dropping the state cannot regress the dedup
+        // cursor: an empty window means everything buffered was
+        // flushed, so the bus's own `journaled_through` covers it.
+        if windows.get(&bus_id).is_some_and(|w| w.entries.is_empty()) {
+            windows.remove(&bus_id);
         }
     }
+    // Drop window state for buses that no longer exist (their entries
+    // can never be written; the bus died un-drained and said so).
+    windows.retain(|id, _| {
+        buses.iter().any(|w| w.upgrade().is_some_and(|b| b.id() == *id))
+    });
 }
 
-/// Project one in-RAM `BusEntry` to its `ExecEvent` shape.
-fn bus_entry_to_event(color: Color, bus_id: &str, entry: &BusEntry) -> ExecEvent {
+/// Outcome of writing a bus's open window row, named so the call sites
+/// read as the contract they enforce.
+enum WindowWrite {
+    /// Everything buffered for this window is now in the journal (a
+    /// row was written, or the window held nothing to write).
+    UpToDate,
+    /// The journal write failed: the bus is marked degraded and the
+    /// window stays buffered so the next pass retries. The caller must
+    /// stop ingesting this bus's tail for this pass.
+    Degraded,
+}
+
+/// Write `state`'s open window as one `BusWindow` row for `inner`.
+async fn write_open_window(
+    inner: &Arc<BusInner>,
+    color: Color,
+    bus_id_str: &str,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    state: &mut PumpBusState,
+) -> WindowWrite {
+    let Some(aggregate) =
+        weft_core::bus::aggregate_window(&state.entries, !inner.ephemeral())
+    else {
+        return WindowWrite::UpToDate;
+    };
+    let ev = ExecEvent::BusWindow {
+        color,
+        bus_id: bus_id_str.to_string(),
+        first_offset: aggregate.first_offset,
+        last_offset: aggregate.last_offset,
+        messages: aggregate.messages,
+        totals: aggregate.totals,
+        // The row's stamp is the LAST entry's append time: the row
+        // describes the bus's own appends, not the moment the pump got
+        // around to flushing them.
+        at_unix: aggregate.last_at_unix,
+    };
+    if let Err(e) = journal.record_event(&ev, Some(pod_name)).await {
+        tracing::error!(
+            target: "weft_engine::bus",
+            bus = %bus_id_str,
+            first_offset = aggregate.first_offset,
+            error = %e,
+            "bus window journal write failed; marking bus degraded"
+        );
+        inner.mark_journal_degraded(format!("journal write failed: {e}"));
+        return WindowWrite::Degraded;
+    }
+    inner.acknowledge_journaled_through(aggregate.last_offset + 1);
+    state.entries.clear();
+    WindowWrite::UpToDate
+}
+
+/// Project one membership `BusEntry` to its `ExecEvent` shape. Message
+/// entries never come through here (they ride window rows).
+fn membership_event(color: Color, bus_id: &str, entry: &BusEntry) -> ExecEvent {
     let at_unix = entry.at_unix;
     let offset = entry.offset;
     match &entry.kind {
@@ -1055,38 +1236,15 @@ fn bus_entry_to_event(color: Color, bus_id: &str, entry: &BusEntry) -> ExecEvent
             name: name.clone(),
             at_unix,
         },
-        BusEntryKind::Message {
-            from,
-            msg_kind,
-            payload,
-            payload_byte_size,
-            payload_sha256_prefix,
-        } => ExecEvent::BusMessage {
-            color,
-            bus_id: bus_id.to_string(),
-            offset,
-            from: from.clone(),
-            msg_kind: msg_kind.clone(),
-            // In-RAM `payload: Option<Value>` is `None` only for
-            // ephemeral buses (per `BusEntryKind::Message`'s contract);
-            // tag the journal event so `Some(Value::Null)` (a journaled
-            // bus where the body sent JSON null) stays distinguishable
-            // from `None` (no journaled payload at all) across the
-            // serde round-trip.
-            payload: match payload {
-                Some(v) => weft_core::primitive::JournaledPayload::Journaled { value: v.clone() },
-                None => weft_core::primitive::JournaledPayload::Ephemeral,
-            },
-            payload_byte_size: *payload_byte_size,
-            payload_sha256_prefix: *payload_sha256_prefix,
-            at_unix,
-        },
         BusEntryKind::Closed => ExecEvent::BusClosed {
             color,
             bus_id: bus_id.to_string(),
             offset,
             at_unix,
         },
+        BusEntryKind::Message { .. } => {
+            unreachable!("Message entries are windowed, never journaled individually")
+        }
     }
 }
 
@@ -1336,11 +1494,14 @@ pub struct RunnerHandle {
     /// did not receive a `live_connection` request. Per-execution, not
     /// per-firing: all firings of one color share the one caller.
     caller_connection: Option<Arc<dyn weft_core::caller::CallerConnection>>,
-    /// Runtime-granted credentials this firing opened
-    /// (`ctx.provider_access`), given back by the loop driver when the
-    /// node's body finishes (see [`Self::close_opened_accesses`]); nothing
-    /// node-facing closes an access.
-    opened_accesses: Mutex<Vec<String>>,
+    /// The resolved value maps of the RUNTIME-OWNED (`Ours`)
+    /// connections this firing opened (`ctx.open`), released by the
+    /// loop driver when the node's body finishes (see
+    /// [`Self::close_opened_accesses`]); nothing node-facing releases
+    /// one. A their-own connection is never tracked: there is nothing
+    /// of the runtime's to retire, and the user's own secrets must
+    /// not travel back on a release.
+    opened_accesses: Mutex<Vec<std::collections::BTreeMap<String, String>>>,
 }
 
 impl RunnerHandle {
@@ -1392,22 +1553,25 @@ impl RunnerHandle {
         }
     }
 
-    /// Give back every runtime-granted access this firing opened. The
-    /// loop driver calls this once the node's body has finished (any
-    /// outcome); a close that fails is logged loudly rather than failing
-    /// the node, because the credential's own window is the backstop.
+    /// Release every runtime-owned connection this firing opened (the
+    /// only kind tracked; see `opened_accesses`). The loop driver
+    /// calls this once the node's body has finished (any outcome); a
+    /// release that fails is logged loudly rather than failing the
+    /// node, because a runtime-supplied credential's own window is the
+    /// backstop.
     pub async fn close_opened_accesses(&self) {
-        let credentials: Vec<String> = std::mem::take(&mut *self.opened_accesses.lock().unwrap());
-        for credential in credentials {
-            let req = weft_broker_client::protocol::ProviderAccessCloseRequest {
+        let opened: Vec<std::collections::BTreeMap<String, String>> =
+            std::mem::take(&mut *self.opened_accesses.lock().unwrap());
+        for values in opened {
+            let req = weft_broker_client::protocol::ReleaseConnectionRequest {
                 color: self.color.to_string(),
-                credential,
+                values,
             };
-            if let Err(e) = self.clients.paid_calls.close_provider_access(&req).await {
+            if let Err(e) = self.clients.access_broker.release_connection(&req).await {
                 tracing::error!(
                     target: "weft_engine::metering",
                     node = %self.node_id,
-                    "giving a provider access back failed (its window remains the backstop): {e:#}"
+                    "releasing a connection failed (its window remains the backstop): {e:#}"
                 );
             }
         }
@@ -2269,50 +2433,73 @@ impl ContextHandle for RunnerHandle {
         Ok(())
     }
 
-    async fn open_provider_access(
+    async fn open_connection(
         &self,
-        provider: &str,
+        access: &weft_core::access::Access,
         window: std::time::Duration,
-    ) -> WeftResult<(String, Option<String>)> {
-        let req = weft_broker_client::protocol::ProviderAccessRequest {
-            expected_duration_secs: window.as_secs(),
+    ) -> WeftResult<weft_core::access::OpenedConnection> {
+        let service = access.service().to_string();
+        let req = weft_broker_client::protocol::ResolveConnectionRequest {
             color: self.color.to_string(),
             project_id: self.project_id.clone(),
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
             node_type: self.node_type.clone(),
-            provider: provider.to_string(),
+            connection_id: access.access_id().to_string(),
+            service: service.clone(),
+            required_permissions: access.required_permissions().to_vec(),
+            required_values: access.required_values().to_vec(),
+            expected_duration_secs: window.as_secs(),
         };
-        let resp =
-            self.clients.paid_calls.open_provider_access(&req).await.map_err(|e| {
-                WeftError::NodeExecution(format!("open access to '{provider}': {e:#}"))
-            })?;
-        // Remember the grant so the loop driver gives it back when this
-        // node's body finishes (`close_opened_accesses`).
-        self.opened_accesses.lock().unwrap().push(resp.credential.clone());
-        Ok((resp.credential, resp.relay_url))
-    }
+        let resp = self.clients.access_broker.resolve_connection(&req).await.map_err(|e| {
+            WeftError::NodeExecution(format!("open the '{service}' connection: {e:#}"))
+        })?;
+        // Remember the lease so the loop driver releases it when this
+        // node's body finishes (`close_opened_accesses`). Only an
+        // Ours-owned connection is remembered: a release retires a
+        // runtime-supplied credential, and a their-own connection's
+        // stored values are the user's own and never travel back.
+        if resp.owner == weft_core::CredentialOwner::Ours {
+            self.opened_accesses.lock().unwrap().push(resp.values.clone());
+        }
 
-    fn metered_client(
-        &self,
-        access: &weft_core::access::ProviderAccess,
-    ) -> WeftResult<reqwest_middleware::ClientWithMiddleware> {
-        crate::metering::metered_client(
-            access.provider(),
-            access.credential(),
-            access.relay_url(),
-            crate::metering::CostSink {
-                tasks: self.clients.tasks.clone(),
-                pending: self.clients.pending_costs.clone(),
-                project_id: self.project_id.clone(),
-                tenant_id: self.tenant_id.clone(),
-                color: self.color,
-                node_id: self.node_id.clone(),
-                frames: self.node_frames.clone(),
-                provider: access.provider().to_string(),
-                origin: access.origin(),
-            },
-        )
+        let steps = weft_core::access::client::resolve_steps(&resp.auth, &resp.values)
+            .map_err(|e| {
+                WeftError::NodeExecution(format!(
+                    "the '{service}' connection's auth steps do not resolve: {e}"
+                ))
+            })?;
+        let sink = Arc::new(crate::metering::CostSink {
+            tasks: self.clients.tasks.clone(),
+            pending: self.clients.pending_costs.clone(),
+            project_id: self.project_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            color: self.color,
+            node_id: self.node_id.clone(),
+            frames: self.node_frames.clone(),
+            service: service.clone(),
+            origin: resp.owner,
+        });
+        let client = crate::metering::connection_client(
+            &service,
+            steps.clone(),
+            resp.relay_url.as_deref(),
+            sink.clone(),
+        )?;
+        let dialer = Arc::new(crate::socket::ConnectionSocketDial::new(
+            steps,
+            resp.relay_url.clone(),
+            sink,
+        ));
+        Ok(weft_core::access::OpenedConnection::assemble(
+            service,
+            resp.values,
+            resp.auth,
+            resp.identity,
+            resp.owner,
+            client,
+            dialer,
+        ))
     }
 
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()> {
@@ -2603,7 +2790,7 @@ mod replay_tests {
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
-            paid_calls: FakePaidCallClient::new(),
+            access_broker: FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
         };
         RunnerHandle::new(
@@ -2625,7 +2812,7 @@ mod replay_tests {
 
     /// Same rig as `handle_with_sequence` but with a caller-supplied
     /// `PaidCallClient` fake, for the access/provision/settle tests.
-    fn handle_with_paid_calls(paid_calls: Arc<FakePaidCallClient>) -> RunnerHandle {
+    fn handle_with_access_broker(access_broker: Arc<FakeAccessBroker>) -> RunnerHandle {
         let clients = EngineClients {
             journal: Arc::new(NoopJournal),
             tasks: Arc::new(NoopTaskStore),
@@ -2634,7 +2821,7 @@ mod replay_tests {
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
-            paid_calls,
+            access_broker,
             pending_costs: crate::metering::PendingCostRecords::new(),
         };
         RunnerHandle::new(
@@ -2674,98 +2861,135 @@ mod replay_tests {
         )
     }
 
-    /// How long the paid call may run: the access's window (the granted
-    /// credential's guaranteed-usable life).
+    /// How long the paid call may run: the connection's window (a
+    /// runtime-supplied credential's guaranteed-usable life).
     const CALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 
-    // Layer 3: the provider_access surface over the fake paid-call client:
-    // origin classification, the user's own key never touching the broker,
-    // and the runtime (not the node) giving runtime grants back.
+    // Layer 3: the ctx.open surface over the fake access broker: one
+    // resolve per open, the lease released by the RUNTIME (never node
+    // code, and only for a runtime-owned credential), the window
+    // threaded through, and the derived credential.
     #[tokio::test]
-    async fn a_users_own_key_never_touches_the_runtime_broker() {
-        let fake = FakePaidCallClient::new();
-        let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
-
-        let access = ctx.provider_access("openrouter", Some("sk-own".into())).await.unwrap();
-        assert_eq!(access.origin(), weft_core::AccessOrigin::UserProvided);
-        assert_eq!(access.credential(), "sk-own");
-        assert_eq!(access.relay_url(), None, "the user's key goes to the provider");
-        assert!(fake.opened.lock().unwrap().is_empty(), "no broker round-trip");
-    }
-
-    #[tokio::test]
-    async fn a_runtime_grant_carries_the_window_and_is_given_back_by_the_runtime() {
-        let fake = FakePaidCallClient::new();
-        fake.set_key("openrouter", "sk-runtime");
-        let handle = Arc::new(handle_with_paid_calls(fake.clone()));
+    async fn open_resolves_once_and_the_runtime_releases_the_lease() {
+        let fake = FakeAccessBroker::new();
+        fake.set_owned_bearer_connection("conn-1", "sk-1", weft_core::CredentialOwner::Ours);
+        let handle = Arc::new(handle_with_access_broker(fake.clone()));
         let ctx = ctx_over_arc(handle.clone());
 
-        // Empty and sentinel both open access on the runtime's key.
-        let access = ctx
-            .provider_access_within(
-                "openrouter",
-                Some(weft_core::PLATFORM_KEY_SENTINEL.into()),
-                CALL_WINDOW,
-            )
-            .await
-            .unwrap();
-        assert_eq!(access.origin(), weft_core::AccessOrigin::Runtime);
-        assert_eq!(access.credential(), "sk-runtime");
+        let access = weft_core::Access::new("conn-1", "openrouter", None);
+        let conn = ctx.open_within(&access, CALL_WINDOW).await.unwrap();
+        assert_eq!(conn.credential().unwrap(), "sk-1", "one bearer step derives the string");
+        assert_eq!(conn.owner(), weft_core::CredentialOwner::Ours);
 
-        let opened = fake.opened.lock().unwrap().clone();
-        assert_eq!(opened.len(), 1);
-        assert_eq!(opened[0].provider, "openrouter");
-        assert_eq!(opened[0].node_type, "TestNode");
+        let resolved = fake.resolved.lock().unwrap().clone();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].connection_id, "conn-1");
+        assert_eq!(resolved[0].service, "openrouter");
+        assert_eq!(resolved[0].node_type, "TestNode");
         assert_eq!(
-            opened[0].expected_duration_secs,
+            resolved[0].expected_duration_secs,
             CALL_WINDOW.as_secs(),
             "the credential's life is the window the node declared, declared once"
         );
 
-        // Nothing node-facing closes an access; the loop driver gives every
-        // grant back once the body finished.
-        assert!(fake.closed_accesses.lock().unwrap().is_empty());
+        // Nothing node-facing releases; the loop driver releases every
+        // runtime-owned connection once the body finished.
+        assert!(fake.released.lock().unwrap().is_empty());
         handle.close_opened_accesses().await;
-        assert_eq!(*fake.closed_accesses.lock().unwrap(), vec!["sk-runtime".to_string()]);
-        // Idempotent: a second sweep has nothing left to give back.
+        let released = fake.released.lock().unwrap().clone();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].get("token").map(String::as_str), Some("sk-1"));
+        // Idempotent: a second sweep has nothing left to release.
         handle.close_opened_accesses().await;
-        assert_eq!(fake.closed_accesses.lock().unwrap().len(), 1);
+        assert_eq!(fake.released.lock().unwrap().len(), 1);
+    }
+
+    /// A their-own connection is never released back: the stored
+    /// values are the user's own secrets, and there is nothing of the
+    /// runtime's to retire, so no release call carries them.
+    #[tokio::test]
+    async fn a_their_own_connection_is_never_released_back() {
+        let fake = FakeAccessBroker::new();
+        fake.set_bearer_connection("conn-1", "sk-user");
+        let handle = Arc::new(handle_with_access_broker(fake.clone()));
+        let ctx = ctx_over_arc(handle.clone());
+
+        let conn = ctx
+            .open_within(&weft_core::Access::new("conn-1", "openrouter", None), CALL_WINDOW)
+            .await
+            .unwrap();
+        assert_eq!(conn.owner(), weft_core::CredentialOwner::TheirOwn);
+        handle.close_opened_accesses().await;
+        assert!(
+            fake.released.lock().unwrap().is_empty(),
+            "the user's own secrets never travel back on a release"
+        );
     }
 
     /// The window is optional: a node that says nothing gets the default.
     #[tokio::test]
     async fn the_default_window_is_used_when_a_node_declares_none() {
-        let fake = FakePaidCallClient::new();
-        fake.set_key("openrouter", "sk-runtime");
-        let ctx = ctx_over(handle_with_paid_calls(fake.clone()));
+        let fake = FakeAccessBroker::new();
+        fake.set_bearer_connection("conn-1", "sk-1");
+        let ctx = ctx_over(handle_with_access_broker(fake.clone()));
 
-        ctx.provider_access("openrouter", None).await.unwrap();
+        ctx.open(&weft_core::Access::new("conn-1", "openrouter", None)).await.unwrap();
         assert_eq!(
-            fake.opened.lock().unwrap()[0].expected_duration_secs,
+            fake.resolved.lock().unwrap()[0].expected_duration_secs,
             weft_core::context::DEFAULT_PROVIDER_WINDOW.as_secs()
         );
     }
 
-    /// A user's-own-key access leaves nothing for the runtime to give back.
+    /// The marker's required permissions ride the resolve, so the
+    /// store's drift backstop sees exactly what the consumer declared.
     #[tokio::test]
-    async fn a_users_own_key_leaves_nothing_to_give_back() {
-        let fake = FakePaidCallClient::new();
-        let handle = Arc::new(handle_with_paid_calls(fake.clone()));
-        let ctx = ctx_over_arc(handle.clone());
-        ctx.provider_access("openrouter", Some("sk-own".into())).await.unwrap();
-        handle.close_opened_accesses().await;
-        assert!(
-            fake.closed_accesses.lock().unwrap().is_empty(),
-            "access on the user's own key has nothing of the runtime's to give back"
+    async fn required_permissions_ride_the_resolve() {
+        let fake = FakeAccessBroker::new();
+        fake.set_bearer_connection("conn-1", "sk-1");
+        let ctx = ctx_over(handle_with_access_broker(fake.clone()));
+
+        let access = weft_core::Access::new("conn-1", "google", None)
+            .with_required_permissions(vec!["drive.readonly".into()]);
+        ctx.open(&access).await.unwrap();
+        assert_eq!(
+            fake.resolved.lock().unwrap()[0].required_permissions,
+            vec!["drive.readonly".to_string()]
         );
     }
 
+    /// A connection the store does not know is a loud error carrying
+    /// the pick-one hint; ctx.client(None) answers a plain client with
+    /// no resolve at all (the works-without-a-connection path).
     #[tokio::test]
-    async fn a_provider_the_runtime_has_no_key_for_errors_loud() {
-        let fake = FakePaidCallClient::new();
-        let ctx = ctx_over(handle_with_paid_calls(fake));
-        let err = ctx.provider_access("elevenlabs", None).await.unwrap_err();
-        assert!(err.to_string().contains("set your own key"), "{err}");
+    async fn an_unknown_connection_errors_loud_and_none_stays_plain() {
+        let fake = FakeAccessBroker::new();
+        let ctx = ctx_over(handle_with_access_broker(fake.clone()));
+
+        let dead = weft_core::Access::new("id-gone", "slack", None);
+        let err = ctx.open(&dead).await.unwrap_err().to_string();
+        assert!(err.contains("pick one"), "{err}");
+
+        ctx.client(None).await.expect("no connection = a plain client");
+        assert_eq!(fake.resolved.lock().unwrap().len(), 1, "None never resolves");
+    }
+
+    /// ctx.client sugar: open + hand back the signed-in client, one
+    /// resolve, one lease.
+    #[tokio::test]
+    async fn client_sugar_opens_and_leases() {
+        let fake = FakeAccessBroker::new();
+        fake.set_owned_bearer_connection("id-1", "xoxb-1", weft_core::CredentialOwner::Ours);
+        let handle = Arc::new(handle_with_access_broker(fake.clone()));
+        let ctx = ctx_over_arc(handle.clone());
+
+        let access = weft_core::Access::new("id-1", "slack", Some("Q @ Acme".into()));
+        ctx.client(&access).await.expect("a connected grant resolves to a client");
+        let resolved = fake.resolved.lock().unwrap().clone();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].connection_id, "id-1");
+        assert_eq!(resolved[0].service, "slack");
+        handle.close_opened_accesses().await;
+        assert_eq!(fake.released.lock().unwrap().len(), 1, "the sugar leases too");
     }
 
     // Layer 3: the ContextHandle storage methods over the fake
@@ -2825,7 +3049,8 @@ mod replay_tests {
         use weft_core::storage::{KeepTtl, StorageScope};
         let ctx = ctx_over(handle_with_sequence(vec![]));
         let ty = weft_core::WeftType::parse("Image").unwrap();
-        let url_file = weft_core::storage::url_file_value("https://x/pic.png", &ty);
+        let url_value = weft_core::storage::url_file_value("https://x/pic.png", &ty);
+        let url_file = weft_core::storage::FileHandle::from_value(&url_value).unwrap();
         let storage = ctx.storage(StorageScope::Execution);
 
         assert_eq!(storage.presign(&url_file, None).await.unwrap(), "https://x/pic.png");
@@ -3246,8 +3471,9 @@ pub async fn apply_via_supervisor(
 //   1. `live_buses` does not leak (Weak refs drop after close).
 //   2. The journal pump never silently drops; failure surfaces on the
 //      next `send` as `SendError::JournalDegraded`.
-//   3. There is no Lagged-style silent swallow: ephemeral consumers get
-//      `CursorError::FellBehind`; journaled consumers just lag.
+//   3. There is no Lagged-style silent swallow of retained data: an
+//      ephemeral consumer's cursor resumes at the oldest retained
+//      entry; journaled consumers just lag.
 //   4. Register-then-close cannot orphan a `Joined`: the log lock
 //      serializes both with the `closed` flag.
 
@@ -3344,9 +3570,35 @@ mod bus_pump_tests {
         }
     }
 
-    /// The pump journals every BusJoined / BusMessage / BusClosed in
-    /// offset order. The bus's mode is carried in the marker JSON
-    /// itself, so there is no separate open event on the wire.
+    /// Wait until `predicate` is true, re-checking after every pump
+    /// drain pass: the coordinator's `drain_complete_notify` fires
+    /// once per pass, which is the real "the pump wrote something"
+    /// signal (no sleep-polling). The notified future is armed BEFORE
+    /// each check so a pass landing between check and park cannot be a
+    /// lost wake-up. Bounded by 2s so a regression fails fast.
+    async fn wait_for_drained<F: FnMut() -> bool>(coord: &Arc<BusCoordinator>, mut predicate: F) {
+        let drained = coord.drain_complete_notify();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let notified = drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if predicate() {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out waiting for the pump to drain the expected event");
+                }
+            }
+        }
+    }
+
+    /// The pump journals BusJoined / BusWindow / BusClosed in offset
+    /// order (membership rows flush the open window first, so the row
+    /// stream never reorders against the bus log). The bus's mode is
+    /// carried in the marker JSON itself.
     #[tokio::test]
     async fn pump_journals_full_lifecycle_in_offset_order() {
         let color = uuid::Uuid::new_v4();
@@ -3381,10 +3633,10 @@ mod bus_pump_tests {
                     assert!(*offset as i64 > last_offset);
                     last_offset = *offset as i64;
                 }
-                ExecEvent::BusMessage { offset, .. } => {
+                ExecEvent::BusWindow { first_offset, last_offset: lo, .. } => {
                     messages += 1;
-                    assert!(*offset as i64 > last_offset);
-                    last_offset = *offset as i64;
+                    assert!(*first_offset as i64 > last_offset);
+                    last_offset = *lo as i64;
                 }
                 ExecEvent::BusClosed { offset, .. } => {
                     closed += 1;
@@ -3395,14 +3647,75 @@ mod bus_pump_tests {
             }
         }
         assert!(joined >= 1, "at least one Joined journaled");
-        assert!(messages >= 1, "at least one Message journaled");
+        assert!(messages >= 1, "at least one window journaled");
         assert_eq!(closed, 1, "Closed emitted at shutdown");
     }
 
+    // A fast stream's window flushes when its TIME is up, without any
+    // close or membership entry forcing it: two sends inside one short
+    // window land as ONE BusWindow row carrying both messages, written
+    // while the bus is still open. Stress-looped: the pump's deadline
+    // select, the drain-notify handshake, and the multi-thread
+    // scheduler race here by construction.
+    weft_core::stress_test!(
+        name: a_window_flushes_on_its_own_deadline,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let color = uuid::Uuid::new_v4();
+            let coord = BusCoordinator::new();
+            let journal = Arc::new(CaptureJournal::default());
+            let pump = spawn_pump(&coord, journal.clone(), color);
+
+            let mut bus = new_bus(
+                &coord,
+                BusOptions {
+                    journal_window: Some(std::time::Duration::from_millis(50)),
+                    ..Default::default()
+                },
+            );
+            bus.register("mic").unwrap();
+            bus.send("frame", serde_json::json!(1)).unwrap();
+            bus.send("frame", serde_json::json!(2)).unwrap();
+
+            // No close: only the window deadline can flush a BusWindow row.
+            let j = journal.clone();
+            wait_for_drained(&coord, || {
+                j.events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, ExecEvent::BusWindow { .. }))
+            })
+            .await;
+            let events = journal.events.lock().unwrap().clone();
+            let (messages, totals) = events
+                .iter()
+                .find_map(|e| match e {
+                    ExecEvent::BusWindow { messages, totals, .. } => {
+                        Some((messages.clone(), totals.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("a BusWindow row was journaled on the deadline");
+            assert_eq!(messages.len(), 2, "both sends in one row");
+            assert_eq!(
+                (totals[0].from.as_str(), totals[0].msg_kind.as_str(), totals[0].count),
+                ("mic", "frame", 2),
+                "the rollup names the sender/kind and counts both sends"
+            );
+            drop(events);
+
+            bus.close();
+            drop(bus);
+            shutdown_and_join(coord, pump).await;
+        }
+    );
+
     /// On a journal write failure, the affected bus is marked
     /// `journal_degraded`; the next `send` returns
-    /// `SendError::JournalDegraded`. After `clear_journal_degraded`
-    /// (or a successful pump batch), subsequent sends return `Ok`.
+    /// `SendError::JournalDegraded`. The pump's next SUCCESSFUL batch
+    /// clears the flag on its own, after which sends return `Ok`.
     #[tokio::test]
     async fn pump_failure_surfaces_journal_degraded_on_next_send() {
         let color = uuid::Uuid::new_v4();
@@ -3426,64 +3739,82 @@ mod bus_pump_tests {
         let err = bus.send("late", serde_json::json!("x"));
         assert!(matches!(err, Err(SendError::JournalDegraded(_))), "got {err:?}");
 
-        // Clear the flag explicitly and confirm sends resume.
-        bus.clear_journal_degraded();
+        // Recovery is the pump's own retry: a fresh append wakes it
+        // (a rejected send appends nothing, so a second participant's
+        // register provides the wake), the buffered tail now writes
+        // successfully, the ack clears the flag, and sends resume.
+        let mut bob = bus.new_handle();
+        bob.register("bob").unwrap();
+        wait_until(|| !bus_inner.is_journal_degraded()).await;
         assert!(bus.send("ok", serde_json::json!("y")).is_ok());
 
         // Shutdown cleanly.
         bus.close();
+        drop(bob);
         drop(bus);
         shutdown_and_join(coord, pump).await;
     }
 
-    /// Ephemeral bus: the journaled BusMessage has `payload: None`
-    /// AND non-zero size + hash prefix. The inspector renders the
-    /// metadata; payload bytes never leave the producer's RAM.
-    #[tokio::test]
-    async fn ephemeral_bus_journal_carries_only_metadata_stub() {
-        let color = uuid::Uuid::new_v4();
-        let coord = BusCoordinator::new();
-        let journal = Arc::new(CaptureJournal::default());
-        let pump = spawn_pump(&coord, journal.clone(), color);
+    // Ephemeral bus: the journaled window carries NO message payloads
+    // (an empty `messages` list) and a totals rollup with a real byte
+    // count. Payload bytes never leave the producer's RAM.
+    // Stress-looped: the close-forces-flush ordering and the
+    // drain-notify handshake race under the multi-thread scheduler.
+    weft_core::stress_test!(
+        name: ephemeral_bus_journal_carries_only_metadata_stub,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let color = uuid::Uuid::new_v4();
+            let coord = BusCoordinator::new();
+            let journal = Arc::new(CaptureJournal::default());
+            let pump = spawn_pump(&coord, journal.clone(), color);
 
-        let mut bus = new_bus(
-            &coord,
-            BusOptions {
-                ephemeral: true,
-                window: Some(4),
-            },
-        );
-        bus.register("camera").unwrap();
-        bus.send("frame", serde_json::json!({"px": "AAAA"})).unwrap();
-        bus.close();
-        drop(bus);
+            let mut bus = new_bus(
+                &coord,
+                BusOptions {
+                    ephemeral: true,
+                    window: Some(4),
+                    ..Default::default()
+                },
+            );
+            bus.register("camera").unwrap();
+            bus.send("frame", serde_json::json!({"px": "AAAA"})).unwrap();
+            bus.close();
+            drop(bus);
 
-        let j = journal.clone();
-        // 3 events: Joined + Message + Closed.
-        wait_until(|| j.events.lock().unwrap().len() >= 3).await;
-
-        shutdown_and_join(coord, pump).await;
-
-        let events = journal.events.lock().unwrap().clone();
-        let message = events
-            .iter()
-            .find_map(|e| match e {
-                ExecEvent::BusMessage {
-                    payload,
-                    payload_byte_size,
-                    payload_sha256_prefix,
-                    ..
-                } => Some((payload.clone(), *payload_byte_size, *payload_sha256_prefix)),
-                _ => None,
+            // The Closed membership row is the LAST thing the pump ships
+            // for this bus (any open window flushes first, in offset
+            // order), so its presence proves the window row landed too.
+            let j = journal.clone();
+            wait_for_drained(&coord, || {
+                j.events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, ExecEvent::BusClosed { .. }))
             })
-            .expect("BusMessage journaled");
-        assert!(
-            matches!(message.0, weft_core::primitive::JournaledPayload::Ephemeral),
-            "ephemeral payload must be tagged Ephemeral in journal"
-        );
-        assert!(message.1 > 0, "byte size must be populated");
-        assert_ne!(message.2, [0u8; 8], "hash prefix must be populated");
-    }
+            .await;
+
+            shutdown_and_join(coord, pump).await;
+
+            let events = journal.events.lock().unwrap().clone();
+            let (messages, totals) = events
+                .iter()
+                .find_map(|e| match e {
+                    ExecEvent::BusWindow { messages, totals, .. } => {
+                        Some((messages.clone(), totals.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("BusWindow journaled");
+            assert!(messages.is_empty(), "ephemeral windows carry no payloads");
+            assert_eq!(totals.len(), 1);
+            assert_eq!((totals[0].from.as_str(), totals[0].msg_kind.as_str()), ("camera", "frame"));
+            assert_eq!(totals[0].count, 1);
+            assert!(totals[0].bytes > 0, "byte rollup must be populated");
+        }
+    );
 
     /// Once every participant handle drops AND `coord.shutdown()`
     /// releases the coordinator's `Arc<BusInner>` refs, the bus's

@@ -13,13 +13,14 @@
 //! really answers, and a real cost lands on the journal, attributed to
 //! `openrouter_custom`, the project's provider, not to `openrouter`.
 //!
-//! Driven BYOK only: a project-defined provider is refused the deployment key
-//! (define your own provider, bring your own key), so the user's own key is the
-//! path that exercises it. Spends real money (fractions of a cent). Needs
+//! Driven on the user's own key only: a project-defined service offers no
+//! shared door (define your own provider, bring your own key), so the own
+//! connection is the path that exercises it. Spends real money (fractions of a cent). Needs
 //! `OPENROUTER_API_KEY` (repo-root `.env` or the shell), the real key the
 //! custom provider's call rides.
 #![cfg(feature = "e2e")]
 
+use weft_e2e::access::{connect_direct, service_spec_of, set_account};
 use weft_e2e::{ensure, project::Project, run};
 
 /// The project defines its own `openrouter_custom` provider; the user's own key
@@ -33,9 +34,13 @@ async fn a_project_defined_provider_meters_a_real_call() -> anyhow::Result<()> {
              call rides the user's own key"
         )
     })?;
-    let mut project = Project::prepare("openrouter_custom", disp).await?;
-    // Set the node's own key input, exactly as picking "Own key" in the editor.
-    project.set_node_config("ask", "apiKey", &format!("{key:?}"))?;
+    let mut project = Project::prepare("openrouter_custom", disp.clone()).await?;
+    // Connect the user's own key as a connection for the PROJECT-DEFINED
+    // service, exactly as the editor's "Your own" page does; the spec is
+    // read off the fixture's own access-node metadata.
+    let spec = service_spec_of(&project.dir().join("nodes/ask/metadata.json"))?;
+    let conn = connect_direct(&disp, spec, "own", serde_json::json!({ "key": key })).await?;
+    set_account(&project, "ask", "connection", conn.handle())?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
@@ -55,7 +60,8 @@ async fn a_project_defined_provider_meters_a_real_call() -> anyhow::Result<()> {
     // `openrouter_custom` (the project's provider name), resolved to a real
     // amount, on the user's own key. If the worker had failed to discover the
     // project meter, there would be no `openrouter_custom` record at all.
-    settled.assert_measured("openrouter_custom", "user-provided").await?;
+    settled.assert_measured("openrouter_custom", "their-own").await?;
 
-    project.finish().await
+    project.finish().await?;
+    conn.finish().await
 }

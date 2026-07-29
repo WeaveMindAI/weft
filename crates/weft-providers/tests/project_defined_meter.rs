@@ -18,7 +18,7 @@ static PROJECT_METER: ProjectMeter = ProjectMeter;
 
 #[async_trait]
 impl ProviderMeter for ProjectMeter {
-    fn provider(&self) -> &'static str {
+    fn service(&self) -> &'static str {
         "acme_project_only"
     }
 
@@ -78,7 +78,7 @@ weft_providers::register_meter!(PROJECT_METER);
 fn a_meter_registered_outside_the_crate_is_discovered() {
     let found =
         weft_providers::meter_for("acme_project_only").expect("project-defined meter must resolve");
-    assert_eq!(found.provider(), "acme_project_only");
+    assert_eq!(found.service(), "acme_project_only");
     assert_eq!(found.base_url(), "https://api.acme.example/v1");
     // And a weft-shipped meter still resolves alongside it: the two registries
     // are one, so a project meter adds to the set, it does not replace it.

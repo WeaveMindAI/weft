@@ -49,16 +49,16 @@ impl Phase {
 }
 
 /// How long a node's provider work may take, unless it says otherwise
-/// ([`ExecutionContext::provider_access_within`]). Generous for a normal API
+/// ([`ExecutionContext::open_within`]). Generous for a normal API
 /// call (including a stream and its cost resolution), short enough that an
 /// access left behind by a crashed worker goes stale the same quarter hour.
 pub const DEFAULT_PROVIDER_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// The per-execution context handed to a node body (`Node::run` /
 /// `Node::setup_trigger`). Exposes the language's primitive surface
-/// (`await_signal` for mid-execution suspensions,
-/// `provider_access`/`metered_client` for paid calls, `log`) plus the
-/// two named-value bags (`ctx.inputs` / `ctx.wake`).
+/// (`await_signal` for mid-execution suspensions, `open`/`client` for
+/// calls on a connection, `log`) plus the two named-value bags
+/// (`ctx.inputs` / `ctx.wake`).
 ///
 /// ExecutionContext is constructed by the engine (inside the user's
 /// compiled binary) and passed to each node invocation. It holds an
@@ -282,6 +282,45 @@ impl ExecutionContext {
         self.handle.bus(marker)
     }
 
+    /// The whole PRODUCER ritual in one call: create the bus, emit its
+    /// marker on output `port`, and register `name` on it. The returned
+    /// guard CLOSES the bus when dropped, so every exit path of the
+    /// node body (success, error, unwind) ends the stream for readers
+    /// instead of leaving them parked forever; no manual close-on-
+    /// every-path blocks in node code.
+    pub async fn open_bus(
+        &self,
+        port: &str,
+        opts: crate::bus::BusOptions,
+        name: &str,
+    ) -> WeftResult<crate::bus::ClosingBus> {
+        let (bus, marker) = self.create_bus(opts)?;
+        self.pulse_downstream(crate::node::NodeOutput::new().set(port, marker)).await?;
+        // Past the marker emission, a reader may already be parked on
+        // this bus: from here EVERY exit closes (the guard's whole
+        // point), including a register failure right below.
+        let mut guard = crate::bus::ClosingBus::new(bus);
+        guard
+            .register(name)
+            .map_err(|e| WeftError::NodeExecution(format!("register '{name}' on the bus: {e}")))?;
+        Ok(guard)
+    }
+
+    /// The consuming twin of [`Self::open_bus`]: resolve the bus on
+    /// input `port` and register `name` on it, with the same
+    /// close-on-drop guard (a consumer that dies mid-conversation must
+    /// not leave the producer parked on `wait_for`). An observer that
+    /// must NOT close the bus on exit (a debug tap) uses
+    /// [`Self::bus_from_input`] instead.
+    pub fn join_bus(&self, port: &str, name: &str) -> WeftResult<crate::bus::ClosingBus> {
+        let bus = self.bus_from_input(port)?;
+        let mut guard = crate::bus::ClosingBus::new(bus);
+        guard
+            .register(name)
+            .map_err(|e| WeftError::NodeExecution(format!("register '{name}' on the bus: {e}")))?;
+        Ok(guard)
+    }
+
     /// Convenience: read input `name` and resolve it to a bus
     /// handle in one call. Equivalent to `ctx.bus(ctx.inputs.raw(name))`
     /// but with a clearer error message naming the input.
@@ -341,70 +380,61 @@ impl ExecutionContext {
         }
     }
 
-    // ----- Provider access + metered calls -----------------------------
+    // ----- Connections ------------------------------------------------
 
-    /// Your access to a provider: what to authenticate with. `user_key` is
-    /// the raw value of the node's key input: a real key string is the
-    /// USER'S OWN key (their provider account, used as-is); empty/absent or
-    /// the `__PLATFORM__` sentinel asks the RUNTIME to supply its
-    /// configured key for `provider`, which it may refuse (none configured,
-    /// or this node is not permitted to use it). Errors are loud and name
-    /// the fix ("set your own key for `provider`").
+    /// Open the connection an [`crate::access::Access`] value references,
+    /// for THIS firing: one resolve, one lease. The runtime fetches the
+    /// stored connection (lazily refreshing an expired token,
+    /// single-flight), builds the signed-in client (measured when a
+    /// meter is registered for the service, relayed when the resolved
+    /// credential carries a relay), and gives the lease back when this
+    /// node's body finishes; nothing node-facing closes it.
     ///
-    /// The whole paid-call surface is two steps: open the access, then make
-    /// the calls with [`Self::metered_client`]. The runtime routes the call,
-    /// measures what it cost (the provider's meter, run around the call),
-    /// records the figure on the execution's cost trail, and gives a
-    /// runtime-granted access back when the node finishes. The node
-    /// declares no estimate, holds nothing, settles nothing, and cannot
-    /// misstate a cost.
+    /// The handle exposes `.client()` (the normal surface) and
+    /// `.credential()` (the single credential string, derived, for
+    /// libraries that insist on a raw value). A dead connection is a
+    /// loud error naming the fix ("needs reconnecting"); a refusal to
+    /// grant the runtime's own credential names the fix too ("connect
+    /// your own").
     ///
-    /// Uses the default work window ([`DEFAULT_PROVIDER_WINDOW`]); a node
-    /// whose provider work legitimately runs longer declares its own with
-    /// [`Self::provider_access_within`].
-    pub async fn provider_access(
+    /// Uses the default work window ([`DEFAULT_PROVIDER_WINDOW`]); a
+    /// node whose provider work legitimately runs longer declares its
+    /// own with [`Self::open_within`].
+    pub async fn open(
         &self,
-        provider: &str,
-        user_key: Option<String>,
-    ) -> WeftResult<crate::access::ProviderAccess> {
-        self.provider_access_within(provider, user_key, DEFAULT_PROVIDER_WINDOW).await
+        access: &crate::access::Access,
+    ) -> WeftResult<crate::access::OpenedConnection> {
+        self.open_within(access, DEFAULT_PROVIDER_WINDOW).await
     }
 
-    /// [`Self::provider_access`] with an explicit `window`: how long this
-    /// node's provider work may take. A runtime-granted credential is
-    /// guaranteed usable exactly that long (the crash backstop; the runtime
-    /// normally retires it when the node finishes). Nodes wrapping genuinely
-    /// long actions (a multi-hour generation) raise it.
-    pub async fn provider_access_within(
+    /// [`Self::open`] with an explicit `window`: how long this node's
+    /// provider work may take. A runtime-supplied credential is
+    /// guaranteed usable exactly that long (the crash backstop; the
+    /// runtime normally retires it when the node finishes). Nodes
+    /// wrapping genuinely long actions (a multi-hour generation) raise it.
+    pub async fn open_within(
         &self,
-        provider: &str,
-        user_key: Option<String>,
+        access: &crate::access::Access,
         window: std::time::Duration,
-    ) -> WeftResult<crate::access::ProviderAccess> {
-        if let Some(own) = crate::access::user_key_of(user_key.as_deref()) {
-            return Ok(crate::access::ProviderAccess::own(provider, own, window));
-        }
-        let (credential, relay_url) =
-            self.handle.open_provider_access(provider, window).await?;
-        Ok(crate::access::ProviderAccess::runtime(provider, credential, relay_url, window))
+    ) -> WeftResult<crate::access::OpenedConnection> {
+        self.handle.open_connection(access, window).await
     }
 
-    /// An HTTP client for paid calls on `access`: use it directly, or hand
-    /// it to any library that accepts an injected client. Behind it, the
-    /// runtime routes the request (straight to the provider, or through the
-    /// runtime's relay when the access carries one) and runs the
-    /// provider's meter around the call, so the call's real cost lands on
-    /// the execution's cost trail without the node doing anything.
-    ///
-    /// The one rule for paid calls: never construct your own HTTP client
-    /// for one; always take it from here. A call made on a hand-rolled
-    /// client is invisible to the cost trail (and a relayed access's
-    /// credential is useless outside this client's routing).
-    pub fn metered_client(
+    /// Sugar for the overwhelmingly common case: open the connection
+    /// and hand back its signed-in client. Accepts an ABSENT connection
+    /// (`None`) and answers a plain client then, for nodes whose access
+    /// input is declared `required: false` because the address they
+    /// call serves link-shared resources without a sign-in; on a
+    /// required input an absent value never reaches here (it is an
+    /// ordinary missing-input error at the read).
+    pub async fn client<'a>(
         &self,
-        access: &crate::access::ProviderAccess,
+        access: impl Into<Option<&'a crate::access::Access>>,
     ) -> WeftResult<reqwest_middleware::ClientWithMiddleware> {
-        self.handle.metered_client(access)
+        match access.into() {
+            Some(access) => Ok(self.open(access).await?.client().clone()),
+            None => Ok(crate::access::client::plain_client()),
+        }
     }
 
     // ----- Side-effect primitives ------------------------------------
@@ -537,10 +567,10 @@ impl ExecutionContext {
 
     // ----- Plain outbound HTTP ---------------------------------------
 
-    /// The shared, pooled HTTP client for plain (unpaid) outbound calls.
-    /// One client per process; a node never constructs its own. The one
-    /// rule for outbound HTTP: a PAID provider call goes through
-    /// [`Self::provider_access`] + [`Self::metered_client`] (that is what
+    /// The shared, pooled HTTP client for plain outbound calls. One
+    /// client per process; a node never constructs its own. The one
+    /// rule for outbound HTTP: a call on a CONNECTION goes through
+    /// [`Self::open`] / [`Self::client`] (that is what signs it and
     /// records its cost); everything else goes through here.
     pub fn http(&self) -> &'static reqwest::Client {
         static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -702,8 +732,21 @@ impl ValueBag {
     /// ports, carry ghosts. Nodes that project "whatever the user
     /// wired in" (Python variable bindings, form prefill data) read
     /// this instead of hardcoding their own setting names.
+    ///
+    /// Iteration projections only: `iter` = everything, `declared` =
+    /// the type's own declared inputs, `custom` = the instance
+    /// extras. NAMED reads (`get`/`opt`/`get_or`/`raw`) are one
+    /// uniform surface over all of them.
     pub fn custom(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.values.iter().filter(|(k, _)| !self.spec_names.contains(k.as_str()))
+    }
+
+    /// The complement of [`Self::custom`]: only the node TYPE's own
+    /// spec-declared inputs (its settings), without the instance
+    /// extras. For forwarding nodes that project "my settings as one
+    /// record" while custom ports carry separate data.
+    pub fn declared(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.values.iter().filter(|(k, _)| self.spec_names.contains(k.as_str()))
     }
 }
 
@@ -724,11 +767,16 @@ impl ValueBag {
 /// No name is special: an object wired to an input (a config node's
 /// output, say) arrives AS that object, and the node decides what to
 /// read out of it.
+///
+/// Errs on a broken spec or a malformed widget handle (an access
+/// widget missing its compiler-stamped service, a remote_select pick
+/// object without a string id): the firing fails loud instead of the
+/// node reading a shape it can never hold.
 pub fn node_input_bag(
     node: &crate::project::NodeDefinition,
     mut delivered: serde_json::Map<String, Value>,
     closed_ports: &[String],
-) -> ValueBag {
+) -> Result<ValueBag, String> {
     // The braces store under-lays what the ready paths delivered.
     // Compiler/editor plumbing keys co-resident in the config blob
     // (`parentId`, `_`-reserved) are not input data and never reach
@@ -752,13 +800,94 @@ pub fn node_input_bag(
             .or_insert_with(|| default.clone());
     }
 
+    // Connection inputs get their metadata threaded onto the value, so
+    // node bodies do TYPED extraction with zero name literals: an
+    // `access` (connect-button) input's stored `{id, identity}` handle
+    // becomes the full Access marker carrying the widget's stamped
+    // service (read back via `get::<Access>`), and a remote_select's
+    // stored `{id, label}` pick becomes the bare id string the node
+    // reads (the label is an editor-side display cache, never data).
+    // The rewrite exists only in the bag; the config value on disk /
+    // in the journal is untouched.
+    for input in &node.inputs {
+        match &input.widget {
+            Some(crate::node::Widget::Access { service: Some(service) }) => {
+                let Some(obj) = delivered.get(&input.name).and_then(Value::as_object) else {
+                    // Not connected yet: leave the input absent so a
+                    // REQUIRED read errors as a missing input, and an
+                    // optional read honestly answers None (the
+                    // works-without-a-connection case).
+                    delivered.remove(&input.name);
+                    continue;
+                };
+                let Some(id) = obj.get("id").and_then(Value::as_str) else {
+                    delivered.remove(&input.name);
+                    continue;
+                };
+                let identity =
+                    obj.get("identity").and_then(Value::as_str).map(|s| s.to_string());
+                let marker = crate::access::Access::new(id, service.clone(), identity).to_value();
+                delivered.insert(input.name.clone(), marker);
+            }
+            // The service is stamped by the compiler (enrich) from the
+            // node metadata's `service` recipe; an access widget
+            // reaching a firing without one is a broken node spec, and
+            // building a marker without a service would misroute every
+            // downstream resolution.
+            Some(crate::node::Widget::Access { service: None }) => {
+                return Err(format!(
+                    "input '{}': access widget carries no service stamp (the compiler \
+                     stamps it from the node metadata's `service` recipe); the node spec \
+                     is broken, rebuild the project",
+                    input.name
+                ));
+            }
+            Some(crate::node::Widget::RemoteSelect { .. }) => {
+                // Only the OBJECT form is unwrapped; a non-object value
+                // is a pasted raw id and passes through untouched.
+                if let Some(obj) = delivered.get(&input.name).and_then(Value::as_object) {
+                    let Some(id) = obj.get("id").and_then(Value::as_str).map(str::to_string)
+                    else {
+                        return Err(format!(
+                            "input '{}': a remote_select pick must be an {{id, label}} \
+                             object with a string `id`; the stored value has none, re-pick \
+                             the resource",
+                            input.name
+                        ));
+                    };
+                    delivered.insert(input.name.clone(), Value::String(id));
+                }
+            }
+            _ => {}
+        }
+        // A consumer input declaring `requiresScopes` stamps them onto
+        // whatever access marker arrived (wired from an access node),
+        // so resolution can hold a VERIFIED connection to them. A
+        // non-marker value is left alone; the read fails loud there.
+        let required_scopes = input.requires_scopes.as_deref().unwrap_or_default();
+        let required_values = input.requires_values.as_deref().unwrap_or_default();
+        if !required_scopes.is_empty() || !required_values.is_empty() {
+            if let Some(value) = delivered.get(&input.name) {
+                if let Ok(access) = crate::access::Access::from_value(value) {
+                    delivered.insert(
+                        input.name.clone(),
+                        access
+                            .with_required_permissions(required_scopes.to_vec())
+                            .with_required_values(required_values.to_vec())
+                            .to_value(),
+                    );
+                }
+            }
+        }
+    }
+
     let spec_names = node
         .inputs
         .iter()
         .filter(|i| i.from_spec)
         .map(|i| i.name.clone())
         .collect();
-    ValueBag::inputs(delivered, spec_names)
+    Ok(ValueBag::inputs(delivered, spec_names))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -828,12 +957,13 @@ impl EndpointHandle {
 /// `ContextHandle` storage methods; the handle itself only carries
 /// the chosen scope.
 ///
-/// File-addressed verbs accept any file value (the concrete
-/// `__weft_<kind>__` reference an upstream node emitted, key- or
-/// url-backed) or a raw key string wrapped in a JSON string; see
-/// [`crate::storage::FileHandle::from_value`]. Verbs that only make
-/// sense on bucket-stored bytes (`delete`, `keep`) error loud on a
-/// url-backed value.
+/// File-addressed verbs take the file's parsed HANDLE
+/// ([`crate::storage::FileHandle`]): the typed address a
+/// `get::<FileHandle>` extraction or a generated inputs field hands
+/// back; a raw value in hand parses via `FileHandle::from_value`
+/// (which accepts the `__weft_<kind>__` marker or a bare key string).
+/// Verbs that only make sense on bucket-stored bytes (`delete`,
+/// `keep`) error loud on a url-backed handle.
 #[derive(Clone)]
 pub struct StorageHandle {
     handle: Arc<dyn ContextHandle>,
@@ -898,16 +1028,18 @@ impl StorageHandle {
         self.handle.storage_put_from_url(&self.scope, url, filename, keep).await
     }
 
-    /// Stream a file's bytes. Accepts any file value (a bucket-backed
-    /// `key` marker, an external `url` marker) or a raw key (JSON string).
-    /// For a bucket-backed file this counts as access (bumps a kept file's
-    /// TTL); a url-backed value has no stored TTL to bump. The node holds
-    /// an ADDRESS and this reads the bytes behind it, whichever form.
+    /// Stream a file's bytes. Takes the file's parsed HANDLE (the typed
+    /// address `ctx.inputs.get::<FileHandle>` / a generated inputs field
+    /// hands back; a raw value in hand parses via
+    /// [`crate::storage::FileHandle::from_value`]). For a bucket-backed
+    /// file this counts as access (bumps a kept file's TTL); a
+    /// url-backed handle has no stored TTL to bump. The node holds an
+    /// ADDRESS and this reads the bytes behind it, whichever form.
     pub async fn get(
         &self,
-        file_or_key: &Value,
+        file: &crate::storage::FileHandle,
     ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
-        self.get_with_range(file_or_key, None).await
+        self.get_with_range(file, None).await
     }
 
     /// Range read: stream only `range` of the file. The home of the
@@ -915,27 +1047,29 @@ impl StorageHandle {
     /// chunks for an API without ever holding the whole file).
     pub async fn get_range(
         &self,
-        file_or_key: &Value,
+        file: &crate::storage::FileHandle,
         range: crate::storage::ByteRange,
     ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
-        self.get_with_range(file_or_key, Some(range)).await
+        self.get_with_range(file, Some(range)).await
     }
 
-    /// The one read dispatch behind `get` / `get_range`: parse the file value's
-    /// HANDLE and route to the bucket (a `key`) or an external fetch (a `url`).
-    /// A `url`-backed file is fetched directly by the worker, which is safe
-    /// because that fetch only ever runs inside the isolated worker (the same
-    /// reason `put_from_url` is safe). The node-facing surface is identical
-    /// either way.
+    /// The one read dispatch behind `get` / `get_range`: route the handle
+    /// to the bucket (a `key`) or an external fetch (a `url`). A
+    /// url-backed file is fetched directly by the worker, which is safe
+    /// because that fetch only ever runs inside the isolated worker (the
+    /// same reason `put_from_url` is safe). The node-facing surface is
+    /// identical either way.
     async fn get_with_range(
         &self,
-        file_or_key: &Value,
+        file: &crate::storage::FileHandle,
         range: Option<crate::storage::ByteRange>,
     ) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
-        match crate::storage::FileHandle::from_value(file_or_key)? {
-            crate::storage::FileHandle::Key(key) => self.handle.storage_get(&key, range).await,
+        match file {
+            crate::storage::FileHandle::Key(key) => self.handle.storage_get(key, range).await,
             crate::storage::FileHandle::Url { url, mime_type, filename, size_bytes } => {
-                self.handle.storage_get_url(&url, &mime_type, &filename, size_bytes, range).await
+                self.handle
+                    .storage_get_url(url, mime_type, filename, *size_bytes, range)
+                    .await
             }
         }
     }
@@ -944,9 +1078,9 @@ impl StorageHandle {
     /// for files known to be small; large files should stream.
     pub async fn get_bytes(
         &self,
-        file_or_key: &Value,
+        file: &crate::storage::FileHandle,
     ) -> WeftResult<(crate::storage::StoredFileMeta, bytes::Bytes)> {
-        let (meta, stream) = self.get(file_or_key).await?;
+        let (meta, stream) = self.get(file).await?;
         let bytes = crate::storage::collect_stream(stream)
             .await
             .map_err(|e| WeftError::NodeExecution(format!("storage get stream: {e}")))?;
@@ -954,11 +1088,11 @@ impl StorageHandle {
     }
 
     /// Delete a stored file. Space is reclaimed in place, instantly.
-    /// Bucket-only: a url-backed file value has nothing in storage to
-    /// delete and errors loud.
-    pub async fn delete(&self, file_or_key: &Value) -> WeftResult<()> {
-        let key = Self::bucket_key(file_or_key, "delete")?;
-        self.handle.storage_delete(&key).await
+    /// Bucket-only: a url-backed file has nothing in storage to delete
+    /// and errors loud.
+    pub async fn delete(&self, file: &crate::storage::FileHandle) -> WeftResult<()> {
+        let key = Self::bucket_key(file, "delete")?;
+        self.handle.storage_delete(key).await
     }
 
     /// List the files under this handle's scope prefix.
@@ -969,15 +1103,15 @@ impl StorageHandle {
     /// Mark an existing execution-scoped file to survive the
     /// terminate sweep (the after-the-fact twin of `put(.., keep)`).
     /// Keep is purely ADDITIVE: there is no un-keep / keep-only verb.
-    /// Bucket-only: a url-backed file value is not subject to the
-    /// terminate sweep (the bytes were never in storage) and errors loud.
+    /// Bucket-only: a url-backed file is not subject to the terminate
+    /// sweep (the bytes were never in storage) and errors loud.
     pub async fn keep(
         &self,
-        file_or_key: &Value,
+        file: &crate::storage::FileHandle,
         ttl: crate::storage::KeepTtl,
     ) -> WeftResult<()> {
-        let key = Self::bucket_key(file_or_key, "keep")?;
-        self.handle.storage_keep(&key, ttl).await
+        let key = Self::bucket_key(file, "keep")?;
+        self.handle.storage_keep(key, ttl).await
     }
 
     /// Mint a TEMPORARY signed URL for handing this file to an
@@ -992,23 +1126,26 @@ impl StorageHandle {
     /// caller's contract ("a URL to hand out") holds for both handles.
     pub async fn presign(
         &self,
-        file_or_key: &Value,
+        file: &crate::storage::FileHandle,
         ttl_secs: Option<u64>,
     ) -> WeftResult<String> {
-        match crate::storage::FileHandle::from_value(file_or_key)? {
+        match file {
             crate::storage::FileHandle::Key(key) => {
-                self.handle.storage_presign(&key, ttl_secs).await
+                self.handle.storage_presign(key, ttl_secs).await
             }
-            crate::storage::FileHandle::Url { url, .. } => Ok(url),
+            crate::storage::FileHandle::Url { url, .. } => Ok(url.clone()),
         }
     }
 
-    /// Parse a file value down to its bucket key for the verbs that only
-    /// make sense on stored bytes (`delete`, `keep`). A url-backed value
-    /// errors loud with the verb's name: the bytes live at an external
-    /// URL, there is nothing in storage to act on.
-    fn bucket_key(file_or_key: &Value, verb: &str) -> WeftResult<String> {
-        match crate::storage::FileHandle::from_value(file_or_key)? {
+    /// The handle's bucket key, for the verbs that only make sense on
+    /// stored bytes (`delete`, `keep`). A url-backed handle errors loud
+    /// with the verb's name: the bytes live at an external URL, there
+    /// is nothing in storage to act on.
+    fn bucket_key<'f>(
+        file: &'f crate::storage::FileHandle,
+        verb: &str,
+    ) -> WeftResult<&'f str> {
+        match file {
             crate::storage::FileHandle::Key(key) => Ok(key),
             crate::storage::FileHandle::Url { url, .. } => Err(WeftError::Input(format!(
                 "storage {verb}: this file value points at an external URL ({url}), not a stored file; only bucket-stored files can be {verb}ed"
@@ -1063,28 +1200,21 @@ pub trait ContextHandle: Send + Sync {
     /// is the value `run_step` returned; passing it explicitly
     /// removes the read-counter-and-subtract-one coupling.
     async fn run_record(&self, name: &str, call_index: u32, value: &Value) -> WeftResult<()>;
-    /// Open access to `provider` on the RUNTIME's configured key for the
-    /// calling node: returns the credential to authenticate with and,
-    /// optionally, the relay address calls on it must go to (`None` = the
-    /// provider's own API). Used internally by
-    /// [`ExecutionContext::provider_access`] (a user-supplied key never
-    /// reaches this). The runtime decides whether this node may use its
-    /// key; a refusal or a missing key is a loud error telling the user to
-    /// set their own key. The runtime gives the access back when the node
-    /// finishes; nothing node-facing closes it.
-    async fn open_provider_access(
+    /// Open the connection `access` references, for the calling
+    /// firing: resolve it through the runtime (tenant wall, lazy
+    /// refresh, required-permission backstop), build the signed-in
+    /// client (metered when the service has a registered meter,
+    /// relayed when the resolved credential carries a relay), and
+    /// lease it to this firing (the runtime releases it when the
+    /// node's body finishes; nothing node-facing closes it). Used
+    /// internally by [`ExecutionContext::open`]. Loud on a
+    /// missing/revoked connection, a service mismatch, or a refusal
+    /// to supply the runtime's own credential.
+    async fn open_connection(
         &self,
-        provider: &str,
+        access: &crate::access::Access,
         window: std::time::Duration,
-    ) -> WeftResult<(String, Option<String>)>;
-    /// The metering HTTP client for calls on `access`: routes the request
-    /// (provider or relay) and runs the provider's meter around it, so the
-    /// call's real cost is measured and recorded by the runtime. Used
-    /// internally by [`ExecutionContext::metered_client`].
-    fn metered_client(
-        &self,
-        access: &crate::access::ProviderAccess,
-    ) -> WeftResult<reqwest_middleware::ClientWithMiddleware>;
+    ) -> WeftResult<crate::access::OpenedConnection>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 
@@ -1251,8 +1381,7 @@ mod value_bag_tests {
         async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
-        async fn open_provider_access(&self, _: &str, _: std::time::Duration) -> WeftResult<(String, Option<String>)> { unreachable!() }
-        fn metered_client(&self, _: &crate::access::ProviderAccess) -> WeftResult<reqwest_middleware::ClientWithMiddleware> { unreachable!() }
+        async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
@@ -1397,7 +1526,7 @@ mod node_input_bag_tests {
     #[test]
     fn delivered_and_config_merge_delivered_wins() {
         let n = node(&[("to", None)], json!({"label": "x", "to": "braces"}));
-        let bag = node_input_bag(&n, delivered(json!({"to": 10})), &[]);
+        let bag = node_input_bag(&n, delivered(json!({"to": 10})), &[]).expect("bag");
         assert_eq!(bag.get::<u64>("to").unwrap(), 10, "delivered beats the braces value");
         assert_eq!(bag.get::<String>("label").unwrap(), "x");
     }
@@ -1416,7 +1545,8 @@ mod node_input_bag_tests {
                 "config": {"model": "from-config-node", "temperature": 0.2}
             })),
             &[],
-        );
+        )
+        .expect("bag");
         assert_eq!(
             bag.get::<Value>("config").unwrap(),
             json!({"model": "from-config-node", "temperature": 0.2}),
@@ -1435,14 +1565,15 @@ mod node_input_bag_tests {
             &[("method", Some(json!("GET"))), ("model", Some(json!("base")))],
             json!({}),
         );
-        let bag = node_input_bag(&n, delivered(json!({"model": "wired"})), &[]);
+        let bag = node_input_bag(&n, delivered(json!({"model": "wired"})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("method").unwrap(), "GET", "absent input reads its default");
         assert_eq!(bag.get::<String>("model").unwrap(), "wired", "a wired value beats the default");
         // The default shows through the whole-record read too: the bag
         // is one consistent view, get/object/iter never disagree.
         assert_eq!(bag.object().unwrap().get("method"), Some(&json!("GET")));
 
-        let bag = node_input_bag(&n, delivered(json!({})), &["method".to_string()]);
+        let bag =
+            node_input_bag(&n, delivered(json!({})), &["method".to_string()]).expect("bag");
         assert!(bag.raw("method").is_none(), "a closed input is not defaulted");
     }
 
@@ -1455,12 +1586,133 @@ mod node_input_bag_tests {
             &[("url", None)],
             json!({"url": "http://x", "parentId": "g1", "_label": "My node", "_tags": ["a"]}),
         );
-        let bag = node_input_bag(&n, delivered(json!({})), &[]);
+        let bag = node_input_bag(&n, delivered(json!({})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("url").unwrap(), "http://x");
         assert!(bag.raw("parentId").is_none(), "parentId is compiler plumbing, not input data");
         assert!(bag.raw("_label").is_none(), "_-reserved keys are editor plumbing, not input data");
         assert!(bag.raw("_tags").is_none());
         assert_eq!(bag.object().unwrap().len(), 1, "the whole-record read agrees");
+    }
+
+    /// Connection inputs get their metadata threaded onto the bag
+    /// value: an access input's stored `{id, identity}` becomes the
+    /// full Access marker (service from the stamped widget). A
+    /// remote_select's PASTED raw id (a plain string) passes through
+    /// untouched; the object pick form is covered by
+    /// `a_remote_select_pick_object_unwraps_to_the_bare_id`.
+    #[test]
+    fn connection_widgets_thread_their_metadata_into_the_bag() {
+        let n: crate::project::NodeDefinition = serde_json::from_value(json!({
+            "id": "n1", "nodeType": "SlackAccess", "label": null,
+            "config": {
+                "account": {"id": "grant-1", "identity": "Q @ Acme"},
+                "channel": "C42"
+            },
+            "position": {"x": 0.0, "y": 0.0}, "scope": [],
+            "inputs": [
+                {"name": "account", "portType": "Access", "required": false,
+                 "widget": {"kind": "access", "service": "slack"}},
+                {"name": "channel", "portType": "String", "required": false,
+                 "widget": {"kind": "remote_select", "access": "account", "sources": [
+                     {"kind": "list", "get": "https://x/list", "items": "channels",
+                      "label": "name", "value": "id"}]}},
+            ],
+            "outputs": [],
+        }))
+        .expect("node json");
+        let bag = node_input_bag(&n, delivered(json!({})), &[]).expect("bag");
+
+        let access: crate::access::Access = bag.get("account").unwrap();
+        assert_eq!(access.access_id(), "grant-1");
+        assert_eq!(access.service(), "slack");
+        assert_eq!(access.identity(), Some("Q @ Acme"));
+
+        assert_eq!(bag.get::<String>("channel").unwrap(), "C42", "a pasted raw id, untouched");
+    }
+
+    /// A remote_select's stored `{id, label}` pick object arrives at
+    /// the node as the BARE id string (the label is an editor-side
+    /// display cache); a pick object without a string id fails the
+    /// bag build loud. An access widget without its compiler-stamped
+    /// service is a broken node spec and fails loud too.
+    #[test]
+    fn a_remote_select_pick_object_unwraps_to_the_bare_id() {
+        let make = |config: Value, service: Value| -> crate::project::NodeDefinition {
+            serde_json::from_value(json!({
+                "id": "n1", "nodeType": "SlackSendMessage", "label": null,
+                "config": config,
+                "position": {"x": 0.0, "y": 0.0}, "scope": [],
+                "inputs": [
+                    {"name": "account", "portType": "Access", "required": false,
+                     "widget": {"kind": "access", "service": service}},
+                    {"name": "channel", "portType": "String", "required": false,
+                     "widget": {"kind": "remote_select", "access": "account", "sources": [
+                         {"kind": "list", "get": "https://x/list", "items": "channels",
+                          "label": "name", "value": "id"}]}},
+                ],
+                "outputs": [],
+            }))
+            .expect("node json")
+        };
+
+        let n = make(json!({"channel": {"id": "C42", "label": "#general"}}), json!("slack"));
+        let bag = node_input_bag(&n, delivered(json!({})), &[]).expect("bag");
+        assert_eq!(bag.get::<String>("channel").unwrap(), "C42", "the object form unwraps");
+
+        let n = make(json!({"channel": {"label": "#general"}}), json!("slack"));
+        let e = node_input_bag(&n, delivered(json!({})), &[]).unwrap_err();
+        assert!(e.contains("string `id`"), "{e}");
+
+        let n = make(json!({}), json!(null));
+        let e = node_input_bag(&n, delivered(json!({})), &[]).unwrap_err();
+        assert!(e.contains("no service stamp"), "{e}");
+    }
+
+    /// A CONSUMER input declaring `requiresScopes` stamps them onto a
+    /// wired access marker, so resolution can hold a verified
+    /// connection to them; the emitting access node never carries them.
+    #[test]
+    fn required_permissions_are_stamped_by_the_consumer() {
+        let n: crate::project::NodeDefinition = serde_json::from_value(json!({
+            "id": "n1", "nodeType": "ListFiles", "label": null,
+            "config": {},
+            "position": {"x": 0.0, "y": 0.0}, "scope": [],
+            "inputs": [
+                {"name": "account", "portType": "Access", "required": true,
+                 "requiresScopes": ["drive.readonly"]},
+            ],
+            "outputs": [],
+        }))
+        .expect("node json");
+        let wired = crate::access::Access::new("grant-1", "google", None).to_value();
+        let bag = node_input_bag(&n, delivered(json!({"account": wired})), &[]).expect("bag");
+        let access: crate::access::Access = bag.get("account").unwrap();
+        assert_eq!(access.required_permissions(), ["drive.readonly".to_string()]);
+    }
+
+    /// An unconnected access input stays ABSENT (a loud missing-input
+    /// read), never a half-built marker; a wired raw id on a
+    /// remote_select passes through.
+    #[test]
+    fn unconnected_access_stays_absent_and_wired_ids_pass_through() {
+        let n: crate::project::NodeDefinition = serde_json::from_value(json!({
+            "id": "n1", "nodeType": "SlackAccess", "label": null,
+            "config": {},
+            "position": {"x": 0.0, "y": 0.0}, "scope": [],
+            "inputs": [
+                {"name": "account", "portType": "Access", "required": false,
+                 "widget": {"kind": "access", "service": "slack"}},
+                {"name": "channel", "portType": "String", "required": false,
+                 "widget": {"kind": "remote_select", "access": "account", "sources": [
+                     {"kind": "list", "get": "https://x/list", "items": "channels",
+                      "label": "name", "value": "id"}]}},
+            ],
+            "outputs": [],
+        }))
+        .expect("node json");
+        let bag = node_input_bag(&n, delivered(json!({"channel": "C-wired"})), &[]).expect("bag");
+        assert!(bag.raw("account").is_none(), "unconnected = absent, reads fail loud");
+        assert_eq!(bag.get::<String>("channel").unwrap(), "C-wired");
     }
 
     /// `custom()` hands back the instance's DATA inputs only: the node
@@ -1479,9 +1731,12 @@ mod node_input_bag_tests {
             "outputs": [],
         }))
         .expect("node json");
-        let bag = node_input_bag(&n, delivered(json!({"a": 7})), &[]);
+        let bag = node_input_bag(&n, delivered(json!({"a": 7})), &[]).expect("bag");
         let data: Vec<&str> = bag.custom().map(|(k, _)| k.as_str()).collect();
         assert_eq!(data, vec!["a"], "settings are excluded, instance ports remain");
+        let settings: Vec<&str> = bag.declared().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(settings, vec!["code"], "declared() is the exact complement");
         assert!(bag.raw("code").is_some(), "the setting is still readable by name");
+        assert_eq!(bag.get::<u64>("a").unwrap(), 7, "named reads cover custom ports too");
     }
 }

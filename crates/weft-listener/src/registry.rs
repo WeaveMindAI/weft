@@ -8,8 +8,28 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use weft_core::primitive::{SignalRouting, SignalSpec};
+
+/// Which transport currently serves a signal's held connection,
+/// recorded on its [`ServingState`] when the serving task decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    Socket,
+    Webhook,
+    Unservable(String),
+}
+
+/// The LIVE, per-pod serving state of one signal: what its background
+/// task is doing right now and the transport it decided on. Written
+/// by the kind's serving task, read by the /display surface. An empty
+/// status with no transport means the kind reports nothing live.
+#[derive(Debug, Default)]
+pub struct ServingState {
+    pub status: String,
+    pub transport: Option<Transport>,
+}
 
 #[derive(Clone)]
 pub struct RegisteredSignal {
@@ -44,6 +64,11 @@ pub struct RegisteredSignal {
     /// populate it, so downstream readers don't need to handle a
     /// None case.
     pub routing: SignalRouting,
+    /// The live serving state (see [`ServingState`]), created at
+    /// registration and shared with the kind's background task so
+    /// status updates land where /display reads them. Dies with the
+    /// entry.
+    pub serving: Arc<Mutex<ServingState>>,
 }
 
 /// Wrapper so dropping a `RegisteredSignal` aborts its loop
@@ -144,6 +169,7 @@ pub async fn rehydrate(
     pod_name: &str,
     registry: Arc<Registry>,
     config: Arc<crate::config::ListenerConfig>,
+    events_broker: Arc<weft_broker_client::BrokerEventsClient>,
 ) -> anyhow::Result<()> {
     let signals = weft_broker_client::BrokerSignalClient::new((*broker_url).clone(), token);
     // Rehydrate the signals PLACED on this pod (a pooled listener holds
@@ -166,13 +192,15 @@ pub async fn rehydrate(
             anyhow::anyhow!("to_routing for signal {}: {e}", row.token)
         })?;
         crate::kinds::register_in_registry(
-            row.token,
-            row.tenant_id,
-            spec,
-            row.node_id,
-            row.is_resume,
-            row.color,
-            row.placement_generation,
+            crate::kinds::SignalIdentity {
+                token: row.token,
+                tenant_id: row.tenant_id,
+                node_id: row.node_id,
+                is_resume: row.is_resume,
+                color: row.color,
+                placement_generation: row.placement_generation,
+                spec,
+            },
             crate::kinds::RoutingSource::Restore {
                 routing,
                 kind_state: row.kind_state,
@@ -180,6 +208,7 @@ pub async fn rehydrate(
             registry.clone(),
             sink.clone(),
             config.clone(),
+            events_broker.clone(),
         )
         .await?;
     }

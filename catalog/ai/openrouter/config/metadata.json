@@ -1,7 +1,7 @@
 {
   "type": "OpenRouterConfig",
   "label": "OpenRouter Config",
-  "description": "OpenRouter model and parameters. When multiple OpenRouterInference nodes share the same settings, point them at one OpenRouterConfig node to keep maintenance simple. Only use multiple configs when you truly need different settings.",
+  "description": "OpenRouter model and parameters (pure model settings; the credential decision lives on the OpenRouterAccess node). When multiple OpenRouterInference nodes share the same settings, point them at one OpenRouterConfig node to keep maintenance simple. Only use multiple configs when you truly need different settings.",
   "category": "AI",
   "tags": [
     "config",
@@ -12,16 +12,6 @@
   "icon": "Settings",
   "color": "#6b6b99",
   "inputs": [
-    {
-      "name": "apiKey",
-      "type": "String",
-      "exposure": "config",
-      "widget": {
-        "kind": "api_key",
-        "provider": "openrouter"
-      },
-      "label": "API Key"
-    },
     {
       "name": "model",
       "type": "String",

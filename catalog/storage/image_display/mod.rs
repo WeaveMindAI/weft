@@ -11,8 +11,8 @@
 
 use async_trait::async_trait;
 
-use weft_core::storage::FileHandle;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::storage::FileHandle;
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ImageDisplayNode;
@@ -20,6 +20,10 @@ pub struct ImageDisplayNode;
 #[async_trait]
 impl Node for ImageDisplayNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // The `Image` port type already guarantees this is an image; the
+        // only thing left to enforce is that it carries a handle the
+        // preview can resolve (a storage key or an external URL), which
+        // is exactly what parsing into a FileHandle checks.
         // The `Image` port type already guarantees this is an image; the
         // only thing left to enforce is that it carries a handle the
         // preview can resolve (a storage key or an external URL), which

@@ -1,7 +1,7 @@
 {
   "type": "OpenRouterInference",
   "label": "OpenRouter",
-  "description": "AI language model completion through OpenRouter. Works out of the box with platform credits (default: anthropic/claude-sonnet-4.6). Model, system prompt, sampling parameters, and API key all come from a wired OpenRouterConfig node; without one, the defaults apply.",
+  "description": "AI language model completion through OpenRouter. The credential decision comes from a wired OpenRouterAccess node (Credits or your own key); model, system prompt, and sampling parameters come from a wired OpenRouterConfig node, and without one the defaults apply (default model: anthropic/claude-sonnet-4.6).",
   "category": "AI",
   "tags": [
     "ai",
@@ -21,6 +21,12 @@
       "description": "The prompt to send to the LLM"
     },
     {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The OpenRouter access (wire an OpenRouterAccess node's output): whose key the call spends."
+    },
+    {
       "name": "config",
       "type": "Dict[String, String | Number | Boolean]",
       "required": false,
@@ -31,6 +37,7 @@
       "name": "parseJson",
       "type": "Boolean",
       "exposure": "config",
+      "default": false,
       "label": "Parse JSON",
       "description": "Parse and repair JSON from the response (changes output to Dict)."
     }

@@ -7,8 +7,13 @@
 //! at compile time that the file exists, is a JSON object, and carries a
 //! string `type` field. A missing or malformed manifest is a compile
 //! error naming the file, not a runtime surprise.
+//!
+//! Generated code reaches weft-core through whatever NAME the invoking
+//! crate gave it (`weft`, the author-facing alias, in generated node
+//! packages; `weft_core` inside the workspace), resolved per-crate.
 
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::quote;
 use syn::{parse_macro_input, DeriveInput};
 
@@ -18,7 +23,7 @@ pub fn derive_node_manifest(input: TokenStream) -> TokenStream {
     let ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-    let (member_path, package_defaults_path) = match manifest_paths() {
+    let (member_path, package_defaults_path) = match manifest_paths(ident.span().unwrap()) {
         Ok(p) => p,
         Err(msg) => return compile_error(&msg),
     };
@@ -33,9 +38,9 @@ pub fn derive_node_manifest(input: TokenStream) -> TokenStream {
     // builds (formFieldSpecs, ... declared once at the package root
     // reach the runtime metadata). A bare node has no package root, so the
     // derive embeds `None` and there is nothing to merge.
-    let defaults_expr = match package_defaults_path {
+    let defaults_expr = match &package_defaults_path {
         Some(path) => {
-            if let Err(msg) = validate_defaults(&path) {
+            if let Err(msg) = validate_defaults(path) {
                 return compile_error(&msg);
             }
             let path_str = path.to_str().expect("package metadata path is valid UTF-8").to_string();
@@ -44,13 +49,14 @@ pub fn derive_node_manifest(input: TokenStream) -> TokenStream {
         None => quote! { None },
     };
 
+    let core = core_crate_path();
     quote! {
-        impl #impl_generics ::weft_core::NodeManifest for #ident #ty_generics #where_clause {
-            fn manifest(&self) -> &'static ::weft_core::NodeMetadata {
-                static MANIFEST: ::std::sync::OnceLock<::weft_core::NodeMetadata> =
+        impl #impl_generics #core::NodeManifest for #ident #ty_generics #where_clause {
+            fn manifest(&self) -> &'static #core::NodeMetadata {
+                static MANIFEST: ::std::sync::OnceLock<#core::NodeMetadata> =
                     ::std::sync::OnceLock::new();
                 MANIFEST.get_or_init(|| {
-                    ::weft_core::NodeMetadata::parse_embedded(
+                    #core::NodeMetadata::parse_embedded(
                         include_str!(#member_str),
                         #defaults_expr,
                         #site,
@@ -62,6 +68,21 @@ pub fn derive_node_manifest(input: TokenStream) -> TokenStream {
     .into()
 }
 
+/// The path generated code reaches weft-core through: whatever NAME
+/// the invoking crate depends on it as (`weft` in generated node
+/// packages, `weft_core` inside the workspace). `Itself` and
+/// resolution failures fall to `::weft_core` (the workspace shape,
+/// where the extern name is always available).
+fn core_crate_path() -> proc_macro2::TokenStream {
+    match proc_macro_crate::crate_name("weft-core") {
+        Ok(proc_macro_crate::FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, Span::call_site());
+            quote! { ::#ident }
+        }
+        _ => quote! { ::weft_core },
+    }
+}
+
 /// The member's own `metadata.json` and, when the node is a package member,
 /// the package root's partial `metadata.json` of shared defaults.
 ///
@@ -70,8 +91,15 @@ pub fn derive_node_manifest(input: TokenStream) -> TokenStream {
 /// PARENT, and it is a package root iff it holds a `package.toml`. A bare
 /// node's parent has no `package.toml`, so it inherits nothing. A package
 /// root without a `metadata.json` (no shared defaults) also yields `None`.
-fn manifest_paths() -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), String> {
-    let source = proc_macro::Span::call_site()
+fn manifest_paths(
+    ident_span: proc_macro::Span,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), String> {
+    // The STRUCT NAME's span, not the derive's call site: when the
+    // whole node is declared through a macro (`weft::access_node!`),
+    // the call site resolves to the macro's own definition file, while
+    // the name token always comes from the node's file, which is
+    // where its metadata.json lives.
+    let source = ident_span
         .local_file()
         .ok_or("derive(NodeManifest): the compiler did not expose the invoking source file")?;
     let dir = source

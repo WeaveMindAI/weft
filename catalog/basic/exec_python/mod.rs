@@ -33,11 +33,11 @@
 //!   in the message so the UI modal shows what actually went wrong
 //!   instead of a bare `ValueError`.
 //!
-//! Isolation: the worker pod IS the isolation boundary. We don't
-//! sandbox the Python further because a spawned pod already can't
-//! see anything outside what the dispatcher grants it. See
-//! docs/v2-design.md on worker execution for the full threat
-//! model.
+//! Isolation: the worker the node runs in IS the isolation boundary;
+//! the Python executes there with the same access that worker already
+//! has, and is not sandboxed further. Running a project therefore runs
+//! its ExecPython code with that worker's privileges, the same trust
+//! model as running the project's own program.
 
 use async_trait::async_trait;
 use pyo3::prelude::*;
@@ -45,8 +45,8 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString};
 use pyo3::ToPyObject;
 use serde_json::{Map, Number, Value};
 
-use weft_core::node::NodeOutput;
-use weft_core::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::node::NodeOutput;
+use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ExecPythonNode;

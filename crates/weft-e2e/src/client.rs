@@ -291,6 +291,20 @@ pub struct CliOutput {
     pub invocation: String,
 }
 
+/// The last `n` bytes of `s`, snapped forward to a char boundary so
+/// the slice is always valid UTF-8. For "show me the end of a big log"
+/// error messages.
+pub fn tail(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut start = s.len() - n;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// Poll `f` until it returns `Ok(Some(v))`, yielding `v`; retry on `Ok(None)`;
 /// propagate `Err` immediately. Times out after `deadline` with a message that
 /// names `what`. This is the rig's single wait primitive: every "wait until the

@@ -1,0 +1,219 @@
+# The opt-in public trigger surface for a local install
+# (`./setup.sh --public-url` / `weft daemon start --public-url`).
+#
+# Two pieces, applied ONLY when the operator opted in:
+#
+#   - weft-public-proxy: an nginx whose config is a strict ALLOWLIST.
+#     Only the public trigger surface passes through to the
+#     dispatcher: the provider-events receiver (`/events/...`) and the
+#     token-authenticated per-signal fire door (`/signal/...`).
+#     Everything else answers 404, so the tunnel never exposes the
+#     project/admin API, the dashboard, or storage.
+#
+#   - weft-tunnel: a cloudflared quick tunnel dialing OUT to
+#     Cloudflare's edge and forwarding what arrives to the proxy. The
+#     public https address it minted is printed in its logs; the
+#     daemon reads it there and wires it in as the deployment's public
+#     base URL. Quick-tunnel addresses are RANDOM PER START: a tunnel
+#     pod restart mints a new one, and the daemon must run again to
+#     re-wire it (documented in docs/event-triggers.md).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: weft-public-proxy-config
+  namespace: weft-system
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      # Provider pushes can be sizeable (a queue envelope with an
+      # encoded event); match the dispatcher's own public fire cap.
+      client_max_body_size 2m;
+      location /events/ {
+        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_set_header Host $host;
+      }
+      location /signal/ {
+        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_set_header Host $host;
+      }
+      location / {
+        return 404;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-public-proxy
+  namespace: weft-system
+  labels:
+    app: weft-public-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weft-public-proxy
+  template:
+    metadata:
+      labels:
+        app: weft-public-proxy
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/conf.d
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: config
+          configMap:
+            name: weft-public-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-public-proxy
+  namespace: weft-system
+spec:
+  selector:
+    app: weft-public-proxy
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-tunnel
+  namespace: weft-system
+  labels:
+    app: weft-tunnel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weft-tunnel
+  template:
+    metadata:
+      labels:
+        app: weft-tunnel
+    spec:
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --url
+            - http://weft-public-proxy.weft-system.svc.cluster.local:8080
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+# The namespace default-denies all traffic, so each tunnel piece
+# enumerates exactly what it speaks.
+#
+# The tunnel dials OUT only: DNS, Cloudflare's edge (443 for the
+# control API, 7844 for the tunnel transport), and the proxy it
+# forwards arrivals to. Every private range is excluded from the
+# public-edge rules, so those ports reach external addresses only;
+# the one in-cluster peer it needs is named by pod label instead.
+# It accepts no inbound connections at all (arrivals ride the
+# outbound tunnel).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tunnel-egress
+  namespace: weft-system
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-tunnel
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+    - ports:
+        - protocol: TCP
+          port: 8080
+      to:
+        - podSelector:
+            matchLabels:
+              app: weft-public-proxy
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 7844
+        - protocol: UDP
+          port: 7844
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+---
+# The proxy hears only the tunnel and speaks only to the dispatcher
+# (plus DNS to resolve it). The allowlisted locations in its nginx
+# config decide WHAT passes; this decides WHO it can talk to at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: public-proxy
+  namespace: weft-system
+spec:
+  podSelector:
+    matchLabels:
+      app: weft-public-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: weft-tunnel
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+    - ports:
+        - protocol: TCP
+          port: 9999
+      to:
+        - podSelector:
+            matchLabels:
+              app: weft-dispatcher

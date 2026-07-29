@@ -400,6 +400,30 @@ pub struct InputDefinition {
     // SYNC: InputDefinition.from_spec <-> packages/weft-graph/src/protocol.ts InputDefinition.fromSpec
     #[serde(default, rename = "fromSpec", skip_serializing_if = "std::ops::Not::not")]
     pub from_spec: bool,
+    /// The permissions THIS consumer needs on the wired connection
+    /// (mirrored from the metadata's `requiresScopes`; only ever set on
+    /// an Access-typed input). The runtime stamps them onto the access
+    /// marker when this node's bag is built, so resolution can hold a
+    /// verified connection to them; the editor reads them for its live
+    /// shortfall check.
+    // SYNC: InputDefinition.requires_scopes <-> packages/weft-graph/src/protocol.ts InputDefinition.requiresScopes
+    #[serde(
+        default,
+        rename = "requiresScopes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requires_scopes: Option<Vec<String>>,
+    /// The stored VALUES this input needs on the wired connection (see
+    /// [`crate::node::InputSpec::requires_values`]). Same three check
+    /// points as the permissions above; the editor reads them for its
+    /// live check.
+    // SYNC: InputDefinition.requires_values <-> packages/weft-graph/src/protocol.ts InputDefinition.requiresValues
+    #[serde(
+        default,
+        rename = "requiresValues",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requires_values: Option<Vec<String>>,
 }
 
 impl InputDefinition {
@@ -419,6 +443,8 @@ impl InputDefinition {
             placeholder: None,
             synthesized_from_carry: port.synthesized_from_carry,
             from_spec: false,
+            requires_scopes: None,
+            requires_values: None,
         }
     }
 
@@ -619,6 +645,8 @@ mod project_wire_tests {
             placeholder: None,
             synthesized_from_carry: false,
             from_spec: false,
+            requires_scopes: None,
+            requires_values: None,
         };
         let node = NodeDefinition {
             id: "g.n".into(),

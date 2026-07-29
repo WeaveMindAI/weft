@@ -1,0 +1,98 @@
+{
+  "type": "S3Access",
+  "label": "S3 Access",
+  "description": "Sign in to an S3-compatible object store (AWS S3, Cloudflare R2, MinIO, ...): paste the endpoint, region, and key pair. Every request through the access is SigV4-signed and aimed at the stored endpoint; node code addresses `https://storage/...` and never sees a key.",
+  "category": "Data",
+  "tags": [
+    "s3",
+    "r2",
+    "storage",
+    "access"
+  ],
+  "icon": "Database",
+  "color": "#e25444",
+  "service": {
+    "service": "s3",
+    "label": "S3",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "endpoint",
+          "label": "Endpoint",
+          "secret": false,
+          "placeholder": "https://s3.us-east-1.amazonaws.com"
+        },
+        {
+          "name": "region",
+          "label": "Region",
+          "secret": false,
+          "placeholder": "us-east-1"
+        },
+        {
+          "name": "access_key_id",
+          "label": "Access key ID",
+          "secret": false
+        },
+        {
+          "name": "secret_access_key",
+          "label": "Secret access key"
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "base_url",
+        "value": "{endpoint}"
+      },
+      {
+        "kind": "sign",
+        "with": {
+          "kind": "sigv4",
+          "service": "s3",
+          "region": "{region}",
+          "access_key_id": "{access_key_id}",
+          "secret_access_key": "{secret_access_key}"
+        }
+      }
+    ],
+    "test": {
+      "url": "https://storage/"
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Store"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The object store's access: wire it into S3 action nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "S3Access '{id}' has no connected store; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

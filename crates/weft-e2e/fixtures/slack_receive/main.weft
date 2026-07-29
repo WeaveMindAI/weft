@@ -1,0 +1,11 @@
+# A message-arrival trigger served by the PUSH transport: the rig
+# seeds a slack connection, activates, then delivers a SIGNED
+# synthetic Slack event at the public events receiver and watches the
+# execution fire with the message's fields.
+
+ws = SlackAccess
+recv = SlackReceiveMessage { channel: "C0E2E" }
+recv.account = ws.access
+
+out = Debug
+out.data = recv.text

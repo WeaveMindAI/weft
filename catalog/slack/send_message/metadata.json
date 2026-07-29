@@ -1,0 +1,65 @@
+{
+  "type": "SlackSendMessage",
+  "label": "Slack: Send Message",
+  "description": "Post a message to a channel through the connected workspace's bot. The channel picker lists the workspace's channels live (the lookup runs on the stored access; nothing needs to be running).",
+  "category": "Data",
+  "tags": [
+    "slack",
+    "message",
+    "chat"
+  ],
+  "icon": "Slack",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "chat:write"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the chat:write scope."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          }
+        ]
+      },
+      "label": "Channel",
+      "placeholder": "Pick a channel or paste its id"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "label": "Text"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "ts",
+      "type": "String",
+      "required": false,
+      "description": "The posted message's timestamp id."
+    }
+  ]
+}

@@ -52,6 +52,7 @@
 //! [`project::Project`] (shells out to the `weft` CLI). This harness is
 //! unauthenticated by construction (its authenticator only ever issues `local`).
 
+pub mod access;
 pub mod assert;
 pub mod bus;
 pub mod client;
@@ -77,7 +78,7 @@ pub mod storage;
 // another harness share ONE definition of the policy via this guard.
 pub mod teardown;
 
-pub use client::{cli, cli_ok, poll_until, Dispatcher};
+pub use client::{cli, cli_ok, poll_until, tail, Dispatcher};
 #[cfg(feature = "e2e")]
 pub use platform::Platform;
 pub use ensure::up;

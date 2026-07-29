@@ -39,6 +39,7 @@ pub mod reaper;
 pub mod registry;
 pub mod shared_worker_namespace;
 pub mod state;
+pub mod broker_admin;
 pub mod storage;
 pub mod supervisor_pool;
 pub mod task_kinds;

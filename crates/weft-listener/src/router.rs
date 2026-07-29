@@ -64,9 +64,10 @@ async fn rehydrate_handler(
         &state.config.pod_name,
         state.registry.clone(),
         state.config.clone(),
+        state.events_broker.clone(),
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -95,22 +96,28 @@ async fn register(
         ));
     }
     let (routing, kind_state) = kinds::register_in_registry(
-        req.token,
-        req.tenant_id,
-        req.spec,
-        req.node_id,
-        req.is_resume,
-        req.color,
-        req.placement_generation,
+        kinds::SignalIdentity {
+            token: req.token,
+            tenant_id: req.tenant_id,
+            node_id: req.node_id,
+            is_resume: req.is_resume,
+            color: req.color,
+            placement_generation: req.placement_generation,
+            spec: req.spec,
+        },
         kinds::RoutingSource::Mint {
             secret_cache: state.secret_cache.clone(),
         },
         state.registry.clone(),
         state.fire_sink.clone(),
         state.config.clone(),
+        state.events_broker.clone(),
     )
     .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    // `{e:#}` keeps the whole cause chain: a register refusal's reason
+    // (a connection missing a required value, an unservable topic)
+    // must reach the user, not just the outermost context line.
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(RegisterResponse { routing, kind_state }))
 }
 
@@ -137,7 +144,7 @@ async fn action(
         &state.registry,
         &state.secret_cache,
     )
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(ActionResponse { result, routing }))
 }
 
@@ -145,7 +152,16 @@ async fn unregister(
     State(state): State<ListenerState>,
     Json(req): Json<UnregisterRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state.registry.remove(&req.token);
+    let removed = state.registry.remove(&req.token);
+    // A signal may hold state OUTSIDE this process (a provider-side
+    // subscription); its kind tears that down, detached (the
+    // unregister answer must not wait on a provider round trip) and
+    // loud in logs on failure.
+    if let Some(sig) = removed {
+        let broker = state.events_broker.clone();
+        let token = req.token.clone();
+        tokio::spawn(async move { kinds::on_unregister(&token, &sig, &broker).await });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -155,7 +171,7 @@ async fn process(
 ) -> Result<Json<ProcessOutcome>, (StatusCode, String)> {
     let outcome = kinds::process(&req.token, req.payload, state.registry.clone())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(outcome))
 }
 
@@ -191,7 +207,7 @@ async fn render(
     Json(req): Json<RenderRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let rendered = kinds::render(&req.token, state.registry.clone())
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
     Ok(Json(rendered.unwrap_or(Value::Null)))
 }
 

@@ -17,10 +17,10 @@
 
 use async_trait::async_trait;
 
-use weft_core::caller::InboundMessage;
-use weft_core::context::LogLevel;
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::caller::InboundMessage;
+use weft::context::LogLevel;
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LiveWsListenerNode;

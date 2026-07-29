@@ -1,0 +1,53 @@
+{
+  "type": "ElevenLabsTranscribe",
+  "label": "ElevenLabs Transcribe (Realtime)",
+  "description": "Realtime speech-to-text over a live audio stream (Scribe v2 realtime). Wire an audio Bus in (16-bit PCM chunks), and the transcript flows out on a text Bus as it is spoken, with the full transcript emitted at the end. The credential decision comes from a wired ElevenLabsAccess node.",
+  "category": "AI",
+  "tags": [
+    "ai",
+    "audio",
+    "speech",
+    "transcription",
+    "stt",
+    "realtime"
+  ],
+  "icon": "AudioLines",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "audio",
+      "type": "Bus",
+      "required": true,
+      "description": "The live audio stream: a bytes Bus of raw 16-bit PCM frames whose metadata declares the sample rate (an Audio Stream node produces exactly this)."
+    },
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node's output): whose key the session spends."
+    },
+    {
+      "name": "language",
+      "type": "String",
+      "exposure": "config",
+      "label": "Language",
+      "placeholder": "(auto-detect)",
+      "description": "ISO language code of the audio (en, fr, ...). Empty lets the model detect it."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "transcript",
+      "type": "Bus",
+      "required": false,
+      "description": "The live transcript: one Bus message of kind 'text' per committed speech segment, closed when the audio ends."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": false,
+      "description": "The full transcript, once the audio stream has ended."
+    }
+  ],
+  "requires_infra": false
+}

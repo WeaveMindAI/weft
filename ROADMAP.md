@@ -36,7 +36,7 @@ What's coming next. Not prioritized, not promised, just directions we're explori
   - `./program`, run once: provision infra, execute, tear down, exit.
   - `./program serve`, service mode: provision infra, run trigger setup, stay alive listening. On each trigger event, run the execution sub-graph. Ctrl+C tears down.
   - `./program infra up` / `infra down`, manage infrastructure lifecycle independently.
-  - Infrastructure targets: local k8s (kind), remote cluster, or WeaveMind cloud.
+  - Infrastructure targets: local k8s (kind) or a remote cluster.
 - **Distributed compiled subprograms**: Compile different parts of a program independently. Infrastructure subgraph runs on a remote server, execution subgraph runs locally, they discover each other at runtime.
 
 ## Stabilization

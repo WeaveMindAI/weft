@@ -4,35 +4,23 @@
 //!
 //! There is no envelope. The bus's `Closed` entry IS the end-of-
 //! conversation signal: the guest's cursor returns `None` when it
-//! reaches it. The guest also calls `close()` itself on EVERY exit
-//! path AFTER it acquired the BusHandle (happy, error, or early-
-//! return) so the host doesn't park forever on a half-broken guest
-//! that died mid-handshake or mid-loop. The host's `recv` filter is
-//! `from == "guest"` (it only wants the guest's replies), which skips
-//! the guest's `Left` Drop entry, so without the explicit close the
-//! host would never wake.
-//!
-//! `bus_from_input` is the only op outside the guarded block: it
-//! either yields a BusHandle (then we're committed to closing) or it
-//! fails with no handle to close. In the latter case the engine's
-//! stuck-detector closes the bus from the outside when it concludes
-//! the host's `wait_for("guest")` can never be satisfied.
+//! reaches it. `ctx.join_bus` hands back a guard that closes on EVERY
+//! exit path (happy, error, or early-return), so a half-broken guest
+//! can never leave the host parked forever on its reply cursor.
 //!
 //! Flow:
-//!   1. resolve the marker on `channel` to a live bus handle
-//!   2. from here on, EVERY exit closes the bus
-//!   3. register("guest"), wait_for("host")
-//!   4. loop: pull the next host message; reply with the next
-//!      scripted line. Exits when the cursor returns None (host closed).
-//!   5. close the bus on every exit path
-//!   6. pulse_downstream(done=true) on success
+//!   1. join_bus (resolve marker + register "guest", close-on-drop)
+//!   2. wait_for("host")
+//!   3. loop: pull the next host message; reply with the next scripted
+//!      line. Exits when the cursor returns None (host closed).
+//!   4. drop the bus, pulse_downstream(done=true)
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use weft_core::bus::BusEntryKind;
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::bus::BusEntryKind;
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BusChatGuestNode;
@@ -47,41 +35,28 @@ const GUEST_LINES: &[&str] = &["hey there", "not much, you?", "later"];
 #[async_trait]
 impl Node for BusChatGuestNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let mut bus = ctx.bus_from_input("channel")?;
+        let bus = ctx.join_bus("channel", "guest")?;
+        bus.wait_for("host").await.node_err("guest waiting for host")?;
 
-        // Try-block guards bus.close() on every error path (see module doc).
-        let result: WeftResult<()> = async {
-            bus.register("guest").node_err("guest register")?;
-
-            bus.wait_for("host").await.node_err("guest waiting for host")?;
-
-            let mut host_cursor = bus.cursor().with_filter(|entry| {
-                matches!(&entry.kind, BusEntryKind::Message { from, .. } if from == "host")
-            });
-            let mut reply_idx = 0;
-            loop {
-                let entry = host_cursor.next().await.node_err("guest cursor")?;
-                let Some(_msg) = entry else { break };
-                // No silent "..." fallback: if HOST_LINES has more turns
-                // than GUEST_LINES, the SYNC contract was broken and we
-                // want the demo to fail loud rather than ship a generic
-                // placeholder reply.
-                let Some(reply) = GUEST_LINES.get(reply_idx).copied() else {
-                    weft_core::node_bail!(
-                        "guest out of replies at turn {reply_idx}: HOST_LINES outgrew GUEST_LINES \
-                         without updating the SYNC contract in bus_chat_guest/mod.rs"
-                    );
-                };
-                bus.send("msg", json!(reply)).node_err(format!("guest send '{reply}'"))?;
-                reply_idx += 1;
-            }
-            Ok(())
+        let mut host_msgs = bus.cursor().with_filter(|entry| {
+            matches!(&entry.kind, BusEntryKind::Message { from, .. } if from == "host")
+        });
+        let mut reply_idx = 0;
+        while host_msgs.next_json("msg").await.node_err("guest cursor")?.is_some() {
+            // No silent "..." fallback: if HOST_LINES has more turns
+            // than GUEST_LINES, the SYNC contract was broken and we
+            // want the demo to fail loud rather than ship a generic
+            // placeholder reply.
+            let Some(reply) = GUEST_LINES.get(reply_idx).copied() else {
+                weft::node_bail!(
+                    "guest out of replies at turn {reply_idx}: HOST_LINES outgrew GUEST_LINES \
+                     without updating the SYNC contract in bus_chat_guest/mod.rs"
+                );
+            };
+            bus.send("msg", json!(reply)).node_err(format!("guest send '{reply}'"))?;
+            reply_idx += 1;
         }
-        .await;
-
-        bus.close();
-
-        result?;
+        drop(bus);
 
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
         Ok(())

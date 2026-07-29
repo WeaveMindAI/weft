@@ -293,6 +293,12 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             node_id TEXT NOT NULL,
             is_resume BOOLEAN NOT NULL,
             spec_json TEXT NOT NULL,
+            -- The connection this signal acts as (`spec.access.id`),
+            -- denormalized at register time. NULL for kinds without
+            -- one. Inbound provider pushes route account-to-signal
+            -- on this column, so the match is one indexed filter
+            -- instead of a spec-parsing scan.
+            access_id TEXT,
             created_at BIGINT NOT NULL,
             -- Opaque per-kind state persisted at register time and
             -- read back at rehydrate time. Empty for most kinds.
@@ -367,6 +373,8 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         r#"CREATE INDEX IF NOT EXISTS idx_signal_project ON signal(project_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_color ON signal(color)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_consumer_kind ON signal(consumer_kind)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_signal_access_id ON signal(access_id)
+           WHERE access_id IS NOT NULL"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_mount_path
              ON signal(mount_path) WHERE mount_path IS NOT NULL"#,
         // Entry rows are keyed by (project_id, node_id): that pair
@@ -940,14 +948,16 @@ impl Journal for PostgresJournal {
         let res = sqlx::query(
             "INSERT INTO signal \
              (token, tenant_id, project_id, color, node_id, is_resume, \
-              spec_json, created_at, consumer_kind, tags, port_snapshot, consumer_payload, \
+              spec_json, access_id, created_at, consumer_kind, tags, port_snapshot, \
+              consumer_payload, \
               surface_kind, mount_path, auth_kind, auth_config, kind_state, \
               listener_pod, placement_generation) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                    $17, $18, $19 \
-             WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $18) \
+                    $17, $18, $19, $20 \
+             WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $19) \
              ON CONFLICT (token) DO UPDATE SET \
                  spec_json = EXCLUDED.spec_json, \
+                 access_id = EXCLUDED.access_id, \
                  consumer_kind = EXCLUDED.consumer_kind, \
                  tags = EXCLUDED.tags, \
                  port_snapshot = EXCLUDED.port_snapshot, \
@@ -967,6 +977,7 @@ impl Journal for PostgresJournal {
         .bind(&sig.node_id)
         .bind(sig.is_resume)
         .bind(&sig.spec_json)
+        .bind(sig.access_id.as_deref())
         .bind(crate::lease::now_unix())
         .bind(sig.consumer_kind.as_deref())
         .bind(&sig.tags)
@@ -1051,31 +1062,31 @@ impl Journal for PostgresJournal {
 
 const SIGNAL_SELECT_WHERE_TOKEN: &str =
     "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
-     spec_json, consumer_kind, tags, port_snapshot, consumer_payload, \
+     spec_json, access_id, consumer_kind, tags, port_snapshot, consumer_payload, \
      surface_kind, mount_path, auth_kind, auth_config, kind_state \
      FROM signal WHERE token = $1";
 
 const SIGNAL_SELECT_WHERE_PROJECT: &str =
     "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
-     spec_json, consumer_kind, tags, port_snapshot, consumer_payload, \
+     spec_json, access_id, consumer_kind, tags, port_snapshot, consumer_payload, \
      surface_kind, mount_path, auth_kind, auth_config, kind_state \
      FROM signal WHERE project_id = $1";
 
 const SIGNAL_DELETE_BY_COLOR_RETURNING: &str =
     "DELETE FROM signal WHERE color = $1 RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, consumer_kind, tags, port_snapshot, \
+     node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
      auth_kind, auth_config, kind_state";
 
 const SIGNAL_DELETE_BY_PROJECT_RETURNING: &str =
     "DELETE FROM signal WHERE project_id = $1 RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, consumer_kind, tags, port_snapshot, \
+     node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
      auth_kind, auth_config, kind_state";
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     "DELETE FROM signal WHERE token = ANY($1) RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, consumer_kind, tags, port_snapshot, \
+     node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
      auth_kind, auth_config, kind_state";
 
@@ -1090,6 +1101,7 @@ struct SignalRow {
     node_id: String,
     is_resume: bool,
     spec_json: String,
+    access_id: Option<String>,
     consumer_kind: Option<String>,
     tags: Vec<String>,
     port_snapshot: Option<serde_json::Value>,
@@ -1128,6 +1140,7 @@ fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
         node_id: row.node_id,
         is_resume: row.is_resume,
         spec_json: row.spec_json,
+        access_id: row.access_id,
         consumer_kind: row.consumer_kind,
         tags: row.tags,
         port_snapshot: row.port_snapshot,

@@ -312,6 +312,8 @@ pub fn enrich_collecting(
                 placeholder: spec.placeholder.clone(),
                 synthesized_from_carry: false,
                 from_spec: true,
+                requires_scopes: spec.requires_scopes.clone(),
+                requires_values: spec.requires_values.clone(),
             })
             .collect();
         let mut catalog_outputs: Vec<PortDefinition> = meta
@@ -340,6 +342,20 @@ pub fn enrich_collecting(
                 derive_form_ports(&node.config, &meta.form_field_specs);
             catalog_inputs.extend(form_inputs);
             catalog_outputs.extend(form_outputs);
+        }
+
+        // An ACCESS NODE (metadata carries the `service` recipe):
+        // stamp the service name onto its `access` widget, so the
+        // runtime bag and the editor read it off the instance. The
+        // permissions are NOT materialized as an input: they are ticked
+        // once at connect time and live on the stored connection, never
+        // in source.
+        if let Some(service_spec) = &meta.service {
+            for input in catalog_inputs.iter_mut() {
+                if let Some(Widget::Access { service }) = &mut input.widget {
+                    *service = Some(service_spec.service.clone());
+                }
+            }
         }
 
         // A header PORT declaration naming a `config`-exposure input is

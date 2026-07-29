@@ -261,11 +261,16 @@ fn write_package_cargo_toml(
     // (`../../weft/...`) is one level deeper than the worker's
     // (`../weft/...`) because we live under `pkg_<name>/`.
     let mut deps = base_runtime_deps();
-    insert_dep(
-        &mut deps,
-        "weft-core",
-        toml::Value::Table(path_table("../../weft/crates/weft-core")),
-    );
+    // The node-author surface is the `weft` crate: an ALIAS of
+    // weft-core, so bodies write `use weft::{...}` (the friendly name)
+    // and never see the internal crate layout. Macro-generated code
+    // (the NodeManifest derive) resolves whatever name the crate gave
+    // weft-core, so the alias is the ONLY name a package crate needs.
+    insert_dep(&mut deps, "weft", {
+        let mut t = path_table("../../weft/crates/weft-core");
+        t.insert("package".into(), toml::Value::String("weft-core".into()));
+        toml::Value::Table(t)
+    });
     // A package may define its OWN provider meter (a shared `.rs` file that
     // calls `weft_providers::register_meter!`), so every package crate can
     // reach the provider toolkit. Cargo compiles it only if a file uses it,

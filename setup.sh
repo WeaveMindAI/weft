@@ -25,6 +25,13 @@
 #   --no-sign     skip the Firefox AMO signing step
 #   --no-daemon   skip the daemon refresh (when CLI is being built)
 #
+# Public trigger surface (event triggers delivered BY providers):
+#   --public-url    expose /events/... and /signal/... to the internet
+#                   through an outbound tunnel + a filtering proxy, so
+#                   provider event pushes reach this local install.
+#                   Nothing else is exposed. Persisted across runs.
+#   --no-public-url close it again.
+#
 # Browser-target flags (default: every browser):
 #   --chrome      Chrome / Brave / Vivaldi / Arc / Edge / Opera unpacked
 #   --firefox
@@ -77,6 +84,9 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The invocation's args, captured before the parse loop consumes them,
+# for the run journal.
+orig_args="$*"
 
 # The VS Code extension id (publisher.name from extension-vscode/package.json).
 # Single source so install, version-probe, and uninstall can never drift (a
@@ -126,6 +136,8 @@ SYM_WARN="⚠"
 SYM_ARROW="→"
 
 section() {
+  # Recorded so a failed run's journal line can name where it died.
+  current_section="$*"
   printf '\n%s%s%s %s%s%s\n' "${C_BOLD}" "${C_BLUE}" "▶" "${C_BOLD}" "$*" "${C_RESET}"
 }
 ok()   { printf '  %s%s%s %s\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "$*"; }
@@ -240,6 +252,7 @@ purge_postgres=0
 # to 0 first so the listed flags act as opt-ins.
 build_cli=1
 refresh_daemon=1
+public_url_flag=""
 build_vscode=1
 build_browser=0
 component_flag_seen=0
@@ -281,6 +294,34 @@ targets_flip() {
 
 # ---- argv ------------------------------------------------------------
 
+# Run journal: one line per run at start, one at exit, in
+# ~/.local/share/weft/setup-runs.log. A run that dies mid-pipeline
+# (set -e) scrolls its failure past and leaves the machine half
+# installed with no trace; the journal makes "what did my last install
+# actually do, and did it finish" a lookup instead of a debate.
+# Installed BEFORE argument parsing so even a bad-flag exit is
+# recorded; the EXIT trap logs the exit code and the LAST section
+# entered, so a partial run names where it stopped.
+run_log_dir="${HOME}/.local/share/weft"
+run_log="${run_log_dir}/setup-runs.log"
+mkdir -p "${run_log_dir}"
+current_section="(argument parsing)"
+printf '%s START tree=%s args=[%s]\n' \
+  "$(date '+%Y-%m-%d %H:%M:%S')" "${here}" "${orig_args}" >> "${run_log}"
+log_run_exit() {
+  local code=$?
+  if [[ ${code} -eq 0 ]]; then
+    printf '%s DONE  ok\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "${run_log}"
+  else
+    printf '%s FAIL  exit=%s in section %s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "${code}" "${current_section}" >> "${run_log}"
+    printf '  %s%s%s this run FAILED in %s%s%s; the install is incomplete (journal: %s)\n' \
+      "${C_RED}" "${SYM_FAIL}" "${C_RESET}" "${C_BOLD}" "${current_section}" "${C_RESET}" \
+      "${run_log}" >&2
+  fi
+}
+trap log_run_exit EXIT
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --uninstall) do_uninstall=1 ;;
@@ -298,6 +339,9 @@ while [[ $# -gt 0 ]]; do
     --no-sign)   do_sign=0 ;;
     --no-daemon) refresh_daemon=0 ;;
 
+    --public-url)    public_url_flag="--public-url" ;;
+    --no-public-url) public_url_flag="--no-public-url" ;;
+
     --chrome)    targets_flip; target_chrome=1 ;;
     --firefox)   targets_flip; target_firefox=1 ;;
     --edge)      targets_flip; target_edge=1 ;;
@@ -308,7 +352,7 @@ while [[ $# -gt 0 ]]; do
     --prefix)    shift; prefix="$1" ;;
 
     -h|--help)
-      sed -n '2,75p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,85p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -637,16 +681,42 @@ if [[ $build_cli -eq 1 ]]; then
   # / core / cli source change) bumps mtime, which is the signal
   # cached worker images may now be stale.
   pre_mtime="$(stat -c %Y "${src}" 2>/dev/null || echo 0)"
-  if [[ "${profile}" == "release" ]]; then
-    spin_passthrough "cargo build --release -p weft-cli" \
-      cargo build --release -p weft-cli
-  else
-    spin_passthrough "cargo build -p weft-cli" cargo build -p weft-cli
-  fi
-  if [[ ! -x "${src}" ]]; then
-    fail "build output missing: ${src}"
-    exit 1
-  fi
+  # Sources can change WHILE this script runs (an AI session editing in
+  # parallel with a reinstall is the everyday case here). cargo builds
+  # what existed when it started, so a source edit landing mid-build
+  # ships a binary that is ALREADY stale, silently. Build, then check
+  # whether any workspace source is newer than the produced binary; if
+  # so, build again (once more is always enough: the recheck is
+  # instant), and if it STILL moves, say so loudly instead of
+  # pretending the install is current.
+  for build_pass in 1 2 3; do
+    if [[ "${profile}" == "release" ]]; then
+      spin_passthrough "cargo build --release -p weft-cli" \
+        cargo build --release -p weft-cli
+    else
+      spin_passthrough "cargo build -p weft-cli" cargo build -p weft-cli
+    fi
+    if [[ ! -x "${src}" ]]; then
+      fail "build output missing: ${src}"
+      exit 1
+    fi
+    # cargo's own freshness check is the authority on whether the
+    # binary matches the sources (mtime scans over the tree false-alarm
+    # on files that are not build inputs). A repeated build doing zero
+    # work == current; it doing work == a source edit landed mid-build
+    # and the first binary shipped stale, so loop.
+    recheck_flags=()
+    if [[ "${profile}" == "release" ]]; then recheck_flags=(--release); fi
+    recheck_out="$(cargo build "${recheck_flags[@]}" -p weft-cli 2>&1)"
+    if ! grep -q '^\s*Compiling' <<<"${recheck_out}"; then
+      break
+    fi
+    if [[ "${build_pass}" -eq 3 ]]; then
+      fail "sources are still changing under the build; the installed binary does NOT include them. Re-run setup.sh once the edits settle."
+      exit 1
+    fi
+    hint "source changed during the build; building again"
+  done
   ln -sfn "${src}" "${weft_bin}"
   ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${src}${C_RESET}"
 
@@ -708,6 +778,11 @@ fi
 # source. Pre-setup.sh behavior was to skip when the daemon was down,
 # which forced a manual `weft daemon start` afterwards.
 
+is_default_install_pending=0
+if [[ $build_cli -eq 1 && $refresh_daemon -eq 1 && $build_vscode -eq 1 && $build_browser -eq 0 ]]; then
+  is_default_install_pending=1
+fi
+
 if [[ $refresh_daemon -eq 1 ]]; then
   section "Daemon"
   if [[ ! -x "${weft_bin}" && ! -L "${weft_bin}" ]]; then
@@ -721,13 +796,26 @@ if [[ $refresh_daemon -eq 1 ]]; then
     if curl --silent --max-time 2 "${dispatcher_url}/health" >/dev/null 2>&1; then
       hint "daemon running at ${C_DIM}${dispatcher_url}${C_RESET}; refreshing (no-op if nothing changed)"
       spin_passthrough "weft daemon restart --rebuild" \
-        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon restart --rebuild
+        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon restart --rebuild ${public_url_flag}
     else
       hint "daemon not running; first install pulls images and creates the kind cluster (~2-3 min)"
       spin_passthrough "weft daemon start --rebuild" \
-        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start --rebuild
+        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start --rebuild ${public_url_flag}
     fi
   fi
+fi
+
+# The address the daemon recorded for the public trigger surface, when
+# it is open. Read from the daemon's own state file so setup.sh never
+# re-derives it (one authority, and `weft daemon status` reads the same).
+public_url=""
+if [[ -r "${HOME}/.local/share/weft/public-url-enabled" \
+   && -r "${HOME}/.local/share/weft/public-url" ]]; then
+  public_url="$(tr -d '[:space:]' < "${HOME}/.local/share/weft/public-url")"
+fi
+if [[ -n "${public_url}" && $is_default_install_pending -eq 0 ]]; then
+  # Non-default installs print no summary block, so say it here.
+  hint "public trigger surface: ${C_BOLD}${public_url}${C_RESET}${C_DIM} (event pushes + signal fire links only)"
 fi
 
 # ---- VS Code extension -----------------------------------------------
@@ -738,6 +826,25 @@ if [[ $build_vscode -eq 1 ]]; then
   if [[ ! -d "${ext_dir}" ]]; then
     fail "${ext_dir} not found"
     exit 1
+  fi
+
+  # The editor's parsing AND source edits run in the `weft` CLI binary
+  # (the extension only shuttles requests to it), so "an editor bug"
+  # very often needs a CLI rebuild, not an extension one. When this run
+  # skips the CLI step, refuse to quietly ship an extension on top of a
+  # stale binary: if any Rust source is newer than the installed
+  # binary, say so and stop (rerun with --cli, or the full default).
+  if [[ $build_cli -eq 0 ]]; then
+    installed_weft="$(readlink -f "${weft_bin}" 2>/dev/null || true)"
+    if [[ -n "${installed_weft}" && -x "${installed_weft}" ]]; then
+      stale_src="$(find "${here}/crates" "${here}/catalog" \
+        \( -name '*.rs' -o -name '*.toml' -o -name '*.json' \) \
+        -newer "${installed_weft}" -print -quit 2>/dev/null || true)"
+      if [[ -n "${stale_src}" ]]; then
+        fail "the installed weft binary is OLDER than ${stale_src#"${here}"/}; the editor's parse/edit logic lives in that binary, so an extension-only install would keep the stale behavior. Run ${C_BOLD}./setup.sh --cli --vscode${C_RESET} (or the full default)."
+        exit 1
+      fi
+    fi
   fi
 
   node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
@@ -1042,6 +1149,16 @@ if [[ $build_cli -eq 1 ]]; then
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
     printf '  %s%s%s VS Code     %sinstalled (reload your window if it is open)%s\n' \
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+    if [[ -n "${public_url}" ]]; then
+      printf '  %s%s%s public URL  %s%s%s\n' \
+        "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${public_url}" "${C_RESET}"
+      printf '              %sevent pushes + signal fire links ONLY; everything else 404s%s\n' \
+        "${C_DIM}" "${C_RESET}"
+      printf '              %sgive providers %s%s/events/<service>/<topic>%s%s; it changes if the tunnel restarts%s\n' \
+        "${C_DIM}" "${C_RESET}${C_BOLD}" "${public_url}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+      printf '              %sclose it with %s./setup.sh --no-public-url%s\n' \
+        "${C_DIM}" "${C_RESET}${C_BOLD}" "${C_RESET}"
+    fi
 
     printf '\n%s%sTry it out:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
     printf '  %s%s%s sanity-check       %sweft daemon status%s\n' \

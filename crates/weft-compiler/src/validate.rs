@@ -56,6 +56,12 @@ pub fn validate_with_mode(
     d
 }
 
+// There is deliberately NO compile-time permission check: source holds
+// only a connection id, so source alone cannot say what a connection
+// actually holds. The check lives where the answer does: live in the
+// editor when a connection is picked, at connect time, and at run-time
+// resolution (the drift backstop).
+
 /// Structural rules that make the trigger/fire semantics well-defined.
 ///
 /// graph-cycle: the wire graph must be a DAG. Iteration is the Loop
@@ -743,6 +749,21 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             // marker/handle whose inferred JSON shape does not match the
             // input type by construction.
             if !input.exposure.allows_braces_literal() { continue }
+            // A widget-shaped handle (a remote_select's `{id, label}`
+            // pick, an access widget's `{id, identity}` connect handle)
+            // is legal on its input by the widget's own contract; the
+            // runtime unwraps it when the input bag is built. Only the
+            // OBJECT form is exempt: a plain value (a pasted raw id
+            // string) still type-checks normally.
+            if value.is_object()
+                && matches!(
+                    input.widget,
+                    Some(weft_core::node::Widget::RemoteSelect { .. })
+                        | Some(weft_core::node::Widget::Access { .. })
+                )
+            {
+                continue;
+            }
             // The culprit is the literal itself; fall back to the node
             // header if the span is missing.
             let span = span.or(node.header_span).unwrap_or_default();
@@ -922,27 +943,6 @@ fn check_port_coverage(
                     .unwrap_or(span)
             };
             match &input.widget {
-                // empty-byok: "own key" selected but no key pasted. An
-                // ABSENT key means runtime-granted access (fine); an
-                // empty-string literal means the user picked their own
-                // key and left it blank, which would send "" as a bearer
-                // token.
-                Some(weft_core::node::Widget::ApiKey { .. }) => {
-                    if literal_value.and_then(|v| v.as_str()).is_some_and(|s| s.trim().is_empty()) {
-                        push(
-                            d,
-                            literal_span(),
-                            Severity::Error,
-                            "empty-byok",
-                            format!(
-                                "input '{}.{}': the key is empty and would be sent as the \
-                                 credential; paste a key, or remove the entry to use \
-                                 runtime-granted access",
-                                node.id, input.name
-                            ),
-                        );
-                    }
-                }
                 // literal-out-of-range: a number widget's min/max bound
                 // the literal at compile time (the editor clamps on
                 // blur; this is the backstop for hand-written source).

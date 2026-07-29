@@ -8,8 +8,8 @@ name = "openrouter"
 # catalog, and another node.
 #
 # minillmlib carries the wire dialects and accepts an injected HTTP client
-# (`GeneratorInfo::with_http_client`), which is how every call rides
-# `ctx.metered_client`; the nodes need no HTTP client and no cost
+# (`GeneratorInfo::with_http_client`), which is how every call rides the
+# opened connection's client; the nodes need no HTTP client and no cost
 # bookkeeping of their own.
 [dependencies]
 async-trait = "0.1"

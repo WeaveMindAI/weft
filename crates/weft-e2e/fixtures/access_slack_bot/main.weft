@@ -1,0 +1,11 @@
+# Post a real Slack message through a hand-made bot token pasted via
+# the Slack service's own_page.paste section (the pasted token's
+# permissions are claimed, so the consumer's chat:write requirement is
+# trusted and Slack's own error is the runtime backstop).
+
+ws = SlackAccess
+send = SlackSendMessage { text: "weft e2e: access proof" }
+send.account = ws.access
+
+out = Debug
+out.data = send.ts

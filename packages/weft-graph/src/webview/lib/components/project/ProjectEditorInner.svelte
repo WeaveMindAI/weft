@@ -522,11 +522,11 @@
 	/** Whose key a group's members spent, folded for the group's synthetic
 	 *  execution row: one distinct origin passes through, disagreeing
 	 *  members read 'mixed', no cost records means no origin. */
-	function groupCostOrigin(
-		members: { costOrigin?: 'user-provided' | 'runtime' | 'mixed' }[],
-	): 'user-provided' | 'runtime' | 'mixed' | undefined {
+	function groupCredentialOwner(
+		members: { credentialOwner?: 'their-own' | 'ours' | 'mixed' }[],
+	): 'their-own' | 'ours' | 'mixed' | undefined {
 		const origins = new Set(
-			members.map((e) => e.costOrigin).filter((o) => o !== undefined),
+			members.map((e) => e.credentialOwner).filter((o) => o !== undefined),
 		);
 		if (origins.size === 0) return undefined;
 		return origins.size === 1 ? [...origins][0] : 'mixed';
@@ -1510,7 +1510,7 @@
 								// An unknown member cost keeps the group honest too: the
 								// summed figure alone would read as the full price.
 								costUnknown: allRelated.some((e) => e.costUnknown),
-								costOrigin: groupCostOrigin(allRelated),
+								credentialOwner: groupCredentialOwner(allRelated),
 								logs: [],
 								color: inExec.color,
 								frames: inExec.frames,

@@ -63,6 +63,9 @@ async fn run_core_migrations_locked(pool: &sqlx::PgPool) -> anyhow::Result<crate
     weft_task_store::migrate(pool)
         .await
         .context("apply task-store migrations")?;
+    weft_access_store::migrate(pool)
+        .await
+        .context("apply access-store migrations")?;
     crate::infra_node::migrate(pool)
         .await
         .context("apply infra_node migrations")?;
@@ -319,6 +322,11 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         local_dev,
         http_port,
     )?;
+    // The additional internet-reachable address (a public tunnel's
+    // minted URL); empty substitution reads back as "" and counts as
+    // unset, exactly like WEFT_LOCAL_DEV above.
+    let internet_url =
+        std::env::var("WEFT_DISPATCHER_INTERNET_URL").ok().filter(|v| !v.is_empty());
 
     // The dispatcher's own projected SA token: signed onto its broker
     // storage-admin requests so the broker resolves the dispatcher to the
@@ -345,6 +353,7 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         sandbox,
         project_reclaimer,
         public_base_url,
+        internet_url,
         cluster_pod_cidr,
         cluster_service_cidr,
         cluster_ingress_namespace,
@@ -537,23 +546,6 @@ async fn graceful_shutdown() {
     }
 }
 
-/// Whether `url` resolves to a loopback address from the dispatcher pod's
-/// perspective. Catches both `http://localhost:9999` (the hostname literal) and
-/// `http://127.0.0.1` / `http://[::1]` (loopback IPs). Anything that fails to
-/// parse as a URL also counts as loopback, since a malformed prod URL is a bug
-/// we want to surface.
-fn is_loopback_url(raw: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(raw) else {
-        return true;
-    };
-    match parsed.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => true,
-    }
-}
-
 /// Resolve the public base URL users hit for webhooks / activation URLs AND
 /// storage file downloads (`<base>/storage/<tenant>/...`).
 ///
@@ -575,7 +567,7 @@ pub(crate) fn resolve_public_base_url(
     let strict = in_cluster && !local_dev;
     match env_value {
         Some(v) => {
-            if strict && is_loopback_url(v) {
+            if strict && weft_core::net::is_loopback_url(v) {
                 anyhow::bail!(
                     "WEFT_DISPATCHER_PUBLIC_BASE_URL='{v}' resolves to a loopback \
                      host in-cluster; set it on the dispatcher Deployment to the \
@@ -594,40 +586,6 @@ pub(crate) fn resolve_public_base_url(
             }
             Ok(format!("http://localhost:{http_port}"))
         }
-    }
-}
-
-#[cfg(test)]
-mod is_loopback_url_tests {
-    use super::is_loopback_url;
-
-    #[test]
-    fn localhost_hostname() {
-        assert!(is_loopback_url("http://localhost:9999"));
-        assert!(is_loopback_url("https://LOCALHOST/path"));
-    }
-
-    #[test]
-    fn loopback_v4() {
-        assert!(is_loopback_url("http://127.0.0.1:9999"));
-        assert!(is_loopback_url("http://127.0.0.42"));
-    }
-
-    #[test]
-    fn loopback_v6() {
-        assert!(is_loopback_url("http://[::1]:9999"));
-    }
-
-    #[test]
-    fn external_host() {
-        assert!(!is_loopback_url("https://api.example.com"));
-        assert!(!is_loopback_url("http://10.0.0.5:9999"));
-    }
-
-    #[test]
-    fn malformed_url_is_loopback() {
-        assert!(is_loopback_url("not a url"));
-        assert!(is_loopback_url(""));
     }
 }
 

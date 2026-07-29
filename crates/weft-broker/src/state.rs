@@ -44,6 +44,22 @@ pub struct BrokerState {
     /// Resolves the runtime's provider keys for nodes that asked the
     /// runtime to supply one (default: the host env).
     pub credentials: Arc<dyn CredentialSource>,
+    /// The SOLE trusted source of the registered shared-door apps
+    /// (default: the shared-credentials file). A shared connect only
+    /// ever resolves its app here; project metadata never supplies
+    /// one (the own door carries the user's own app instead).
+    pub app_provider: Arc<dyn crate::app_provider::AppProvider>,
+    /// The stable base URL users hit for this weft
+    /// (`WEFT_DISPATCHER_PUBLIC_BASE_URL`, the same value the
+    /// dispatcher publishes). Event subscribe calls tell the provider
+    /// to post to `<base>/events/<service>/<topic>` when this is
+    /// reachable from the internet; a weft with no internet-reachable
+    /// address refuses those subscriptions loudly, naming the fix.
+    pub public_base_url: Option<String>,
+    /// An ADDITIONAL internet-reachable address (a public tunnel's
+    /// minted URL, `WEFT_DISPATCHER_INTERNET_URL`), preferred over the
+    /// base when telling a provider where to post.
+    pub internet_url: Option<String>,
 }
 
 impl BrokerState {
@@ -57,7 +73,14 @@ impl BrokerState {
         object_store: Option<Arc<dyn ObjectStore>>,
         entitlements: Arc<dyn EntitlementSource>,
         credentials: Arc<dyn CredentialSource>,
+        app_provider: Arc<dyn crate::app_provider::AppProvider>,
     ) -> anyhow::Result<Arc<Self>> {
+        let public_base_url = std::env::var("WEFT_DISPATCHER_PUBLIC_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let internet_url = std::env::var("WEFT_DISPATCHER_INTERNET_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let pool = loop {
             match PgPoolOptions::new()
@@ -118,6 +141,9 @@ impl BrokerState {
             runtime_store,
             entitlements,
             credentials,
+            app_provider,
+            public_base_url,
+            internet_url,
         }))
     }
 }

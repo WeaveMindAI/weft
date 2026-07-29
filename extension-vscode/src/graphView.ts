@@ -26,13 +26,13 @@ export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
   private watchedDoc: vscode.TextDocument | undefined;
   private watchedProjectId: string | undefined;
-  /// Origin (scheme://host:port) the storage box serves file bytes
-  /// from, fetched once from the dispatcher at panel boot. The
-  /// webview CSP allows this origin in img-src/media-src so an
-  /// <img>/<video> streams directly from the box (range requests,
-  /// seeking), the same way any web host would. Empty if the fetch
-  /// failed (older dispatcher / offline): previews then can't load,
-  /// which surfaces as the node's fallback rather than a silent break.
+  /// The OBJECT STORE's browser-facing origin (scheme://host:port),
+  /// fetched once from the dispatcher at panel boot. The webview CSP
+  /// allows it in img-src/media-src so an <img>/<video> streams file
+  /// bytes directly from the box (range requests, seeking). Empty if
+  /// the fetch failed (older dispatcher / offline): previews then
+  /// can't load, which surfaces as the node's fallback rather than a
+  /// silent break.
   private storageOrigin = '';
   /// Include-navigation back-stack. Each frame records the doc the user came
   /// from and the include alias they clicked to descend (used to build the
@@ -1017,6 +1017,12 @@ export class GraphViewController {
       case 'storageCall':
         void this.runStorageCall(msg.requestId, msg.path, msg.body);
         break;
+      case 'accessCall':
+        void this.runAccessCall(msg.requestId, msg.method, msg.path, msg.body);
+        break;
+      case 'openExternalUrl':
+        void vscode.env.openExternal(vscode.Uri.parse(msg.url));
+        break;
       case 'pickAsset':
         void this.runPickAsset(msg.requestId, msg.accept, msg.dropped);
         break;
@@ -1083,7 +1089,7 @@ export class GraphViewController {
   private async loadStorageOrigin(): Promise<void> {
     try {
       const resp = await this.client.get<{ public_base_url: string }>('/storage/public-base');
-      this.storageOrigin = new URL(resp.public_base_url).origin;
+      this.storageOrigin = originOf(resp.public_base_url);
     } catch (err) {
       this.storageOrigin = '';
       console.warn(
@@ -1118,6 +1124,46 @@ export class GraphViewController {
             ? e.message
             : String(e);
       this.post({ kind: 'storageResult', requestId, error });
+    }
+  }
+
+  /// Drive one access-store verb for the webview: send `method` to the
+  /// dispatcher's `/access/<path>` route, reply with a correlated
+  /// `accessResult`. The single brokered channel behind the connect
+  /// flows, grant summaries, and remote_select lookups. Secrets travel
+  /// INTO it (pasted fields going editor -> store) and never back out;
+  /// the host stamps the active project into POST bodies so grants
+  /// scope to the project being edited.
+  private async runAccessCall(
+    requestId: number,
+    method: 'GET' | 'POST' | 'DELETE',
+    path: string,
+    body?: unknown,
+  ): Promise<void> {
+    try {
+      let result: unknown;
+      switch (method) {
+        case 'GET':
+          result = await this.client.get<unknown>(`/access/${path}`);
+          break;
+        case 'POST': {
+          const merged = {
+            ...(body as Record<string, unknown>),
+            project_id: this.watchedProjectId ?? null,
+          };
+          result = await this.client.post<unknown>(`/access/${path}`, merged);
+          break;
+        }
+        case 'DELETE':
+          await this.client.del(`/access/${path}`);
+          result = {};
+          break;
+      }
+      this.post({ kind: 'accessResult', requestId, result });
+    } catch (e) {
+      const error =
+        e instanceof HttpError ? `${e.body || e.message}` : e instanceof Error ? e.message : String(e);
+      this.post({ kind: 'accessResult', requestId, error });
     }
   }
 
@@ -1690,6 +1736,17 @@ export class GraphViewController {
 <script nonce="${nonce}" src="${bundleJs}"></script>
 </body>
 </html>`;
+  }
+}
+
+/// The origin of a base URL, or '' when it is empty/unparseable. A
+/// missing origin narrows the webview's policy (the surface using it
+/// fails visibly at the point of use), never widens it.
+function originOf(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).origin;
+  } catch {
+    return '';
   }
 }
 

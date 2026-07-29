@@ -332,6 +332,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 node_id: payload.node_id.clone(),
                 is_resume: payload.is_resume,
                 spec_json,
+                access_id: payload.spec.access.as_ref().map(|a| a.id.clone()),
                 consumer_kind: payload.spec.consumer_kind.clone(),
                 tags,
                 port_snapshot: payload.port_snapshot.clone(),

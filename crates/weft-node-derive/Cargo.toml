@@ -13,3 +13,8 @@ proc-macro2 = "1"
 quote = "1"
 syn = "2"
 serde_json = { workspace = true }
+# Generated code references weft-core by whatever NAME the invoking
+# crate gave it: `weft` in generated node-package crates (the
+# author-facing alias), `weft_core` inside the workspace. This resolves
+# the right one from the invoking crate's Cargo.toml.
+proc-macro-crate = "3"

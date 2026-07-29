@@ -8,16 +8,16 @@
 //! really answers, the meter really resolves a real number from the real
 //! response, and that number reaches the cost trail.
 //!
-//! Two scenarios drive the SAME graph through the OpenRouterConfig node's
-//! `apiKey` field, exactly as a user picks "Credits" vs "Own key" in the
-//! editor:
-//!   - `runtime`: `apiKey` unset, so the call is made on the runtime's
-//!     configured key (`OPENROUTER_API_KEY` on the broker), which the worker
-//!     never holds.
-//!   - `byok`: a real key on the config node, so the call is made on the
-//!     user's own.
+//! Two scenarios drive the SAME graph through the OpenRouterAccess node's
+//! connection picker, exactly as a user picks a connection in the editor
+//! (the pick lives on the ACCESS node; the inference node just consumes
+//! the wired access value):
+//!   - `ours`: a shared-door connection, so the call is made on the
+//!     runtime's configured key (`OPENROUTER_API_KEY` on the broker),
+//!     which the worker never holds directly.
+//!   - `their-own`: a connection holding the user's own pasted key.
 //! Both land a resolved cost, measured worker-side; the difference is only
-//! whose key spent, which the node never sees.
+//! whose credential spent, which the node never sees.
 //!
 //! Spends real money (fractions of a cent on the cheapest model). Needs an
 //! OpenRouter key: `OPENROUTER_API_KEY` in the environment the daemon was
@@ -27,12 +27,13 @@
 //! 'openrouter'", which is exactly what this test then reports.
 #![cfg(feature = "e2e")]
 
+use weft_e2e::access::{catalog_spec, connect_direct, set_account};
 use weft_e2e::{ensure, project::Project, run};
 
 /// Drive the openrouter fixture and assert a real blue-sky completion came
-/// back with a resolved cost, spent on the expected key (`origin` is
-/// `"runtime"` or `"user-provided"`; the cost record says whose key spent,
-/// so a silent fall-through to the other key fails here).
+/// back with a resolved cost, spent on the expected credential (`origin`
+/// is `"ours"` or `"their-own"`; the cost record says whose credential
+/// spent, so a silent fall-through to the other one fails here).
 async fn assert_metered(project: &mut Project, origin: &str) -> anyhow::Result<()> {
     let mut settled = run::run_and_settle(project).await?;
     settled.completed()?;
@@ -55,18 +56,27 @@ async fn assert_metered(project: &mut Project, origin: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// The runtime path: the fixture leaves `apiKey` unset, so the runtime uses
-/// its configured key.
+/// The shared-door path: a one-click connection on the runtime's own
+/// credential, exactly as picking "Use ours" in the editor.
 #[tokio::test]
 async fn openrouter_node_measures_a_call_on_the_runtime_key() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
+    let conn = connect_direct(
+        &disp,
+        catalog_spec("ai/openrouter", "access")?,
+        "shared",
+        serde_json::json!({}),
+    )
+    .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    assert_metered(&mut project, "runtime").await?;
-    project.finish().await
+    set_account(&project, "auth", "connection", conn.handle())?;
+    assert_metered(&mut project, "ours").await?;
+    project.finish().await?;
+    conn.finish().await
 }
 
-/// The BYOK path: the user's own key is set on the node's `apiKey` input, so
-/// the runtime uses it instead of the deployment's.
+/// The own-credential path: the user's own key is connected through the
+/// "Your own" door, so the call rides it instead of the runtime's.
 #[tokio::test]
 async fn openrouter_node_measures_a_call_on_the_users_own_key() -> anyhow::Result<()> {
     // `up` loads the repo-root `.env` (uncommitted), so OPENROUTER_API_KEY is
@@ -78,11 +88,20 @@ async fn openrouter_node_measures_a_call_on_the_users_own_key() -> anyhow::Resul
              BYOK path"
         )
     })?;
+    // Connect the user's own key as its own connection, exactly as the
+    // editor's "Your own" page does; the node config only ever holds the
+    // handle. The inference node consumes the wired access; model
+    // settings ride the wired config.
+    let conn = connect_direct(
+        &disp,
+        catalog_spec("ai/openrouter", "access")?,
+        "own",
+        serde_json::json!({ "key": key }),
+    )
+    .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    // Set the key on the OpenRouterConfig node, exactly as picking "Own key"
-    // in the editor writes a real key into its api_key field. The inference
-    // node takes every model setting from the wired config.
-    project.set_node_config("cfg", "apiKey", &format!("{key:?}"))?;
-    assert_metered(&mut project, "user-provided").await?;
-    project.finish().await
+    set_account(&project, "auth", "connection", conn.handle())?;
+    assert_metered(&mut project, "their-own").await?;
+    project.finish().await?;
+    conn.finish().await
 }

@@ -1,16 +1,21 @@
 //! OpenRouterInference: one language-model call through OpenRouter.
 //!
-//! ALL model settings (model, system prompt, sampling knobs, API key) come
-//! from the `config` input: ONE plain object an upstream OpenRouterConfig
-//! node emits, which THIS node reads and interprets (nothing engine-side is
-//! special about the input). No config node = the defaults. The node's only
-//! own setting is `parseJson`: the response is JSON-repaired and its
-//! top-level keys fan onto matching declared output ports.
+//! The CONNECTION arrives on the `account` input: an `Access` value an
+//! OpenRouterAccess node emitted (the connection was picked once, over
+//! there). Model settings (model, system prompt, sampling knobs) come
+//! from the `config` input: ONE plain object an upstream
+//! OpenRouterConfig node emits, which THIS node reads and interprets
+//! (nothing engine-side is special about either input). No config node
+//! = the defaults. The node's only own setting is `parseJson`: the
+//! response is JSON-repaired and its top-level keys fan onto matching
+//! declared output ports.
 //!
-//! The paid-call surface is two steps: open the access, make the call on the
-//! metered client. The runtime routes the call and measures what it really
-//! cost (the call streams internally, and a Stop mid-generation still gets
-//! its actual cost resolved); this node holds no cost bookkeeping at all.
+//! The paid-call surface is two steps: open the connection
+//! (`ctx.open`, one resolve, one lease for THIS firing), make the call
+//! on its client. The runtime routes the call and measures what it
+//! really cost (the call streams internally, and a Stop mid-generation
+//! still gets its actual cost resolved); this node holds no cost
+//! bookkeeping at all.
 
 use async_trait::async_trait;
 use minillmlib::{
@@ -20,8 +25,8 @@ use minillmlib::{
 
 use serde_json::Value;
 
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct OpenRouterInferenceNode;
@@ -30,7 +35,9 @@ pub struct OpenRouterInferenceNode;
 impl Node for OpenRouterInferenceNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let prompt: String = ctx.inputs.get("prompt")?;
-        let parse_json: bool = ctx.inputs.get_or("parseJson", false)?;
+        // `parseJson` declares a metadata default, so the bag always
+        // holds a value.
+        let parse_json: bool = ctx.inputs.get("parseJson")?;
 
         // The `config` input carries ONE plain object (the wired
         // OpenRouterConfig node's output); THIS node interprets it.
@@ -70,14 +77,17 @@ impl Node for OpenRouterInferenceNode {
             cp = cp.with_openrouter_routing(routing);
         }
 
-        // The whole paid-call surface: open the access, build the generator
-        // over the metered client. The runtime routes the call and measures
-        // its real cost behind the client.
-        let access = ctx.provider_access("openrouter", cfg.opt("apiKey")?).await?;
+        // The whole paid-call surface: open the wired connection (the
+        // pick was made on the OpenRouterAccess node; a runtime
+        // credential opens HERE, inside this firing), build the
+        // generator over its client. The runtime routes the call and
+        // measures its real cost behind the client.
+        let account = ctx.inputs.get("account")?;
+        let conn = ctx.open(&account).await?;
         let generator = GeneratorInfo::openrouter(model)
-            .with_api_key(access.credential())
+            .with_api_key(conn.credential()?)
             .with_app_attribution("https://weavemind.ai", "WeaveMind")
-            .with_http_client(ctx.metered_client(&access)?);
+            .with_http_client(conn.client().clone());
 
         let root = ChatNode::root(system_prompt);
         let user = root.add_user(prompt);
@@ -97,7 +107,7 @@ impl Node for OpenRouterInferenceNode {
         };
 
         if response.content.trim().is_empty() {
-            weft_core::node_bail!(
+            weft::node_bail!(
                 "openrouter: provider returned no text content (function-call only or empty \
                  response)"
             );

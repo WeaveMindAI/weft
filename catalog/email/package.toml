@@ -1,0 +1,13 @@
+[package]
+name = "email"
+
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"
+# The receive node speaks IMAP over a TLS pipe from `weft::net`.
+async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
+futures = "0.3"
+# The send node speaks SMTP; rustls, like everything else in weft.
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1", "tokio1-rustls-tls", "ring"] }
+# Decoding a fetched message (headers, quoted-printable, multipart).
+mail-parser = "0.9"

@@ -1,0 +1,4 @@
+[package]
+name = "e2e_access_wrong_kind"
+id = "00000000-0000-0000-0000-000000000038"
+version = "0.1.0"

@@ -2,6 +2,9 @@ target/
 .env
 .env.dashboard
 .env.extension
+# The deployment's OAuth apps (client ids + secrets). Copy
+# `access-apps.example.json` to this and fill it in.
+access-apps.json
 restate-data
 restate-data-cloud
 restate-data-cloud.toml

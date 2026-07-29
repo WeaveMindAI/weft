@@ -48,6 +48,18 @@ export interface InputDefinition extends PortDefinition {
   /// form-derived ports).
   // SYNC: InputDefinition.fromSpec <-> crates/weft-core/src/project.rs InputDefinition.from_spec
   fromSpec?: boolean;
+  /// The permissions THIS consumer needs on the wired connection
+  /// (Access-typed inputs only). The editor's live check compares them
+  /// against the picked connection's granted set; the runtime stamps
+  /// them onto the marker for the resolve-time backstop.
+  // SYNC: InputDefinition.requiresScopes <-> crates/weft-core/src/project.rs InputDefinition.requires_scopes
+  requiresScopes?: string[];
+  /// The stored VALUES this input needs on the wired connection
+  /// (Access-typed inputs only), for a service whose optional fields
+  /// decide what a connection can do. Same three check points; unlike
+  /// permissions a shortfall is never "unknown", so it always marks.
+  // SYNC: InputDefinition.requiresValues <-> crates/weft-core/src/project.rs InputDefinition.requires_values
+  requiresValues?: string[];
 }
 
 /// Source span of one config field plus how it was written. `origin` tells
@@ -223,8 +235,47 @@ export type WidgetKind =
   | 'password'
   // SYNC: WidgetKind 'file_drop' <-> crates/weft-core/src/node.rs Widget::FileDrop
   | 'file_drop'
-  | 'api_key'
+  | 'access'
+  | 'remote_select'
   | 'form_builder';
+
+// One way a `remote_select` field can be filled, in preference order;
+// the editor uses the richest source the chosen connection supports
+// and silently drops each source whose requirement is not met.
+// SYNC: ResourceSource <-> crates/weft-core/src/node.rs ResourceSource
+export type ResourceSource =
+  /// Options recorded on the connection during sign-in; free.
+  | { kind: 'granted'; from: string; label: string; value: string }
+  /// Call the service and enumerate; needs `requires` on the connection.
+  | ({ kind: 'list'; requires?: string[] } & Lookup)
+  /// The provider's own chooser, declared entirely by the NODE: the
+  /// chooser script's address and the author's glue, run on a
+  /// weft-served page (embedded, or a browser tab), never in the
+  /// editor. Choosing GRANTS the picked resource.
+  | { kind: 'picker'; script: string; code: string; grants?: string[]; mime_types?: string[] }
+  /// Paste a link; the pattern's first capture group is the id.
+  | { kind: 'from_url'; pattern: string };
+
+// The declarative list request behind a `remote_select` list source.
+// SYNC: Lookup <-> crates/weft-core/src/node.rs Lookup
+export interface Lookup {
+  /// GET URL; `{query}` interpolates the search text, `{<parent>}` a
+  /// depends_on parent's picked id.
+  get: string;
+  /// Dotted path to the items array in the response.
+  items: string;
+  /// Dotted path (per item) for the display label.
+  label: string;
+  /// Dotted path (per item) for the stored id.
+  value: string;
+  page?: PageSpec;
+}
+
+// SYNC: PageSpec <-> crates/weft-core/src/node.rs PageSpec
+export interface PageSpec {
+  cursor_param: string;
+  cursor_path: string;
+}
 
 // The editor control an input renders. Every key a widget object may
 // carry, one per Rust variant payload. No index signature: the Rust
@@ -242,8 +293,17 @@ export interface Widget {
   /// file_drop: the declared weft file type (Image/Audio/Video/Blob/File).
   // SYNC: Widget.type <-> crates/weft-core/src/node.rs Widget::FileDrop file_type
   type?: string;
-  /// api_key: the provider whose runtime key the Credits mode uses.
-  provider?: string;
+  /// access: the service this connect control signs into
+  /// (compiler-stamped from the node metadata's `service.service`).
+  service?: string | null;
+  /// remote_select: the name of this node's Access input that
+  /// authenticates the sources needing one.
+  access?: string;
+  /// remote_select: the ways this field can be filled, in preference
+  /// order.
+  sources?: ResourceSource[];
+  /// remote_select: parent inputs for drill-down.
+  depends_on?: string[];
   /// number
   min?: number;
   /// number
@@ -267,6 +327,15 @@ export interface InputSpec {
   label?: string;
   placeholder?: string;
   description?: string;
+  /// The permissions THIS consumer needs on the wired connection
+  /// (Access-typed inputs only); checked live against the picked
+  /// connection, at connect, and at resolve, never by the compiler.
+  // SYNC: InputSpec.requiresScopes <-> crates/weft-core/src/node.rs InputSpec.requires_scopes
+  requiresScopes?: string[];
+  /// The stored VALUES this consumer needs on the wired connection
+  /// (Access-typed inputs only); checked the same three places.
+  // SYNC: InputSpec.requiresValues <-> crates/weft-core/src/node.rs InputSpec.requires_values
+  requiresValues?: string[];
 }
 
 // SYNC: OutputSpec <-> crates/weft-core/src/node.rs OutputSpec
@@ -306,7 +375,155 @@ export interface CatalogEntry {
    *  inherited by every member, so the form_builder editor can drive
    *  the field-type dropdown without a separate fetch. */
   formFieldSpecs?: FormFieldSpecWire[];
+  /** The service recipe, present ONLY on an access node. Drives the
+   *  connection picker (doors, permission catalogue, own page). */
+  // SYNC: AccessSpecWire <-> crates/weft-core/src/access/spec.rs AccessSpec
+  service?: AccessSpecWire;
+  /** The OAuth apps this project uses, keyed by service name. Declared
+   *  once at a package root and inherited by every member node; an
+   *  access node resolves its own app by its service name. Each value
+   *  is the app's credentials. Empty in the shipped catalog. */
+  // SYNC: accessApps <-> crates/weft-core/src/node.rs NodeMetadata.access_apps
+  accessApps?: Record<string, AppRegistration>;
 }
+
+/** The credentials of a service's OAuth app: a mandatory display
+ *  label (the connection list's middle column), client id, secret
+ *  (absent for a public PKCE client, and FORBIDDEN on project-declared
+ *  apps: metadata is source), and any registration_fields extras. */
+// SYNC: AppRegistration <-> crates/weft-core/src/access/spec.rs AppRegistration
+export interface AppRegistration {
+  label: string;
+  client_id: string;
+  client_secret?: string;
+  /** registration_fields extras, flattened alongside id + secret. */
+  [key: string]: string | undefined;
+}
+
+/** How grants coexist across projects (a provider property). */
+// SYNC: GrantCoexistence <-> crates/weft-core/src/access/spec.rs GrantCoexistence
+export type GrantCoexistence = 'coexisting' | 'exclusive';
+
+/** One pasted credential field on the connect form. */
+// SYNC: CredentialFieldWire <-> crates/weft-core/src/access/spec.rs CredentialField
+export interface CredentialFieldWire {
+  name: string;
+  label?: string;
+  /** The connect accepts this field empty (an app-level token only
+   *  some uses of the service need); default false. */
+  optional?: boolean;
+  /** Render as a password field; default true. */
+  secret?: boolean;
+  placeholder?: string;
+}
+
+/** One connect door. */
+// SYNC: Door <-> crates/weft-core/src/access/spec.rs Door
+export type Door = 'shared' | 'own';
+
+/** One entry of a service's permission catalogue. */
+// SYNC: Permission <-> crates/weft-core/src/access/spec.rs Permission
+export interface Permission {
+  id: string;
+  label: string;
+  description: string;
+  default?: boolean;
+}
+
+/** Where a service's permissions take effect. */
+// SYNC: PermissionTiming <-> crates/weft-core/src/access/spec.rs PermissionTiming
+export type PermissionTiming = 'at_mint' | 'at_app' | 'at_approve' | 'both' | 'none';
+
+// SYNC: VerificationRung <-> crates/weft-core/src/access/spec.rs VerificationRung
+export type VerificationRung =
+  | 'reports_permissions'
+  | 'self_introspect'
+  | 'reports_validity'
+  | 'probe'
+  | 'silent';
+
+// SYNC: VerificationCost <-> crates/weft-core/src/access/spec.rs VerificationCost
+export type VerificationCost = 'free' | 'ambiguous' | 'paid';
+
+/** The optional parts of the "Your own" page beyond its paste fields
+ *  (which derive from the acquisition; see `ownFields`). */
+// SYNC: OwnPage <-> crates/weft-core/src/access/spec.rs OwnPage
+export interface OwnPageWire {
+  mint?: { url: string; payload: unknown; captures: unknown[] };
+  guide?: { link?: string; steps: string[] };
+  /** "I already have a credential": paste it, no app; the server
+   *  stores a static-acquisition connection over these fields. */
+  paste?: { fields: CredentialFieldWire[] };
+}
+
+/** The wire shape of an `AccessSpec` (the parts the editor reads;
+ *  auth steps/test calls pass through opaquely to the store). */
+// SYNC: AccessSpecWire <-> crates/weft-core/src/access/spec.rs AccessSpec
+export interface AccessSpecWire {
+  service: string;
+  label?: string;
+  grants?: GrantCoexistence;
+  /** The connect doors this service offers; default ['own']. */
+  doors?: Door[];
+  own_page?: OwnPageWire;
+  permissions?: Permission[];
+  /** Where the provider's COMPLETE permission list lives, when
+   *  `permissions` is a curated subset (Google class); drives the
+   *  picker's "missing one? add it to this node's metadata" hint.
+   *  Absent = the catalogue is the complete set, no hint. */
+  all_permissions_url?: string;
+  permission_timing?: PermissionTiming;
+  verification?: { rung?: VerificationRung; cost?: VerificationCost };
+  reconnect_action?: string;
+  acquisition: {
+    kind: 'static' | 'oauth2' | 'mint_jwt';
+    fields?: CredentialFieldWire[];
+    registration_fields?: CredentialFieldWire[];
+    grant?: { kind: 'authorization_code' | 'client_credentials'; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  auth?: unknown[];
+  test?: unknown;
+  identity?: string;
+  /** How the service REPORTS events, by named topic. The editor never
+   *  reads inside; the blob rides to the server verbatim (the door
+   *  probe records it so the events receiver can verify pushes). */
+  events?: Record<string, unknown>;
+  /** All-or-nothing groups of optional fields, at least one of which a
+   *  connect must fill (a mailbox's receiving vs sending servers). The
+   *  connect refuses a half-filled or empty choice, naming the fix. */
+  // SYNC: Capability <-> crates/weft-core/src/access/spec.rs Capability
+  capabilities?: { label: string; fields: string[] }[];
+}
+
+/** A connection row as the store lists it: everything the connection
+ *  list renders, never a stored value. */
+// SYNC: GrantSummary <-> crates/weft-access-store/src/lib.rs GrantSummary
+export interface GrantSummary {
+  id: string;
+  service: string;
+  project_id?: string | null;
+  identity?: string | null;
+  /** The list's middle column: the app's label, or the user's name for
+   *  a pasted credential. */
+  label?: string | null;
+  scopes: string[];
+  /** Whether `scopes` came from the provider (verified) or the user's
+   *  ticks (claimed); only a verified shortfall marks a node. */
+  permissions_verified: boolean;
+  /** Whose credential the row resolves to; 'ours' rows spend credits. */
+  owner: CredentialOwner;
+  /** Which door created it; drives the shared-door one-time warning. */
+  door: Door;
+  expires_at?: string | null;
+  /** The NAMES of the values this connection stores (never the values).
+   *  What the live `requiresValues` check compares against. */
+  value_names?: string[];
+}
+
+/** The on-wire sentinel key tagging an Access value. */
+// SYNC: ACCESS_MARKER_KEY <-> crates/weft-core/src/access/value.rs ACCESS_MARKER_KEY
+export const ACCESS_MARKER_KEY = '__weft_access__';
 
 /** Render hint for one form field. Opaque to the host; the
  *  consumer (browser extension, dashboard) reads `component` to
@@ -376,10 +593,9 @@ export interface LoopIteration {
   index: number;
 }
 
-/// Whose key a metered call spent (the wire values of the runtime's
-/// access-origin tag).
-// SYNC: CostOrigin <-> crates/weft-core/src/access.rs AccessOrigin
-export type CostOrigin = 'user-provided' | 'runtime';
+/// Whose credential a measured call spent.
+// SYNC: CredentialOwner <-> crates/weft-core/src/access/mod.rs CredentialOwner
+export type CredentialOwner = 'their-own' | 'ours';
 
 export interface NodeExecEvent {
   nodeId: string;
@@ -445,22 +661,25 @@ export type LoopInspectorEvent =
 
 /// One line in a node's bus inspector panel. IRC-shaped: `joined` /
 /// `left` render as `* name joined` / `* name left`; `message`
-/// renders as `from: <payload-pretty>` for journaled buses or
-/// `from sent <kind> of <size> bytes [hash: <hex>]` for ephemeral
-/// buses (where `payload` is null). `closed` renders an explicit
-/// `* the bus closed here` marker. `busId` groups lines by channel
-/// so a node attached to multiple buses gets one scrollable section
-/// per bus. Replay orders lines by arrival from the SSE stream (the
-/// dispatcher already orders them by journal row id).
-// SYNC: JournaledPayload <-> crates/weft-core/src/primitive.rs JournaledPayload
-/// Tagged payload. Default `Option<Value>` would collapse `Some(Value::Null)` with
-/// `None` at the JSON boundary; the tag preserves the distinction
-/// so a journaled bus that sends literal `null` doesn't render as
-/// if it were ephemeral.
-export type JournaledPayload =
-  | { kind: 'journaled'; value: unknown }
-  | { kind: 'ephemeral' };
+/// renders as `from: <payload-pretty>` (or a byte count for a binary
+/// payload); `window` renders an ephemeral window's rollup ("N frames,
+/// M bytes"); `closed` renders an explicit `* the bus closed here`
+/// marker. `busId` groups lines by channel so a node attached to
+/// multiple buses gets one scrollable section per bus. Replay orders
+/// lines by arrival from the SSE stream (the dispatcher already orders
+/// them by journal row id).
+/// A journaled message's payload, in its declared kind: a JSON value,
+/// or raw bytes carried as base64 (the wire form of a media frame; the
+/// panel renders its size, not the base64). The ONE wire payload
+/// vocabulary for every journaled exchange (bus window messages and the
+/// live caller's events).
+// SYNC: WirePayload <-> crates/weft-core/src/bus.rs WirePayload
+export type WirePayload =
+  | { kind: 'json'; data: unknown }
+  | { kind: 'bytes'; data: string };
 
+// SYNC: BusInspectorEvent 'message' <-> crates/weft-core/src/bus.rs WindowedBusMessage, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' messages
+// SYNC: BusInspectorEvent 'window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' totals
 export type BusInspectorEvent =
   | { kind: 'joined'; busId: string; offset: number; name: string; atUnix: number }
   | { kind: 'left'; busId: string; offset: number; name: string; atUnix: number }
@@ -470,33 +689,44 @@ export type BusInspectorEvent =
       offset: number;
       from: string;
       msgKind: string;
-      payload: JournaledPayload;
+      payload: WirePayload;
       payloadByteSize: number;
-      payloadSha256Prefix: string;
+      atUnix: number;
+    }
+  /// One journal window of an EPHEMERAL bus: the payloads never reach
+  /// the journal, so the panel renders the rollup ("N frames, M bytes
+  /// from <sender>"). `offset` is the window's first offset (the
+  /// dedup key the log store uses). Journaled buses never produce
+  /// this: their windows unpack into per-message `message` events.
+  | {
+      kind: 'window';
+      busId: string;
+      offset: number;
+      lastOffset: number;
+      totals: Array<{ from: string; msgKind: string; count: number; bytes: number }>;
       atUnix: number;
     }
   | { kind: 'closed'; busId: string; offset: number; atUnix: number };
 
 /// One live-caller-connection event the inspector replays. One caller
 /// per execution (no busId; the execution color is the identity).
-/// `payload` reuses `JournaledPayload` so a high-volume stream renders
-/// metadata-only exactly like an ephemeral bus.
+/// `payload` is the same tagged `WirePayload` shape a bus window's
+/// messages carry.
+// SYNC: CallerInspectorEvent 'inbound'/'outbound' <-> crates/weft-journal/src/events.rs CallerInbound/CallerOutbound, crates/weft-dispatcher/src/events.rs CallerInbound/CallerOutbound, extension-vscode/src/execFollower.ts DispatcherEvent 'caller_inbound'/'caller_outbound'
 export type CallerInspectorEvent =
   | { kind: 'connected'; offset: number; protocol: string; atUnix: number }
   | {
       kind: 'inbound';
       offset: number;
-      payload: JournaledPayload;
+      payload: WirePayload;
       payloadByteSize: number;
-      payloadSha256Prefix: string;
       atUnix: number;
     }
   | {
       kind: 'outbound';
       offset: number;
-      payload: JournaledPayload;
+      payload: WirePayload;
       payloadByteSize: number;
-      payloadSha256Prefix: string;
       terminal: boolean;
       atUnix: number;
     }
@@ -949,7 +1179,7 @@ export type HostMessage =
   /// on it. `amountUsd` null = the meter could not resolve the figure (an
   /// honest unknown; nothing is added to the row's total). `origin` says
   /// whose key the call spent.
-  | { kind: 'execCost'; nodeId: string; frames: LoopIteration[]; costId: string; amountUsd: number | null; origin: CostOrigin }
+  | { kind: 'execCost'; nodeId: string; frames: LoopIteration[]; costId: string; amountUsd: number | null; origin: CredentialOwner }
   /// One bus event (live or replay). Carries only what the bus layer
   /// recorded: join / left / message / closed keyed by `busId`.
   /// Routing to node inspector panels is a SEPARATE signal,
@@ -1016,6 +1246,10 @@ export type HostMessage =
   /// dispatcher route's JSON response on success; `error` is the failure
   /// reason (HTTP error body or transport fault) on failure.
   | { kind: 'storageResult'; requestId: number; result?: unknown; error?: string }
+  /// Reply to `accessCall`, correlated by requestId. `result` is the
+  /// dispatcher route's JSON response on success; `error` the failure
+  /// reason. Summaries only: no stored value ever rides this channel.
+  | { kind: 'accessResult'; requestId: number; result?: unknown; error?: string }
   /// Reply to `pickAsset`: `path` is the token path the field writes into its
   /// `@asset("<path>", <Type>)` ref (a path in place locally, `assets/<name>`
   /// for stored bytes), absent on cancel; `error` on failure.
@@ -1187,6 +1421,21 @@ export type WebviewMessage =
   /// correlated `storageResult`. This is the ONE channel for storage control
   /// calls (the inline preview's download handshake); bytes never ride it.
   | { kind: 'storageCall'; requestId: number; path: string; body: unknown }
+  /// Drive one access-store verb through the host: the host sends
+  /// `method` to the dispatcher's `/access/<path>` route (stamping the
+  /// active project into a POST body) and replies with a correlated
+  /// `accessResult`. The ONE channel for connect flows, grant
+  /// summaries, and remote_select lookups; secrets travel INTO it
+  /// (pasted fields going editor -> store) and never back out.
+  | {
+      kind: 'accessCall';
+      requestId: number;
+      method: 'GET' | 'POST' | 'DELETE';
+      path: string;
+      body?: unknown;
+    }
+  /// Open a URL in the user's real browser (the OAuth consent page).
+  | { kind: 'openExternalUrl'; url: string }
   /// The file-drop field asks the host to produce an ASSET REF path. With
   /// `dropped` (a drag-dropped file's bytes, base64), the host stores them
   /// as a project file under `assets/<name>` through its normal save path

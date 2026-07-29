@@ -7,9 +7,9 @@
   "icon": "Hash",
   "color": "#64748b",
   "inputs": [
-    { "name": "from", "type": "Number", "required": false },
+    { "name": "from", "type": "Number", "required": false, "default": 0 },
     { "name": "to", "type": "Number", "required": true },
-    { "name": "step", "type": "Number", "required": false }
+    { "name": "step", "type": "Number", "required": false, "default": 1 }
   ],
   "outputs": [
     { "name": "values", "type": "List[Number]", "required": false }

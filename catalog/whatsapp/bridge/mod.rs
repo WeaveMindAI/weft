@@ -11,13 +11,13 @@
 
 use async_trait::async_trait;
 
-use weft_core::infra::{
+use weft::infra::{
     AccessMode, Container, ContainerPort, Endpoint, EnvEntry, Expose, Image, InfraSpec, Lifecycle,
     Mount, Probe, Protocol, Resources, TerminateBehavior, Unit, UnitKind, UpgradeBehavior, Volume,
     VolumeKind,
 };
-use weft_core::node::NodeOutput;
-use weft_core::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct WhatsAppBridgeNode;
@@ -119,7 +119,7 @@ impl Node for WhatsAppBridgeNode {
         // and the declared output ports must stay in sync.
         let api = ctx.endpoint("api").await?;
         let bridge_outputs = api
-            .call(weft_core::EndpointMethod::Get, "/outputs", None)
+            .call(weft::EndpointMethod::Get, "/outputs", None)
             .await?;
         // `endpointUrl` is our locally-known truth (the resolved
         // EndpointHandle URL). Set AFTER the fan (set-after-fan wins) so a

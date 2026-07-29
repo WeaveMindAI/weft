@@ -1,0 +1,118 @@
+{
+  "type": "GoogleDriveWatch",
+  "label": "Google Drive Watch",
+  "description": "Fires an execution when a watched Drive file or folder changes. Google delivers change notifications by pushing to your weft, so your weft must be reachable from the internet (locally: ./setup.sh --public-url), and the address must belong to a domain verified in the app's Google console. The watch is renewed automatically for as long as the trigger is active.",
+  "category": "Triggers",
+  "tags": [
+    "google",
+    "drive",
+    "trigger"
+  ],
+  "icon": "HardDrive",
+  "color": "#0F9D58",
+  "features": {
+    "isTrigger": true
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Google access (wire a GoogleAccess node). The account needs at least read access to the watched file."
+    },
+    {
+      "name": "target",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "https://www.googleapis.com/auth/drive.readonly"
+            ],
+            "get": "https://www.googleapis.com/drive/v3/files?pageSize=100",
+            "items": "files",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "pageToken",
+              "cursor_path": "nextPageToken"
+            }
+          },
+          {
+            "kind": "picker",
+            "script": "https://apis.google.com/js/api.js",
+            "code": "await new Promise((resolve) => gapi.load('picker', resolve));\nif (!weft.clientId) throw new Error('this connection has no OAuth app; the Google picker only grants files to an app');\nlet view = new google.picker.DocsView().setIncludeFolders(true).setSelectFolderEnabled(true);\nif (weft.mimeTypes.length > 0) view = view.setMimeTypes(weft.mimeTypes.join(','));\nnew google.picker.PickerBuilder()\n  .setOAuthToken(weft.token)\n  .setAppId(weft.clientId.split('-')[0])\n  .addView(view)\n  .setCallback((data) => {\n    const action = data[google.picker.Response.ACTION];\n    if (action === google.picker.Action.PICKED) {\n      const doc = data[google.picker.Response.DOCUMENTS][0];\n      weft.done({ id: doc.id, label: doc.name || doc.id });\n    } else if (action === google.picker.Action.CANCEL) {\n      weft.cancel();\n    }\n  })\n  .build()\n  .setVisible(true);",
+        "grants": [
+          "https://www.googleapis.com/auth/drive.file"
+        ],
+        "mime_types": []
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/(?:d|folders)/([a-zA-Z0-9_-]+)"
+          }
+        ]
+      },
+      "label": "File or folder",
+      "placeholder": "Pick one, or paste its link"
+    },
+    {
+      "name": "changes",
+      "type": "String",
+      "exposure": "config",
+      "default": "any",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "any",
+          "content",
+          "properties",
+          "children"
+        ]
+      },
+      "label": "Change kinds",
+      "description": "Which changes fire: any change, only content edits, only property/metadata changes, or only children added/removed (folders)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "state",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "changed",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "modifiedTime",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "modifiedBy",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

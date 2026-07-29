@@ -1,0 +1,221 @@
+{
+  "type": "SlackAccess",
+  "label": "Slack Access",
+  "description": "Sign in to a Slack workspace. Pick an existing connection or add one: one click on the built-in app, through your own Slack app, or by pasting a bot token (xoxb-...) you made yourself. Slack has ONE grant per app + workspace, so reconnecting or upgrading permissions rotates the shared connection every project follows. Event triggers (a message arriving) work through your own app's Socket Mode token, or through pushes to a weft that is reachable from the internet.",
+  "category": "Data",
+  "tags": [
+    "slack",
+    "access",
+    "oauth"
+  ],
+  "icon": "Slack",
+  "color": "#4A154B",
+  "service": {
+    "service": "slack",
+    "label": "Slack",
+    "grants": "exclusive",
+    "callback_https": true,
+    "acquisition": {
+      "kind": "oauth2",
+      "grant": {
+        "kind": "authorization_code",
+        "auth_url": "https://slack.com/oauth/v2/authorize",
+        "pkce": false
+      },
+      "token_url": "https://slack.com/api/oauth.v2.access",
+      "scope_delimiter": ",",
+      "captures": [
+        {
+          "name": "team",
+          "path": "team.name"
+        },
+        {
+          "name": "team_id",
+          "path": "team.id"
+        }
+      ],
+      "registration_fields": [
+        {
+          "name": "app_token",
+          "label": "App-level token (xapp-...)",
+          "optional": true,
+          "secret": true,
+          "placeholder": "xapp-... (only needed for event triggers; mint it under Basic Information > App-Level Tokens with the connections:write scope)"
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {token}"
+      }
+    ],
+    "test": {
+      "url": "https://slack.com/api/auth.test",
+      "method": "POST",
+      "captures": [
+        {
+          "name": "team",
+          "path": "team"
+        },
+        {
+          "name": "team_id",
+          "path": "team_id"
+        }
+      ]
+    },
+    "identity": "{team}",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "permissions": [
+      {
+        "id": "chat:write",
+        "label": "Send messages",
+        "description": "Post messages to channels the bot is in.",
+        "default": true
+      },
+      {
+        "id": "channels:read",
+        "label": "List public channels",
+        "description": "See the workspace's public channel list.",
+        "default": true
+      },
+      {
+        "id": "channels:history",
+        "label": "Read channel messages",
+        "description": "Read the message history of public channels the bot is in."
+      }
+    ],
+    "all_permissions_url": "https://docs.slack.dev/reference/scopes",
+    "permission_timing": "at_mint",
+    "verification": {
+      "rung": "reports_permissions",
+      "cost": "free"
+    },
+    "own_page": {
+      "paste": {
+        "fields": [
+          {
+            "name": "token",
+            "label": "Bot token",
+            "placeholder": "xoxb-..."
+          },
+          {
+            "name": "app_token",
+            "label": "App-level token (xapp-...)",
+            "optional": true,
+            "secret": true,
+            "placeholder": "xapp-... (only needed for event triggers)"
+          }
+        ]
+      },
+      "guide": {
+        "link": "https://api.slack.com/apps",
+        "steps": [
+          "Open api.slack.com/apps and click Create New App (From scratch), picking your workspace.",
+          "Under OAuth & Permissions, add the callback URL shown here as a Redirect URL.",
+          "Add these bot scopes: {permissions}.",
+          "Copy the Client ID and Client Secret from Basic Information into the fields below.",
+          "For event triggers, enable Socket Mode and mint an app-level token with the connections:write scope under Basic Information > App-Level Tokens; paste it in the app token field."
+        ]
+      }
+    },
+    "events": {
+      "messages": {
+        "fields": {
+          "type": "type",
+          "channel": "channel",
+          "user": "user",
+          "text": "text",
+          "bot": "bot_id",
+          "thread": "thread_ts",
+          "ts": "ts",
+          "workspace": "team"
+        },
+        "account": {
+          "value": "team_id",
+          "path": "team_id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {app_token}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url"
+              }
+            ]
+          },
+          "replies": [
+            {
+              "when_field": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "event_path": "payload.event",
+          "multi_account": true
+        },
+        "webhook": {
+          "handshake": {
+            "kind": "echo_body_field",
+            "path": "challenge"
+          },
+          "verify": {
+            "kind": "hmac",
+            "signature_header": "X-Slack-Signature",
+            "timestamp_header": "X-Slack-Request-Timestamp",
+            "concat": "v0:{timestamp}:{body}",
+            "prefix": "v0="
+          },
+          "event_path": "event"
+        }
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Workspace"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The workspace's access: wire it into Slack action nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "SlackAccess '{id}' has no connected workspace; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

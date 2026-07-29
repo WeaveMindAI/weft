@@ -412,6 +412,14 @@ export interface PortDefinition {
 	 *  The editor renders it as a ghost mirror of the carry output; the user
 	 *  edits the output's role to remove or rename it, never this side. */
 	synthesizedFromCarry?: boolean;
+	/** The permissions THIS consumer needs on the wired connection
+	 *  (Access-typed inputs only). Drives the live shortfall check. */
+	// SYNC: PortDefinition.requiresScopes <-> crates/weft-core/src/project.rs InputDefinition.requires_scopes
+	requiresScopes?: string[];
+	/** The stored VALUES THIS consumer needs on the wired connection
+	 *  (Access-typed inputs only). Drives the live shortfall check. */
+	// SYNC: PortDefinition.requiresValues <-> crates/weft-core/src/project.rs InputDefinition.requires_values
+	requiresValues?: string[];
 }
 
 // =============================================================================
@@ -437,13 +445,16 @@ export interface FieldDefinition {
 	options?: string[];
 	defaultValue?: unknown;
 	description?: string;
-	provider?: string; // For api_key fields: which runtime key the Credits mode uses
 	accept?: string; // For file_drop fields: narrows the type-derived HTML-accept filter
 	fileType?: string; // For file_drop fields: the declared weft file type (Image/Audio/.../File)
 	language?: string; // For code fields: the CodeMirror syntax ("python", "javascript", ...)
 	min?: number; // For number fields: minimum allowed value (clamped on blur)
 	max?: number; // For number fields: maximum allowed value (clamped on blur)
 	step?: number; // For number fields: granularity of the input (used by slider/number)
+	service?: string | null; // For access fields: the connected service (compiler-stamped)
+	access?: string; // For remote_select fields: the Access input authenticating sources needing one
+	sources?: import('../../../protocol').ResourceSource[]; // For remote_select fields: the fill sources, in preference order
+	dependsOn?: string[]; // For remote_select fields: parent inputs for drill-down
 }
 
 // =============================================================================
@@ -480,7 +491,7 @@ export interface NodeExecution {
 	costUnknown?: boolean;
 	/// Whose key this firing's cost records spent; 'mixed' when records
 	/// disagree (e.g. a group row aggregating both kinds of member).
-	costOrigin?: 'user-provided' | 'runtime' | 'mixed';
+	credentialOwner?: 'their-own' | 'ours' | 'mixed';
 	/// Identities of the cost records already folded into `costUsd` /
 	/// `costUnknown`. The dispatcher re-streams journal events on every
 	/// follow/reconnect (replay + live overlap), so the reducer dedups on
@@ -597,8 +608,14 @@ export interface NodeTemplate {
 	defaultInputs: PortDefinition[];
 	defaultOutputs: PortDefinition[];
 	features?: NodeFeatures;
-	setupGuide?: string[];
 	formFieldSpecs?: import('../utils/form-field-specs').FormFieldSpec[];
+	/** The service recipe, present ONLY on a personal access node;
+	 *  drives the connect flow's forms and scope menu. */
+	service?: import('../../../protocol').AccessSpecWire;
+	/** The project's OAuth apps (inherited from the package root),
+	 *  keyed by service name. An access node resolves its own app here
+	 *  and sends it on connect. */
+	accessApps?: Record<string, import('../../../protocol').AppRegistration>;
 	/** Dynamically resolve port types based on current port definitions.
 	 *  Returns overrides for input and output port types.
 	 *  Only needed for nodes with dynamic type behavior (Pack, Unpack, etc.). */

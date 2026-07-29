@@ -6,4 +6,5 @@
 //! trait, the route classification, the SSE tap helper) lives at the crate
 //! root, not here: this folder is only the concrete meters.
 
+pub mod elevenlabs;
 pub mod openrouter;

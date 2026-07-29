@@ -1,0 +1,43 @@
+{
+  "type": "TelegramSendMessage",
+  "label": "Telegram: Send Message",
+  "description": "Send a text message to a chat through the connected bot.",
+  "category": "Data",
+  "tags": [
+    "telegram",
+    "message",
+    "bot"
+  ],
+  "icon": "Send",
+  "color": "#229ED9",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Telegram bot access (wire a TelegramAccess node)."
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": true,
+      "label": "Chat ID",
+      "placeholder": "123456789 or @channelname",
+      "description": "The chat/channel to send to (the bot must be a member)."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "label": "Text"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "messageId",
+      "type": "Number",
+      "required": false,
+      "description": "The sent message's id."
+    }
+  ]
+}

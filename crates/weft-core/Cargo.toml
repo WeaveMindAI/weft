@@ -20,6 +20,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
 sha2 = { workspace = true }
+# `from_url` resource-source patterns are validated at metadata load, so
+# a typo'd extractor fails the node's metadata parse, not a later paste.
+regex = { workspace = true }
 # Runtime-only deps, gated behind the `runtime` feature (default on). The
 # language TYPE layer (project/node/weft_type/...) that the compiler's
 # parse+validate path needs does NOT use any of these, so a parse-only consumer
@@ -39,13 +42,28 @@ cron = { version = "0.12", optional = true }
 # base64url payload.
 hmac = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-# The metered-client capability (`ctx.metered_client`): the paid-call HTTP
+# OAuth 1.0a request signing (`access::client`): HMAC-SHA1 by spec.
+sha1 = { workspace = true, optional = true }
+# Asymmetric push-verification schemes (`access::verify`): Ed25519
+# (Discord's scheme) and ECDSA P-256 (SendGrid's scheme).
+ed25519-dalek = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+# The connection-client capability (`ctx.open` / `ctx.client`): the HTTP
 # client type named in the `ContextHandle` trait. Runtime-only (no wasm32
 # support needed).
 reqwest-middleware = { workspace = true, optional = true }
 # The plain outbound HTTP capability (`ctx.http()`): the one shared, pooled
 # client for unpaid calls, so nodes never construct their own.
 reqwest = { workspace = true, optional = true }
+# The personal-access auth pipeline (`access::client`): URL surgery for
+# query/path transforms, and the middleware's Extensions type.
+url = { workspace = true, optional = true }
+http = { version = "1", optional = true }
+# Raw outbound pipes (`net`): TLS over TCP with the system's trust roots,
+# for everything that holds a non-HTTP connection (the listener's raw-pipe
+# engine, node code handing a connected stream to a protocol library).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [features]
 default = ["runtime"]
@@ -60,8 +78,15 @@ runtime = [
     "dep:cron",
     "dep:hmac",
     "dep:base64",
+    "dep:sha1",
+    "dep:ed25519-dalek",
+    "dep:p256",
     "dep:reqwest-middleware",
     "dep:reqwest",
+    "dep:url",
+    "dep:http",
+    "dep:tokio-rustls",
+    "dep:rustls-native-certs",
 ]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into

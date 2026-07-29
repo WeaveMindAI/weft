@@ -1,20 +1,14 @@
 //! Authoritative mapping from k8s namespace name to tenant id.
 //!
 //! The broker's TokenReview path uses the caller's namespace to
-//! determine which tenant they belong to. Parsing the namespace
-//! string is brittle: it works as long as the dispatcher is the
-//! only writer (its `name_for` collapses dash runs so `--` is the
-//! unambiguous separator), but it relies on a k8s RBAC invariant
-//! that tenant pods can't create their own namespaces. If that
-//! invariant ever leaks, an attacker could hand-craft a
-//! `wft-project-eve--alice--proj1` namespace and the parser would
-//! happily call them tenant `eve` with project `alice--proj1`.
+//! determine which tenant they belong to. This table is the
+//! authoritative source for that mapping: the tenant id is READ from a
+//! row, never parsed out of the namespace string (a string parse would
+//! depend on formatting invariants and is not a source of truth).
 //!
-//! This table is the database of record. Dispatcher writes a row
-//! on every namespace creation (tenant + project). Broker looks
-//! up the namespace here and reads the tenant_id from the row.
-//! No parsing. An attacker-created namespace with no row in this
-//! table fails authentication outright.
+//! Dispatcher writes a row on every namespace creation (tenant +
+//! project). Broker looks the namespace up here and reads the tenant_id
+//! from the row. A namespace with no row fails authentication outright.
 
 use anyhow::Result;
 use sqlx::postgres::PgPool;

@@ -17,6 +17,10 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
+# The ElevenLabs session observer reads the session URL's query (audio
+# format, add-on flags): the negotiated parameters price the bytes.
+url = { workspace = true }
 # The OpenRouter meter's billing ceiling: the request body is the JSON
 # minillmlib serialized, so its conversation deserializes straight back and
 # the lib's own deliberately-high estimator prices it (`estimate` feature).
@@ -24,3 +28,4 @@ minillmlib = { version = "0.5.7", features = ["estimate"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+base64 = { workspace = true }

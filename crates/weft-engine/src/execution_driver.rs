@@ -1305,11 +1305,26 @@ async fn drive(
             // delivered (wired pulses + body literals), the remaining
             // braces config values, and declared defaults for whatever
             // is still absent (a closed wire is never defaulted).
-            let inputs = weft_core::context::node_input_bag(
+            let inputs = match weft_core::context::node_input_bag(
                 node_def,
                 group.input.as_object().cloned().unwrap_or_default(),
                 &group.closed_ports,
-            );
+            ) {
+                Ok(bag) => bag,
+                // A broken spec or malformed widget handle: the node
+                // fails loud instead of running on a bag it can never
+                // read correctly.
+                Err(err) => {
+                    let mentioned = std::collections::HashSet::new();
+                    handle_node_failure(
+                        &node_id, &mentioned, group.color, &group.frames, &err,
+                        project, edge_idx, pulses, executions, journal, pod_name,
+                        phase_scope.as_ref(),
+                    )
+                    .await;
+                    continue;
+                }
+            };
             // Hand the per-(node, frames) await sequence to the
             // handle. The body's `await_signal` calls pop entries
             // in call_index order: resolved entries replay
@@ -1354,6 +1369,10 @@ async fn drive(
             let runner_for_close = runner.clone();
             let handle = runner as Arc<dyn weft_core::context::ContextHandle>;
 
+            // Input values for provisioning: the same one bag the
+            // run-time dispatch built above, so provision bodies read
+            // the same view a `run` body would.
+            let provision_input = inputs.clone();
             let ctx = ExecutionContext::new(
                 exec_id.to_string(),
                 project.id.to_string(),
@@ -1411,14 +1430,6 @@ async fn drive(
             let provision_tenant_id = tenant_id.to_string();
             let provision_namespace = namespace.to_string();
             let provision_clients = clients.clone();
-            // Input values for provisioning (the same one-bag build the
-            // run-time dispatch uses, so provision bodies read the same
-            // view a `run` body would).
-            let provision_input = weft_core::context::node_input_bag(
-                node_def,
-                group.input.as_object().cloned().unwrap_or_default(),
-                &group.closed_ports,
-            );
             let abort_handle = in_flight.spawn(async move {
                 if is_infra_setup_provision {
                     // 1. Call the node's provision body.

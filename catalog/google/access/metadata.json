@@ -1,0 +1,189 @@
+{
+  "type": "GoogleAccess",
+  "label": "Google Access",
+  "description": "Sign in to a Google account, once, for everything Google. Pick an existing connection or add one; what a connection can DO is the permissions it was granted, shown in the list. The permission list grows with the nodes that need more.",
+  "category": "Data",
+  "tags": [
+    "google",
+    "drive",
+    "sheets",
+    "calendar",
+    "access",
+    "oauth"
+  ],
+  "icon": "HardDrive",
+  "color": "#1FA463",
+  "service": {
+    "service": "google",
+    "label": "Google",
+    "grants": "coexisting",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "acquisition": {
+      "kind": "oauth2",
+      "grant": {
+        "kind": "authorization_code",
+        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "pkce": true
+      },
+      "token_url": "https://oauth2.googleapis.com/token",
+      "auth_params": {
+        "access_type": "offline",
+        "prompt": "consent"
+      }
+    },
+    "permissions": [
+      {
+        "id": "https://www.googleapis.com/auth/drive.file",
+        "label": "Files you pick",
+        "description": "Read and write only the files you pick or this project creates.",
+        "default": true
+      },
+      {
+        "id": "https://www.googleapis.com/auth/drive.readonly",
+        "label": "Read all of Drive",
+        "description": "Read every file the account can see (needed to browse or search Drive)."
+      }
+    ],
+    "all_permissions_url": "https://developers.google.com/identity/protocols/oauth2/scopes",
+    "permission_timing": "at_approve",
+    "verification": {
+      "rung": "reports_permissions",
+      "cost": "free"
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {token}"
+      }
+    ],
+    "test": {
+      "url": "https://www.googleapis.com/drive/v3/about?fields=user",
+      "captures": [
+        {
+          "name": "user_email",
+          "path": "user.emailAddress"
+        }
+      ]
+    },
+    "identity": "{user_email}",
+    "own_page": {
+      "guide": {
+        "link": "https://console.cloud.google.com/apis/credentials",
+        "steps": [
+          "Open the Google Cloud Console credentials page and create an OAuth 2.0 Client ID (Web application).",
+          "Enable the APIs your permissions need (Drive, Sheets, Calendar) under APIs & Services.",
+          "Add the callback URL shown here as an Authorized redirect URI.",
+          "On the consent screen, allow these scopes: {permissions}.",
+          "Copy the Client ID and Client Secret into the fields below."
+        ]
+      }
+    },
+    "events": {
+      "drive_changes": {
+        "fields": {
+          "state": "header:X-Goog-Resource-State",
+          "changed": "header:X-Goog-Changed",
+          "resource": "header:X-Goog-Resource-Id",
+          "resourceUri": "header:X-Goog-Resource-URI",
+          "messageNumber": "header:X-Goog-Message-Number"
+        },
+        "account": {
+          "value": "user_email",
+          "path": "header:X-Goog-Channel-Token"
+        },
+        "webhook": {
+          "verify": {
+            "kind": "token_echo"
+          },
+          "route_by": "subscription",
+          "id_path": "header:X-Goog-Channel-ID",
+          "token_path": "header:X-Goog-Channel-Token",
+          "subscribe": {
+            "subscribe": {
+              "url": "https://www.googleapis.com/drive/v3/files/{target}/watch?supportsAllDrives=true",
+              "method": "POST",
+              "body": {
+                "id": "{subscription_id}",
+                "type": "web_hook",
+                "address": "{receiver_url}",
+                "token": "{subscription_token}"
+              },
+              "auth": [
+                {
+                  "kind": "header",
+                  "name": "Authorization",
+                  "value": "Bearer {token}"
+                }
+              ],
+              "captures": [
+                {
+                  "name": "expires_at",
+                  "path": "expiration"
+                },
+                {
+                  "name": "resource_id",
+                  "path": "resourceId"
+                }
+              ]
+            },
+            "unsubscribe": {
+              "url": "https://www.googleapis.com/drive/v3/channels/stop",
+              "method": "POST",
+              "body": {
+                "id": "{subscription_id}",
+                "resourceId": "{resource_id}"
+              },
+              "auth": [
+                {
+                  "kind": "header",
+                  "name": "Authorization",
+                  "value": "Bearer {token}"
+                }
+              ]
+            },
+            "renew_margin_secs": 600
+          }
+        }
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The Google access: wire it into Google action nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "GoogleAccess '{id}' has no connected account; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+[package]
+name = "weft-access-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Gates the Layer-3 DB tests that need a real Postgres via `#[sqlx::test]`
+# + $DATABASE_URL. OFF by default so `cargo test --workspace` is green on
+# any machine without Postgres.
+db-tests = []
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }
+# The token exchanges (OAuth code/refresh, MintJwt exchange), test calls,
+# and resource lookups all go out through the shared auth pipeline in
+# weft-core (`access::client`), so a lookup is authenticated exactly like
+# a worker call.
+reqwest = { workspace = true }
+weft-core = { workspace = true }
+# MintJwt acquisitions (GitHub App class): RS256 over the pasted private
+# key, exchanged for the working token at resolution time.
+jsonwebtoken = "9"
+# Per-subscription secret mint (the token a push must echo back).
+rand = "0.8"
+# At-rest sealing of stored credential material (crypt.rs).
+aes-gcm = { workspace = true }
+
+[dev-dependencies]
+weft-core = { workspace = true }
+# The layer-3 tests' fake provider is a tiny in-process HTTP server.
+axum = { workspace = true }
+anyhow = { workspace = true }

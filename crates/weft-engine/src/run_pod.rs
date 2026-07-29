@@ -181,6 +181,7 @@ pub async fn run_pod(
     connection_port: u16,
     token_secret: Option<Vec<u8>>,
 ) -> Result<()> {
+    weft_core::net::install_crypto_provider();
     let shutdown = Arc::new(AtomicBool::new(false));
     let cancel_registry: CancelRegistry = Arc::new(Mutex::new(HashMap::new()));
 
@@ -372,18 +373,14 @@ impl BrokerCallerJournal {
     }
 }
 
-/// Project an `OutboundChunk`/`InboundMessage` into the journal payload +
-/// size + sha prefix, mirroring the bus's metadata. Journaled mode stores
-/// the full value; ephemeral would store metadata-only (live connections
-/// default journaled today, so always full; the ephemeral window is a
-/// follow-on once big-stream triggers exist).
-fn caller_payload(
-    value: serde_json::Value,
-) -> (weft_core::primitive::JournaledPayload, u64, [u8; 8]) {
-    // Same metadata derivation the bus uses (one shared helper in core), so
-    // the size/hash shape never drifts between the two journaled-event paths.
-    let (size, prefix) = weft_core::primitive::payload_metadata(&value);
-    (weft_core::primitive::JournaledPayload::Journaled { value }, size, prefix)
+/// Project an `OutboundChunk`/`InboundMessage` into the journal payload
+/// plus its byte size, using the same tagged `WirePayload` vocabulary
+/// (and the same size derivation) as the bus's window rows, so the two
+/// journaled-event paths can never drift.
+fn caller_payload(value: serde_json::Value) -> (weft_core::bus::WirePayload, u64) {
+    let payload = weft_core::bus::WirePayload::Json(value);
+    let size = payload.byte_size();
+    (payload, size)
 }
 
 fn inbound_to_value(msg: &InboundMessage) -> serde_json::Value {
@@ -412,13 +409,12 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
         });
     }
     fn inbound(&self, color: Color, offset: u64, msg: &weft_core::caller::InboundMessage) {
-        let (payload, size, prefix) = caller_payload(inbound_to_value(msg));
+        let (payload, size) = caller_payload(inbound_to_value(msg));
         self.emit(weft_journal::ExecEvent::CallerInbound {
             color,
             offset,
             payload,
             payload_byte_size: size,
-            payload_sha256_prefix: prefix,
             at_unix: crate::now_unix(),
         });
     }
@@ -429,13 +425,12 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
         chunk: &weft_core::caller::OutboundChunk,
         terminal: bool,
     ) {
-        let (payload, size, prefix) = caller_payload(outbound_to_value(chunk));
+        let (payload, size) = caller_payload(outbound_to_value(chunk));
         self.emit(weft_journal::ExecEvent::CallerOutbound {
             color,
             offset,
             payload,
             payload_byte_size: size,
-            payload_sha256_prefix: prefix,
             terminal,
             at_unix: crate::now_unix(),
         });
