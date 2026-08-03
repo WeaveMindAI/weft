@@ -6,13 +6,13 @@ A reference for contributors. These are the opinions that guide every decision i
 
 ## Coordination, not replacement
 
-Weft coordinates things, it does not replace them. LLMs, databases, APIs, humans, code execution: these are primitives in the language, not libraries. Each node is implemented in Rust. Weft handles how they connect, type-check, and execute.
+Weft coordinates things rather than replacing them. LLMs, databases, APIs, humans, code execution: these are primitives in the language, not libraries. Each node is implemented in Rust. Weft handles how they connect, type-check, and execute.
 
 The surface area of the language is small on purpose. You learn the core once, then you compose. Everything interesting is in the nodes.
 
 ## If it compiles, the architecture is sound
 
-Same philosophy as Rust's memory safety, but for system architecture. The compiler validates:
+Rust's memory-safety philosophy, applied to system architecture. The compiler validates:
 
 - **Connections.** Types match at every edge. String into Number is a compile error. Generics, unions, and type variables are all resolved before the program runs.
 - **Completeness.** Every required input is wired. Orphan nodes are flagged. A dangling LLM call is a compile error, not a runtime surprise.

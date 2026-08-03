@@ -1,6 +1,8 @@
 # Weft
 
-## Main branch is inactive because Weft is being actively rebuilt in the mvp branch, plan release August 2026. You can follow the build, feel free to send feedback on discord this would be greatly appreciated
+## Status
+
+The main branch is inactive — Weft is being rebuilt in the `mvp` branch, with a release planned for August 2026. You can follow the build and send feedback on [Discord](https://discord.com/invite/FGwNu6mDkU); it would be greatly appreciated.
 
 > **Building in public, two months in.** Weft is young. The language, the type system, and the durable executor are the stable parts. The node catalog is small and intentionally opinionated (a few dozen nodes across LLM, code, communication, flow, storage, and triggers). The long-term vision is to let projects define their own nodes fluently in the language itself, but that is still ahead. If you are evaluating it for production, treat it as a foundation to build on, not a finished product. Breaking changes are expected while the shape is still settling; they will be announced, and migration notes will come with them.
 >
@@ -8,16 +10,16 @@
 
 **A programming language for AI systems.**
 
-In 2026, real software calls LLMs, spins up databases, waits for humans, browses the web, coordinates agents. Where are those primitives? You are still importing libraries and writing plumbing for things that should be one line.
+Modern software calls LLMs, spins up databases, waits for humans, browses the web, and coordinates agents. Those capabilities should be one line — but today they mean importing libraries and writing plumbing.
 
-Weft is a language where LLMs, humans, APIs, and infrastructure are base ingredients. You wire them together, the compiler checks the architecture, and you get a visual graph of your program automatically. No plumbing.
+Weft makes LLMs, humans, APIs, and infrastructure the base ingredients of the language. Wire them together, let the compiler check the architecture, and get a visual graph of your program automatically.
 
 - **First-class humans.** Pause mid-program, send a form to a human, wait days, resume exactly where you left off. One node. No webhooks, no polling, no state management.
 - **Recursively foldable.** Any group of nodes collapses into a single node with a described interface. A 100-node system still looks like 5 blocks at the top level.
 - **Typed end to end.** Generics, unions, type variables, null propagation. The compiler catches missing connections, type mismatches, and broken architecture before anything runs.
 - **Durable execution.** Programs survive crashes and restarts via [Restate](https://restate.dev). A human approval that takes three days is the same code as one that takes three seconds.
-- **Built-in nodes.** LLM, Code, HTTP, Human Query, Gate, Template, Discord, Slack, Telegram, WhatsApp, Email, X, Postgres, Memory, Apollo, Web Search, and more, the end goal will be to allow AI to build custom node on the fly using the langauge features (this is not the case right now).
-- **Two native views.** Same program, rendered as dense code for AI builders and as a graph for humans. Edit either, the other updates. Nothing is bolted on.
+- **Built-in nodes.** LLM, Code, HTTP, Human Query, Gate, Template, Discord, Slack, Telegram, WhatsApp, Email, X, Postgres, Memory, Apollo, Web Search, and more. The end goal is to let AI build custom nodes on the fly using the language's own features — that is not possible yet.
+- **Two native views.** The same program renders as dense code for AI builders and as a graph for humans. Edit either, the other updates.
 
 Read the full story: [The Future of Programming (and Why I'm Building a New Language)](https://weavemind.ai/blog/future-of-programming).
 
