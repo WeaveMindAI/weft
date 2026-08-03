@@ -17,15 +17,15 @@ fi
 #   bash catalog-link.sh --copy    # copy mode (CI/CD, Docker builds)
 #
 # Naming convention:
-#   - Folders prefixed with ":" contribute their name (without ":") as a prefix.
+#   - Folders prefixed with "_" contribute their name (without "_") as a prefix.
 #   - The leaf folder name is the suffix.
 #   - Joined with "-" to form the canonical node name (kebab-case).
-#   - Example: catalog/communication/:discord/send/ → "discord-send"
+#   - Example: catalog/communication/_discord/send/ → "discord-send"
 #
 # Files handled:
 #   - backend.rs  → linked into crates/weft-nodes/src/nodes/{snake_case}/mod.rs
 #   - frontend.ts → linked into dashboard/src/lib/nodes/{kebab-case}.ts
-#   - lib.rs      → linked as {prefix}_lib/mod.rs (Rust) using the parent :prefix folder name
+#   - lib.rs      → linked as {prefix}_lib/mod.rs (Rust) using the parent _prefix folder name
 #   - sidecar/    → linked as sidecars/{resolved-name}/ (directory)
 #   - Extra files (e.g. .py) in catalog node dirs → linked into the Rust node folder
 #
@@ -138,7 +138,7 @@ to_snake_case() {
 }
 
 # --- Walk the catalog and resolve names ---
-# For each file, we walk up from its directory to catalog/ collecting :prefix segments.
+# For each file, we walk up from its directory to catalog/ collecting _prefix segments.
 resolve_name() {
     local file_path="$1"
     local dir="$(dirname "$file_path")"
@@ -153,9 +153,9 @@ resolve_name() {
     local leaf=""
 
     for seg in "${segments[@]}"; do
-        if [[ "$seg" == :* ]]; then
-            # This is a prefix folder, strip the ":" and accumulate
-            prefixes+=("${seg#:}")
+        if [[ "$seg" == _* ]]; then
+            # This is a prefix folder, strip the "_" and accumulate
+            prefixes+=("${seg#_}")
         else
             # Non-prefix folder, this could be the leaf or just organizational
             leaf="$seg"
@@ -164,7 +164,7 @@ resolve_name() {
 
     if [[ "$filename" == "lib.rs" ]]; then
         # lib.rs files: name = last_prefix + "_lib"
-        # e.g., :email/lib.rs → email_lib
+        # e.g., _email/lib.rs → email_lib
         if [[ ${#prefixes[@]} -gt 0 ]]; then
             local last_prefix="${prefixes[-1]}"
             echo "$(to_snake_case "$last_prefix")_lib"
@@ -348,8 +348,8 @@ def walk_tree(path, rel=''):
         if entry in ('examples',):
             continue
 
-        display_name = entry.lstrip(':')
-        is_prefix = entry.startswith(':')
+        display_name = entry.lstrip('_')
+        is_prefix = entry.startswith('_')
         child_rel = f'{rel}/{display_name}' if rel else display_name
 
         # Check if this is a leaf node (has backend.rs or frontend.ts)
