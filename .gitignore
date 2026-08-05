@@ -26,7 +26,7 @@ node_modules/
 
 # Codegen-emitted builder-base warm-up crate (emitted by
 # `codegen::emit_warmup_crate` at build time; regenerated, never hand-edited).
-.weft-warmup/
+.weft-base-context/
 
 # VS Code extension build output
 extension-vscode/out/

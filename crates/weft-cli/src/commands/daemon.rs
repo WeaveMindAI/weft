@@ -648,10 +648,10 @@ async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltIma
     // Only the dispatcher stages `catalog/` (describe / compile
     // endpoints); the others must not rebuild on a catalog edit.
     let (dispatcher, listener, broker, supervisor, ()) = tokio::join!(
-        images::ensure_system_image(&cfg.dispatcher_image, "dispatcher.Dockerfile", &["catalog"], rebuild),
-        images::ensure_system_image(&cfg.listener_image, "listener.Dockerfile", &[], rebuild),
-        images::ensure_system_image(&cfg.broker_image, "broker.Dockerfile", &[], rebuild),
-        images::ensure_system_image(&cfg.supervisor_image, "infra-supervisor.Dockerfile", &[], rebuild),
+        images::ensure_system_image(&cfg.dispatcher_image, "dispatcher", &["catalog"], rebuild),
+        images::ensure_system_image(&cfg.listener_image, "listener", &[], rebuild),
+        images::ensure_system_image(&cfg.broker_image, "broker", &[], rebuild),
+        images::ensure_system_image(&cfg.supervisor_image, "supervisor", &[], rebuild),
         worker_base_prewarm,
     );
     let mut failures: Vec<String> = Vec::new();

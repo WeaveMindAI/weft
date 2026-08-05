@@ -126,6 +126,14 @@ pub async fn sweep_leftovers() -> Result<()> {
         .await?
         .sweep_e2e_clones()
         .await?;
+    // Leftover worker IMAGES: with the projects above gone, their
+    // content-addressed `weft-worker:<hash>` images reference nothing and
+    // would pile up run after run. The CLI's reclaim verb removes every
+    // image no live project runs (host docker + the kind node's cache),
+    // so each test starts with only the images of what actually exists.
+    // A failed test's image survives with its project until the NEXT run's
+    // sweep, same as every other piece of its post-mortem state.
+    cli_ok(&repo_root()?, &["clean", "--images", "--all"]).await?;
     Ok(())
 }
 

@@ -536,6 +536,127 @@ pub fn fixed_worker_deps() -> BTreeMap<String, toml::Value> {
     deps
 }
 
+/// The workspace crates a worker build actually links: the closure of local
+/// path dependencies reachable from `fixed_worker_deps()`, resolved by reading
+/// the real crate manifests under `<weft_root>/crates/`. This is the ONLY set
+/// the builder base bakes, the worker build context stages, and the worker /
+/// infra / builder-base hashes cover; every other workspace crate (CLI,
+/// dispatcher, tests, ...) is invisible to worker builds, so editing it never
+/// invalidates a worker image or the builder base.
+///
+/// Resolution walks `[dependencies]` + `[build-dependencies]` (including
+/// per-`[target.*]` variants) and follows both direct `path = "..."` entries
+/// and `workspace = true` entries whose `[workspace.dependencies]` definition
+/// carries a path. Dev-dependencies are deliberately excluded: cargo ignores
+/// the dev-dependencies of a path dependency, so they never reach a worker
+/// build. Returned sorted for deterministic hashing / staging.
+pub fn worker_workspace_crates(weft_root: &Path) -> CompileResult<Vec<String>> {
+    let seeds: Vec<String> = fixed_worker_deps()
+        .values()
+        .filter_map(|spec| spec.get("path").and_then(|v| v.as_str()))
+        .filter_map(crate_dir_name)
+        .collect();
+    workspace_crate_closure(weft_root, &seeds)
+}
+
+/// Closure of local path dependencies reachable from `seeds` (crate DIR names
+/// under `<weft_root>/crates/`), resolved by reading the real crate manifests.
+/// The generic brain behind `worker_workspace_crates` (seeded from the worker's
+/// fixed deps) and the CLI's system-image staleness stamps (seeded from the
+/// four system binaries). See `worker_workspace_crates` for the resolution
+/// rules (dependencies + build-dependencies, dev-dependencies excluded).
+pub fn workspace_crate_closure(
+    weft_root: &Path,
+    seeds: &[String],
+) -> CompileResult<Vec<String>> {
+    let root_manifest = parse_manifest(&weft_root.join("Cargo.toml"))?;
+    // Dependency NAME -> crate DIR name, from the root manifest's
+    // `[workspace.dependencies]` path entries, for `workspace = true` deps.
+    let mut ws_paths: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(deps) = root_manifest
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        for (name, spec) in deps {
+            if let Some(dir) = spec
+                .get("path")
+                .and_then(|v| v.as_str())
+                .and_then(crate_dir_name)
+            {
+                ws_paths.insert(name.clone(), dir);
+            }
+        }
+    }
+
+    let mut pending: Vec<String> = seeds.to_vec();
+    let mut closure: BTreeSet<String> = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !closure.insert(name.clone()) {
+            continue;
+        }
+        let manifest = parse_manifest(&weft_root.join("crates").join(&name).join("Cargo.toml"))?;
+        for table in dependency_tables(&manifest) {
+            for (dep_name, spec) in table {
+                if let Some(dir) = spec
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate_dir_name)
+                {
+                    pending.push(dir);
+                } else if spec.get("workspace").and_then(|v| v.as_bool()) == Some(true) {
+                    if let Some(dir) = ws_paths.get(dep_name) {
+                        pending.push(dir.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(closure.into_iter().collect())
+}
+
+/// Last path component of a dependency `path = "..."` value: every worker-linked
+/// local crate lives directly under `crates/`, so the final component IS the
+/// crate's directory name whether the path is root-relative (`crates/weft-core`),
+/// sibling-relative (`../weft-infra`), or container-absolute
+/// (`../weft/crates/weft-engine`).
+fn crate_dir_name(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+}
+
+fn parse_manifest(path: &Path) -> CompileResult<toml::Value> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        CompileError::Build(format!("read manifest {}: {e}", path.display()))
+    })?;
+    raw.parse::<toml::Value>()
+        .map_err(|e| CompileError::Build(format!("parse manifest {}: {e}", path.display())))
+}
+
+/// `[dependencies]` + `[build-dependencies]` tables of a crate manifest,
+/// including per-`[target.<cfg>]` variants. Dev-dependencies excluded (see
+/// `worker_workspace_crates`).
+fn dependency_tables(manifest: &toml::Value) -> Vec<&toml::value::Table> {
+    let mut out = Vec::new();
+    for key in ["dependencies", "build-dependencies"] {
+        if let Some(t) = manifest.get(key).and_then(|v| v.as_table()) {
+            out.push(t);
+        }
+    }
+    if let Some(targets) = manifest.get("target").and_then(|v| v.as_table()) {
+        for cfg_tables in targets.values() {
+            for key in ["dependencies", "build-dependencies"] {
+                if let Some(t) = cfg_tables.get(key).and_then(|v| v.as_table()) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Emit the builder-base WARM-UP crate at `crate_root`: a minimal binary crate
 /// whose dependencies are EXACTLY `fixed_worker_deps()` (no per-project
 /// `pkg_<node>`), plus a `main.rs` that references the engine so cargo actually
@@ -951,7 +1072,34 @@ impl NodeCatalog for CatalogRef {{
 #[cfg(test)]
 mod tests {
     use super::collect_node_types;
-    use super::{emit_warmup_crate, fixed_worker_deps};
+    use super::{emit_warmup_crate, fixed_worker_deps, worker_workspace_crates};
+
+    /// The worker crate closure on THIS repo. Not a tautology check: the
+    /// closure is computed from the real manifests, so this pins the expected
+    /// result and forces a conscious look when a workspace crate enters or
+    /// leaves the worker's dependency tree (each entry widens what the builder
+    /// base bakes and what invalidates every worker image).
+    #[test]
+    fn worker_crate_closure_is_the_expected_set() {
+        let weft_root = crate::build::resolve_weft_root().expect("resolve weft root");
+        let closure = worker_workspace_crates(&weft_root).expect("compute closure");
+        assert_eq!(
+            closure,
+            vec![
+                "weft-broker-client".to_string(),
+                "weft-core".to_string(),
+                "weft-engine".to_string(),
+                "weft-infra".to_string(),
+                "weft-journal".to_string(),
+                "weft-node-derive".to_string(),
+                "weft-platform-traits".to_string(),
+                "weft-providers".to_string(),
+                "weft-task-store".to_string(),
+            ],
+            "worker crate closure changed; confirm the new set is really \
+             worker-linked, then update this pin"
+        );
+    }
 
     /// The warm-up crate's dependencies MUST be exactly the project-independent
     /// `fixed_worker_deps`: if they drift, the builder base precompiles a

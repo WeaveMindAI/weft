@@ -30,11 +30,19 @@
 # correctly partitioned.
 #
 # Rebuild trigger: the base image tag is content-addressed on the
-# workspace source (`crates/`, `Cargo.toml`, `Cargo.lock`,
-# `rust-toolchain.toml`) plus this Dockerfile (see
+# WORKER CRATE CLOSURE (`codegen::worker_workspace_crates`: the only
+# workspace crates a worker links) plus `Cargo.toml`, `Cargo.lock`,
+# `rust-toolchain.toml` and this Dockerfile (see
 # `hash::compute_builder_base_hash`). Edit the engine and the tag
 # changes, so the setup script rebuilds this base and per-project
-# worker Dockerfiles automatically `FROM` the new tag.
+# worker Dockerfiles automatically `FROM` the new tag; edit a
+# non-worker crate (CLI, dispatcher, tests) and nothing here moves.
+#
+# Build context: NOT the repo root. The CLI stages
+# `.weft-base-context/` (`build::stage_builder_base_context`) holding
+# exactly the closure crates, a workspace manifest scoped to them, the
+# lock, the toolchain pin, and the generated warm-up crate. The COPY
+# paths below read from that staged layout.
 
 FROM debian:bookworm-slim
 
@@ -68,12 +76,40 @@ COPY crates ./crates
 # (same fixed deps, same lock, same target dir, also at `/work`) reuses them and
 # compiles only its `pkg_<node>` crates + the thin top crate.
 #
-# The target dir is baked as a real image layer (NOT a `--mount=type=cache`):
-# the per-project build mounts its own registry cache, so anything written under
-# a cache-mount path here would be shadowed and wasted. The toolchain
-# materializes implicitly on this first `cargo` invocation (rustup reads
-# `rust-toolchain.toml`).
+# The compile runs against a PERSISTENT cache mount and the result is
+# then copied into `/weft/target` as a real image layer. Two reasons
+# for that split:
+#   - the layer: per-project builds point CARGO_TARGET_DIR at
+#     `/weft/target`, so the precompiled rlibs must live in the image
+#     itself (a cache mount would be invisible to them);
+#   - the cache: successive base builds (every engine edit mints a new
+#     content-addressed tag) reuse the previous build's artifacts, so
+#     an engine edit recompiles only the crates it touched instead of
+#     the whole dependency tree from cold. Fingerprints stay valid
+#     across builds because the staging preserves source mtimes and
+#     the in-container paths (/weft, /work) never change.
+#
+# `{{target_cache_key}}` is substituted by the staging step
+# (`build::stage_builder_base_context`) with a hash of Cargo.lock +
+# rust-toolchain.toml: a lock or toolchain change starts a FRESH cache
+# instead of inheriting the old one. Without the key, the cache (and
+# therefore the baked layer, since the whole cache is copied in)
+# accumulates every dependency version and toolchain ever built:
+# cargo never removes superseded artifacts, so the image would grow
+# without bound across months of iteration.
+#
+# The registry cache id is the base's own, NOT shared with per-project
+# worker builds: both sides mount `sharing=locked`, so a shared id
+# would serialize a minutes-long base rebuild against every concurrent
+# worker build. The one-time cost is re-fetching the crates.io
+# artifacts this build needs into its own cache.
+# The toolchain materializes implicitly on this first `cargo`
+# invocation (rustup reads `rust-toolchain.toml`).
 COPY .weft-warmup /work
-RUN cp /weft/Cargo.lock /work/Cargo.lock \
+RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=weft-builder-base-target-{{target_cache_key}},target=/cache/target,sharing=locked \
+    cp /weft/Cargo.lock /work/Cargo.lock \
     && cd /work \
-    && CARGO_TARGET_DIR=/weft/target cargo build --release
+    && CARGO_TARGET_DIR=/cache/target cargo build --release \
+    && mkdir -p /weft/target \
+    && cp -a /cache/target/. /weft/target/

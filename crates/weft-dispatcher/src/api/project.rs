@@ -52,6 +52,68 @@ pub struct ProjectSummary {
     pub status: String,
 }
 
+impl From<crate::project_store::StoredProjectSummary> for ProjectSummary {
+    fn from(p: crate::project_store::StoredProjectSummary) -> Self {
+        Self {
+            id: p.id.to_string(),
+            name: p.name,
+            description: p.description,
+            status: p.status.as_str().to_string(),
+        }
+    }
+}
+
+/// `GET /images/referenced`: every worker-image tag suffix the system still
+/// needs, across ALL tenants. The union of each project's
+/// `running_binary_hash` (what a fresh spawn would run), the `binary_hash`
+/// of every non-terminal worker pod (a pod draining in-flight work may
+/// still run an image its project no longer points at), and the
+/// `binary_hash` stamped on every pending/claimed task (a task can outlive
+/// both the project pointer and its pod between a resync and the
+/// cold-start sweep that fails superseded tasks). THE authority image
+/// reclamation deletes against: `weft clean --images` keeps exactly this
+/// set and reclaims everything else, so under-reporting here deletes an
+/// image something still runs.
+///
+/// Control-plane only: the set spans every tenant, so no single tenant may
+/// read it (a public build-activity oracle otherwise).
+// SYNC: response shape (JSON array of bare hash strings) <->
+//       crates/weft-cli/src/commands/executions.rs clean_worker_images
+pub async fn referenced_images(
+    State(state): State<DispatcherState>,
+    _ops: crate::authenticator::ControlPlaneCaller,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    referenced_image_hashes(&state.pg_pool)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("referenced images: {e}"),
+            )
+        })
+}
+
+/// The query behind `GET /images/referenced` (see `referenced_images` for
+/// the contract). Split out so the layer-3 db tests exercise the exact SQL
+/// the endpoint serves.
+pub async fn referenced_image_hashes(pool: &sqlx::PgPool) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT running_binary_hash FROM project \
+         WHERE running_binary_hash IS NOT NULL AND running_binary_hash <> '' \
+         UNION \
+         SELECT DISTINCT binary_hash FROM worker_pod \
+         WHERE terminal_at_unix IS NULL AND binary_hash <> '' \
+         UNION \
+         SELECT DISTINCT binary_hash FROM task \
+         WHERE status IN ('pending', 'claimed') \
+           AND binary_hash IS NOT NULL AND binary_hash <> ''",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(h,)| h).collect())
+}
+
 pub async fn list(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -61,17 +123,7 @@ pub async fn list(
         .list(caller.0.as_str())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list projects: {e}")))?;
-    Ok(Json(
-        items
-            .into_iter()
-            .map(|p| ProjectSummary {
-                id: p.id.to_string(),
-                name: p.name,
-                description: p.description,
-                status: p.status.as_str().to_string(),
-            })
-            .collect(),
-    ))
+    Ok(Json(items.into_iter().map(ProjectSummary::from).collect()))
 }
 
 /// Payload accepted by `POST /projects`. The client (CLI) sends an
@@ -128,12 +180,7 @@ pub fn register_internal_error(msg: String) -> (StatusCode, Json<RegisterError>)
 }
 
 pub fn registered_summary(summary: crate::project_store::StoredProjectSummary) -> Json<ProjectSummary> {
-    Json(ProjectSummary {
-        id: summary.id.to_string(),
-        name: summary.name,
-        description: summary.description,
-        status: summary.status.as_str().to_string(),
-    })
+    Json(ProjectSummary::from(summary))
 }
 
 /// `POST /projects/register` (the standalone / CLI door). The CLI does all
@@ -207,12 +254,7 @@ pub async fn get(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ProjectSummary {
-        id: summary.id.to_string(),
-        name: summary.name,
-        description: summary.description,
-        status: summary.status.as_str().to_string(),
-    }))
+    Ok(Json(ProjectSummary::from(summary)))
 }
 
 #[derive(Debug, Default, Deserialize)]

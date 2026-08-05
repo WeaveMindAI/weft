@@ -203,5 +203,17 @@ for t in "${TESTS[@]}"; do
 done
 
 cleanup_provisioned
+
+# Final image reclaim: every passing test already `weft rm`'d its project, so
+# its worker images reference nothing; without this the LAST run's images
+# linger until some future run's start-sweep. A failing run never reaches
+# here (state is kept for inspection); the next run's start-sweep reclaims.
+if ! weft clean --images --all; then
+  echo ""
+  echo "All e2e tests passed, BUT the final worker-image reclaim failed (see above)." >&2
+  echo "Leftover weft-worker images remain; re-run 'weft clean --images --all' by hand." >&2
+  exit 1
+fi
+
 echo ""
 echo "All e2e tests passed."

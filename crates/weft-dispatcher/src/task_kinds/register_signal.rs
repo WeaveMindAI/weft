@@ -108,10 +108,12 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         }
 
         // Resolve tenant + project_id, then place the signal on a pooled
-        // listener. The chosen pod's spawn grace keeps it from being
-        // reaped between placement and the `signal_insert`. Token reuse
-        // for entry rows keeps the registration stable across reactivates;
-        // resume rows always mint fresh.
+        // listener. Placement RE-ARMS the chosen pod's grace atomically
+        // (see `place_signal_excluding`), which keeps the idle reaper off
+        // it between the pick, the listener round-trip, and the
+        // `signal_insert`. Token reuse for entry rows keeps the
+        // registration stable across reactivates; resume rows always
+        // mint fresh.
         let project_id = match state.journal.execution_project(color).await? {
             crate::journal::ColorLookup::Found(p) => p,
             crate::journal::ColorLookup::NotFound => {

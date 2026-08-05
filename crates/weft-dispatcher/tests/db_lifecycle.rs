@@ -119,6 +119,8 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         auth_kind: "none".to_string(),
         auth_config: None,
         kind_state: json!({}),
+        access_id: None,
+        port_snapshot: None,
     }
 }
 
@@ -373,7 +375,9 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
     let kick = weft_journal::ExecEvent::NodeKicked {
         color,
         node_id: "entry".into(),
+        firing: true,
         payload: None,
+        port_snapshot: None,
         at_unix: now,
     };
     let task = weft_task_store::tasks::NewTask {
@@ -448,3 +452,364 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         .expect("count tasks");
     assert_eq!((events2, tasks2), (1, 1), "a successful birth commits the event AND the task");
 }
+
+// =====================================================================
+// Supervisor pool: pending-command gate + ghost-lease hygiene.
+// =====================================================================
+
+/// Recording fake for the supervisor backend: no processes, no kubectl.
+#[derive(Default)]
+struct FakeSupervisorBackend {
+    stopped: std::sync::Mutex<Vec<String>>,
+    spawned: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl weft_dispatcher::supervisor_pool::SupervisorBackend for FakeSupervisorBackend {
+    async fn spawn(
+        &self,
+        pod_name: &str,
+        _namespace: &str,
+    ) -> anyhow::Result<weft_dispatcher::supervisor_pool::SupervisorHandle> {
+        self.spawned.lock().unwrap().push(pod_name.to_string());
+        Ok(weft_dispatcher::supervisor_pool::SupervisorHandle {
+            admin_url: format!("http://{pod_name}.test:8080"),
+        })
+    }
+    async fn stop(&self, pod_name: &str, _namespace: &str) -> anyhow::Result<()> {
+        self.stopped.lock().unwrap().push(pod_name.to_string());
+        Ok(())
+    }
+}
+
+async fn seed_supervisor_pod(pool: &PgPool, pod_name: &str, owner: &str, past_grace: bool) {
+    let now = weft_dispatcher::lease::now_unix();
+    let grace = if past_grace { now - 60 } else { now + 60 };
+    sqlx::query(
+        "INSERT INTO supervisor_pod \
+         (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, grace_until_unix) \
+         VALUES ($1, 'http://x:8080', 'weft-system', $2, $3, $4)",
+    )
+    .bind(pod_name)
+    .bind(owner)
+    .bind(now + 60)
+    .bind(grace)
+    .execute(pool)
+    .await
+    .expect("seed supervisor_pod");
+}
+
+async fn seed_pending_command(pool: &PgPool, project_id: &str) -> i64 {
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO infra_lifecycle_command \
+         (tenant_id, project_id, node_id, verb, issued_by_pod, issued_at_unix) \
+         VALUES ($1, $2, 'svc', 'apply', 'test-pod', $3) RETURNING id",
+    )
+    .bind(TENANT)
+    .bind(project_id)
+    .bind(weft_dispatcher::lease::now_unix())
+    .fetch_one(pool)
+    .await
+    .expect("seed pending command");
+    id
+}
+
+async fn supervisor_pod_exists(pool: &PgPool, pod_name: &str) -> bool {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT pod_name FROM supervisor_pod WHERE pod_name = $1")
+            .bind(pod_name)
+            .fetch_optional(pool)
+            .await
+            .expect("query supervisor_pod");
+    row.is_some()
+}
+
+/// Register a project AND give it a namespace, so its lifecycle commands
+/// are claimable per the broker's precondition (`project_namespace <> ''`,
+/// the same condition `pending_commands_exist` checks).
+async fn seed_claimable_project(pool: &PgPool, projects: &weft_dispatcher::ProjectStore) -> Uuid {
+    let id = Uuid::new_v4();
+    seed_project(projects, id, "hash-x").await;
+    sqlx::query("UPDATE project SET project_namespace = 'wft-test-ns' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("set project namespace");
+    id
+}
+
+/// A zero-owner past-grace supervisor is NOT idle while a claimable
+/// lifecycle command sits pending: the command may have been issued after
+/// the spawn site ran (worker cold start), and reaping the pod strands it
+/// (the exact production incident: `weft infra start` timing out after
+/// 120s). Once the command completes, the same pod is reaped. A DRAINING
+/// pod is exempt from the gate: drain releases its work then relies on
+/// the reap, so gating it would zombie the pod forever.
+#[sqlx::test]
+async fn reap_spares_the_pool_while_a_command_is_pending(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
+    let backend = FakeSupervisorBackend::default();
+    let sup = weft_dispatcher::supervisor_pool::SupervisorPool::new("weft-system".into());
+
+    let project = seed_claimable_project(&pool, &projects).await;
+    seed_supervisor_pod(&pool, "sup-1", "disp-1", true).await;
+    let cmd = seed_pending_command(&pool, &project.to_string()).await;
+
+    sup.reap_idle(&backend, &pool, "disp-1").await.expect("reap");
+    assert!(
+        supervisor_pod_exists(&pool, "sup-1").await,
+        "pending command must keep the zero-owner pod alive"
+    );
+
+    // A draining pod is reaped even while the command pends.
+    seed_supervisor_pod(&pool, "sup-drain", "disp-1", true).await;
+    sqlx::query("UPDATE supervisor_pod SET draining = TRUE WHERE pod_name = 'sup-drain'")
+        .execute(&pool)
+        .await
+        .expect("mark draining");
+    sup.reap_idle(&backend, &pool, "disp-1").await.expect("reap");
+    assert!(
+        !supervisor_pod_exists(&pool, "sup-drain").await,
+        "draining pods must not be protected by the pending gate"
+    );
+    assert!(
+        supervisor_pod_exists(&pool, "sup-1").await,
+        "the non-draining pod stays protected"
+    );
+
+    sqlx::query("UPDATE infra_lifecycle_command SET completed_at_unix = $1 WHERE id = $2")
+        .bind(weft_dispatcher::lease::now_unix())
+        .bind(cmd)
+        .execute(&pool)
+        .await
+        .expect("complete command");
+    sup.reap_idle(&backend, &pool, "disp-1").await.expect("reap");
+    assert!(
+        !supervisor_pod_exists(&pool, "sup-1").await,
+        "with the command completed the idle pod is reaped"
+    );
+    assert_eq!(
+        backend.stopped.lock().unwrap().as_slice(),
+        ["sup-drain", "sup-1"]
+    );
+}
+
+/// An EMPTY pool with a claimable pending command is stranded work:
+/// nothing outside the `infra start` sync top spawns supervisors, and
+/// that site already ran. `reconcile` (the reaper's sweep) must re-seed
+/// the pool so the command gets claimed within one sweep. An UNCLAIMABLE
+/// command (dispatcher-owned verb, or a project with no namespace) must
+/// NOT trigger a spawn: a supervisor could never serve it.
+#[sqlx::test]
+async fn reconcile_reseeds_an_empty_pool_when_a_command_pends(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
+    let backend = FakeSupervisorBackend::default();
+    let sup = weft_dispatcher::supervisor_pool::SupervisorPool::new("weft-system".into());
+
+    // Unclaimable pendings first: a dispatcher-owned verb on a claimable
+    // project, and a supervisor verb on a namespace-less project.
+    let claimable = seed_claimable_project(&pool, &projects).await;
+    sqlx::query(
+        "INSERT INTO infra_lifecycle_command \
+         (tenant_id, project_id, node_id, verb, issued_by_pod, issued_at_unix) \
+         VALUES ($1, $2, NULL, 'deactivate', 'test-pod', $3)",
+    )
+    .bind(TENANT)
+    .bind(claimable.to_string())
+    .bind(weft_dispatcher::lease::now_unix())
+    .execute(&pool)
+    .await
+    .expect("seed dispatcher-verb command");
+    seed_pending_command(&pool, &Uuid::new_v4().to_string()).await;
+    sup.reconcile(&backend, &pool, "disp-1").await.expect("reconcile");
+    assert!(
+        backend.spawned.lock().unwrap().is_empty(),
+        "unclaimable commands must not spawn a supervisor"
+    );
+
+    // A claimable supervisor-verb command does.
+    seed_pending_command(&pool, &claimable.to_string()).await;
+    sup.reconcile(&backend, &pool, "disp-1").await.expect("reconcile");
+    assert_eq!(
+        backend.spawned.lock().unwrap().len(),
+        1,
+        "empty pool + claimable pending command must spawn a supervisor"
+    );
+}
+
+/// Project removal releases the project's `infra_owner` lease, and
+/// `reconcile` drops any ghost lease left by older removals, so a
+/// supervisor never renews ownership of a deleted project forever.
+#[sqlx::test]
+async fn removed_projects_do_not_keep_supervisor_leases(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
+    let backend = FakeSupervisorBackend::default();
+    let sup = weft_dispatcher::supervisor_pool::SupervisorPool::new("weft-system".into());
+
+    // A live project with a lease, and a ghost lease for a project that
+    // was never (or is no longer) registered.
+    let live = Uuid::new_v4();
+    seed_project(&projects, live, "hash-live").await;
+    for (project, pod) in [(live.to_string(), "sup-live"), (Uuid::new_v4().to_string(), "sup-ghost")] {
+        sqlx::query(
+            "INSERT INTO infra_owner (project_id, supervisor_pod, namespace, tenant_id, leased_until_unix) \
+             VALUES ($1, $2, 'ns', $3, $4)",
+        )
+        .bind(&project)
+        .bind(pod)
+        .bind(TENANT)
+        .bind(weft_dispatcher::lease::now_unix() + 60)
+        .execute(&pool)
+        .await
+        .expect("seed infra_owner");
+    }
+
+    sup.reconcile(&backend, &pool, "disp-1").await.expect("reconcile");
+    let leases: Vec<(String,)> = sqlx::query_as("SELECT project_id FROM infra_owner")
+        .fetch_all(&pool)
+        .await
+        .expect("list leases");
+    assert_eq!(
+        leases,
+        vec![(live.to_string(),)],
+        "ghost lease dropped, live project's lease kept"
+    );
+
+    let released =
+        weft_dispatcher::supervisor_pool::release_project(&pool, &live.to_string())
+            .await
+            .expect("release");
+    assert_eq!(released, 1, "project removal releases its lease");
+}
+
+/// The referenced-image set (`GET /images/referenced`) must cover a
+/// project's current hash, the hash a still-alive (e.g. draining) worker
+/// pod runs, AND the hash stamped on a pending/claimed task (a task can
+/// outlive both the project pointer and its pod between a resync and the
+/// cold-start sweep): `weft clean --images` deletes everything outside
+/// this set, so any of them escaping it would be deleted out from under a
+/// running workload. Terminal pods' and completed tasks' hashes drop out.
+#[sqlx::test]
+async fn referenced_images_cover_projects_live_pods_and_live_tasks(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
+    let now = weft_dispatcher::lease::now_unix();
+    seed_project(&projects, Uuid::new_v4(), "hash-current").await;
+    for (pod, hash, terminal) in [
+        ("wp-drain", "hash-draining", false),
+        ("wp-done", "hash-terminal", true),
+    ] {
+        sqlx::query(
+            "INSERT INTO worker_pod \
+             (pod_name, project_id, namespace, status, owner_dispatcher, \
+              last_heartbeat_unix, created_at_unix, terminal_at_unix, binary_hash) \
+             VALUES ($1, 'p', 'ns', 'alive', 'disp-1', $2, $2, $3, $4)",
+        )
+        .bind(pod)
+        .bind(now)
+        .bind(if terminal { Some(now) } else { None })
+        .bind(hash)
+        .execute(&pool)
+        .await
+        .expect("seed worker_pod");
+    }
+    for (status, hash) in [("pending", "hash-pending-task"), ("complete", "hash-done-task")] {
+        sqlx::query(
+            "INSERT INTO task \
+             (id, kind, target, project_id, status, binary_hash, payload, attempts, created_at_unix) \
+             VALUES ($4, 'execute', 'worker', 'p', $1, $2, '{}'::jsonb, 0, $3)",
+        )
+        .bind(status)
+        .bind(hash)
+        .bind(now)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("seed task");
+    }
+
+    let mut hashes = weft_dispatcher::api::project::referenced_image_hashes(&pool)
+        .await
+        .expect("referenced set");
+    hashes.sort();
+    assert_eq!(
+        hashes,
+        vec![
+            "hash-current".to_string(),
+            "hash-draining".to_string(),
+            "hash-pending-task".to_string(),
+        ],
+        "project + live pod + live task hashes in; terminal pod and \
+         completed task hashes out"
+    );
+}
+
+/// The pick-then-register window: placement RE-ARMS the chosen pod's
+/// grace before the listener HTTP round-trip, so the idle reaper firing
+/// mid-placement declines instead of tearing the pod down under the
+/// in-flight `/register` (a live incident: DNS failure dialing a pod the
+/// reaper had deleted three seconds earlier). The register closure here
+/// IS the race: it runs a full reap sweep while the placement is
+/// mid-flight and asserts the pod survives it.
+#[sqlx::test]
+async fn placement_rearms_grace_so_a_midflight_reap_declines(pool: PgPool) {
+    setup(&pool).await;
+    // A stand-in listener answering only `/load` (never saturated), so
+    // `pick_live` can choose the seeded pod without a real listener.
+    let load_router = axum::Router::new().route(
+        "/load",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "saturated": false, "mem_pressure": 0.0, "signals": 0, "held_connections": 0
+            }))
+        }),
+    );
+    let load_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind load stub");
+    let admin_url = format!("http://{}", load_listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        axum::serve(load_listener, load_router).await.expect("serve load stub");
+    });
+
+    // One live, zero-signal, PAST-GRACE pod: reapable the instant before
+    // a placement picks it.
+    let now = weft_dispatcher::lease::now_unix();
+    sqlx::query(
+        "INSERT INTO listener_pod \
+         (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, grace_until_unix) \
+         VALUES ('listener-est', $1, 'weft-system', 'disp-1', $2, $3)",
+    )
+    .bind(&admin_url)
+    .bind(now + 3600)
+    .bind(now - 1)
+    .execute(&pool)
+    .await
+    .expect("seed listener_pod");
+
+    let backend = FakeBackend::default();
+    let listeners = ListenerPool::new("weft-system".to_string());
+    let (pod_name, ()) = listeners
+        .place_signal(&backend, &pool, "disp-1", |_handle| {
+            let pool = pool.clone();
+            let backend = &backend;
+            let listeners = &listeners;
+            async move {
+                // The reaper fires while the register round-trip is in
+                // flight. The re-armed grace must make it decline.
+                listeners.reap_idle(backend, &pool, "disp-1").await?;
+                Ok(())
+            }
+        })
+        .await
+        .expect("placement survives a mid-flight reap");
+    assert_eq!(pod_name, "listener-est");
+    assert!(
+        listener_pod_exists(&pool, "listener-est").await,
+        "the re-armed pod must survive the mid-placement reap sweep"
+    );
+    assert!(
+        backend.stopped.lock().unwrap().is_empty(),
+        "nothing may be torn down while the placement is in flight"
+    );
+}
+

@@ -23,10 +23,13 @@
 //!     - the REFERENCED nodes' package roots (mod.rs, deps.toml,
 //!       shared package files). A change to a node implementation
 //!       (re)compiles the worker.
-//!     - worker build environment: `crates/`, `Cargo.toml`,
-//!       `Cargo.lock`, `rust-toolchain.toml`, and the builder-base
-//!       Dockerfile. Any engine, toolchain or build-image change
-//!       invalidates every project's worker image.
+//!     - worker build environment: the worker crate closure
+//!       (`codegen::worker_workspace_crates`: the workspace crates a
+//!       worker actually links), `Cargo.toml`, `Cargo.lock`,
+//!       `rust-toolchain.toml`, and the builder-base Dockerfile. Any
+//!       engine, toolchain or build-image change invalidates every
+//!       project's worker image; edits to non-worker crates (CLI,
+//!       dispatcher, tests) do not.
 //!
 //!   NOT hashed: per-node config values, edges, node ids, positions.
 //!   Those live in the `ProjectDefinition` the worker fetches from
@@ -69,7 +72,7 @@
 //! same source produces the same digest regardless of OS file-listing
 //! order. No mtime, no environment-dependent state: the binary that
 //! runs the engine has no fingerprint of its own; engine identity is
-//! captured by hashing `crates/` directly.
+//! captured by hashing the worker crate closure's sources directly.
 
 use sha2::{Digest, Sha256};
 
@@ -221,28 +224,32 @@ mod fs_hashes {
     /// participates in the binary / infra / builder-base hashes.
     pub const BUILDER_BASE_DOCKERFILE: &str = "deploy/docker/worker-builder-base.Dockerfile";
 
-    /// The workspace source inputs every weft-built artifact depends on:
-    /// the engine crates, the workspace manifests, and the pinned
-    /// toolchain. One list, as `(label, path)` pairs (the label is the
-    /// machine-independent string folded into digests), consumed by the
-    /// three project-level hash functions here AND the image-stamp
-    /// hasher in the CLI's `images.rs`, so the input sets can't drift.
-    pub fn workspace_source_inputs(weft_root: &Path) -> Vec<(String, PathBuf)> {
-        ["crates", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"]
-            .iter()
-            .map(|rel| (rel.to_string(), weft_root.join(rel)))
-            .collect()
-    }
-
-    /// Fold the full worker build environment into `hasher`: the
-    /// workspace source inputs plus the builder-base Dockerfile (the
-    /// image every worker compiles inside). Shared by the binary, infra
-    /// and builder-base hashes: a toolchain bump or a builder-base edit
-    /// must flip all three, otherwise `image_present` short-circuits and
-    /// a stale worker keeps running forever.
+    /// Fold the worker build environment into `hasher`: the worker crate
+    /// closure (`codegen::worker_workspace_crates`, the ONLY workspace
+    /// crates a worker build links), the workspace manifests + toolchain
+    /// pin, and the builder-base Dockerfile (the image every worker
+    /// compiles inside). Shared by the binary, infra and builder-base
+    /// hashes: a toolchain bump or a builder-base edit must flip all
+    /// three, otherwise `image_present` short-circuits and a stale worker
+    /// keeps running forever. Scoping to the closure (not all of
+    /// `crates/`) is what keeps an edit to the CLI / dispatcher / tests
+    /// from spuriously rebuilding the base + every worker image.
     fn hash_worker_build_env(hasher: &mut Sha256, weft_root: &Path) -> Result<()> {
-        for (label, path) in workspace_source_inputs(weft_root) {
-            hash_path(hasher, &label, &path)?;
+        let closure = crate::codegen::worker_workspace_crates(weft_root)
+            .map_err(|e| anyhow::anyhow!("worker crate closure: {e}"))?;
+        for name in &closure {
+            // Same enumerator as the stager (`stage_worker_workspace`):
+            // hashed bytes and staged bytes must stay equal, and the
+            // crate-root `tests/` dir never reaches a worker build.
+            let entries =
+                crate::build::worker_crate_entries(&weft_root.join("crates").join(name))
+                    .map_err(|e| anyhow::anyhow!("enumerate crate {name}: {e}"))?;
+            for (entry_name, entry_path) in entries {
+                hash_path(hasher, &format!("crates/{name}/{entry_name}"), &entry_path)?;
+            }
+        }
+        for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+            hash_path(hasher, rel, &weft_root.join(rel))?;
         }
         hash_path(
             hasher,

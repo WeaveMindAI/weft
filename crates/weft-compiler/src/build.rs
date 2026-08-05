@@ -24,8 +24,9 @@ use weft_catalog::FsCatalog;
 pub struct BuildResult {
     /// Absolute path to the docker build context the CLI should
     /// feed to `docker build`. Contains `Dockerfile`, `build/`
-    /// (the generated cargo crate), and `weft/` (a hardlinked or
-    /// copied copy of the weft workspace).
+    /// (the generated cargo crate), and, when the pre-built builder
+    /// base is not in play, `weft/` (the worker-linked slice of the
+    /// weft workspace, see `stage_worker_workspace`).
     pub build_context: PathBuf,
     /// Path to the generated Dockerfile inside the build context.
     /// Convenience for CLI callers that pass `-f` explicitly.
@@ -187,27 +188,8 @@ fn stage_build_context(
     // template or non-debian runtime). When the pre-built base is
     // used, `/weft/` lives in the base image layers and re-COPYing
     // it would just bloat the build context tarball.
-    //
-    // Excludes match the source-hash walk over `weft_root/crates`
-    // (`hash::walk_dir` uses NODE_TREE_EXCLUDE), so what's staged is
-    // exactly what's hashed: a file copied-but-not-hashed (or vice
-    // versa) is a stale-image hole.
     if stage_weft {
-        let weft_stage = ctx.join("weft");
-        std::fs::create_dir_all(&weft_stage).map_err(CompileError::Io)?;
-        copy_dir_filtered(
-            &weft_root.join("crates"),
-            &weft_stage.join("crates"),
-            weft_catalog::NODE_TREE_EXCLUDE,
-        )?;
-        // Workspace Cargo.toml + Cargo.lock are required for path deps
-        // to resolve inside the container.
-        for name in ["Cargo.toml", "Cargo.lock"] {
-            let src = weft_root.join(name);
-            if src.exists() {
-                std::fs::copy(&src, weft_stage.join(name)).map_err(CompileError::Io)?;
-            }
-        }
+        stage_worker_workspace(weft_root, &ctx.join("weft"))?;
     }
 
     // `project-nodes/` = each referenced package root, placed at its
@@ -230,6 +212,216 @@ fn stage_build_context(
     }
 
     Ok(ctx)
+}
+
+/// Top-level entries of a closure crate that enter the worker slice:
+/// everything except the crate-ROOT `tests/` dir (integration tests cargo
+/// never compiles for a path dependency, so staging or hashing them only
+/// makes an unrelated test edit rebuild the base and every worker image)
+/// and the shared node-tree excludes. Root-anchored on purpose: a dir named
+/// `tests` deeper in the tree (weft-core's `src/tests`, reached via a
+/// `#[path]` attribute) stays in, so the exclusion can never silently drop
+/// a module the crate actually declares. THE one enumerator both the stager
+/// (`stage_worker_workspace`) and the hasher (`hash::hash_worker_build_env`)
+/// iterate, so staged and hashed bytes stay equal by construction. Sorted
+/// for deterministic hashing.
+pub fn worker_crate_entries(crate_dir: &Path) -> CompileResult<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(crate_dir).map_err(CompileError::Io)? {
+        let entry = entry.map_err(CompileError::Io)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "tests" || weft_catalog::is_node_tree_excluded(&name) {
+            continue;
+        }
+        // Symlinks are skipped everywhere in the slice (stager and hasher
+        // both), matching the deeper walks.
+        if entry.file_type().map_err(CompileError::Io)?.is_symlink() {
+            continue;
+        }
+        out.push((name, entry.path()));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Stage the worker-linked slice of the weft workspace at `dest`:
+/// `crates/<closure>` (exactly `codegen::worker_workspace_crates`, the only
+/// workspace crates a worker build links), a workspace manifest whose members
+/// are rewritten to that closure, and the workspace `Cargo.lock`. Everything
+/// else in the workspace (CLI, dispatcher, tests) is deliberately absent, so
+/// it can neither bloat the docker context nor invalidate a worker build.
+///
+/// The staged set must match what `hash::hash_worker_build_env` hashes
+/// (closure crates + manifests): a file staged-but-not-hashed (or vice versa)
+/// is a stale-image hole. Crate copies preserve mtimes (see
+/// `copy_dir_filtered`) so cargo's fingerprint inside the container sees
+/// unchanged files as unchanged; the generated manifest + copied lock get the
+/// SOURCE files' mtimes stamped for the same reason.
+pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()> {
+    std::fs::create_dir_all(dest).map_err(CompileError::Io)?;
+    let closure = codegen::worker_workspace_crates(weft_root)?;
+    for name in &closure {
+        let crate_dest = dest.join("crates").join(name);
+        std::fs::create_dir_all(&crate_dest).map_err(CompileError::Io)?;
+        for (entry_name, entry_path) in
+            worker_crate_entries(&weft_root.join("crates").join(name))?
+        {
+            let to = crate_dest.join(&entry_name);
+            if entry_path.is_dir() {
+                copy_dir_filtered(&entry_path, &to, weft_catalog::NODE_TREE_EXCLUDE)?;
+            } else if entry_path.is_file() {
+                std::fs::copy(&entry_path, &to).map_err(CompileError::Io)?;
+                mirror_mtime(&entry_path, &to);
+            }
+        }
+    }
+    write_scoped_workspace_manifest(weft_root, dest, &closure)?;
+    let lock_src = weft_root.join("Cargo.lock");
+    let lock_dst = dest.join("Cargo.lock");
+    std::fs::copy(&lock_src, &lock_dst).map_err(CompileError::Io)?;
+    mirror_mtime(&lock_src, &lock_dst);
+    Ok(())
+}
+
+/// Write `dest/Cargo.toml`: the real workspace manifest with `members`
+/// rewritten to exactly `crates`. Everything else ([workspace.dependencies],
+/// [workspace.package], profiles) is carried verbatim, so `workspace = true`
+/// inheritance in the staged crates resolves identically to the full
+/// workspace. Extra `[workspace.dependencies]` path entries pointing at
+/// absent crates are harmless: cargo only opens a path when something in the
+/// resolve graph references it, and nothing in the staged slice does.
+fn write_scoped_workspace_manifest(
+    weft_root: &Path,
+    dest: &Path,
+    crates: &[String],
+) -> CompileResult<()> {
+    let src = weft_root.join("Cargo.toml");
+    let raw = std::fs::read_to_string(&src).map_err(CompileError::Io)?;
+    let mut manifest: toml::Value = raw
+        .parse()
+        .map_err(|e| CompileError::Build(format!("parse {}: {e}", src.display())))?;
+    let workspace = manifest
+        .get_mut("workspace")
+        .and_then(|w| w.as_table_mut())
+        .ok_or_else(|| {
+            CompileError::Build(format!("{} has no [workspace] table", src.display()))
+        })?;
+    workspace.insert(
+        "members".into(),
+        toml::Value::Array(
+            crates
+                .iter()
+                .map(|c| toml::Value::String(format!("crates/{c}")))
+                .collect(),
+        ),
+    );
+    let body = toml::to_string_pretty(&manifest)
+        .map_err(|e| CompileError::Build(format!("serialize scoped workspace manifest: {e}")))?;
+    let dst = dest.join("Cargo.toml");
+    std::fs::write(&dst, body).map_err(CompileError::Io)?;
+    mirror_mtime(&src, &dst);
+    Ok(())
+}
+
+/// Stamp `src`'s mtime onto `dst`. Cargo's fingerprint inside the docker
+/// build container short-circuits a clean crate only when every source
+/// file's mtime is older than its rlib; without mirroring, every staging
+/// run gives cargo a wall-clock mtime and every crate looks dirty on every
+/// build. Warn-only on failure: correctness is unaffected (only rebuild
+/// time), but an invisible failure would look like the cache mysteriously
+/// stopped working, so it must be loud.
+fn mirror_mtime(src: &Path, dst: &Path) {
+    let result = std::fs::metadata(src)
+        .and_then(|meta| meta.modified())
+        .and_then(|modified| {
+            filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(modified))
+        });
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "weft_compiler::build",
+            file = %dst.display(),
+            error = %e,
+            "could not mirror source mtime; the docker build will treat this \
+             file as changed and rebuild its crate"
+        );
+    }
+}
+
+/// Stage the builder-base docker build context at
+/// `<weft_root>/.weft-base-context/` and return its path. Layout matches what
+/// the rendered Dockerfile COPYs:
+///
+/// ```text
+/// .weft-base-context/
+///   Dockerfile           (worker-builder-base.Dockerfile with the target
+///                         cache key substituted; build with -f THIS file)
+///   rust-toolchain.toml
+///   Cargo.toml           (workspace manifest scoped to the worker closure)
+///   Cargo.lock
+///   crates/<closure>/    (only the worker-linked crates)
+///   .weft-warmup/        (generated warm-up crate, see codegen::emit_warmup_crate)
+/// ```
+///
+/// The Dockerfile is RENDERED, not copied: its `{{target_cache_key}}` token
+/// becomes a hash of Cargo.lock + rust-toolchain.toml, so a dependency or
+/// toolchain change starts a fresh compile cache instead of inheriting (and
+/// baking into the image) every artifact ever built. The base hash keeps
+/// covering the SOURCE template; the key is a pure function of two files the
+/// hash already covers.
+///
+/// Regenerated wholesale on every call (it is a derived artifact): a stale
+/// leftover crate from a previous closure would otherwise linger in the
+/// context and the baked image. Callers only invoke this when the
+/// content-addressed base tag is absent, so the staging cost is paid exactly
+/// once per base rebuild.
+pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
+    let ctx = weft_root.join(worker_image::BASE_CONTEXT_DIR);
+    if ctx.exists() {
+        std::fs::remove_dir_all(&ctx).map_err(CompileError::Io)?;
+    }
+    stage_worker_workspace(weft_root, &ctx)?;
+    let toolchain_src = weft_root.join("rust-toolchain.toml");
+    let toolchain_dst = ctx.join("rust-toolchain.toml");
+    std::fs::copy(&toolchain_src, &toolchain_dst).map_err(CompileError::Io)?;
+    mirror_mtime(&toolchain_src, &toolchain_dst);
+    codegen::emit_warmup_crate(&ctx.join(worker_image::WARMUP_CRATE_DIR), weft_root)?;
+
+    let template_path = weft_root.join(crate::hash::BUILDER_BASE_DOCKERFILE);
+    let template = std::fs::read_to_string(&template_path).map_err(CompileError::Io)?;
+    let key = target_cache_key(weft_root)?;
+    if !template.contains("{{target_cache_key}}") {
+        return Err(CompileError::Build(format!(
+            "{} lost its {{{{target_cache_key}}}} token; the base compile cache \
+             would stop keying on the lock + toolchain",
+            template_path.display()
+        )));
+    }
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        template.replace("{{target_cache_key}}", &key),
+    )
+    .map_err(CompileError::Io)?;
+    Ok(ctx)
+}
+
+/// The builder-base compile-cache key: a short hash of `Cargo.lock` +
+/// `rust-toolchain.toml`. Exactly the inputs whose change makes previous
+/// cache contents dead weight (new dependency versions, new toolchain);
+/// engine source edits keep the key, so they stay incremental.
+fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for rel in ["Cargo.lock", "rust-toolchain.toml"] {
+        hasher.update(
+            std::fs::read(weft_root.join(rel)).map_err(CompileError::Io)?,
+        );
+    }
+    let digest = hasher.finalize();
+    Ok(digest
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
 }
 
 /// Recursive directory copy with a simple exclude list matched on
@@ -265,33 +457,7 @@ pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Com
             copy_dir_filtered(&from, &to, exclude)?;
         } else {
             std::fs::copy(&from, &to).map_err(CompileError::Io)?;
-            // Mirror the source mtime onto the destination so cargo's
-            // fingerprint inside the docker build container sees an
-            // unchanged file as unchanged. Without this, every staging
-            // run gives cargo a "younger than the rlib" mtime and
-            // every per-package crate looks dirty. A failure here only
-            // costs a full rebuild (correctness is unaffected), but an
-            // invisible one would look like the cache mysteriously
-            // stopped working: warn loud.
-            let mtime_result = std::fs::metadata(&from)
-                .map_err(|e| e.to_string())
-                .and_then(|meta| meta.modified().map_err(|e| e.to_string()))
-                .and_then(|modified| {
-                    filetime::set_file_mtime(
-                        &to,
-                        filetime::FileTime::from_system_time(modified),
-                    )
-                    .map_err(|e| e.to_string())
-                });
-            if let Err(e) = mtime_result {
-                tracing::warn!(
-                    target: "weft_compiler::build",
-                    file = %to.display(),
-                    error = %e,
-                    "could not mirror source mtime; the docker build will treat this \
-                     file as changed and rebuild its crate"
-                );
-            }
+            mirror_mtime(&from, &to);
         }
     }
     Ok(())

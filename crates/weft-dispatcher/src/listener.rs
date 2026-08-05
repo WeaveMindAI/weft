@@ -735,7 +735,32 @@ impl ListenerPool {
         F: FnOnce(ListenerHandle) -> Fut,
         Fut: std::future::Future<Output = Result<R>>,
     {
-        let pod = self.pick_or_spawn(backend, pg_pool, pod_id, exclude).await?;
+        // Pick a pod AND re-arm its spawn grace in one atomic claim. The
+        // grace is the idle reaper's "work is about to arrive, hands off"
+        // signal, and it must cover THIS placement's whole window (pick,
+        // the listener HTTP round-trip below, the signal_insert stamp),
+        // not just a fresh pod's boot: an ESTABLISHED zero-signal pod is
+        // otherwise reapable the instant after pick, and the register
+        // call then dials a torn-down pod (a live incident: DNS failure
+        // on /register three seconds after the reaper deleted the pod).
+        // Zero rows back from the re-arm means the reaper's gated DELETE
+        // won the row race first; the pod is gone, pick again. The
+        // reaper's own DELETE re-checks grace, so whichever statement
+        // lands second sees the other's write: exactly one winner per
+        // pod, no window.
+        let pod = loop {
+            let candidate = self.pick_or_spawn(backend, pg_pool, pod_id, exclude).await?;
+            let armed = sqlx::query(
+                "UPDATE listener_pod SET grace_until_unix = $1 WHERE pod_name = $2",
+            )
+            .bind(crate::lease::now_unix() + crate::lease::SPAWN_GRACE_SECS)
+            .bind(&candidate.pod_name)
+            .execute(pg_pool)
+            .await?;
+            if armed.rows_affected() > 0 {
+                break candidate;
+            }
+        };
         // The chosen pod 503s `/register` if it saturated between our
         // load read and now; that surfaces as an error here and the
         // task framework retries placement (a fresh pick, possibly a

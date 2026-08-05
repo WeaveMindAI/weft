@@ -1597,5 +1597,22 @@ pub async fn delete_project(
             }
         }
     }
+    // Step 5: release the project's exclusive supervisor lease
+    // (`infra_owner`). AFTER the namespace-row clear on purpose: the
+    // broker's claim path only offers projects with a non-empty
+    // `project_namespace`, so with the row cleared a released project
+    // cannot be re-claimed mid-teardown (release-first left a window
+    // where a supervisor re-adopted the dying project and started
+    // reconciling its infra). Left behind, the owning supervisor would
+    // renew a lease on a ghost forever: it never becomes idle, the pool
+    // never drains to zero, and rows accumulate one per removed project.
+    crate::supervisor_pool::release_project(&state.pg_pool, &project_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("supervisor_pool::release_project: {e}"),
+            )
+        })?;
     Ok(())
 }

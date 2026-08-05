@@ -296,6 +296,77 @@ spec:
     )
 }
 
+/// Release a project's exclusive supervisor lease (its `infra_owner`
+/// row). Called by project removal alongside the other `infra_*` row
+/// drops: the owning supervisor stops reconciling the project the moment
+/// the row is gone (its loop only acts on projects it owns), and a row
+/// left behind would be renewed forever, keeping the pool from ever
+/// draining to zero.
+pub async fn release_project(pg_pool: &PgPool, project_id: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM infra_owner WHERE project_id = $1")
+        .bind(project_id)
+        .execute(pg_pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Whether any lifecycle command still awaits a supervisor: issued, not
+/// completed, of a SUPERVISOR-owned verb (apply / stop / terminate;
+/// deactivate / reactivate are dispatcher-claimed and must not keep this
+/// pool alive), against a project a supervisor can actually claim
+/// (`project_namespace <> ''`, the broker's claim precondition; a
+/// command whose project lost its namespace is unclaimable and must not
+/// pin the pool forever). A cancel-FLAGGED row still counts: the broker
+/// hands it out regardless, and only a supervisor executing it (and
+/// hitting the cancel check) drives it to completed, so it still needs a
+/// pod. Pending work means the pool is NOT idle even when no pod owns a
+/// project (see `reap_idle`'s gate), and an EMPTY pool with pending work
+/// is stranded and must be re-seeded (see `SupervisorPool::reconcile`).
+// SYNC: pending_commands_exist filter <-> crates/weft-broker/src/handlers.rs
+//       supervisor_claim_command (verb IN ('apply','stop','terminate')),
+//       crates/weft-broker/src/handlers.rs supervisor_sync_ownership (the
+//       `project_namespace <> ''` claim precondition; the claim SQL itself
+//       checks it only transitively, via infra_owner rows existing solely
+//       for namespaced projects)
+pub async fn pending_commands_exist(pg_pool: &PgPool) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT c.id FROM infra_lifecycle_command c \
+         WHERE c.completed_at_unix IS NULL \
+           AND c.verb IN ('apply', 'stop', 'terminate') \
+           AND EXISTS ( \
+               SELECT 1 FROM project p \
+               WHERE p.id::TEXT = c.project_id AND p.project_namespace <> '' \
+           ) \
+         LIMIT 1",
+    )
+    .fetch_optional(pg_pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Drop `infra_owner` rows whose project no longer exists. Should never
+/// fire now that project removal releases the lease in the same pass
+/// (`release_project`); kept as self-healing for rows minted before that
+/// fix or by a removal that died between the two writes, and it WARNS so
+/// a recurring leak is visible instead of silently mopped.
+async fn release_ghost_leases(pg_pool: &PgPool) -> Result<()> {
+    let res = sqlx::query(
+        "DELETE FROM infra_owner io \
+         WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id::text = io.project_id)",
+    )
+    .execute(pg_pool)
+    .await?;
+    if res.rows_affected() > 0 {
+        tracing::warn!(
+            target: "weft_dispatcher::supervisor_pool",
+            dropped = res.rows_affected(),
+            "dropped infra_owner leases pointing at deleted projects; \
+             a recurring count here means some removal path skips release_project"
+        );
+    }
+    Ok(())
+}
+
 // =============================================================
 // Pod registry schema
 // =============================================================
@@ -510,21 +581,63 @@ impl SupervisorPool {
         Ok(())
     }
 
-    /// Reaper hook: reap every supervisor pod that owns ZERO projects.
-    /// Per-pod idle reap (the supervisor twin of the listener's). A pod
-    /// owning even one project is kept (it is reconciling that infra);
-    /// when no infra exists globally, every supervisor owns nothing and
-    /// the pool drains to ZERO, with `ensure_at_least_one` on the next
-    /// sync covering the cold start (the same shape as the listener pool,
-    /// which also keeps no idle pods). Adopt-on-expiry: a pod whose
-    /// owning dispatcher died (lease lapsed) is adopted before being
-    /// reaped, so a sibling cleans it.
+    /// Periodic pool reconciliation (the reaper's supervisor sweep):
+    /// keep the pool matched to the actual work.
+    ///
+    ///   1. Drop ghost `infra_owner` leases (projects that no longer
+    ///      exist), so ownership reflects reality before any decision.
+    ///   2. Pending lifecycle commands + empty pool = stranded work (the
+    ///      only spawn site outside this is the `infra start` sync top,
+    ///      already past by the time a command sits unclaimed): ensure a
+    ///      supervisor exists so the command gets claimed within one
+    ///      sweep instead of hanging until its issuer times out.
+    ///   3. Otherwise reap truly idle pods (`reap_idle`, itself gated on
+    ///      no pending commands).
+    pub async fn reconcile(
+        &self,
+        backend: &dyn SupervisorBackend,
+        pg_pool: &PgPool,
+        pod_id: &str,
+    ) -> Result<()> {
+        release_ghost_leases(pg_pool).await?;
+        if pending_commands_exist(pg_pool).await? {
+            self.ensure_at_least_one(backend, pg_pool, pod_id).await?;
+            return Ok(());
+        }
+        self.reap_idle(backend, pg_pool, pod_id).await
+    }
+
+    /// Reaper hook: reap every supervisor pod that owns ZERO projects,
+    /// PROVIDED no lifecycle command is pending. Per-pod idle reap (the
+    /// supervisor twin of the listener's). A pod owning even one project
+    /// is kept (it is reconciling that infra); when no infra exists
+    /// globally, every supervisor owns nothing and the pool drains to
+    /// ZERO, with `ensure_at_least_one` on the next sync covering the
+    /// cold start (the same shape as the listener pool, which also keeps
+    /// no idle pods). A pod whose owning dispatcher died (lease lapsed)
+    /// is reapable by any sibling: the gated DELETE's ownership term
+    /// accepts either "ours" or "lease expired".
+    ///
+    /// The pending-command gate exists because ownership alone lies about
+    /// idleness: `infra start` spawns the supervisor at sync top, but the
+    /// apply command is issued by the InfraSetup execution only once the
+    /// worker has cold-started, which can outlast the spawn grace. In
+    /// that window the pod owns nothing yet IS the only thing able to
+    /// serve the imminent command; reaping it strands the command until
+    /// its issuer times out (a 120s `weft infra start` failure in
+    /// production was the incident). DRAINING pods are exempt from the
+    /// gate: they were explicitly chosen for removal, their projects are
+    /// already released for adoption, and the broker's claim path skips
+    /// them, so no pending command can need them; gating them would leave
+    /// a permanent zombie (drain marks + releases, then the reap it
+    /// relies on never fires).
     pub async fn reap_idle(
         &self,
         backend: &dyn SupervisorBackend,
         pg_pool: &PgPool,
         pod_id: &str,
     ) -> Result<()> {
+        let pending = pending_commands_exist(pg_pool).await?;
         let now = crate::lease::now_unix();
         // Idle candidate pods: those owning no projects AND past their
         // spawn grace (a freshly-spawned supervisor owns zero projects
@@ -538,33 +651,40 @@ impl SupervisorPool {
              FROM supervisor_pod sp \
              LEFT JOIN infra_owner io ON io.supervisor_pod = sp.pod_name \
              WHERE io.project_id IS NULL \
-               AND (sp.draining OR sp.grace_until_unix < $2) \
+               AND (sp.draining OR ($3 = FALSE AND sp.grace_until_unix < $2)) \
                AND (sp.owner_pod_id = $1 OR sp.leased_until_unix < $2)",
         )
         .bind(pod_id)
         .bind(now)
+        .bind(pending)
         .fetch_all(pg_pool)
         .await?;
         for (pod_name, namespace) in rows {
-            // Claim the pod (take ownership + a short lease) gated on it
-            // still owning zero projects AND still past-grace-or-draining,
-            // so a sibling does not also reap it and a project claimed (or
-            // a re-spawn that re-armed the grace) between scan and claim
-            // aborts it.
-            let claimed: Option<(String,)> = sqlx::query_as(
-                "UPDATE supervisor_pod SET owner_pod_id = $1, leased_until_unix = $2 \
-                 WHERE pod_name = $3 \
-                   AND (draining OR grace_until_unix < $4) \
-                   AND NOT EXISTS (SELECT 1 FROM infra_owner WHERE supervisor_pod = $3) \
+            // Delete the registry row FIRST, atomically re-checking every
+            // reap condition (the listener reaper's discipline, same
+            // reasons): the single gated DELETE is the exactly-one-winner
+            // step, so a sibling reaper, a project claimed via the
+            // broker's ownership sync, or work arriving between scan and
+            // now all make the DELETE hit zero rows and the pod survives
+            // untouched. Row-first ordering: once the row is gone the pod
+            // is invisible to pick_live; a backend.stop failure then
+            // leaves only an orphan k8s object, never a registry row
+            // pointing at a half-dead pod.
+            let gone: Option<(String,)> = sqlx::query_as(
+                "DELETE FROM supervisor_pod \
+                 WHERE pod_name = $1 \
+                   AND (draining OR ($4 = FALSE AND grace_until_unix < $2)) \
+                   AND (owner_pod_id = $3 OR leased_until_unix < $2) \
+                   AND NOT EXISTS (SELECT 1 FROM infra_owner WHERE supervisor_pod = $1) \
                  RETURNING pod_name",
             )
-            .bind(pod_id)
-            .bind(now + crate::lease::LEASE_DURATION_SECS)
             .bind(&pod_name)
             .bind(now)
+            .bind(pod_id)
+            .bind(pending)
             .fetch_optional(pg_pool)
             .await?;
-            if claimed.is_none() {
+            if gone.is_none() {
                 continue;
             }
             if let Err(e) = backend.stop(&pod_name, &namespace).await {
@@ -573,13 +693,10 @@ impl SupervisorPool {
                     pod = %pod_name,
                     namespace = %namespace,
                     error = %e,
-                    "backend.stop failed during supervisor reap; deleting registry row anyway"
+                    "backend.stop failed during supervisor reap; registry row already \
+                     deleted, the k8s object is left for the operator to remove"
                 );
             }
-            sqlx::query("DELETE FROM supervisor_pod WHERE pod_name = $1")
-                .bind(&pod_name)
-                .execute(pg_pool)
-                .await?;
         }
         Ok(())
     }

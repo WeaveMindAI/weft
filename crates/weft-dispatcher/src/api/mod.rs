@@ -113,6 +113,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/dashboard", get(dashboard::serve_root))
         .route("/dashboard/{*path}", get(dashboard::serve))
         .route("/listener/inspect", get(signal::listener_inspect))
+        .route("/images/referenced", get(project::referenced_images))
         // Storage plane: the `weft files` CLI surface (list, usage, download
         // handshake, remove). The dispatcher resolves the acting tenant and
         // proxies each verb to the broker (which owns the bucket + metadata);

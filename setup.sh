@@ -602,10 +602,15 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       ok "pruned BuildKit cache"
     fi
 
-    # 3. Workspace cargo target/.
+    # 3. Workspace cargo target/ + the staged builder-base docker context
+    # (both derived artifacts, regenerated on the next build).
     if [[ -d "${here}/target" ]]; then
       rm -rf "${here}/target"
       ok "removed ${C_DIM}target/${C_RESET}"
+    fi
+    if [[ -d "${here}/.weft-base-context" ]]; then
+      rm -rf "${here}/.weft-base-context"
+      ok "removed ${C_DIM}.weft-base-context/${C_RESET}"
     fi
 
     # 4. Daemon-local state.

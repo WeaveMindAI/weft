@@ -1,12 +1,14 @@
-# Allowlist model: ignore EVERYTHING, then un-ignore only what the weft
-# Dockerfiles (deploy/docker/*.Dockerfile) actually COPY. This keeps the build
+# Allowlist model: ignore EVERYTHING, then un-ignore only what the
+# repo-root-context builds (the system images via
+# deploy/docker/system-images.Dockerfile) actually COPY. This keeps the build
 # context to a few MB of source instead of the whole tree (target/ alone is many
 # GB), and it stays correct when new heavy dirs appear (they are ignored by
-# default, never dragged in).
+# default, never dragged in). The builder base does NOT build from the repo
+# root: it uses the staged `.weft-base-context/` dir as its own context.
 #
-# The Dockerfiles COPY: rust-toolchain.toml, Cargo.toml, Cargo.lock, crates/,
-# catalog/, .weft-warmup/. deploy/ is kept so the Dockerfiles referenced with
-# `-f` are inside the context too.
+# The system-images Dockerfile COPYs: rust-toolchain.toml, Cargo.toml,
+# Cargo.lock, crates/, catalog/. deploy/ is kept so the Dockerfile referenced
+# with `-f` is inside the context too.
 *
 
 !rust-toolchain.toml
@@ -14,7 +16,6 @@
 !Cargo.lock
 !crates/
 !catalog/
-!.weft-warmup/
 !deploy/
 
 # Even inside the allowlisted dirs, never ship build artifacts or VCS/dev junk.

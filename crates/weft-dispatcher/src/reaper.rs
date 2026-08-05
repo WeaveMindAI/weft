@@ -422,18 +422,21 @@ async fn sweep_listener_scaledown(state: DispatcherState) -> anyhow::Result<()> 
         .await
 }
 
-/// Supervisor idle reaper. Every 30s, reap every pooled supervisor pod
-/// that owns ZERO projects (the supervisor twin of the listener idle
-/// reaper). A pod owning even one project is reconciling that infra and
-/// is kept; when no infra exists globally, every supervisor owns nothing
-/// and the pool drains to zero (cold-start is covered by
-/// `ensure_at_least_one` on the next sync). Ownership, not a separate
-/// node-count check, is what keeps a busy supervisor alive: a project's
-/// `infra_owner` lease IS the "this pod has work" signal.
+/// Supervisor pool reconciliation. Every 30s: drop ghost project leases,
+/// re-seed an EMPTY pool when lifecycle commands sit pending (a command
+/// can be issued after the spawn site already ran, see
+/// `SupervisorPool::reconcile`), and otherwise reap every pooled
+/// supervisor pod that owns ZERO projects (the supervisor twin of the
+/// listener idle reaper). A pod owning even one project is reconciling
+/// that infra and is kept; when no infra exists globally and no command
+/// is pending, the pool drains to zero (cold-start is covered by
+/// `ensure_at_least_one` on the next sync). Ownership plus pending
+/// commands, not a separate node-count check, is what keeps a busy
+/// supervisor alive.
 async fn sweep_supervisors(state: DispatcherState) -> anyhow::Result<()> {
     state
         .supervisors
-        .reap_idle(
+        .reconcile(
             state.supervisor_backend.as_ref(),
             &state.pg_pool,
             state.pod_id.as_str(),

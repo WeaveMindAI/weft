@@ -857,6 +857,11 @@ pub async fn supervisor_sync_ownership(
         // ONLY if its lease is actually expired, so a live owner is
         // never stolen. Rows we lock are guaranteed free at insert time
         // because the lock is held to the end of the tx.
+        // SYNC: the `project_namespace <> ''` precondition <->
+        //       crates/weft-dispatcher/src/supervisor_pool.rs
+        //       pending_commands_exist, crates/weft-broker/src/handlers.rs
+        //       supervisor_claim_command (its ownership term inherits this
+        //       precondition transitively)
         sqlx::query(
             "WITH free AS ( \
                  SELECT p.id::TEXT AS project_id, p.project_namespace, p.tenant_id \
@@ -1110,6 +1115,12 @@ pub async fn supervisor_claim_command(
     // commands concurrently. Re-running an already-claimed-but-unfinished
     // command after a crash is correct and idempotent (declarative
     // kubectl), so there is nothing to serialize against.
+    //
+    // SYNC: the verb list below <->
+    //       crates/weft-dispatcher/src/supervisor_pool.rs pending_commands_exist,
+    //       crates/weft-broker/src/handlers.rs supervisor_sync_ownership (whose
+    //       `project_namespace <> ''` precondition is what makes the
+    //       ownership term here imply a namespaced project)
     let sql = format!(
         "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force, \
                 c.drain_timeout_secs \
