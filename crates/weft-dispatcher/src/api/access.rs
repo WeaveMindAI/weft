@@ -97,24 +97,13 @@ pub struct DoorsRequest {
     pub spec: weft_core::AccessSpec,
 }
 
-/// One registered app the editor offers as its own shared-door option:
-/// its label and its FIXED permission set.
-// SYNC: SharedAppChoice <-> crates/weft-broker/src/access_admin.rs SharedAppChoice, packages/weft-graph/src/webview/lib/components/project/AccessField.svelte SharedAppChoice
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SharedAppChoice {
-    pub label: String,
-    pub covers: Vec<String>,
-}
-
+// SYNC: DoorsStatus <-> crates/weft-access-store/src/lib.rs DoorsAnswer (flattened in), packages/weft-graph/src/webview/lib/components/project/AccessField.svelte DoorsStatus
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoorsStatus {
-    /// The registered apps, one shared-door option each (oauth
-    /// services only). Empty = the one-click door is hidden; the
-    /// editor HIDES an unbacked door, it never greys.
-    pub shared_apps: Vec<SharedAppChoice>,
-    /// Whether a runtime credential backs the shared door of a
-    /// non-oauth (key) service.
-    pub shared_credential: bool,
+    /// The broker's probe answer (shared-door options + the
+    /// runtime-credential flag), flattened onto this wire unchanged.
+    #[serde(flatten)]
+    pub doors: weft_access_store::DoorsAnswer,
     /// The callback URL an author registers on the provider's site,
     /// shown on the "Your own" page. `None` iff `consent_blocked`.
     pub redirect_uri: Option<String>,
@@ -133,12 +122,7 @@ pub async fn doors(
     _caller: CallerTenant,
     Json(req): Json<DoorsRequest>,
 ) -> Result<Json<DoorsStatus>, ApiError> {
-    #[derive(Deserialize)]
-    struct Answer {
-        shared_apps: Vec<SharedAppChoice>,
-        shared_credential: bool,
-    }
-    let answer: Answer =
+    let doors: weft_access_store::DoorsAnswer =
         crate::broker_admin::forward_json(&state, "/v1/access/admin/doors", &req).await?;
     // A provider demanding https on a weft with no https address
     // blocks every CONSENT, not the panel: paste connects need no
@@ -147,12 +131,7 @@ pub async fn doors(
         Ok(uri) => (Some(uri), None),
         Err((_, msg)) => (None, Some(msg)),
     };
-    Ok(Json(DoorsStatus {
-        shared_apps: answer.shared_apps,
-        shared_credential: answer.shared_credential,
-        redirect_uri,
-        consent_blocked,
-    }))
+    Ok(Json(DoorsStatus { doors, redirect_uri, consent_blocked }))
 }
 
 /// POST /access/mint-app: run the service's "Create it for me" recipe;

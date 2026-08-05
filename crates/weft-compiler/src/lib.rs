@@ -74,6 +74,19 @@ pub fn parse_only(
     catalog: &dyn MetadataCatalog,
     source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
+    // The catalog's type registry is active for the whole pipeline, so
+    // a declared type name in source (a port override, a record) parses
+    // against the same table the metadata was loaded under.
+    catalog.type_registry().scoped(|| parse_only_inner(source, project_id, fs, catalog, source_name))
+}
+
+fn parse_only_inner(
+    source: &str,
+    project_id: Uuid,
+    fs: CompileFs,
+    catalog: &dyn MetadataCatalog,
+    source_name: Option<&str>,
+) -> (ProjectDefinition, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
     // Stages 1+2: lex + parse + flatten, LENIENT. A bad line becomes a
@@ -159,10 +172,14 @@ pub fn compile_strict(
     mode: validate::ValidationMode,
     source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<Diagnostic>) {
-    let (project, mut diagnostics) =
-        compile_and_enrich(source, project_id, fs, catalog, source_name);
-    diagnostics.extend(validate::validate_with_mode(&project, catalog, mode));
-    (project, diagnostics)
+    // Same registry activation as `parse_only`: one table for source
+    // parsing, enrichment, and validation.
+    catalog.type_registry().scoped(|| {
+        let (project, mut diagnostics) =
+            compile_and_enrich(source, project_id, fs, catalog, source_name);
+        diagnostics.extend(validate::validate_with_mode(&project, catalog, mode));
+        (project, diagnostics)
+    })
 }
 
 /// Compile + strict enrich + validate, aborting if any `Error`-severity
@@ -212,6 +229,23 @@ pub fn compile_enriched_with_diagnostics(
 /// an empty project (mirrors `parse_only`) so the shape is uniform;
 /// callers decide whether to abort (`bail_on_errors`) or surface.
 fn compile_and_enrich(
+    source: &str,
+    project_id: Uuid,
+    fs: CompileFs,
+    catalog: &dyn MetadataCatalog,
+    source_name: Option<&str>,
+) -> (ProjectDefinition, Vec<Diagnostic>) {
+    // Parsing and enrichment both resolve declared type names, so the
+    // catalog's registry is activated HERE, at the shared front half,
+    // rather than trusting every public entry to remember the wrap
+    // (`compile_enriched_with_diagnostics`, the build/hash path, once
+    // forgot it and custom types failed only at build time). The scope
+    // is a re-entrant stack, so `compile_strict`'s outer scope (which
+    // also covers validation) nests harmlessly.
+    catalog.type_registry().scoped(|| compile_and_enrich_inner(source, project_id, fs, catalog, source_name))
+}
+
+fn compile_and_enrich_inner(
     source: &str,
     project_id: Uuid,
     fs: CompileFs,

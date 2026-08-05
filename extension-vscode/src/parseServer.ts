@@ -19,7 +19,7 @@ import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:c
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import { WeftCliError } from './cli';
-import type { EditOp, TextEdit } from './shared/protocol';
+import type { EditOp, TextEdit } from '../../packages/weft-graph/src/protocol';
 
 /** A parse-server request. `kind` selects the pipeline; `source` is the buffer
  *  text (parsed as-is, no disk read); `file` gives the `@file`/`@include` base
@@ -151,7 +151,24 @@ export class ParseServer {
     try {
       env = JSON.parse(line) as ServerResponseEnvelope;
     } catch {
-      console.error(`[weft parse-server] unparseable response line: ${line}`);
+      // A line that is not JSON must still settle SOMETHING: leaving it
+      // on the floor stalls the pending request until the 30s timeout.
+      // Salvage the id and fail that request now; with no id the line
+      // cannot be attributed, so the child is torn down (which rejects
+      // every pending request) rather than left silently wedged.
+      const id = line.match(/"id"\s*:\s*(\d+)/);
+      if (id) {
+        const p = this.pending.get(Number(id[1]));
+        if (p) {
+          clearTimeout(p.timer);
+          this.pending.delete(Number(id[1]));
+          p.reject(new WeftCliError(['parse-server'], null, `malformed response line: ${line.slice(0, 200)}`));
+          return;
+        }
+      }
+      if (this.child) {
+        this.onChildGone(this.child, new WeftCliError(['parse-server'], null, `unparseable response line: ${line.slice(0, 200)}`));
+      }
       return;
     }
     const p = this.pending.get(env.id);

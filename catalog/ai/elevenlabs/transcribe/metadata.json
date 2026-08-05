@@ -2,7 +2,6 @@
   "type": "ElevenLabsTranscribe",
   "label": "ElevenLabs Transcribe (Realtime)",
   "description": "Realtime speech-to-text over a live audio stream (Scribe v2 realtime). Wire an audio Bus in (16-bit PCM chunks), and the transcript flows out on a text Bus as it is spoken, with the full transcript emitted at the end. The credential decision comes from a wired ElevenLabsAccess node.",
-  "category": "AI",
   "tags": [
     "ai",
     "audio",

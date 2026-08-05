@@ -524,6 +524,55 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool)
     resolve_for_worker(&pool, TENANT_A, first.id, "fakeoauth", &["write".to_string()], &[])
         .await
         .expect("a held scope resolves");
+
+    // An upgrade id naming a grant of a DIFFERENT service is a clean
+    // miss: the row's app must never be parked into another provider's
+    // consent.
+    let mut other = spec.clone();
+    other.service = "otheroauth".into();
+    let err = begin_oauth(
+        &pool,
+        TENANT_A,
+        BeginOAuth {
+            spec: other,
+            door: Door::Own,
+            registration: Some(oauth_app()),
+            permissions: vec!["read".into()],
+            project_id: Some("proj-1".into()),
+            upgrade_grant_id: Some(first.id),
+            redirect_uri: "http://disp.example/access/oauth/callback".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)),
+        "{err}"
+    );
+
+    // A request carrying a DIFFERENT app than the row's is a
+    // contradiction, refused loudly instead of silently picking a side.
+    let mut other_app = oauth_app();
+    other_app.client_id = "cid-2".into();
+    let err = begin_oauth(
+        &pool,
+        TENANT_A,
+        BeginOAuth {
+            spec: spec.clone(),
+            door: Door::Own,
+            registration: Some(other_app),
+            permissions: vec!["read".into()],
+            project_id: Some("proj-1".into()),
+            upgrade_grant_id: Some(first.id),
+            redirect_uri: "http://disp.example/access/oauth/callback".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(m)) if m.contains("different app")),
+        "{err}"
+    );
 }
 
 #[sqlx::test]

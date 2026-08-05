@@ -21,7 +21,7 @@
 
 import type { DispatcherClient, SseSubscription } from './dispatcher';
 import type { ExecutionFollower, DispatcherEvent } from './execFollower';
-import type { HostMessage } from './shared/protocol';
+import type { HostMessage } from '../../packages/weft-graph/src/protocol';
 
 export type FollowMode = 'latest' | 'pinned';
 
@@ -190,7 +190,11 @@ export class AutoFollowController {
       ev.kind === 'project_activated' ||
       ev.kind === 'project_deactivated' ||
       ev.kind === 'infra_config_error' ||
-      ev.kind === 'trigger_url_changed'
+      ev.kind === 'trigger_url_changed' ||
+      // Build/verb lifecycle: the dispatcher announces transition flips
+      // (building, activating, ...) so the bar shows "Building... (cancel)"
+      // without waiting for the verb round-trip to finish.
+      ev.kind === 'project_transition_changed'
     ) {
       this.onActionable(ev);
     }

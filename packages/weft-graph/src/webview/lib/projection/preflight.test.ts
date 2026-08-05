@@ -3,7 +3,7 @@ import type { ProjectDefinition, NodeInstance } from '../types';
 import { runPreflight } from './preflight';
 import { isLogicLocked, lockReasonText, type LockState } from './types';
 import type { ProjectionCatalog } from './apply';
-import type { EditOp } from '../../../shared/protocol';
+import type { EditOp } from '../../../protocol';
 
 const catalog: ProjectionCatalog = {
   Text: { defaultInputs: [], defaultOutputs: [{ name: 'value', portType: 'String', required: true }] },

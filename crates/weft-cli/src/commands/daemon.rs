@@ -814,15 +814,44 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
         let _ = std::fs::remove_file(public_url_file());
         return Ok(None);
     }
-    let status = kubectl(&["apply", "-f", manifest.to_str().unwrap()]).status().await?;
-    if !status.success() {
-        anyhow::bail!("applying the public tunnel manifest failed");
+    // Content-hash apply: when the manifest actually changed (e.g. the
+    // proxy's nginx allowlist gained a location), the running proxy
+    // must be ROLLED, because nginx never re-reads a mounted ConfigMap
+    // on its own; a plain apply would leave the old filter serving
+    // until the pod happens to restart. The tunnel pod is untouched
+    // (its minted address survives a proxy roll).
+    if kubectl_apply_changed(&manifest, &[]).await? {
+        let status = kubectl(&[
+            "-n",
+            "weft-system",
+            "rollout",
+            "restart",
+            "deployment/weft-public-proxy",
+        ])
+        .status()
+        .await?;
+        if !status.success() {
+            anyhow::bail!("restarting the public proxy after a manifest change failed");
+        }
+        let status = kubectl(&[
+            "-n",
+            "weft-system",
+            "rollout",
+            "status",
+            "deployment/weft-public-proxy",
+            "--timeout=120s",
+        ])
+        .status()
+        .await?;
+        if !status.success() {
+            anyhow::bail!("the public proxy never became ready after its restart");
+        }
     }
     let url = wait_for_tunnel_url().await?;
     std::fs::create_dir_all(data_dir())?;
     std::fs::write(public_url_file(), &url)?;
     println!("public trigger surface reachable at {url}");
-    println!("  exposed through the filtering proxy: /events/... (provider event pushes) and /signal/... (per-signal fire tokens); everything else answers 404.");
+    println!("  exposed through the filtering proxy: /events/... (provider event pushes), /signal/... (per-signal fire tokens), and /public/files/... (minted expiring media links); everything else answers 404.");
     println!("  Rerun with --no-public-url to close it.");
     println!("  NOTE: this address changes whenever the tunnel restarts; re-run the daemon start to re-wire active triggers after one.");
     Ok(Some(url))

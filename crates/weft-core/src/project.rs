@@ -169,6 +169,7 @@ pub fn is_internal_config_key(key: &str) -> bool {
     key.starts_with('_') || key == "parentId"
 }
 
+// SYNC: NodeDefinition <-> packages/weft-graph/src/protocol.ts NodeDefinition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDefinition {
     pub id: String,
@@ -486,6 +487,7 @@ pub struct Position {
     pub y: f64,
 }
 
+// SYNC: Edge <-> packages/weft-graph/src/protocol.ts Edge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub id: String,

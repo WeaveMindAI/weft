@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest';
 import {
 	parseWeftType,
 	weftTypeToString,
+	weftTypeToWireString,
 	isWeftTypeCompatible,
 	isCompatible,
+	weftTypesEqual,
 	extractPrimitives,
 	inferTypeFromValue,
 	type WeftType,
@@ -62,6 +64,46 @@ describe('parseWeftType', () => {
 
 	it('parses MustOverride', () => {
 		expect(parseWeftType('MustOverride')?.kind).toBe('must_override');
+	});
+
+	it('parses Access', () => {
+		expect(parseWeftType('Access')?.kind).toBe('access');
+	});
+
+	it('parses a record with optional fields', () => {
+		const t = parseWeftType('{ name: String, age: Number, nickname?: String }');
+		expect(t).toEqual({
+			kind: 'record',
+			fields: [
+				{ name: 'name', ty: { kind: 'primitive', value: 'String' }, optional: false },
+				{ name: 'age', ty: { kind: 'primitive', value: 'Number' }, optional: false },
+				{ name: 'nickname', ty: { kind: 'primitive', value: 'String' }, optional: true },
+			],
+		});
+	});
+
+	it('parses the self-contained named wire form', () => {
+		const t = parseWeftType('Profile={ name: String }');
+		expect(t).toEqual({
+			kind: 'named',
+			name: 'Profile',
+			body: {
+				kind: 'record',
+				fields: [{ name: 'name', ty: { kind: 'primitive', value: 'String' }, optional: false }],
+			},
+		});
+	});
+
+	it('rejects a bare declared name (no registry frontend-side)', () => {
+		expect(parseWeftType('Profile')).toBeNull();
+	});
+
+	it('rejects reserved names in the named wire form', () => {
+		// Mirrors the backend's check_declarable_name: primitives,
+		// container keywords, special types, and TypeVar shapes.
+		for (const s of ['String=Number', 'Blob=String', 'List=String', 'Access=String', 'T1=String', 'T_Auto=String']) {
+			expect(parseWeftType(s), s).toBeNull();
+		}
 	});
 
 	it('parses type var inside List', () => {
@@ -484,6 +526,8 @@ describe('weftTypeToString roundtrip', () => {
 		'T1',
 		'List[T]',
 		'MustOverride',
+		'Access',
+		'{ name: String, nickname?: String }',
 	];
 
 	for (const c of cases) {
@@ -571,6 +615,115 @@ describe('isWeftTypeCompatible', () => {
 
 	it('wrong primitive types incompatible', () => {
 		expect(isWeftTypeCompatible('Number', 'String')).toBe(false);
+	});
+
+	// Access connects only to Access.
+	it('access into access compatible', () => {
+		expect(isWeftTypeCompatible('Access', 'Access')).toBe(true);
+	});
+	it('access into anything else incompatible', () => {
+		expect(isWeftTypeCompatible('Access', 'String')).toBe(false);
+		expect(isWeftTypeCompatible('String', 'Access')).toBe(false);
+	});
+
+	// Named types are nominal; the mirror of the backend semantics.
+	// SYNC assertions with crates/weft-core/src/weft_type.rs is_compatible.
+	it('same-name named types compatible', () => {
+		expect(isWeftTypeCompatible('Profile={ name: String }', 'Profile={ name: String }')).toBe(true);
+	});
+	it('different-name named types incompatible', () => {
+		expect(isWeftTypeCompatible('Profile={ name: String }', 'Person={ name: String }')).toBe(false);
+	});
+	it('named decays into a structural target', () => {
+		expect(isWeftTypeCompatible('Profile={ name: String }', 'JsonDict')).toBe(true);
+		expect(isWeftTypeCompatible('Profile={ name: String }', '{ name: String }')).toBe(true);
+	});
+	it('nothing unnamed flows into a named target', () => {
+		expect(isWeftTypeCompatible('JsonDict', 'Profile={ name: String }')).toBe(false);
+		expect(isWeftTypeCompatible('{ name: String }', 'Profile={ name: String }')).toBe(false);
+	});
+	it('named matches its arm inside a union target', () => {
+		expect(isWeftTypeCompatible('Profile={ name: String }', 'Profile={ name: String } | Null')).toBe(true);
+	});
+
+	// Record contract: strict unknown keys, optionality respected.
+	it('record with an unknown key incompatible', () => {
+		expect(isWeftTypeCompatible('{ name: String, extra: Number }', '{ name: String }')).toBe(false);
+	});
+	it('record missing an optional target field compatible', () => {
+		expect(isWeftTypeCompatible('{ name: String }', '{ name: String, nickname?: String }')).toBe(true);
+	});
+	it('record missing a required target field incompatible', () => {
+		expect(isWeftTypeCompatible('{ name: String }', '{ name: String, age: Number }')).toBe(false);
+	});
+	it('record forgets into JsonDict, never the reverse', () => {
+		expect(isWeftTypeCompatible('{ name: String }', 'JsonDict')).toBe(true);
+		expect(isWeftTypeCompatible('JsonDict', '{ name: String }')).toBe(false);
+	});
+});
+
+describe('wire form round-trips', () => {
+	// SYNC assertions with crates/weft-core/src/tests/weft_type_tests.rs named_union_body_wire_form_is_unambiguous
+	it('a named union body parenthesizes and round-trips as one named type', () => {
+		const t = parseWeftType('Kind=(String | Number)');
+		expect(t).toEqual({
+			kind: 'named',
+			name: 'Kind',
+			body: { kind: 'union', types: [
+				{ kind: 'primitive', value: 'String' },
+				{ kind: 'primitive', value: 'Number' },
+			] },
+		});
+		expect(weftTypeToWireString(t!)).toBe('Kind=(String | Number)');
+	});
+
+	it('the un-parenthesized spelling is a union with a named member', () => {
+		const t = parseWeftType('Kind=String | Number');
+		expect(t).toEqual({
+			kind: 'union',
+			types: [
+				{ kind: 'named', name: 'Kind', body: { kind: 'primitive', value: 'String' } },
+				{ kind: 'primitive', value: 'Number' },
+			],
+		});
+		expect(weftTypeToWireString(t!)).toBe('Kind=String | Number');
+	});
+
+	it('a record-bodied named type beside Null round-trips (braces protect)', () => {
+		const wire = 'Profile={ name: String } | Null';
+		const t = parseWeftType(wire);
+		expect(t?.kind).toBe('union');
+		expect(parseWeftType(weftTypeToWireString(t!))).toEqual(t);
+	});
+
+	it('paren grouping parses and nests', () => {
+		expect(parseWeftType('(String | Number)')).toEqual(parseWeftType('String | Number'));
+		expect(parseWeftType('((String))')).toEqual({ kind: 'primitive', value: 'String' });
+	});
+
+	it('unions drop Empty when another member remains', () => {
+		expect(parseWeftType('String | Empty')).toEqual({ kind: 'primitive', value: 'String' });
+		expect(parseWeftType('Empty | Number')).toEqual({ kind: 'primitive', value: 'Number' });
+		expect(parseWeftType('Empty')).toEqual({ kind: 'primitive', value: 'Empty' });
+	});
+});
+
+describe('runtime handle inference', () => {
+	it('infers Bus and Access from their sentinel markers', () => {
+		expect(inferTypeFromValue({ __weft_bus__: { id: 'a', mode: 'journaled' } })).toEqual({ kind: 'bus' });
+		expect(inferTypeFromValue({ __weft_access__: {} })).toEqual({ kind: 'access' });
+	});
+});
+
+describe('named display form', () => {
+	// Display renders the BARE name (the authored form); only the wire
+	// form (`Name=Body`) reparses frontend-side, by design: the editor
+	// receives wire forms from the backend and shows bare names to the
+	// user, and edit ops re-resolve bare names against the project
+	// registry backend-side.
+	it('renders a named type as its bare name', () => {
+		const t = parseWeftType('Profile={ name: String }');
+		expect(weftTypeToString(t!)).toBe('Profile');
 	});
 });
 
@@ -938,6 +1091,24 @@ describe('inferTypeFromValue no typevars', () => {
 		const s = weftTypeToString(t);
 		expect(s).not.toContain(' T');
 		expect(s).not.toMatch(/T\]/);
+	});
+
+	it('union dedup is structural: field order and named bodies do not fork members', () => {
+		// The backend's equality compares record fields as an unordered
+		// set (a rendered-string compare kept both spellings of the
+		// same record as separate members) and named types by name
+		// alone (which even the display string got right by accident;
+		// the record case is the one that regresses).
+		const reordered = parseWeftType('{ a: String, b: Number } | { b: Number, a: String }');
+		expect(reordered?.kind).toBe('record');
+		const named = parseWeftType('K=String | K=Number');
+		expect(named?.kind).toBe('named');
+		// Direct equality checks too, for the two deliberate departures.
+		const r1 = parseWeftType('{ a: String, b?: Number }')!;
+		const r2 = parseWeftType('{ b?: Number, a: String }')!;
+		expect(weftTypesEqual(r1, r2)).toBe(true);
+		expect(weftTypesEqual(parseWeftType('K=String')!, parseWeftType('K=Number')!)).toBe(true);
+		expect(weftTypesEqual(r1, parseWeftType('{ a: String, b: Number }')!)).toBe(false);
 	});
 
 	it('complex nested structure with empties produces no typevars', () => {

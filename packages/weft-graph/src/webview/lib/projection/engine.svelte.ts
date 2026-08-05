@@ -14,7 +14,7 @@
 // re-derive.
 
 import type { ProjectDefinition } from '../types';
-import type { EditOp, TextEdit } from '../../../shared/protocol';
+import type { EditOp, TextEdit } from '../../../protocol';
 import { applyLayoutOps, diffLayoutOps, type LayoutOp } from '../layout';
 import { foldOps, type ProjectionCatalog } from './apply';
 import { runPreflight } from './preflight';

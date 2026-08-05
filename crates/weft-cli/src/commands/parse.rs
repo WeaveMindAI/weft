@@ -191,9 +191,19 @@ pub async fn serve(_ctx: Ctx) -> Result<()> {
         }
         let resp = match serde_json::from_str::<ServerRequest>(&line) {
             Ok(req) => handle_request(req, &mut catalogs),
-            // A request we can't even parse has no id to echo; answer id 0 so
-            // the host sees the failure rather than hanging on a lost reply.
-            Err(e) => ServerResponse { id: 0, payload: None, error: Some(format!("bad request: {e}")) },
+            // A request we can't parse into the typed shape may still be
+            // valid JSON carrying an `id` (a stale editor talking to a
+            // newer server): recover it so the host matches the reply to
+            // its pending request and shows the real reason instead of
+            // idling into its timeout. Only truly unparseable input
+            // falls back to id 0.
+            Err(e) => {
+                let id = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
+                    .unwrap_or(0);
+                ServerResponse { id, payload: None, error: Some(format!("bad request: {e}")) }
+            }
         };
         let mut out = stdout.lock();
         serde_json::to_writer(&mut out, &resp).context("serialize server response")?;
@@ -250,7 +260,23 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
             // Parse the result so the UI re-renders in one round-trip. Edit
             // failure is loud (the frontend keeps the pre-edit source).
             let source_id = weft_compiler::source_name::derive_id(req.file.as_deref());
-            let (new_source, inverse) = match weft_compiler::edit::apply_edits(&req.source, base.as_deref(), &source_id, &req.ops) {
+            // Edit ops validate written TYPE strings, so the project's
+            // registry must be active (a declared name in a port
+            // override is valid exactly when the catalog knows it).
+            let registry = match &project {
+                Some(p) => match warm_catalog(catalogs, &p.root, req.reload_catalog) {
+                    Ok(cat) => cat.type_registry(),
+                    Err(e) => return ServerResponse { id, payload: None, error: Some(e) },
+                },
+                None => FsCatalog::empty().type_registry(),
+            };
+            let (new_source, inverse) = match weft_compiler::edit::apply_edits(
+                &req.source,
+                base.as_deref(),
+                &source_id,
+                &req.ops,
+                registry,
+            ) {
                 Ok(r) => r,
                 Err(e) => return ServerResponse { id, payload: None, error: Some(format!("edit: {e}")) },
             };

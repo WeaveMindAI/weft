@@ -121,6 +121,12 @@ pub struct FsCatalog {
     /// Soft errors collected under `DiscoverPolicy::Lenient` (always
     /// empty under `Strict`, which errors instead).
     warnings: Vec<String>,
+    /// The project's resolved type registry: builtin aliases plus every
+    /// `types` declaration harvested from the tree's `metadata.json`
+    /// files. Built BEFORE any metadata is deserialized (port type
+    /// strings may use the declared names) and carried here so
+    /// compile/enrich callers can activate the same registry.
+    type_registry: std::sync::Arc<weft_core::weft_type::TypeRegistry>,
 }
 
 impl FsCatalog {
@@ -146,12 +152,29 @@ impl FsCatalog {
             entries: HashMap::new(),
             packages: HashMap::new(),
             warnings: Vec::new(),
+            type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
         };
         if root.exists() {
+            // Type declarations first: port type strings in any
+            // metadata.json may use the declared names, so the registry
+            // must exist before a single NodeMetadata is deserialized.
+            match build_type_registry(root, policy, &mut cat.warnings)? {
+                Some(registry) => cat.type_registry = std::sync::Arc::new(registry),
+                None => { /* Lenient fallback: builtin only, warned. */ }
+            }
+            let registry = cat.type_registry.clone();
             let mut ctx = DiscoverCtx { policy, cat: &mut cat };
-            visit_dir(root, &mut ctx)?;
+            registry.scoped(|| visit_dir(root, &mut ctx))?;
         }
         Ok(cat)
+    }
+
+    /// The project's resolved type registry (builtin aliases + every
+    /// harvested `types` declaration). Activate it (`scoped`) around
+    /// compiling weft source against this catalog, so source-side type
+    /// names resolve to the same table the metadata was loaded under.
+    pub fn type_registry(&self) -> std::sync::Arc<weft_core::weft_type::TypeRegistry> {
+        self.type_registry.clone()
     }
 
     /// An empty catalog: no nodes, no packages. The honest value for
@@ -163,6 +186,7 @@ impl FsCatalog {
             entries: HashMap::new(),
             packages: HashMap::new(),
             warnings: Vec::new(),
+            type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
         }
     }
 
@@ -238,6 +262,9 @@ impl MetadataCatalog for FsCatalog {
     }
     fn all(&self) -> Vec<&NodeMetadata> {
         self.entries.values().map(|e| &e.metadata).collect()
+    }
+    fn type_registry(&self) -> std::sync::Arc<weft_core::weft_type::TypeRegistry> {
+        self.type_registry.clone()
     }
 }
 
@@ -494,6 +521,86 @@ impl DiscoverCtx<'_> {
         self.cat.entries.insert(entry.node_type.clone(), entry);
         Ok(true)
     }
+}
+
+/// Harvest every `types` declaration under `root` and build the
+/// project's [`weft_core::weft_type::TypeRegistry`]. This walk is
+/// deliberately simpler than unit discovery: type declarations are
+/// global, so it reads the `types` key of EVERY `metadata.json` in the
+/// tree (member and package-root alike, same no-follow/exclusion policy
+/// via `read_node_dir`) with no unit semantics. Malformed JSON is left
+/// for the main discovery pass to report (it owns metadata errors);
+/// only the declarations themselves fail here. Under `Lenient` a
+/// registry build failure becomes a warning and `None` (builtin-only),
+/// so the editor keeps rendering while the author fixes the clash.
+fn build_type_registry(
+    root: &Path,
+    policy: DiscoverPolicy,
+    warnings: &mut Vec<String>,
+) -> Result<Option<weft_core::weft_type::TypeRegistry>, CatalogError> {
+    let mut declarations: Vec<(String, String, String)> = Vec::new();
+    harvest_type_declarations(root, &mut declarations)?;
+    // Lexical order by origin path: `fs::read_dir` order is
+    // filesystem-dependent, and a clash error names the SECOND origin,
+    // so an unsorted harvest would blame a different file per machine.
+    declarations.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    match weft_core::weft_type::TypeRegistry::build(&declarations) {
+        Ok(registry) => Ok(Some(registry)),
+        Err(error) => match policy {
+            DiscoverPolicy::Strict => Err(CatalogError::Parse {
+                path: root.to_path_buf(),
+                error: format!("type declarations: {error}"),
+            }),
+            DiscoverPolicy::Lenient => {
+                warnings.push(format!("type declarations: {error}"));
+                Ok(None)
+            }
+        },
+    }
+}
+
+fn harvest_type_declarations(
+    dir: &Path,
+    out: &mut Vec<(String, String, String)>,
+) -> Result<(), CatalogError> {
+    for entry in read_node_dir(dir)? {
+        match entry {
+            NodeDirEntry::Dir(path) => harvest_type_declarations(&path, out)?,
+            NodeDirEntry::File(path) => {
+                if path.file_name().and_then(|n| n.to_str()) != Some("metadata.json") {
+                    continue;
+                }
+                // Raw read: the typed NodeMetadata parse needs the
+                // registry we are building. Malformed JSON is the main
+                // pass's error to report (it owns metadata errors), so
+                // it is skipped here; an UNREADABLE file is not (the
+                // main pass treats a package root's partial as defaults
+                // to merge and may never report it, and a vanished
+                // declaration would surface much later as an unresolved
+                // port type on an innocent node).
+                let raw = fs::read_to_string(&path)
+                    .map_err(|error| CatalogError::Io { path: path.clone(), error })?;
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+                let Some(types) = value.get("types") else { continue };
+                let Some(map) = types.as_object() else {
+                    return Err(CatalogError::Parse {
+                        path,
+                        error: "`types` must be an object of name -> type string".into(),
+                    });
+                };
+                for (name, body) in map {
+                    let Some(body) = body.as_str() else {
+                        return Err(CatalogError::Parse {
+                            path,
+                            error: format!("`types.{name}` must be a type string"),
+                        });
+                    };
+                    out.push((name.clone(), body.to_string(), path.display().to_string()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Recursive directory visitor under `nodes/`. For each directory:

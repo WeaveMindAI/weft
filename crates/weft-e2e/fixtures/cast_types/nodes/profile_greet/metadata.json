@@ -1,0 +1,29 @@
+{
+  "type": "ProfileGreet",
+  "label": "Profile Greet",
+  "description": "Greet a Profile. A project-local custom node used by the e2e rig to prove a user-declared named type flows from a Cast into a typed node input.",
+  "tags": [
+    "custom",
+    "e2e",
+    "types"
+  ],
+  "icon": "User",
+  "color": "#8b5cf6",
+  "types": {
+    "Profile": "{ name: String, age: Number, nickname?: String }"
+  },
+  "inputs": [
+    {
+      "name": "profile",
+      "type": "Profile",
+      "required": true
+    }
+  ],
+  "outputs": [
+    {
+      "name": "greeting",
+      "type": "String"
+    }
+  ],
+  "requires_infra": false
+}

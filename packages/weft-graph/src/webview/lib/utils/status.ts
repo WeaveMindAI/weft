@@ -1,6 +1,6 @@
 // Node statuses (mirror Rust `weft_core::exec::NodeExecutionStatus`):
 // running, waiting_for_input, completed, skipped, failed, cancelled.
-// The TS union (`NodeExecutionStatus` in shared/protocol.ts) is the
+// The TS union (`NodeExecutionStatus` in protocol.ts) is the
 // single source of truth for the closed set; helpers here only need
 // to handle those values.
 

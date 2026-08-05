@@ -22,17 +22,41 @@ export function fieldForInput(input: PortDefinition): FieldDefinition {
 	if (input.placeholder !== undefined) field.placeholder = input.placeholder;
 	if (input.default !== undefined) field.defaultValue = input.default;
 	if (input.description !== undefined) field.description = input.description;
-	if (w.options) field.options = w.options;
-	if (w.min !== undefined) field.min = w.min;
-	if (w.max !== undefined) field.max = w.max;
-	if (w.step !== undefined) field.step = w.step;
-	if (w.accept) field.accept = w.accept;
-	if (w.type) field.fileType = w.type;
-	if (w.language) field.language = w.language;
-	if (w.service !== undefined) field.service = w.service;
-	if (w.access) field.access = w.access;
-	if (w.sources) field.sources = w.sources;
-	if (w.depends_on) field.dependsOn = w.depends_on;
+	// Per-variant payloads: the Widget union narrows on `kind`, so a
+	// variant's required payload (a select's options, a remote_select's
+	// sources) cannot be silently absent.
+	switch (w.kind) {
+		case 'select':
+		case 'multiselect':
+			field.options = w.options;
+			break;
+		case 'number':
+			if (w.min != null) field.min = w.min;
+			if (w.max != null) field.max = w.max;
+			if (w.step != null) field.step = w.step;
+			break;
+		case 'code':
+			field.language = w.language;
+			break;
+		case 'access':
+			if (w.service !== undefined) field.service = w.service;
+			break;
+		case 'remote_select':
+			field.access = w.access;
+			field.sources = w.sources;
+			if (w.depends_on) field.dependsOn = w.depends_on;
+			break;
+		case 'file_drop':
+			if (w.accept) field.accept = w.accept;
+			field.fileType = w.type;
+			break;
+		case 'text':
+		case 'textarea':
+		case 'checkbox':
+		case 'password':
+		case 'form_builder':
+			break;
+	}
 	return field;
 }
 

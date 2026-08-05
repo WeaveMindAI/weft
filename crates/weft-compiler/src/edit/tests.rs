@@ -6,6 +6,24 @@ use crate::cst::kind::SyntaxKind;
 use crate::cst::nodes::WeftFile;
 use crate::cst::parse;
 
+/// Test rig: the public `apply_edits` with the builtin registry (no
+/// test here edits a user-declared type name). Shadows the real name so
+/// call sites stay signature-free.
+fn apply_edits(
+    source: &str,
+    base_dir: Option<&std::path::Path>,
+    source_id: &str,
+    ops: &[EditOp],
+) -> Result<(String, TextEdit), EditError> {
+    super::apply_edits(
+        source,
+        base_dir,
+        source_id,
+        ops,
+        std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
+    )
+}
+
 fn apply(source: &str, ops: Vec<EditOp>) -> String {
     apply_edits(source, None, "Untitled", &ops).expect("edits apply").0
 }
@@ -1919,12 +1937,54 @@ fn move_group_into_group_nests_and_reparses() {
 }
 
 #[test]
-fn set_label_rejects_triple_backtick_value() {
-    // A multi-line label containing ``` can't be encoded as a heredoc (no fence
-    // escape), so it's a loud error, not silently-corrupt source.
+fn set_label_escapes_triple_backtick_value() {
+    // A multi-line label containing ``` encodes as the escaped inner
+    // fence (`\```` ``` ``) and round-trips verbatim through the
+    // compiler's heredoc decode. Only the escape's own literal spelling
+    // (`\```` inside the value) is unencodable and errs loudly.
     let src = "n = Text { value: \"x\" }\n";
-    let err = apply_edits(src, None, "Untitled", &[EditOp::SetLabel { node: "n".into(), label: Some("a\n```\nb".into()) }]).unwrap_err();
+    let (out, _) = apply_edits(src, None, "Untitled", &[EditOp::SetLabel {
+        node: "n".into(),
+        label: Some("a\n```\nb".into()),
+    }])
+    .expect("inner fence encodes");
+    assert!(out.contains("\\```"), "escaped fence in source: {out}");
+    let project = crate::weft_compiler::compile(&out, uuid::Uuid::nil(), crate::CompileFs::none())
+        .expect("edited source parses");
+    let n = project.nodes.iter().find(|n| n.id == "n").expect("node");
+    assert_eq!(n.label.as_deref(), Some("a\n```\nb"), "label round-trips verbatim");
+
+    let err = apply_edits(src, None, "Untitled", &[EditOp::SetLabel {
+        node: "n".into(),
+        label: Some("a\n\\```\nb".into()),
+    }])
+    .unwrap_err();
     assert!(matches!(err, EditError::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn heredoc_content_is_verbatim() {
+    // Indentation and trailing spaces inside a multi-line value are the
+    // VALUE, byte for byte: no dedent guessing, no end trim. (Past bug:
+    // a uniformly indented snippet lost its indentation, and trailing
+    // spaces on the last line vanished.)
+    let src = "n = Text { value: \"x\" }\n";
+    let content = "    line1\n    line2   ";
+    let (out, _) = apply_edits(src, None, "Untitled", &[EditOp::SetConfig {
+        node: "n".into(),
+        key: "value".into(),
+        value: format!("```\n{content}\n```"),
+        form: None,
+    }])
+    .expect("edit applies");
+    let project = crate::weft_compiler::compile(&out, uuid::Uuid::nil(), crate::CompileFs::none())
+        .expect("edited source parses");
+    let n = project.nodes.iter().find(|n| n.id == "n").expect("node");
+    assert_eq!(
+        n.config.get("value").and_then(|v| v.as_str()),
+        Some(content),
+        "content survives byte for byte"
+    );
 }
 
 #[test]
@@ -3166,3 +3226,6 @@ fn set_config_on_a_bodyless_decl_keeps_its_leading_newlines() {
     );
     assert_reversible(src, ops);
 }
+
+
+

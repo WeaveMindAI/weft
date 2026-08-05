@@ -2,7 +2,6 @@
   "type": "SlackAppMessages",
   "label": "Slack App Messages (all workspaces)",
   "description": "Fires an execution for messages in EVERY workspace that installed your Slack app. For app owners distributing their app as a product: each install's events are yours. Needs a connection through your own app with its app-level (xapp-...) Socket Mode token pasted; weft dials out and holds the line, so no public address is needed. For 'a bot in my own workspace', use Slack Receive Message instead.",
-  "category": "Triggers",
   "tags": [
     "slack",
     "trigger",

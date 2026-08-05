@@ -2,7 +2,6 @@
   "type": "LiveWsEcho",
   "label": "Live: WebSocket Echo",
   "description": "Demo node for a WebSocket live connection. Holds a two-way conversation: echoes each message the caller sends, with a turn counter, until they close. Wire under a LiveSocket trigger.",
-  "category": "live",
   "tags": [
     "live",
     "websocket",

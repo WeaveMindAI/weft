@@ -66,12 +66,7 @@ fn listener_only(caller: &crate::auth::CallerIdentity) -> Result<(), ApiError> {
 /// subscriptions it counts as "no public address" and meets the
 /// teaching error instead of a subscribe that can never deliver.
 pub fn receiver_url(state: &BrokerState, service: &str, topic: &str) -> Option<String> {
-    let base = state.internet_url.as_deref().or_else(|| {
-        state
-            .public_base_url
-            .as_deref()
-            .filter(|b| !weft_core::net::is_loopback_url(b))
-    })?;
+    let base = state.internet_base()?;
     Some(format!("{}/events/{service}/{topic}", base.trim_end_matches('/')))
 }
 
@@ -111,7 +106,7 @@ fn parse_access_id(raw: &str) -> Result<uuid::Uuid, ApiError> {
 /// subscription serves this signal; answers the current expiry so
 /// the listener knows when to come back. Refuses loudly, naming the
 /// fix, when the topic needs inbound delivery and this weft has no
-/// public address. The broker fills the receiver address: deployment
+/// public address. The broker fills the receiver address: the address
 /// configuration is its to know.
 async fn subscription_ensure(
     State(state): State<Arc<BrokerState>>,

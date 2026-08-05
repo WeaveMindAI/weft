@@ -85,6 +85,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/list", get(list_files))
         .route("/v1/storage/keep", post(keep_file))
         .route("/v1/storage/presign", post(presign))
+        .route("/v1/storage/public-link", post(public_link))
         // Admin upload: the dispatcher drives the SAME multipart contract on
         // behalf of a tenant's editor session (a file-drop config field).
         // Project-scoped only; part URLs are presigned for the browser-facing
@@ -100,6 +101,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/tenant-usage", post(admin_tenant_usage))
         .route("/v1/storage/admin/files/{*key}", delete(admin_delete_file))
         .route("/v1/storage/admin/presign", post(admin_presign))
+        .route("/v1/storage/admin/relay/{token}", axum::routing::get(admin_relay))
         .route("/v1/storage/admin/wipe-prefix", post(admin_wipe_prefix))
         .route("/v1/storage/admin/sweep-exec", post(admin_sweep_exec))
 }
@@ -404,6 +406,84 @@ async fn presign(
     Ok(Json(PresignResponse { url: store.presign(&parsed, req.ttl_secs).await.map_err(map_err)? }))
 }
 
+/// Mint a URL the OPEN INTERNET can fetch the file from, or `url: None`
+/// when no internet-reachable address is configured; the worker then
+/// inlines the bytes instead. Three configurations, one rule each:
+/// - the bucket's public endpoint is a declared internet host
+///   (`WEFT_OBJECT_STORE_PUBLIC_INTERNET`): the bucket's own presigned
+///   URL, zero relay hops;
+/// - an internet-reachable base exists (a public tunnel, a real
+///   ingress): a relay link under it, resolved by the public
+///   `/public/files/{token}` route;
+/// - neither: no public link exists, answer `None`.
+async fn public_link(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<weft_core::storage::PresignRequest>,
+) -> Result<Json<weft_core::storage::PublicLinkResponse>, ApiError> {
+    let caller = worker_caller(&state, &headers).await?;
+    let store = store(&state)?;
+    let parsed = wall(&caller, &req.key)?;
+    let url = match public_link_route(state.object_store_public_internet, state.internet_base()) {
+        PublicLinkRoute::DirectPresign => {
+            Some(store.presign(&parsed, req.ttl_secs).await.map_err(map_err)?)
+        }
+        PublicLinkRoute::Relay(base) => {
+            let token = store.mint_public_link(&parsed, req.ttl_secs).await.map_err(map_err)?;
+            Some(format!("{}/public/files/{token}", base.trim_end_matches('/')))
+        }
+        PublicLinkRoute::Unsupported => None,
+    };
+    Ok(Json(weft_core::storage::PublicLinkResponse { url }))
+}
+
+/// Which way a public file link is served, decided from two configured
+/// facts alone: the operator's declaration that the bucket's public
+/// endpoint is a real internet host, and whether an internet-reachable
+/// base exists at all.
+#[derive(Debug, PartialEq, Eq)]
+enum PublicLinkRoute<'a> {
+    /// The bucket's own presigned URL, zero relay hops.
+    DirectPresign,
+    /// A relay link under the internet base.
+    Relay(&'a str),
+    /// No public link exists; the caller inlines the bytes.
+    Unsupported,
+}
+
+fn public_link_route(bucket_internet: bool, internet_base: Option<&str>) -> PublicLinkRoute<'_> {
+    if bucket_internet {
+        PublicLinkRoute::DirectPresign
+    } else if let Some(base) = internet_base {
+        PublicLinkRoute::Relay(base)
+    } else {
+        PublicLinkRoute::Unsupported
+    }
+}
+
+#[cfg(test)]
+mod public_link_route_tests {
+    use super::{public_link_route, PublicLinkRoute};
+
+    #[test]
+    fn route_follows_the_configured_facts() {
+        // Internet-declared bucket wins outright (even with a base up:
+        // the direct URL is the no-hop path).
+        assert_eq!(public_link_route(true, None), PublicLinkRoute::DirectPresign);
+        assert_eq!(
+            public_link_route(true, Some("https://x.example")),
+            PublicLinkRoute::DirectPresign
+        );
+        // Private bucket + internet base: relay under the base.
+        assert_eq!(
+            public_link_route(false, Some("https://x.example")),
+            PublicLinkRoute::Relay("https://x.example")
+        );
+        // Neither: no public link, callers inline.
+        assert_eq!(public_link_route(false, None), PublicLinkRoute::Unsupported);
+    }
+}
+
 /// Parse the key through the wall's grammar and confirm the caller may touch
 /// it. Every key-addressed worker verb goes through here (so "a key reaching
 /// the store passed the wall" holds by construction).
@@ -619,6 +699,57 @@ async fn admin_delete_file(
     let parsed = key::parse_key(&key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     store.delete(&parsed).await.map_err(map_err)?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// GET /v1/storage/admin/relay/{token}: stream a minted public-relay
+/// link's bytes. The dispatcher's public `/public/files/{token}` route
+/// forwards here because its egress is locked to the control plane;
+/// the broker is the one service with bucket reach, so it resolves the
+/// token (missing and expired are an identical 404) and streams the
+/// presigned in-cluster fetch through.
+async fn admin_relay(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    let Some(link) = store
+        .resolve_public_link(&token)
+        .await
+        .map_err(|e| map_err(RuntimeStoreError::Other(e)))?
+    else {
+        return Err((StatusCode::NOT_FOUND, "no such file link".into()));
+    };
+    static RELAY_HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let http = RELAY_HTTP.get_or_init(reqwest::Client::new);
+    let upstream = http.get(&link.fetch_url).send().await.map_err(|e| {
+        tracing::error!(target: "weft_broker::runtime_storage", error = %e, "relay bucket fetch failed");
+        (StatusCode::BAD_GATEWAY, "file fetch failed".to_string())
+    })?;
+    if !upstream.status().is_success() {
+        tracing::error!(
+            target: "weft_broker::runtime_storage",
+            status = %upstream.status(),
+            "relay bucket fetch refused"
+        );
+        return Err((StatusCode::BAD_GATEWAY, "file fetch failed".to_string()));
+    }
+    // content-length only when the bucket stated one for THIS response
+    // (restating the row's size against a body someone else produced
+    // would lie on a torn or replaced object; absent = chunked).
+    // mime/filename passed validate_serveable at the upload boundary,
+    // so both are header-safe as stored.
+    let mut resp = axum::response::Response::builder()
+        .header("content-type", link.mime_type)
+        .header("content-disposition", format!("inline; filename=\"{}\"", link.filename));
+    if let Some(len) = upstream.headers().get("content-length") {
+        resp = resp.header("content-length", len);
+    }
+    resp.body(axum::body::Body::from_stream(upstream.bytes_stream())).map_err(|e| {
+        tracing::error!(target: "weft_broker::runtime_storage", error = %e, "relay response build failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string())
+    })
 }
 
 async fn admin_presign(

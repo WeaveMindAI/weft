@@ -20,34 +20,60 @@
 //! No central enum, no match dispatch. The framework discovers kinds
 //! at startup via the `inventory` registry.
 
-pub mod auth;
+// `predicate` is wire-pure (serde types + a pure evaluator) and stays
+// available without the `runtime` feature: `SignalSpec` (an ungated
+// wire type) carries `Vec<Predicate>`. Every other submodule is a
+// typed runtime kind (cron/chrono/inventory deps), runtime-gated.
 pub mod predicate;
+pub use predicate::{Predicate, PredicateOp};
+
+#[cfg(feature = "runtime")]
+pub mod auth;
+#[cfg(feature = "runtime")]
 pub mod timer;
+#[cfg(feature = "runtime")]
 pub mod form;
+#[cfg(feature = "runtime")]
 pub mod sse_subscribe;
+#[cfg(feature = "runtime")]
 pub mod poll_endpoint;
+#[cfg(feature = "runtime")]
 pub mod socket_listen;
+#[cfg(feature = "runtime")]
 pub mod stream_listen;
+#[cfg(feature = "runtime")]
 pub mod provider_events;
+#[cfg(feature = "runtime")]
 pub mod live_connection;
 
+#[cfg(feature = "runtime")]
 pub use auth::PublicEntryAuth;
-pub use predicate::{Predicate, PredicateOp};
+#[cfg(feature = "runtime")]
 pub use provider_events::{EventScope, ProviderEvents};
+#[cfg(feature = "runtime")]
 pub use timer::{Timer, TimerSpec};
+#[cfg(feature = "runtime")]
 pub use form::{Form, FormSchema, FormField};
+#[cfg(feature = "runtime")]
 pub use sse_subscribe::SseSubscribe;
+#[cfg(feature = "runtime")]
 pub use poll_endpoint::PollEndpoint;
+#[cfg(feature = "runtime")]
 pub use socket_listen::{SocketFrame, SocketListen};
+#[cfg(feature = "runtime")]
 pub use stream_listen::{Framing, LengthCounts, ScriptStep, StreamListen, StreamReply};
+#[cfg(feature = "runtime")]
 pub use live_connection::{
     protocol_for_tag, ApiEndpoint, Backpressure, DataType, ErrorMode, JournalMode,
     LiveConnectionConfig, LiveSocket, Protocol,
 };
 
+#[cfg(feature = "runtime")]
 use serde::{de::DeserializeOwned, Serialize};
+#[cfg(feature = "runtime")]
 use serde_json::Value;
 
+#[cfg(feature = "runtime")]
 use crate::primitive::{AccessRef, SignalSpec};
 
 /// Trait every wake-signal kind implements. Carries:
@@ -62,6 +88,7 @@ use crate::primitive::{AccessRef, SignalSpec};
 /// `is_resume` is NOT on the trait. Whether a registration is a
 /// fresh entry or a paused-firing resume is decided by which
 /// `ExecutionContext` method the author called.
+#[cfg(feature = "runtime")]
 pub trait Signal: Serialize + DeserializeOwned + Sized {
     /// Kind tag stored on the wire (`"timer"`, `"api_endpoint"`, ...).
     /// Used to route incoming specs to the right handler in the
@@ -110,6 +137,7 @@ pub trait Signal: Serialize + DeserializeOwned + Sized {
 /// Project a typed kind into the wire-shape `SignalSpec`. The
 /// entry-vs-resume distinction is dispatcher-flow metadata, NOT
 /// part of the spec; it rides on the register request.
+#[cfg(feature = "runtime")]
 pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
     // Charset: consumer_kind round-trips through SQL `ANY($1)` and
     // URL paths, so it must match the tag charset. Catalog authors
@@ -133,6 +161,7 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
 /// Each `weft-core/src/signal/<name>.rs` file submits one of these.
 /// The framework iterates the registry to validate any `SignalSpec`
 /// without knowing the typed struct.
+#[cfg(feature = "runtime")]
 pub struct SignalKindEntry {
     pub tag: &'static str,
     /// Parse `config` as the typed kind and call `validate`. Returns
@@ -144,10 +173,12 @@ pub struct SignalKindEntry {
     pub requires_access: bool,
 }
 
+#[cfg(feature = "runtime")]
 inventory::collect!(SignalKindEntry);
 
 /// Find a registered kind by tag, or None. Internal: callers go
 /// through `validate_spec`.
+#[cfg(feature = "runtime")]
 fn lookup(tag: &str) -> Option<&'static SignalKindEntry> {
     inventory::iter::<SignalKindEntry>
         .into_iter()
@@ -158,6 +189,7 @@ fn lookup(tag: &str) -> Option<&'static SignalKindEntry> {
 /// kind shares (the pre-fire filter), then the kind's own config.
 /// Returns Err for unknown tags, malformed filters, and
 /// kind-reported failures alike.
+#[cfg(feature = "runtime")]
 pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
     let entry = lookup(&spec.kind)
         .ok_or_else(|| format!("unknown signal kind: '{}'", spec.kind))?;
@@ -199,7 +231,7 @@ macro_rules! register_signal_kind {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 mod tests {
     use super::*;
 

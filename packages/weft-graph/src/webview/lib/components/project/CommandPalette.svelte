@@ -1,9 +1,8 @@
 <script lang="ts">
-	import type { NodeCategory } from "../../types";
 	import { NODE_TYPE_CONFIG, ALL_NODES, type NodeType } from "../../nodes";
 	import { browser } from "$app/environment";
 	import {
-		Search, BrainCircuit, ChartBar, GitFork, Server, Wrench, Bug, Zap,
+		Search,
 		Undo2, Redo2, Copy, Trash2, CheckSquare, Maximize2, LayoutDashboard,
 	} from '@lucide/svelte';
 	import type { Component } from 'svelte';
@@ -42,41 +41,14 @@
 		}
 	});
 	
-	// Auto-generate categories from node definitions
-	const CATEGORY_CONFIG: Record<NodeCategory, { icon: Component; order: number }> = {
-		Triggers: { icon: Zap, order: 0 },
-		AI: { icon: BrainCircuit, order: 1 },
-		Data: { icon: ChartBar, order: 2 },
-		Flow: { icon: GitFork, order: 3 },
-		Infrastructure: { icon: Server, order: 4 },
-		Utility: { icon: Wrench, order: 5 },
-		Debug: { icon: Bug, order: 6 },
-	};
-	
-	// Build categories from ALL_NODES (excluding hidden nodes)
-	const nodeCategories = $derived.by(() => {
-		const categoryMap = new Map<NodeCategory, NodeType[]>();
-
-		for (const node of ALL_NODES) {
-			// Skip nodes that are hidden from palette
-			if (node.features?.hidden) continue;
-
-			const category = node.category;
-			if (!categoryMap.has(category)) {
-				categoryMap.set(category, []);
-			}
-			categoryMap.get(category)!.push(node.type as NodeType);
-		}
-		
-		return Array.from(categoryMap.entries())
-			.map(([name, types]) => ({
-				name,
-				types,
-				icon: CATEGORY_CONFIG[name]?.icon || Search,
-				order: CATEGORY_CONFIG[name]?.order ?? 99,
-			}))
-			.sort((a, b) => a.order - b.order);
-	});
+	// The palette is a flat, alphabetical node list: discovery is typing
+	// (label / tags / description ranking below), not category browsing.
+	// The catalog producers already filter hidden nodes off the wire.
+	const paletteNodes = $derived(
+		[...ALL_NODES]
+			.sort((a, b) => a.label.localeCompare(b.label))
+			.map((n) => n.type as NodeType)
+	);
 	
 	// VS Code embedding: save/run/export/import are handled by the
 	// extension (Ctrl+S writes the document, execution is an editor
@@ -119,15 +91,13 @@
 		const query = searchValue.toLowerCase().trim();
 
 		if (!query) {
-			// No query: show everything in default order (actions first, then nodes by category)
+			// No query: show everything in default order (actions first, then nodes alphabetically)
 			const items: PaletteItem[] = [];
 			for (const action of visibleActions) {
 				items.push({ type: 'action', actionId: action.id });
 			}
-			for (const category of nodeCategories) {
-				for (const nodeType of category.types) {
-					items.push({ type: 'node', nodeType });
-				}
+			for (const nodeType of paletteNodes) {
+				items.push({ type: 'node', nodeType });
 			}
 			return items;
 		}
@@ -143,13 +113,11 @@
 			}
 		}
 
-		for (const category of nodeCategories) {
-			for (const nodeType of category.types) {
-				const config = NODE_TYPE_CONFIG[nodeType];
-				const score = scoreNode(config, query);
-				if (score >= 0) {
-					scored.push({ item: { type: 'node', nodeType }, score });
-				}
+		for (const nodeType of paletteNodes) {
+			const config = NODE_TYPE_CONFIG[nodeType];
+			const score = scoreNode(config, query);
+			if (score >= 0) {
+				scored.push({ item: { type: 'node', nodeType }, score });
 			}
 		}
 
@@ -310,12 +278,11 @@
 							>
 								<span class="w-4 h-4 flex items-center justify-center text-muted-foreground">{#if NodeIcon}<NodeIcon size={14} />{/if}</span>
 								<span class="flex-1">{config.label}</span>
-								<span class="text-xs text-muted-foreground">{config.category}</span>
 							</button>
 						{/if}
 					{/each}
 				{:else}
-					<!-- Default view: grouped by category -->
+					<!-- Default view: actions, then the flat node list -->
 					<!-- Actions Section -->
 					<div class="text-xs font-medium text-muted-foreground px-2 py-1">Actions</div>
 					{#each actions as action}
@@ -334,25 +301,21 @@
 						</button>
 					{/each}
 					
-					<!-- Nodes by Category -->
-					{#each nodeCategories as category}
-						{#if category.types.length > 0}
-							<div class="text-xs font-medium text-muted-foreground px-2 py-1 mt-2 flex items-center gap-1.5"><category.icon size={12} />{category.name}</div>
-							{#each category.types as type}
-							{@const config = NODE_TYPE_CONFIG[type]}
-							{@const itemIndex = filteredItems.findIndex(item => item.type === 'node' && item.nodeType === type)}
-							{@const NodeIcon = config.icon}
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-left transition-colors {itemIndex === selectedIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-muted'}"
-								data-selected={itemIndex === selectedIndex}
-								onclick={() => handleSelectNode(type)}
-								onmouseenter={() => selectedIndex = itemIndex}
-							>
-								<span class="w-4 h-4 flex items-center justify-center text-muted-foreground">{#if NodeIcon}<NodeIcon size={14} />{/if}</span>
-								<span class="flex-1">{config.label}</span>
-							</button>
-						{/each}
-						{/if}
+					<!-- Nodes (flat, alphabetical) -->
+					<div class="text-xs font-medium text-muted-foreground px-2 py-1 mt-2">Nodes</div>
+					{#each paletteNodes as type}
+						{@const config = NODE_TYPE_CONFIG[type]}
+						{@const itemIndex = filteredItems.findIndex(item => item.type === 'node' && item.nodeType === type)}
+						{@const NodeIcon = config.icon}
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-left transition-colors {itemIndex === selectedIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-muted'}"
+							data-selected={itemIndex === selectedIndex}
+							onclick={() => handleSelectNode(type)}
+							onmouseenter={() => selectedIndex = itemIndex}
+						>
+							<span class="w-4 h-4 flex items-center justify-center text-muted-foreground">{#if NodeIcon}<NodeIcon size={14} />{/if}</span>
+							<span class="flex-1">{config.label}</span>
+						</button>
 					{/each}
 				{/if}
 			</div>

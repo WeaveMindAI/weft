@@ -2,7 +2,6 @@
   "type": "AskCustom",
   "label": "Ask (custom provider)",
   "description": "One LLM call through a PROJECT-DEFINED provider (openrouter_custom), whose meter ships in this project. Used by the e2e rig to prove a project can define its own paid provider and have the worker discover its meter and price a real call.",
-  "category": "Custom",
   "tags": [
     "ai",
     "custom",

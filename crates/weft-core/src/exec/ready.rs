@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value};
 
 use crate::exec::skip::check_should_skip;
-use crate::exec::typecheck::runtime_type_check;
 use crate::frames::LoopFrames;
 use crate::project::{EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
@@ -337,7 +336,7 @@ pub fn build_kicked_input(node: &NodeDefinition, port_snapshot: Option<&Value>) 
 fn check_input(port: &crate::project::InputDefinition, value: &Value) -> InputCheck {
     if value.is_null()
         || port.port_type.is_unresolved()
-        || runtime_type_check(&port.port_type, value)
+        || port.port_type.accepts_runtime_value(value)
     {
         return InputCheck::Ok;
     }
@@ -410,6 +409,21 @@ mod tests {
             "name": "p", "portType": ty, "required": required
         }))
         .expect("port")
+    }
+
+    #[test]
+    fn named_type_accepts_fitting_object_and_refuses_misfit() {
+        // A declared shape validates structurally (inference can never
+        // produce a nominal name, so an infer-and-compare gate would
+        // refuse every legitimate value). Regression: the readiness
+        // gate once had its own infer-based check beside
+        // `accepts_runtime_value` and failed every Named input.
+        let p = port("Profile={ name: String, age: Number, nickname?: String }", true);
+        assert_eq!(check_input(&p, &json!({"name": "Ada", "age": 36})), InputCheck::Ok);
+        match check_input(&p, &json!({"name": "Ada"})) {
+            InputCheck::Fail(msg) => assert!(msg.contains("Profile"), "names the type: {msg}"),
+            other => panic!("missing required field must fail, got {other:?}"),
+        }
     }
 
     #[test]

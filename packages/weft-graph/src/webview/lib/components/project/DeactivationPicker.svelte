@@ -8,8 +8,8 @@
 	//     contradictory);
 	//   - graceMinutes applies to hibernate only.
 	// Produces a `DeactivationSpec`; the host just forwards it.
-	import type { DeactivationSpec } from '../../../../shared/protocol';
-	import { DEFAULT_DRAIN_TIMEOUT_SECS } from '../../../../shared/protocol';
+	import type { DeactivationSpec } from '../../../../protocol';
+	import { DEFAULT_DRAIN_TIMEOUT_SECS } from '../../../../protocol';
 
 	let {
 		open = false,

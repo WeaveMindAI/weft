@@ -7,7 +7,7 @@
 		BackendSnapshot,
 		ActionBarOverlay,
 		CliPhase,
-	} from '../../../../shared/protocol';
+	} from '../../../../protocol';
 	import ErrorDetailsModal from './ErrorDetailsModal.svelte';
 
 	let {

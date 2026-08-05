@@ -2,7 +2,6 @@
   "type": "HumanTrigger",
   "label": "Human Trigger",
   "description": "Start an execution when a human submits a form. Form fields determine the output ports via form_field_specs.",
-  "category": "Triggers",
   "tags": [
     "human",
     "form",

@@ -2,7 +2,6 @@
   "type": "LiveHttpResponder",
   "label": "Live: HTTP Responder",
   "description": "Demo node for an HTTP live connection. Reads the caller's request, streams two progress chunks, then sends a final JSON body echoing what they sent. Wire under an ApiEndpoint trigger.",
-  "category": "live",
   "tags": [
     "live",
     "http",

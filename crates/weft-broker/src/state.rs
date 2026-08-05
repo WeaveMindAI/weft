@@ -60,9 +60,26 @@ pub struct BrokerState {
     /// minted URL, `WEFT_DISPATCHER_INTERNET_URL`), preferred over the
     /// base when telling a provider where to post.
     pub internet_url: Option<String>,
+    /// True iff the object store's presigned EXTERNAL-audience URLs are
+    /// reachable from the open internet (`WEFT_OBJECT_STORE_PUBLIC_INTERNET`):
+    /// the operator's declaration that the bucket's public endpoint is a
+    /// real internet host, letting public file links skip the relay and
+    /// point straight at the bucket. A local install never sets it.
+    pub object_store_public_internet: bool,
 }
 
 impl BrokerState {
+    /// The base URL the OPEN INTERNET reaches this weft at, or `None`
+    /// when there is none: the tunnel's minted address when one is up,
+    /// else the stable base when it is not a loopback (a real cluster's
+    /// ingress host). A loopback base counts as "not reachable".
+    pub fn internet_base(&self) -> Option<&str> {
+        self.internet_url.as_deref().or_else(|| {
+            self.public_base_url
+                .as_deref()
+                .filter(|b| !weft_core::net::is_loopback_url(b))
+        })
+    }
     /// Build the broker state. `object_store` is the deploy-time slot (from
     /// `object_store_from_env`); `entitlements` is the budget policy (the default
     /// binary passes the local default; a per-tenant source can be passed instead).
@@ -144,6 +161,9 @@ impl BrokerState {
             app_provider,
             public_base_url,
             internet_url,
+            object_store_public_internet: std::env::var("WEFT_OBJECT_STORE_PUBLIC_INTERNET")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
         }))
     }
 }

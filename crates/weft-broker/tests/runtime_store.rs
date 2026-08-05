@@ -540,6 +540,85 @@ async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn public_link_outlives_terminate_and_dies_with_its_file(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let file = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "img", None, &big(), body(b"png"))
+        .await
+        .unwrap();
+    let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
+    let link_ttl: u64 = 900;
+    let token = s.mint_public_link(&parsed, Some(link_ttl)).await.unwrap();
+    let link_expiry = clock.now_unix() + link_ttl as i64;
+    assert!(s.resolve_public_link(&token).await.unwrap().is_some());
+
+    // Terminate: the linger deadline honors the live link (a minted link
+    // is a promise the bytes stay fetchable for its stated lifetime).
+    assert!(link_ttl as i64 > EXEC_LINGER_TTL_SECS, "the test needs the link to outlast the linger");
+    let (_, lingering) = s.sweep_exec("t1", "c1").await.unwrap();
+    assert_eq!(lingering, 1);
+    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, Some(link_expiry));
+
+    // Past the plain linger but inside the link's life: file + link live.
+    clock.advance(Duration::from_secs(EXEC_LINGER_TTL_SECS as u64 + 1));
+    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+    assert!(s.resolve_public_link(&token).await.unwrap().is_some());
+
+    // Past the link's expiry: the token resolves to nothing, and the
+    // sweep reclaims the file WITH its link row (cascade), so a re-mint
+    // sweep has nothing left to find.
+    clock.advance(Duration::from_secs(link_ttl));
+    assert!(s.resolve_public_link(&token).await.unwrap().is_none(), "expired token is gone");
+    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
+
+    // A deleted file takes a still-live link with it: dead token, clean miss.
+    let file2 = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "img2", None, &big(), body(b"x"))
+        .await
+        .unwrap();
+    let parsed2 = weft_core::storage::key::parse_key(&file2.key).unwrap();
+    let token2 = s.mint_public_link(&parsed2, Some(600)).await.unwrap();
+    s.delete(&parsed2).await.unwrap();
+    assert!(s.resolve_public_link(&token2).await.unwrap().is_none(), "cascade removed the link");
+}
+
+#[sqlx::test]
+async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    // A kept file on a SHORT keep TTL, carrying a LONG-lived link.
+    let file = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "img", Some(KeepTtl::Secs { secs: 60 }), &big(), body(b"png"))
+        .await
+        .unwrap();
+    let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
+    let token = s.mint_public_link(&parsed, Some(3600)).await.unwrap();
+    let link_expiry = clock.now_unix() + 3600;
+    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, Some(link_expiry), "mint covered");
+
+    // An ACCESS bumps to now + keep TTL, which must not undercut the link.
+    clock.advance(Duration::from_secs(10));
+    get_via(&s, &bucket, &parsed, None).await.unwrap();
+    assert_eq!(
+        s.meta(&parsed).await.unwrap().expires_at_unix,
+        Some(link_expiry),
+        "access bump must not shorten below a live link"
+    );
+
+    // A re-KEEP with a short TTL must not undercut it either.
+    s.keep(&parsed, KeepTtl::Secs { secs: 60 }).await.unwrap();
+    assert_eq!(
+        s.meta(&parsed).await.unwrap().expires_at_unix,
+        Some(link_expiry),
+        "keep must not shorten below a live link"
+    );
+
+    // Past the link's cover the normal clocks apply again: the sweep
+    // reclaims the file once its (link-extended) deadline passes.
+    clock.advance(Duration::from_secs(3601));
+    assert_eq!(s.sweep_expired().await.unwrap(), 1, "past the link cover the file dies normally");
+}
+
+#[sqlx::test]
 async fn keep_then_expiry_sweep_reclaims_after_ttl(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));

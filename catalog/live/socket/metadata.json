@@ -2,7 +2,6 @@
   "type": "LiveSocket",
   "label": "Live Socket",
   "description": "Turn this program into a live WebSocket endpoint. An outside caller opens a WebSocket at the project's gateway URL and holds a full two-way conversation: nodes downstream send and receive messages via the caller handle. Fires a fresh execution per connection.",
-  "category": "Triggers",
   "tags": [
     "live",
     "websocket",

@@ -2,7 +2,6 @@
   "type": "WhatsAppReceive",
   "label": "WhatsApp Receive",
   "description": "Fires an execution when a WhatsApp message arrives at the project's WhatsApp bridge. Wire this node's `endpointUrl` input from a WhatsAppBridge node; the listener subscribes to the bridge's SSE events stream and fires on every `message.received` event.",
-  "category": "Triggers",
   "tags": [
     "whatsapp",
     "trigger",

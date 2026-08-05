@@ -5,10 +5,12 @@
 #
 #   - weft-public-proxy: an nginx whose config is a strict ALLOWLIST.
 #     Only the public trigger surface passes through to the
-#     dispatcher: the provider-events receiver (`/events/...`) and the
-#     token-authenticated per-signal fire door (`/signal/...`).
-#     Everything else answers 404, so the tunnel never exposes the
-#     project/admin API, the dashboard, or storage.
+#     dispatcher: the provider-events receiver (`/events/...`), the
+#     token-authenticated per-signal fire door (`/signal/...`), and the
+#     token-credentialed file relay (`/public/files/...`, minted
+#     expiring media links). Everything else answers 404, so the
+#     tunnel never exposes the project/admin API, the dashboard, or
+#     the storage plane itself.
 #
 #   - weft-tunnel: a cloudflared quick tunnel dialing OUT to
 #     Cloudflare's edge and forwarding what arrives to the proxy. The
@@ -34,6 +36,14 @@ data:
         proxy_set_header Host $host;
       }
       location /signal/ {
+        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_set_header Host $host;
+      }
+      # The public file relay: minted expiring media links an external
+      # consumer (a model provider) fetches. The unguessable token in
+      # the path is the credential; the route answers 404 for anything
+      # else, same trust shape as the fire tokens above.
+      location /public/files/ {
         proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
         proxy_set_header Host $host;
       }

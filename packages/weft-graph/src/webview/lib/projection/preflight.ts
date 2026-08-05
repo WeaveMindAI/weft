@@ -9,7 +9,7 @@
 
 import type { ProjectDefinition } from '../types';
 import { isContainerNodeType } from '../types';
-import type { EditOp } from '../../../shared/protocol';
+import type { EditOp } from '../../../protocol';
 import { applyOpsToProject, type ProjectionCatalog } from './apply';
 import { isLogicLocked, lockReasonText, type LockState } from './types';
 

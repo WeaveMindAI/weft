@@ -10,7 +10,7 @@
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
-  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, ProjectDefinition as ProtocolProject } from '../shared/protocol';
+  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, ProjectDefinition as ProtocolProject } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import type { Snippet } from 'svelte';
   import type { EditorContext } from './editor-context';
@@ -550,14 +550,17 @@
             if (state === 'running' && e.input !== undefined && r.input === undefined) {
               updated.input = e.input;
             }
-            // A `running` transition is a FRESH firing of this (node,
-            // frames) row (a resume / re-dispatch reuses the row). Reset
-            // its per-firing port warnings so the new firing starts clean
-            // and the inspector shows THIS firing's dropped ports, not a
-            // stale union with a previous attempt's. Same per-firing-state
-            // discipline as `error` (refreshed on terminal) and
-            // `closedPorts` (refreshed below).
-            if (state === 'running') {
+            // A non-resumed `running` transition is a FRESH firing of
+            // this (node, frames) row. Reset its per-firing port
+            // warnings so the new firing starts clean and the inspector
+            // shows THIS firing's dropped ports, not a stale union with
+            // a previous attempt's. A RESUME (crash re-dispatch,
+            // suspension waking) continues the same attempt: warnings
+            // recorded before it still belong to this firing and
+            // survive. Same per-firing-state discipline as `error`
+            // (refreshed on terminal) and `closedPorts` (refreshed
+            // below).
+            if (state === 'running' && !e.resumed) {
               updated.portWarnings = [];
             }
             // closedPorts may arrive on node_started (state=running) or

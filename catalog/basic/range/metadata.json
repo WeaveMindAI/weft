@@ -2,7 +2,6 @@
   "type": "Range",
   "label": "Range",
   "description": "Produce a list of numbers between `from` (inclusive) and `to` (exclusive), stepping by `step`. Commonly used to drive `Loop(over: [\"values\"])` for count-based iteration.",
-  "category": "basic",
   "tags": ["number", "list", "range", "loop"],
   "icon": "Hash",
   "color": "#64748b",

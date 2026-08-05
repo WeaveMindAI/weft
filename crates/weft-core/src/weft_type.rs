@@ -207,8 +207,263 @@ impl Exposure {
     }
 }
 
-/// Recursive port type system.
+/// One resolved type declaration: the body a name expands to, and
+/// whether the name is NOMINAL (user-declared: the name is the contract,
+/// values wire only into the same name) or pure display sugar (the
+/// builtin `Media`/`File` aliases: equality never sees the name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDecl {
+    pub body: WeftType,
+    pub nominal: bool,
+}
+
+/// The named-type registry: every type NAME the parser may resolve
+/// (builtin aliases plus user declarations from `types` keys in
+/// `metadata.json`). Needed only at AUTHORING boundaries, where humans
+/// write bare names: catalog metadata loading and weft-source compiling.
+/// Serialized type strings are self-contained (`Name=Body`, see
+/// [`WeftType::wire_string`]) precisely so that DESERIALIZING a stored
+/// project or journal never needs a registry.
+///
+/// How a registry becomes visible to [`WeftType::parse`]:
+/// - [`TypeRegistry::scoped`] activates one for a synchronous closure
+///   (a catalog scan, a compile). The scope is thread-local and must
+///   not span an `.await`; the closure is sync by construction. This
+///   is the form for processes that handle many projects.
+/// - [`TypeRegistry::install`] sets one for the whole process, once.
+///   Only for binaries that live inside a single project (an emitted
+///   project binary installs its own table at boot). A second install
+///   with different content is a loud error.
+/// - With neither, [`TypeRegistry::current`] answers the builtin table
+///   (`Media`, `File`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TypeRegistry {
+    entries: std::collections::BTreeMap<std::string::String, TypeDecl>,
+}
+
+thread_local! {
+    static REGISTRY_SCOPE: std::cell::RefCell<Vec<std::sync::Arc<TypeRegistry>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+static REGISTRY_INSTALLED: std::sync::OnceLock<std::sync::Arc<TypeRegistry>> =
+    std::sync::OnceLock::new();
+
+impl TypeRegistry {
+    /// The builtin table: the union aliases (`Media`, `File`), as
+    /// non-nominal display sugar. Seeded from [`WeftType::UNION_ALIASES`]
+    /// so the alias set has one source of truth.
+    pub fn builtin() -> Self {
+        let mut entries = std::collections::BTreeMap::new();
+        for (name, prims) in WeftType::UNION_ALIASES {
+            entries.insert(
+                (*name).to_string(),
+                TypeDecl {
+                    body: WeftType::union_primitives(prims.to_vec()),
+                    nominal: false,
+                },
+            );
+        }
+        Self { entries }
+    }
+
+    /// Resolve a bare name to its type: a nominal entry answers
+    /// `Named { name, body }`, a sugar entry answers its body directly.
+    pub fn lookup(&self, name: &str) -> Option<WeftType> {
+        self.entries.get(name).map(|decl| {
+            if decl.nominal {
+                WeftType::Named { name: name.to_string(), body: Box::new(decl.body.clone()) }
+            } else {
+                decl.body.clone()
+            }
+        })
+    }
+
+    /// Every user-declared (nominal) entry as `(name, authored body
+    /// string)`, for shipping to surfaces that parse type strings
+    /// themselves (the editor).
+    pub fn nominal_entries(&self) -> Vec<(std::string::String, std::string::String)> {
+        self.entries
+            .iter()
+            .filter(|(_, d)| d.nominal)
+            .map(|(n, d)| (n.clone(), d.body.to_string()))
+            .collect()
+    }
+
+    /// Build a registry from raw declarations (`name`, `type string`,
+    /// `origin` for error messages). Declarations may reference each
+    /// other in any order; resolution iterates to a fixed point.
+    /// Duplicate names with structurally identical bodies are absorbed
+    /// (two independent packages may declare the same shared type);
+    /// different bodies are a loud error naming both origins. Fails
+    /// loud on a reserved name, a cycle, or a reference to a name
+    /// nobody declares.
+    pub fn build(
+        declarations: &[(std::string::String, std::string::String, std::string::String)],
+    ) -> Result<Self, std::string::String> {
+        for (name, _, origin) in declarations {
+            Self::check_declarable_name(name)
+                .map_err(|e| format!("{origin}: type `{name}`: {e}"))?;
+        }
+
+        let mut registry = Self::builtin();
+        // Where each name was FIRST declared, so a clash names both
+        // sides (blaming only the second sends the author to fix the
+        // wrong file half the time).
+        let mut first_origin: std::collections::BTreeMap<&str, &str> =
+            std::collections::BTreeMap::new();
+        // (name, body string, origin) still waiting for their references.
+        let mut pending: Vec<&(std::string::String, std::string::String, std::string::String)> =
+            declarations.iter().collect();
+
+        loop {
+            let mut progressed = false;
+            let mut still_pending = Vec::new();
+            for decl in pending {
+                let (name, body_str, origin) = decl;
+                let parsed =
+                    std::sync::Arc::new(registry.clone()).scoped_ref(|| WeftType::parse(body_str));
+                match parsed {
+                    Some(body) => {
+                        if let Some(existing) = registry.entries.get(name.as_str()) {
+                            if existing.nominal && existing.body == body {
+                                // Identical redeclaration: absorbed.
+                            } else if existing.nominal {
+                                let first = first_origin.get(name.as_str()).copied().unwrap_or("?");
+                                return Err(format!(
+                                    "type `{name}` is declared twice with different bodies \
+                                     (first in {first}, then in {origin}: `{body_str}`); rename one"
+                                ));
+                            } else {
+                                // check_declarable_name refuses builtin-alias
+                                // names up front, so a non-nominal (builtin)
+                                // collision here is an internal invariant break.
+                                return Err(format!(
+                                    "{origin}: type `{name}` is reserved by the type language"
+                                ));
+                            }
+                        } else {
+                            first_origin.insert(name.as_str(), origin.as_str());
+                            registry.entries.insert(
+                                name.clone(),
+                                TypeDecl { body, nominal: true },
+                            );
+                        }
+                        progressed = true;
+                    }
+                    None => still_pending.push(decl),
+                }
+            }
+            if still_pending.is_empty() {
+                return Ok(registry);
+            }
+            if !progressed {
+                let names: Vec<std::string::String> = still_pending
+                    .iter()
+                    .map(|(n, b, o)| format!("`{n}` = `{b}` ({o})"))
+                    .collect();
+                return Err(format!(
+                    "type declarations could not be resolved (an unknown referenced name, \
+                     a cycle, or invalid syntax): {}",
+                    names.join(", ")
+                ));
+            }
+            pending = still_pending;
+        }
+    }
+
+    /// A declarable name: an identifier starting with an uppercase
+    /// letter, not colliding with anything the type language already
+    /// means (a primitive, a container keyword, a special type, a
+    /// TypeVar shape).
+    fn check_declarable_name(name: &str) -> Result<(), std::string::String> {
+        let mut chars = name.chars();
+        let valid_ident = chars.next().is_some_and(|c| c.is_ascii_uppercase())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid_ident {
+            return Err("a type name starts with an uppercase letter and contains only \
+                        letters, digits, and underscores"
+                .into());
+        }
+        let reserved = WeftPrimitive::from_str(name).is_some()
+            || matches!(name, "List" | "Dict" | "JsonDict" | "Bus" | "Access" | "MustOverride")
+            || WeftType::UNION_ALIASES.iter().any(|(alias, _)| *alias == name)
+            || is_type_var_name(name);
+        if reserved {
+            return Err(format!("`{name}` is reserved by the type language"));
+        }
+        Ok(())
+    }
+
+    /// Run `f` with this registry active for bare-name resolution on the
+    /// current thread. `f` is a sync closure ON PURPOSE: the scope is
+    /// thread-local and must never span an `.await`.
+    pub fn scoped<R>(self: std::sync::Arc<Self>, f: impl FnOnce() -> R) -> R {
+        self.scoped_ref(f)
+    }
+
+    fn scoped_ref<R>(self: std::sync::Arc<Self>, f: impl FnOnce() -> R) -> R {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                REGISTRY_SCOPE.with(|s| {
+                    s.borrow_mut().pop();
+                });
+            }
+        }
+        REGISTRY_SCOPE.with(|s| s.borrow_mut().push(self));
+        let _guard = Guard;
+        f()
+    }
+
+    /// Install the process-wide registry. For single-project binaries
+    /// only (an emitted project binary at boot). Idempotent for the
+    /// same content; a different content is a loud error.
+    pub fn install(registry: TypeRegistry) -> Result<(), std::string::String> {
+        let arc = std::sync::Arc::new(registry);
+        match REGISTRY_INSTALLED.set(arc.clone()) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let existing = REGISTRY_INSTALLED.get().expect("set just failed, so present");
+                if **existing == *arc {
+                    Ok(())
+                } else {
+                    Err("a different type registry is already installed in this process; \
+                         a process serves one project's types"
+                        .into())
+                }
+            }
+        }
+    }
+
+    /// The registry bare-name resolution reads right now: the innermost
+    /// active scope, else the installed one, else builtin.
+    pub fn current() -> std::sync::Arc<TypeRegistry> {
+        if let Some(scoped) = REGISTRY_SCOPE.with(|s| s.borrow().last().cloned()) {
+            return scoped;
+        }
+        if let Some(installed) = REGISTRY_INSTALLED.get() {
+            return installed.clone();
+        }
+        static BUILTIN: std::sync::OnceLock<std::sync::Arc<TypeRegistry>> =
+            std::sync::OnceLock::new();
+        BUILTIN.get_or_init(|| std::sync::Arc::new(TypeRegistry::builtin())).clone()
+    }
+}
+
+/// One declared field of a [`WeftType::Record`]: a name, a type, and
+/// whether the key may be absent (a present `null` counts as absent,
+/// matching serde's skip-when-none world). Field ORDER is preserved for
+/// display; equality and compatibility are order-insensitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordField {
+    pub name: std::string::String,
+    pub ty: WeftType,
+    pub optional: bool,
+}
+
+/// Recursive port type system.
+#[derive(Debug, Clone, Eq)]
 pub enum WeftType {
     /// Scalar: String, Number, Boolean, Image, Video, Audio, Blob
     Primitive(WeftPrimitive),
@@ -235,6 +490,23 @@ pub enum WeftType {
     /// service wiring fails loud at runtime). Wired-only: the marker is
     /// minted by an access node, never typed as a literal.
     Access,
+    /// Dict with KNOWN field names and per-field types:
+    /// `{ role: String, name?: String }`. `?` marks an optional field.
+    /// Validation is strict: a value carrying an undeclared key does not
+    /// match. Structural (two records with the same fields are the same
+    /// type); the nominal wrapper is [`WeftType::Named`].
+    Record(Vec<RecordField>),
+    /// A user-declared NOMINAL type: the name is the contract.
+    /// Compatibility is by name (same-named `Named` only); the body is
+    /// carried inline so validation, display, and file detection never
+    /// need a registry after parse. Declared via the `types` key in
+    /// `metadata.json` (see [`TypeRegistry`]); the serialized wire form
+    /// is self-contained (`Name=Body`) so a stored type string is
+    /// interpretable in any process with no out-of-band state.
+    Named {
+        name: std::string::String,
+        body: Box<WeftType>,
+    },
     /// Node-scoped type variable: T, T1, T2, etc.
     /// Same name on different ports of the same node = same type.
     /// Resolved per-node when connections are made.
@@ -242,6 +514,37 @@ pub enum WeftType {
     /// Node cannot determine the type. User/AI must override in Weft code.
     /// Remaining MustOverride at compile time = error.
     MustOverride,
+}
+
+/// Structural equality, with two deliberate departures from a derive:
+/// record fields compare as a SET (declaration order is display-only),
+/// and a `Named` equals only a same-named `Named` (the name IS the
+/// contract; bodies of same-named types are identical by construction,
+/// the registry refuses conflicting redeclarations).
+impl PartialEq for WeftType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (WeftType::Primitive(a), WeftType::Primitive(b)) => a == b,
+            (WeftType::List(a), WeftType::List(b)) => a == b,
+            (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => ak == bk && av == bv,
+            (WeftType::Union(a), WeftType::Union(b)) => a == b,
+            (WeftType::JsonDict, WeftType::JsonDict) => true,
+            (WeftType::Bus, WeftType::Bus) => true,
+            (WeftType::Access, WeftType::Access) => true,
+            (WeftType::Record(a), WeftType::Record(b)) => {
+                a.len() == b.len()
+                    && a.iter().all(|fa| {
+                        b.iter().any(|fb| {
+                            fa.name == fb.name && fa.optional == fb.optional && fa.ty == fb.ty
+                        })
+                    })
+            }
+            (WeftType::Named { name: a, .. }, WeftType::Named { name: b, .. }) => a == b,
+            (WeftType::TypeVar(a), WeftType::TypeVar(b)) => a == b,
+            (WeftType::MustOverride, WeftType::MustOverride) => true,
+            _ => false,
+        }
+    }
 }
 
 impl WeftType {
@@ -420,6 +723,7 @@ impl WeftType {
     pub fn concrete_file_kind(&self) -> Option<FileKind> {
         match self {
             WeftType::Primitive(p) => FileKind::from_primitive(*p),
+            WeftType::Named { body, .. } => body.concrete_file_kind(),
             _ => None,
         }
     }
@@ -443,6 +747,8 @@ impl WeftType {
             WeftType::List(inner) => inner.references_file(),
             WeftType::Dict(_, v) => v.references_file(),
             WeftType::Union(types) => types.iter().any(|t| t.references_file()),
+            WeftType::Record(fields) => fields.iter().any(|f| f.ty.references_file()),
+            WeftType::Named { body, .. } => body.references_file(),
             WeftType::JsonDict
             | WeftType::Bus
             | WeftType::Access
@@ -486,6 +792,20 @@ impl WeftType {
                 }
             }
             WeftType::JsonDict => Exposure::All,
+            // A record is as restrictive as its most restrictive field
+            // (same fold as a union's members).
+            WeftType::Record(fields) => {
+                let members: Vec<Exposure> =
+                    fields.iter().map(|f| f.ty.default_exposure()).collect();
+                if members.contains(&Exposure::Wire) {
+                    Exposure::Wire
+                } else if members.contains(&Exposure::Assignment) {
+                    Exposure::Assignment
+                } else {
+                    Exposure::All
+                }
+            }
+            WeftType::Named { body, .. } => body.default_exposure(),
             WeftType::Bus => Exposure::Wire,
             WeftType::Access => Exposure::Wire,
             WeftType::TypeVar(_) => Exposure::Assignment,
@@ -503,6 +823,7 @@ impl WeftType {
         match self {
             WeftType::Primitive(p) => Self::file_primitives().contains(p),
             WeftType::Union(types) => types.iter().all(|t| t.is_file_valued()),
+            WeftType::Named { body, .. } => body.is_file_valued(),
             _ => false,
         }
     }
@@ -513,6 +834,7 @@ impl WeftType {
         match self {
             WeftType::Primitive(WeftPrimitive::Null) => true,
             WeftType::Union(types) => types.iter().any(|t| t.contains_null()),
+            WeftType::Named { body, .. } => body.contains_null(),
             _ => false,
         }
     }
@@ -546,6 +868,16 @@ impl WeftType {
                 .iter()
                 .find(|t| !t.contains_null())
                 .map_or(Value::Null, |t| t.zero_value()),
+            // An all-optional record zeroes to {}; one with required
+            // fields has no honest zero (null, like Media).
+            WeftType::Record(fields) => {
+                if fields.iter().all(|f| f.optional) {
+                    Value::Object(serde_json::Map::new())
+                } else {
+                    Value::Null
+                }
+            }
+            WeftType::Named { body, .. } => body.zero_value(),
             WeftType::Bus | WeftType::Access | WeftType::TypeVar(_) | WeftType::MustOverride => {
                 Value::Null
             }
@@ -591,6 +923,35 @@ impl WeftType {
             // An access connects only to an access; the KIND/service is
             // checked at runtime resolution, not by the type system.
             (WeftType::Access, WeftType::Access) => true,
+            // A NAMED type is nominal: the name is the contract, so only
+            // the same name flows in. (Bodies of same-named types are
+            // identical by construction; the registry refuses
+            // conflicting redeclarations.)
+            (WeftType::Named { name: a, .. }, WeftType::Named { name: b, .. }) => a == b,
+            // Records: the target's contract decides. Every source field
+            // must be declared on the target (strict unknown keys), every
+            // required target field must be a required source field, and
+            // field types must match pairwise.
+            (WeftType::Record(sources), WeftType::Record(targets)) => {
+                sources.iter().all(|sf| targets.iter().any(|tf| tf.name == sf.name))
+                    && targets.iter().all(|tf| match sources.iter().find(|sf| sf.name == tf.name) {
+                        Some(sf) => {
+                            (!sf.optional || tf.optional) && Self::is_compatible(&sf.ty, &tf.ty)
+                        }
+                        None => tf.optional,
+                    })
+            }
+            // A record forgets itself into the generic-object types, but
+            // never the reverse: an unchecked object claiming a declared
+            // shape is exactly what the record type exists to refuse
+            // (the deliberate door is the Cast node).
+            (WeftType::Record(_), WeftType::JsonDict) => true,
+            (WeftType::Record(fields), WeftType::Dict(k, v)) => {
+                matches!(k.as_ref(), WeftType::Primitive(WeftPrimitive::String))
+                    && fields.iter().all(|f| Self::is_compatible(&f.ty, v))
+            }
+            (WeftType::JsonDict, WeftType::Record(_)) => false,
+            (WeftType::Dict(_, _), WeftType::Record(_)) => false,
             // Both unions: every source variant must match at least one target variant
             (WeftType::Union(sources), WeftType::Union(targets)) => {
                 sources.iter().all(|s| targets.iter().any(|t| Self::is_compatible(s, t)))
@@ -603,6 +964,13 @@ impl WeftType {
             (WeftType::Union(sources), tgt) => {
                 sources.iter().all(|s| Self::is_compatible(s, tgt))
             }
+            // A named source DECAYS into a structural target (forgetting
+            // the name is always safe); this arm sits after the union
+            // arms so `Named -> Named | Null` matches through the union.
+            (WeftType::Named { body, .. }, tgt) => Self::is_compatible(body, tgt),
+            // Nothing unnamed flows into a named target (the arm above
+            // the unions handled Named -> Named).
+            (_, WeftType::Named { .. }) => false,
             _ => false,
         }
     }
@@ -770,8 +1138,13 @@ impl WeftType {
         if value.is_null() {
             return Err("null has no cast".into());
         }
+        // A file-valued type (a bare Image/Media/...) never casts: a
+        // file value is a marker, not convertible data. Containers and
+        // records HOLDING files recurse below; their file-typed leaves
+        // only pass through when the value already is a marker (the
+        // compatibility fast path), so nothing invents a file.
         if self.is_unresolved()
-            || self.references_file()
+            || self.is_file_valued()
             || matches!(self, WeftType::Bus | WeftType::Access)
         {
             return Err(format!("no cast into {self}"));
@@ -847,6 +1220,51 @@ impl WeftType {
                 }
                 _ => Err(format!("no cast from {} into JsonDict", Self::infer(value))),
             },
+            // A record casts field by field under its declared contract:
+            // undeclared keys refused, required fields demanded, an
+            // optional field's null kept as written. A string parses as
+            // JSON first.
+            WeftType::Record(fields) => match value {
+                Value::Object(map) => {
+                    if let Some(unknown) =
+                        map.keys().find(|k| !fields.iter().any(|f| &f.name == *k))
+                    {
+                        return Err(format!("unknown field {unknown:?} (not declared on {self})"));
+                    }
+                    let mut out = serde_json::Map::new();
+                    for field in fields {
+                        match map.get(&field.name) {
+                            Some(Value::Null) | None if field.optional => {
+                                if map.contains_key(&field.name) {
+                                    out.insert(field.name.clone(), Value::Null);
+                                }
+                            }
+                            Some(v) => {
+                                let cast = field.ty.cast_value(v).map_err(|e| {
+                                    format!("field {:?}: {e}", field.name)
+                                })?;
+                                out.insert(field.name.clone(), cast);
+                            }
+                            None => {
+                                return Err(format!("missing required field {:?}", field.name))
+                            }
+                        }
+                    }
+                    Ok(Value::Object(out))
+                }
+                Value::String(s) => {
+                    let parsed: Value = serde_json::from_str(s.trim())
+                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
+                    self.cast_value(&parsed)
+                }
+                _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+            },
+            // A named type casts through its body; the RESULT is a value
+            // of the named type (nominal-ness lives in the type system,
+            // values carry no name tag).
+            WeftType::Named { body, .. } => body
+                .cast_value(value)
+                .map_err(|e| format!("not a valid {self}: {e}")),
             // Exact compatibility was tried above; now EVERY member's
             // cast. One success (or several agreeing) wins; members
             // disagreeing on the result is ambiguous and refused with
@@ -879,6 +1297,322 @@ impl WeftType {
                 }
             }
             _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+        }
+    }
+
+    /// The Cast node's compile-time conversion table: may a value of
+    /// `source` be CAST (converted / runtime-validated) into `target`?
+    /// The one table the compiler's validate pass consults; the runtime
+    /// side of the same door is [`Self::cast_value`], so a pair allowed
+    /// here either converts or fails loudly at run time with a
+    /// field-level message, and a pair refused here dies at compile
+    /// time (`JsonDict -> Number` is nonsense, not a runtime surprise).
+    ///
+    /// Allowed, beyond plain compatibility (which needs no cast but is
+    /// permitted as the trivial case):
+    /// - `String` -> anything parseable from text (Number, Boolean, and
+    ///   every structural type: the text is parsed as JSON, then held
+    ///   to the target's contract);
+    /// - anything text-serializable -> `String` (scalars print,
+    ///   structures emit JSON; stored files, buses, and accesses do
+    ///   not stringify);
+    /// - `Number` <-> `Boolean` (1/0);
+    /// - any generic or declared object shape (JsonDict, Dict, List,
+    ///   Record, Named) -> a `Record` or `Named` target: the checked
+    ///   claim, validated against the declared structure at run time.
+    ///
+    /// Unresolved endpoints answer Ok: `must-override-unmet` and the
+    /// TypeVar machinery own those diagnostics.
+    pub fn cast_allowed(source: &WeftType, target: &WeftType) -> Result<(), std::string::String> {
+        if source.is_unresolved() || target.is_unresolved() {
+            return Ok(());
+        }
+        if Self::is_compatible(source, target) {
+            return Ok(());
+        }
+        let refused = || {
+            Err(format!(
+                "no cast from {source} into {target}; a cast parses text, stringifies data, \
+                 or validates an object shape against a declared type"
+            ))
+        };
+        // Union endpoints: one castable pairing is enough (the runtime
+        // cast tries every member and refuses ambiguity loudly).
+        if let WeftType::Union(members) = source {
+            return if members.iter().any(|m| Self::cast_allowed(m, target).is_ok()) {
+                Ok(())
+            } else {
+                refused()
+            };
+        }
+        if let WeftType::Union(members) = target {
+            return if members.iter().any(|m| Self::cast_allowed(source, m).is_ok()) {
+                Ok(())
+            } else {
+                refused()
+            };
+        }
+        let text_serializable = |t: &WeftType| {
+            !t.references_file() && !matches!(t, WeftType::Bus | WeftType::Access)
+        };
+        let object_shaped = |t: &WeftType| {
+            matches!(
+                t,
+                WeftType::JsonDict
+                    | WeftType::Dict(_, _)
+                    | WeftType::List(_)
+                    | WeftType::Record(_)
+                    | WeftType::Named { .. }
+            )
+        };
+        let ok = match (source, target) {
+            (WeftType::Primitive(WeftPrimitive::String), t) => {
+                matches!(t, WeftType::Primitive(WeftPrimitive::Number | WeftPrimitive::Boolean))
+                    || object_shaped(t)
+            }
+            (s, WeftType::Primitive(WeftPrimitive::String)) => text_serializable(s),
+            (
+                WeftType::Primitive(WeftPrimitive::Number),
+                WeftType::Primitive(WeftPrimitive::Boolean),
+            )
+            | (
+                WeftType::Primitive(WeftPrimitive::Boolean),
+                WeftType::Primitive(WeftPrimitive::Number),
+            ) => true,
+            (s, WeftType::Record(_) | WeftType::Named { .. }) => object_shaped(s),
+            // Container targets from container sources lean on the
+            // runtime cast's recursion (List[String] -> List[Number]).
+            (WeftType::List(s_inner), WeftType::List(t_inner)) => {
+                Self::cast_allowed(s_inner, t_inner).is_ok()
+            }
+            (WeftType::Dict(_, sv), WeftType::Dict(_, tv)) => Self::cast_allowed(sv, tv).is_ok(),
+            _ => false,
+        };
+        if ok { Ok(()) } else { refused() }
+    }
+
+    /// Validate that a JSON value IS a value of this type, with an error
+    /// naming the exact offending path (`messages[2].role: expected
+    /// String, got Number`). Strict where the type is strict: a record
+    /// refuses undeclared keys and missing required fields; a file
+    /// primitive demands its stored-file marker (a raw URL string is not
+    /// a stored file). Unlike [`Self::cast_value`] this never converts:
+    /// the value either already matches or the error says why not.
+    pub fn validate_value(&self, value: &serde_json::Value) -> Result<(), std::string::String> {
+        let mut path = std::string::String::new();
+        self.validate_at(value, &mut path)
+    }
+
+    fn validate_at(
+        &self,
+        value: &serde_json::Value,
+        path: &mut std::string::String,
+    ) -> Result<(), std::string::String> {
+        use serde_json::Value;
+        use std::fmt::Write;
+        let here = |path: &std::string::String| {
+            if path.is_empty() { "value".to_string() } else { path.clone() }
+        };
+        let mismatch = |path: &std::string::String| {
+            Err(format!("{}: expected {self}, got {}", here(path), Self::infer(value)))
+        };
+        match self {
+            WeftType::Primitive(p) => {
+                let ok = match p {
+                    WeftPrimitive::String => value.is_string(),
+                    WeftPrimitive::Number => value.is_number(),
+                    WeftPrimitive::Boolean => value.is_boolean(),
+                    WeftPrimitive::Null => value.is_null(),
+                    WeftPrimitive::Empty => false,
+                    WeftPrimitive::Image
+                    | WeftPrimitive::Video
+                    | WeftPrimitive::Audio
+                    | WeftPrimitive::Blob => value
+                        .as_object()
+                        .and_then(Self::detect_file_type)
+                        .is_some_and(|t| t == WeftType::Primitive(*p)),
+                };
+                if ok { Ok(()) } else { mismatch(path) }
+            }
+            WeftType::List(inner) => match value {
+                Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        let len = path.len();
+                        let _ = write!(path, "[{i}]");
+                        inner.validate_at(item, path)?;
+                        path.truncate(len);
+                    }
+                    Ok(())
+                }
+                _ => mismatch(path),
+            },
+            WeftType::Dict(_, v_ty) => match value {
+                Value::Object(map) => {
+                    for (k, v) in map {
+                        let len = path.len();
+                        let _ = write!(path, ".{k}");
+                        v_ty.validate_at(v, path)?;
+                        path.truncate(len);
+                    }
+                    Ok(())
+                }
+                _ => mismatch(path),
+            },
+            WeftType::JsonDict => {
+                if value.is_object() { Ok(()) } else { mismatch(path) }
+            }
+            WeftType::Record(fields) => {
+                let Value::Object(map) = value else { return mismatch(path) };
+                if let Some(unknown) = map.keys().find(|k| !fields.iter().any(|f| &f.name == *k)) {
+                    return Err(format!(
+                        "{}: unknown field {unknown:?} (not declared on {self})",
+                        here(path)
+                    ));
+                }
+                for field in fields {
+                    match map.get(&field.name) {
+                        // An absent key (or a present null) is fine for
+                        // an optional field, and for a field whose type
+                        // itself admits null.
+                        Some(Value::Null) | None
+                            if field.optional || field.ty.contains_null() => {}
+                        Some(v) => {
+                            let len = path.len();
+                            let _ = write!(path, ".{}", field.name);
+                            field.ty.validate_at(v, path)?;
+                            path.truncate(len);
+                        }
+                        None => {
+                            return Err(format!(
+                                "{}: missing required field {:?}",
+                                here(path),
+                                field.name
+                            ))
+                        }
+                    }
+                }
+                Ok(())
+            }
+            WeftType::Union(members) => {
+                let mut member_errors = Vec::new();
+                for m in members {
+                    match m.validate_at(value, &mut path.clone()) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => member_errors.push((m, e)),
+                    }
+                }
+                // Report the DEEP error when exactly one member even
+                // matches the value's outer JSON kind (an array against
+                // `String | List[Part]` can only have meant the list, so
+                // its field-level path is the useful message); otherwise
+                // the generic union mismatch.
+                let candidates: Vec<&(&WeftType, std::string::String)> = member_errors
+                    .iter()
+                    .filter(|(m, _)| m.shallow_matches(value))
+                    .collect();
+                match candidates.as_slice() {
+                    [(_, e)] => Err(e.clone()),
+                    _ => mismatch(path),
+                }
+            }
+            WeftType::Named { body, .. } => body
+                .validate_at(value, path)
+                .map_err(|e| format!("not a valid {self}: {e}")),
+            WeftType::Bus => {
+                if value.as_object().and_then(Self::detect_bus_type).is_some() {
+                    Ok(())
+                } else {
+                    mismatch(path)
+                }
+            }
+            WeftType::Access => {
+                if value
+                    .as_object()
+                    .is_some_and(|o| o.contains_key(crate::access::ACCESS_MARKER_KEY))
+                {
+                    Ok(())
+                } else {
+                    mismatch(path)
+                }
+            }
+            WeftType::TypeVar(_) | WeftType::MustOverride => Err(format!(
+                "{}: cannot validate against unresolved type {self}",
+                here(path)
+            )),
+        }
+    }
+
+    /// Does this DECLARED type accept `value` at run time? The one
+    /// runtime gate semantics: the engine's output-type check and the
+    /// firing-input readiness check both route here.
+    /// A type carrying a declared shape (a `Named` or a `Record`
+    /// anywhere) is checked by [`Self::validate_value`], its contract:
+    /// inference can never produce a nominal name, so the infer path
+    /// would refuse every legitimate value. Everything else keeps the
+    /// structural infer-and-compare gate.
+    pub fn accepts_runtime_value(&self, value: &serde_json::Value) -> bool {
+        if self.contains_declared_shape() && !self.contains_unresolved_leaf() {
+            self.validate_value(value).is_ok()
+        } else {
+            // A type still carrying an unresolved leaf (a TypeVar nested
+            // in a union/container) keeps the permissive structural gate:
+            // validate_at refuses unresolved leaves outright, which would
+            // flip `A | T` from accept-anything to accept-only-A.
+            Self::is_compatible(&Self::infer(value), self)
+        }
+    }
+
+    /// True when a `Named` or `Record` sits anywhere in this type.
+    fn contains_declared_shape(&self) -> bool {
+        match self {
+            WeftType::Named { .. } | WeftType::Record(_) => true,
+            WeftType::List(inner) => inner.contains_declared_shape(),
+            WeftType::Dict(k, v) => k.contains_declared_shape() || v.contains_declared_shape(),
+            WeftType::Union(members) => members.iter().any(|m| m.contains_declared_shape()),
+            _ => false,
+        }
+    }
+
+    /// True when a `TypeVar` or `MustOverride` sits anywhere in this
+    /// type. The compile-time unresolved-typevar diagnostic uses this
+    /// (a nested unresolved leaf is as unusable as a bare one), and the
+    /// runtime gate falls back to the structural check when one slipped
+    /// through.
+    pub fn contains_unresolved_leaf(&self) -> bool {
+        match self {
+            WeftType::TypeVar(_) | WeftType::MustOverride => true,
+            WeftType::List(inner) => inner.contains_unresolved_leaf(),
+            WeftType::Dict(k, v) => k.contains_unresolved_leaf() || v.contains_unresolved_leaf(),
+            WeftType::Union(members) => members.iter().any(|m| m.contains_unresolved_leaf()),
+            WeftType::Record(fields) => fields.iter().any(|f| f.ty.contains_unresolved_leaf()),
+            WeftType::Named { body, .. } => body.contains_unresolved_leaf(),
+            _ => false,
+        }
+    }
+
+    /// Does the value's OUTER JSON kind fit this type at all (an array
+    /// for a list, an object for a dict/record, ...)? Only a triage for
+    /// union error reporting; deep validation is [`Self::validate_at`].
+    fn shallow_matches(&self, value: &serde_json::Value) -> bool {
+        use serde_json::Value;
+        match self {
+            WeftType::Primitive(p) => match p {
+                WeftPrimitive::String => value.is_string(),
+                WeftPrimitive::Number => value.is_number(),
+                WeftPrimitive::Boolean => value.is_boolean(),
+                WeftPrimitive::Null => value.is_null(),
+                WeftPrimitive::Empty => false,
+                _ => value.is_object(),
+            },
+            WeftType::List(_) => matches!(value, Value::Array(_)),
+            WeftType::Dict(_, _)
+            | WeftType::JsonDict
+            | WeftType::Record(_)
+            | WeftType::Bus
+            | WeftType::Access => value.is_object(),
+            WeftType::Union(members) => members.iter().any(|m| m.shallow_matches(value)),
+            WeftType::Named { body, .. } => body.shallow_matches(value),
+            WeftType::TypeVar(_) | WeftType::MustOverride => false,
         }
     }
 
@@ -920,6 +1654,7 @@ impl WeftType {
     ///        "String | Number", "Media", "T", "T1", "T2", "MustOverride",
     ///        "List[T]", "Dict[String, T1 | T2]"
     /// Invalid: "Any", "List", "Dict", "Foo"
+    // SYNC: WeftType::parse <-> packages/weft-graph/src/webview/lib/types/index.ts parseWeftType
     pub fn parse(s: &str) -> Option<Self> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -982,20 +1717,14 @@ impl WeftType {
                 "@file cannot cast to {}: a stored file is referenced by key/URL, not loaded inline from a file",
                 self
             )),
-            // Structural types: parse the file as JSON, then check the inferred
-            // shape is compatible with the declared type.
+            // Structural types: parse the file as JSON, then cast into
+            // the declared type (`cast_value` covers plain compatibility
+            // and the record/named contracts with field-level errors).
             _ => {
                 let value: serde_json::Value = serde_json::from_str(text.trim())
                     .map_err(|e| format!("expected {}, file is not valid JSON: {}", self, e))?;
-                let inferred = WeftType::infer(&value);
-                if WeftType::is_compatible(&inferred, self) {
-                    Ok(value)
-                } else {
-                    Err(format!(
-                        "file content has type {} but @file declares {}",
-                        inferred, self
-                    ))
-                }
+                self.cast_value(&value)
+                    .map_err(|e| format!("file content does not fit @file's declared {self}: {e}"))
             }
         }
     }
@@ -1004,10 +1733,58 @@ impl WeftType {
 fn parse_single_type(s: &str) -> Option<WeftType> {
     let s = s.trim();
 
-    // Named union aliases (Media, File, and later user-defined unions)
-    // all resolve through the one registry, never a per-name branch.
-    if let Some(alias) = WeftType::named_union(s) {
-        return Some(alias);
+    // Parenthesized group: `(A | B)` is the type inside. Exists so a
+    // named type's union body has an unambiguous wire form
+    // (`Kind=(A | B)` vs the union `Kind=A | B`). Only strip when the
+    // opening paren closes at the very end (otherwise `(A) | (B)`'s
+    // halves would be mangled; the top-level union split already
+    // protects that case, this guard keeps the function total).
+    if s.starts_with('(') && s.ends_with(')') && find_top_level(&s[1..s.len() - 1], ')').is_none() {
+        return WeftType::parse(&s[1..s.len() - 1]);
+    }
+
+    // Self-contained named form (`Name=Body`): the WIRE encoding of a
+    // user-declared type (see `WeftType::wire_string`). The body rides
+    // inline so a stored type string resolves in any process with no
+    // registry. The `=` must be top-level: a record's fields use `:`.
+    if let Some(eq) = find_top_level(s, '=') {
+        let name = s[..eq].trim();
+        let body = s[eq + 1..].trim();
+        if TypeRegistry::check_declarable_name(name).is_ok() {
+            let body = WeftType::parse(body)?;
+            return Some(WeftType::Named { name: name.to_string(), body: Box::new(body) });
+        }
+        return None;
+    }
+
+    // Record: `{ field: Type, field?: Type }`. At least one field (an
+    // empty `{}` is not a type; use JsonDict for "some object").
+    if let Some(inner) = s.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+        let mut fields: Vec<RecordField> = Vec::new();
+        for part in split_top_level(inner, ',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let colon = find_top_level(part, ':')?;
+            let mut name = part[..colon].trim();
+            let optional = name.ends_with('?');
+            if optional {
+                name = name[..name.len() - 1].trim_end();
+            }
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || fields.iter().any(|f| f.name == name)
+            {
+                return None;
+            }
+            let ty = WeftType::parse(part[colon + 1..].trim())?;
+            fields.push(RecordField { name: name.to_string(), ty, optional });
+        }
+        if fields.is_empty() {
+            return None;
+        }
+        return Some(WeftType::Record(fields));
     }
 
     if s == "JsonDict" {
@@ -1058,6 +1835,13 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
         // Type variable: T, T1, T2, ... (starts with uppercase T, optionally followed by digits)
         if is_type_var_name(s) {
             return Some(WeftType::TypeVar(s.to_string()));
+        }
+        // Declared names, through the one registry: builtin aliases
+        // (Media, File: display sugar, expand structurally) and
+        // user-declared nominal types (resolve to `Named`). See
+        // `TypeRegistry` for how a registry becomes visible here.
+        if let Some(resolved) = TypeRegistry::current().lookup(s) {
+            return Some(resolved);
         }
         None
     }
@@ -1112,8 +1896,8 @@ fn split_top_level(s: &str, delimiter: char) -> Vec<&str> {
 
     for (i, c) in s.char_indices() {
         match c {
-            '[' => depth += 1,
-            ']' => depth -= 1,
+            '[' | '{' | '(' => depth += 1,
+            ']' | '}' | ')' => depth -= 1,
             c if c == delimiter && depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + c.len_utf8();
@@ -1125,41 +1909,125 @@ fn split_top_level(s: &str, delimiter: char) -> Vec<&str> {
     parts
 }
 
+/// The byte position of the first top-level (outside `[]`/`{}`)
+/// occurrence of `delimiter`, if any.
+fn find_top_level(s: &str, delimiter: char) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' | '{' | '(' => depth += 1,
+            ']' | '}' | ')' => depth -= 1,
+            c if c == delimiter && depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 impl Default for WeftType {
     fn default() -> Self {
         WeftType::MustOverride
     }
 }
 
-impl std::fmt::Display for WeftType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl WeftType {
+    /// Render this type. `wire` decides how a `Named` prints: false is
+    /// the AUTHORED form (the bare name, what humans read and write in
+    /// source and metadata), true is the WIRE form (`Name=Body`, fully
+    /// self-contained, what serialization emits so a stored type string
+    /// resolves in any process with no registry).
+    fn fmt_with(&self, out: &mut std::string::String, wire: bool) {
+        use std::fmt::Write;
         match self {
-            WeftType::Primitive(p) => write!(f, "{}", p.as_str()),
-            WeftType::List(inner) => write!(f, "List[{}]", inner),
-            WeftType::Dict(k, v) => write!(f, "Dict[{}, {}]", k, v),
+            WeftType::Primitive(p) => out.push_str(p.as_str()),
+            WeftType::List(inner) => {
+                out.push_str("List[");
+                inner.fmt_with(out, wire);
+                out.push(']');
+            }
+            WeftType::Dict(k, v) => {
+                out.push_str("Dict[");
+                k.fmt_with(out, wire);
+                out.push_str(", ");
+                v.fmt_with(out, wire);
+                out.push(']');
+            }
             WeftType::Union(types) => {
                 // An alias's member set renders under its NAME (see
                 // UNION_ALIASES): `File`/`Media` must survive a
                 // parse -> to_string round trip instead of leaking the
                 // structural expansion into source lines and metadata.
                 if let Some(name) = Self::union_alias_name(types) {
-                    return write!(f, "{name}");
+                    out.push_str(name);
+                    return;
                 }
-                let parts: Vec<std::string::String> = types.iter().map(|t| t.to_string()).collect();
-                write!(f, "{}", parts.join(" | "))
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(" | ");
+                    }
+                    t.fmt_with(out, wire);
+                }
             }
-            WeftType::JsonDict => write!(f, "JsonDict"),
-            WeftType::Bus => write!(f, "Bus"),
-            WeftType::Access => write!(f, "Access"),
-            WeftType::TypeVar(name) => write!(f, "{}", name),
-            WeftType::MustOverride => write!(f, "MustOverride"),
+            WeftType::JsonDict => out.push_str("JsonDict"),
+            WeftType::Bus => out.push_str("Bus"),
+            WeftType::Access => out.push_str("Access"),
+            WeftType::Record(fields) => {
+                out.push('{');
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{}{}: ", field.name, if field.optional { "?" } else { "" });
+                    field.ty.fmt_with(out, wire);
+                }
+                out.push('}');
+            }
+            WeftType::Named { name, body } => {
+                out.push_str(name);
+                if wire {
+                    out.push('=');
+                    // A union body is parenthesized so the rendered
+                    // string is unambiguous: `Kind=(A | B)` is one named
+                    // type, `Kind=A | B` would re-parse as the union
+                    // `Kind=A | B` (a named member beside a plain one).
+                    let parens = matches!(**body, WeftType::Union(_));
+                    if parens {
+                        out.push('(');
+                    }
+                    body.fmt_with(out, wire);
+                    if parens {
+                        out.push(')');
+                    }
+                }
+            }
+            WeftType::TypeVar(name) => out.push_str(name),
+            WeftType::MustOverride => out.push_str("MustOverride"),
         }
+    }
+
+    /// The self-contained serialized form: like `to_string`, except a
+    /// `Named` carries its body inline (`ChatHistory=List[...]`), so
+    /// parsing the result never needs a registry. This is what
+    /// `Serialize` emits (stored projects, journals, editor payloads);
+    /// `Display` stays the authored bare-name form.
+    pub fn wire_string(&self) -> std::string::String {
+        let mut out = std::string::String::new();
+        self.fmt_with(&mut out, true);
+        out
+    }
+}
+
+impl std::fmt::Display for WeftType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = std::string::String::new();
+        self.fmt_with(&mut out, false);
+        f.write_str(&out)
     }
 }
 
 impl Serialize for WeftType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_str(&self.wire_string())
     }
 }
 

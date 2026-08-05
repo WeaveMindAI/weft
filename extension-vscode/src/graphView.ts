@@ -16,8 +16,8 @@ import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { textTabsForPath } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from './shared/protocol';
-import { typeReferencesFile } from './shared/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
 import { readProjectIdFromToml, findProjectRoot } from './sidebar/projects';
@@ -585,7 +585,7 @@ export class GraphViewController {
    *  Also drives the ActionBar's infra + trigger status pollers
    *  based on which node families the project contains.
    */
-  private syncInfraLivePollers(response: { project: ProjectDefinition; catalog: Record<string, { requires_infra?: boolean; features?: { isTrigger?: boolean; liveEndpoint?: string } }> }): void {
+  private syncInfraLivePollers(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
     const projectId = response.project.id;
     if (!projectId) {
       this.stopAllLivePollers();
@@ -662,7 +662,7 @@ export class GraphViewController {
    *  empty items list in that case so the inspector clears stale
    *  data instead of showing it forever.
    */
-  private syncSignalDisplayPollers(response: { project: ProjectDefinition; catalog: Record<string, { features?: { isTrigger?: boolean } }> }): void {
+  private syncSignalDisplayPollers(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
     const projectId = response.project.id;
     if (!projectId) {
       for (const timer of this.signalDisplayTimers.values()) clearInterval(timer);
@@ -1473,7 +1473,10 @@ export class GraphViewController {
       const message = err instanceof Error ? err.message : String(err);
       this.post({
         kind: 'editApplied', requestId, ok: false,
-        reason: message.replace(/^edit: /, ''),
+        // Both wire envelopes (`edit: ` for ops, `applyEdit: ` for the
+        // undo/redo replay) are transport prefixes, not part of the
+        // user-facing reason.
+        reason: message.replace(/^(edit|applyEdit): /, ''),
       });
     }
   }

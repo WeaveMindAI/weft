@@ -1,0 +1,42 @@
+# Exercises the Cast node across the conversion table, including a custom
+# named type (Profile, declared by the project-local ProfileGreet node):
+# text parses into a number, a boolean, and a typed list; a number
+# stringifies back; a JsonDict is validated into Profile (its optional
+# nickname absent); and the Profile value then feeds both a typed node
+# input and a plain JsonDict input (a named type wires freely into
+# JsonDict). Every result funnels into one summary dict Debug receives.
+
+seed = ExecPython() -> (num_text: String, flag_text: String, list_text: String, profile: JsonDict) {
+  code: "return {'num_text': '6.5', 'flag_text': 'true', 'list_text': '[1, 2, 3]', 'profile': {'name': 'Ada', 'age': 36}}"
+}
+
+to_number = Cast() -> (value: Number)
+to_number.value = seed.num_text
+
+to_text = Cast() -> (value: String)
+to_text.value = to_number.value
+
+to_flag = Cast() -> (value: Boolean)
+to_flag.value = seed.flag_text
+
+to_list = Cast() -> (value: List[Number])
+to_list.value = seed.list_text
+
+to_profile = Cast() -> (value: Profile)
+to_profile.value = seed.profile
+
+greet = ProfileGreet
+greet.profile = to_profile.value
+
+summary = ExecPython(number: Number, text: String, flag: Boolean, items: List[Number], profile: JsonDict, greeting: String) -> (result: JsonDict) {
+  code: "return {'result': {'number': number, 'text': text, 'flag': flag, 'total': float(sum(items)), 'profile_name': profile['name'], 'greeting': greeting}}"
+}
+summary.number = to_number.value
+summary.text = to_text.value
+summary.flag = to_flag.value
+summary.items = to_list.value
+summary.profile = to_profile.value
+summary.greeting = greet.greeting
+
+out = Debug
+out.data = summary.result

@@ -278,13 +278,25 @@ pub(crate) fn string_is_closed(text: &str) -> bool {
 /// fence was found (`true`) vs the token ran to end-of-input unterminated. The
 /// one heredoc scan, so `heredoc_len` (lexing) and `heredoc_is_closed`
 /// (containment) cannot disagree about where a heredoc ends.
+/// Any `\` directly before a fence marks it as the escaped inner fence; a
+/// value ending in a backslash therefore needs the canonical close on its
+/// own line (the encoder always emits that form).
+/// SYNC: heredoc encode/decode <-> crates/weft-compiler/src/weft_compiler.rs unescape_heredoc, crates/weft-compiler/src/edit/ops.rs format_string, packages/weft-graph/src/webview/lib/value-format.ts formatConfigValue/parseConfigToken
 fn heredoc_span(rest: &str) -> (usize, bool) {
     // Callers pass a `` ``` ``-led run (the lexer only emits HEREDOC then), so
-    // `rest` is at least the 3-byte open fence.
-    match rest.get(3..).and_then(|body| body.find("```")) {
-        Some(rel) => (3 + rel + 3, true), // open + body + close
-        None => (rest.len(), false),
+    // `rest` is at least the 3-byte open fence. A fence preceded by `\`
+    // is the escaped INNER fence (`\```` ``` ``, content), not the close.
+    let bytes = rest.as_bytes();
+    let mut at = 3;
+    while let Some(rel) = rest.get(at..).and_then(|body| body.find("```")) {
+        let pos = at + rel;
+        if bytes.get(pos.wrapping_sub(1)) == Some(&b'\\') {
+            at = pos + 3;
+            continue;
+        }
+        return (pos + 3, true); // open + body + close
     }
+    (rest.len(), false)
 }
 
 /// True iff a `HEREDOC` token is CLOSED (its closing fence was found), by the

@@ -1,0 +1,37 @@
+{
+  "type": "Cast",
+  "label": "Cast",
+  "description": "Convert a value into a declared type: parse text into a number, boolean, or JSON structure; stringify data; or validate an object against a custom type. Declare the target type on the output in weft source; an impossible conversion is a compile error, a value that does not fit fails this node loudly naming the offending field.",
+  "tags": [
+    "cast",
+    "convert",
+    "parse",
+    "validate",
+    "type"
+  ],
+  "icon": "ArrowRightLeft",
+  "color": "#64748b",
+  "inputs": [
+    {
+      "name": "value",
+      "type": "T",
+      "required": true,
+      "exposure": "wire",
+      "label": "Value"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "value",
+      "type": "MustOverride",
+      "required": false
+    }
+  ],
+  "features": {
+    "castPorts": {
+      "input": "value",
+      "output": "value"
+    }
+  },
+  "requires_infra": false
+}

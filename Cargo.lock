@@ -2223,9 +2223,9 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "minillmlib"
-version = "0.5.7"
+version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "589412f218b441eaf600cb7393983adac090a0d0ac6a895995b4a08ed66e569c"
+checksum = "4487e18f929ff513ee5ae6f337513848ad93b46a7a879a9c02e6825dba074f76"
 dependencies = [
  "base64 0.22.1",
  "dotenvy",
@@ -4471,6 +4471,7 @@ name = "weft-catalog"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "minillmlib",
  "serde",
  "serde_json",
  "tempfile",

@@ -13,7 +13,8 @@ use sqlx::PgPool;
 
 use weft_core::access::client::{authed_client, base_client, resolve_steps};
 use weft_core::access::spec::{
-    lookup_path, Acquisition, Door, GrantCoexistence, OAuthGrant, TestCall, VerificationRung,
+    lookup_path, Acquisition, CredentialField, Door, GrantCoexistence, OAuthGrant, TestCall,
+    VerificationRung,
 };
 use weft_core::{AccessSpec, AppRegistration, CredentialOwner};
 
@@ -230,12 +231,18 @@ fn require_registration<'a>(
     })?;
     // A half-filled app fails HERE with a clear message, not at the
     // token call: every extra the acquisition declares must be present.
-    let declared = match &spec.acquisition {
+    reg.validate(declared_registration_fields(spec)).map_err(AccessError::Invalid)?;
+    Ok(reg)
+}
+
+/// The registration extras the spec's acquisition declares (empty for a
+/// non-OAuth acquisition). The one derivation, shared by the fresh-app
+/// validation and the upgrade path's re-validation of a row's app.
+fn declared_registration_fields(spec: &AccessSpec) -> &[CredentialField] {
+    match &spec.acquisition {
         Acquisition::OAuth2 { registration_fields, .. } => registration_fields.as_slice(),
         _ => &[],
-    };
-    reg.validate(declared).map_err(AccessError::Invalid)?;
-    Ok(reg)
+    }
 }
 
 /// The credential snapshot for a grant / pending-connect row: the app as
@@ -795,7 +802,63 @@ pub async fn begin_oauth(
         )
         .into());
     }
-    let registration = require_registration(&req.registration, spec)?;
+    // An in-place upgrade reuses the ROW's app: the grant row already
+    // knows which registered app it belongs to, and re-deriving the app
+    // from the request (an empty editor form falls back to the
+    // project's default app) would silently reassign the grant to a
+    // different app on token rotation. The lookup is guarded by SERVICE
+    // too: an upgrade id naming a grant of a different service would
+    // otherwise park that service's app credentials into this consent
+    // and overwrite the row with the wrong provider's tokens.
+    let row_registration: Option<AppRegistration> = match req.upgrade_grant_id {
+        Some(id) => {
+            let row: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT registration_sealed FROM access_grant \
+                 WHERE id = $1 AND tenant_id = $2 AND service = $3",
+            )
+            .bind(id)
+            .bind(tenant)
+            .bind(&spec.service)
+            .fetch_optional(pool)
+            .await?;
+            let Some((sealed,)) = row else {
+                return Err(AccessError::NotFound.into());
+            };
+            let Some(sealed) = sealed else {
+                return Err(AccessError::Invalid(
+                    "this connection was made without an app; it cannot be upgraded \
+                     through a browser consent"
+                        .into(),
+                )
+                .into());
+            };
+            let reg: AppRegistration = serde_json::from_value(crate::open_json(&sealed)?)
+                .map_err(|e| anyhow::anyhow!("grant row has a malformed app: {e}"))?;
+            // The row's app must still satisfy the spec (a row sealed
+            // under an older spec missing a now-declared field fails
+            // HERE with the field's name, not at the token call).
+            reg.validate(declared_registration_fields(spec)).map_err(AccessError::Invalid)?;
+            // The request may carry an app too (the editor resolved
+            // one); a DIFFERENT app is a contradiction, refused loudly
+            // rather than silently preferring either side.
+            if let Some(requested) = &req.registration {
+                if requested.client_id != reg.client_id {
+                    return Err(AccessError::Invalid(
+                        "this connection was made through a different app; forget it and \
+                         connect again to switch apps"
+                            .into(),
+                    )
+                    .into());
+                }
+            }
+            Some(reg)
+        }
+        None => None,
+    };
+    let registration = match &row_registration {
+        Some(r) => r,
+        None => require_registration(&req.registration, spec)?,
+    };
     let client_id = registration.client_id.clone();
 
     let state = uuid::Uuid::new_v4().simple().to_string();
@@ -1105,11 +1168,15 @@ async fn finish_connect(
         Some(id) => {
             // Union of scopes: an exclusive grant only ever grows, and
             // every referencing project follows the row.
+            // Guarded by service like the begin-side lookup: the rotate
+            // must never land on a row of a different provider.
             let prior: Option<(Value,)> = sqlx::query_as(
-                "SELECT granted_scopes FROM access_grant WHERE id = $1 AND tenant_id = $2",
+                "SELECT granted_scopes FROM access_grant \
+                 WHERE id = $1 AND tenant_id = $2 AND service = $3",
             )
             .bind(id)
             .bind(&tenant)
+            .bind(&service)
             .fetch_optional(pool)
             .await?;
             let Some((prior_scopes,)) = prior else {

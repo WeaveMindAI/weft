@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { Search } from '@lucide/svelte';
 	import type { NodeExecution } from '../../types';
-	import type { BusInspectorEvent, BusMeta, CorruptionSite, LoopInspectorEvent, LoopIteration } from '../../../../shared/protocol';
-	import { parseFileValue } from '../../../../shared/protocol';
+	import type { BusInspectorEvent, BusMeta, CorruptionSite, LoopInspectorEvent, LoopIteration } from '../../../../protocol';
+	import { parseFileValue } from '../../../../protocol';
 	import { displayStatus, getStatusIcon } from '../../utils/status';
 	import JsonTree from './JsonTree.svelte';
 	import FileCard from './FileCard.svelte';

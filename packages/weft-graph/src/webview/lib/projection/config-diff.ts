@@ -8,7 +8,7 @@
 // Diffing against the node's current (projected) config keeps source ops to
 // exactly what changed.
 
-import type { EditOp } from '../../../shared/protocol';
+import type { EditOp } from '../../../protocol';
 import type { PortDefinition } from '../types';
 import { inputExposure } from '../types';
 import { formatConfigValue } from '../value-format';

@@ -2,7 +2,6 @@
   "type": "SendEmail",
   "label": "Send Email",
   "description": "Send an email as the connected mailbox, over SMTP (the standard sending protocol every mail provider serves). Set replyToMessageId to answer inside an existing conversation.",
-  "category": "Communication",
   "tags": [
     "email",
     "smtp"

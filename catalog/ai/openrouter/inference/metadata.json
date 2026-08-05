@@ -2,7 +2,6 @@
   "type": "OpenRouterInference",
   "label": "OpenRouter",
   "description": "AI language model completion through OpenRouter. The credential decision comes from a wired OpenRouterAccess node (Credits or your own key); model, system prompt, and sampling parameters come from a wired OpenRouterConfig node, and without one the defaults apply (default model: anthropic/claude-sonnet-4.6).",
-  "category": "AI",
   "tags": [
     "ai",
     "gpt",
@@ -19,6 +18,19 @@
       "type": "String",
       "required": true,
       "description": "The prompt to send to the LLM"
+    },
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false,
+      "exposure": "wire",
+      "description": "The conversation so far (a ChatHistoryAppend chain or a previous call's history output). The prompt is appended as the newest user message."
+    },
+    {
+      "name": "media",
+      "type": "Media | List[Media]",
+      "required": false,
+      "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them."
     },
     {
       "name": "account",
@@ -48,6 +60,12 @@
       "type": "MustOverride",
       "required": false,
       "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly."
+    },
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false,
+      "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
     }
   ],
   "requires_infra": false,

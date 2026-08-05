@@ -1,7 +1,9 @@
 [package]
 name = "openrouter"
 
-# The OpenRouter nodes: one inference call, and a shared parameter block.
+# The OpenRouter nodes: one inference call, a shared parameter block,
+# and the provider-agnostic ChatHistoryAppend (it shares this package's
+# chat helpers; the ChatHistory types are declared at this root).
 # Both speak to OpenRouter specifically (its model slugs, its unified
 # pricing catalog, its API key), which is why they are named for it rather
 # than for "LLM" in general: another provider needs another key, another
@@ -13,6 +15,6 @@ name = "openrouter"
 # bookkeeping of their own.
 [dependencies]
 async-trait = "0.1"
-minillmlib = "0.5.7"
+minillmlib = "0.5.8"
 serde_json = "1"
 tokio = "1"

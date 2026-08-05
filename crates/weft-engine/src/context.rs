@@ -1317,14 +1317,13 @@ pub(crate) const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// `PoisonOnWriteFailure`, so the failure latches a flag the drive
 /// loop checks every iteration: the worker exits instead of driving
 /// on top of a journal that no longer matches its live state.
-/// Does `declared` accept a value whose inferred type is `infer(value)`?
 /// The runtime output-type gate: a node may only emit on a port a value
-/// compatible with the port's declared type. An unresolved declared type
-/// (TypeVar / MustOverride / unresolved) accepts anything, since
-/// `is_compatible` short-circuits to true when either side is unresolved.
+/// its declared type accepts (`WeftType::accepts_runtime_value`: a
+/// declared named/record shape validates the value against its
+/// contract, everything else infers and compares structurally; an
+/// unresolved declared type accepts anything).
 fn type_accepts(declared: &WeftType, value: &Value) -> bool {
-    let inferred = WeftType::infer(value);
-    WeftType::is_compatible(&inferred, declared)
+    declared.accepts_runtime_value(value)
 }
 
 pub async fn record_from_pod(journal: &dyn JournalClient, event: ExecEvent, pod_name: &str) {
@@ -2333,6 +2332,10 @@ impl ContextHandle for RunnerHandle {
 
     async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
         self.clients.storage.presign(self.color, key, ttl_secs).await
+    }
+
+    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>> {
+        self.clients.storage.public_link(self.color, key, ttl_secs).await
     }
 
     async fn endpoint_url(&self, name: &str) -> WeftResult<String> {

@@ -13,8 +13,8 @@
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure } from "../../types";
-	import type { EditOp, TextEdit } from "../../../../shared/protocol";
+	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import type { EditOp, TextEdit } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
 	import { updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
@@ -74,9 +74,9 @@
 		// the reply carries the inverse text edit (the action's undo) PLUS the
 		// post-edit truth. Rejects with the server's reason; the editor rolls the
 		// optimistic op back through the one rejection path.
-		onApplyEdits: (ops: import('../../../../shared/protocol').EditOp[]) => Promise<import('../../projection/types').EditRpcResult>;
+		onApplyEdits: (ops: import('../../../../protocol').EditOp[]) => Promise<import('../../projection/types').EditRpcResult>;
 		// Replay a raw source text edit (undo/redo); same reply shape.
-		onApplyTextEdit: (edit: import('../../../../shared/protocol').TextEdit) => Promise<import('../../projection/types').EditRpcResult>;
+		onApplyTextEdit: (edit: import('../../../../protocol').TextEdit) => Promise<import('../../projection/types').EditRpcResult>;
 		// Fetch the host's current truth after a rejected edit (the authoritative
 		// post-rejection state). Resolves null when the source doesn't parse
 		// right now (the editor keeps its previous truth).
@@ -90,7 +90,7 @@
 		// Resolved content of @file targets, keyed by the marker's relative
 		// path. The display value for file-backed fields (config holds only
 		// the `@file(...)` marker, never the resolved content).
-		fileContents?: Record<string, import('../../../../shared/protocol').FileContent>;
+		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		// Action-bar verb callbacks. The webview emits these; the
 		// host translates each into a CLI shell-out.
 		onRun?: () => void;
@@ -118,8 +118,8 @@
 		// Action-bar state machine (host-owned single source of
 		// truth) and drift snapshot. Passed straight through to
 		// the ActionBar component; nothing in this file decides.
-		actionBarState: import('../../../../shared/protocol').ActionBarState;
-		drift: import('../../../../shared/protocol').ActionAvailability | undefined;
+		actionBarState: import('../../../../protocol').ActionBarState;
+		drift: import('../../../../protocol').ActionAvailability | undefined;
 		// Per-node infra status, keyed by node_id. Used by the
 		// graph node decorations (badge under each infra node);
 		// independent of the action bar's infra rollup.
@@ -137,10 +137,10 @@
 		autoOrganizeOnMount?: boolean;
 		/// Per-node infra /live tick state. Read for nodes whose
 		/// `requiresInfra` flag is true; ignored otherwise.
-		infraFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
+		infraFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
 		/// Per-node listener /display tick state. Read for nodes whose
 		/// `features.isTrigger` flag is true; ignored otherwise.
-		signalFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
+		signalFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
 	} = $props();
 
 	// VS Code embedding: dashboard chrome (right sidebar, code
@@ -697,7 +697,7 @@
 			// them to the source (the webview never edits `.weft` text). Layout
 			// keys (width/height/expanded) are NOT source edits: they go to the
 			// companion layout file via layoutUpdateAny.
-			const ops: import('../../../../shared/protocol').EditOp[] = [];
+			const ops: import('../../../../protocol').EditOp[] = [];
 
 			// Layout mutations are a PURE `(layout) => layout` transform the engine
 			// runs and diffs (one reversible action with the source ops). Layout-
@@ -1323,11 +1323,11 @@
 	type OverlayCtx = {
 		nodeOutputs: Record<string, unknown>;
 		nodeExecutions: Record<string, import('../../types').NodeExecution[]>;
-		busLogByBus: Record<string, import('../../../../shared/protocol').BusInspectorEvent[]>;
+		busLogByBus: Record<string, import('../../../../protocol').BusInspectorEvent[]>;
 		busesByNode: Record<string, string[]>;
-		busMetaByBus: Record<string, import('../../../../shared/protocol').BusMeta>;
-		loopEventsByGroup: Record<string, import('../../../../shared/protocol').LoopInspectorEvent[]>;
-		journalCorruptions: Array<{ site: import('../../../../shared/protocol').CorruptionSite; reason: string }>;
+		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
+		loopEventsByGroup: Record<string, import('../../../../protocol').LoopInspectorEvent[]>;
+		journalCorruptions: Array<{ site: import('../../../../protocol').CorruptionSite; reason: string }>;
 		infraNodes: typeof infraNodes;
 		fileContents: typeof fileContents;
 		infraFeedByNode: typeof infraFeedByNode;
@@ -2260,6 +2260,27 @@
 		return parentId || '__root__';
 	}
 
+	/** The declared type string of the port behind a handle. A handle id
+	 *  is the port name; a group's `__inner` suffix marks the INSIDE
+	 *  face, where the group's inputs act as sources and its outputs as
+	 *  targets, so the face picks exactly one list (a node may carry an
+	 *  input AND an output under the same name, e.g. a passthrough
+	 *  `value`/`value`; searching one list then the other would resolve
+	 *  the wrong side of that pair). Null when the port is not in the
+	 *  face's list (the implicit loop handles, `_raw`), which the type
+	 *  gate treats as "no opinion". */
+	function handlePortType(nodeId: string, handleId: string | null | undefined, side: 'source' | 'target'): string | null {
+		const node = nodes.find(n => n.id === nodeId);
+		if (!node) return null;
+		const inner = handleId?.endsWith('__inner') ?? false;
+		const clean = inner && handleId ? handleId.slice(0, -7) : handleId;
+		const outputs = (node.data.outputs ?? []) as Array<{ name: string; portType: string }>;
+		const inputs = (node.data.inputs ?? []) as Array<{ name: string; portType: string }>;
+		const list = (side === 'source') !== inner ? outputs : inputs;
+		const port = list.find(p => p.name === clean);
+		return port?.portType ?? null;
+	}
+
 	function isValidConnection(connection: Edge | Connection): boolean {
 		// Simplified view is look-only for wiring: the single in/out dots don't
 		// map to real ports, so no edge can be authored or reconnected here. The
@@ -2268,7 +2289,17 @@
 		const sourceScope = getHandleScope(connection.source!, connection.sourceHandle);
 		const targetScope = getHandleScope(connection.target!, connection.targetHandle);
 		if (sourceScope === null || targetScope === null) return false;
-		return sourceScope === targetScope;
+		if (sourceScope !== targetScope) return false;
+		// Type gate: refuse a wire the compiler would reject, at the
+		// gesture, with the same compatibility rules the backend uses
+		// (the frontend mirror in lib/types). Unresolvable or unparsable
+		// port types pass: the compiler is the authority, this gate only
+		// stops the certainly-wrong wire early.
+		const sourceType = handlePortType(connection.source!, connection.sourceHandle, 'source');
+		const targetType = handlePortType(connection.target!, connection.targetHandle, 'target');
+		if (sourceType === null || targetType === null) return true;
+		if (parseWeftType(sourceType) === null || parseWeftType(targetType) === null) return true;
+		return isWeftTypeCompatible(sourceType, targetType);
 	}
 
 	// Track current connection line color based on source handle
@@ -3110,7 +3141,7 @@
 	}
 
 	type PortLike = { name: string; required?: boolean; portType?: string };
-	function toPortSigs(ports: PortLike[]): import('../../../../shared/protocol').EditPortSig[] {
+	function toPortSigs(ports: PortLike[]): import('../../../../protocol').EditPortSig[] {
 		return (ports ?? []).map(p => ({ name: p.name, required: p.required !== false, portType: p.portType }));
 	}
 

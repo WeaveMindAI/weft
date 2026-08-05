@@ -42,19 +42,19 @@
 			/// when no member node has used a bus.
 			busLogs?: Array<{
 				busId: string;
-				events: import('../../../../shared/protocol').BusInspectorEvent[];
-				meta?: import('../../../../shared/protocol').BusMeta;
+				events: import('../../../../protocol').BusInspectorEvent[];
+				meta?: import('../../../../protocol').BusMeta;
 			}>;
 			/// Execution-wide journal corruptions. Empty in the normal
 			/// case. The inspector renders a muted collapsed disclosure
 			/// at the bottom when non-empty.
 			journalCorruptions?: Array<{
-				site: import('../../../../shared/protocol').CorruptionSite;
+				site: import('../../../../protocol').CorruptionSite;
 				reason: string;
 			}>;
 			/// Loop-specific inspector events for this loop group.
 			/// Empty for ordinary groups.
-			loopEvents?: import('../../../../shared/protocol').LoopInspectorEvent[];
+			loopEvents?: import('../../../../protocol').LoopInspectorEvent[];
 		};
 		selected?: boolean
 	} = $props();

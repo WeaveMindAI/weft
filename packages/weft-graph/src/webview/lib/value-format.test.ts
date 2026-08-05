@@ -19,9 +19,18 @@ describe('formatConfigValue / parseConfigToken round-trip', () => {
     expect(roundTrip(v)).toEqual(v);
   });
 
-  it('throws on a multi-line string containing a fence (the lexer cannot encode it)', () => {
-    // Mirrors the Rust edit-server: a heredoc has no inner-fence escape.
-    expect(() => formatConfigValue('a\n```\nb')).toThrow(/heredoc fence/);
+  it('round-trips a multi-line string containing a fence via the escape', () => {
+    // Mirrors the Rust edit-server: an inner ``` encodes as \``` and
+    // round-trips; only the escape's own literal spelling is refused.
+    const v = 'a\n```\nb';
+    expect(formatConfigValue(v)).toBe('```\na\n\\```\nb\n```');
+    expect(roundTrip(v)).toEqual(v);
+    expect(() => formatConfigValue('a\n\\```\nb')).toThrow(/fence escape/);
+  });
+
+  it('round-trips indentation and trailing spaces verbatim', () => {
+    const v = '    line1\n    line2   ';
+    expect(roundTrip(v)).toEqual(v);
   });
 
   it('round-trips objects and arrays', () => {

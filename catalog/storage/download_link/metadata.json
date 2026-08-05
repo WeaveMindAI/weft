@@ -2,7 +2,6 @@
   "type": "DownloadLink",
   "label": "Download Link",
   "description": "Show a download button for a stored file in the graph. Wire any File value into `file`; the node renders the filename, size, and a Download button right in the editor. Clicking it runs the same authenticated handshake a CLI download uses and streams the bytes directly from storage. A terminal node: it emits nothing.",
-  "category": "Storage",
   "tags": [
     "storage",
     "download",

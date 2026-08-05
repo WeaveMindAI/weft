@@ -66,6 +66,9 @@ pub trait WorkerStorageOps: Send + Sync {
     async fn list(&self, color: Color, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>>;
     async fn keep(&self, color: Color, key: &str, ttl: KeepTtl) -> WeftResult<()>;
     async fn presign(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
+    /// A temporary INTERNET-reachable URL for `key`, or `None` when the
+    /// deployment cannot serve one (callers fall back to inline bytes).
+    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>>;
 }
 
 /// Map a broker HTTP failure to a node-facing error. A transport failure
@@ -499,6 +502,22 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(out.url)
     }
 
+    async fn public_link(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>> {
+        let resp = self
+            .authed(self.http.post(self.url("/v1/storage/public-link")), color)
+            .await?
+            .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs })
+            .send()
+            .await
+            .map_err(|e| http_err("public-link", e))?;
+        if !resp.status().is_success() {
+            return Err(status_err("public-link", resp).await);
+        }
+        let out: weft_core::storage::PublicLinkResponse =
+            resp.json().await.map_err(|e| http_err("public-link response", e))?;
+        Ok(out.url)
+    }
+
 }
 
 // ---------- fake (tests) ----------
@@ -676,6 +695,16 @@ mod fake {
                 return Err(WeftError::NodeExecution(format!("storage file not found: {key}")));
             }
             Ok(format!("https://fake-bucket/runtime/{key}?sig=fake"))
+        }
+
+        async fn public_link(&self, _color: Color, key: &str, _ttl_secs: Option<u64>) -> WeftResult<Option<String>> {
+            self.enforce_wall(key)?;
+            if !self.files.lock().contains_key(key) {
+                return Err(WeftError::NodeExecution(format!("storage file not found: {key}")));
+            }
+            // The fake deployment serves no public links: callers
+            // exercise the inline fallback.
+            Ok(None)
         }
     }
 }

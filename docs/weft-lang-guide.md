@@ -168,6 +168,42 @@ Port types the compiler understands:
 - **Optional**: a trailing `?` on an input port lets it accept `null` (it opts
   into receiving "no value"). Without `?`, a required input refuses to run on
   null and the node is skipped.
+- **Records**: a dict with KNOWN field names and per-field types:
+  `{ role: String, name?: String }`. A `?` on a field marks it optional (the
+  key may be absent; a present `null` counts as absent). Validation is
+  strict: a value carrying a key the record does not declare is refused,
+  which is what makes a record a contract rather than documentation.
+- **Named custom types**: any node's `metadata.json` may declare named types
+  under a `types` key (`"ChatHistory": "List[ChatMessage]"`); once declared
+  anywhere in the project, the name is usable in every port type and every
+  inline port signature. Named types are NOMINAL: the name is the contract.
+  A named value wires freely into `JsonDict` or its own structural shape
+  (forgetting the name is safe), but nothing unnamed wires into a named
+  input; the deliberate door for "this dict IS a ChatHistory, check it" is
+  the `Cast` node, which validates the value against the declared structure
+  at run time and fails naming the exact offending field. Declaring the same
+  name twice is fine when the bodies are structurally identical (two
+  packages may ship the same shared type) and a loud error telling you to
+  rename one when they differ.
+
+## The Cast node
+
+`Cast` converts a value into the type declared on its output (the inline
+port signature pins it, since the metadata ships the output as
+`MustOverride`):
+
+```weft
+raw = Http { url: "https://api.example.com/history.json" }
+history = Cast() -> (value: ChatHistory)
+history.value = raw.body
+```
+
+The conversion table is checked at compile time (an impossible pair like
+`JsonDict -> Number` is a compile error, not a runtime surprise): text
+parses into numbers, booleans, and JSON structures; data stringifies;
+`Number` and `Boolean` interconvert as 1/0; and any object shape casts
+into a record or named type by VALIDATION (the value is held to the
+declared structure, with a field-level error when it does not fit).
 
 ## Null propagation (how branching works)
 

@@ -1542,7 +1542,7 @@ fn store_value_text(
         return None;
     }
     // Heredoc (multiline string): strip fences, single leading/trailing newline,
-    // dedent, unescape.
+    // unescape.
     if let Some(text) = unescape_heredoc(value) {
         config.insert(key.to_string(), serde_json::Value::String(text));
         return Some(key.to_string());
@@ -1555,6 +1555,13 @@ fn store_value_text(
 /// Parse a ` ```...``` ` heredoc (multiline string) value into its text, or None
 /// if `value` isn't a heredoc. The single home for heredoc unescaping, shared by
 /// `store_value_text` and the label path.
+///
+/// The content between the fences is VERBATIM: only the one newline
+/// after the opening fence and the one before the closing fence are the
+/// syntax's own, everything else (indentation, trailing spaces, blank
+/// lines) is the value, byte for byte. The single escape is `\```` ``` ``
+/// for an inner fence.
+/// SYNC: heredoc encode/decode <-> crates/weft-compiler/src/cst/lexer.rs heredoc_span, crates/weft-compiler/src/edit/ops.rs format_string, packages/weft-graph/src/webview/lib/value-format.ts formatConfigValue/parseConfigToken
 fn unescape_heredoc(value: &str) -> Option<String> {
     if !(value.starts_with("```") && value.ends_with("```") && value.len() >= 6) {
         return None;
@@ -1562,7 +1569,7 @@ fn unescape_heredoc(value: &str) -> Option<String> {
     let inner = &value[3..value.len() - 3];
     let inner = inner.strip_prefix('\n').unwrap_or(inner);
     let inner = inner.strip_suffix('\n').unwrap_or(inner);
-    Some(dedent(inner).replace("\\```", "```").replace("\\`", "`"))
+    Some(inner.replace("\\```", "```"))
 }
 
 /// Parse a `_label` value: it must be a STRING (a quoted `"..."` or a ` ``` `
@@ -2108,7 +2115,7 @@ fn scoped(parent: Option<&str>, local: &str) -> String {
 // ─── Lowering value/id helpers ──────────────────────────────────────────────
 // Pure text helpers used by the CST lowering: port-decl text -> ParsedPort,
 // include-arg parsing, scoped-id rescoping for includes, scalar value parsing,
-// string unquote/unescape, heredoc dedent. (Not parsers; the CST parser owns
+// string unquote/unescape, heredoc unescape. (Not parsers; the CST parser owns
 // all tokenization. These operate on already-tokenized fragments' text.)
 
 /// Parse a single port declaration.
@@ -2174,25 +2181,6 @@ fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
 }
 
 // ─── Config Block Parsing ───────────────────────────────────────────────────
-
-
-fn dedent(s: &str) -> String {
-    let raw = s.trim_end();
-    let min_indent = raw.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    if min_indent > 0 {
-        raw.lines()
-            .map(|l| if l.len() >= min_indent { &l[min_indent..] } else { l })
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        raw.to_string()
-    }
-}
-
 
 
 /// Parse connections inside a group. Uses `self` instead of `in`/`out`.
@@ -2545,7 +2533,11 @@ fn collect_group_definitions(
     out.push(weft_core::GroupDefinition {
         id: group.id.clone(),
         kind,
-        label: Some(group.id.clone()),
+        // No group-like decl carries a user label in the language, so
+        // the wire says so honestly; the editor derives the display
+        // name from the id's local segment (restating the full dotted
+        // id here made every NESTED group render as "outer.inner").
+        label: None,
         in_ports,
         out_ports,
         one_of_required: group.one_of_required.clone(),

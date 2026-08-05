@@ -247,6 +247,24 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         -- The expiry sweep ranges kept files by their expiry.
         CREATE INDEX IF NOT EXISTS idx_runtime_file_expiry
             ON runtime_file(expires_at_unix) WHERE expires_at_unix IS NOT NULL;
+        -- One row per minted PUBLIC RELAY link: the public
+        -- `/public/files/{token}` route resolves the token here and
+        -- streams the file. `fetch_url` is a presigned in-cluster GET
+        -- the relay reads the bytes from, signed for the same lifetime
+        -- as the token. Rows expire with the link; every mint deletes
+        -- the expired ones, so the table stays the size of the live
+        -- link set. ON DELETE CASCADE ties a link to its file row, so a
+        -- deleted/swept file takes its links with it and a live token
+        -- can never point at bytes that are gone (a dead token is a
+        -- clean 404, never a broken stream).
+        CREATE TABLE IF NOT EXISTS public_file_link (
+            token           TEXT PRIMARY KEY,
+            key             TEXT NOT NULL REFERENCES runtime_file(key) ON DELETE CASCADE,
+            mime_type       TEXT NOT NULL,
+            filename        TEXT NOT NULL,
+            fetch_url       TEXT NOT NULL,
+            expires_at_unix BIGINT NOT NULL
+        );
         "#,
     )
     .execute(&mut *tx)
@@ -295,6 +313,15 @@ impl FileRow {
     }
 }
 
+/// A resolved public-relay link: the headers the relay answers with and
+/// the presigned in-cluster URL it streams the bytes from.
+#[derive(Debug)]
+pub struct PublicLinkTarget {
+    pub mime_type: String,
+    pub filename: String,
+    pub fetch_url: String,
+}
+
 /// What a sweep needs to know per row: spare it (kept ACTIVE file) or reap
 /// its bucket state (aborting the in-flight upload of a pending row).
 #[derive(Debug, sqlx::FromRow)]
@@ -321,6 +348,19 @@ struct PendingUpload {
 }
 
 /// Resolve a `KeepTtl` to its seconds, `None` for `Never`.
+/// SQL fragment: the later of `param` (a bind like `$1`) and the newest
+/// live public link's expiry for the row being updated. Every write to
+/// `runtime_file.expires_at_unix` that could SHORTEN a deadline goes
+/// through this, so no path (access bump, keep, linger stamp) can pull
+/// a file's death forward under a live link: a minted link is a promise
+/// the bytes stay fetchable for its stated lifetime.
+fn expiry_honoring_links(param: &str) -> String {
+    format!(
+        "GREATEST({param}, COALESCE((SELECT MAX(l.expires_at_unix) FROM public_file_link l \
+         WHERE l.key = runtime_file.key), 0))"
+    )
+}
+
 fn keep_ttl_secs(ttl: KeepTtl) -> Option<u64> {
     match ttl {
         KeepTtl::Never => None,
@@ -1444,17 +1484,22 @@ impl RuntimeStore {
 
     /// Bump a kept file's expiry to now + its TTL (an access keeps it alive).
     /// No-op for files with no expiry (project/shared, KeepTtl::Never).
+    /// Never shortens below a live public link's expiry (a minted link is
+    /// a promise the bytes stay fetchable for its stated lifetime).
     async fn bump_expiry(&self, row: &FileRow) -> Result<()> {
         let Some(ttl) = row.keep_ttl_secs else {
             return Ok(());
         };
         let new_expiry = self.clock.now_unix() + ttl;
-        sqlx::query("UPDATE runtime_file SET expires_at_unix = $1 WHERE key = $2")
-            .bind(new_expiry)
-            .bind(&row.key)
-            .execute(&self.pool)
-            .await
-            .context("bump expiry")?;
+        sqlx::query(&format!(
+            "UPDATE runtime_file SET expires_at_unix = {} WHERE key = $2",
+            expiry_honoring_links("$1")
+        ))
+        .bind(new_expiry)
+        .bind(&row.key)
+        .execute(&self.pool)
+        .await
+        .context("bump expiry")?;
         Ok(())
     }
 
@@ -1571,11 +1616,15 @@ impl RuntimeStore {
         let key = parsed.to_key();
         let ttl_secs = keep_ttl_secs(ttl);
         let expires_at = ttl_secs.map(|s| self.clock.now_unix() + s as i64);
-        let row: Option<FileRow> = sqlx::query_as::<_, FileRow>(
-            "UPDATE runtime_file SET keep = TRUE, keep_ttl_secs = $1, expires_at_unix = $2 \
+        // KeepTtl::Never binds NULL (never expires, covers links
+        // trivially); a finite deadline never undercuts a live link.
+        let row: Option<FileRow> = sqlx::query_as::<_, FileRow>(&format!(
+            "UPDATE runtime_file SET keep = TRUE, keep_ttl_secs = $1, \
+                 expires_at_unix = CASE WHEN $2::bigint IS NULL THEN NULL ELSE {} END \
              WHERE key = $3 AND status <> 'reaping' \
              RETURNING key, mime_type, filename, size_bytes, keep, expires_at_unix, keep_ttl_secs, created_at_unix",
-        )
+            expiry_honoring_links("$2")
+        ))
         .bind(ttl_secs.map(|s| s as i64))
         .bind(expires_at)
         .bind(&key)
@@ -1594,6 +1643,90 @@ impl RuntimeStore {
         // Handed to an EXTERNAL URL-accepting API (the node's `ctx.storage.presign`),
         // which streams from the bucket over the public network -> External audience.
         Ok(self.presign_get(parsed, PresignAudience::External, ttl_secs).await?.1)
+    }
+
+    /// Mint a PUBLIC RELAY link token for a file: the returned token
+    /// resolves at the public `/public/files/{token}` route, which
+    /// streams the bytes. The row carries the metadata
+    /// plus a presigned INTERNAL-audience fetch URL the relay (an
+    /// in-cluster service) reads from, signed for the token's own
+    /// lifetime. Minting counts as access (bumps a kept file's
+    /// expiry), and a minted link is a PROMISE: a file already carrying
+    /// an expiry gets it pushed past the link's, so the bytes outlive
+    /// every live token (a file with no expiry outlives it trivially,
+    /// and the terminate sweep's linger stamp honors live links too).
+    pub async fn mint_public_link(
+        &self,
+        parsed: &ParsedKey,
+        ttl_secs: Option<u64>,
+    ) -> StoreResult<String> {
+        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).min(MAX_PRESIGN_TTL_SECS).max(1);
+        let (meta, fetch_url) =
+            self.presign_get(parsed, PresignAudience::Internal, Some(ttl)).await?;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let now = self.clock.now_unix();
+        let link_expiry = now + ttl as i64;
+        // Opportunistic sweep: expired links are dead weight nobody can
+        // act on, deleted on every mint so the table never accumulates.
+        sqlx::query("DELETE FROM public_file_link WHERE expires_at_unix < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .context("public_file_link sweep")
+            .map_err(RuntimeStoreError::Other)?;
+        sqlx::query(
+            "INSERT INTO public_file_link
+               (token, key, mime_type, filename, fetch_url, expires_at_unix)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&token)
+        .bind(parsed.to_key())
+        .bind(&meta.mime_type)
+        .bind(&meta.filename)
+        .bind(&fetch_url)
+        .bind(link_expiry)
+        .execute(&self.pool)
+        .await
+        .context("public_file_link insert")
+        .map_err(RuntimeStoreError::Other)?;
+        // The promise half: a file already on an expiry clock (kept with
+        // a TTL, or lingering after its execution) must not be reaped
+        // while this link lives. NULL expiries stay NULL (a live exec
+        // file's lifetime is its execution's, plus the linger stamp
+        // below at terminate; setting a clock here would ADD one).
+        sqlx::query(
+            "UPDATE runtime_file SET expires_at_unix = GREATEST(expires_at_unix, $2)
+             WHERE key = $1 AND expires_at_unix IS NOT NULL",
+        )
+        .bind(parsed.to_key())
+        .bind(link_expiry)
+        .execute(&self.pool)
+        .await
+        .context("public_file_link expiry cover")
+        .map_err(RuntimeStoreError::Other)?;
+        Ok(token)
+    }
+
+    /// Resolve a public-relay token to its file: the metadata for the
+    /// response headers plus the presigned in-cluster fetch URL minted
+    /// with it. `None` for a missing OR expired token (the two must be
+    /// indistinguishable to the outside).
+    pub async fn resolve_public_link(&self, token: &str) -> Result<Option<PublicLinkTarget>> {
+        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT mime_type, filename, fetch_url, expires_at_unix
+             FROM public_file_link WHERE token = $1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await
+        .context("public_file_link lookup")?;
+        Ok(row.and_then(|(mime_type, filename, fetch_url, expires)| {
+            (expires >= self.clock.now_unix()).then_some(PublicLinkTarget {
+                mime_type,
+                filename,
+                fetch_url,
+            })
+        }))
     }
 
     /// Mint a presigned GET URL a WORKER uses to read a runtime file's bytes
@@ -1695,12 +1828,15 @@ impl RuntimeStore {
                 // landed since the scan wins and the file survives untouched),
                 // and only stamps a NULL expiry so a re-delivered terminate
                 // sweep (the queue is idempotent) can't keep pushing the
-                // deadline out.
-                let stamped = sqlx::query(
-                    "UPDATE runtime_file SET expires_at_unix = $2 \
+                // deadline out. The deadline honors any live public link on
+                // the file (a minted link is a promise the bytes stay
+                // fetchable for its stated lifetime).
+                let stamped = sqlx::query(&format!(
+                    "UPDATE runtime_file SET expires_at_unix = {} \
                      WHERE key = $1 AND status = 'active' AND NOT keep \
                        AND expires_at_unix IS NULL",
-                )
+                    expiry_honoring_links("$2")
+                ))
                 .bind(&entry.key)
                 .bind(self.clock.now_unix() + EXEC_LINGER_TTL_SECS)
                 .execute(&self.pool)

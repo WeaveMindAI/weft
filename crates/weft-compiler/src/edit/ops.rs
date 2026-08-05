@@ -2353,19 +2353,20 @@ fn build_signature(inputs: &[PortSig], outputs: &[PortSig]) -> String {
 }
 
 /// Render a string to a `.weft` value token (quoted, or heredoc if multi-line).
-/// SYNC: format_string <-> packages/weft-graph/src/webview/lib/value-format.ts formatConfigValue (and parseConfigToken, its inverse)
+/// SYNC: format_string <-> crates/weft-compiler/src/weft_compiler.rs unescape_heredoc, crates/weft-compiler/src/cst/lexer.rs heredoc_span, packages/weft-graph/src/webview/lib/value-format.ts formatConfigValue (and parseConfigToken, its inverse)
 fn format_string(s: &str) -> Result<String, EditError> {
     if s.contains('\n') {
-        // A multi-line value is emitted as a ```...``` heredoc. The heredoc has
-        // NO escape for an inner fence, so a value that itself contains ``` can't
-        // be encoded faithfully: reject loudly rather than emit source that
-        // re-parses wrong (a silent corrupt encode is the worst outcome).
-        if s.contains("```") {
+        // A multi-line value is emitted as a ```...``` heredoc. Content is
+        // verbatim between the fences; an inner ``` is escaped as \```
+        // (the one escape the decoder honors). The escape's own literal
+        // spelling (`\```` inside the value) is therefore unencodable:
+        // reject loudly rather than emit source that re-parses wrong.
+        if s.contains("\\```") {
             return Err(EditError::InvalidArgument(
-                "multi-line value cannot contain ``` (no heredoc fence escape)".into(),
+                "multi-line value cannot contain the sequence \\``` (it is the heredoc's fence escape)".into(),
             ));
         }
-        Ok(format!("```\n{s}\n```"))
+        Ok(format!("```\n{}\n```", s.replace("```", "\\```")))
     } else {
         Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
     }

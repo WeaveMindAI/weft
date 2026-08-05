@@ -25,7 +25,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use weft_core::access::spec::{lookup_path, Door};
-use weft_access_store::{GrantedQuery, MintAppRequest, MintAppResponse, SharedDoorPick};
+use weft_access_store::{DoorsAnswer, GrantedQuery, MintAppRequest, MintAppResponse, SharedAppChoice, SharedDoorPick};
 use weft_core::storage::Tenanted;
 use weft_core::AccessSpec;
 
@@ -182,29 +182,6 @@ struct DoorsQuery {
     spec: AccessSpec,
 }
 
-/// One registered app the editor offers as its own shared-door option:
-/// its label and its FIXED permission set. The user picks an option;
-/// they never tick permissions on the shared door.
-// SYNC: SharedAppChoice <-> crates/weft-dispatcher/src/api/access.rs SharedAppChoice, packages/weft-graph/src/webview/lib/components/project/AccessField.svelte SharedAppChoice
-#[derive(Serialize)]
-struct SharedAppChoice {
-    label: String,
-    covers: Vec<String>,
-}
-
-/// Which doors this weft can actually open for a service right now:
-/// one option per registered app for a consent service, a single
-/// runtime-credential option for a key service. The editor hides what
-/// is not offered; it never greys.
-#[derive(Serialize)]
-struct DoorsAnswer {
-    /// The registered apps, one shared-door option each (oauth
-    /// services only). Empty = the one-click door is hidden.
-    shared_apps: Vec<SharedAppChoice>,
-    /// Whether a runtime credential backs the shared door of a
-    /// non-oauth (key) service.
-    shared_credential: bool,
-}
 
 /// POST /v1/access/admin/doors: which shared-door options exist. Also
 /// where a typo'd `covers` entry surfaces loudly (the broker never

@@ -245,7 +245,7 @@ vs statement; locked to statement for `"assignment"` inputs).
   `ctx.node_type`, `ctx.node_label`, `ctx.color`, `ctx.frames`.
 
 `metadata.json` declares the surface (see `weft::NodeMetadata` for
-every field): `type`, `label`, `description`, `category`, `tags`, `icon`,
+every field): `type`, `label`, `description`, `tags`, `icon`,
 `color`, `inputs` (`{ name, type, required, exposure, widget, default,
 label, placeholder, description }`), `outputs` (`{ name, type, required,
 description }`), `requires_infra`, `images`, `features`, `validate`.
@@ -261,6 +261,75 @@ reqwest = { version = "0.12", features = ["json"] }
 
 A package (one `package.toml` root with member node subdirs) shares deps
 and helper files across members; a bare node dir stands alone.
+
+## Declaring custom types
+
+A `types` key in any `metadata.json` (a node's own, or the package
+root's shared partial) declares NAMED types the whole project may use:
+
+```json
+"types": {
+  "ChatHistory": "List[ChatMessage]",
+  "ChatMessage": "{ role: String, content: String | List[Part], name?: String }",
+  "Part": "{ type: String, text?: String, image_url?: { url: Image } }"
+}
+```
+
+The rules that matter when authoring:
+
+- Declarations are GLOBAL: once any metadata declares `ChatHistory`,
+  every node's ports (and every `.weft` inline signature) may name it.
+  Declare a type next to the node that owns the concept.
+- Named types are NOMINAL: only a same-named value wires in; the value
+  wires OUT into `JsonDict` freely. The user's escape hatch for a
+  hand-built dict is the stdlib `Cast` node, which validates at run
+  time, so your node can trust that a named input already fits its
+  declared structure.
+- Redeclaring an identical body elsewhere is absorbed silently (two
+  packages may ship the same shared type without depending on each
+  other); a DIFFERENT body under the same name fails the catalog load
+  loudly. Drift between two copies is therefore a build error, which is
+  the point.
+- Record validation is strict: declare every field the values really
+  carry, optional ones with `?`.
+
+### Media inside custom types
+
+A field declared `Image` / `Audio` / `Video` / `Blob` is a MEDIA SLOT:
+in stored form (what rides edges and the journal) it holds the small
+stored-file value, never bytes or URLs, so a large conversation stays
+cheap to journal and the editor can render it. Two storage verbs
+convert a WHOLE typed value at an external boundary, driven by the
+declared type (no per-node walking code, ever):
+
+```rust
+use weft::storage::media::{ExternalizePolicy, MediaForm};
+
+let ty = ctx.output_type("history").expect("declared on the port");
+let storage = ctx.storage(StorageScope::Project);
+
+// Out to a provider: each media slot becomes something the consumer
+// can use. `MediaForm::Url` is a PREFERENCE, not a promise: the slot
+// becomes a public link when an internet-reachable address is
+// configured (a publicly addressable bucket, or the relay under the
+// public base), and falls back to inline data: bytes when none is.
+// Declare `Inline` only for consumers that ONLY take base64 (e.g.
+// chat-API audio).
+let wire = storage.externalize(&value, &ty,
+    ExternalizePolicy { audio: MediaForm::Inline, ..ExternalizePolicy::urls() }).await?;
+
+// Back from a provider: raw media (a generated image's data: URL, an
+// external URL) is stored and every slot becomes a stored-file value
+// again; already-stored slots pass through untouched.
+let stored = storage.internalize(&response_value, &ty, None).await?;
+```
+
+Emit only the internalized form: presigned URLs expire and never
+belong in a stored value. The `catalog/ai` chat nodes
+(`ChatHistoryAppend`, `OpenRouterInference`) are the worked example:
+the `ChatHistory` type carries media through arbitrarily long
+conversations with one externalize per call and one internalize per
+reply.
 
 ## Sharing state across executions: process-global statics
 
@@ -293,6 +362,24 @@ never see it, so anything that must survive a restart or be visible
 across Pods belongs in the language's durable primitives (`ctx.run`,
 buses, storage), with the static as at most a warm cache in front. And
 hold locks only for map lookups, never across `.await`.
+
+The same pattern covers repeated STORAGE reads: a node that inlines the
+same stored bytes on every firing (an audio clip re-sent base64 to a
+provider each conversation turn) can keep a byte cache in a keyed
+static, exactly like the generator pool above, keyed by the file's
+storage key:
+
+```rust
+/// Process-shared bytes for a stored file. The provider needs the
+/// full base64 on every call anyway; this only saves re-reading the
+/// same bytes from the bucket while this worker lives.
+static BYTES: OnceLock<Mutex<HashMap<String, bytes::Bytes>>> = OnceLock::new();
+```
+
+Values themselves stay single-form (the stored-file reference is the
+one truth; the journal replays without any cache), so this is always a
+pure optimization a node adds when a real workload measures slow, never
+something the shape depends on.
 
 ## Cancellation
 
@@ -1460,8 +1547,8 @@ default (it is one node's identity); setting it at the package level is
 an error.
 
 Use it for whatever a package's nodes share: the `formFieldSpecs`
-vocabulary the `human` package's trigger and query both speak, a shared
-`category`, and any future shared key. A
+vocabulary the `human` package's trigger and query both speak, a
+shared `types` block, and any future shared key. A
 bare node has no package level; its own `metadata.json` is already the
 whole story.
 

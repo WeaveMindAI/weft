@@ -57,7 +57,7 @@ async fn assert_transcribed(
     // The session was MEASURED: the meter's frame tap priced the audio
     // actually sent (50s of it, a fraction of a cent) and booked one
     // resolved cost record on the expected credential.
-    settled.assert_measured("elevenlabs", origin).await?;
+    settled.assert_measured("elevenlabs", origin, 1).await?;
 
     project.finish().await?;
     conn.finish().await

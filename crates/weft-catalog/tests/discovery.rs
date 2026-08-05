@@ -13,7 +13,7 @@ fn write_node(dir: &Path, node_type: &str) {
     fs::write(
         dir.join("metadata.json"),
         format!(
-            r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "", "category": "Test", "inputs": [], "outputs": [] }}"#
+            r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "", "inputs": [], "outputs": [] }}"#
         ),
     )
     .unwrap();
@@ -241,7 +241,7 @@ fn symlinked_marker_does_not_define_a_unit() {
     let shared_meta = tmp.path().join("shared_metadata.json");
     fs::write(
         &shared_meta,
-        r#"{ "type": "Sneaky", "label": "Sneaky", "description": "", "category": "Test", "inputs": [], "outputs": [] }"#,
+        r#"{ "type": "Sneaky", "label": "Sneaky", "description": "", "inputs": [], "outputs": [] }"#,
     )
     .unwrap();
     let node = nodes.join("sneaky");
@@ -260,7 +260,7 @@ fn symlinked_marker_does_not_define_a_unit() {
 /// A `formFieldSpecs` metadata value with a single spec whose `field_type`
 /// is `tag` (so a test can tell WHICH definition site won the merge).
 fn specs_json(tag: &str) -> String {
-    format!(r#"[{{ "field_type": "{tag}", "label": "{tag}", "render": {{}} }}]"#)
+    format!(r#"[{{ "field_type": "{tag}", "label": "{tag}", "render": {{ "component": "text" }} }}]"#)
 }
 
 /// Package-level metadata defaults: a PARTIAL `metadata.json` at the package
@@ -289,7 +289,7 @@ fn package_metadata_defaults_merge_key_by_key_member_wins() {
     fs::write(
         overrides.join("metadata.json"),
         format!(
-            r#"{{ "type": "Overrides", "label": "o", "description": "", "category": "Test",
+            r#"{{ "type": "Overrides", "label": "o", "description": "",
                   "formFieldSpecs": {} }}"#,
             specs_json("member_spec")
         ),
@@ -303,7 +303,7 @@ fn package_metadata_defaults_merge_key_by_key_member_wins() {
     fs::write(
         bare.join("metadata.json"),
         format!(
-            r#"{{ "type": "Bare", "label": "b", "description": "", "category": "Test",
+            r#"{{ "type": "Bare", "label": "b", "description": "",
                   "formFieldSpecs": {} }}"#,
             specs_json("bare_spec")
         ),
@@ -340,4 +340,70 @@ fn package_metadata_defaults_refuse_identity_keys() {
         let err = FsCatalog::discover(&nodes).unwrap_err().to_string();
         assert!(err.contains(key), "the error names the offending key `{key}`: {err}");
     }
+}
+
+/// The `types` metadata key: declared at a package root, harvested
+/// into the catalog's registry BEFORE metadata parses, so member port
+/// types may use the declared names; a project-level declaration with
+/// a conflicting body fails loudly under Strict and warns under
+/// Lenient (builtin-only fallback).
+#[test]
+fn types_declarations_resolve_member_port_types() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("nodes");
+    let pkg = root.join("chat");
+    fs::create_dir_all(pkg.join("ask")).unwrap();
+    fs::write(pkg.join("package.toml"), "[package]\nname = \"chat\"\n").unwrap();
+    fs::write(
+        pkg.join("metadata.json"),
+        serde_json::json!({
+            "types": {
+                "ChatHistory": "List[ChatMessage]",
+                "ChatMessage": "{ role: String, content: String }",
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        pkg.join("ask").join("metadata.json"),
+        serde_json::json!({
+            "type": "Ask", "label": "Ask", "description": "d",
+            "inputs": [{ "name": "history", "type": "ChatHistory" }],
+            "outputs": [{ "name": "history", "type": "ChatHistory" }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(pkg.join("ask").join("mod.rs"), "// impl\n").unwrap();
+
+    let cat = FsCatalog::discover(&root).expect("declared types must resolve member metadata");
+    let ask = cat.entry("Ask").unwrap();
+    let input = &ask.metadata.inputs[0];
+    assert!(
+        matches!(&input.input_type, weft_core::weft_type::WeftType::Named { name, .. } if name == "ChatHistory"),
+        "port resolved to the declared nominal type, got {}",
+        input.input_type
+    );
+    // The registry is exposed for the compile pipeline.
+    assert_eq!(cat.type_registry().nominal_entries().len(), 2);
+
+    // A second declaration of the same name with a DIFFERENT body:
+    // Strict fails loudly, Lenient warns and falls back to builtin.
+    let clash = root.join("other");
+    fs::create_dir_all(&clash).unwrap();
+    fs::write(
+        clash.join("metadata.json"),
+        serde_json::json!({
+            "type": "Other", "label": "O", "description": "d",
+            "types": { "ChatMessage": "{ role: Number, content: String }" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(clash.join("mod.rs"), "// impl\n").unwrap();
+    let err = FsCatalog::discover(&root).unwrap_err();
+    assert!(err.to_string().contains("declared twice"), "{err}");
+    let lenient = FsCatalog::discover_with_policy(&root, DiscoverPolicy::Lenient).unwrap();
+    assert!(lenient.warnings().iter().any(|w| w.contains("declared twice")), "{:?}", lenient.warnings());
 }

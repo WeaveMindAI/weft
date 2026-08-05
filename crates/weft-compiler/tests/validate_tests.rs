@@ -1226,3 +1226,134 @@ out.data = cfg.config
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"config-type-mismatch"), "{:?}", d);
 }
+
+/// The checked-cast semantic (`features.castPorts`): the compiler holds
+/// the resolved (input, output) pair to the one weft-core conversion
+/// table, keyed on the metadata FEATURE (never a node-type name).
+#[test]
+fn cast_pair_is_checked_against_the_conversion_table() {
+    // Parse text into a number: allowed, no diagnostics.
+    let project = parse_enrich(
+        r#"
+src = Text { value: "42" }
+c = Cast() -> (value: Number)
+c.value = src.value
+out = Debug
+out.data = c.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "String -> Number cast must be clean: {:?}", errors(&d));
+
+    // A structured dict into a Number: nonsense, refused at compile time.
+    let project = parse_enrich(
+        r#"
+p = ExecPython() -> (out: JsonDict) {
+    code: "out = {}"
+}
+c = Cast() -> (value: Number)
+c.value = p.out
+out = Debug
+out.data = c.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"cast-not-allowed"),
+        "JsonDict -> Number must die at compile time: {:?}",
+        codes(&d)
+    );
+}
+
+/// The build/hash entry (`compile_enriched_with_diagnostics`) resolves
+/// catalog-declared type names on inline port signatures by itself: the
+/// registry activation lives in the shared compile front half, not in
+/// each public entry. Regression: this path once skipped the registry,
+/// so a custom type parsed fine in the editor but died at build time.
+#[test]
+fn build_entry_resolves_declared_types() {
+    let source = r#"
+src = Text { value: "{}" }
+c = Cast() -> (value: ChatMessage)
+c.value = src.value
+out = Debug
+out.data = c.value
+"#;
+    let result = weft_compiler::compile_enriched_with_diagnostics(
+        source,
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        &catalog(),
+    );
+    assert!(
+        result.is_ok(),
+        "ChatMessage (declared by the history package) must resolve on the build path: {:?}",
+        result.err()
+    );
+}
+
+/// A NESTED typevar port (`List[T]`) wired to a concrete list on both
+/// sides resolves cleanly, and a genuinely unwired one is refused by
+/// the unresolved-typevar diagnostic (the binder and the validator
+/// must agree on what "unresolved" means; a bare-`T`-only binder left
+/// nested vars unresolved forever, which the validator then rejected
+/// on a perfectly wired graph).
+#[test]
+fn nested_typevar_resolves_through_edges_or_fails_loud() {
+    let wired = r#"
+py = ExecPython(a: Number) -> (b: List[Number]) { code: "return {'b': [a]}", a: 1 }
+g = Group(items: List[T]) -> (out: List[T]) {
+    self.out = self.items
+}
+g.items = py.b
+sink = Debug
+sink.data = g.out
+"#;
+    let result = weft_compiler::compile_checked(
+        wired,
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        &catalog(),
+        weft_compiler::validate::ValidationMode::Structural,
+    );
+    assert!(result.is_ok(), "a wired List[T] must resolve: {:?}", result.err());
+
+    let unwired = r#"
+g = Group(items: List[T]) -> (out: List[T]) {
+    self.out = self.items
+}
+sink = Debug
+sink.data = g.out
+"#;
+    let err = weft_compiler::compile_checked(
+        unwired,
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        &catalog(),
+        weft_compiler::validate::ValidationMode::Structural,
+    )
+    .expect_err("an unwired List[T] port must be refused");
+    assert!(format!("{err:?}").contains("'List[T]' unresolved"), "{err:?}");
+}
+
+/// An un-overridden Cast output wired downstream still dies on the
+/// existing must-override-unmet rule (the cast check does not eat it).
+#[test]
+fn cast_without_declared_target_is_must_override_unmet() {
+    let project = parse_enrich(
+        r#"
+src = Text { value: "42" }
+c = Cast
+c.value = src.value
+out = Debug
+out.data = c.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"must-override-unmet"),
+        "un-overridden Cast output must be refused: {:?}",
+        codes(&d)
+    );
+}
+

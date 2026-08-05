@@ -23,6 +23,8 @@ use crate::error::{WeftError, WeftResult};
 /// dispatcher) both go through it, so the grammar lives next to the
 /// `StorageScope`/`StoredFile` contract it guards, in one dependency-free place.
 pub mod key;
+#[cfg(feature = "runtime")]
+pub mod media;
 
 /// Boxed byte stream used for streaming put/get. `'static` so it can
 /// cross the `ContextHandle` trait object; chunks are `Bytes` so
@@ -548,6 +550,15 @@ pub struct KeepRequest {
 pub struct PresignRequest {
     pub key: String,
     pub ttl_secs: Option<u64>,
+}
+
+/// `POST /v1/storage/public-link`: mint a temporary URL the OPEN
+/// INTERNET can fetch the file from. `url: None` = this deployment
+/// cannot serve one (private store, no public relay); the caller falls
+/// back to inline bytes. Same request shape as presign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicLinkResponse {
+    pub url: Option<String>,
 }
 
 // The broker's control-plane admin envelopes (the dispatcher's CLI-verb proxy:

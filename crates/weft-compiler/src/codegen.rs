@@ -90,7 +90,7 @@ pub fn emit(
     // crate, and the docker image hash stays cache-hit.
     write_package_crates(&crate_root, project_root, catalog, &packages)?;
     write_registry_rs(&src_dir, &packages)?;
-    write_main_rs(&src_dir)?;
+    write_main_rs(&src_dir, catalog)?;
 
     Ok(crate_root)
 }
@@ -777,8 +777,22 @@ fn ident_for_node_type(node_type: &str) -> String {
 
 // Each package crate is an EXTERNAL cargo dep (path = "./pkg_<name>"
 // in Cargo.toml), so the worker binary just uses them as crates and
-// main.rs needs no package knowledge (no `mod pkg_<name>;`).
-fn write_main_rs(src_dir: &Path) -> CompileResult<()> {
+// main.rs needs no package knowledge (no `mod pkg_<name>;`), but it
+// bakes the project's TYPE declarations: node metadata embedded by
+// `#[derive(NodeManifest)]` holds bare declared names (`ChatHistory`),
+// so the process-wide registry must be installed before any manifest
+// parse. The baked table is the catalog's resolved nominal entries.
+fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
+    let type_decls: String = catalog
+        .type_registry()
+        .nominal_entries()
+        .iter()
+        .map(|(name, body)| {
+            format!(
+                "        ({name:?}.to_string(), {body:?}.to_string(), \"baked\".to_string()),\n"
+            )
+        })
+        .collect();
     let contents = format!(
         r#"//! Project worker binary. Spawned by the dispatcher as part of
 //! a per-project pool. Claims `target=worker` tasks for its own
@@ -863,6 +877,16 @@ async fn main() -> anyhow::Result<()> {{
         .init();
 
     let args = Args::parse();
+
+    // The project's type declarations, baked at codegen time. Installed
+    // before anything parses node metadata (embedded metadata holds
+    // bare declared type names).
+    weft_core::weft_type::TypeRegistry::install(
+        weft_core::weft_type::TypeRegistry::build(&[
+{type_decls}    ])
+        .expect("baked type declarations were validated at build time"),
+    )
+    .expect("first registry install in this process");
 
     let token = TokenSource::new(std::path::PathBuf::from(&args.broker_token_path));
     let worker_pods = BrokerWorkerPodClient::new(args.broker_url.clone(), token.clone());

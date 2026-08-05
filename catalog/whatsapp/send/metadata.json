@@ -2,7 +2,6 @@
   "type": "WhatsAppSend",
   "label": "WhatsApp Send",
   "description": "Send a text message via the project's WhatsApp bridge. Wire `endpointUrl` from a WhatsAppBridge; set `to` to a jid (e.g. `1234567890@s.whatsapp.net`) and `message` to the text body.",
-  "category": "Communication",
   "tags": [
     "whatsapp",
     "send",

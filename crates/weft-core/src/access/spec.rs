@@ -29,6 +29,7 @@ use serde_json::Value;
 /// The recipe for one service's personal accesses: how a grant is
 /// acquired, how a request through it is authenticated, and how grants
 /// coexist across projects.
+// SYNC: AccessSpec <-> packages/weft-graph/src/protocol.ts AccessSpecWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessSpec {
@@ -103,10 +104,6 @@ pub struct AccessSpec {
     /// such hint is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub all_permissions_url: Option<String>,
-    /// Where the ticked permissions take effect for this service, which
-    /// decides where the editor renders the picker.
-    #[serde(default, skip_serializing_if = "PermissionTiming::is_none")]
-    pub permission_timing: PermissionTiming,
     /// What the connect-time check can actually learn about a fresh
     /// credential, and what running it costs. Decides whether the
     /// recorded permissions are VERIFIED (the provider stated them) or
@@ -114,11 +111,6 @@ pub struct AccessSpec {
     /// later shortfall fails.
     #[serde(default, skip_serializing_if = "Verification::is_default")]
     pub verification: Verification,
-    /// Service-specific wording for how to recover a dead connection,
-    /// appended to the reconnect error ("re-invite the bot, then
-    /// reconnect"). Absent = the generic reconnect message alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reconnect_action: Option<String>,
     /// How this service REPORTS events, when it does: named TOPICS,
     /// each a full recipe (fields, account, transports). A map
     /// because one provider genuinely reports along independent
@@ -264,31 +256,6 @@ pub struct Permission {
     /// Starts ticked on the picker.
     #[serde(default)]
     pub default: bool,
-}
-
-/// Where a service's permissions take effect; drives where the editor
-/// renders the picker.
-// SYNC: PermissionTiming <-> packages/weft-graph/src/protocol.ts PermissionTiming
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionTiming {
-    /// Baked into the minted/created app (Slack manifest class).
-    AtMint,
-    /// Configured on the app at the provider's site (GitHub App class).
-    AtApp,
-    /// Chosen on the consent screen (Google class).
-    AtApprove,
-    /// Both on the app and re-narrowed at consent.
-    Both,
-    /// The service has no permission concept (a plain key).
-    #[default]
-    None,
-}
-
-impl PermissionTiming {
-    fn is_none(&self) -> bool {
-        matches!(self, PermissionTiming::None)
-    }
 }
 
 /// What connect-time verification can learn, and what it costs.
@@ -446,6 +413,7 @@ pub enum GrantCoexistence {
 /// One pasted credential field on the connect form. Values go
 /// editor -> store directly and NEVER into node config (node config
 /// rides the journal in plaintext).
+// SYNC: CredentialField <-> packages/weft-graph/src/protocol.ts CredentialFieldWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialField {
@@ -473,6 +441,7 @@ fn default_true() -> bool {
 }
 
 /// How a grant's stored values are acquired.
+// SYNC: Acquisition <-> packages/weft-graph/src/protocol.ts AccessSpecWire.acquisition
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Acquisition {
@@ -1504,6 +1473,7 @@ impl AccessSpec {
     /// The guide's steps with `{permissions}` replaced by the ticked
     /// permissions' labels (comma-joined), generated per pick rather
     /// than written as a static blob. Empty when no guide is declared.
+    // SYNC: guide_steps <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts guideSteps
     pub fn guide_steps(&self, ticked: &[String]) -> Vec<String> {
         let Some(guide) = self.own_page.as_ref().and_then(|p| p.guide.as_ref()) else {
             return Vec::new();
@@ -1630,7 +1600,6 @@ mod tests {
                 { "id": "files:write", "label": "Upload files",
                   "description": "Upload files into channels." }
             ],
-            "permission_timing": "at_mint",
             "all_permissions_url": "https://docs.slack.dev/reference/scopes",
             "verification": { "rung": "reports_permissions", "cost": "free" },
             "own_page": {

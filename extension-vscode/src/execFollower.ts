@@ -25,7 +25,7 @@ import type {
   LoopIteration,
   LoopTerminationReason,
   NodeExecEvent,
-} from './shared/protocol';
+} from '../../packages/weft-graph/src/protocol';
 
 // SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 export type DispatcherEvent =
@@ -258,12 +258,16 @@ export class ExecutionFollower implements vscode.Disposable {
         break;
       }
       case 'node_resumed': {
-        // A resume is rendered as a plain re-dispatch (the row returns
-        // to `running`). The delivered value shows up in the execution
-        // replay itself, so the event carries no resume payload.
+        // A resume is rendered as a re-dispatch (the row returns to
+        // `running`), flagged `resumed` so the reducer keeps the
+        // firing's accumulated per-attempt state (port warnings)
+        // instead of resetting it like a fresh start. The delivered
+        // value shows up in the execution replay itself, so the event
+        // carries no resume payload.
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
           state: 'running',
+          resumed: true,
           frames: e.frames,
         };
         this.post({ kind: 'execEvent', event: execEvent });

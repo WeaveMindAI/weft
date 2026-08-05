@@ -2,7 +2,6 @@
   "type": "ApiEndpoint",
   "label": "API Endpoint",
   "description": "Turn this program into a live HTTP endpoint. An outside caller makes a request at the project's gateway URL; the request is held open and any node downstream replies once or streams a response back via the caller handle. Fires a fresh execution per request.",
-  "category": "Triggers",
   "tags": [
     "live",
     "http",

@@ -2,7 +2,6 @@
   "type": "Cron",
   "label": "Cron Schedule",
   "description": "Fire on a schedule. Standard cron expression in the `cron` field.",
-  "category": "Triggers",
   "tags": [
     "cron",
     "schedule",

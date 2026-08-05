@@ -2,7 +2,6 @@
   "type": "KeepFile",
   "label": "Keep File",
   "description": "Mark a stored execution file to survive the end-of-run sweep, then pass the reference through unchanged. Put this at the end of a pipeline so only the file(s) you actually want survive; everything left un-kept is swept when the run ends. No effect on project/shared files (those are persistent already).",
-  "category": "Storage",
   "tags": [
     "storage",
     "keep",

@@ -14,6 +14,7 @@ export const PORT_TYPE_COLORS: Record<string, string> = {
 	TypeVar: '#6366f1',  // Indigo
 	MustOverride: '#ef4444', // Red (needs attention)
 	Bus: '#d97706',      // Amber-600 (live-channel signal)
+	Access: '#0d9488',   // Teal-600 (credential grant)
 };
 
 const FALLBACK_COLOR = '#52525b'; // Dark gray
@@ -37,9 +38,14 @@ function colorForParsed(t: WeftType): string {
 		case 'dict': return PORT_TYPE_COLORS.Dict;
 		case 'json_dict': return PORT_TYPE_COLORS.Dict;
 		case 'union': return colorForParsed(t.types[0]);
+		// A record colors like the generic object types; a named type
+		// colors as its body, so e.g. a media-bodied name reads as media.
+		case 'record': return PORT_TYPE_COLORS.Dict;
+		case 'named': return colorForParsed(t.body);
 		case 'typevar': return PORT_TYPE_COLORS.TypeVar;
 		case 'must_override': return PORT_TYPE_COLORS.MustOverride;
 		case 'bus': return PORT_TYPE_COLORS.Bus;
+		case 'access': return PORT_TYPE_COLORS.Access;
 	}
 }
 

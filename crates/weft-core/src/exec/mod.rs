@@ -9,7 +9,6 @@ pub mod ready;
 pub mod postprocess;
 pub mod skip;
 pub mod completion;
-pub mod typecheck;
 
 pub use execution::{NodeExecution, NodeExecutionStatus, NodeExecutionTable, PortWarning};
 pub use emission::PulseEmission;

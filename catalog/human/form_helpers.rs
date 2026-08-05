@@ -82,13 +82,13 @@ pub fn build_form_fields(
                 .unwrap_or_else(|| Value::Object(Map::new()));
 
             // Resolve render: explicit on the source field wins,
-            // otherwise inherit the spec's default. The wire shape
-            // is opaque JSON the consumer interprets via
-            // `render.component`.
-            let render = raw
-                .get("render")
-                .cloned()
-                .unwrap_or_else(|| spec.render.clone());
+            // otherwise inherit the spec's default (a typed
+            // FormFieldRender on the metadata side, serialized to the
+            // form's wire JSON here). The wire shape is opaque JSON the
+            // consumer interprets via `render.component`.
+            let render = raw.get("render").cloned().unwrap_or_else(|| {
+                serde_json::to_value(&spec.render).expect("FormFieldRender serializes")
+            });
 
             // Pre-fill `value` for fields whose render needs an
             // upstream input port: display + image inherently

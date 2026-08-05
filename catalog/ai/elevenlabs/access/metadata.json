@@ -2,7 +2,6 @@
   "type": "ElevenLabsAccess",
   "label": "ElevenLabs Access",
   "description": "Connect ElevenLabs for the project's audio AI calls: pick the built-in connection, or bring your own ElevenLabs API key. Wire the access output into every ElevenLabs node; one connection, picked once, however many calls consume it.",
-  "category": "AI",
   "tags": [
     "ai",
     "audio",

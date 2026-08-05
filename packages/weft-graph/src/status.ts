@@ -64,6 +64,14 @@ const VALID_STATUSES = [
 // SYNC: VALID_TRANSITIONS <-> crates/weft-dispatcher/src/project_store.rs ProjectTransition, packages/weft-graph/src/protocol.ts ProjectTransition, crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.transition
 const VALID_TRANSITIONS: ProjectTransition[] = ['none', 'building', 'cancelling_build'];
 
+/// Collapse a raw transition string to the enum, resting on 'none' for
+/// an unknown value (a version-skewed dispatcher shouldn't brick the
+/// bar). Shared by the status parse and the SSE transition event.
+export function parseTransition(raw: unknown): ProjectTransition {
+  const s = String(raw ?? 'none');
+  return VALID_TRANSITIONS.includes(s as ProjectTransition) ? (s as ProjectTransition) : 'none';
+}
+
 /// The honest snapshot for a project the dispatcher doesn't know yet
 /// (first graph open, post-wipe): empty verb list (starter verbs light
 /// from graph shape), everything at rest. Hosts return this instead of
@@ -96,12 +104,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
   const projectStatus = (VALID_STATUSES as readonly string[]).includes(statusStr)
     ? (statusStr as ActionAvailability['projectStatus'])
     : 'unknown';
-  const transitionStr = String(raw.transition ?? 'none');
-  const transition: ProjectTransition = VALID_TRANSITIONS.includes(
-    transitionStr as ProjectTransition,
-  )
-    ? (transitionStr as ProjectTransition)
-    : 'none';
+  const transition = parseTransition(raw.transition);
   const rollupStr = String(raw.infra_rollup ?? 'none');
   const infraRollup = (VALID_ROLLUPS as readonly string[]).includes(rollupStr)
     ? (rollupStr as ActionAvailability['infraRollup'])

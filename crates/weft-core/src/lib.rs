@@ -25,7 +25,10 @@ pub mod primitive;
 pub mod project;
 pub mod pulse;
 pub mod running_policy;
-#[cfg(feature = "runtime")]
+// The predicate submodule is wire-pure and always available (the
+// `SignalSpec` wire type in `primitive` carries `Vec<Predicate>`); the
+// rest of the module (kind registry, typed kinds) is runtime-only and
+// gated inside the module.
 pub mod signal;
 #[cfg(feature = "runtime")]
 pub mod signed_token;

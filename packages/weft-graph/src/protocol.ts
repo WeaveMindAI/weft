@@ -108,10 +108,10 @@ export function typeReferencesFile(type: string): boolean {
 export type FileContent = { content: string } | { error: string } | { loading: true };
 
 // SYNC: NodeFeaturesWire <-> crates/weft-core/src/node.rs NodeFeatures
-// A field that appears in one side but not the other will silently
-// round-trip as undefined (Rust serde drops unknown metadata fields;
-// JS reads missing fields as undefined). See the sync comment
-// over NodeFeatures in node.rs for the full checklist.
+// This mirrors ONLY the features the editor reads. Backend-only
+// features (cast ports, output defaults, hidden filtering, ...) stay
+// out: an unread field in a wire type advertises UI behavior that does
+// not exist. The wire may still carry them (JS ignores unknown keys).
 export interface NodeFeaturesWire {
   oneOfRequired?: string[][];
   canAddInputPorts?: boolean;
@@ -123,12 +123,10 @@ export interface NodeFeaturesWire {
   showImagePreview?: boolean;
   // SYNC: showDownloadLink <-> crates/weft-core/src/node.rs NodeFeatures.show_download_link
   showDownloadLink?: boolean;
-  isOutputDefault?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
   /// so the panel doesn't show a broken eye.
   liveEndpoint?: string;
-  hidden?: boolean;
 }
 
 export interface NodeDefinition {
@@ -184,6 +182,10 @@ export interface GroupDefinition {
   /// Loop config fields (parallel/over/carry/max_iters/trim_on_mismatch).
   /// Always present when `kind === 'loop'`, never for `group`.
   loopConfig?: Record<string, unknown> | null;
+  /// Always null today: no group-like decl carries a user label in the
+  /// language; the editor derives the display name from the id's local
+  /// segment. The slot exists so a future label syntax needs no wire
+  /// change.
   label: string | null;
   inPorts: PortDefinition[];
   outPorts: PortDefinition[];
@@ -211,33 +213,23 @@ export interface ProjectDefinition {
 
 export type Severity = 'error' | 'warning' | 'info' | 'hint';
 
+// SYNC: Diagnostic <-> crates/weft-core/src/node.rs Diagnostic
 export interface Diagnostic {
   // 1-based start line, 0-based start char column.
   line: number;
   column: number;
-  // End of the culprit's range (1-based line, 0-based char column, exclusive).
-  // Optional for back-compat with older payloads; absent => a 1-char caret.
-  endLine?: number;
-  endColumn?: number;
+  // End of the culprit's range (1-based line, 0-based char column,
+  // exclusive). Always present (Rust serializes 0 when the producer
+  // only knew a point); endLine 0 renders as a 1-char caret.
+  endLine: number;
+  endColumn: number;
   severity: Severity;
   message: string;
   code?: string;
 }
 
-export type WidgetKind =
-  | 'text'
-  | 'textarea'
-  | 'code'
-  | 'select'
-  | 'multiselect'
-  | 'number'
-  | 'checkbox'
-  | 'password'
-  // SYNC: WidgetKind 'file_drop' <-> crates/weft-core/src/node.rs Widget::FileDrop
-  | 'file_drop'
-  | 'access'
-  | 'remote_select'
-  | 'form_builder';
+/// Derived from the Widget union below (never a second hand-kept list).
+export type WidgetKind = Widget['kind'];
 
 // One way a `remote_select` field can be filled, in preference order;
 // the editor uses the richest source the chosen connection supports
@@ -281,36 +273,36 @@ export interface PageSpec {
 // carry, one per Rust variant payload. No index signature: the Rust
 // side rejects unknown keys, so a key that is not listed here cannot
 // survive a metadata load and must not typecheck.
+// A DISCRIMINATED union mirroring the Rust tagged enum, one member per
+// variant with only its own payload: an options-less select or a
+// sources-less remote_select cannot typecheck (Rust already refuses
+// them at metadata load), and adding a Rust variant without a member
+// here breaks every exhaustive switch instead of shipping unhandled.
 // SYNC: Widget <-> crates/weft-core/src/node.rs Widget
-export interface Widget {
-  kind: WidgetKind | string;
-  /// code: syntax highlighting language ("python", "javascript", ...).
-  language?: string;
-  /// select, multiselect
-  options?: string[];
-  /// file_drop: narrows the filter derived from `type`.
-  accept?: string;
-  /// file_drop: the declared weft file type (Image/Audio/Video/Blob/File).
+export type Widget =
+  | { kind: 'text' }
+  | { kind: 'textarea' }
+  /// Syntax highlighting language ("python", "javascript", ...).
+  | { kind: 'code'; language: string }
+  /// `step` is the input's granularity (arrow/slider increment).
+  | { kind: 'number'; min?: number | null; max?: number | null; step?: number | null }
+  | { kind: 'checkbox' }
+  | { kind: 'select'; options: string[] }
+  | { kind: 'multiselect'; options: string[] }
+  | { kind: 'password' }
+  /// The connection picker; `service` is compiler-stamped from the
+  /// node metadata's `service.service`.
+  | { kind: 'access'; service?: string | null }
+  /// Pick a resource on the connected service. `access` names this
+  /// node's Access input; `sources` are the fill ways in preference
+  /// order; `depends_on` are parent inputs for drill-down.
+  | { kind: 'remote_select'; access: string; sources: ResourceSource[]; depends_on?: string[] }
+  | { kind: 'form_builder' }
+  /// Editor file picker. `type` is the declared weft file type
+  /// (Image/Audio/Video/Blob/File); `accept` optionally narrows the
+  /// derived filter.
   // SYNC: Widget.type <-> crates/weft-core/src/node.rs Widget::FileDrop file_type
-  type?: string;
-  /// access: the service this connect control signs into
-  /// (compiler-stamped from the node metadata's `service.service`).
-  service?: string | null;
-  /// remote_select: the name of this node's Access input that
-  /// authenticates the sources needing one.
-  access?: string;
-  /// remote_select: the ways this field can be filled, in preference
-  /// order.
-  sources?: ResourceSource[];
-  /// remote_select: parent inputs for drill-down.
-  depends_on?: string[];
-  /// number
-  min?: number;
-  /// number
-  max?: number;
-  /// number: the input's granularity (arrow/slider increment).
-  step?: number;
-}
+  | { kind: 'file_drop'; accept?: string | null; type: string };
 
 // One declared INPUT of a node type, as authored in metadata.json and
 // RESOLVED by the CLI before it ships (exposure + widget always filled
@@ -346,22 +338,12 @@ export interface OutputSpec {
   description?: string;
 }
 
-export type NodeCategory =
-  | 'Triggers'
-  | 'AI'
-  | 'Data'
-  | 'Flow'
-  | 'Utility'
-  | 'Debug'
-  | 'Infrastructure';
-
 // SYNC: CatalogEntry/InputSpec/Widget/OutputSpec <-> crates/weft-core/src/node.rs
 //       NodeMetadata (the `weft describe-nodes` serialization these mirror)
 export interface CatalogEntry {
   type: string;
   label: string;
   description: string;
-  category: NodeCategory | string;
   tags: string[];
   icon?: string;
   color?: string;
@@ -430,10 +412,6 @@ export interface Permission {
   default?: boolean;
 }
 
-/** Where a service's permissions take effect. */
-// SYNC: PermissionTiming <-> crates/weft-core/src/access/spec.rs PermissionTiming
-export type PermissionTiming = 'at_mint' | 'at_app' | 'at_approve' | 'both' | 'none';
-
 // SYNC: VerificationRung <-> crates/weft-core/src/access/spec.rs VerificationRung
 export type VerificationRung =
   | 'reports_permissions'
@@ -472,11 +450,10 @@ export interface AccessSpecWire {
    *  picker's "missing one? add it to this node's metadata" hint.
    *  Absent = the catalogue is the complete set, no hint. */
   all_permissions_url?: string;
-  permission_timing?: PermissionTiming;
   verification?: { rung?: VerificationRung; cost?: VerificationCost };
-  reconnect_action?: string;
   acquisition: {
-    kind: 'static' | 'oauth2' | 'mint_jwt';
+    // SYNC: kind <-> crates/weft-core/src/access/spec.rs Acquisition
+    kind: 'static' | 'oauth2' | 'runtime' | 'mint_jwt';
     fields?: CredentialFieldWire[];
     registration_fields?: CredentialFieldWire[];
     grant?: { kind: 'authorization_code' | 'client_credentials'; [key: string]: unknown };
@@ -528,6 +505,7 @@ export const ACCESS_MARKER_KEY = '__weft_access__';
 /** Render hint for one form field. Opaque to the host; the
  *  consumer (browser extension, dashboard) reads `component` to
  *  pick a UI primitive. */
+// SYNC: FormFieldRenderWire <-> crates/weft-core/src/node.rs FormFieldRender
 export interface FormFieldRenderWire {
   component: string;
   source?: 'static' | 'input';
@@ -600,6 +578,12 @@ export type CredentialOwner = 'their-own' | 'ours';
 export interface NodeExecEvent {
   nodeId: string;
   state: NodeExecutionStatus;
+  /// This `running` transition is a RESUME of the same firing (a
+  /// crash re-dispatch or a suspension waking), not a fresh attempt.
+  /// Per-firing state accumulated before the resume (port warnings)
+  /// belongs to this attempt and must survive it; only a fresh firing
+  /// resets it.
+  resumed?: boolean;
   /// Frame stack: empty when the firing is not inside any loop;
   /// `[{index:2}]` when inside iteration 2 of a single loop; nested
   /// loops extend the array. Used as part of the execution-card key so

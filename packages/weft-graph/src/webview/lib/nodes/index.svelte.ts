@@ -11,7 +11,7 @@
  * `$derived` reads on first render see a populated registry.
  */
 
-import type { NodeTemplate, NodeCategory, PortDefinition } from '../types';
+import type { NodeTemplate, PortDefinition } from '../types';
 import type { CatalogEntry, InputSpec, OutputSpec } from '../../../protocol';
 import type { Component } from 'svelte';
 import {
@@ -86,7 +86,7 @@ import {
 	Zap,
 } from '@lucide/svelte';
 
-export type { NodeTemplate, NodeCategory } from '../types';
+export type { NodeTemplate } from '../types';
 
 // Dispatcher icon-name → Lucide Svelte component. Names match the
 // entries Rust-side metadata.json files use. Unknown names fall
@@ -185,28 +185,20 @@ function resolveIcon(name: string | undefined): Component {
 // template carries them verbatim; the editor derives nothing.
 
 /// Wire input (`{ name, type, exposure, widget, ... }`) -> render port.
-function flattenInput(i: InputSpec): PortDefinition {
-	return {
-		name: i.name,
-		portType: i.type,
-		required: i.required ?? false,
-		...(i.exposure !== undefined ? { exposure: i.exposure } : {}),
-		...(i.widget !== undefined ? { widget: i.widget } : {}),
-		...(i.default !== undefined ? { default: i.default } : {}),
-		...(i.label !== undefined ? { label: i.label } : {}),
-		...(i.placeholder !== undefined ? { placeholder: i.placeholder } : {}),
-		...(i.description !== undefined ? { description: i.description } : {}),
-	};
+/// A generic spread: ONLY the `type` -> `portType` rename and the
+/// `required` default are applied; every other wire field rides through
+/// untouched, so adding a field to `InputSpec` propagates with no
+/// second edit site. (A past hand-written field-by-field copy silently
+/// dropped `requiresScopes`/`requiresValues`, killing the permission
+/// shortfall check on freshly-added nodes.)
+function toInputPort({ type, required, ...rest }: InputSpec): PortDefinition {
+	return { ...rest, portType: type, required: required ?? false };
 }
 
-/// Wire output (`{ name, type, ... }`) -> render port.
-function flattenOutput(p: OutputSpec): PortDefinition {
-	return {
-		name: p.name,
-		portType: p.type,
-		required: p.required ?? false,
-		...(p.description !== undefined ? { description: p.description } : {}),
-	};
+/// Wire output (`{ name, type, ... }`) -> render port. Same generic
+/// spread discipline as `toInputPort`.
+function toOutputPort({ type, required, ...rest }: OutputSpec): PortDefinition {
+	return { ...rest, portType: type, required: required ?? false };
 }
 
 function toTemplate(entry: CatalogEntry): NodeTemplate {
@@ -216,7 +208,6 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		description: entry.description,
 		icon: resolveIcon(entry.icon),
 		color: entry.color ?? '#71717a',
-		category: entry.category as NodeCategory,
 		// Empty-array default keeps the command palette's
 		// `tags.some(...)` call safe for nodes that declare no tags.
 		tags: entry.tags ?? [],
@@ -226,8 +217,8 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		// infra-backed. Without it the subgraph "eye" finds no
 		// seeds and shows an empty subgraph.
 		requiresInfra: entry.requires_infra ?? false,
-		defaultInputs: (entry.inputs ?? []).map(flattenInput),
-		defaultOutputs: (entry.outputs ?? []).map(flattenOutput),
+		defaultInputs: (entry.inputs ?? []).map(toInputPort),
+		defaultOutputs: (entry.outputs ?? []).map(toOutputPort),
 		features: entry.features,
 		// `weft describe-nodes` ships the field-type vocabulary inline
 		// for nodes whose features.hasFormSchema is true; the
@@ -303,7 +294,6 @@ function registerBuiltins(): void {
 			description: 'Wrap a subgraph. Interface ports flow in and out; children share a scope.',
 			icon: resolveIcon('GitFork'),
 			color: '#71717a',
-			category: 'Flow' as NodeCategory,
 			tags: ['group', 'container', 'scope'],
 			requiresInfra: false,
 			defaultInputs: [],
@@ -318,7 +308,6 @@ function registerBuiltins(): void {
 			description: 'Iterate over lists, fold via carry ports, or drive by self.done. Body sees one element per iteration. Pick port roles via right-click on each port.',
 			icon: resolveIcon('Repeat'),
 			color: '#8b5cf6',
-			category: 'Flow' as NodeCategory,
 			tags: ['loop', 'iterate', 'container', 'scope'],
 			requiresInfra: false,
 			// The loop-config knobs (parallel / max_iters / trim_on_mismatch)

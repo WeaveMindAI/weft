@@ -56,8 +56,17 @@
 	/// One registered app the shared door offers as its own option:
 	/// its label and its FIXED permission set. The user picks an
 	/// option; they never tick permissions on the shared door.
-	// SYNC: SharedAppChoice <-> crates/weft-broker/src/access_admin.rs SharedAppChoice, crates/weft-dispatcher/src/api/access.rs SharedAppChoice
+	// SYNC: SharedAppChoice <-> crates/weft-access-store/src/lib.rs SharedAppChoice
 	type SharedAppChoice = { label: string; covers: string[] };
+	/// The doors probe's answer: the shared-door options (DoorsAnswer,
+	/// flattened) plus the consent surface facts.
+	// SYNC: DoorsStatus <-> crates/weft-dispatcher/src/api/access.rs DoorsStatus, crates/weft-access-store/src/lib.rs DoorsAnswer (its flattened core)
+	type DoorsStatus = {
+		shared_apps: SharedAppChoice[];
+		shared_credential: boolean;
+		redirect_uri: string | null;
+		consent_blocked?: string;
+	};
 	/// The shared-door options actually backed right now; a door with
 	/// nothing behind it is HIDDEN.
 	let sharedApps = $state<SharedAppChoice[]>([]);
@@ -103,12 +112,7 @@
 		busy = true;
 		try {
 			connections = await grantsForService(spec.service);
-			const doors = await accessCall<{
-				shared_apps: SharedAppChoice[];
-				shared_credential: boolean;
-				redirect_uri: string | null;
-				consent_blocked?: string;
-			}>('POST', 'doors', { spec });
+			const doors = await accessCall<DoorsStatus>('POST', 'doors', { spec });
 			sharedApps = doors.shared_apps;
 			sharedCredential = doors.shared_credential;
 			redirectUri = doors.redirect_uri ?? '';
@@ -421,7 +425,7 @@
 							>x</button>
 						{/if}
 					</div>
-					{#if exclusive && hasPermissions}
+					{#if exclusive && hasPermissions && isConsent}
 						<div class="flex justify-end">
 							<button
 								type="button"
@@ -569,9 +573,20 @@
 						bind:value={ownName}
 					/>
 				</div>
+				{#if (spec.capabilities ?? []).length > 0}
+					<!-- The stand-or-fall groups the store enforces
+					     (capability_shortfall): show the rule up front
+					     instead of teaching it by refusal. -->
+					<div class="text-[10px] text-amber-600">
+						Fill the fields of at least one of: {(spec.capabilities ?? []).map((c) => c.label).join(', ')}.
+					</div>
+				{/if}
 				{#each ownFields(spec) as f (f.name)}
+					{@const group = (spec.capabilities ?? []).find((c) => c.fields.includes(f.name))}
 					<div class="space-y-0.5">
-						<label class="text-[10px] text-muted-foreground" for={`acc-${spec.service}-${f.name}`}>{f.label ?? f.name}</label>
+						<label class="text-[10px] text-muted-foreground" for={`acc-${spec.service}-${f.name}`}>
+							{f.label ?? f.name}{#if group}<span class="text-muted-foreground/60"> ({group.label})</span>{/if}
+						</label>
 						<input
 							id={`acc-${spec.service}-${f.name}`}
 							type={(f.secret ?? true) ? 'password' : 'text'}
@@ -597,37 +612,39 @@
 							onclick={(e) => connectConsent(e, 'own')}
 						>Sign in with {label}</button>
 					{/if}
-					{#if spec.own_page?.paste}
-						<!-- The ready-credential alternative: no app, no
-						     consent; one paste, same list row at the end. -->
-						<div class="text-[10px] text-muted-foreground pt-1 border-t border-muted">
-							Or paste a credential you already made:
-						</div>
-						{#each spec.own_page.paste.fields as f (f.name)}
-							<div class="space-y-0.5">
-								<label class="text-[10px] text-muted-foreground" for={`acc-${spec.service}-paste-${f.name}`}>{f.label ?? f.name}</label>
-								<input
-									id={`acc-${spec.service}-paste-${f.name}`}
-									type={(f.secret ?? true) ? 'password' : 'text'}
-									class="w-full text-xs bg-muted px-2 py-1 rounded border-none outline-none font-mono"
-									placeholder={f.placeholder}
-									bind:value={pasteValues[f.name]}
-								/>
-							</div>
-						{/each}
-						<button
-							type="button"
-							class="w-full text-[10px] px-3 py-1.5 rounded font-medium bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50"
-							disabled={busy}
-							onclick={(e) => connectDirect(e, 'own', true)}
-						>Connect</button>
-					{/if}
 				{:else}
 					<button
 						type="button"
 						class="w-full text-[10px] px-3 py-1.5 rounded font-medium bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50"
 						disabled={busy}
 						onclick={(e) => connectDirect(e, 'own')}
+					>Connect</button>
+				{/if}
+				{#if spec.own_page?.paste}
+					<!-- The ready-credential alternative: no app, no
+					     consent; one paste, same list row at the end.
+					     Drawn for EVERY sign-in kind that declares a
+					     paste recipe, not only the browser-consent one. -->
+					<div class="text-[10px] text-muted-foreground pt-1 border-t border-muted">
+						Or paste a credential you already made:
+					</div>
+					{#each spec.own_page.paste.fields as f (f.name)}
+						<div class="space-y-0.5">
+							<label class="text-[10px] text-muted-foreground" for={`acc-${spec.service}-paste-${f.name}`}>{f.label ?? f.name}</label>
+							<input
+								id={`acc-${spec.service}-paste-${f.name}`}
+								type={(f.secret ?? true) ? 'password' : 'text'}
+								class="w-full text-xs bg-muted px-2 py-1 rounded border-none outline-none font-mono"
+								placeholder={f.placeholder}
+								bind:value={pasteValues[f.name]}
+							/>
+						</div>
+					{/each}
+					<button
+						type="button"
+						class="w-full text-[10px] px-3 py-1.5 rounded font-medium bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50"
+						disabled={busy}
+						onclick={(e) => connectDirect(e, 'own', true)}
 					>Connect</button>
 				{/if}
 				<button type="button" class="text-[10px] text-muted-foreground hover:text-foreground" onclick={(e) => { e.stopPropagation(); surface = 'list'; }}>Back</button>

@@ -10,6 +10,15 @@
 //! response is JSON-repaired and its top-level keys fan onto matching
 //! declared output ports.
 //!
+//! CONVERSATIONS ride the `history` input/output (`ChatHistory`, the
+//! typed minillmlib-shaped value whose media slots hold stored files):
+//! the prompt (plus any `media` attachments) is appended as the newest
+//! user message, the whole conversation is externalized at this call
+//! boundary (images and video as fresh presigned URLs, audio inlined
+//! as base64: the audio wire takes no URLs) and deserialized straight
+//! into minillmlib messages, and the reply is internalized back so the
+//! emitted history again holds only stored references.
+//!
 //! The paid-call surface is two steps: open the connection
 //! (`ctx.open`, one resolve, one lease for THIS firing), make the call
 //! on its client. The runtime routes the call and measures what it
@@ -19,14 +28,18 @@
 
 use async_trait::async_trait;
 use minillmlib::{
-    ChatNode, CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings,
-    ReasoningConfig,
+    ChatNode, CompletionParameters, GeneratorInfo, Message, NodeCompletionParameters,
+    ProviderSettings, ReasoningConfig,
 };
 
 use serde_json::Value;
 
 use weft::node::NodeOutput;
+use weft::storage::media::{ExternalizePolicy, MediaForm};
+use weft::storage::StorageScope;
 use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+
+use super::chat;
 
 #[derive(NodeManifest)]
 pub struct OpenRouterInferenceNode;
@@ -89,14 +102,60 @@ impl Node for OpenRouterInferenceNode {
             .with_app_attribution("https://weavemind.ai", "WeaveMind")
             .with_http_client(conn.client().clone());
 
-        let root = ChatNode::root(system_prompt);
-        let user = root.add_user(prompt);
+        // The conversation in STORED form: the wired history (or a
+        // fresh one) plus this call's user message (prompt + media,
+        // media slots holding the stored-file values verbatim).
+        let history_ty = ctx
+            .output_type("history")
+            .ok_or_else(|| weft::node_error("the history output declares no type"))?;
+        let mut stored: Vec<Value> = ctx.inputs.opt("history")?.unwrap_or_default();
+        // The system prompt SEEDS the conversation as its first message
+        // and rides the emitted history from then on (the lib treats a
+        // role-system message in the list as first-class). A history
+        // already opening with a system message is the truth and the
+        // config never re-inserts (silently overriding it would make
+        // the sent conversation disagree with the emitted one);
+        // switching instructions mid-chain is an explicit act (append a
+        // system message via ChatHistoryAppend). A wired history built
+        // WITHOUT one still gets the seed, so a configured prompt is
+        // never silently dropped.
+        let opens_with_system =
+            stored.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system");
+        if !opens_with_system && !system_prompt.is_empty() {
+            stored.insert(0, chat::stored_message("system", &system_prompt, &[])?);
+        }
+        let media = chat::media_items(ctx.inputs.opt("media")?);
+        stored.push(chat::stored_message("user", &prompt, &media)?);
+
+        // The WIRE form: media slots become material the provider
+        // consumes (images/video as fresh presigned URLs, audio inline:
+        // the audio wire takes no URLs), and the result deserializes
+        // straight into minillmlib messages because the shapes are
+        // identical apart from the media slots.
+        let storage = ctx.storage(StorageScope::Project);
+        let wire = storage
+            .externalize(
+                &Value::Array(stored.clone()),
+                &history_ty,
+                // Links preferred where the provider takes them (image /
+                // video: the provider fetches the bytes itself, nothing
+                // is downloaded or inflated here); the runtime hands out
+                // a link only when the deployment can serve one the open
+                // internet can fetch, and inlines the bytes otherwise.
+                // Audio is inline always: the chat API only takes base64.
+                ExternalizePolicy { audio: MediaForm::Inline, ..ExternalizePolicy::urls() },
+            )
+            .await?;
+        let messages: Vec<Message> =
+            serde_json::from_value(wire).node_err("chat history does not fit minillmlib messages")?;
+        let (_root, leaf) =
+            ChatNode::from_messages(&messages).node_err("building the conversation")?;
         let params = NodeCompletionParameters::new().with_params(cp);
 
         // Stream so a Stop lands mid-generation instead of after it; on
         // cancel, dropping the stream is all the wrap-up there is (the
         // metered client resolves the interrupted call's cost on its own).
-        let stream = user
+        let stream = leaf
             .complete_streaming(&generator, Some(&params))
             .await
             .node_err("openrouter")?;
@@ -112,6 +171,18 @@ impl Node for OpenRouterInferenceNode {
                  response)"
             );
         }
+
+        // The conversation INCLUDING the reply, back in stored form:
+        // internalize brings any raw reply media (a generated image's
+        // data URL) into storage as references; everything already
+        // stored passes through untouched.
+        let assistant = serde_json::to_value(response.to_assistant_message())
+            .node_err("serializing the assistant message")?;
+        stored.push(assistant);
+        let stored_history = storage
+            .internalize(&Value::Array(stored), &history_ty, None)
+            .await?;
+
         let text = response.content;
 
         // parseJson: repair the reply with the lib's JSON repairer (the
@@ -126,7 +197,8 @@ impl Node for OpenRouterInferenceNode {
             Value::String(text)
         };
         let output = if parse_json { ctx.fan_declared(&response_value) } else { NodeOutput::new() }
-            .set("response", response_value);
+            .set("response", response_value)
+            .set("history", stored_history);
         ctx.pulse_downstream(output).await
     }
 }

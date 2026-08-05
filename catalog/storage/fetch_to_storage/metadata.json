@@ -2,7 +2,6 @@
   "type": "FetchToStorage",
   "label": "Fetch to Storage",
   "description": "Download a file from a URL straight into execution storage and emit a file reference. The bytes stream directly into storage (never buffered whole), so it handles large files. Wire `file` into ImageDisplay, DownloadLink, KeepFile, or any node that takes a stored file.",
-  "category": "Storage",
   "tags": [
     "storage",
     "fetch",

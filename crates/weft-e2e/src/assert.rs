@@ -257,15 +257,24 @@ impl SettledRun {
     /// deadline covers the resolve's own internal bounds (the follow-up
     /// client's request timeout, the record's bounded enqueue retries, the
     /// task fold); a record still absent past it is a real failure.
-    pub async fn assert_measured(&mut self, service: &str, origin: &str) -> Result<&Self> {
+    /// `count` is how many calls the graph made against the service:
+    /// every one must land its own resolved record on the right key.
+    pub async fn assert_measured(
+        &mut self,
+        service: &str,
+        origin: &str,
+        count: usize,
+    ) -> Result<&Self> {
         const COST_TRAIL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
         self.refresh_replay_until(
-            &format!("the '{service}' call's cost record to land on the journal"),
+            &format!("all {count} '{service}' cost records to land on the journal"),
             COST_TRAIL_DEADLINE,
             |replay| {
                 replay
                     .by_kind("cost_reported")
-                    .any(|e| e.str_field("service") == Some(service))
+                    .filter(|e| e.str_field("service") == Some(service))
+                    .count()
+                    >= count
             },
         )
         .await?;
@@ -275,26 +284,33 @@ impl SettledRun {
             .filter(|(s, _, _)| s == service)
             .map(|(_, o, amount)| (o.as_str(), *amount))
             .collect();
-        match for_service.as_slice() {
-            [(o, amount)] if *amount > 0.0 && *o == origin => Ok(self),
-            [(o, _)] if *o != origin => bail!(
-                "the '{service}' call spent on the '{o}' key, expected '{origin}': the call \
-                 did not ride the key the test set up"
-            ),
-            [(_, amount)] => bail!(
-                "the '{service}' call recorded a cost of ${amount}: the call happened but its \
-                 cost never resolved to a real figure"
-            ),
-            // The refresh above guarantees a record for the service EXISTS,
-            // so reaching here means its amount is null: the meter honestly
-            // could not resolve the figure. That is a final answer, not
-            // something to wait longer for.
-            [] => bail!(
-                "the '{service}' call's cost record landed with an UNKNOWN amount (the meter \
-                 could not resolve the figure); resolved costs seen: {costs:?}"
-            ),
-            many => bail!("expected one '{service}' cost, got {}: {many:?}", many.len()),
+        // The refresh above counted RECORDS; `costs()` keeps only the
+        // resolved ones (a null amount drops out), so a shortfall here
+        // means a record landed with an UNKNOWN amount: the meter
+        // honestly could not resolve the figure. That is a final
+        // answer, not something to wait longer for.
+        if for_service.len() != count {
+            bail!(
+                "expected {count} resolved '{service}' cost(s), got {} (an UNRESOLVED record \
+                 is not counted); costs seen: {costs:?}",
+                for_service.len()
+            );
         }
+        for (o, amount) in &for_service {
+            if *o != origin {
+                bail!(
+                    "a '{service}' call spent on the '{o}' key, expected '{origin}': the call \
+                     did not ride the key the test set up"
+                );
+            }
+            if *amount <= 0.0 {
+                bail!(
+                    "a '{service}' call recorded a cost of ${amount}: the call happened but \
+                     its cost never resolved to a real figure"
+                );
+            }
+        }
+        Ok(self)
     }
 
     /// Borrow the raw replay for assertions the typed helpers don't cover yet.

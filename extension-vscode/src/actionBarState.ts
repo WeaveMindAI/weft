@@ -36,8 +36,8 @@ import type {
   BackendSnapshot,
   CliEvent,
   ErrorVerb,
-} from './shared/protocol';
-import { backendFromSnapshot } from './shared/protocol';
+} from '../../packages/weft-graph/src/protocol';
+import { backendFromSnapshot, parseTransition } from '../../packages/weft-graph/src/status';
 
 interface FollowState {
   mode: 'latest' | 'pinned';
@@ -130,6 +130,19 @@ export class ActionBarStore {
     if (seedRunningColor !== undefined) {
       slot.runningColors.add(seedRunningColor);
     }
+    this.notifyIfPinned(projectId);
+  }
+
+  /// SSE `project_transition_changed` arrived: the event already
+  /// carries the new transition, so the bar flips NOW ("Building...
+  /// (cancel)") instead of waiting for the debounced status refetch
+  /// (which still runs afterwards, as reconciliation for everything
+  /// the event does not carry). No backend snapshot yet means nothing
+  /// to flip; the refetch seeds the whole snapshot then.
+  markTransition(projectId: string, transition: unknown): void {
+    const slot = this.slots.get(projectId);
+    if (!slot?.backend) return;
+    slot.backend = { ...slot.backend, transition: parseTransition(transition) };
     this.notifyIfPinned(projectId);
   }
 

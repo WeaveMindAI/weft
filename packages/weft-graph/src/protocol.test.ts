@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseFileValue, typeReferencesFile } from './protocol';
+import { parseFileValue, typeReferencesFile, type CatalogEntry, type Widget } from './protocol';
 
 describe('typeReferencesFile', () => {
 	it('matches file primitives and aliases, alone and in composites', () => {
@@ -43,5 +43,66 @@ describe('parseFileValue', () => {
 		expect(parseFileValue({ notAMarker: { key: 'k', ...meta } })).toBeNull();
 		expect(parseFileValue('exec/c1/f1')).toBeNull();
 		expect(parseFileValue(null)).toBeNull();
+	});
+});
+
+describe('catalog wire fixture', () => {
+	// Layer-2 wire-shape, the TS half: the exact JSON the backend's
+	// `resolved()` metadata serializes (pinned by the Rust twin) must
+	// satisfy `CatalogEntry`. A field the mirror requires but the
+	// backend stopped sending (or renamed) fails this assignment at
+	// compile time.
+	// SYNC: catalog wire fixture <-> crates/weft-core/src/node.rs catalog_wire_tests
+	it('the backend catalog payload satisfies CatalogEntry', () => {
+		const fixture: CatalogEntry = {
+			type: 'Fixture', label: 'Fixture', description: 'd',
+			tags: ['a'], icon: 'Zap', color: '#123456',
+			requires_infra: true,
+			inputs: [
+				{ name: 'code', type: 'String', required: true, exposure: 'all',
+				  widget: { kind: 'code', language: 'python' } },
+				{ name: 'pick', type: 'String', exposure: 'config',
+				  widget: { kind: 'select', options: ['a', 'b'] } },
+				{ name: 'n', type: 'Number', exposure: 'all',
+				  widget: { kind: 'number', min: 0, max: 9, step: 1 } },
+				{ name: 'grant', type: 'Access', exposure: 'config',
+				  widget: { kind: 'access' },
+				  requiresScopes: ['s.read'], requiresValues: ['host'] },
+				{ name: 'sheet', type: 'String', exposure: 'config',
+				  widget: { kind: 'remote_select', access: 'grant',
+				            sources: [{ kind: 'granted', from: 'sheets' }], depends_on: ['pick'] } },
+				{ name: 'img', type: 'Image', exposure: 'all',
+				  widget: { kind: 'file_drop', type: 'Image', accept: 'image/png' } },
+			],
+			outputs: [{ name: 'out', type: 'String' }],
+			features: { oneOfRequired: [['code', 'img']], isTrigger: true,
+			            showImagePreview: true, showDownloadLink: true,
+			            hasFormSchema: true, canAddInputPorts: true,
+			            showDebugPreview: true, liveEndpoint: 'web' },
+			formFieldSpecs: [
+				{ fieldType: 'text', label: 'Text',
+				  render: { component: 'text_input', source: 'input', multiple: true },
+				  requiredConfig: [], optionalConfig: [], addsInputs: [], addsOutputs: [] },
+			],
+		};
+		expect(fixture.type).toBe('Fixture');
+	});
+
+	it('every Widget kind is handled exhaustively', () => {
+		// A new Rust Widget variant mirrored into the union breaks this
+		// switch at compile time until someone routes it.
+		const label = (w: Widget): string => {
+			switch (w.kind) {
+				case 'text': case 'textarea': case 'checkbox': case 'password':
+				case 'form_builder': case 'code': case 'number': case 'select':
+				case 'multiselect': case 'access': case 'remote_select': case 'file_drop':
+					return w.kind;
+				default: {
+					const unhandled: never = w;
+					return unhandled;
+				}
+			}
+		};
+		expect(label({ kind: 'text' })).toBe('text');
 	});
 });

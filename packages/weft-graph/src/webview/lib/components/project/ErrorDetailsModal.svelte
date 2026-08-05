@@ -7,7 +7,7 @@
 
 	import { CircleAlert, Copy, Check, X as XIcon } from '@lucide/svelte';
 	import * as Dialog from '../ui/dialog';
-	import type { ActionBarError } from '../../../../shared/protocol';
+	import type { ActionBarError } from '../../../../protocol';
 
 	let {
 		error,

@@ -2,7 +2,6 @@
   "type": "S3Access",
   "label": "S3 Access",
   "description": "Sign in to an S3-compatible object store (AWS S3, Cloudflare R2, MinIO, ...): paste the endpoint, region, and key pair. Every request through the access is SigV4-signed and aimed at the stored endpoint; node code addresses `https://storage/...` and never sees a key.",
-  "category": "Data",
   "tags": [
     "s3",
     "r2",

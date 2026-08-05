@@ -92,6 +92,7 @@ pub use node_trait::Node;
 
 /// Validation diagnostic. Emitted by the generic validate pass and
 /// per-node validators. Mirrored by the VS Code extension's
+// SYNC: Diagnostic/Severity <-> packages/weft-graph/src/protocol.ts Diagnostic, Severity
 /// Diagnostic type; wire format matches. `line`/`column` are the START of the
 /// culprit (1-based line, 0-based char column); `end_line`/`end_column` bound
 /// its end (exclusive) so the editor underlines the exact range, not just a
@@ -155,9 +156,6 @@ pub struct NodeMetadata {
     pub label: String,
     /// One-line description shown in UIs and AI builder context.
     pub description: String,
-    /// Category path (e.g. "communication/email"), used for grouping
-    /// in the node picker.
-    pub category: String,
     /// Free-form tags for search.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -193,7 +191,10 @@ pub struct NodeMetadata {
     ///
     /// Empty for non-infra nodes and for infra nodes that only use
     /// upstream images.
-    #[serde(default)]
+    /// Backend-only (the CLI's image build); deliberately not mirrored
+    /// in the editor's `CatalogEntry`, and absent from the wire when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
     /// Node-level semantic constraints. Small, extensible.
     #[serde(default)]
@@ -204,7 +205,10 @@ pub struct NodeMetadata {
     /// Rules carry a `level` that distinguishes `structural` (checked
     /// on parse / AI edits) from `runtime` (checked only at run time
     /// so a missing credential is fine in the editor).
-    #[serde(default)]
+    /// Backend-only (the compiler's validate pass); deliberately not
+    /// mirrored in the editor's `CatalogEntry`, and absent from the
+    /// wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validate: Vec<ValidationRule>,
     /// Form-field vocabulary for nodes whose `features.has_form_schema`
     /// is true (which field types a form config may use, and what ports
@@ -245,6 +249,15 @@ pub struct NodeMetadata {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub access_apps: std::collections::BTreeMap<String, crate::access::spec::AppRegistration>,
+    /// User-declared TYPE names this metadata contributes: name to type
+    /// string (`"ChatMessage": "{ role: String, ... }"`). Collected
+    /// across every `metadata.json` into the project's one
+    /// [`crate::weft_type::TypeRegistry`] before any metadata is parsed;
+    /// a package root declares shared types once and members inherit the
+    /// key (harmless: identical redeclarations absorb). Declared types
+    /// are nominal and global: any node's ports may use them by name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub types: std::collections::BTreeMap<String, String>,
 }
 
 /// The one charset a provider name may use: lowercase ASCII letters,
@@ -495,11 +508,16 @@ impl NodeMetadata {
                 }
             }
             if let Some(default) = &input.default {
-                let inferred = WeftType::infer(default);
-                if !WeftType::is_compatible(&inferred, &input.input_type) {
+                // The one runtime gate: declared shapes (Named/Record)
+                // validate structurally; inference alone can never
+                // produce a nominal name, so an infer-and-compare here
+                // would refuse every custom-typed default.
+                if !input.input_type.accepts_runtime_value(default) {
                     return Err(format!(
                         "input '{}': default value has type {} but the input declares {}",
-                        input.name, inferred, input.input_type
+                        input.name,
+                        WeftType::infer(default),
+                        input.input_type
                     ));
                 }
                 if let Widget::Number { min, max, .. } = input.effective_widget() {
@@ -677,6 +695,17 @@ pub enum Condition {
 ///   1. Add the matching camelCase field to `NodeFeaturesWire` in
 ///      protocol.ts.
 ///   2. Update any webview code that switches on the new feature.
+/// The (input, output) port pair of a node declaring the checked-cast
+/// semantic (see [`NodeFeatures::cast_ports`]).
+// Backend-only: the editor's NodeFeaturesWire deliberately carries no
+// castPorts mirror (the wire field rides unread on the editor side).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CastPorts {
+    pub input: String,
+    pub output: String,
+}
+
 // SYNC: NodeFeatures <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -685,47 +714,47 @@ pub struct NodeFeatures {
     /// be non-null. If every port in a group is null/missing, the
     /// node is skipped. Example: email send might declare
     /// `one_of_required: [["message", "attachment"]]`.
-    #[serde(default, rename = "oneOfRequired")]
+    #[serde(default, rename = "oneOfRequired", skip_serializing_if = "Vec::is_empty")]
     pub one_of_required: Vec<Vec<String>>,
     /// The node accepts ad-hoc extra input ports declared in weft
     /// source. If unset, extra ports cause a compile error.
-    #[serde(default, rename = "canAddInputPorts")]
+    #[serde(default, rename = "canAddInputPorts", skip_serializing_if = "std::ops::Not::not")]
     pub can_add_input_ports: bool,
     /// Same for outputs.
-    #[serde(default, rename = "canAddOutputPorts")]
+    #[serde(default, rename = "canAddOutputPorts", skip_serializing_if = "std::ops::Not::not")]
     pub can_add_output_ports: bool,
     /// The node derives ports from a FormBuilder field at compile
     /// time. See `form_field_specs` for the derivation rules.
-    #[serde(default, rename = "hasFormSchema")]
+    #[serde(default, rename = "hasFormSchema", skip_serializing_if = "std::ops::Not::not")]
     pub has_form_schema: bool,
     /// Marks the node as a trigger (fires executions from external
     /// events rather than running as part of an execution).
-    #[serde(default, rename = "isTrigger")]
+    #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
     pub is_trigger: bool,
     /// Webview hint: render the node's latest output as a JSON
     /// preview inline on the node body. Used by Debug.
-    #[serde(default, rename = "showDebugPreview")]
+    #[serde(default, rename = "showDebugPreview", skip_serializing_if = "std::ops::Not::not")]
     pub show_debug_preview: bool,
     /// Webview hint: when the node's input is a stored image
     /// reference, render the picture inline on the node body, fetched
     /// through the authenticated download handshake. Used by
     /// ImageDisplay.
     // SYNC: showImagePreview <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire.showImagePreview
-    #[serde(default, rename = "showImagePreview")]
+    #[serde(default, rename = "showImagePreview", skip_serializing_if = "std::ops::Not::not")]
     pub show_image_preview: bool,
     /// Webview hint: when the node's input is a stored-file
     /// reference, render a download button inline on the node body
     /// (the click runs the same handshake a CLI download uses). Used
     /// by DownloadLink.
     // SYNC: showDownloadLink <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire.showDownloadLink
-    #[serde(default, rename = "showDownloadLink")]
+    #[serde(default, rename = "showDownloadLink", skip_serializing_if = "std::ops::Not::not")]
     pub show_download_link: bool,
     /// Default value of the node's `is_output` config flag. Nodes that
     /// are semantically "produce this thing" (Debug, Output) default
     /// to true. Any project can override by setting `is_output` in the
     /// node's weft config. Read at run-dispatch time to compute the
     /// subgraph to execute (see docs/v2-design.md section 3.0).
-    #[serde(default, rename = "isOutputDefault")]
+    #[serde(default, rename = "isOutputDefault", skip_serializing_if = "std::ops::Not::not")]
     pub is_output_default: bool,
     /// Which declared `Endpoint` (by name) the dispatcher proxies
     /// `/live` to. `Some("api")` means the node exposes a `/live`
@@ -737,13 +766,22 @@ pub struct NodeFeatures {
     /// endpoint, so the two can't drift out of sync.
     #[serde(default, rename = "liveEndpoint", skip_serializing_if = "Option::is_none")]
     pub live_endpoint: Option<String>,
+    /// Declares this node as a CHECKED CAST between two of its ports:
+    /// at run time the node converts the named input's value into the
+    /// named output's RESOLVED declared type, so at compile time the
+    /// resolved (input, output) type pair must be in the one conversion
+    /// table (`WeftType::cast_allowed`); a nonsense pair is a compile
+    /// error on the node. The compiler reads only this declaration,
+    /// never a node-type name: any node may declare the semantic.
+    #[serde(default, rename = "castPorts", skip_serializing_if = "Option::is_none")]
+    pub cast_ports: Option<CastPorts>,
     /// Hidden from the node picker and describe-nodes output. For a
     /// catalog node type that executes but must not appear in
     /// user-facing tooling. Users cannot declare a hidden node type
     /// in source; the parser rejects them with a dedicated error.
     /// (Group/Loop boundary lowering does NOT use this: those are
     /// not catalog nodes, they're inline-dispatched in the engine.)
-    #[serde(default, rename = "hidden")]
+    #[serde(default, rename = "hidden", skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
 }
 
@@ -752,6 +790,32 @@ pub struct NodeFeatures {
 /// `has_form_schema` (HumanQuery, runner triggers). The enrich pass
 /// reads this, iterates the configured fields, and materializes
 /// inputs/outputs on the NodeDefinition.
+/// A field type's render metadata: which UI primitive draws it and the
+/// primitive's flags. Typed (not a raw `Value`) so the loud-load
+/// guarantee holds here too: a typo'd key inside `render` fails the
+/// metadata load instead of shipping a component-less field.
+// SYNC: FormFieldRender <-> packages/weft-graph/src/protocol.ts FormFieldRenderWire
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormFieldRender {
+    pub component: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<FormFieldSource>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiple: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefilled: bool,
+}
+
+/// Where a select-style field's options come from: baked into the
+/// form schema, or fed by a node input at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormFieldSource {
+    Static,
+    Input,
+}
+
 // SYNC: FormFieldSpec <-> packages/weft-graph/src/protocol.ts FormFieldSpecWire
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -773,7 +837,7 @@ pub struct FormFieldSpec {
     /// overridden in the weft source. The dashboard / browser
     /// extension reads `render.component` (and its sibling flags)
     /// to pick a UI primitive without knowing field-type strings.
-    pub render: Value,
+    pub render: FormFieldRender,
     /// Config keys the form_builder editor must collect when the
     /// user adds this field type (e.g. ["options"] for a static
     /// select). The editor validates these before saving.
@@ -829,6 +893,14 @@ pub trait MetadataCatalog: Send + Sync {
     fn lookup(&self, node_type: &str) -> Option<&NodeMetadata>;
     /// Every known node's metadata.
     fn all(&self) -> Vec<&NodeMetadata>;
+    /// The type registry this catalog's metadata was loaded under
+    /// (builtin aliases plus the project's `types` declarations). The
+    /// compile pipeline activates it so type names in weft source
+    /// resolve against the same table. Default: builtin only, the
+    /// honest answer for hand-rolled test catalogs.
+    fn type_registry(&self) -> std::sync::Arc<crate::weft_type::TypeRegistry> {
+        std::sync::Arc::new(crate::weft_type::TypeRegistry::builtin())
+    }
 }
 
 /// Runtime node catalog. Produced by codegen inside the emitted
@@ -1394,7 +1466,7 @@ mod deny_unknown_tests {
 
     fn base() -> serde_json::Value {
         json!({
-            "type": "T", "label": "L", "description": "D", "category": "C"
+            "type": "T", "label": "L", "description": "D"
         })
     }
 
@@ -1469,6 +1541,96 @@ mod deny_unknown_tests {
 }
 
 #[cfg(test)]
+mod catalog_wire_tests {
+    use super::*;
+
+    /// Layer-2 wire-shape for the CATALOG boundary: `resolved()` metadata is
+    /// what `weft describe-nodes` / the parse server ship to the editor, and
+    /// the editor's `CatalogEntry`/`InputSpec`/`Widget`/`NodeFeaturesWire`
+    /// mirrors read exact key names. Pin the serialized key sets (top level,
+    /// per input, per widget variant, features) so a renamed or newly
+    /// unrenamed field fails HERE, not as a silently-undefined editor read.
+    /// The serialized fixture doubles as the TS side's checked-in fixture
+    /// (packages/weft-graph/src/protocol.test.ts).
+    // SYNC: catalog wire fixture <-> packages/weft-graph/src/protocol.test.ts catalog wire fixture
+    #[test]
+    fn resolved_metadata_serializes_the_editor_contract() {
+        let meta: NodeMetadata = serde_json::from_value(serde_json::json!({
+            "type": "Fixture", "label": "Fixture", "description": "d",
+            "tags": ["a"], "icon": "Zap", "color": "#123456",
+            "requires_infra": true,
+            "inputs": [
+                { "name": "code", "type": "String", "required": true,
+                  "widget": { "kind": "code", "language": "python" } },
+                { "name": "pick", "type": "String", "exposure": "config",
+                  "widget": { "kind": "select", "options": ["a", "b"] } },
+                { "name": "n", "type": "Number",
+                  "widget": { "kind": "number", "min": 0.0, "max": 9.0, "step": 1.0 } },
+                { "name": "grant", "type": "Access",
+                  "widget": { "kind": "access" },
+                  "requiresScopes": ["s.read"], "requiresValues": ["host"] },
+                { "name": "sheet", "type": "String",
+                  "widget": { "kind": "remote_select", "access": "grant",
+                              "sources": [{ "kind": "granted", "from": "sheets" }], "depends_on": ["pick"] } },
+                { "name": "img", "type": "Image",
+                  "widget": { "kind": "file_drop", "type": "Image", "accept": "image/png" } }
+            ],
+            "outputs": [{ "name": "out", "type": "String" }],
+            "features": { "oneOfRequired": [["code", "img"]], "isTrigger": true,
+                          "showImagePreview": true, "showDownloadLink": true,
+                          "hasFormSchema": true, "canAddInputPorts": true,
+                          "showDebugPreview": true, "liveEndpoint": "web" },
+            "formFieldSpecs": [
+                { "fieldType": "text", "label": "Text",
+                  "render": { "component": "text_input", "source": "input", "multiple": true } }
+            ]
+        }))
+        .expect("fixture metadata loads");
+        let v = serde_json::to_value(meta.resolved()).expect("serializes");
+
+        // Key ORDER is not part of the contract (whether serde_json
+        // iterates sorted or insertion-ordered depends on feature
+        // unification across the build); compare sorted sets, with
+        // every expectation below listed alphabetically.
+        let keys = |o: &serde_json::Value| -> Vec<String> {
+            let mut ks: Vec<String> = o.as_object().unwrap().keys().cloned().collect();
+            ks.sort();
+            ks
+        };
+        assert_eq!(
+            keys(&v),
+            ["color", "description", "features", "formFieldSpecs", "icon", "inputs",
+             "label", "outputs", "requires_infra", "tags", "type"],
+            "top-level catalog keys are the editor contract"
+        );
+        // Every resolved input ships the full editor surface, with the
+        // renamed camelCase keys the TS mirror reads.
+        assert_eq!(
+            keys(&v["inputs"][3]),
+            ["default", "description", "exposure", "label", "name", "placeholder",
+             "required", "requiresScopes", "requiresValues", "type", "widget"]
+        );
+        // Widget variants serialize their own payload under the tag.
+        assert_eq!(keys(&v["inputs"][0]["widget"]), ["kind", "language"]);
+        assert_eq!(keys(&v["inputs"][1]["widget"]), ["kind", "options"]);
+        assert_eq!(keys(&v["inputs"][2]["widget"]), ["kind", "max", "min", "step"]);
+        assert_eq!(keys(&v["inputs"][4]["widget"]), ["access", "depends_on", "kind", "sources"]);
+        assert_eq!(keys(&v["inputs"][5]["widget"]), ["accept", "kind", "type"]);
+        assert_eq!(
+            keys(&v["features"]),
+            ["canAddInputPorts", "hasFormSchema", "isTrigger", "liveEndpoint",
+             "oneOfRequired", "showDebugPreview", "showDownloadLink", "showImagePreview"],
+            "feature keys are the camelCase forms the editor reads"
+        );
+        assert_eq!(keys(&v["formFieldSpecs"][0]),
+            ["addsInputs", "addsOutputs", "fieldType", "label", "optionalConfig",
+             "render", "requiredConfig"]);
+        assert_eq!(keys(&v["formFieldSpecs"][0]["render"]),
+            ["component", "multiple", "source"]);
+    }
+}
+
+#[cfg(test)]
 mod diagnostic_wire_tests {
     use super::*;
     use crate::project::Span;
@@ -1519,7 +1681,7 @@ mod input_semantics_tests {
 
     fn metadata_with(inputs: Vec<InputSpec>) -> NodeMetadata {
         serde_json::from_str::<NodeMetadata>(
-            r#"{ "type": "T", "label": "T", "description": "", "category": "Utility" }"#,
+            r#"{ "type": "T", "label": "T", "description": "" }"#,
         )
         .map(|mut m| {
             m.inputs = inputs;
@@ -1828,9 +1990,9 @@ mod package_defaults_tests {
     use super::*;
 
     const MEMBER: &str = r#"{ "type": "OpenRouterInference", "label": "OpenRouter",
-        "description": "", "category": "AI" }"#;
+        "description": "" }"#;
     const DEFAULTS: &str = r#"{ "formFieldSpecs":
-        [{ "fieldType": "root_spec", "label": "Root spec", "render": {} }] }"#;
+        [{ "fieldType": "root_spec", "label": "Root spec", "render": { "component": "text" } }] }"#;
 
     /// The one guarantee finding-3 turns on: a package member's metadata is
     /// ONE document. The derive's runtime `parse_embedded(member, defaults)`
@@ -1892,7 +2054,6 @@ mod package_defaults_tests {
             "type": "SlackSendMessage",
             "label": "Send Slack message",
             "description": "d",
-            "category": "communication",
             "inputs": [],
             "outputs": []
         });
@@ -1913,7 +2074,7 @@ mod package_defaults_tests {
 
         // A member's OWN app for a service wins wholesale over the root's.
         let mut member = serde_json::json!({
-            "type": "T", "label": "l", "description": "d", "category": "c",
+            "type": "T", "label": "l", "description": "d",
             "inputs": [], "outputs": [],
             "accessApps": { "slack": { "label": "Mine", "client_id": "mine" } }
         });

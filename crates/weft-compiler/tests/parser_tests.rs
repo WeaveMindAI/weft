@@ -1303,8 +1303,12 @@ node = ExecPython(
 // ─── Triple Backtick Edge Cases ────────────────────────────────────────────
 
 #[test]
-fn test_triple_backtick_dedent() {
-    // Indented content should be dedented
+fn test_triple_backtick_verbatim() {
+    // Heredoc content is VERBATIM between the fences: only the one
+    // newline after the open fence and the one before the close fence
+    // are syntax. Indentation and trailing spaces are the value (no
+    // dedent guessing; a Python snippet's leading whitespace is
+    // load-bearing and a "helpful" strip silently changed values).
     let source = "
 node = ExecPython {
     code: ```
@@ -1316,11 +1320,7 @@ node = ExecPython {
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
-    // After dedenting, 4 spaces of common indent removed
-    assert!(code.contains("line1"), "code should contain line1: got {:?}", code);
-    assert!(code.contains("line2"), "code should contain line2: got {:?}", code);
-    // Should NOT have leading spaces from common indent
-    assert!(!code.starts_with("        "), "common indent should be stripped");
+    assert_eq!(code, "        line1\n        line2\n    ", "content byte for byte");
 }
 
 #[test]
@@ -1338,18 +1338,22 @@ node = ExecPython {
 }
 
 #[test]
-fn test_triple_backtick_with_escaped_backticks() {
+fn test_triple_backtick_with_escaped_inner_fence() {
+    // The ONE heredoc escape: `\```` ``` `` is a literal inner fence.
+    // The lexer skips it (the heredoc does not end there) and the
+    // decoder unescapes it. Lone backticks are verbatim, no escape.
     let source = "
 node = ExecPython {
     code: ```
-print(\"\\`\\`\\`\")
+print(\"\\```\")
+tick `
     ```
 }
 ";
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile escaped backticks");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile escaped fence");
     let node = &result.nodes[0];
     let code = node.config.get("code").unwrap().as_str().unwrap();
-    assert!(code.contains("```"), "escaped backticks should become real backticks");
+    assert_eq!(code, "print(\"```\")\ntick `\n    ", "fence unescaped, backtick verbatim");
 }
 
 // ─── One-liner Config ──────────────────────────────────────────────────────
@@ -1997,12 +2001,13 @@ Group(raw: String) -> (cleaned: String) {
     let blob = serde_json::to_string(&project).unwrap();
     assert!(!blob.contains("__include_root__"), "no sentinel anywhere: {blob}");
     let root = project.groups.iter().find(|g| g.id == "Cleaner").expect("root group named from source");
-    // The anonymous root's label defaults to its id (the filename humanization
-    // for display is the CLI/editor's concern, not the flatten's).
-    assert_eq!(root.label.as_deref(), Some("Cleaner"));
-    // The nested child group's id AND its (id-derived) label use the source id.
+    // Groups carry no user label in the language, and the wire says so
+    // honestly: the editor derives the display name from the id's local
+    // segment (restating the id here made nested groups render dotted).
+    assert_eq!(root.label, None);
+    // The nested child group's ID still carries the source-id prefix.
     let child = project.groups.iter().find(|g| g.id == "Cleaner.sub").expect("child group under root");
-    assert_eq!(child.label.as_deref(), Some("Cleaner.sub"));
+    assert_eq!(child.label, None);
     assert!(project.nodes.iter().any(|n| n.id == "Cleaner.sub.inner"));
     assert!(project.nodes.iter().any(|n| n.id == "Cleaner__out"));
 }

@@ -2,7 +2,6 @@
   "type": "S3PutObject",
   "label": "S3: Put Object",
   "description": "Upload a text object to a bucket on the connected store.",
-  "category": "Data",
   "tags": [
     "s3",
     "r2",

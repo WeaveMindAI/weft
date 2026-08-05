@@ -317,15 +317,10 @@ by name (`conn.value("imap_host")`) instead.
   sentence each. Deliberately not exhaustive on huge-scope providers:
   list what shipped nodes use, declare `all_permissions_url` so the
   picker can say where the rest live.
-- `permission_timing`: where ticks take effect (`at_mint`, `at_app`,
-  `at_approve`, `both`, `none`), which decides where the editor
-  renders the picker.
 - `verification`: the ladder rung + cost, above.
 - `test`: the declarative connect-time check (URL, method, expected
   status, captures). Also where identity captures usually hang;
   `identity` is a template over captured values (`"{team}"`).
-- `reconnect_action`: service-specific words appended to the
-  reconnect error ("re-invite the bot, then reconnect").
 - `callback_https`: the provider refuses plain-http OAuth callbacks
   (Slack does; Google takes a loopback). Consents then use an https
   address, failing loudly when this weft has none.

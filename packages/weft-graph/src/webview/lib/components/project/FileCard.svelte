@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Download, ExternalLink, FileAudio, FileVideo, FileImage, FileText } from '@lucide/svelte';
-	import type { FileValueWire } from '../../../../shared/protocol';
+	import type { FileValueWire } from '../../../../protocol';
 	import { send } from '../../../vscode';
 
 	let { label, file }: { label: string; file: FileValueWire } = $props();

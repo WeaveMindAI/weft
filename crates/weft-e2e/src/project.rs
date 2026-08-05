@@ -158,6 +158,11 @@ impl Project {
         let path = self.dir.join("main.weft");
         let source = std::fs::read_to_string(&path)
             .with_context(|| format!("read {}", path.display()))?;
+        // The fixture's own catalog registry: an edit touching a declared
+        // type name resolves exactly like it does in the editor.
+        let registry = weft_compiler::build::build_project_catalog(&self.dir)
+            .map_err(|e| anyhow::anyhow!("catalog for {}: {e}", self.dir.display()))?
+            .type_registry();
         let (edited, _inverse) = weft_compiler::edit::apply_edits(
             &source,
             None,
@@ -170,6 +175,7 @@ impl Project {
                 value: value.to_string(),
                 form: None,
             }],
+            registry,
         )
         .map_err(|e| anyhow::anyhow!("set config {node}.{key} in {}: {e:?}", path.display()))?;
         std::fs::write(&path, edited).with_context(|| format!("write {}", path.display()))?;

@@ -5,7 +5,7 @@
 // or invalidated op leaves the queue and the projection snaps back on its own.
 
 import type { ProjectDefinition } from '../types';
-import type { EditOp, TextEdit } from '../../../shared/protocol';
+import type { EditOp, TextEdit } from '../../../protocol';
 import type { LayoutOp } from '../layout';
 
 /** The last host-confirmed parse: the structural source of truth the

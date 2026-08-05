@@ -12,8 +12,9 @@
 //! caller's tenant and rejects any key naming a different tenant, so a wipe or
 //! download can never cross tenants.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +119,54 @@ fn ensure_tenant_key(tenant: &TenantId, key: &str) -> Result<String, ApiError> {
         [scope, _, _] if weft_core::storage::key::is_scope_tag(scope) => Ok(format!("{prefix}{key}")),
         _ => Err((StatusCode::FORBIDDEN, "key does not belong to the caller's tenant".into())),
     }
+}
+
+/// GET /public/files/{token}: the PUBLIC RELAY for a minted file link.
+/// A pure pass-through to the broker's `/v1/storage/admin/relay`
+/// (authenticated with the dispatcher's SA token): the dispatcher's
+/// egress is deliberately locked to the control plane, so the broker,
+/// the one service with bucket reach, resolves the token and streams
+/// the bytes; this route only carries them out the public door. The
+/// token IS the credential (unguessable, expiring); the broker's 404
+/// for missing and expired links passes through unchanged, and broker
+/// transport failures answer 502 with the detail logged.
+pub async fn public_file(
+    State(state): State<DispatcherState>,
+    Path(token): Path<String>,
+) -> Result<Response, ApiError> {
+    let bad_gateway = |detail: String| {
+        tracing::error!(target: "weft_dispatcher::storage", "public file relay: {detail}");
+        (StatusCode::BAD_GATEWAY, "file fetch failed".to_string())
+    };
+    let sa_token = crate::broker_admin::read_token(&state)
+        .await
+        .map_err(|e| bad_gateway(format!("{e:#}")))?;
+    let upstream = state
+        .http
+        .get(crate::broker_admin::admin_url(
+            &state,
+            &format!("/v1/storage/admin/relay/{token}"),
+        ))
+        .bearer_auth(sa_token)
+        .send()
+        .await
+        .map_err(|e| bad_gateway(e.to_string()))?;
+    let status = upstream.status();
+    if !status.is_success() {
+        // The broker's own answer (404 unknown/expired) keeps its
+        // status; only its body text is echoed, never internals.
+        let msg = upstream.text().await.unwrap_or_default();
+        return Err((status, msg));
+    }
+    let mut builder = Response::builder();
+    for header in ["content-type", "content-length", "content-disposition"] {
+        if let Some(v) = upstream.headers().get(header) {
+            builder = builder.header(header, v);
+        }
+    }
+    builder
+        .body(axum::body::Body::from_stream(upstream.bytes_stream()))
+        .map_err(internal)
 }
 
 #[derive(Serialize)]

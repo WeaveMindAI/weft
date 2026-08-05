@@ -75,12 +75,12 @@
 	}: {
 		project: ProjectDefinition;
 		onSave: (data: { layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
-		onApplyEdits: (ops: import('../../../../shared/protocol').EditOp[]) => Promise<import('../../projection/types').EditRpcResult>;
-		onApplyTextEdit: (edit: import('../../../../shared/protocol').TextEdit) => Promise<import('../../projection/types').EditRpcResult>;
+		onApplyEdits: (ops: import('../../../../protocol').EditOp[]) => Promise<import('../../projection/types').EditRpcResult>;
+		onApplyTextEdit: (edit: import('../../../../protocol').TextEdit) => Promise<import('../../projection/types').EditRpcResult>;
 		onResyncSource: () => Promise<{ project: ProjectDefinition; weftCode: string } | null>;
 		onOpenInclude?: (path: string, alias: string) => void;
 		execPrefix?: string;
-		fileContents?: Record<string, import('../../../../shared/protocol').FileContent>;
+		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		onRun?: () => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
@@ -102,8 +102,8 @@
 		onInfraNodeStop?: (nodeId: string) => void;
 		onInfraNodeTerminate?: (nodeId: string) => void;
 		onUpgradeInfra?: () => void;
-		actionBarState: import('../../../../shared/protocol').ActionBarState;
-		drift: import('../../../../shared/protocol').ActionAvailability | undefined;
+		actionBarState: import('../../../../protocol').ActionBarState;
+		drift: import('../../../../protocol').ActionAvailability | undefined;
 		infraNodes?: Array<{ nodeId: string; nodeType: string; status: string; failureStage?: string; failureMessage?: string }>;
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
@@ -111,10 +111,10 @@
 		autoOrganizeOnMount?: boolean;
 		/// Per-node infra /live tick state. Only consumed for nodes
 		/// with `requiresInfra: true`.
-		infraFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
+		infraFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
 		/// Per-node listener /display tick state. Only consumed for
 		/// nodes with `features.isTrigger`.
-		signalFeedByNode?: Record<string, import('../../../../shared/protocol').NodeFeedState>;
+		signalFeedByNode?: Record<string, import('../../../../protocol').NodeFeedState>;
 	} = $props();
 </script>
 

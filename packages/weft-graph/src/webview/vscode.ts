@@ -9,7 +9,7 @@
 // `setHostTransport(...)` once, before mount, with a transport backed by the
 // dispatcher HTTP API.
 
-import type { HostMessage, WebviewMessage } from '../shared/protocol';
+import type { HostMessage, WebviewMessage } from '../protocol';
 
 /// The seam each consumer implements: deliver a `WebviewMessage` to the host,
 /// and call `receive` for every `HostMessage` the host emits. `dispose` tears

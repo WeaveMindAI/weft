@@ -2,7 +2,6 @@
   "type": "Text",
   "label": "Text",
   "description": "Emit a literal string. Useful for prompts, labels, and config values.",
-  "category": "basic",
   "tags": [
     "literal",
     "string"

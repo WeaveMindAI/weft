@@ -2,7 +2,6 @@
   "type": "OpenRouterAccess",
   "label": "OpenRouter Access",
   "description": "Connect OpenRouter for the project's AI calls: pick the built-in credits connection, or bring your own OpenRouter API key. Wire the access output into every OpenRouter node; one connection, picked once, however many calls consume it.",
-  "category": "AI",
   "tags": [
     "ai",
     "access",

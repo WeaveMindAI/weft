@@ -1,5 +1,5 @@
 import type { PortDefinition, PortType } from '../types';
-import { parseWeftType, weftTypeToString, type WeftType } from '../types';
+import { parseWeftType, weftTypeToWireString, type WeftType } from '../types';
 
 /** Generic render descriptor, tells the task review page HOW to render a field
  *  without knowing anything about the field type itself. */
@@ -72,7 +72,9 @@ function resolvePortName(template: string, key: string): string {
 const AUTO_TYPE_VAR_MARKER = 'T_Auto';
 
 /** Recursively replace every `T_Auto` marker in a parsed WeftType with a
- *  TypeVar scoped to the field key. */
+ *  TypeVar scoped to the field key. Every container arm recurses, so a
+ *  nested placeholder scopes exactly like a top-level one.
+ *  SYNC: materializeAutoTypeVars <-> crates/weft-compiler/src/enrich.rs materialize_auto_type_vars */
 function materializeAutoTypeVars(t: WeftType, key: string): WeftType {
 	switch (t.kind) {
 		case 'typevar':
@@ -90,6 +92,13 @@ function materializeAutoTypeVars(t: WeftType, key: string): WeftType {
 			};
 		case 'union':
 			return { kind: 'union', types: t.types.map(x => materializeAutoTypeVars(x, key)) };
+		case 'record':
+			return {
+				kind: 'record',
+				fields: t.fields.map(f => ({ ...f, ty: materializeAutoTypeVars(f.ty, key) })),
+			};
+		case 'named':
+			return { kind: 'named', name: t.name, body: materializeAutoTypeVars(t.body, key) };
 		default:
 			return t;
 	}
@@ -101,7 +110,11 @@ function resolveAutoTypeVars(portType: PortType, key: string): PortType {
 	const parsed = parseWeftType(portType);
 	if (!parsed) return portType;
 	const materialized = materializeAutoTypeVars(parsed, key);
-	return weftTypeToString(materialized);
+	// Wire rendering: the result flows back into `parseWeftType` (port
+	// matching, colors), and only the self-contained form re-parses
+	// when a named type is present (`weftTypeToString` prints the bare
+	// name, which the frontend has no registry to resolve).
+	return weftTypeToWireString(materialized);
 }
 
 export function buildSpecMap(specs: FormFieldSpec[]): Record<string, FormFieldSpec> {

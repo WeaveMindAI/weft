@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { translateProject } from './host-bridge';
-import type { ProjectDefinition as HostProject } from '../shared/protocol';
+import type { ProjectDefinition as HostProject } from '../protocol';
 
 /** The regression this file pins: `translateProject` maps wire nodes
  *  FIELD BY FIELD, so any definition field it forgets is silently
@@ -54,5 +54,30 @@ describe('translateProject', () => {
     expect(node.inputs[0].default).toBe('be nice');
     expect(node.inputs[0].label).toBe('System prompt');
     expect(node.inputs[0].placeholder).toBe('You are...');
+  });
+
+  it('labels a group by its local id segment, never the full dotted path', () => {
+    const group = (id: string, parentGroupId: string | null) => ({
+      id,
+      kind: 'group' as const,
+      label: null,
+      inPorts: [],
+      outPorts: [],
+      oneOfRequired: [],
+      parentGroupId,
+      childGroupIds: [],
+      nodeIds: [],
+    });
+    const host = {
+      id: 'p1',
+      nodes: [],
+      edges: [],
+      groups: [group('outer', null), group('outer.inner', 'outer')],
+    } as unknown as HostProject;
+
+    const v1 = translateProject(host, 'src', '');
+    const labels = new Map(v1.nodes.map((n) => [n.id, n.label]));
+    expect(labels.get('outer')).toBe('outer');
+    expect(labels.get('outer.inner')).toBe('inner');
   });
 });

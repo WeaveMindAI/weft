@@ -38,7 +38,7 @@ function unquoteString(inner: string): string {
  *  quoted strings / literals; objects and arrays become pretty-printed JSON;
  *  multi-line strings become triple-backtick heredocs; a `@file` marker becomes
  *  `@file("path"[, Type])` (Type omitted when it's the default String).
- *  SYNC: formatConfigValue <-> crates/weft-compiler/src/edit/ops.rs format_string */
+ *  SYNC: formatConfigValue <-> crates/weft-compiler/src/edit/ops.rs format_string, crates/weft-compiler/src/weft_compiler.rs unescape_heredoc, crates/weft-compiler/src/cst/lexer.rs heredoc_span */
 export function formatConfigValue(value: unknown): string {
   // Unset is a removeConfig, not a token: an emitted `null`/`undefined` would
   // splice garbage into source (or, for undefined, break the string contract).
@@ -54,14 +54,14 @@ export function formatConfigValue(value: unknown): string {
   }
   if (typeof value === 'string') {
     if (value.includes('\n')) {
-      // A multi-line value is a ```...``` heredoc. The weft lexer has NO escape
-      // for an inner fence (it ends the heredoc at the first ```), so a value
-      // containing ``` cannot be encoded faithfully: throw, exactly as the Rust
-      // edit-server does, rather than emit source that re-parses wrong.
-      if (value.includes('```')) {
-        throw new Error('multi-line value cannot contain ``` (no heredoc fence escape)');
+      // A multi-line value is a ```...``` heredoc. Content is verbatim
+      // between the fences; an inner ``` is escaped as \``` (the one
+      // escape the decoder honors), so only the escape's own literal
+      // spelling is unencodable. Throws exactly as the Rust edit-server.
+      if (value.includes('\\```')) {
+        throw new Error('multi-line value cannot contain the sequence \\``` (it is the heredoc\'s fence escape)');
       }
-      return `\`\`\`\n${value}\n\`\`\``;
+      return `\`\`\`\n${value.replaceAll('```', '\\```')}\n\`\`\``;
     }
     return quoteString(value);
   }
@@ -96,7 +96,7 @@ const JSON_COMPACT_MAX_CHARS = 60;
  *  Used by the optimistic projection to display a pending `setConfig` op's
  *  value before the host round-trip lands. Throws on a token this module
  *  could not have produced (the projection drops the op loudly).
- *  SYNC: parseConfigToken <-> crates/weft-compiler/src/edit/ops.rs format_string (it inverts what format_string emits) */
+ *  SYNC: parseConfigToken <-> crates/weft-compiler/src/edit/ops.rs format_string (it inverts what format_string emits), crates/weft-compiler/src/weft_compiler.rs unescape_heredoc, crates/weft-compiler/src/cst/lexer.rs heredoc_span */
 export function parseConfigToken(token: string): unknown {
   // The path group accepts escaped chars so a `"` inside the path round-trips.
   const fileRef = token.match(/^@(file|asset)\("((?:[^"\\]|\\.)*)"(?:,\s*([A-Za-z][A-Za-z0-9_[\],| ]*))?\)$/);
@@ -115,9 +115,9 @@ export function parseConfigToken(token: string): unknown {
     if (!token.endsWith('```') || token.length < 6) {
       throw new Error(`unterminated heredoc config token: ${token.slice(0, 40)}`);
     }
-    // No fence escape exists (formatConfigValue throws on an inner ```), so the
-    // body is taken verbatim between the fences.
-    return token.replace(/^```\n?/, '').replace(/\n?```$/, '');
+    // Body is verbatim between the fences (one syntax newline stripped
+    // each side); the one escape is \``` for an inner fence.
+    return token.replace(/^```\n?/, '').replace(/\n?```$/, '').replaceAll('\\```', '```');
   }
   if (token.startsWith('"') && token.endsWith('"') && token.length >= 2) {
     return unquoteString(token.slice(1, -1));

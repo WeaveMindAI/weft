@@ -2,7 +2,6 @@
   "type": "TelegramAccess",
   "label": "Telegram Access",
   "description": "Sign in as a Telegram bot: paste the token BotFather gave you. Wire the access output into Telegram action nodes; the token lives in the runtime's access store, never in the project file.",
-  "category": "Data",
   "tags": [
     "telegram",
     "access",

@@ -377,6 +377,19 @@ impl Platform {
     /// The pod that currently OWNS an execution's color (stamped by the
     /// claim trigger), or None while unclaimed. Lets a multi-worker e2e
     /// assert WHICH worker picked a run up.
+    /// How many live PUBLIC RELAY file links exist right now. A minted
+    /// relay link (a media slot externalized as `<base>/public/files/
+    /// <token>`) leaves one row until it expires, so a test that just
+    /// externalized media can tell which path it took: rows appeared =
+    /// relay links; none = inline bytes (or the direct-bucket path,
+    /// which a local install never has).
+    pub async fn public_file_link_count(&self) -> Result<i64> {
+        sqlx::query_scalar("SELECT count(*) FROM public_file_link")
+            .fetch_one(&self.pool)
+            .await
+            .context("count public file links")
+    }
+
     pub async fn execution_owner(&self, color: &Uuid) -> Result<Option<String>> {
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT owner_pod_name FROM execution_color WHERE color = $1")

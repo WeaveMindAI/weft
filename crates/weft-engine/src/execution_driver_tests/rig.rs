@@ -10,7 +10,7 @@
 
     pub(super) fn trivial_metadata(node_type: &str) -> NodeMetadata {
         serde_json::from_value(json!({
-            "type": node_type, "label": node_type, "description": "", "category": "test"
+            "type": node_type, "label": node_type, "description": ""
         }))
         .expect("trivial metadata")
     }

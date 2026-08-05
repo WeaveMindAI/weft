@@ -182,7 +182,22 @@ pub struct TextEdit {
 /// `Untitled` for an unsaved buffer). It's the id an anonymous top-level group
 /// takes, so the editor resolves a scoped id (`MyCleaner.child`) against the
 /// SAME prefix the lowering renders, with no rename pass between the two.
+///
+/// `registry` is the project's type registry: edit ops validate written
+/// TYPE strings (a declared name in a port override is valid exactly
+/// when the catalog knows it), and the scope activation lives HERE, not
+/// on each caller, so no entry point can forget it.
 pub fn apply_edits(
+    source: &str,
+    base_dir: Option<&std::path::Path>,
+    source_id: &str,
+    ops: &[EditOp],
+    registry: std::sync::Arc<weft_core::weft_type::TypeRegistry>,
+) -> Result<(String, TextEdit), EditError> {
+    registry.scoped(|| apply_edits_inner(source, base_dir, source_id, ops))
+}
+
+fn apply_edits_inner(
     source: &str,
     _base_dir: Option<&std::path::Path>,
     source_id: &str,

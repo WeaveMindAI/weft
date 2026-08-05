@@ -1,0 +1,57 @@
+{
+  "type": "ChatHistoryAppend",
+  "label": "Chat Message",
+  "description": "Append one message to a chat history (or start a new one when no history is wired). The history is a typed value any chat-capable AI node consumes and re-emits, so a conversation is built by chaining this node and the AI calls; media attachments ride inside messages as stored files.",
+  "tags": [
+    "ai",
+    "chat",
+    "history",
+    "conversation",
+    "message"
+  ],
+  "icon": "MessagesSquare",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false,
+      "exposure": "wire",
+      "description": "The conversation so far. Unwired, this message starts a new history."
+    },
+    {
+      "name": "role",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "select",
+        "options": ["user", "assistant", "system"]
+      },
+      "default": "user",
+      "label": "Role"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": false,
+      "description": "The message text."
+    },
+    {
+      "name": "media",
+      "type": "Media | List[Media]",
+      "required": false,
+      "description": "Media attached to this message: one stored image, audio clip, or video, or a list of them."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false
+    }
+  ],
+  "features": {
+    "oneOfRequired": [["text", "media"]]
+  },
+  "requires_infra": false
+}

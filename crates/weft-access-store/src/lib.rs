@@ -42,6 +42,30 @@ pub use resolve::{
 
 use serde::{Deserialize, Serialize};
 
+/// One registered app the editor offers as its own shared-door option:
+/// its label and its FIXED permission set. The user picks an option;
+/// they never tick permissions on the shared door.
+// SYNC: SharedAppChoice <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte SharedAppChoice
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedAppChoice {
+    pub label: String,
+    pub covers: Vec<String>,
+}
+
+/// The doors probe's answer core: which shared-door options exist right
+/// now. The ONE definition every service answering or forwarding the
+/// probe uses (the editor hides what is not offered; it never greys).
+// SYNC: DoorsAnswer <-> crates/weft-dispatcher/src/api/access.rs DoorsStatus (flattens it), packages/weft-graph/src/webview/lib/components/project/AccessField.svelte DoorsStatus
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorsAnswer {
+    /// The registered apps, one shared-door option each (oauth
+    /// services only). Empty = the one-click door is hidden.
+    pub shared_apps: Vec<SharedAppChoice>,
+    /// Whether a runtime credential backs the shared door of a
+    /// non-oauth (key) service.
+    pub shared_credential: bool,
+}
+
 /// A connection row as the EDITOR sees it: names, ids, identity,
 /// permissions. Never a stored value. Everything the connection list
 /// renders (identity / app label / what it can do, plus the

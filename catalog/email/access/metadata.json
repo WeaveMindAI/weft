@@ -2,7 +2,6 @@
   "type": "EmailAccess",
   "label": "Email Access",
   "description": "Sign in to a mailbox with its address and password. Mail uses two separate protocols, one per direction: IMAP reads what arrives, SMTP sends. Fill the half you need (both, to receive and send through one connection). Works with every provider that serves them, which is essentially all of them: Gmail (imap.gmail.com / smtp.gmail.com, with an app password), Outlook, Fastmail, iCloud, a company server, a self-hosted box.",
-  "category": "Communication",
   "tags": [
     "email",
     "imap",

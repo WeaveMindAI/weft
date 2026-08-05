@@ -52,7 +52,7 @@ async fn assert_metered(project: &mut Project, origin: &str) -> anyhow::Result<(
 
     // The call was measured: one cost record for the provider, resolved to a
     // real amount (the meter read a real usage figure off the real response).
-    settled.assert_measured("openrouter", origin).await?;
+    settled.assert_measured("openrouter", origin, 1).await?;
     Ok(())
 }
 

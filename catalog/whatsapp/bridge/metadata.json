@@ -2,7 +2,6 @@
   "type": "WhatsAppBridge",
   "label": "WhatsApp Bridge",
   "description": "Provision a per-project WhatsApp bridge (Baileys + WhatsApp Web). Connect with a phone via QR code on first start; the bridge persists its auth state in a PVC so subsequent starts reuse the session.",
-  "category": "Communication",
   "tags": [
     "whatsapp",
     "infra",

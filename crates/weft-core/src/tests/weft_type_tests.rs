@@ -1627,3 +1627,311 @@ fn cast_value_handles_union_and_nested_shapes() {
     assert!(t("List[Number]").cast_value(&json!([1, "banana"])).is_err());
     assert!(t("List[Number | Boolean]").cast_value(&json!([1, "maybe"])).is_err());
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Records, named types, and the type registry
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A registry with the chat-ish shapes used across these tests. Built
+/// through the real `TypeRegistry::build`, declared out of dependency
+/// order on purpose (the fixed point must resolve forward references).
+fn test_registry() -> std::sync::Arc<TypeRegistry> {
+    let d = |n: &str, b: &str| (n.to_string(), b.to_string(), "test".to_string());
+    std::sync::Arc::new(
+        TypeRegistry::build(&[
+            d("ChatHistory", "List[ChatMessage]"),
+            d("ChatMessage", "{ role: String, content: String | List[Part], name?: String }"),
+            d("Part", "{ type: String, text?: String, image?: Image }"),
+        ])
+        .unwrap(),
+    )
+}
+
+fn reg_parse(s: &str) -> WeftType {
+    test_registry().scoped(|| WeftType::parse(s)).unwrap_or_else(|| panic!("parse failed: {s}"))
+}
+
+#[test]
+fn record_syntax_parses_and_round_trips_display() {
+    let t = WeftType::parse("{ role: String, name?: String, parts: List[Number] }").unwrap();
+    let WeftType::Record(fields) = &t else { panic!("not a record: {t}") };
+    assert_eq!(fields.len(), 3);
+    assert!(!fields[0].optional && fields[1].optional);
+    // Display round-trips through parse.
+    let rendered = t.to_string();
+    assert_eq!(rendered, "{role: String, name?: String, parts: List[Number]}");
+    assert_eq!(WeftType::parse(&rendered).unwrap(), t);
+}
+
+#[test]
+fn record_rejects_bad_syntax() {
+    for bad in ["{}", "{ role }", "{ role: Foo }", "{ role: String, role: Number }", "{ : String }"] {
+        assert!(WeftType::parse(bad).is_none(), "{bad:?} must not parse");
+    }
+}
+
+#[test]
+fn record_equality_is_field_order_insensitive() {
+    let a = WeftType::parse("{ x: String, y?: Number }").unwrap();
+    let b = WeftType::parse("{ y?: Number, x: String }").unwrap();
+    assert_eq!(a, b);
+    assert_ne!(a, WeftType::parse("{ x: String, y: Number }").unwrap(), "optionality differs");
+}
+
+#[test]
+fn bare_names_resolve_only_inside_a_registry_scope() {
+    assert!(WeftType::parse("ChatHistory").is_none(), "no scope, no name");
+    let t = reg_parse("ChatHistory");
+    let WeftType::Named { name, body } = &t else { panic!("not named: {t}") };
+    assert_eq!(name, "ChatHistory");
+    assert!(matches!(body.as_ref(), WeftType::List(_)));
+    // Display is the bare authored name; the wire form is self-contained
+    // and parses back to the same type WITHOUT any scope.
+    assert_eq!(t.to_string(), "ChatHistory");
+    let wire = t.wire_string();
+    assert!(wire.starts_with("ChatHistory=List["), "{wire}");
+    assert_eq!(WeftType::parse(&wire).unwrap(), t);
+    // Serde uses the wire form.
+    let json = serde_json::to_string(&t).unwrap();
+    let back: WeftType = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, t);
+}
+
+#[test]
+fn named_union_body_wire_form_is_unambiguous() {
+    // A named type whose BODY is a union parenthesizes on the wire
+    // (`Kind=(A | B)`), so it round-trips as one named type instead of
+    // re-parsing as the union `Kind=A | B`.
+    let named_union = WeftType::Named {
+        name: "Kind".into(),
+        body: Box::new(WeftType::Union(vec![
+            WeftType::Primitive(WeftPrimitive::String),
+            WeftType::Primitive(WeftPrimitive::Number),
+        ])),
+    };
+    let wire = named_union.wire_string();
+    assert_eq!(wire, "Kind=(String | Number)");
+    assert_eq!(WeftType::parse(&wire).unwrap(), named_union);
+
+    // The un-parenthesized spelling is the OTHER type: a union whose
+    // first member is named. Both directions round-trip.
+    let union_with_named = WeftType::Union(vec![
+        WeftType::Named {
+            name: "Kind".into(),
+            body: Box::new(WeftType::Primitive(WeftPrimitive::String)),
+        },
+        WeftType::Primitive(WeftPrimitive::Number),
+    ]);
+    let wire = union_with_named.wire_string();
+    assert_eq!(wire, "Kind=String | Number");
+    assert_eq!(WeftType::parse(&wire).unwrap(), union_with_named);
+
+    // The common optional-port shape: a record-bodied named type beside
+    // Null (braces protect the body, no parens needed).
+    let optional = WeftType::Union(vec![
+        WeftType::Named {
+            name: "Profile".into(),
+            body: Box::new(WeftType::Record(vec![RecordField {
+                name: "name".into(),
+                ty: WeftType::Primitive(WeftPrimitive::String),
+                optional: false,
+            }])),
+        },
+        WeftType::Primitive(WeftPrimitive::Null),
+    ]);
+    assert_eq!(WeftType::parse(&optional.wire_string()).unwrap(), optional);
+
+    // Plain paren grouping parses (and nests).
+    assert_eq!(
+        WeftType::parse("(String | Number)").unwrap(),
+        WeftType::parse("String | Number").unwrap()
+    );
+    assert_eq!(WeftType::parse("((String))").unwrap(), WeftType::Primitive(WeftPrimitive::String));
+}
+
+#[test]
+fn registry_build_absorbs_identical_and_refuses_conflicts() {
+    let d = |n: &str, b: &str, o: &str| (n.to_string(), b.to_string(), o.to_string());
+    // Identical redeclaration (even with different field order): absorbed.
+    TypeRegistry::build(&[
+        d("M", "{ a: String, b?: Number }", "pkg1"),
+        d("M", "{ b?: Number, a: String }", "pkg2"),
+    ])
+    .unwrap();
+    // Different bodies: loud error naming the second origin.
+    let err = TypeRegistry::build(&[
+        d("M", "{ a: String }", "pkg1"),
+        d("M", "{ a: Number }", "pkg2"),
+    ])
+    .unwrap_err();
+    assert!(err.contains("declared twice") && err.contains("pkg2"), "{err}");
+    // Reserved and malformed names refused.
+    for bad in ["String", "List", "Media", "T", "T3", "MustOverride", "lower", "Has Space"] {
+        assert!(
+            TypeRegistry::build(&[d(bad, "String", "pkg")]).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+    // A cycle fails loud instead of spinning.
+    let err = TypeRegistry::build(&[d("A", "List[B]", "p"), d("B", "List[A]", "p")]).unwrap_err();
+    assert!(err.contains("could not be resolved"), "{err}");
+}
+
+#[test]
+fn wire_form_refuses_reserved_names() {
+    // A `Name=Body` wire string minting a nominal type that shadows a
+    // reserved name (a union alias, a primitive) would round-trip into
+    // a DIFFERENT type (`Media=Number` displays as `Media`, which
+    // reparses as the builtin alias). The parse refuses it outright.
+    for bad in ["Media=Number", "File=String", "String=Number", "List=String"] {
+        assert!(WeftType::parse(bad).is_none(), "{bad:?} must not parse");
+    }
+}
+
+#[test]
+fn union_with_unresolved_leaf_keeps_the_permissive_gate() {
+    use serde_json::json;
+    // `A={x: Number} | T` carries a declared shape AND an unresolved
+    // leaf. The declared-shape validator refuses unresolved leaves, so
+    // routing there would flip the union from accept-anything to
+    // accept-only-A; the gate must stay structural (like bare `T`).
+    let mixed = WeftType::Union(vec![
+        WeftType::Named {
+            name: "A".into(),
+            body: Box::new(WeftType::parse("{ x: Number }").unwrap()),
+        },
+        WeftType::TypeVar("T".into()),
+    ]);
+    assert!(mixed.accepts_runtime_value(&json!({ "x": 1 })));
+    assert!(mixed.accepts_runtime_value(&json!(5)));
+    // Fully resolved, the declared gate takes over and refuses misfits.
+    let resolved = WeftType::Union(vec![
+        WeftType::Named {
+            name: "A".into(),
+            body: Box::new(WeftType::parse("{ x: Number }").unwrap()),
+        },
+        WeftType::Primitive(WeftPrimitive::String),
+    ]);
+    assert!(resolved.accepts_runtime_value(&json!({ "x": 1 })));
+    assert!(resolved.accepts_runtime_value(&json!("s")));
+    assert!(!resolved.accepts_runtime_value(&json!(5)));
+}
+
+#[test]
+fn named_compatibility_is_by_name_and_decays_structurally() {
+    let reg = test_registry();
+    reg.scoped(|| {
+        let history = WeftType::parse("ChatHistory").unwrap();
+        let message = WeftType::parse("ChatMessage").unwrap();
+        let compat = WeftType::is_compatible;
+
+        // Same name flows; different names never do, even shape-alike.
+        assert!(compat(&history, &history));
+        assert!(!compat(&message, &history));
+        // Forgetting the name is safe: Named -> JsonDict / structural body.
+        assert!(compat(&message, &WeftType::JsonDict));
+        assert!(compat(&history, &WeftType::parse("List[ChatMessage]").unwrap()));
+        // The reverse is the refused soup door.
+        assert!(!compat(&WeftType::JsonDict, &message));
+        assert!(!compat(&WeftType::parse("List[ChatMessage]").unwrap(), &history));
+        // Through a union target.
+        assert!(compat(&history, &WeftType::parse("ChatHistory | Null").unwrap()));
+    });
+}
+
+#[test]
+fn record_compatibility_follows_the_target_contract() {
+    let t = |s: &str| WeftType::parse(s).unwrap();
+    let compat = WeftType::is_compatible;
+    // Optional target field may be missing from the source.
+    assert!(compat(&t("{ a: String }"), &t("{ a: String, b?: Number }")));
+    // Extra source field = undeclared key at runtime: refused.
+    assert!(!compat(&t("{ a: String, x: Number }"), &t("{ a: String }")));
+    // Optional source into required target: the key may be absent, refused.
+    assert!(!compat(&t("{ a?: String }"), &t("{ a: String }")));
+    // Record forgets into JsonDict / Dict[String, V]; never the reverse.
+    assert!(compat(&t("{ a: String }"), &WeftType::JsonDict));
+    assert!(compat(&t("{ a: String, b: String }"), &t("Dict[String, String]")));
+    assert!(!compat(&WeftType::JsonDict, &t("{ a: String }")));
+    assert!(!compat(&t("Dict[String, String]"), &t("{ a: String }")));
+}
+
+#[test]
+fn validate_value_names_the_offending_path() {
+    use serde_json::json;
+    let history = reg_parse("ChatHistory");
+
+    assert!(history.validate_value(&json!([])).is_ok());
+    assert!(history
+        .validate_value(&json!([{ "role": "user", "content": "hi" }]))
+        .is_ok());
+    // Optional field present, and content as parts with a stored image.
+    assert!(history
+        .validate_value(&json!([{
+            "role": "assistant", "name": "bot",
+            "content": [
+                { "type": "text", "text": "look" },
+                { "type": "image", "image": file_url("image/png") },
+            ],
+        }]))
+        .is_ok());
+
+    let err = history
+        .validate_value(&json!([{ "role": "user", "content": "a" }, { "role": 3, "content": "b" }]))
+        .unwrap_err();
+    assert!(err.contains("[1].role"), "path names the bad message: {err}");
+
+    let err = history
+        .validate_value(&json!([{ "role": "user", "content": "a", "extra": 1 }]))
+        .unwrap_err();
+    assert!(err.contains("unknown field \"extra\""), "{err}");
+
+    let err = history.validate_value(&json!([{ "role": "user" }])).unwrap_err();
+    assert!(err.contains("missing required field \"content\""), "{err}");
+
+    // A raw URL string is NOT a stored image: the marker is the contract.
+    let err = history
+        .validate_value(&json!([{
+            "role": "user",
+            "content": [{ "type": "image", "image": "https://x.com/f.png" }],
+        }]))
+        .unwrap_err();
+    assert!(err.contains(".image"), "{err}");
+}
+
+#[test]
+fn cast_value_validates_into_named_and_record_types() {
+    use serde_json::json;
+    let message = reg_parse("ChatMessage");
+
+    // A hand-built matching dict casts (the Cast node's runtime door).
+    let v = json!({ "role": "user", "content": "hi" });
+    assert_eq!(message.cast_value(&v).unwrap(), v);
+    // A JSON string parses then validates.
+    assert_eq!(
+        message.cast_value(&json!("{\"role\": \"user\", \"content\": \"hi\"}")).unwrap(),
+        v
+    );
+    // Wrong shapes are refused naming the field.
+    let err = message.cast_value(&json!({ "role": "user" })).unwrap_err();
+    assert!(err.contains("missing required field"), "{err}");
+    let err = message.cast_value(&json!({ "role": "user", "content": "x", "zz": 1 })).unwrap_err();
+    assert!(err.contains("unknown field"), "{err}");
+    // A record with a file-typed field accepts a marker, refuses raw bytes.
+    let part = reg_parse("Part");
+    assert!(part
+        .cast_value(&json!({ "type": "image", "image": file_url("image/png") }))
+        .is_ok());
+    assert!(part.cast_value(&json!({ "type": "image", "image": "base64stuff" })).is_err());
+}
+
+#[test]
+fn installed_registry_is_idempotent_for_identical_content_only() {
+    // `install` is process-global; this test only checks the content
+    // rule through fresh threads' current() view being scope-driven.
+    let reg = test_registry();
+    let seen = reg.clone().scoped(|| TypeRegistry::current());
+    assert_eq!(*seen, *reg);
+    // Outside the scope, bare names are gone again (builtin only).
+    assert!(WeftType::parse("ChatMessage").is_none());
+}

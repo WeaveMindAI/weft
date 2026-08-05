@@ -15,6 +15,9 @@ export function ownFields(spec: AccessSpecWire): CredentialFieldWire[] {
 			...(acq.registration_fields ?? []),
 		];
 	}
+	// Runtime acquisition spends the runtime's own credential: the user
+	// pastes nothing (mirrors Rust's `Runtime => Vec::new()`).
+	if (acq.kind === 'runtime') return [];
 	return acq.fields ?? [];
 }
 

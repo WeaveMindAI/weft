@@ -2,7 +2,6 @@
   "type": "OpenRouterConfig",
   "label": "OpenRouter Config",
   "description": "OpenRouter model and parameters (pure model settings; the credential decision lives on the OpenRouterAccess node). When multiple OpenRouterInference nodes share the same settings, point them at one OpenRouterConfig node to keep maintenance simple. Only use multiple configs when you truly need different settings.",
-  "category": "AI",
   "tags": [
     "config",
     "ai",
@@ -29,7 +28,7 @@
       "exposure": "config",
       "label": "System Prompt",
       "placeholder": "You are a helpful assistant.",
-      "description": "System prompt for every inference node wired to this config. This is the one place to set it."
+      "description": "System prompt for every inference node wired to this config. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node."
     },
     {
       "name": "maxTokens",

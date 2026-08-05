@@ -2,7 +2,6 @@
   "type": "GoogleDriveWatch",
   "label": "Google Drive Watch",
   "description": "Fires an execution when a watched Drive file or folder changes. Google delivers change notifications by pushing to your weft, so your weft must be reachable from the internet (locally: ./setup.sh --public-url), and the address must belong to a domain verified in the app's Google console. The watch is renewed automatically for as long as the trigger is active.",
-  "category": "Triggers",
   "tags": [
     "google",
     "drive",

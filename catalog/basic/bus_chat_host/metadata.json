@@ -2,7 +2,6 @@
   "type": "BusChatHost",
   "label": "Bus Chat: Host",
   "description": "Demo node. Creates a Bus, registers as 'host', waits for a 'guest' to connect, then chats a few lines (host opens the conversation) and closes the bus. Pair with a Bus Chat: Guest node.",
-  "category": "basic",
   "tags": [
     "bus",
     "demo",

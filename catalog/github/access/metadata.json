@@ -2,7 +2,6 @@
   "type": "GitHubAccess",
   "label": "GitHub Access",
   "description": "Sign in to GitHub with a personal access token (fine-grained or classic). Wire the access output into GitHub action nodes; the token lives in the runtime's access store, never in the project file.",
-  "category": "Data",
   "tags": [
     "github",
     "access",

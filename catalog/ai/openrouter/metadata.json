@@ -1,0 +1,7 @@
+{
+  "types": {
+    "ChatHistory": "List[ChatMessage]",
+    "ChatMessage": "{ role: String, content: String | List[ChatContentPart], name?: String, tool_call_id?: String, tool_calls?: List[{ id: String, name: String, arguments: String }], cache_breakpoint?: Boolean }",
+    "ChatContentPart": "{ type: String, text?: String, image_url?: { url: Image, detail?: String, width?: Number, height?: Number }, input_audio?: { data: Audio, format?: String, duration_secs?: Number }, video_url?: { url: Video, duration_secs?: Number, width?: Number, height?: Number } }"
+  }
+}

@@ -28,6 +28,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Which CLI verb is emitting events. Webview state machine
 /// disambiguates so the bar can render the right label per phase.
+/// (Reactivate / resume-active reuse the plain `Activate` verb, so
+/// they have no variant here.)
+// SYNC: ActionVerb <-> packages/weft-graph/src/protocol.ts ActionVerb, crates/weft-dispatcher/src/api/project.rs compute_available_actions
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionVerb {

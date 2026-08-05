@@ -2,7 +2,6 @@
   "type": "GoogleSheetsRead",
   "label": "Google Sheets: Read",
   "description": "Read a spreadsheet's rows. Works signed in (pick a sheet, or let the picker grant one) and with nothing but a share link: leave the account unconnected and paste the link of a sheet shared with 'anyone with the link'.",
-  "category": "Data",
   "tags": [
     "google",
     "sheets",

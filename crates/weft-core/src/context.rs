@@ -238,6 +238,15 @@ impl ExecutionContext {
             .extend_from_declared(source, self.handle.declared_output_ports())
     }
 
+    /// The declared type of one of THIS instance's output ports, as the
+    /// compiled project resolved it (a metadata `MustOverride` output
+    /// reads as the concrete type the weft source declared on it).
+    /// `None` for a port this node does not declare. For nodes whose
+    /// behavior follows their resolved type (Cast).
+    pub fn output_type(&self, port: &str) -> Option<WeftType> {
+        self.handle.declared_output_ports().get(port).cloned()
+    }
+
     /// Close an output port mid-firing. The downstream subgraph attached
     /// to `port` receives a CLOSURE pulse (structural "nothing's coming")
     /// at the firing's own frame stack, same shape as the
@@ -1137,6 +1146,110 @@ impl StorageHandle {
         }
     }
 
+    /// Mint a temporary URL the OPEN INTERNET can fetch this file from,
+    /// or `None` when this deployment cannot serve one. `Some` is a
+    /// publicly addressable store's own presigned URL, or a relay link
+    /// under the deployment's public base; `None` means the store is
+    /// private and no public relay is up, and the caller should hand
+    /// out the bytes instead. A url-backed file value is already an
+    /// external URL and answers itself.
+    pub async fn public_link(
+        &self,
+        file: &crate::storage::FileHandle,
+        ttl_secs: Option<u64>,
+    ) -> WeftResult<Option<String>> {
+        match file {
+            crate::storage::FileHandle::Key(key) => {
+                self.handle.storage_public_link(key, ttl_secs).await
+            }
+            crate::storage::FileHandle::Url { url, .. } => Ok(Some(url.clone())),
+        }
+    }
+
+    /// Convert every MEDIA SLOT of a typed value into a form an
+    /// external consumer can use, per the value's declared type: a slot
+    /// is any position `ty` declares as a stored-file type, anywhere
+    /// inside lists, dicts, records, and declared named types. Stored
+    /// references become a freshly presigned URL or an inline `data:`
+    /// URL per the policy's kind-by-kind choice (a chat provider takes
+    /// image URLs but only inline audio). Slots already holding
+    /// external material (an http URL, a data: URL) pass through. The
+    /// result is intentionally NOT a value of `ty` anymore (its media
+    /// slots hold plain strings): hand it to the consumer, never store
+    /// it; presigned URLs expire and the stored form keeps references.
+    pub async fn externalize(
+        &self,
+        value: &serde_json::Value,
+        ty: &WeftType,
+        policy: crate::storage::media::ExternalizePolicy,
+    ) -> WeftResult<serde_json::Value> {
+        use crate::storage::media::{classify_media_slot, MediaForm, MediaSlotContent};
+        let mut replacements = std::collections::HashMap::new();
+        for slot in crate::storage::media::media_slots(value, ty) {
+            let (handle, kind) = match classify_media_slot(&slot).map_err(WeftError::Input)? {
+                MediaSlotContent::Stored { handle, kind } => (handle, kind),
+                // Already-external material passes through as-is.
+                MediaSlotContent::DataUrl { .. } | MediaSlotContent::ExternalUrl(_) => continue,
+            };
+            let external = match policy.form(kind) {
+                // Url is a PREFERENCE: a link only helps the consumer
+                // when the open internet can fetch it, so the slot
+                // falls back to inline bytes on a deployment that
+                // cannot serve a public link (private store, no relay).
+                MediaForm::Url => match self.public_link(&handle, None).await? {
+                    Some(url) => url,
+                    None => {
+                        let (meta, bytes) = self.get_bytes(&handle).await?;
+                        crate::storage::media::data_url(&meta.mime_type, &bytes)
+                    }
+                },
+                MediaForm::Inline => {
+                    let (meta, bytes) = self.get_bytes(&handle).await?;
+                    crate::storage::media::data_url(&meta.mime_type, &bytes)
+                }
+            };
+            replacements.insert(slot.to_string(), serde_json::Value::String(external));
+        }
+        Ok(crate::storage::media::substitute_media(value, ty, &replacements))
+    }
+
+    /// The inverse of [`Self::externalize`]: bring every media slot of
+    /// a typed value into the canonical STORED form. Raw material (a
+    /// `data:` URL from a provider response, an external http URL) is
+    /// stored into this handle's scope and the slot becomes the
+    /// stored-file reference; slots already holding a reference pass
+    /// through untouched, so re-internalizing a value is free. `keep`
+    /// applies to every newly stored file (see [`Self::put`]); pick the
+    /// handle's scope for where the bytes belong (a value that outlives
+    /// this execution needs a scope that does too). The result IS a
+    /// valid value of `ty` and is what gets emitted and journaled.
+    pub async fn internalize(
+        &self,
+        value: &serde_json::Value,
+        ty: &WeftType,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<serde_json::Value> {
+        use crate::storage::media::{classify_media_slot, MediaSlotContent};
+        let mut replacements = std::collections::HashMap::new();
+        for slot in crate::storage::media::media_slots(value, ty) {
+            let stored = match classify_media_slot(&slot).map_err(WeftError::Input)? {
+                MediaSlotContent::Stored { .. } => continue,
+                MediaSlotContent::DataUrl { mime, bytes } => {
+                    let filename = format!(
+                        "media.{}",
+                        mime.rsplit('/').next().unwrap_or("bin")
+                    );
+                    self.put(bytes, &mime, &filename, keep.clone()).await?
+                }
+                MediaSlotContent::ExternalUrl(url) => {
+                    self.put_from_url(&url, None, keep.clone()).await?
+                }
+            };
+            replacements.insert(slot.to_string(), stored);
+        }
+        Ok(crate::storage::media::substitute_media(value, ty, &replacements))
+    }
+
     /// The handle's bucket key, for the verbs that only make sense on
     /// stored bytes (`delete`, `keep`). A url-backed handle errors loud
     /// with the verb's name: the bytes live at an external URL, there
@@ -1339,6 +1452,11 @@ pub trait ContextHandle: Send + Sync {
     /// `key` directly from the box. `None` TTL = service default.
     async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
 
+    /// Mint a temporary INTERNET-reachable URL for `key`, or `None`
+    /// when this deployment cannot serve one (no publicly addressable
+    /// store and no public relay); callers fall back to inline bytes.
+    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>>;
+
     /// The wake event's payload for this firing. `Some(value)` only
     /// when the engine dispatched this node as the FIRING TRIGGER of
     /// a fresh execution (the HTTP body for a webhook, the SSE event
@@ -1397,8 +1515,105 @@ mod value_bag_tests {
         async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
         async fn storage_keep(&self, _: &str, _: crate::storage::KeepTtl) -> WeftResult<()> { unreachable!() }
         async fn storage_presign(&self, _: &str, _: Option<u64>) -> WeftResult<String> { unreachable!() }
+        async fn storage_public_link(&self, _: &str, _: Option<u64>) -> WeftResult<Option<String>> { unreachable!() }
         fn wake_payload(&self) -> Option<&Value> { None }
         fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
+    }
+
+    /// A handle whose STORAGE verbs work (one fixed stored file, a
+    /// configurable public-link answer); everything else stays dead.
+    /// Exists to pin `externalize`'s link-or-bytes fallback.
+    struct StorageProbeHandle {
+        public_link: Option<String>,
+    }
+    #[async_trait::async_trait]
+    impl ContextHandle for StorageProbeHandle {
+        async fn await_signal(&self, _: SignalSpec) -> WeftResult<Value> { unreachable!() }
+        async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
+        async fn endpoint_url(&self, _: &str) -> WeftResult<String> { unreachable!() }
+        async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
+        async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
+        async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
+        async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
+        async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
+        fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
+        fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
+        async fn pulse_downstream(&self, _: crate::node::NodeOutput) -> WeftResult<()> { unreachable!() }
+        async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
+        fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
+        fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
+        async fn storage_put(&self, _: &crate::storage::StorageScope, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_get(&self, key: &str, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
+            let meta = crate::storage::StoredFileMeta {
+                key: key.to_string(),
+                mime_type: "image/png".into(),
+                size_bytes: 3,
+                filename: "p.png".into(),
+                keep: false,
+                expires_at_unix: None,
+                keep_ttl_secs: None,
+                created_at_unix: 0,
+            };
+            Ok((meta, crate::storage::bytes_stream(bytes::Bytes::from_static(b"png"))))
+        }
+        async fn storage_get_url(&self, _: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
+        async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
+        async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
+        async fn storage_keep(&self, _: &str, _: crate::storage::KeepTtl) -> WeftResult<()> { unreachable!() }
+        async fn storage_presign(&self, _: &str, _: Option<u64>) -> WeftResult<String> { unreachable!() }
+        async fn storage_public_link(&self, _: &str, _: Option<u64>) -> WeftResult<Option<String>> {
+            Ok(self.public_link.clone())
+        }
+        fn wake_payload(&self) -> Option<&Value> { None }
+        fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
+    }
+
+    /// `MediaForm::Url` is a preference: the slot takes the deployment's
+    /// public link when one exists and falls back to inline bytes when
+    /// it does not; `Inline` always embeds.
+    #[tokio::test]
+    async fn externalize_url_form_falls_back_to_inline_without_a_public_link() {
+        use crate::storage::media::ExternalizePolicy;
+        let file = crate::storage::StoredFile {
+            key: "project/p1/img1".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 3,
+            filename: "p.png".into(),
+        };
+        let ty = WeftType::parse("Image").unwrap();
+        let with_link = |link: Option<&str>| {
+            ExecutionContext::new(
+                "exec-1".into(),
+                "project-1".into(),
+                "node-1".into(),
+                "TestNode".into(),
+                None,
+                crate::Color::nil(),
+                LoopFrames::default(),
+                inputs_bag(json!({})),
+                Arc::new(StorageProbeHandle { public_link: link.map(str::to_string) }),
+            )
+        };
+
+        // A deployment that serves public links: the slot IS the link.
+        let ctx = with_link(Some("https://pub.example/files/tok1"));
+        let out = ctx
+            .storage(crate::storage::StorageScope::Project)
+            .externalize(&file.to_value(), &ty, ExternalizePolicy::urls())
+            .await
+            .unwrap();
+        assert_eq!(out, json!("https://pub.example/files/tok1"));
+
+        // No public link: the same call inlines the bytes.
+        let ctx = with_link(None);
+        let out = ctx
+            .storage(crate::storage::StorageScope::Project)
+            .externalize(&file.to_value(), &ty, ExternalizePolicy::urls())
+            .await
+            .unwrap();
+        let s = out.as_str().unwrap();
+        assert!(s.starts_with("data:image/png;base64,"), "{s}");
     }
 
     fn ctx(inputs_json: serde_json::Value) -> ExecutionContext {

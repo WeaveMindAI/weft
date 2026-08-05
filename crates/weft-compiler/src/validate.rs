@@ -695,7 +695,9 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             continue;
         }
 
-        if matches!(&src_port.port_type, weft_core::weft_type::WeftType::TypeVar(_)) {
+        // A nested unresolved leaf (`A | T`, `List[T]`) is as unusable as a
+        // bare one: the runtime gate cannot validate against it.
+        if src_port.port_type.contains_unresolved_leaf() {
             push(d, span, Severity::Error, "unresolved-typevar",
                 format!(
                     "source port '{}.{}' type '{}' unresolved; connect it to something concrete or declare the type",
@@ -703,7 +705,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 ));
             continue;
         }
-        if matches!(&tgt_port.port_type, weft_core::weft_type::WeftType::TypeVar(_)) {
+        if tgt_port.port_type.contains_unresolved_leaf() {
             push(d, span, Severity::Error, "unresolved-typevar",
                 format!(
                     "target port '{}.{}' type '{}' unresolved; connect it to something concrete or declare the type",
@@ -713,19 +715,51 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
 
         if !weft_core::weft_type::WeftType::is_compatible(&src_port.port_type, &tgt_port.port_type) {
+            // When the pair is refused as a wire but the Cast table
+            // accepts it (a JsonDict claiming a declared type, text
+            // that would parse), name the door.
+            let cast_hint = if weft_core::weft_type::WeftType::cast_allowed(
+                &src_port.port_type,
+                &tgt_port.port_type,
+            )
+            .is_ok()
+            {
+                "; wire it through a Cast node to convert and validate the value"
+            } else {
+                ""
+            };
             push(d, span, Severity::Error, "type-mismatch",
                 format!(
-                    "cannot connect '{}.{}: {}' to '{}.{}: {}'",
+                    "cannot connect '{}.{}: {}' to '{}.{}: {}'{cast_hint}",
                     edge.source, src_port.name, src_port.port_type,
                     edge.target, tgt_port.name, tgt_port.port_type,
                 ));
         }
     }
 
-    // config-type-mismatch + incompatible-port-type-override: walk
-    // each node's config fields vs port types.
-    // v1 refs: 3515-3519 (config literal), 4224-4258 (port type
-    // override incompatibility).
+    // cast-not-allowed: any node declaring the checked-cast semantic
+    // (`features.castPorts`, metadata-declared; the compiler never
+    // names a node type) must have a resolved conversion pair the one
+    // weft-core table accepts (`WeftType::cast_allowed`). The runtime
+    // cast is the same door, so an allowed pair either converts or
+    // fails loudly at run time with a field-level message, and a
+    // nonsense pair (JsonDict -> Number) dies here instead.
+    for node in &project.nodes {
+        let Some(cast) = &node.features.cast_ports else { continue };
+        let input = node.inputs.iter().find(|p| p.name == cast.input);
+        let output = node.outputs.iter().find(|p| p.name == cast.output);
+        let (Some(input), Some(output)) = (input, output) else { continue };
+        if let Err(e) = weft_core::weft_type::WeftType::cast_allowed(
+            &input.port_type,
+            &output.port_type,
+        ) {
+            push(d, node.header_span_or_default(), Severity::Error, "cast-not-allowed", e);
+        }
+    }
+
+    // config-type-mismatch: walk each node's config fields vs port
+    // types. (Port-type-override incompatibility is caught upstream by
+    // the connection type check on the overridden port.)
     for node in &project.nodes {
         // Literal values live in TWO stores by written form: wireable
         // drivers in `port_literals`, `config`-exposure braces values in

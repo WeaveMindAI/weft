@@ -192,6 +192,10 @@ fn outside_caller_routes() -> Router<DispatcherState> {
             get(signal::list_signals_for_token).delete(signal::clear_all_signals),
         )
         .route("/signal-token/health", get(signal::signal_token_health))
+        // The public file relay: an external consumer fetches a minted
+        // media link here; the unguessable expiring token in the path
+        // is the credential (see api/storage.rs public_file).
+        .route("/public/files/{token}", get(storage::public_file))
         // Live caller connection handshake: an outside caller hits
         // `/connect/<path>` to open a held connection. The handler
         // authenticates, ensures a worker pod is up, starts a fresh

@@ -2,7 +2,6 @@
   "type": "ReceiveEmail",
   "label": "Receive Email",
   "description": "Fires an execution when an email lands in the connected mailbox's inbox. The mailbox is watched over IMAP (the standard held-connection protocol every mail provider serves), so no public address and no provider app are needed. The from/subject filters run before anything is emitted.",
-  "category": "Triggers",
   "tags": [
     "email",
     "imap",

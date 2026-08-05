@@ -13,16 +13,16 @@ import type {
 	LoopIteration,
 	NodeExecutionStatus,
 	NodeFeaturesWire as NodeFeatures,
-} from '../../../shared/protocol';
+} from '../../../protocol';
 // Node feature flags ARE the wire type `NodeFeaturesWire`, aliased to
 // `NodeFeatures` and re-exported under the `lib/types` module so webview
 // imports stay uniform and there is one definition of the concept (not a
 // webview-local copy that drifts from the wire shape).
 export type { NodeExecutionStatus };
-export type { NodeFeaturesWire as NodeFeatures } from '../../../shared/protocol';
+export type { NodeFeaturesWire as NodeFeatures } from '../../../protocol';
 // The exposure/widget vocabulary IS the wire type, re-exported for the
 // same one-definition reason.
-import type { Exposure, Widget, WidgetKind } from '../../../protocol';
+import { ACCESS_MARKER_KEY, type Exposure, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
 export type { Exposure, Widget, WidgetKind };
 
 // =============================================================================
@@ -93,7 +93,18 @@ export type WeftType =
 	// A Bus output connects only to a Bus input; the payloads are not
 	// type-checked. Wires only (a live runtime handle takes no literal).
 	| { kind: 'bus' }
+	// An access handle (a stored credential grant). Access connects only
+	// to Access; the grant itself is opaque to the type system.
+	// SYNC: access <-> crates/weft-core/src/weft_type.rs WeftType::Access
+	| { kind: 'access' }
 	| { kind: 'union'; types: WeftType[] }
+	// Dict with KNOWN field names: `{ role: String, name?: String }`.
+	// SYNC: record/named <-> crates/weft-core/src/weft_type.rs WeftType::Record/Named
+	| { kind: 'record'; fields: { name: string; ty: WeftType; optional: boolean }[] }
+	// A user-declared NOMINAL type: compatibility is by name. The backend
+	// serializes it self-contained (`Name=Body`), so the parser here never
+	// needs a registry; display renders the bare name.
+	| { kind: 'named'; name: string; body: WeftType }
 	| { kind: 'typevar'; name: string }
 	| { kind: 'must_override' };
 
@@ -122,14 +133,14 @@ function isTypeVarName(s: string): boolean {
 	return false;
 }
 
-/** Split string on delimiter, but only at top level (not inside []) */
+/** Split string on delimiter, but only at top level (not inside [] or {}) */
 function splitTopLevel(s: string, delimiter: string): string[] {
 	const parts: string[] = [];
 	let depth = 0;
 	let start = 0;
 	for (let i = 0; i < s.length; i++) {
-		if (s[i] === '[') depth++;
-		else if (s[i] === ']') depth--;
+		if (s[i] === '[' || s[i] === '{' || s[i] === '(') depth++;
+		else if (s[i] === ']' || s[i] === '}' || s[i] === ')') depth--;
 		else if (s[i] === delimiter && depth === 0) {
 			parts.push(s.slice(start, i));
 			start = i + 1;
@@ -139,16 +150,74 @@ function splitTopLevel(s: string, delimiter: string): string[] {
 	return parts;
 }
 
+/** Index of the first top-level (outside []/{}) occurrence of `delimiter`. */
+function findTopLevel(s: string, delimiter: string): number {
+	let depth = 0;
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] === '[' || s[i] === '{' || s[i] === '(') depth++;
+		else if (s[i] === ']' || s[i] === '}' || s[i] === ')') depth--;
+		else if (s[i] === delimiter && depth === 0) return i;
+	}
+	return -1;
+}
+
 function parseSingleType(s: string): WeftType | null {
 	s = s.trim();
-	// Named union aliases (Media, File, future user unions) all resolve
-	// through the one registry, never a per-name branch.
+	// Parenthesized group: `(A | B)` is the type inside. Exists so a
+	// named type's union body has an unambiguous wire form
+	// (`Kind=(A | B)` vs the union `Kind=A | B`). Only strip when the
+	// opening paren closes at the very end.
+	// SYNC: paren group <-> crates/weft-core/src/weft_type.rs parse_single_type
+	if (s.startsWith('(') && s.endsWith(')') && findTopLevel(s.slice(1, -1), ')') === -1) {
+		return parseWeftType(s.slice(1, -1));
+	}
+	// Named union aliases (Media, File) resolve through the one table,
+	// never a per-name branch.
 	const alias = NAMED_UNIONS[s];
 	if (alias !== undefined) {
 		return { kind: 'union', types: alias.map(t => ({ kind: 'primitive', value: t })) };
 	}
+	// Self-contained named form (`Name=Body`): the wire encoding of a
+	// user-declared type. The body rides inline, so no registry here.
+	const eq = findTopLevel(s, '=');
+	if (eq !== -1) {
+		const name = s.slice(0, eq).trim();
+		// Same rule as the backend's check_declarable_name: an
+		// uppercase-starting identifier that is not something the type
+		// language already means (a primitive, a container keyword, a
+		// special type, an alias, a TypeVar shape).
+		// SYNC: named-name rule <-> crates/weft-core/src/weft_type.rs TypeRegistry::check_declarable_name
+		if (!/^[A-Z][A-Za-z0-9_]*$/.test(name)) return null;
+		if (
+			(ALL_PRIMITIVE_TYPES as string[]).includes(name)
+			|| ['List', 'Dict', 'JsonDict', 'Bus', 'Access', 'MustOverride'].includes(name)
+			|| isTypeVarName(name)
+		) return null;
+		const body = parseWeftType(s.slice(eq + 1));
+		return body ? { kind: 'named', name, body } : null;
+	}
+	// Record: `{ field: Type, field?: Type }` (at least one field).
+	if (s.startsWith('{') && s.endsWith('}')) {
+		const inner = s.slice(1, -1);
+		const fields: { name: string; ty: WeftType; optional: boolean }[] = [];
+		for (const part of splitTopLevel(inner, ',')) {
+			const p = part.trim();
+			if (!p) return null;
+			const colon = findTopLevel(p, ':');
+			if (colon === -1) return null;
+			let name = p.slice(0, colon).trim();
+			const optional = name.endsWith('?');
+			if (optional) name = name.slice(0, -1).trimEnd();
+			if (!/^[A-Za-z0-9_]+$/.test(name) || fields.some(f => f.name === name)) return null;
+			const ty = parseWeftType(p.slice(colon + 1));
+			if (!ty) return null;
+			fields.push({ name, ty, optional });
+		}
+		return fields.length > 0 ? { kind: 'record', fields } : null;
+	}
 	if (s === 'JsonDict') return { kind: 'json_dict' };
 	if (s === 'Bus') return { kind: 'bus' };
+	if (s === 'Access') return { kind: 'access' };
 	if (s === 'MustOverride') return { kind: 'must_override' };
 
 	// Parameterized: List[...], Dict[...]
@@ -199,22 +268,25 @@ export function parseWeftType(s: string): WeftType | null {
 			if (!parsed) return null;
 			types.push(parsed);
 		}
-		// Flatten nested unions, dedup
+		// Flatten nested unions, then normalize like the backend's
+		// union builder: dedup by structural equality, drop `Empty`
+		// whenever another member remains (`Number | Empty` IS
+		// `Number`; the bottom type adds nothing), collapse a single
+		// survivor.
+		// SYNC: union normalization <-> crates/weft-core/src/weft_type.rs WeftType::union
 		const flat: WeftType[] = [];
 		for (const t of types) {
 			if (t.kind === 'union') flat.push(...t.types);
 			else flat.push(t);
 		}
-		const seen = new Set<string>();
 		const deduped: WeftType[] = [];
 		for (const t of flat) {
-			const key = weftTypeToString(t);
-			if (!seen.has(key)) {
-				seen.add(key);
-				deduped.push(t);
-			}
+			if (!deduped.some(u => weftTypesEqual(u, t))) deduped.push(t);
 		}
-		return deduped.length === 1 ? deduped[0] : { kind: 'union', types: deduped };
+		const nonEmpty = deduped.length > 1
+			? deduped.filter(t => !(t.kind === 'primitive' && t.value === 'Empty'))
+			: deduped;
+		return nonEmpty.length === 1 ? nonEmpty[0] : { kind: 'union', types: nonEmpty };
 	}
 
 	return parseSingleType(trimmed);
@@ -240,14 +312,42 @@ function unionAliasName(types: WeftType[]): string | null {
 /** Convert a parsed type back to string form. An alias's member set
  *  renders under its NAME (`File`/`Media` survive a parse -> string round
  *  trip), matching the backend's rendering. */
+/** The AUTHORED rendering: a named type prints its bare name (what
+ *  humans read/write; edit ops re-resolve it against the project
+ *  registry backend-side). NOT re-parseable frontend-side when a named
+ *  type is present; a string that will be parsed again must use
+ *  `weftTypeToWireString`.
+ *  SYNC: weftTypeToString/weftTypeToWireString <-> crates/weft-core/src/weft_type.rs WeftType::fmt_with, wire_string */
 export function weftTypeToString(t: WeftType): string {
+	return renderType(t, false);
+}
+
+/** The SELF-CONTAINED rendering: a named type prints `Name=Body`, so
+ *  the result re-parses without any registry. Use for every string that
+ *  flows back into `parseWeftType`. */
+export function weftTypeToWireString(t: WeftType): string {
+	return renderType(t, true);
+}
+
+function renderType(t: WeftType, wire: boolean): string {
 	switch (t.kind) {
 		case 'primitive': return t.value;
-		case 'list': return `List[${weftTypeToString(t.inner)}]`;
-		case 'dict': return `Dict[${weftTypeToString(t.key)}, ${weftTypeToString(t.value)}]`;
+		case 'list': return `List[${renderType(t.inner, wire)}]`;
+		case 'dict': return `Dict[${renderType(t.key, wire)}, ${renderType(t.value, wire)}]`;
 		case 'json_dict': return 'JsonDict';
 		case 'bus': return 'Bus';
-		case 'union': return unionAliasName(t.types) ?? t.types.map(weftTypeToString).join(' | ');
+		case 'access': return 'Access';
+		case 'union': return unionAliasName(t.types) ?? t.types.map(m => renderType(m, wire)).join(' | ');
+		case 'record':
+			return `{${t.fields.map(f => `${f.name}${f.optional ? '?' : ''}: ${renderType(f.ty, wire)}`).join(', ')}}`;
+		case 'named': {
+			if (!wire) return t.name;
+			// A union body is parenthesized so the rendered string is
+			// unambiguous: `Kind=(A | B)` is one named type, `Kind=A | B`
+			// re-parses as a union with a named member.
+			const body = renderType(t.body, wire);
+			return t.body.kind === 'union' ? `${t.name}=(${body})` : `${t.name}=${body}`;
+		}
 		case 'typevar': return t.name;
 		case 'must_override': return 'MustOverride';
 	}
@@ -261,7 +361,10 @@ export function extractPrimitives(t: WeftType): WeftPrimitive[] {
 		case 'dict': return [...extractPrimitives(t.key), ...extractPrimitives(t.value)];
 		case 'json_dict': return [];
 		case 'bus': return [];
+		case 'access': return [];
 		case 'union': return t.types.flatMap(extractPrimitives);
+		case 'record': return t.fields.flatMap(f => extractPrimitives(f.ty));
+		case 'named': return extractPrimitives(t.body);
 		case 'typevar': return [];
 		case 'must_override': return [];
 	}
@@ -273,6 +376,38 @@ export function isWeftTypeCompatible(source: PortType, target: PortType): boolea
 	const t = parseWeftType(target);
 	if (!s || !t) return false;
 	return isCompatible(s, t);
+}
+
+/** Structural equality, mirroring the backend's hand-written rules
+ *  exactly: record fields compare as an unordered set, and two NAMED
+ *  types are equal by name alone (bodies are identical by construction;
+ *  the registry refuses conflicting redeclarations). A rendered-string
+ *  compare would reintroduce exactly the two things those rules ignore.
+ *  SYNC: weftTypesEqual <-> crates/weft-core/src/weft_type.rs impl PartialEq for WeftType */
+export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
+	if (a.kind !== b.kind) return false;
+	switch (a.kind) {
+		case 'primitive':
+			return b.kind === 'primitive' && a.value === b.value;
+		case 'list':
+			return b.kind === 'list' && weftTypesEqual(a.inner, b.inner);
+		case 'dict':
+			return b.kind === 'dict' && weftTypesEqual(a.key, b.key) && weftTypesEqual(a.value, b.value);
+		case 'union':
+			return b.kind === 'union' && a.types.length === b.types.length
+				&& a.types.every((t, i) => weftTypesEqual(t, (b as Extract<WeftType, { kind: 'union' }>).types[i]));
+		case 'record':
+			return b.kind === 'record' && a.fields.length === b.fields.length
+				&& a.fields.every(af => (b as Extract<WeftType, { kind: 'record' }>).fields.some(
+					bf => bf.name === af.name && bf.optional === af.optional && weftTypesEqual(af.ty, bf.ty)));
+		case 'named':
+			return b.kind === 'named' && a.name === (b as Extract<WeftType, { kind: 'named' }>).name;
+		case 'typevar':
+			return b.kind === 'typevar' && a.name === (b as Extract<WeftType, { kind: 'typevar' }>).name;
+		default:
+			// json_dict / bus / access / must_override carry no payload.
+			return true;
+	}
 }
 
 export function isCompatible(source: WeftType, target: WeftType): boolean {
@@ -301,6 +436,31 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	}
 	// A bus connects only to a bus; payloads are not type-checked.
 	if (source.kind === 'bus' && target.kind === 'bus') return true;
+	if (source.kind === 'access' && target.kind === 'access') return true;
+	// A NAMED type is nominal: only the same name flows in.
+	// SYNC: named/record compatibility <-> crates/weft-core/src/weft_type.rs WeftType::is_compatible
+	if (source.kind === 'named' && target.kind === 'named') {
+		return source.name === target.name;
+	}
+	// Records: the target's contract decides (strict unknown keys,
+	// required target fields must be required source fields).
+	if (source.kind === 'record' && target.kind === 'record') {
+		return source.fields.every(sf => target.fields.some(tf => tf.name === sf.name))
+			&& target.fields.every(tf => {
+				const sf = source.fields.find(f => f.name === tf.name);
+				if (!sf) return tf.optional;
+				return (!sf.optional || tf.optional) && isCompatible(sf.ty, tf.ty);
+			});
+	}
+	// A record forgets into the generic-object types; never the reverse
+	// (the deliberate door is the Cast node).
+	if (source.kind === 'record' && target.kind === 'json_dict') return true;
+	if (source.kind === 'record' && target.kind === 'dict') {
+		return target.key.kind === 'primitive' && target.key.value === 'String'
+			&& source.fields.every(f => isCompatible(f.ty, target.value));
+	}
+	if (source.kind === 'json_dict' && target.kind === 'record') return false;
+	if (source.kind === 'dict' && target.kind === 'record') return false;
 	// Both unions: every source variant must match at least one target variant
 	if (source.kind === 'union' && target.kind === 'union') {
 		return source.types.every(s => target.types.some(t => isCompatible(s, t)));
@@ -313,6 +473,12 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	if (source.kind === 'union') {
 		return source.types.every(s => isCompatible(s, target));
 	}
+	// A named source decays into a structural target (after the union
+	// arms, so `Named -> Named | Null` matched through the union above).
+	if (source.kind === 'named') {
+		return isCompatible(source.body, target);
+	}
+	if (target.kind === 'named') return false;
 	return false;
 }
 
@@ -329,6 +495,11 @@ const STORED_FILE_MARKER_TYPES: Record<string, WeftPrimitive> = {
 	'__weft_blob__': 'Blob',
 };
 const FILE_HANDLE_KEYS = ['url', 'data', 'key'];
+
+// The bus sentinel (`{"__weft_bus__": ...}`); the access sentinel is
+// imported from the protocol module.
+// SYNC: BUS_MARKER_KEY <-> crates/weft-core/src/bus.rs bus marker
+const BUS_MARKER_KEY = '__weft_bus__';
 
 /** Infer the WeftType of a JSON value. Mirrors WeftType::infer() in Rust. */
 export function inferTypeFromValue(value: unknown): WeftType {
@@ -352,6 +523,16 @@ export function inferTypeFromValue(value: unknown): WeftType {
 				return { kind: 'primitive', value: prim };
 			}
 		}
+		// Same sentinel discipline for the other runtime handles, in the
+		// backend's order: a bus channel and a credential grant are
+		// their own types, never a generic dict. The bus marker's value
+		// must itself be an object (the backend's detect_bus_type reads
+		// it as one); the access marker is a bare key test there too.
+		if (typeof obj[BUS_MARKER_KEY] === 'object' && obj[BUS_MARKER_KEY] !== null
+			&& !Array.isArray(obj[BUS_MARKER_KEY])) {
+			return { kind: 'bus' };
+		}
+		if (ACCESS_MARKER_KEY in obj) return { kind: 'access' };
 		const values = Object.values(obj);
 		if (values.length === 0) {
 			return { kind: 'dict', key: { kind: 'primitive', value: 'String' }, value: { kind: 'primitive', value: 'Empty' } };
@@ -374,53 +555,27 @@ export function inputExposure(port: PortDefinition): Exposure {
 	return String(port.portType) === 'MustOverride' ? 'assignment' : 'all';
 }
 
-/** Unify a list of types. If all identical, return that type. Otherwise, return a union. */
+/** Unify a list of inferred types: dedup by MUTUAL compatibility (each
+ *  flows into the other), collapse a single survivor into itself.
+ *  SYNC: unifyTypes <-> crates/weft-core/src/weft_type.rs WeftType::unify_types */
 function unifyTypes(types: WeftType[]): WeftType {
 	if (types.length === 0) return { kind: 'primitive', value: 'Empty' };
-	const seen = new Set<string>();
 	const unique: WeftType[] = [];
 	for (const t of types) {
-		const key = weftTypeToString(t);
-		if (!seen.has(key)) { seen.add(key); unique.push(t); }
+		const members = t.kind === 'union' ? t.types : [t];
+		for (const m of members) {
+			if (!unique.some(u => isCompatible(m, u) && isCompatible(u, m))) unique.push(m);
+		}
 	}
 	return unique.length === 1 ? unique[0] : { kind: 'union', types: unique };
 }
 
-export interface PortDefinition {
-	name: string;
-	portType: PortType;
-	required: boolean;
-	description?: string;
-	/** Where this input's value may come from ('all' | 'assignment' |
-	 *  'config' | 'wire'). RESOLVED by the compiler/CLI on every wire
-	 *  payload; absent only on a locally-added port pre-round-trip
-	 *  (read it through `inputExposure`). Meaningless on outputs. */
-	exposure?: Exposure;
-	/** The input's effective editor widget, resolved by the compiler/CLI
-	 *  (declared, else derived from the type). Absent on outputs and on
-	 *  locally-added ports pre-round-trip. */
-	widget?: Widget;
-	/** The input's declared default value: rendered as the effective
-	 *  value when nothing else drives the input; supplied by the runtime
-	 *  at execution. Never written into source. */
-	default?: unknown;
-	/** Editor label override (defaults to the name). */
-	label?: string;
-	/** Editor placeholder for the input's field. */
-	placeholder?: string;
-	/** True iff this is the auto-synthesized input half of a loop carry port.
-	 *  The editor renders it as a ghost mirror of the carry output; the user
-	 *  edits the output's role to remove or rename it, never this side. */
-	synthesizedFromCarry?: boolean;
-	/** The permissions THIS consumer needs on the wired connection
-	 *  (Access-typed inputs only). Drives the live shortfall check. */
-	// SYNC: PortDefinition.requiresScopes <-> crates/weft-core/src/project.rs InputDefinition.requires_scopes
-	requiresScopes?: string[];
-	/** The stored VALUES THIS consumer needs on the wired connection
-	 *  (Access-typed inputs only). Drives the live shortfall check. */
-	// SYNC: PortDefinition.requiresValues <-> crates/weft-core/src/project.rs InputDefinition.requires_values
-	requiresValues?: string[];
-}
+/** The editor's ONE render-side port shape: the wire's enriched input
+ *  (`InputDefinition`), re-exported rather than re-declared so it
+ *  cannot drift from what the backend sends. Outputs and group
+ *  interface ports ride the same shape with the input-only members
+ *  absent, because every port renders through the same components. */
+export type PortDefinition = InputDefinition;
 
 // =============================================================================
 // Field Types (for node configuration UI)
@@ -461,7 +616,6 @@ export interface FieldDefinition {
 // Node Template Types (defines what a node TYPE looks like)
 // =============================================================================
 
-export type NodeCategory = "Triggers" | "AI" | "Data" | "Flow" | "Utility" | "Debug" | "Infrastructure";
 
 /** Record of a single execution of a node. The `NodeExecutionStatus`
  *  alias re-exported at the top of the file lets the wire and the UI
@@ -569,12 +723,12 @@ export interface ExecutionState {
 }
 
 /** A typed data item shown on a node's body-panel feed. The
- *  authoritative definition lives in `shared/protocol.ts`; this
+ *  authoritative definition lives in `protocol.ts`; this
  *  re-export keeps webview imports under the `lib/types` module.
  *  Adding a new kind: extend the union in protocol.ts AND add a
  *  branch in ProjectNode.svelte's render block.
  */
-export type { LiveDataItem } from '../../../shared/protocol';
+export type { LiveDataItem } from '../../../protocol';
 
 
 /**
@@ -593,7 +747,6 @@ export interface NodeTemplate {
 	description: string;
 	icon: import('svelte').Component;
 	color: string;
-	category: NodeCategory;
 	/** Free-form search tags from the node's metadata.json. The
 	 *  command palette's scoreNode() reads this for tag-match
 	 *  ranking. Always present (empty array when the node declares

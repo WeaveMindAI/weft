@@ -2,7 +2,6 @@
   "type": "GoogleAccess",
   "label": "Google Access",
   "description": "Sign in to a Google account, once, for everything Google. Pick an existing connection or add one; what a connection can DO is the permissions it was granted, shown in the list. The permission list grows with the nodes that need more.",
-  "category": "Data",
   "tags": [
     "google",
     "drive",
@@ -48,7 +47,6 @@
       }
     ],
     "all_permissions_url": "https://developers.google.com/identity/protocols/oauth2/scopes",
-    "permission_timing": "at_approve",
     "verification": {
       "rung": "reports_permissions",
       "cost": "free"

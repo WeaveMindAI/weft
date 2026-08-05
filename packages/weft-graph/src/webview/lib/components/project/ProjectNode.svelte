@@ -3,7 +3,7 @@
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
-	import { parseWeftType, inputExposure } from "../../types";
+	import { inputExposure } from "../../types";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
 	import CodeEditor from "../CodeEditor.svelte";
@@ -11,7 +11,7 @@
 	import CopyButton from "../ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromFields, deriveOutputsFromFields, isValidFieldKey, type FormFieldDef, type FormFieldSpec } from '../../utils/form-field-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "../../utils/status";
-	import type { FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../shared/protocol";
+	import type { FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
@@ -27,8 +27,8 @@
 	import RemoteSelectField from './RemoteSelectField.svelte';
 	import { grantsForService, grantsGeneration } from './grants-cache.svelte';
 	import FilePreview from './FilePreview.svelte';
-	import type { FileValueWire } from "../../../../shared/protocol";
-	import { parseFileValue, typeReferencesFile } from "../../../../shared/protocol";
+	import type { FileValueWire } from "../../../../protocol";
+	import { parseFileValue, typeReferencesFile } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -102,7 +102,6 @@
 			description: 'Unknown node type',
 			icon: BadgeQuestionMark,
 			color: '#999',
-			category: 'Logic',
 			tags: [],
 			requiresInfra: false,
 			defaultInputs: [],

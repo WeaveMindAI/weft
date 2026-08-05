@@ -2,7 +2,6 @@
   "type": "GitHubCreateIssue",
   "label": "GitHub: Create Issue",
   "description": "Open an issue on a repository. The repo picker searches the connected account's repositories, or paste a repo URL / owner/name directly.",
-  "category": "Data",
   "tags": [
     "github",
     "issue",

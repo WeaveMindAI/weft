@@ -2,7 +2,6 @@
   "type": "Multiply",
   "label": "Multiply",
   "description": "Multiply two numbers. A project-local custom node used by the e2e rig to prove user-authored nodes compile into the worker and run.",
-  "category": "Custom",
   "tags": [
     "math",
     "custom",

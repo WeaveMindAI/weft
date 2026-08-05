@@ -2,7 +2,6 @@
   "type": "GitHubAppAccess",
   "label": "GitHub App Access",
   "description": "Sign in as a GitHub App installation: paste the app id, installation id, and private key; the runtime mints a short-lived JWT and exchanges it for a one-hour installation token, lazily, on every expiry. Wire the access output into GitHub action nodes.",
-  "category": "Data",
   "tags": [
     "github",
     "access",

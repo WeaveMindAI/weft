@@ -508,18 +508,22 @@ fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
             .collect();
 
         for (src_node, _src_port, src_type, tgt_node, _tgt_port, tgt_type) in snapshot {
-            if let WeftType::TypeVar(name) = &tgt_type {
-                if !src_type.is_unresolved() {
-                    if substitute_type_var(project, &tgt_node, name, &src_type) {
-                        changed = true;
-                    }
+            // Bind typevars at ANY depth (a `List[T]` port wired to a
+            // `List[Number]` binds `T = Number`), matching what the
+            // validator counts as unresolved; a bare-`T`-only binder
+            // would leave nested vars unresolved forever.
+            let mut bindings = Vec::new();
+            collect_type_var_bindings(&tgt_type, &src_type, &mut bindings);
+            for (name, concrete) in &bindings {
+                if substitute_type_var(project, &tgt_node, name, concrete) {
+                    changed = true;
                 }
             }
-            if let WeftType::TypeVar(name) = &src_type {
-                if !tgt_type.is_unresolved() {
-                    if substitute_type_var(project, &src_node, name, &tgt_type) {
-                        changed = true;
-                    }
+            let mut bindings = Vec::new();
+            collect_type_var_bindings(&src_type, &tgt_type, &mut bindings);
+            for (name, concrete) in &bindings {
+                if substitute_type_var(project, &src_node, name, concrete) {
+                    changed = true;
                 }
             }
         }
@@ -530,6 +534,38 @@ fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
     }
 
     Ok(())
+}
+
+/// Walk `port` and `other` in parallel and record every typevar in
+/// `port` that lines up with a RESOLVED subtree of `other`. Containers
+/// recurse positionally, records by field name; a union is never
+/// descended (which member aligns is ambiguous), and Named bodies need
+/// no walk (the registry refuses typevars inside declared bodies).
+fn collect_type_var_bindings(
+    port: &WeftType,
+    other: &WeftType,
+    out: &mut Vec<(String, WeftType)>,
+) {
+    match (port, other) {
+        (WeftType::TypeVar(name), concrete) => {
+            if !concrete.contains_unresolved_leaf() {
+                out.push((name.clone(), concrete.clone()));
+            }
+        }
+        (WeftType::List(a), WeftType::List(b)) => collect_type_var_bindings(a, b, out),
+        (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => {
+            collect_type_var_bindings(ak, bk, out);
+            collect_type_var_bindings(av, bv, out);
+        }
+        (WeftType::Record(af), WeftType::Record(bf)) => {
+            for fa in af {
+                if let Some(fb) = bf.iter().find(|f| f.name == fa.name) {
+                    collect_type_var_bindings(&fa.ty, &fb.ty, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn substitute_type_var(
@@ -619,12 +655,43 @@ fn derive_form_ports(
     (inputs, outputs)
 }
 
+/// Replace every `T_Auto` placeholder with a TypeVar scoped to the
+/// field key, recursing through every container arm: `List[T_Auto]`
+/// reads as "a list of anything, scoped to this field", so a nested
+/// placeholder scopes exactly like a top-level one.
+/// SYNC: materialize_auto_type_vars <-> packages/weft-graph/src/webview/lib/utils/form-field-specs.ts materializeAutoTypeVars
+fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
+    match t {
+        WeftType::TypeVar(n) if n == "T_Auto" => WeftType::type_var(&format!("T__{key}")),
+        WeftType::List(inner) => WeftType::List(Box::new(materialize_auto_type_vars(inner, key))),
+        WeftType::Dict(k, v) => WeftType::Dict(
+            Box::new(materialize_auto_type_vars(k, key)),
+            Box::new(materialize_auto_type_vars(v, key)),
+        ),
+        WeftType::Union(members) => {
+            WeftType::Union(members.iter().map(|m| materialize_auto_type_vars(m, key)).collect())
+        }
+        WeftType::Record(fields) => WeftType::Record(
+            fields
+                .iter()
+                .map(|f| weft_core::weft_type::RecordField {
+                    name: f.name.clone(),
+                    ty: materialize_auto_type_vars(&f.ty, key),
+                    optional: f.optional,
+                })
+                .collect(),
+        ),
+        WeftType::Named { name, body } => WeftType::Named {
+            name: name.clone(),
+            body: Box::new(materialize_auto_type_vars(body, key)),
+        },
+        other => other.clone(),
+    }
+}
+
 fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> PortDefinition {
     let name = template.resolve_name(key);
-    let port_type = match &template.port_type {
-        WeftType::TypeVar(n) if n == "T_Auto" => WeftType::type_var(&format!("T__{key}")),
-        other => other.clone(),
-    };
+    let port_type = materialize_auto_type_vars(&template.port_type, key);
     PortDefinition {
         name,
         port_type,

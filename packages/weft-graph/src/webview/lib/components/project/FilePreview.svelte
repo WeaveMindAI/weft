@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Download, ExternalLink, FileAudio, FileVideo, FileText, Image as ImageIcon, AlertCircle } from '@lucide/svelte';
-	import type { FileValueWire } from '../../../../shared/protocol';
+	import type { FileValueWire } from '../../../../protocol';
 	import { send, resolveStoredFileUrl } from '../../../vscode';
 
 	// `mode='image'` renders the picture inline (ImageDisplay);

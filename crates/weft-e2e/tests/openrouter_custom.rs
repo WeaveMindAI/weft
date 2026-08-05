@@ -60,7 +60,7 @@ async fn a_project_defined_provider_meters_a_real_call() -> anyhow::Result<()> {
     // `openrouter_custom` (the project's provider name), resolved to a real
     // amount, on the user's own key. If the worker had failed to discover the
     // project meter, there would be no `openrouter_custom` record at all.
-    settled.assert_measured("openrouter_custom", "their-own").await?;
+    settled.assert_measured("openrouter_custom", "their-own", 1).await?;
 
     project.finish().await?;
     conn.finish().await

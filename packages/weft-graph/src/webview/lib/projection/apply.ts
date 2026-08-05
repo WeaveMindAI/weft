@@ -15,7 +15,7 @@
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
 import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure } from '../types';
-import type { EditOp, EditPortSig } from '../../../shared/protocol';
+import type { EditOp, EditPortSig } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
 import type { FoldResult, PendingOp } from './types';
 

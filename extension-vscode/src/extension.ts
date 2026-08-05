@@ -29,8 +29,8 @@ import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/proje
 import { ExecutionsProvider, ExecutionNode, type ExecutionSummary } from './sidebar/executions';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
-import type { ActionVerb, ActionErrorDetails, CliEvent } from './shared/protocol';
-import { emptyActionAvailability, parseStatusPayload } from './shared/protocol';
+import type { ActionVerb, ActionErrorDetails, CliEvent } from '../../packages/weft-graph/src/protocol';
+import { emptyActionAvailability, parseStatusPayload } from '../../packages/weft-graph/src/status';
 
 export function activate(context: vscode.ExtensionContext) {
   const dispatcher = new DispatcherClient(getDispatcherUrl());
@@ -67,7 +67,7 @@ export function activate(context: vscode.ExtensionContext) {
   /// project. Cached here so the webview's `ready` handler can
   /// re-receive it after iframe (re)mount; without the cache the
   /// only path is the next status fetch's roundtrip.
-  let lastStatusSnapshot: import('./shared/protocol').ActionAvailability | undefined;
+  let lastStatusSnapshot: import('../../packages/weft-graph/src/protocol').ActionAvailability | undefined;
   actionBar.subscribe((state) => {
     graphView.post({ kind: 'actionBarState', state });
   });
@@ -112,6 +112,10 @@ export function activate(context: vscode.ExtensionContext) {
         ev.kind === 'execution_cancelled'
       ) {
         actionBar.markExecutionFinished(ev.project_id, ev.color);
+      } else if (ev.kind === 'project_transition_changed') {
+        // The event carries the transition; apply it directly so the
+        // bar flips without waiting for the status round-trip.
+        actionBar.markTransition(ev.project_id, ev.transition);
       }
       scheduleStatusRefresh('sse');
     },
@@ -430,7 +434,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   interface StatusResult {
-    snapshot: import('./shared/protocol').ActionAvailability;
+    snapshot: import('../../packages/weft-graph/src/protocol').ActionAvailability;
     /// Most-recent execution color from the status fetch.
     color: string | undefined;
     /// Whether that color's worker is currently running. SSE
@@ -470,7 +474,7 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       // The remap lives in the shared package (`parseStatusPayload`)
       // so every host builds the exact same snapshot.
-      const json = JSON.parse(out) as import('./shared/protocol').RawStatusPayload;
+      const json = JSON.parse(out) as import('../../packages/weft-graph/src/status').RawStatusPayload;
       const execs = json?.executions ?? {};
       const lastStatus: string | undefined = execs.last_status;
       const lastColor: string | undefined = execs.last_color;

@@ -2,7 +2,6 @@
   "type": "Gate",
   "label": "Gate",
   "description": "Forwards value when pass is true; closes the output when pass is null or false (downstream sees a structural closure, not a data null).",
-  "category": "Flow",
   "tags": [
     "flow",
     "gate",

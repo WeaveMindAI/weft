@@ -4,7 +4,7 @@
 // expects the engine to consume, so an unexpected RPC fails loudly.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { ProjectDefinition, NodeInstance } from '../types';
-import type { EditOp, TextEdit } from '../../../shared/protocol';
+import type { EditOp, TextEdit } from '../../../protocol';
 import { ProjectionEngine, type EngineHost } from './engine.svelte';
 import type { EditRpcResult } from './types';
 import type { ProjectionCatalog } from './apply';

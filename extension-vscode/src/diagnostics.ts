@@ -8,7 +8,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
-import type { Diagnostic as WeftDiagnostic, Severity } from './shared/protocol';
+import type { Diagnostic as WeftDiagnostic, Severity } from '../../packages/weft-graph/src/protocol';
 
 export function attachDiagnostics(context: vscode.ExtensionContext, parseServer: ParseServer): void {
   const collection = vscode.languages.createDiagnosticCollection('weft');
@@ -108,11 +108,11 @@ function toVsCodeDiagnostic(d: WeftDiagnostic): vscode.Diagnostic {
   // location) falls back to a 1-char caret so it's still visible.
   const startLine = Math.max(0, d.line - 1);
   const startCol = Math.max(0, d.column);
-  // Nullish-coalesce (not `||`) for both end bounds: the fields are OPTIONAL,
-  // so only an absent (null/undefined) end falls back to the start. `||` would
-  // wrongly treat a legitimate `endLine: 0` / `endColumn: 0` as absent.
-  const endLine = Math.max(0, (d.endLine ?? d.line) - 1);
-  const endCol = Math.max(0, d.endColumn ?? d.column);
+  // `endLine: 0` is the wire's "the producer only knew a point" (lines
+  // are 1-based, so 0 is never a real end): treat it as the start, not
+  // as a line before it (which would build an inverted range).
+  const endLine = Math.max(0, (d.endLine === 0 ? d.line : d.endLine) - 1);
+  const endCol = Math.max(0, d.endLine === 0 ? d.column : d.endColumn);
   const pointSpan = endLine === startLine && endCol <= startCol;
   const range = pointSpan
     ? new vscode.Range(startLine, startCol, startLine, startCol + 1)

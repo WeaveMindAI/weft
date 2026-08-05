@@ -13,7 +13,7 @@ import type {
   GroupDefinition as HostGroup,
   PortDefinition as HostPort,
   InputDefinition as HostInput,
-} from '../shared/protocol';
+} from '../protocol';
 import type {
   ProjectDefinition as V1Project,
   NodeInstance,
@@ -122,7 +122,12 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     // loop-flavored xyflow type vs a group-flavored one. The lowering
     // (LoopIn/LoopOut boundary nodes) is unaffected by this.
     nodeType: isLoop ? 'Loop' : 'Group',
-    label: localName(g.id, parentId),
+    // A user-written label wins when the language grows one (today the
+    // wire always says null); the display name is the id's LOCAL
+    // segment, so a nested group renders "inner", never "outer.inner"
+    // (this covers the anonymous included-file group too, whose id is
+    // derived from its filename).
+    label: g.label ?? localName(g.id, parentId),
     // The webview reads the parent group from `config.parentId` (buildNodes,
     // getLayoutKey, edge scoping, the ancestor-collapse walk all read it there),
     // so the structural parent MUST be mirrored into config on every parse. Before

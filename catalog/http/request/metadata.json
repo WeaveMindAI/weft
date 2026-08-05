@@ -2,7 +2,6 @@
   "type": "HttpRequest",
   "label": "HTTP Request",
   "description": "Make an outbound HTTP request. Supports GET/POST/PUT/PATCH/DELETE with JSON body and custom headers.",
-  "category": "http",
   "tags": [
     "http",
     "api",

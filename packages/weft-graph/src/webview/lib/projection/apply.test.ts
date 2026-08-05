@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { ProjectDefinition, NodeInstance } from '../types';
 import { applyOpsToProject, foldOps, type ProjectionCatalog } from './apply';
 import type { PendingOp } from './types';
-import type { EditOp } from '../../../shared/protocol';
+import type { EditOp } from '../../../protocol';
 
 const catalog: ProjectionCatalog = {
   Text: {

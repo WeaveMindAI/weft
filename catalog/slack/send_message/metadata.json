@@ -2,7 +2,6 @@
   "type": "SlackSendMessage",
   "label": "Slack: Send Message",
   "description": "Post a message to a channel through the connected workspace's bot. The channel picker lists the workspace's channels live (the lookup runs on the stored access; nothing needs to be running).",
-  "category": "Data",
   "tags": [
     "slack",
     "message",

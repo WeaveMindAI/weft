@@ -2,7 +2,6 @@
   "type": "SlackReceiveMessage",
   "label": "Slack Receive Message",
   "description": "Fires an execution when a message lands in a Slack channel. Works through your own Slack app's Socket Mode token (paste it on the connection), or through Slack pushing events to a weft that is reachable from the internet. Filters run before anything fires, so only matching messages cost an execution. For 'every workspace that installed my app', use Slack App Messages instead.",
-  "category": "Triggers",
   "tags": [
     "slack",
     "trigger",
