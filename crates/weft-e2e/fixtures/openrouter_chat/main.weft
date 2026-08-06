@@ -9,13 +9,14 @@
 # Needs OPENROUTER_API_KEY like the openrouter fixture; the cheapest
 # vision-capable model keeps the run nearly free.
 
-auth = OpenRouterAccess
-
-cfg = OpenRouterConfig {
+prov = OpenRouterProvider {
   # A cheap Gemini: strong vision for pennies. (gpt-4.1-nano reliably
   # misnamed even a solid-color square; the relay link was verified
   # byte-identical, so the failure was the model, not the pipeline.)
-  model: "google/gemini-2.5-flash-lite",
+  model: "google/gemini-2.5-flash-lite"
+}
+
+params = LlmParams {
   systemPrompt: "You answer with exactly one word, lowercase, no punctuation.",
   temperature: 0.0,
   maxTokens: 16
@@ -24,26 +25,26 @@ cfg = OpenRouterConfig {
 # The remembered fact is deliberately NOT a color: turn two asks for
 # the square's color, and a color-valued fact bled into that answer on
 # a small model (it said "teal" about a red square).
-turn1 = OpenRouterInference -> (response: String) {
+turn1 = LlmInference -> (response: String) {
   prompt: "Remember this: my dog is named Biscuit. Reply with the word: ok"
 }
-turn1.account = auth.access
-turn1.config = cfg.config
+turn1.provider = prov.provider
+turn1.params = params.params
 
-turn2 = OpenRouterInference -> (response: String) {
+turn2 = LlmInference -> (response: String) {
   prompt: "What color is the attached square? One word."
 }
 turn2.history = turn1.history
 turn2.media = @asset("assets/red.png", Image)
-turn2.account = auth.access
-turn2.config = cfg.config
+turn2.provider = prov.provider
+turn2.params = params.params
 
-turn3 = OpenRouterInference -> (response: String) {
+turn3 = LlmInference -> (response: String) {
   prompt: "What is my dog's name? One word."
 }
 turn3.history = turn2.history
-turn3.account = auth.access
-turn3.config = cfg.config
+turn3.provider = prov.provider
+turn3.params = params.params
 
 out = Debug
 out.data = turn3.response

@@ -1,0 +1,118 @@
+{
+  "type": "AnthropicProvider",
+  "label": "Anthropic",
+  "description": "Serve LLM calls directly on Anthropic's API with your own API key: pick the connection and the model, and wire the provider output into any LLM node. Model names are Anthropic's own (claude-sonnet-4-5, ...).",
+  "tags": [
+    "ai",
+    "provider",
+    "model",
+    "claude",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "anthropic",
+    "label": "Anthropic",
+    "doors": ["own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk-ant-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "x-api-key",
+        "value": "{key}"
+      },
+      {
+        "kind": "header",
+        "name": "anthropic-version",
+        "value": "2023-06-01"
+      }
+    ],
+    "test": {
+      "url": "https://api.anthropic.com/v1/models"
+    },
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://console.anthropic.com/settings/keys",
+        "steps": [
+          "Open console.anthropic.com, Settings > API Keys, and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "connection",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Connection"
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Model",
+      "placeholder": "claude-sonnet-5"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": false,
+      "description": "The provider value: wire it into an LLM node's provider input."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "connection"
+        }
+      },
+      "then": {
+        "message": "AnthropicProvider '{id}' has no connection picked; pick one on the node.",
+        "level": "runtime",
+        "field": "connection"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "AnthropicProvider '{id}' has no model; name one on the node.",
+        "level": "runtime",
+        "field": "model"
+      }
+    }
+  ],
+  "requires_infra": false
+}

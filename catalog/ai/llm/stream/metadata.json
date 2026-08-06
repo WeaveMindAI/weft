@@ -1,0 +1,99 @@
+{
+  "type": "LlmStream",
+  "label": "LLM Stream",
+  "description": "AI language model completion whose reply streams live: each text delta is sent onto the stream bus the moment the model produces it, and the whole reply then pulses on the normal ports. Same provider/params/history/tools wiring as the LLM node; use this one when a consumer should see the text as it is generated.",
+  "tags": [
+    "ai",
+    "stream",
+    "completion",
+    "chat",
+    "generate",
+    "live"
+  ],
+  "icon": "BrainCircuit",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": false,
+      "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone)."
+    },
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false,
+      "exposure": "wire",
+      "description": "The conversation so far (a Chat Message chain or a previous call's history output)."
+    },
+    {
+      "name": "media",
+      "type": "Media | List[Media]",
+      "required": false,
+      "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them."
+    },
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": true,
+      "exposure": "wire",
+      "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends."
+    },
+    {
+      "name": "params",
+      "type": "Dict[String, String | Number | Boolean | List[String]]",
+      "required": false,
+      "exposure": "wire",
+      "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply."
+    },
+    {
+      "name": "tools",
+      "type": "JsonDict | List[JsonDict]",
+      "required": false,
+      "exposure": "wire",
+      "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
+    },
+    {
+      "name": "toolChoice",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "select",
+        "options": ["auto", "required", "none"]
+      },
+      "default": "auto",
+      "label": "Tool choice",
+      "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "stream",
+      "type": "Bus",
+      "required": false,
+      "description": "The live text: one 'delta' message per generated fragment, in order; the bus closing is the end of the reply. The bus metadata carries the serving model's name."
+    },
+    {
+      "name": "response",
+      "type": "String",
+      "required": false,
+      "description": "The whole reply, once generation finishes."
+    },
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false,
+      "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
+    },
+    {
+      "name": "toolCalls",
+      "type": "List[ToolCall]",
+      "required": false,
+      "description": "The tool calls the model made, if any. Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "oneOfRequired": [["prompt", "history", "media"]]
+  }
+}

@@ -3052,58 +3052,68 @@
 			if (!config) return;
 			for (const [key, value] of Object.entries(config)) {
 				if (NON_SOURCE_KEYS.has(key)) continue;
-				// Copy every set field, incl a deliberately-empty string (the
-				// live-edit path emits "", so duplicate must too or it drops an
-				// intentionally-blank field).
-				if (value === undefined || value === null) continue;
+				// Copy every set field verbatim, incl an explicit empty string
+				// written in the source. Source-derived config never holds
+				// null (unset = key absent), and formatConfigValue throws
+				// loudly if that invariant ever breaks.
 				ops.push(isLoop
 					? { op: 'setLoopConfig', loopId: scopedId, key, value: formatConfigValue(value) }
 					: { op: 'setConfig', node: scopedId, key, value: formatConfigValue(value) });
 			}
 		};
 
-		for (const orig of originals) {
-			const nodeType = orig.data.nodeType as string;
-			const isContainer = orig.type === 'group' || orig.type === 'groupCollapsed';
-			const isLoop = isContainer && containerKindOf(nodeType) === 'Loop';
-			const parentId = (orig.data.config as Record<string, string> | undefined)?.parentId;
-			const newPos = { x: orig.position.x + 50, y: orig.position.y + 50 };
-			const config = orig.data.config as Record<string, unknown> | undefined;
+		// Build the whole batch before recording anything, and surface a
+		// build failure (e.g. a config value the source formatter rejects)
+		// as a toast: an uncaught throw out of a click handler would leave
+		// the Duplicate button silently dead. The batch is atomic or
+		// absent, never half-recorded.
+		try {
+			for (const orig of originals) {
+				const nodeType = orig.data.nodeType as string;
+				const isContainer = orig.type === 'group' || orig.type === 'groupCollapsed';
+				const isLoop = isContainer && containerKindOf(nodeType) === 'Loop';
+				const parentId = (orig.data.config as Record<string, string> | undefined)?.parentId;
+				const newPos = { x: orig.position.x + 50, y: orig.position.y + 50 };
+				const config = orig.data.config as Record<string, unknown> | undefined;
 
-			if (isContainer) {
-				const base = (orig.data.label as string) || (isLoop ? 'MyLoop' : 'MyGroup');
-				const { label, scopedId } = freshScopedLabel(base, parentId, taken);
-				newIds.push(scopedId);
-				const cfg = config as Record<string, number> | undefined;
-				ops.push(isLoop
-					? { op: 'addLoop', label, parentGroup: parentId ?? null }
-					: { op: 'addGroup', label, parentGroup: parentId ?? null });
-				// Copy the container's boundary SIGNATURE: it is part of the decl,
-				// and a Loop's `over`/`carry` config references its ports, so the
-				// shell must declare them or the next build hard-errors
-				// (loop-over/carry-unknown-port). Carry GHOST inputs are stripped
-				// (they re-derive from the copied carry list on apply). Then copy
-				// the source config AFTER the ports exist. (Children are NOT
-				// deep-copied: the shell duplicates.)
-				const sigInputs = toPortSigs((orig.data.inputs as PortDefinition[]).filter(p => !p.synthesizedFromCarry));
-				const sigOutputs = toPortSigs(orig.data.outputs as PortLike[]);
-				if (sigInputs.length > 0 || sigOutputs.length > 0) {
+				if (isContainer) {
+					const base = (orig.data.label as string) || (isLoop ? 'MyLoop' : 'MyGroup');
+					const { label, scopedId } = freshScopedLabel(base, parentId, taken);
+					newIds.push(scopedId);
+					const cfg = config as Record<string, number> | undefined;
 					ops.push(isLoop
-						? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
-						: { op: 'updateGroupPorts', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
-				}
-				if (isLoop) copyConfig(config, scopedId, true);
-				layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y, cfg?.width, cfg?.height));
-			} else {
-				const { localId, scopedId } = freshScopedNodeId(nodeType, parentId, taken);
-				newIds.push(scopedId);
-				ops.push({ op: 'addNode', id: localId, nodeType, parentGroup: parentId ?? null });
-				layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y));
-				copyConfig(config, scopedId, false);
-				if (orig.data.label) {
-					ops.push({ op: 'setLabel', node: scopedId, label: orig.data.label as string });
+						? { op: 'addLoop', label, parentGroup: parentId ?? null }
+						: { op: 'addGroup', label, parentGroup: parentId ?? null });
+					// Copy the container's boundary SIGNATURE: it is part of the decl,
+					// and a Loop's `over`/`carry` config references its ports, so the
+					// shell must declare them or the next build hard-errors
+					// (loop-over/carry-unknown-port). Carry GHOST inputs are stripped
+					// (they re-derive from the copied carry list on apply). Then copy
+					// the source config AFTER the ports exist. (Children are NOT
+					// deep-copied: the shell duplicates.)
+					const sigInputs = toPortSigs((orig.data.inputs as PortDefinition[]).filter(p => !p.synthesizedFromCarry));
+					const sigOutputs = toPortSigs(orig.data.outputs as PortLike[]);
+					if (sigInputs.length > 0 || sigOutputs.length > 0) {
+						ops.push(isLoop
+							? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
+							: { op: 'updateGroupPorts', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
+					}
+					if (isLoop) copyConfig(config, scopedId, true);
+					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y, cfg?.width, cfg?.height));
+				} else {
+					const { localId, scopedId } = freshScopedNodeId(nodeType, parentId, taken);
+					newIds.push(scopedId);
+					ops.push({ op: 'addNode', id: localId, nodeType, parentGroup: parentId ?? null });
+					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y));
+					copyConfig(config, scopedId, false);
+					if (orig.data.label) {
+						ops.push({ op: 'setLabel', node: scopedId, label: orig.data.label as string });
+					}
 				}
 			}
+		} catch (e) {
+			toast.error(`Cannot duplicate: ${e instanceof Error ? e.message : String(e)}`);
+			return;
 		}
 
 		// Select the new copies once the projection rebuilds (they don't exist

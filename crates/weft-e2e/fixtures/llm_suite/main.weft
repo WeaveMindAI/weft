@@ -1,0 +1,122 @@
+# The whole ai/llm package in one graph, against the real services: all
+# four provider nodes (OpenRouter, Anthropic, OpenAI, Custom pointed at
+# OpenRouter's OpenAI-compatible endpoint), one shared LlmParams, a
+# buffered call per provider, a streamed call (deltas on the bus), and a
+# full tool round trip (forced tool call -> ExecPython extracts the call
+# id -> Chat Message feeds the result back as a role-tool message -> a
+# prompt-less re-entry answers from it).
+#
+# The TEST stamps each provider node's connection (own-key door, from
+# OPENROUTER_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY). Each question
+# demands one exact word so the answers are assertable; the cheapest
+# models keep the run nearly free.
+
+prov_or = OpenRouterProvider {
+  model: "openai/gpt-4.1-nano"
+}
+
+prov_an = AnthropicProvider {
+  model: "claude-haiku-4-5"
+}
+
+prov_oa = OpenAIProvider {
+  model: "gpt-4.1-nano"
+}
+
+# The custom node speaks to any OpenAI-compatible endpoint; OpenRouter's
+# own API is one, so the same key exercises the whole custom path
+# (base URL + pasted-key connection + generic wire).
+prov_cu = CustomProvider {
+  baseUrl: "https://openrouter.ai/api/v1",
+  model: "openai/gpt-4.1-nano",
+  name: "OpenRouter via Custom"
+}
+
+params = LlmParams {
+  systemPrompt: "You answer with exactly one word, lowercase, no punctuation.",
+  temperature: 0.0,
+  maxTokens: 64
+}
+
+# One buffered call per provider.
+ask_or = LlmInference -> (response: String) {
+  prompt: "What color is a clear midday sky? One word."
+}
+ask_or.provider = prov_or.provider
+ask_or.params = params.params
+out_or = Debug
+out_or.data = ask_or.response
+
+ask_an = LlmInference -> (response: String) {
+  prompt: "What color is fresh grass? One word."
+}
+ask_an.provider = prov_an.provider
+ask_an.params = params.params
+out_an = Debug
+out_an.data = ask_an.response
+
+ask_oa = LlmInference -> (response: String) {
+  prompt: "What color is a ripe banana? One word."
+}
+ask_oa.provider = prov_oa.provider
+ask_oa.params = params.params
+out_oa = Debug
+out_oa.data = ask_oa.response
+
+ask_cu = LlmInference -> (response: String) {
+  prompt: "What color is a ripe tomato? One word."
+}
+ask_cu.provider = prov_cu.provider
+ask_cu.params = params.params
+out_cu = Debug
+out_cu.data = ask_cu.response
+
+# The streamed call: the deltas ride the `stream` bus (the test reasserts
+# them from the journal and checks their concatenation IS the response).
+live = LlmStream {
+  prompt: "Count from 1 to 5 as plain digits separated by single spaces."
+}
+live.provider = prov_or.provider
+live.params = params.params
+out_stream = Debug
+out_stream.data = live.response
+
+# The tool round trip. The first call is FORCED to call the tool; the
+# model's call comes out on toolCalls, ExecPython plays the tool (it
+# answers "Biscuit" and hands back the call id), Chat Message appends
+# the role-tool result to the history, and the second call re-enters
+# with the history alone (no prompt) to answer from the result.
+dog = LlmTool {
+  name: "dog_name",
+  description: "Returns the name of the user's dog."
+}
+
+t1 = LlmInference -> (response: String) {
+  prompt: "What is my dog's name? Use the dog_name tool to find out.",
+  toolChoice: "required"
+}
+t1.provider = prov_or.provider
+t1.params = params.params
+t1.tools = dog.tool
+
+ext = ExecPython(calls: List[ToolCall]) -> (call_id: String) {
+  code: "return {'call_id': calls[0]['id']}"
+}
+ext.calls = t1.toolCalls
+
+answer = ChatHistoryAppend {
+  role: "tool"
+}
+answer.history = t1.history
+answer.toolCallId = ext.call_id
+answer.text = "Biscuit"
+
+t2 = LlmInference -> (response: String) {
+  toolChoice: "none"
+}
+t2.history = answer.history
+t2.provider = prov_or.provider
+t2.params = params.params
+t2.tools = dog.tool
+out_tool = Debug
+out_tool.data = t2.response

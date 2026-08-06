@@ -1,0 +1,20 @@
+[package]
+name = "llm"
+
+# The generic language-model nodes: provider nodes (each owns one
+# service's connection and emits an `LlmProvider` value), a shared
+# parameter node, a tool declaration node, the two inference nodes
+# (buffered `LlmInference`, live `LlmStream`), and the
+# provider-agnostic ChatHistoryAppend. The ChatHistory / ToolCall /
+# LlmProvider types are declared at this root.
+#
+# minillmlib carries the wire dialects (OpenAI-compatible, native
+# Anthropic) and accepts an injected HTTP client
+# (`GeneratorInfo::with_http_client`), which is how every call rides
+# the opened connection's client; the nodes need no HTTP client and no
+# cost bookkeeping of their own.
+[dependencies]
+async-trait = "0.1"
+minillmlib = "0.5.8"
+serde_json = "1"
+tokio = "1"

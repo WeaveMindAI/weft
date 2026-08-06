@@ -52,7 +52,7 @@ fn test_basic_project() {
     let source = r#"
 # A test project
 
-config = OpenRouterConfig {
+config = LlmParams {
     model: "gpt-4"
 }
 
@@ -1780,7 +1780,7 @@ fn file_ref_resolves_through_compile() {
     std::fs::write(dir.path().join("system.txt"), "you are a helpful poet").unwrap();
 
     let source = r#"
-poet = OpenRouterConfig {
+poet = LlmParams {
     systemPrompt: @file("system.txt")
 }
 "#;
@@ -1801,7 +1801,7 @@ fn file_ref_on_connection_line_inside_group_resolves() {
 
     let source = r#"
 g = Group() -> () {
-    poet = OpenRouterConfig
+    poet = LlmParams
     poet.systemPrompt = @file("sys.txt")
 }
 "#;
@@ -1834,7 +1834,7 @@ fn file_ref_surfaces_to_node_for_editor() {
     std::fs::write(dir.path().join("system.txt"), "be helpful").unwrap();
 
     let source = r#"
-poet = OpenRouterConfig {
+poet = LlmParams {
     systemPrompt: @file("system.txt")
 }
 "#;
@@ -2259,7 +2259,7 @@ fn file_and_include_compose_in_one_project() {
     ).unwrap();
 
     let source = r#"
-cfg = OpenRouterConfig { systemPrompt: @file("system.txt") }
+cfg = LlmParams { systemPrompt: @file("system.txt") }
 clean = @include("cleaner.weft")
 "#;
     let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");

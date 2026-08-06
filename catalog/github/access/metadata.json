@@ -7,7 +7,7 @@
     "access",
     "git"
   ],
-  "icon": "Github",
+  "icon": "GitBranch",
   "color": "#24292f",
   "service": {
     "service": "github",

@@ -1,7 +1,7 @@
 {
   "type": "ChatHistoryAppend",
   "label": "Chat Message",
-  "description": "Append one message to a chat history (or start a new one when no history is wired). The history is a typed value any chat-capable AI node consumes and re-emits, so a conversation is built by chaining this node and the AI calls; media attachments ride inside messages as stored files.",
+  "description": "Append one message to a chat history (or start a new one when no history is wired). The history is a typed value any chat-capable AI node consumes and re-emits, so a conversation is built by chaining this node and the AI calls; media attachments ride inside messages as stored files. Role 'tool' feeds a tool call's result back (wire the call's id to toolCallId).",
   "tags": [
     "ai",
     "chat",
@@ -25,7 +25,7 @@
       "exposure": "config",
       "widget": {
         "kind": "select",
-        "options": ["user", "assistant", "system"]
+        "options": ["user", "assistant", "system", "tool"]
       },
       "default": "user",
       "label": "Role"
@@ -41,6 +41,12 @@
       "type": "Media | List[Media]",
       "required": false,
       "description": "Media attached to this message: one stored image, audio clip, or video, or a list of them."
+    },
+    {
+      "name": "toolCallId",
+      "type": "String",
+      "required": false,
+      "description": "For role 'tool' only: the id of the tool call this message answers (from an LLM node's toolCalls output)."
     }
   ],
   "outputs": [

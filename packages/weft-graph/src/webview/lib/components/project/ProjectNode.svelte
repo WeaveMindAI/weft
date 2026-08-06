@@ -15,7 +15,7 @@
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
-	import { isFileRefValue, type WeftFileRefValue } from '../../value-format';
+	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { createPortContextMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
 	import { fieldForInput } from "../../utils/input-field";
@@ -586,7 +586,14 @@
 				toast.error(`Cannot edit ${fs.path}: ${fs.error ?? 'still loading'}`);
 				return;
 			}
-			const content = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+			// A cleared box (null) empties the file; there is no "unset" for
+			// file-backed content, the file IS the value.
+			const content =
+				value === null || value === undefined
+					? ''
+					: typeof value === 'string'
+						? value
+						: JSON.stringify(value, null, 2);
 			data.onSaveFileRef?.(fs.path, content);
 			return;
 		}
@@ -616,8 +623,11 @@
 	$effect(() => fieldEditorRegistry?.register(fieldEditor.flush));
 
 	/** Write a PORT-DRIVEN field's value: the port's body literal, kept
-	 *  apart from config (one home per name). An empty string clears the
-	 *  literal (the port goes back to unset/wireable). */
+	 *  apart from config (one home per name). An emptied control clears
+	 *  the literal (the port goes back to unset/wireable): null is what
+	 *  the strip's and the code editor's cleared boxes save, and an
+	 *  empty string is accepted as cleared too so no control can ever
+	 *  store a phantom "" literal. */
 	function updatePortLiteral(key: string, value: unknown) {
 		if (!data.onUpdate) return;
 		const cleared = value === null || value === undefined || value === '';
@@ -1597,6 +1607,7 @@
 						>
 								<CodeEditor
 									value={fieldDisplayValue(field)}
+									liveValue={!!fileFieldState(field.key)}
 									readonly={fileFieldReadonly(field.key)}
 									placeholder={field.placeholder}
 									language={field.language}
@@ -1605,13 +1616,17 @@
 										// Direct, not via fieldEditor: CodeEditor has no blur to clear
 										// the field editor's active key, which would strand the field
 										// on its local value and mask external (file -> graph) updates.
-										// A file-backed field routes to the (serialized) file write;
-										// otherwise the value goes to the home the field's exposure
-										// routes to (port literal vs config), same as every control.
+										// An emptied editor means UNSET (null), same contract as the
+										// strip's text boxes; a file-backed write turns it back into
+										// an empty file. A file-backed field routes to the
+										// (serialized) file write; otherwise the value goes to the
+										// home the field's exposure routes to (port literal vs
+										// config), same as every control.
+										const value = emptyToUnset(newValue);
 										if (fileFieldState(field.key)) {
-											updateConfig(field.key, newValue);
+											updateConfig(field.key, value);
 										} else {
-											updateFieldValue(field.key, newValue, field.portDriven);
+											updateFieldValue(field.key, value, field.portDriven);
 										}
 									}}
 								/>

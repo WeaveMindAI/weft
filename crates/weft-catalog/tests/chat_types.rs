@@ -6,7 +6,7 @@
 //! catalog's declared `ChatHistory`. A drift on either side (a lib
 //! field the declaration misses, a declaration field the lib never
 //! writes) fails here instead of at a user's provider call.
-// SYNC: (exercises) catalog/ai/openrouter/metadata.json types <->
+// SYNC: (exercises) catalog/ai/llm/metadata.json types <->
 //       MiniLLMLibRS/src/message serde
 
 use minillmlib::{

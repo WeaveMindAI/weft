@@ -119,11 +119,11 @@ out.data = f.file
 
 #[test]
 fn literal_placement_gates_where_a_literal_may_drive_a_port() {
-    // `literal: none` (OpenRouterInference's `config` port): no literal
+    // `literal: none` (LlmInference's `params` port): no literal
     // in ANY form. The braces form...
     let project = parse_enrich(
         r#"
-n = OpenRouterInference -> (response: String) { config: {"temperature": 0.5} }
+n = LlmInference -> (response: String) { params: {"temperature": 0.5} }
 n.prompt = "hi"
 out = Debug
 out.data = n.response
@@ -136,8 +136,8 @@ out.data = n.response
     // ...and the assignment form are both rejected.
     let project = parse_enrich(
         r#"
-n = OpenRouterInference -> (response: String) {}
-n.config = {"temperature": 0.5}
+n = LlmInference -> (response: String) {}
+n.params = {"temperature": 0.5}
 n.prompt = "hi"
 out = Debug
 out.data = n.response
@@ -184,10 +184,10 @@ n.image = "a-literal"
     // is already wired.
     let project = parse_enrich(
         r#"
-cfg = OpenRouterConfig {}
-n = OpenRouterInference -> (response: String) {}
-n.config = cfg.config
-n.config = {"temperature": 0.5}
+cfg = LlmParams {}
+n = LlmInference -> (response: String) {}
+n.params = cfg.params
+n.params = {"temperature": 0.5}
 n.prompt = "hi"
 out = Debug
 out.data = n.response
@@ -1124,12 +1124,12 @@ send.account = ws.access
 
 #[test]
 fn a_number_literal_outside_the_widget_range_is_rejected() {
-    // OpenRouterConfig's `temperature` widget declares max 2.0.
+    // LlmParams' `temperature` widget declares max 2.0.
     let project = parse_enrich(
         r#"
-cfg = OpenRouterConfig { model: "m" temperature: 5.0 }
+cfg = LlmParams { temperature: 5.0 }
 out = Debug
-out.data = cfg.config
+out.data = cfg.params
 "#,
     );
     let d = validate(&project, &catalog());
@@ -1137,9 +1137,9 @@ out.data = cfg.config
 
     let project = parse_enrich(
         r#"
-cfg = OpenRouterConfig { model: "m" temperature: 0.7 }
+cfg = LlmParams { temperature: 0.7 }
 out = Debug
-out.data = cfg.config
+out.data = cfg.params
 "#,
     );
     let d = validate(&project, &catalog());
@@ -1190,9 +1190,9 @@ fn a_castable_literal_is_cast_instead_of_failing() {
     // than failing dumbly. The range check then runs on the cast value.
     let project = parse_enrich(
         r#"
-cfg = OpenRouterConfig { model: "m" temperature: "0.7" }
+cfg = LlmParams { temperature: "0.7" }
 out = Debug
-out.data = cfg.config
+out.data = cfg.params
 "#,
     );
     let d = validate(&project, &catalog());
@@ -1207,9 +1207,9 @@ out.data = cfg.config
     // An out-of-range value stays out of range after the cast.
     let project = parse_enrich(
         r#"
-cfg = OpenRouterConfig { model: "m" temperature: "5.0" }
+cfg = LlmParams { temperature: "5.0" }
 out = Debug
-out.data = cfg.config
+out.data = cfg.params
 "#,
     );
     let d = validate(&project, &catalog());
@@ -1218,9 +1218,9 @@ out.data = cfg.config
     // A genuinely uncastable literal still fails loudly.
     let project = parse_enrich(
         r#"
-cfg = OpenRouterConfig { model: "m" temperature: "banana" }
+cfg = LlmParams { temperature: "banana" }
 out = Debug
-out.data = cfg.config
+out.data = cfg.params
 "#,
     );
     let d = validate(&project, &catalog());

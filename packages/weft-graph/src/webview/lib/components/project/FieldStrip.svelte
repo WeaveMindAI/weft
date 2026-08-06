@@ -14,6 +14,7 @@
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { clampToRange } from '../../utils/input-field';
+	import { emptyToUnset } from '../../value-format';
 
 	let {
 		fields,
@@ -143,8 +144,12 @@
 		return fieldEditor.display(k, storeStr);
 	}
 
+	/// Save a text-shaped field (text / textarea / password). An emptied
+	/// box means UNSET, exactly like an emptied number box: it saves
+	/// null, never the empty string, so a node reads absent (and its
+	/// declared default reapplies) instead of a phantom "" value.
 	function saveFn(field: FieldDefinition): (value: string) => void {
-		return (value: string) => onUpdate(field.key, value, field.portDriven);
+		return (value: string) => onUpdate(field.key, emptyToUnset(value), field.portDriven);
 	}
 
 	/// Save a number field, CLAMPED to its declared min/max: the widget's

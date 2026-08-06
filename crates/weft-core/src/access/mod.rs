@@ -203,7 +203,7 @@ impl std::fmt::Debug for OpenedConnection {
 ///
 /// ```ignore
 /// weft::access_node!(SlackAccessNode);
-/// weft::access_node!(OpenRouterAccessNode, "connection"); // non-default input name
+/// weft::access_node!(ElevenLabsAccessNode, "connection"); // non-default input name
 /// ```
 #[macro_export]
 macro_rules! access_node {

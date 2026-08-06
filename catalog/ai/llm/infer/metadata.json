@@ -1,0 +1,102 @@
+{
+  "type": "LlmInference",
+  "label": "LLM",
+  "description": "AI language model completion. Which service serves it comes from a wired provider node (OpenRouter, Anthropic, OpenAI, or a custom endpoint); sampling parameters come from a wired LlmParams node, and without one the defaults apply. Conversations chain through the history ports; wired LLM Tool declarations turn on tool calling.",
+  "tags": [
+    "ai",
+    "gpt",
+    "claude",
+    "completion",
+    "chat",
+    "generate"
+  ],
+  "icon": "BrainCircuit",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": false,
+      "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone)."
+    },
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false,
+      "exposure": "wire",
+      "description": "The conversation so far (a Chat Message chain or a previous call's history output)."
+    },
+    {
+      "name": "media",
+      "type": "Media | List[Media]",
+      "required": false,
+      "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them."
+    },
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": true,
+      "exposure": "wire",
+      "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends."
+    },
+    {
+      "name": "params",
+      "type": "Dict[String, String | Number | Boolean | List[String]]",
+      "required": false,
+      "exposure": "wire",
+      "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply."
+    },
+    {
+      "name": "tools",
+      "type": "JsonDict | List[JsonDict]",
+      "required": false,
+      "exposure": "wire",
+      "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
+    },
+    {
+      "name": "toolChoice",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "select",
+        "options": ["auto", "required", "none"]
+      },
+      "default": "auto",
+      "label": "Tool choice",
+      "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one."
+    },
+    {
+      "name": "parseJson",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "label": "Parse JSON",
+      "description": "Parse and repair JSON from the response (changes output to Dict)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "response",
+      "type": "MustOverride",
+      "required": false,
+      "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly."
+    },
+    {
+      "name": "history",
+      "type": "ChatHistory",
+      "required": false,
+      "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
+    },
+    {
+      "name": "toolCalls",
+      "type": "List[ToolCall]",
+      "required": false,
+      "description": "The tool calls the model made, if any (each with the raw JSON text of its arguments). Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "canAddOutputPorts": true,
+    "oneOfRequired": [["prompt", "history", "media"]]
+  }
+}

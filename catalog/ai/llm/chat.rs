@@ -1,5 +1,5 @@
 //! Stored-form chat helpers shared by the package members (the
-//! inference call and the provider-agnostic ChatHistoryAppend).
+//! inference calls and the provider-agnostic ChatHistoryAppend).
 //!
 //! A `ChatHistory` value keeps media as weft stored-file values inside
 //! minillmlib-shaped messages. The type is declared once, in this
@@ -7,12 +7,13 @@
 //! minillmlib's `Message` serde exactly: a field the declaration
 //! omitted would be DROPPED when a consumer round-trips the history
 //! through `serde_json::from_value::<Message>`, so "unused" optional
-//! fields (`name`, `tool_call_id`, `cache_breakpoint`) are part of the
-//! mirror, not decoration. These helpers build the stored form; a
-//! provider call externalizes it at the boundary.
-// SYNC: types.ChatMessage/ChatContentPart (../metadata.json) <->
+//! fields (`name`, `cache_breakpoint`) are part of the mirror, not
+//! decoration. These helpers build the stored form; a provider call
+//! externalizes it at the boundary.
+// SYNC: types.ChatMessage/ChatContentPart/ToolCall (metadata.json) <->
 //       MiniLLMLibRS/src/message/mod.rs Message,
-//       MiniLLMLibRS/src/message/content.rs ContentPart
+//       MiniLLMLibRS/src/message/content.rs ContentPart,
+//       MiniLLMLibRS/src/tools/mod.rs ToolCall
 
 use serde_json::{json, Value};
 
@@ -40,9 +41,10 @@ pub fn media_part(media: &Value) -> WeftResult<Value> {
     })
 }
 
-/// The `media` input's one-or-many forms, normalized: absent/null is
-/// none, a list is itself, a single stored value is a one-item list.
-pub fn media_items(value: Option<Value>) -> Vec<Value> {
+/// An input's one-or-many forms, normalized: absent/null is none, a
+/// list is itself, a single value is a one-item list (the `media` and
+/// `tools` inputs both take either).
+pub fn one_or_many(value: Option<Value>) -> Vec<Value> {
     match value {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => items,
@@ -51,8 +53,14 @@ pub fn media_items(value: Option<Value>) -> Vec<Value> {
 }
 
 /// The stored-form message for one turn: plain text content, or parts
-/// (text first, then each stored media).
-pub fn stored_message(role: &str, text: &str, media: &[Value]) -> WeftResult<Value> {
+/// (text first, then each stored media). A tool-result message (`role:
+/// tool`) carries the id of the call it answers.
+pub fn stored_message(
+    role: &str,
+    text: &str,
+    media: &[Value],
+    tool_call_id: Option<&str>,
+) -> WeftResult<Value> {
     let content = if media.is_empty() {
         Value::String(text.to_string())
     } else {
@@ -65,5 +73,9 @@ pub fn stored_message(role: &str, text: &str, media: &[Value]) -> WeftResult<Val
         }
         Value::Array(parts)
     };
-    Ok(json!({ "role": role, "content": content }))
+    let mut message = json!({ "role": role, "content": content });
+    if let Some(id) = tool_call_id {
+        message["tool_call_id"] = json!(id);
+    }
+    Ok(message)
 }

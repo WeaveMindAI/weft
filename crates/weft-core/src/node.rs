@@ -1989,7 +1989,7 @@ mod input_semantics_tests {
 mod package_defaults_tests {
     use super::*;
 
-    const MEMBER: &str = r#"{ "type": "OpenRouterInference", "label": "OpenRouter",
+    const MEMBER: &str = r#"{ "type": "LlmInference", "label": "LLM",
         "description": "" }"#;
     const DEFAULTS: &str = r#"{ "formFieldSpecs":
         [{ "fieldType": "root_spec", "label": "Root spec", "render": { "component": "text" } }] }"#;

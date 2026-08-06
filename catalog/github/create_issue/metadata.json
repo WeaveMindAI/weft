@@ -7,7 +7,7 @@
     "issue",
     "git"
   ],
-  "icon": "Github",
+  "icon": "GitBranch",
   "color": "#24292f",
   "inputs": [
     {

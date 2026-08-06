@@ -250,6 +250,15 @@ every field): `type`, `label`, `description`, `tags`, `icon`,
 label, placeholder, description }`), `outputs` (`{ name, type, required,
 description }`), `requires_infra`, `images`, `features`, `validate`.
 
+`icon` names any [Lucide](https://lucide.dev/icons) icon in its
+PascalCase form (`"BrainCircuit"`, `"KeyRound"`); the editor resolves
+it dynamically against its installed `@lucide/svelte`, so every icon
+that library ships just works. A name it does not ship renders as a
+generic square with a loud console error, and the editor's test suite
+pins every icon the editor asks for (each catalog metadata's, plus its
+own builtins') to the installed set, so a typo or an icon a lucide
+upgrade dropped fails the suite instead of shipping as a square.
+
 `deps.toml` lists extra cargo dependencies beyond the always-available
 base (weft, tokio, serde, serde_json, async-trait, anyhow, tracing,
 uuid):
@@ -326,7 +335,7 @@ let stored = storage.internalize(&response_value, &ty, None).await?;
 
 Emit only the internalized form: presigned URLs expire and never
 belong in a stored value. The `catalog/ai` chat nodes
-(`ChatHistoryAppend`, `OpenRouterInference`) are the worked example:
+(`ChatHistoryAppend`, `LlmInference`) are the worked example:
 the `ChatHistory` type carries media through arbitrarily long
 conversations with one externalize per call and one internalize per
 reply.
@@ -757,7 +766,7 @@ refresh; the node's body is a pure pass-through:
 weft::access_node!(SlackAccessNode);
 
 // A node whose access input is not named `account` names it:
-weft::access_node!(OpenRouterAccessNode, "connection");
+weft::access_node!(ElevenLabsAccessNode, "connection");
 ```
 
 The full recipe language (acquisition kinds, auth steps, doors and the

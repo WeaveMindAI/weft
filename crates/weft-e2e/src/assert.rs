@@ -198,6 +198,23 @@ impl SettledRun {
         Ok(self)
     }
 
+    /// Assert a node RAN to completion at least once. The counterpart of
+    /// [`Self::assert_skipped`]: a branch behind an optional output port
+    /// (toolCalls, a fan port) is silently SKIPPED when the port never
+    /// pulses, and the run still settles as completed, so a test that
+    /// only reads the branch's sink would fail with a confusing empty
+    /// value. Assert the branch actually ran first.
+    pub fn assert_completed(&self, node: &str) -> Result<&Self> {
+        if !self.node_completed(node) {
+            bail!(
+                "expected node '{node}' to run to completion, but it did not. \
+                 Its events: {:?}",
+                self.replay.for_node(node).map(|e| e.kind()).collect::<Vec<_>>()
+            );
+        }
+        Ok(self)
+    }
+
     /// Number of iterations a loop launched (count of `loop_iteration_launched`
     /// for `group_id`). The honest "how many times did the body run" measure.
     pub fn loop_iterations(&self, group_id: &str) -> usize {

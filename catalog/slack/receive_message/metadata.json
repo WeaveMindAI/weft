@@ -7,7 +7,7 @@
     "trigger",
     "message"
   ],
-  "icon": "Slack",
+  "icon": "Hash",
   "color": "#4A154B",
   "features": {
     "isTrigger": true

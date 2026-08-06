@@ -1,0 +1,138 @@
+{
+  "type": "OpenRouterProvider",
+  "label": "OpenRouter",
+  "description": "Serve LLM calls through OpenRouter: pick the connection (the built-in credits connection, or your own OpenRouter API key) and the model, and wire the provider output into any LLM node. One provider node, picked once, however many calls consume it.",
+  "tags": [
+    "ai",
+    "provider",
+    "model",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "openrouter",
+    "label": "OpenRouter",
+    "doors": ["shared", "own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk-or-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "test": {
+      "url": "https://openrouter.ai/api/v1/key",
+      "captures": [
+        {
+          "name": "key_label",
+          "path": "data.label",
+          "optional": true
+        }
+      ]
+    },
+    "identity": "{key_label}",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://openrouter.ai/keys",
+        "steps": [
+          "Open openrouter.ai/keys and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "connection",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Connection"
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Model",
+      "placeholder": "deepseek/deepseek-v4-flash-0731"
+    },
+    {
+      "name": "servingProvider",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Serving provider",
+      "placeholder": "(any)",
+      "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price."
+    },
+    {
+      "name": "providerFallbacks",
+      "type": "Boolean",
+      "exposure": "config",
+      "label": "Allow provider fallbacks",
+      "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top-ranked choice) is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": false,
+      "description": "The provider value: wire it into an LLM node's provider input."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "connection"
+        }
+      },
+      "then": {
+        "message": "OpenRouterProvider '{id}' has no connection picked; pick one on the node.",
+        "level": "runtime",
+        "field": "connection"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "OpenRouterProvider '{id}' has no model; name one on the node.",
+        "level": "runtime",
+        "field": "model"
+      }
+    }
+  ],
+  "requires_infra": false
+}

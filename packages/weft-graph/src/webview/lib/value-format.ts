@@ -34,6 +34,15 @@ function unquoteString(inner: string): string {
   return inner.replace(/\\(["\\])/g, '$1');
 }
 
+/** The one rule for every text-shaped control (text/textarea/password
+ *  boxes, code editors): an emptied box means UNSET (null, routed to a
+ *  removeConfig / cleared literal), never a stored empty string. Kept
+ *  here, next to the unset-vs-token boundary, so the controls cannot
+ *  drift apart on it. */
+export function emptyToUnset(value: string): string | null {
+  return value === '' ? null : value;
+}
+
 /** Format a config value as a `.weft` source token. Single-line scalars become
  *  quoted strings / literals; objects and arrays become pretty-printed JSON;
  *  multi-line strings become triple-backtick heredocs; a `@file` marker becomes

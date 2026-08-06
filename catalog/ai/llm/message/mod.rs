@@ -8,6 +8,10 @@
 //! node externalizes the history at its call boundary and deserializes
 //! it straight into minillmlib messages. The stored-form builders live
 //! in the package's shared `chat.rs`.
+//!
+//! Role `tool` is how a tool loop feeds a result back: it answers one
+//! call from an LLM node's `toolCalls` output, so it requires that
+//! call's id on `toolCallId`.
 
 use async_trait::async_trait;
 
@@ -27,12 +31,27 @@ impl Node for ChatHistoryAppendNode {
         let mut history: Vec<Value> = ctx.inputs.opt("history")?.unwrap_or_default();
         let role: String = ctx.inputs.get("role")?;
         let text: Option<String> = ctx.inputs.opt("text")?;
-        let media = chat::media_items(ctx.inputs.opt("media")?);
+        let media = chat::one_or_many(ctx.inputs.opt("media")?);
+        let tool_call_id: Option<String> = ctx.inputs.opt("toolCallId")?;
 
         if text.is_none() && media.is_empty() {
             node_bail!("a message needs text or media");
         }
-        history.push(chat::stored_message(&role, text.as_deref().unwrap_or(""), &media)?);
+        match (role.as_str(), &tool_call_id) {
+            ("tool", None) => {
+                node_bail!("a tool message answers one tool call; wire the call's id to toolCallId")
+            }
+            ("tool", Some(_)) | (_, None) => {}
+            (other, Some(_)) => {
+                node_bail!("toolCallId only belongs on a 'tool' message, not '{other}'")
+            }
+        }
+        history.push(chat::stored_message(
+            &role,
+            text.as_deref().unwrap_or(""),
+            &media,
+            tool_call_id.as_deref(),
+        )?);
         ctx.pulse_downstream(NodeOutput::new().set("history", history)).await
     }
 }

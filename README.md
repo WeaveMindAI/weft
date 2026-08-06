@@ -10,42 +10,39 @@ Weft is the fourth option. It's a language where LLMs, humans, APIs, databases, 
 
 **You own the units of computation. Weft owns the coordination between them, types, time, failure, live messaging, and infrastructure.** That's the whole idea.
 
-Here's a real one. A support ticket comes in over a webhook, an LLM triages it, and anything it flags as critical waits for a human before it gets escalated:
+Here's a real one. A support ticket comes in by email, an LLM triages it, and anything it flags as critical waits for a human before it gets escalated:
 
 ````weft
-ticket = ApiPost -> (subject: String, body: String) {}
+mailbox = EmailAccess
 
-triage = OpenRouterConfig {
+ticket = ReceiveEmail
+ticket.account = mailbox.access
+
+llm = OpenRouterProvider { model: "openai/gpt-4.1-nano" }
+
+triage = LlmParams {
   systemPrompt: "Classify this support ticket. Reply with JSON: {severity, summary}."
 }
 
-classify = OpenRouterInference -> (response: String) {}
+classify = LlmInference -> (response: String) {}
 classify.prompt = ticket.body
-classify.config = triage.config
+classify.provider = llm.provider
+classify.params = triage.params
 
-route = ExecPython(raw: String) -> (severity: String, is_critical: Boolean) {
-  code: ```
-import json
-r = json.loads(raw)
-return {"severity": r["severity"], "is_critical": r["severity"] == "critical"}
-```
-}
-route.raw = classify.response
-
-review = HumanQuery(context: String) -> (escalate_approved: Boolean?) {
+review = HumanQuery {
+  title: "Escalate this ticket?"
   fields: [{ "fieldType": "approve_reject", "key": "escalate" }]
 }
-review.context = classify.response
 
 escalate = Gate(pass: Boolean, value: String) -> (value: String?) {}
 escalate.pass = review.escalate_approved
 escalate.value = classify.response
 
-alert = Debug { label: "Escalated" }
+alert = Debug
 alert.data = escalate.value
 ````
 
-Read it top to bottom: ticket in, LLM classifies, Python pulls out the severity, a human approves the critical ones, the gate only lets approved tickets through to the alert. Every edge and every type was checked before a single node ran. The human pause is one node (`HumanQuery`): the program can wait minutes or days for that approval and resume exactly where it left off. Open the same file in the editor and it's a graph you click through and watch execute live.
+Read it top to bottom: ticket in, LLM classifies, a human approves the escalation, the gate only lets approved tickets through to the alert. Every edge and every type was checked before a single node ran. The human pause is one node (`HumanQuery`): the program can wait minutes or days for that approval and resume exactly where it left off. Open the same file in the editor and it's a graph you click through and watch execute live.
 
 > **Building in public, early days.** The language, the type system, and the durable executor are the stable core. The node catalog is small and opinionated on purpose. Breaking changes will happen while the shape settles, and they'll come with migration notes. Treat this as a foundation to build on, not a finished product.
 
@@ -111,30 +108,30 @@ weft run               # compile, register, fire an execution, stream live event
 
 Open the project folder in VS Code to see the graph, click nodes, and watch execution flow through in real time. The full walkthrough (webhooks, human-in-the-loop, infrastructure nodes) is in [docs/getting-started.md](./docs/getting-started.md).
 
-### API keys
+### API keys and connections
 
-All optional. A node that needs a key fails loudly at run time if it's missing, never silently.
+Nodes that call a third party (an LLM provider, email, Slack) take a **connection**, picked on the node in the editor. Your key never enters the graph or the source file; the node's config stores only a handle to the stored connection. Two ways to connect:
 
-```bash
-OPENROUTER_API_KEY=     # LLM nodes (via OpenRouter)
-TAVILY_API_KEY=         # Web Search nodes
-ELEVENLABS_API_KEY=     # Speech-to-Text nodes
-```
+- **Your own key**: paste it once in the editor's connection flow for that service.
+- **One click on this weft's own key**: add an `api_key` entry for the service in the shared-credentials file (`access-apps.json`) and the editor offers it as a ready-made connection.
 
-Copy `.env.example` to `.env` and fill in what you need.
+Copy `access-apps.example.json` to `access-apps.json` and fill in the services you want to offer that way. All optional: a node whose connection is missing fails loudly at run time, never silently.
 
 ## Repo layout
 
 ```
 weft/
 ├── catalog/            # The node catalog (source of truth for every built-in node)
-│   ├── ai/             #   LLM config + inference
+│   ├── ai/             #   LLM providers, params + inference; speech-to-text
 │   ├── basic/          #   Text, Debug, Python execution
+│   ├── email/          #   Email receive/send
 │   ├── http/           #   HTTP request
 │   ├── human/          #   Human Query, Human Trigger (forms, approvals)
+│   ├── live/           #   HTTP endpoints, websockets
 │   ├── logic/          #   Gate (conditional routing)
-│   ├── triggers/       #   Cron, webhooks
-│   └── whatsapp/       #   WhatsApp bridge + send/receive
+│   ├── triggers/       #   Cron
+│   ├── whatsapp/       #   WhatsApp bridge + send/receive
+│   └── ...             #   Slack, GitHub, Google, storage, Telegram
 ├── crates/
 │   ├── weft-core/      #   Type system, pulse model, the Node trait
 │   ├── weft-compiler/  #   Lex, parse (lossless CST), enrich, validate, codegen

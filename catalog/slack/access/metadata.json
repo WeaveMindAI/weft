@@ -7,7 +7,7 @@
     "access",
     "oauth"
   ],
-  "icon": "Slack",
+  "icon": "Hash",
   "color": "#4A154B",
   "service": {
     "service": "slack",

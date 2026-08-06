@@ -1,34 +1,23 @@
 {
-  "type": "OpenRouterConfig",
-  "label": "OpenRouter Config",
-  "description": "OpenRouter model and parameters (pure model settings; the credential decision lives on the OpenRouterAccess node). When multiple OpenRouterInference nodes share the same settings, point them at one OpenRouterConfig node to keep maintenance simple. Only use multiple configs when you truly need different settings.",
+  "type": "LlmParams",
+  "label": "LLM Params",
+  "description": "Completion parameters for LLM nodes (system prompt, sampling knobs, reasoning). Provider-agnostic: the same params drive any wired provider. When multiple LLM nodes share the same settings, point them at one LlmParams node; only use multiple when you truly need different settings.",
   "tags": [
     "config",
     "ai",
     "settings",
-    "model"
+    "parameters"
   ],
   "icon": "Settings",
   "color": "#6b6b99",
   "inputs": [
-    {
-      "name": "model",
-      "type": "String",
-      "required": true,
-      "exposure": "config",
-      "widget": {
-        "kind": "text"
-      },
-      "label": "Model",
-      "placeholder": "anthropic/claude-sonnet-4.6"
-    },
     {
       "name": "systemPrompt",
       "type": "String",
       "exposure": "config",
       "label": "System Prompt",
       "placeholder": "You are a helpful assistant.",
-      "description": "System prompt for every inference node wired to this config. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node."
+      "description": "System prompt for every LLM node wired to these params. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node."
     },
     {
       "name": "maxTokens",
@@ -69,6 +58,17 @@
       "placeholder": "1.0"
     },
     {
+      "name": "topK",
+      "type": "Number",
+      "exposure": "config",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Top K"
+    },
+    {
       "name": "frequencyPenalty",
       "type": "Number",
       "exposure": "config",
@@ -97,6 +97,13 @@
       "description": "-2.0 to 2.0"
     },
     {
+      "name": "stop",
+      "type": "List[String]",
+      "exposure": "config",
+      "label": "Stop sequences",
+      "description": "Generation stops when the model produces any of these strings."
+    },
+    {
       "name": "reasoning",
       "type": "Boolean",
       "exposure": "config",
@@ -119,22 +126,11 @@
       "description": "Only used when reasoning is enabled"
     },
     {
-      "name": "provider",
+      "name": "forcePrepend",
       "type": "String",
       "exposure": "config",
-      "widget": {
-        "kind": "text"
-      },
-      "label": "Provider",
-      "placeholder": "(any)",
-      "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price."
-    },
-    {
-      "name": "providerFallbacks",
-      "type": "Boolean",
-      "exposure": "config",
-      "label": "Allow provider fallbacks",
-      "description": "When a provider is pinned, still fall back to others if it is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else."
+      "label": "Force response prefix",
+      "description": "Force the model's reply to start with this exact text (constrained generation)."
     },
     {
       "name": "seed",
@@ -147,10 +143,10 @@
   ],
   "outputs": [
     {
-      "name": "config",
-      "type": "Dict[String, String | Number | Boolean]",
+      "name": "params",
+      "type": "Dict[String, String | Number | Boolean | List[String]]",
       "required": false,
-      "description": "OpenRouter configuration object fed into one or more OpenRouterInference nodes."
+      "description": "The parameters object, fed into one or more LLM nodes."
     }
   ],
   "requires_infra": false

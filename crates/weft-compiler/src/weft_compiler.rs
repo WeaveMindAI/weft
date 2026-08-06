@@ -2868,7 +2868,7 @@ fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
 //
 //     target.port = Template { template: "hi" }.text
 //
-//     my_llm = OpenRouterInference {
+//     my_llm = LlmInference {
 //       prompt: Template { template: "{{x}}" x: other.value }.text
 //     }
 //

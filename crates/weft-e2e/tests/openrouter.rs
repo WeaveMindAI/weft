@@ -8,23 +8,24 @@
 //! really answers, the meter really resolves a real number from the real
 //! response, and that number reaches the cost trail.
 //!
-//! Two scenarios drive the SAME graph through the OpenRouterAccess node's
+//! Two scenarios drive the SAME graph through the OpenRouterProvider node's
 //! connection picker, exactly as a user picks a connection in the editor
-//! (the pick lives on the ACCESS node; the inference node just consumes
-//! the wired access value):
+//! (the pick lives on the PROVIDER node; the inference node just consumes
+//! the wired provider value):
 //!   - `ours`: a shared-door connection, so the call is made on the
-//!     runtime's configured key (`OPENROUTER_API_KEY` on the broker),
+//!     runtime's configured key (the shared-credentials `api_key` entry),
 //!     which the worker never holds directly.
 //!   - `their-own`: a connection holding the user's own pasted key.
 //! Both land a resolved cost, measured worker-side; the difference is only
 //! whose credential spent, which the node never sees.
 //!
 //! Spends real money (fractions of a cent on the cheapest model). Needs an
-//! OpenRouter key: `OPENROUTER_API_KEY` in the environment the daemon was
-//! started from (the CLI packs it into the broker's secret for the runtime
-//! path, and this test reads it for the BYOK path). Without it the runtime
-//! scenario fails loudly with "the runtime has no key configured for
-//! 'openrouter'", which is exactly what this test then reports.
+//! OpenRouter key twice over: an `api_key` entry for openrouter in the
+//! shared-credentials file the daemon ships to the broker (the runtime
+//! path), and `OPENROUTER_API_KEY` in this test's environment (read
+//! directly for the BYOK path). Without the former the runtime scenario
+//! fails loudly at connect time, naming the missing `api_key` entry and
+//! the file it belongs in, which is exactly what this test then reports.
 #![cfg(feature = "e2e")]
 
 use weft_e2e::access::{catalog_spec, connect_direct, set_account};
@@ -63,13 +64,13 @@ async fn openrouter_node_measures_a_call_on_the_runtime_key() -> anyhow::Result<
     let disp = ensure::up().await?;
     let conn = connect_direct(
         &disp,
-        catalog_spec("ai/openrouter", "access")?,
+        catalog_spec("ai/llm", "openrouter")?,
         "shared",
         serde_json::json!({}),
     )
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    set_account(&project, "auth", "connection", conn.handle())?;
+    set_account(&project, "prov", "connection", conn.handle())?;
     assert_metered(&mut project, "ours").await?;
     project.finish().await?;
     conn.finish().await
@@ -89,18 +90,19 @@ async fn openrouter_node_measures_a_call_on_the_users_own_key() -> anyhow::Resul
         )
     })?;
     // Connect the user's own key as its own connection, exactly as the
-    // editor's "Your own" page does; the node config only ever holds the
-    // handle. The inference node consumes the wired access; model
-    // settings ride the wired config.
+    // editor's "Your own" page does; the provider node's config stores
+    // only the handle, never the key itself. The inference node
+    // consumes the wired LlmProvider object (connection, model, and
+    // routing); sampling settings ride the wired LlmParams object.
     let conn = connect_direct(
         &disp,
-        catalog_spec("ai/openrouter", "access")?,
+        catalog_spec("ai/llm", "openrouter")?,
         "own",
         serde_json::json!({ "key": key }),
     )
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    set_account(&project, "auth", "connection", conn.handle())?;
+    set_account(&project, "prov", "connection", conn.handle())?;
     assert_metered(&mut project, "their-own").await?;
     project.finish().await?;
     conn.finish().await

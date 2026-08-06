@@ -1,0 +1,113 @@
+{
+  "type": "OpenAIProvider",
+  "label": "OpenAI",
+  "description": "Serve LLM calls directly on OpenAI's API with your own API key: pick the connection and the model, and wire the provider output into any LLM node.",
+  "tags": [
+    "ai",
+    "provider",
+    "model",
+    "gpt",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "openai",
+    "label": "OpenAI",
+    "doors": ["own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.openai.com/v1/models"
+    },
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://platform.openai.com/api-keys",
+        "steps": [
+          "Open platform.openai.com, API keys, and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "connection",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Connection"
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Model",
+      "placeholder": "gpt-5.6-luna"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": false,
+      "description": "The provider value: wire it into an LLM node's provider input."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "connection"
+        }
+      },
+      "then": {
+        "message": "OpenAIProvider '{id}' has no connection picked; pick one on the node.",
+        "level": "runtime",
+        "field": "connection"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "OpenAIProvider '{id}' has no model; name one on the node.",
+        "level": "runtime",
+        "field": "model"
+      }
+    }
+  ],
+  "requires_infra": false
+}

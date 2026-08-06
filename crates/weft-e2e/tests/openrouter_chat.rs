@@ -25,13 +25,13 @@ async fn a_conversation_carries_history_and_media_through_typed_values() -> anyh
     let disp = ensure::up().await?;
     let conn = connect_direct(
         &disp,
-        catalog_spec("ai/openrouter", "access")?,
+        catalog_spec("ai/llm", "openrouter")?,
         "shared",
         serde_json::json!({}),
     )
     .await?;
     let mut project = Project::prepare("openrouter_chat", disp).await?;
-    set_account(&project, "auth", "connection", conn.handle())?;
+    set_account(&project, "prov", "connection", conn.handle())?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;

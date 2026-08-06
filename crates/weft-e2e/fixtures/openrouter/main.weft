@@ -1,28 +1,30 @@
-# One real LLM call, metered end to end. The access node's connection is
+# One real LLM call, metered end to end. The provider node's connection is
 # stamped by the TEST (a shared-door or own-key connection, created through
 # the store exactly as the editor does); the consuming node opens it inside
 # its own firing. The runtime measures the real cost off the real response.
 # The model is asked for one exact word so the answer is assertable, and
 # parseJson is off so the response is the raw string.
 #
-# Needs OPENROUTER_API_KEY in the environment the daemon was started from (the
-# CLI packs it into the broker's secret); the cheapest model keeps the run
-# nearly free.
+# The shared-door scenario needs an `api_key` entry for openrouter in the
+# shared-credentials file the daemon ships to the broker; the own-key
+# scenario reads OPENROUTER_API_KEY from the test's environment. The
+# cheapest model keeps the run nearly free.
 
-auth = OpenRouterAccess
+prov = OpenRouterProvider {
+  model: "openai/gpt-4.1-nano"
+}
 
-cfg = OpenRouterConfig {
-  model: "openai/gpt-4.1-nano",
+params = LlmParams {
   systemPrompt: "You answer with exactly one word, lowercase, no punctuation.",
   temperature: 0.0,
   maxTokens: 16
 }
 
-ask = OpenRouterInference -> (response: String) {
+ask = LlmInference -> (response: String) {
   prompt: "What color is a clear midday sky? Answer with one word."
 }
-ask.account = auth.access
-ask.config = cfg.config
+ask.provider = prov.provider
+ask.params = params.params
 
 out = Debug
 out.data = ask.response

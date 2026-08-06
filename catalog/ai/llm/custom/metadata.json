@@ -1,0 +1,133 @@
+{
+  "type": "CustomProvider",
+  "label": "Custom Provider",
+  "description": "Serve LLM calls on any OpenAI-compatible endpoint (a self-hosted vLLM or Ollama, an enterprise gateway, a niche vendor): base URL, model, and optionally a pasted API key. Wire the provider output into any LLM node.",
+  "tags": [
+    "ai",
+    "provider",
+    "model",
+    "endpoint",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "custom_llm",
+    "label": "Custom LLM endpoint",
+    "doors": ["own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "verification": {
+      "rung": "silent",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "steps": [
+          "Paste the endpoint's API key below and name the connection.",
+          "The endpoint's address lives on the Custom Provider node itself, not here."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "connection",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Connection",
+      "description": "Optional: the endpoint's API key, sent as a Bearer header. Leave unpicked for an endpoint that takes bare calls."
+    },
+    {
+      "name": "baseUrl",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Base URL",
+      "placeholder": "http://localhost:11434/v1",
+      "description": "The endpoint's base address; the OpenAI-compatible chat-completions path is derived from it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Model",
+      "placeholder": "tangle-v2"
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Name",
+      "placeholder": "Custom",
+      "description": "A display name for this endpoint, used in error messages."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": false,
+      "description": "The provider value: wire it into an LLM node's provider input."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "baseUrl"
+        }
+      },
+      "then": {
+        "message": "CustomProvider '{id}' has no base URL; set the endpoint's address on the node.",
+        "level": "runtime",
+        "field": "baseUrl"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "model"
+        }
+      },
+      "then": {
+        "message": "CustomProvider '{id}' has no model; name one on the node.",
+        "level": "runtime",
+        "field": "model"
+      }
+    }
+  ],
+  "requires_infra": false
+}
