@@ -1401,8 +1401,9 @@ async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
 ```
 
 The HTTP shape is the same idea with `respond`/`write` instead of
-`send`/`receive`. Working examples: `catalog/live/http_responder`,
-`catalog/live/ws_echo`, `catalog/live/ws_listener`.
+`send`/`receive`. Working examples:
+`crates/weft-e2e/fixtures/web_trigger/nodes/http_responder`,
+`crates/weft-e2e/fixtures/live_chat/nodes/ws_echo`.
 
 ### Lifetime: caller-tied vs survives
 

@@ -1,8 +1,7 @@
 //! ElevenLabsTranscribe: realtime speech-to-text over a live audio bus.
 //!
 //! The audio arrives on the `audio` Bus: raw 16-bit PCM frames on a
-//! BYTES bus whose creator metadata declares the format (an AudioStream
-//! node produces exactly this shape):
+//! BYTES bus whose creator metadata declares the format:
 //!
 //! ```json
 //! { "sample_rate": 16000, "encoding": "pcm_s16le" }
@@ -99,8 +98,9 @@ impl Node for ElevenLabsTranscribeNode {
         // before the first frame, so the session dials to match.
         let rate = audio.meta()["sample_rate"].as_u64().ok_or_else(|| {
             node_error(
-                "the audio bus declares no sample_rate in its metadata; wire an \
-                 AudioStream (or a producer declaring the same contract) into 'audio'",
+                "the audio bus declares no sample_rate in its metadata; wire a \
+                 producer that declares { sample_rate, encoding } as its bus \
+                 metadata into 'audio'",
             )
         })?;
         if !SUPPORTED_RATES.contains(&rate) {

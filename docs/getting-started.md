@@ -91,14 +91,61 @@ You should see the `hello` project listed.
 
 Make a project an outside caller can hit over HTTP. `ApiEndpoint` is the
 trigger (each request fires a fresh execution); a downstream node reads the
-request and replies through the caller handle. `LiveHttpResponder` is the
-shipped demo responder (streams two progress chunks, then echoes the request
-body back as JSON):
+request and replies through the caller handle. The responder is a
+project-local node you write yourself (a directory under `nodes/`; see
+`docs/authoring-nodes.md` for the full authoring guide):
 
 ```bash
+mkdir -p nodes/reply
+cat > nodes/reply/metadata.json <<'EOF'
+{
+  "type": "Reply",
+  "label": "Reply",
+  "description": "Echo the caller's request body back as JSON.",
+  "tags": ["live", "http"],
+  "icon": "Send",
+  "color": "#06b6d4",
+  "inputs": [
+    { "name": "started", "type": "Boolean", "required": false,
+      "description": "Kick from the ApiEndpoint trigger." }
+  ],
+  "outputs": [
+    { "name": "done", "type": "Boolean", "required": false,
+      "description": "Fires true once the response has been sent." }
+  ],
+  "requires_infra": false
+}
+EOF
+cat > nodes/reply/mod.rs <<'EOF'
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+use weft::caller::{InboundMessage, OutboundChunk};
+use weft::node::NodeOutput;
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+
+#[derive(NodeManifest)]
+pub struct ReplyNode;
+
+#[async_trait]
+impl Node for ReplyNode {
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // The connected HTTP caller handle; fails loud on a non-HTTP run.
+        let http = ctx.http_caller().await?;
+        let req = http.request_parts()?;
+        let echoed = match &req.body {
+            InboundMessage::Json(v) => v.clone(),
+            InboundMessage::Text(s) => Value::String(s.clone()),
+            InboundMessage::Bytes(b) => json!({ "bytes": b.len() }),
+        };
+        http.respond(OutboundChunk::Json(json!({ "you_sent": echoed }))).await?;
+        ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
+    }
+}
+EOF
 cat > main.weft <<'EOF'
 api = ApiEndpoint { path: "hello" }
-reply = LiveHttpResponder { _label: "responder" }
+reply = Reply { _label: "responder" }
 
 reply.started = api.started
 EOF
